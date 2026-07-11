@@ -109,7 +109,6 @@ jobs:
               ${{ steps.enable_sccache.outputs.CXX_LAUNCHER }} \
               ${{ steps.enable_sccache.outputs.C_LAUNCHER }} \
               -DENABLE_COVERAGE=OFF \
-              -DCMAKE_COMPILE_COMMANDS=ON \
               -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
               -DCMAKE_C_COMPILER=${{ matrix.cc }} \
               ${{ matrix.cmake_flags }}
@@ -132,7 +131,9 @@ jobs:
       - name: Build
         shell: bash
         run: |
-          test -f $EMSDK_HOME/emsdk_env.sh && source $EMSDK_HOME/emsdk_env.sh
+          if [ -n "${EMSDK_HOME:-}" ] && [ -f "${EMSDK_HOME}/emsdk_env.sh" ]; then
+            source "${EMSDK_HOME}/emsdk_env.sh"
+          fi
           cmake --build ../build
 
       - name: execute tests

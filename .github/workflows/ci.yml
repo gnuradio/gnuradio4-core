@@ -144,28 +144,6 @@ jobs:
             -DENABLE_COVERAGE=OFF \
             ${{ matrix.cmake_flags }}
 
-      - name: Configure AdaptiveCpp
-        if: matrix.cxx == 'acpp'
-        shell: bash
-        env:
-          CC: "${{ matrix.cc }}"
-          CXX: "${{ matrix.cxx }}"
-          ACPP_TARGETS: omp
-        run: >
-          which acpp &&
-          acpp --version &&
-          cmake \
-            -S . \
-            -B ../build \
-            -DCMAKE_COLOR_DIAGNOSTICS=ON \
-            -DDISABLE_EXTERNAL_DEPS_WARNINGS=ON \
-            -DCMAKE_BUILD_TYPE=${{ matrix.cmake-build-type }} \
-            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-            ${{ steps.enable_sccache.outputs.CXX_LAUNCHER }} \
-            ${{ steps.enable_sccache.outputs.C_LAUNCHER }} \
-            -DENABLE_COVERAGE=OFF \
-            ${{ matrix.cmake_flags }}
-
       - name: Configure CMake Emscripten
         if: matrix.cmake_wrapper == 'emcmake'
         shell: bash
@@ -187,7 +165,9 @@ jobs:
       - name: Build
         shell: bash
         run: |
-          test -f $EMSDK_HOME/emsdk_env.sh && source $EMSDK_HOME/emsdk_env.sh
+          if [ -n "${EMSDK_HOME:-}" ] && [ -f "${EMSDK_HOME}/emsdk_env.sh" ]; then
+            source "${EMSDK_HOME}/emsdk_env.sh"
+          fi
           cmake --build ../build
 
       - name: execute tests
