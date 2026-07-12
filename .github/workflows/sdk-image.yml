@@ -10,13 +10,59 @@ permissions:
   packages: write
 
 env:
-  IMAGE_NAME: ghcr.io/gnuradio/gnuradio4-core-sdk
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/gnuradio4-core-sdk
 
 jobs:
   publish:
-    name: Build and publish SDK image
+    name: "${{ matrix.name }}"
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu 24.04 | gcc-14 | Release
+            tag_suffix: ubuntu-24.04-gcc14-release
+            base_image: ghcr.io/gnuradio/ci:ubuntu-24.04-4.0
+            cc: gcc-14
+            cxx: g++-14
+            cmake_build_type: RelWithDebInfo
+            cmake_flags: -DADDRESS_SANITIZER=OFF
+          - name: Ubuntu 26.04 | gcc | Release
+            tag_suffix: ubuntu-26.04-gcc-release
+            base_image: ghcr.io/gnuradio/ci:ubuntu-26.04-4.0
+            cc: gcc
+            cxx: g++
+            cmake_build_type: RelWithDebInfo
+            cmake_flags: -DADDRESS_SANITIZER=OFF
+          - name: Ubuntu 26.04 | gcc | Debug
+            tag_suffix: ubuntu-26.04-gcc-debug
+            base_image: ghcr.io/gnuradio/ci:ubuntu-26.04-4.0
+            cc: gcc
+            cxx: g++
+            cmake_build_type: Debug
+            cmake_flags: -DADDRESS_SANITIZER=OFF
+          - name: Ubuntu 24.04 | clang-20 | Release
+            tag_suffix: ubuntu-24.04-clang20-release
+            base_image: ghcr.io/gnuradio/ci:ubuntu-24.04-4.0
+            cc: clang-20
+            cxx: clang++-20
+            cmake_build_type: RelWithDebInfo
+            cmake_flags: -DADDRESS_SANITIZER=ON
+          - name: Fedora 44 | clang | Release
+            tag_suffix: fedora-44-clang-release
+            base_image: ghcr.io/gnuradio/ci:fedora-44-4.0
+            cc: clang
+            cxx: clang++
+            cmake_build_type: RelWithDebInfo
+            cmake_flags: -DADDRESS_SANITIZER=ON
+          - name: Fedora 44 | clang | Debug
+            tag_suffix: fedora-44-clang-debug
+            base_image: ghcr.io/gnuradio/ci:fedora-44-4.0
+            cc: clang
+            cxx: clang++
+            cmake_build_type: Debug
+            cmake_flags: -DADDRESS_SANITIZER=ON
 
     steps:
       - uses: actions/checkout@v6
@@ -41,9 +87,14 @@ jobs:
           push: true
           build-args: |
             GIT_SHA=${{ github.sha }}
+            BASE_IMAGE=${{ matrix.base_image }}
+            CC=${{ matrix.cc }}
+            CXX=${{ matrix.cxx }}
+            CMAKE_BUILD_TYPE=${{ matrix.cmake_build_type }}
+            CMAKE_FLAGS=${{ matrix.cmake_flags }}
           tags: |
-            ${{ env.IMAGE_NAME }}:${{ github.sha }}
-            ${{ env.IMAGE_NAME }}:main
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ matrix.tag_suffix }}
+            ${{ env.IMAGE_NAME }}:main-${{ matrix.tag_suffix }}
           labels: |
             org.opencontainers.image.source=https://github.com/gnuradio/gnuradio4-core
             org.opencontainers.image.revision=${{ github.sha }}
@@ -53,10 +104,12 @@ jobs:
       - name: Validate SDK image contents
         shell: bash
         run: |
-          docker run --rm "${IMAGE_NAME}:${GITHUB_SHA}" bash -lc '
+          docker run --rm "${IMAGE_NAME}:${GITHUB_SHA}-${{ matrix.tag_suffix }}" bash -lc '
             set -euo pipefail
             printf "GNURADIO4_PREFIX=%s\n" "${GNURADIO4_PREFIX}"
             test -d /opt/gnuradio4
+            test -f /opt/gnuradio4/share/gnuradio4-core-sdk/manifest
+            cat /opt/gnuradio4/share/gnuradio4-core-sdk/manifest
             ls -la /opt/gnuradio4
             if [ -d /opt/gnuradio4/lib ]; then
               ls -la /opt/gnuradio4/lib

@@ -1,33 +1,46 @@
-FROM ghcr.io/gnuradio/ci:ubuntu-26.04-4.0 AS builder
+ARG BASE_IMAGE=ghcr.io/gnuradio/ci:ubuntu-26.04-4.0
+
+FROM ${BASE_IMAGE} AS builder
 
 ARG GIT_SHA=unknown
+ARG CMAKE_BUILD_TYPE=RelWithDebInfo
+ARG CMAKE_FLAGS="-DADDRESS_SANITIZER=OFF"
+ARG CC=gcc
+ARG CXX=g++
 
 WORKDIR /src/gnuradio4
 COPY . .
 
-ENV CC=gcc \
-    CXX=g++ \
+ENV CC=${CC} \
+    CXX=${CXX} \
     CMAKE_EXPORT_COMPILE_COMMANDS=ON
 
 RUN cmake -S . -B /build/gnuradio4 \
       -DCMAKE_COLOR_DIAGNOSTICS=ON \
       -DDISABLE_EXTERNAL_DEPS_WARNINGS=ON \
-      -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+      -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} \
       -DCMAKE_INSTALL_PREFIX=/opt/gnuradio4 \
       -DUSE_CCACHE=OFF \
       -DENABLE_EXAMPLES=OFF \
       -DENABLE_TESTING=OFF \
       -DENABLE_COVERAGE=OFF \
-      -DADDRESS_SANITIZER=OFF \
+      ${CMAKE_FLAGS} \
     && cmake --build /build/gnuradio4 --parallel 4 \
     && cmake --install /build/gnuradio4 \
+    && smoke_cmake_flags="" \
+    && case "${CMAKE_FLAGS}" in *-DADDRESS_SANITIZER=ON*) \
+      smoke_cmake_flags="-DCMAKE_CXX_FLAGS=-fsanitize=address -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address -DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=address" ;; \
+    esac \
     && cmake -S test_external/minimal_blocklib -B /build/minimal-blocklib \
       -DCMAKE_PREFIX_PATH=/opt/gnuradio4 \
+      ${smoke_cmake_flags} \
     && cmake --build /build/minimal-blocklib --parallel 4 \
     && mkdir -p /opt/gnuradio4/share/gnuradio4-core-sdk \
-    && printf 'git_sha=%s\nprefix=/opt/gnuradio4\n' "${GIT_SHA}" > /opt/gnuradio4/share/gnuradio4-core-sdk/manifest
+    && printf 'git_sha=%s\nprefix=/opt/gnuradio4\nbase_image=%s\ncmake_build_type=%s\ncmake_flags=%s\n' \
+      "${GIT_SHA}" "${BASE_IMAGE}" "${CMAKE_BUILD_TYPE}" "${CMAKE_FLAGS}" \
+      > /opt/gnuradio4/share/gnuradio4-core-sdk/manifest
 
-FROM ghcr.io/gnuradio/ci:ubuntu-26.04-4.0 AS sdk
+FROM ${BASE_IMAGE} AS sdk
 
 ARG GIT_SHA=unknown
 

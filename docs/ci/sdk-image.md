@@ -17,14 +17,25 @@ It uses that image's default GCC/G++ toolchain and installs GNU Radio 4 under:
 ```
 
 Downstream builds should set `CMAKE_PREFIX_PATH=/opt/gnuradio4`. For
-reproducible CI, pin the image to a full git SHA tag. The `:main` tag is a
-moving convenience tag and should not be treated as reproducible.
+reproducible CI, pin the image to a full git SHA plus profile tag. The
+`main-<profile>` tags are moving convenience tags and should not be treated as
+reproducible.
 
 Published tags:
 
 ```text
-ghcr.io/gnuradio/gnuradio4-sdk:<full-git-sha>
-ghcr.io/gnuradio/gnuradio4-sdk:main
+ghcr.io/<owner>/gnuradio4-core-sdk:<full-git-sha>-ubuntu-24.04-gcc14-release
+ghcr.io/<owner>/gnuradio4-core-sdk:main-ubuntu-24.04-gcc14-release
+ghcr.io/<owner>/gnuradio4-core-sdk:<full-git-sha>-ubuntu-26.04-gcc-release
+ghcr.io/<owner>/gnuradio4-core-sdk:main-ubuntu-26.04-gcc-release
+ghcr.io/<owner>/gnuradio4-core-sdk:<full-git-sha>-ubuntu-26.04-gcc-debug
+ghcr.io/<owner>/gnuradio4-core-sdk:main-ubuntu-26.04-gcc-debug
+ghcr.io/<owner>/gnuradio4-core-sdk:<full-git-sha>-ubuntu-24.04-clang20-release
+ghcr.io/<owner>/gnuradio4-core-sdk:main-ubuntu-24.04-clang20-release
+ghcr.io/<owner>/gnuradio4-core-sdk:<full-git-sha>-fedora-44-clang-release
+ghcr.io/<owner>/gnuradio4-core-sdk:main-fedora-44-clang-release
+ghcr.io/<owner>/gnuradio4-core-sdk:<full-git-sha>-fedora-44-clang-debug
+ghcr.io/<owner>/gnuradio4-core-sdk:main-fedora-44-clang-debug
 ```
 
 Example downstream GitHub Actions usage:
@@ -34,7 +45,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/gnuradio/gnuradio4-sdk:<sha>
+      image: ghcr.io/<owner>/gnuradio4-core-sdk:<sha>-ubuntu-26.04-gcc-release
 
     steps:
       - uses: actions/checkout@v4
@@ -52,6 +63,6 @@ Example local container build:
 docker run --rm -it \
   -v "$PWD:/work" \
   -w /work \
-  ghcr.io/gnuradio/gnuradio4-sdk:<sha> \
+  ghcr.io/<owner>/gnuradio4-core-sdk:<sha>-ubuntu-26.04-gcc-release \
   bash -lc 'cmake -S . -B build -DCMAKE_PREFIX_PATH=/opt/gnuradio4 && cmake --build build --parallel'
 ```
