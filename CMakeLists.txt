@@ -626,6 +626,36 @@ if(ENABLE_TESTING
   append_coverage_compiler_flags()
   set(GCOVR_ADDITIONAL_ARGS "--merge-mode-functions=merge-use-line-min"
                             "--gcov-ignore-parse-errors=negative_hits.warn_once_per_file")
+  set(GR4_CORE_COVERAGE_DEPENDENCIES
+      qa_buffer
+      qa_AtomicBitset
+      qa_AtomicRef
+      qa_Value
+      qa_ValueHelper
+      qa_ComputeDomain
+      qa_DataSet
+      qa_DynamicPort
+      qa_LifeCycle
+      qa_MemoryAllocators
+      qa_PmtCollections
+      qa_Port
+      qa_Profiler
+      qa_Tensor
+      qa_TensorMath
+      qa_SVD
+      qa_TriggerMatcher
+      qa_YamlPmt
+      qa_PortableTypeName
+      qa_thread_affinity
+      qa_thread_pool
+      qa_SubGraphAssets
+      qa_fixed_string
+      qa_reflection
+      qa_formatter
+      qa_traits
+      qa_type_name
+      qa_UncertainValue
+      qa_RangesHelper)
   setup_target_for_coverage_gcovr_xml(
     NAME
     coverage
@@ -634,21 +664,9 @@ if(ENABLE_TESTING
     EXECUTABLE_ARGS
     "--output-on-failure"
     DEPENDENCIES
-    qa_buffer
-    qa_DataSink
-    qa_DynamicPort
-    qa_DynamicBlock
-    qa_UnmanagedSubGraph
-    qa_ManagedSubGraph
-    qa_filter
-    qa_Settings
-    qa_Tags
-    qa_Scheduler
-    qa_thread_pool
-    qa_thread_affinity
-    qa_YamlPmt
+    ${GR4_CORE_COVERAGE_DEPENDENCIES}
     EXCLUDE
-    "$CMAKE_BUILD_DIR/*")
+    "${CMAKE_BINARY_DIR}/*")
   setup_target_for_coverage_gcovr_html(
     NAME
     coverage_html
@@ -657,21 +675,9 @@ if(ENABLE_TESTING
     EXECUTABLE_ARGS
     "--output-on-failure"
     DEPENDENCIES
-    qa_buffer
-    qa_DataSink
-    qa_DynamicPort
-    qa_DynamicBlock
-    qa_UnmanagedSubGraph
-    qa_ManagedSubGraph
-    qa_filter
-    qa_Settings
-    qa_Tags
-    qa_Scheduler
-    qa_thread_pool
-    qa_thread_affinity
-    qa_YamlPmt
+    ${GR4_CORE_COVERAGE_DEPENDENCIES}
     EXCLUDE
-    "$CMAKE_BUILD_DIR/*")
+    "${CMAKE_BINARY_DIR}/*")
 endif()
 
 # Configure and install the pkg-config file TODO: This should become more granular - .pc for each in-tree module
