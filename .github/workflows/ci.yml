@@ -198,6 +198,9 @@ jobs:
       - name: build installed SDK smoke project
         if: matrix.cmake_wrapper == null
         shell: bash
+        env:
+          CC: "${{ matrix.cc }}"
+          CXX: "${{ matrix.cxx }}"
         run: |
           smoke_cmake_flags=()
           if [[ "${{ matrix.cmake_flags }}" == *"-DADDRESS_SANITIZER=ON"* ]]; then
@@ -209,6 +212,8 @@ jobs:
           fi
           cmake -S test_external/minimal_blocklib -B "${{ runner.workspace }}/build-smoke" \
             -DCMAKE_PREFIX_PATH="${{ runner.workspace }}/install-core" \
+            -DCMAKE_C_COMPILER="${{ matrix.cc }}" \
+            -DCMAKE_CXX_COMPILER="${{ matrix.cxx }}" \
             "${smoke_cmake_flags[@]}"
           cmake --build "${{ runner.workspace }}/build-smoke"
 

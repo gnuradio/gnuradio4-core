@@ -20,4 +20,4 @@ gr_add_block_library(
   LINK_LIBRARIES minimal_blocklib_support)
 
 add_executable(minimal_blocklib_consumer src/consumer.cpp)
-target_link_libraries(minimal_blocklib_consumer PRIVATE gnuradio4::gnuradio-core MinimalBlockLibShared)
+target_link_libraries(minimal_blocklib_consumer PRIVATE MinimalBlockLibShared gnuradio4::gnuradio-core)

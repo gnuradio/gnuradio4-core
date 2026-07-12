@@ -33,6 +33,8 @@ RUN cmake -S . -B /build/gnuradio4 \
     esac \
     && cmake -S test_external/minimal_blocklib -B /build/minimal-blocklib \
       -DCMAKE_PREFIX_PATH=/opt/gnuradio4 \
+      -DCMAKE_C_COMPILER=${CC} \
+      -DCMAKE_CXX_COMPILER=${CXX} \
       ${smoke_cmake_flags} \
     && cmake --build /build/minimal-blocklib --parallel 4 \
     && mkdir -p /opt/gnuradio4/share/gnuradio4-core-sdk \
