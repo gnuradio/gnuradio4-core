@@ -3,11 +3,9 @@
 </p>
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![PR CI](https://github.com/gnuradio/gnuradio4-core/actions/workflows/ci.yml/badge.svg)](https://github.com/gnuradio/gnuradio4-core/actions/workflows/ci.yml)
 [![Main CI](https://github.com/gnuradio/gnuradio4-core/actions/workflows/ci-main.yml/badge.svg?branch=main)](https://github.com/gnuradio/gnuradio4-core/actions/workflows/ci-main.yml)
-[![macOS CI](https://github.com/gnuradio/gnuradio4-core/actions/workflows/ci-macos.yml/badge.svg)](https://github.com/gnuradio/gnuradio4-core/actions/workflows/ci-macos.yml)
+[![macOS CI](https://github.com/gnuradio/gnuradio4-core/actions/workflows/ci-macos.yml/badge.svg?branch=main)](https://github.com/gnuradio/gnuradio4-core/actions/workflows/ci-macos.yml)
 [![SDK Image](https://github.com/gnuradio/gnuradio4-core/actions/workflows/sdk-image.yml/badge.svg?branch=main)](https://github.com/gnuradio/gnuradio4-core/actions/workflows/sdk-image.yml)
-[![CPack](https://github.com/gnuradio/gnuradio4-core/actions/workflows/cpack.yml/badge.svg?branch=main)](https://github.com/gnuradio/gnuradio4-core/actions/workflows/cpack.yml)
 
 # GNU Radio 4.0 Core
 
