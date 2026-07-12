@@ -1,9 +1,9 @@
 # GR4 Block Development — User-API Reference
 
-Note: Standard block examples referenced by name in this document are moving to
-the future `gnuradio4-blocks` repository. This core repository keeps the block
-API and blocklib SDK surface, but no longer carries the standard block source
-tree locally.
+Note: This document describes the core block API and blocklib SDK surface.
+Standard block implementations live in `gnuradio4-blocks`, and reusable DSP
+library code lives in `gnuradio4-library`. Use those downstream repositories for
+full production block examples.
 
 GR4 blocks are `struct`s that inherit from `gr::Block<Derived>` via CRTP.
 Settings are (optionally) declared as `Annotated<T, "name", ...>` fields and exposed
@@ -130,7 +130,7 @@ void settingsChanged(const gr::property_map& /*old*/, const gr::property_map& ne
 | `gr::InputSpanLike`  | input spans — `consume(n)`, `tags()`, `rawTags`        |
 | `gr::OutputSpanLike` | output spans — `publish(n)`, `publishTag(map, offset)` |
 
-Reference: `Selector.hpp` (dynamic ports), `Soapy.hpp` (conditional port count)
+Downstream examples: dynamic-port and hardware-backed blocks in `gnuradio4-blocks`.
 
 ## Settings & `Annotated<T, ...>`
 
@@ -210,7 +210,7 @@ using gr::property_map = gr::pmt::Value::Map;  // std::pmr::map<std::pmr::string
 Settings are read and written as `property_map` key–value pairs where keys match
 the `snake_case` setting name and values are `pmt::Value`.
 
-Reference: `Soapy.hpp` (rich annotations), `Rotator.hpp` (XOR constraints)
+Downstream examples: richly annotated hardware and oscillator blocks in `gnuradio4-blocks`.
 
 ## Processing functions
 
@@ -353,7 +353,8 @@ requires std::is_arithmetic_v<T>
 | `INSUFFICIENT_OUTPUT_ITEMS` (-3) | need a larger output buffer           |
 | `ERROR` (-100)                   | error occurred                        |
 
-Reference: `NullSources.hpp` (source), `CommonBlocks.hpp` (1:1), `time_domain_filter.hpp` (history)
+Downstream examples: source, sink, 1:1 transform, and history-based blocks in
+`gnuradio4-blocks`.
 
 ## Resampling & decimation/interpolation
 
@@ -405,7 +406,7 @@ template<typename T>
 struct WindowedFFT : gr::Block<WindowedFFT<T>, gr::Stride<512U>> { ... };
 ```
 
-Reference: `ConverterBlocks.hpp` (`Resampling<1,2>` and `<2,1>`), `time_domain_filter.hpp` (filter with history)
+Downstream examples: converter and filter blocks in `gnuradio4-blocks`.
 
 ## Lifecycle methods
 
@@ -470,7 +471,8 @@ gr::lifecycle::isActive(this->state());       // true for RUNNING, REQUESTED_PAU
 gr::lifecycle::isShuttingDown(this->state()); // true for REQUESTED_STOP, STOPPED
 ```
 
-Reference: `Soapy.hpp` (start/stop with hardware), `NullSources.hpp` (`requestStop`)
+Downstream examples: hardware-backed lifecycle and finite-source blocks in
+`gnuradio4-blocks`.
 
 ## Settings change callback
 
@@ -518,7 +520,8 @@ if (newSettings.contains("frequency_shift") && !newSettings.contains("phase_incr
 }
 ```
 
-Reference: `Rotator.hpp` (XOR), `Selector.hpp` (port resize + validation)
+Downstream examples: mutually exclusive settings and dynamic-port validation in
+`gnuradio4-blocks`.
 
 ## Tags & streaming metadata
 
@@ -623,7 +626,8 @@ struct MyAccumulator : gr::Block<MyAccumulator, gr::Resampling<1024, 1024, true>
 | `"reset_default"`               | `bool`        | reset block to stored defaults     |
 | `"store_default"`               | `bool`        | store current settings as defaults |
 
-Reference: `TagMonitors.hpp` (TagSource, TagMonitor), `ClockSource.hpp`
+Downstream examples: tag source, tag monitor, and clock source blocks in
+`gnuradio4-blocks`.
 
 ## Graph & connections
 
@@ -693,7 +697,8 @@ GR_REGISTER_BLOCK("gr::blocks::math::AddConst", gr::blocks::math::MathOpImpl,
 | `[float, double]`       | type list for expansion of corresponding `[T]`               |
 | `"custom::name"`        | optional custom registered name (default: deduced from type) |
 
-Reference: `CommonBlocks.hpp`, `Math.hpp`, `PowerEstimators.hpp`, `Soapy.hpp`
+Downstream examples: common blocks, math blocks, power estimators, and
+hardware-backed blocks in `gnuradio4-blocks`.
 
 ## Dos and don'ts
 
@@ -812,8 +817,5 @@ Reference: [`Block.hpp`](../core/include/gnuradio-4.0/Block.hpp) (`workInternal`
 - [`annotated.hpp`](../core/include/gnuradio-4.0/annotated.hpp) — `Annotated<T>`, `Limits`, `Doc`, `Unit`, `Visible`
 - [`Tag.hpp`](../core/include/gnuradio-4.0/Tag.hpp) — `Tag` struct and standard keys
 - [`LifeCycle.hpp`](../core/include/gnuradio-4.0/LifeCycle.hpp) — state machine (canonical diagram)
-- `CommonBlocks.hpp` — simple reference blocks
-- `Selector.hpp` — dynamic ports, tag routing
-- `TagMonitors.hpp` — tag handling patterns
-- `NullSources.hpp` — source/sink patterns
-- `ConverterBlocks.hpp` — resampling examples
+- `gnuradio4-blocks` — standard block implementations and block-level examples
+- `gnuradio4-library` — reusable DSP libraries consumed by downstream blocks

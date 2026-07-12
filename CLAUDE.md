@@ -1,7 +1,7 @@
-# CLAUDE.md — GNU Radio 4.0 Code & Documentation Style Guide (V1)
+# CLAUDE.md — GNU Radio 4 Core Code & Documentation Style Guide (V1)
 
 This is the authoritative style guide for all AI-assisted (Claude Code) and human contributions
-to GNU Radio 4.0 and related/downstream projects.
+to `gnuradio4-core` and related downstream GNU Radio 4 projects.
 It is **self-contained** — no other guideline files need to be read.
 
 See `.claude/commands/` for review persona commands.
@@ -250,7 +250,7 @@ Only use language and library features that are **available in both libstdc++ an
 
 **Build system:** CMake exclusively.
 
-**Warnings:** Compile with `-Werror`. Already enforced for GNU Radio 4.0; downstream projects
+**Warnings:** Compile with `-Werror`. Already enforced for `gnuradio4-core`; downstream projects
 should strive for the same.
 
 ### Prefer

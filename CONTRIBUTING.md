@@ -22,7 +22,8 @@ We welcome all forms of contributions from the community. Please read the follow
 ### Communication
 
 - Before starting work on a feature, check if there isn't already an example in the block library.
-  If not, then please open an issue on GitHub describing the proposed feature. We want to make sure any feature work goes smoothly.
+  For core runtime or SDK work, open an issue in this repository describing the proposed feature. For standard blocks or reusable DSP libraries, use the downstream repository that owns that code.
+  We want to make sure any feature work goes smoothly.
   We're happy to work with you to determine if it fits the current project direction and make sure no one else is already working on it.
 
 - For any work related to setting up build, test, and CI for GNU Radio on GitHub, or for small patches or bug fixes, please open an issue
@@ -57,7 +58,6 @@ GNU Radio intends to maintain the existing license terms under which contributio
 
 By submitting a contribution, you agree to the terms of the Developer Certificate of Origin (DCO), which certifies that your contribution is your original work and that you have the right to submit it under the license terms of the specific module.
 
-
 ### DCO Signing
 
 Code submitters must have the authority to merge that code into the public GNU Radio codebase.
@@ -74,24 +74,23 @@ of stakeholders, make sure that all are listed, each with a separate Signed-off-
 
 #### License Philosophy
 
-GNU Radio 4 uses the MIT License for the core runtime and libraries, with the option for submodules to be licensed under GPLv3 when the author desired stronger copyleft or the code origin requires it. This licensing model in combination with the DCO was chosen to support the following goals:
+GNU Radio 4 core uses the MIT License for the core runtime and SDK surface. Downstream block and library repositories may use their own compatible licensing policy, including GPLv3 where stronger copyleft or code origin requires it. This licensing model in combination with the DCO was chosen to support the following goals:
 
 - Maximize Adoption and Enable Public-Private Collaboration: The MIT License reduces legal and logistical friction for development partners - including those with cautious legal teams or incompatible licensing needs - making it easier for academia, industry, and government to integrate, contribute to, and build on GNU Radio. This fosters innovation, accelerates adoption across sectors, and ensures that the broader community benefits from shared advancements.
 
 - Encourage Contributions from a Diverse Ecosystem: By lowering legal barriers, we aim to attract contributors from companies, academic institutions, and individuals who might otherwise avoid contributing to more restrictively licensed codebases due to internal policies or licensing constraints.
 
-- Remain free/libre in the spirit of the open source principles: For certain submodules that implement signal processing algorithms or higher-level blocks, the GPLv3 license can be used to preserve the copyleft spirit of GNU Radio.
+- Remain free/libre in the spirit of the open source principles: For certain downstream modules that implement signal processing algorithms or higher-level blocks, the GPLv3 license can be used to preserve the copyleft spirit of GNU Radio.
 
-- Empower Submodule Authors: We recognize that some contributors may wish to enforce stronger copyleft guarantees. By allowing submodules to choose GPLv3 (and out of tree authors to choose any other license), we provide flexibility for authors to assert more control over how their code is reused.
+- Empower Downstream Module Authors: We recognize that some contributors may wish to enforce stronger copyleft guarantees. By allowing downstream block and library repositories to choose GPLv3 where appropriate, and out-of-tree authors to choose any other license, we provide flexibility for authors to assert more control over how their code is reused.
 
 - Stay Compliant with Evolving Legal Landscapes: A modular, permissive licensing approach ensures GNU Radio can remain compliant under changing national and international laws - particularly around cybersecurity, product liability, AI governance, and data protection regulations like GDPR.
 
-
 We accept contributions for in-tree code with the following license preference:
 
-Core: MIT required
+Core runtime and SDK: MIT required
 
-Block Library: MIT preferred, with GPLv3 as an alternative
+Block and library repositories: follow the license policy of the repository that owns the code
 
 ## Code of Conduct
 
