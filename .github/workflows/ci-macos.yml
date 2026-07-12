@@ -73,6 +73,7 @@ jobs:
             ${{ steps.enable_sccache.outputs.CXX_LAUNCHER }} \
             ${{ steps.enable_sccache.outputs.C_LAUNCHER }} \
             -DENABLE_COVERAGE=OFF \
+            -DGR_USE_FETCHCONTENT_DEPS=ON \
             -DCMAKE_OSX_SYSROOT="$SDKROOT" \
             -DCMAKE_EXE_LINKER_FLAGS="-L${{ matrix.compiler.prefix }}/lib/c++ -Wl,-rpath,${{ matrix.compiler.prefix }}/lib/c++" \
             -DCMAKE_SHARED_LINKER_FLAGS="-L${{ matrix.compiler.prefix }}/lib/c++ -Wl,-rpath,${{ matrix.compiler.prefix }}/lib/c++"
@@ -94,13 +95,15 @@ jobs:
       - name: Build installed SDK smoke project
         run: |
           cmake -S test_external/minimal_blocklib -B build-smoke \
-            -DCMAKE_PREFIX_PATH="${{ github.workspace }}/install-core"
+            -DCMAKE_PREFIX_PATH="${{ github.workspace }}/install-core" \
+            -DCMAKE_C_COMPILER="${CC}" \
+            -DCMAKE_CXX_COMPILER="${CXX}"
           cmake --build build-smoke
 
       - name: Show final sccache and build directory stats
         if: always()
         continue-on-error: true
-        shell: zsh
+        shell: bash
         run: ./.github/ci-tools/build-summary.sh "MacOS ${{ matrix.compiler.label }}" "build/"
 
       - name: Save FetchContent
