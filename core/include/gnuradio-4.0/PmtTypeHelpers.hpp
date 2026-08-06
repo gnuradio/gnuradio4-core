@@ -94,7 +94,7 @@ constexpr std::string_view trimAndCutComment(std::string_view input) {
 
 template<typename T>
 requires(std::is_floating_point_v<T>)
-static std::expected<T, std::string> parseStringToFloat(std::string_view trimmed) {
+std::expected<T, std::string> parseStringToFloat(std::string_view trimmed) {
     using namespace std::string_literals;
 #if defined(__clang__)
     // Fallback to std::strtof / strtod for Clang versions prior to 20
