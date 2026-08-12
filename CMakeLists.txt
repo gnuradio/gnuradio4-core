@@ -418,8 +418,11 @@ set_project_warnings(gnuradio-options)
 
 if(EMSCRIPTEN)
   set(CMAKE_EXECUTABLE_SUFFIX ".js")
-  add_compile_options(-fexceptions -pthread -g)
-  add_link_options(
+  # Make sure consumers of gnuradio4::gnuradio-options don't accidentally build with conflicting arguments
+  target_compile_options(gnuradio-options INTERFACE -fexceptions -pthread)
+  target_link_options(
+    gnuradio-options
+    INTERFACE
     "SHELL:-s ALLOW_MEMORY_GROWTH=1"
     "SHELL:-s ASSERTIONS=1"
     "SHELL:-s INITIAL_MEMORY=256MB"
