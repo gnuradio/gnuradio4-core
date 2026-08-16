@@ -64,7 +64,11 @@ target_link_libraries(
          magic_enum
          vir)
 
-add_library(gnuradio-blocklib-core SHARED src/BlockRegistry.cpp)
+if(EMSCRIPTEN)
+  add_library(gnuradio-blocklib-core STATIC src/BlockRegistry.cpp)
+else()
+  add_library(gnuradio-blocklib-core SHARED src/BlockRegistry.cpp)
+endif()
 set(blocklib_public_headers include/gnuradio-4.0/BlockRegistry.hpp include/gnuradio-4.0/Plugin.hpp)
 set_target_properties(gnuradio-blocklib-core PROPERTIES PUBLIC_HEADER "${blocklib_public_headers}")
 add_library(gnuradio4::gnuradio-blocklib-core ALIAS gnuradio-blocklib-core)
