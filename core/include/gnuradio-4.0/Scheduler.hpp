@@ -640,12 +640,17 @@ protected:
         }
     }
 
+    // re-entering INITIALISED must rebuild the same execution state that init() builds, because the graph
+    // may have been exchanged or edited since: a stale _executionOrder runs the previous graph's blocks
     void reset() {
         graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) { this->emitErrorMessageIfAny("reset() -> LifecycleState", block->changeStateTo(lifecycle::INITIALISED)); });
         disconnectAllEdges();
+        connectBlockMessagePorts();
 
         if constexpr (requires(Derived& d) { d.customReset(); }) {
             static_cast<Derived*>(this)->customReset();
+        } else if constexpr (requires(Derived& d) { d.customInit(); }) {
+            static_cast<Derived*>(this)->customInit();
         }
     }
 
@@ -693,8 +698,8 @@ protected:
             throw;
         }
 
-        assert(_nRunningJobs->value() == 0UZ);
-        assert(!_executionOrder->empty());
+        waitDone(); // a stop only publishes STOPPED -- the previous generation of workers may still be unwinding
+        assert(_executionOrder != nullptr && !_executionOrder->empty());
         if constexpr (executionPolicy() == ExecutionPolicy::singleThreaded || executionPolicy() == ExecutionPolicy::singleThreadedBlocking) {
             static_cast<Derived*>(this)->poolWorker(0UZ, _executionOrder);
         } else { // run on processing thread pool
