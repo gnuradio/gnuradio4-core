@@ -115,6 +115,32 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
 
         expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
     };
+
+    "removing one edge of a fan-out leaves the sibling flowing and stays removed"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_edit::Source>();
+        auto&     sinkA  = flow.emplaceBlock<qa_edit::Sink>();
+        auto&     sinkB  = flow.emplaceBlock<qa_edit::Sink>();
+        expect(flow.connect<"out", "in">(source, sinkA).has_value());
+        expect(flow.connect<"out", "in">(source, sinkB).has_value());
+        expect(eq(flow.edges().size(), 2UZ));
+
+        expect(flow.connectPendingEdges()) << "the fan-out did not connect";
+
+        const auto removed = flow.removeEdgeBySourcePort(source.unique_name, "out", sinkA.unique_name, "in");
+        expect(fatal(removed.has_value())) << "the edge could not be removed: " << (removed.has_value() ? std::string{} : removed.error().message);
+        expect(eq(*removed, 1UZ)) << "removing one edge of the fan-out removed a different number of edges";
+        expect(eq(flow.edges().size(), 1UZ)) << "the removed edge was left in the edge list and will be resurrected on restart";
+        expect(eq(flow.edges()[0].destinationBlock()->uniqueName(), std::string_view(sinkB.unique_name))) << "the wrong edge was removed";
+        expect(flow.edges()[0].state() == gr::Edge::EdgeState::Connected) << "the sibling edge was left dead after the port teardown";
+
+        // a restart must not bring the removed edge back
+        flow.disconnectAllEdges();
+        expect(flow.connectPendingEdges()) << "the graph did not reconnect after a restart";
+        expect(eq(flow.edges().size(), 1UZ)) << "the removed edge came back on restart";
+
+        expect(!flow.removeEdgeBySourcePort(source.unique_name, "out", sinkA.unique_name, "in").has_value()) << "removing an absent edge reported success";
+    };
 };
 
 int main() { /* tests are statically registered */ }

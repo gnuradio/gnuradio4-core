@@ -476,7 +476,9 @@ public:
         return {};
     }
 
-    std::expected<void, Error> removeEdgeBySourcePort(std::string_view sourceBlock, std::string_view sourcePort) {
+    // an empty destination removes every edge fanning out from the source port; the port's buffer is shared by
+    // all of them, so the ones that stay must be reconnected afterwards
+    std::expected<std::size_t, Error> removeEdgeBySourcePort(std::string_view sourceBlock, std::string_view sourcePort, std::string_view destinationBlock = {}, std::string_view destinationPort = {}) {
         auto sourceBlockIt = std::ranges::find_if(_blocks, [&sourceBlock](const auto& block) { return block->uniqueName() == sourceBlock; });
         if (sourceBlockIt == _blocks.end()) {
             return std::unexpected(Error(std::format("Block {} was not found in {}", sourceBlock, this->unique_name)));
@@ -488,11 +490,50 @@ public:
         }
         auto& sourcePortRef = *srcPortResult.value();
 
+        // resolve both sides to port objects: an edge may name its ports by index or by name
+        const auto resolvedOutput = [](const Edge& edge) {
+            auto port = edge.sourceBlock()->dynamicOutputPort(edge.sourcePortDefinition());
+            return port ? port.value() : nullptr;
+        };
+        const auto resolvedInput = [](const Edge& edge) {
+            auto port = edge.destinationBlock()->dynamicInputPort(edge.destinationPortDefinition());
+            return port ? port.value() : nullptr;
+        };
+        const auto sharesSourcePort = [&](const Edge& edge) { return resolvedOutput(edge) == std::addressof(sourcePortRef); };
+        const auto isRequestedEdge  = [&](const Edge& edge) {
+            if (!sharesSourcePort(edge)) {
+                return false;
+            }
+            if (destinationBlock.empty() || edge.destinationBlock()->uniqueName() != destinationBlock) {
+                return destinationBlock.empty();
+            }
+            if (destinationPort.empty()) {
+                return true;
+            }
+            auto requestedPort = edge.destinationBlock()->dynamicInputPort(destinationPort);
+            return requestedPort && requestedPort.value() == resolvedInput(edge);
+        };
+
+        if (std::ranges::none_of(_edges, isRequestedEdge)) {
+            return std::unexpected(Error(std::format("No edge from {}.{} in {}", sourceBlock, sourcePort, this->unique_name)));
+        }
+
         if (auto result = sourcePortRef.disconnect(); !result) {
             return std::unexpected(Error(std::format("Block {} sourcePortRef could not be disconnected {}: {}", sourceBlock, this->unique_name, result.error().message)));
         }
 
-        return {};
+        const auto [first, last] = std::ranges::remove_if(_edges, isRequestedEdge);
+        const auto nRemoved      = static_cast<std::size_t>(std::ranges::distance(first, last));
+        _edges.erase(first, last);
+
+        for (auto& edge : _edges) { // siblings lost their buffer with the port teardown
+            if (sharesSourcePort(edge)) {
+                edge._state = Edge::EdgeState::WaitingToBeConnected;
+            }
+        }
+        std::ignore = connectPendingEdges();
+
+        return nRemoved;
     }
 
     std::optional<Message> propertyCallbackGraphInspect([[maybe_unused]] std::string_view propertyName, Message message);
