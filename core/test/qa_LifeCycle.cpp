@@ -126,12 +126,33 @@ const boost::ut::suite StateMachineTest = [] {
         nominalTest.template operator()<gr::test::MockStateMachine<StorageType::NON_ATOMIC>>();
     };
 
+    "StateMachine REQUESTED_PAUSE is not terminal"_test = [] {
+        // a block that never reaches PAUSED (isBlocking() -> true) must still be stoppable and resumable
+        auto toRequestedPause = [](auto& machine) {
+            expect(machine.changeStateTo(State::INITIALISED).has_value());
+            expect(machine.changeStateTo(State::RUNNING).has_value());
+            expect(machine.changeStateTo(State::REQUESTED_PAUSE).has_value());
+        };
+
+        gr::test::MockStateMachine<StorageType::NON_ATOMIC> stoppable;
+        toRequestedPause(stoppable);
+        expect(stoppable.changeStateTo(State::REQUESTED_STOP).has_value()) << "a pause-requesting block must be stoppable";
+        expect(stoppable.state() == State::REQUESTED_STOP);
+        expect(eq(stoppable.stopCalled, 1)) << "stop() runs on the direct REQUESTED_PAUSE -> REQUESTED_STOP path";
+
+        gr::test::MockStateMachine<StorageType::NON_ATOMIC> resumable;
+        toRequestedPause(resumable);
+        expect(resumable.changeStateTo(State::RUNNING).has_value()) << "a pause-requesting block must be resumable";
+        expect(resumable.state() == State::RUNNING);
+        expect(eq(resumable.resumeCalled, 1)) << "resume() runs on the direct REQUESTED_PAUSE -> RUNNING path";
+    };
+
     "StateMachine all State transitions"_test = [] {
         std::map<State, std::vector<State>> allowedTransitions = {
             {State::IDLE, {State::INITIALISED, State::REQUESTED_STOP, State::STOPPED}},
             {State::INITIALISED, {State::RUNNING, State::REQUESTED_STOP, State::STOPPED}},
             {State::RUNNING, {State::REQUESTED_PAUSE, State::REQUESTED_STOP}},
-            {State::REQUESTED_PAUSE, {State::PAUSED}},
+            {State::REQUESTED_PAUSE, {State::PAUSED, State::RUNNING, State::REQUESTED_STOP}},
             {State::PAUSED, {State::RUNNING, State::REQUESTED_STOP}},
             {State::REQUESTED_STOP, {State::STOPPED}},
             {State::STOPPED, {State::INITIALISED}},
