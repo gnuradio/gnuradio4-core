@@ -712,7 +712,7 @@ private:
         Reader() = delete;
         explicit Reader(std::shared_ptr<BufferImpl> buffer) noexcept : _buffer(buffer) {
             gr::detail::addSequences(_buffer->_claimStrategy._readSequences, _buffer->_claimStrategy._publishCursor, {_readIndex});
-            _buffer->_claimStrategy.updateCachedReaderInfo();
+            _buffer->_claimStrategy.notifyReaderSetChanged();
             gr::atomic_ref(_buffer->_reader_count).fetch_add(1UZ);
             _readIndexCached = _readIndex->value();
         }
@@ -742,7 +742,7 @@ private:
         ~Reader() {
             if (_buffer) {
                 gr::detail::removeSequence(_buffer->_claimStrategy._readSequences, _readIndex);
-                _buffer->_claimStrategy.updateCachedReaderInfo();
+                _buffer->_claimStrategy.notifyReaderSetChanged();
                 gr::atomic_ref(_buffer->_reader_count).fetch_sub(1UZ);
             }
         }
