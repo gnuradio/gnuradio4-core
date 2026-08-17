@@ -150,6 +150,7 @@ protected:
     };
     std::mutex                     _pendingExchangeMutex;
     std::optional<PendingExchange> _pendingExchange;
+    std::size_t                    _nDeferredExchanges{0UZ}; // claimed swaps still running outside the job count
     std::size_t                    _nStopRequests{0UZ};
 
     // for blocks that were added while scheduler was running. They need to be adopted by a thread
@@ -262,19 +263,24 @@ public:
     }
 
     ~SchedulerBase() {
+        gr::atomic_ref(_valid).store_release(false); // mark as invalid: also stops a deferred swap from restarting the scheduler
+        {                                            // a deferred graph swap must not restart a scheduler that is being destroyed
+            std::lock_guard guard(_pendingExchangeMutex);
+            _pendingExchange.reset();
+        }
+
         if (lifecycle::isActive(this->state())) { // RUNNING, REQUESTED_PAUSE or PAUSED -- workers are parked, not gone
             if (auto e = this->changeStateTo(lifecycle::REQUESTED_STOP); !e) {
                 std::println(std::cerr, "Failed to stop execution at destruction of scheduler: {} ({})", e.error().message, e.error().srcLoc());
                 std::abort();
             }
         }
-        { // a deferred graph swap must not restart a scheduler that is being destroyed
-            std::lock_guard guard(_pendingExchangeMutex);
-            _pendingExchange.reset();
-        }
         waitDone();
 
-        gr::atomic_ref(_valid).store_release(false); // Mark as invalid
+        // a swap claimed before _valid was cleared runs outside the job count, so wait for it separately
+        for (std::size_t nDeferred = gr::atomic_ref(_nDeferredExchanges).load_acquire(); nDeferred != 0UZ; nDeferred = gr::atomic_ref(_nDeferredExchanges).load_acquire()) {
+            gr::atomic_ref(_nDeferredExchanges).wait(nDeferred);
+        }
 
         // the watchdog dereferences SchedulerBase, wait until it finishes
         for (std::size_t nWatchdogs = gr::atomic_ref(_nWatchdogsRunning).load_acquire(); nWatchdogs != 0UZ; nWatchdogs = gr::atomic_ref(_nWatchdogsRunning).load_acquire()) {
@@ -725,10 +731,22 @@ protected:
         nRunningJobs->incrementAndGet();
         nRunningJobs->notify_all();
         on_scope_exit decrementRunningJobs = [this, &nRunningJobs] {
-            const std::size_t nRemaining = nRunningJobs->subAndGet(1UZ);
+            // claim before releasing the job count, so ~SchedulerBase()'s waitDone() cannot run ahead of the swap
+            std::optional<PendingExchange> claimed;
+            {
+                std::lock_guard guard(_pendingExchangeMutex);
+                if (_pendingExchange.has_value()) {
+                    claimed = std::move(_pendingExchange);
+                    _pendingExchange.reset();
+                    gr::atomic_ref(_nDeferredExchanges).fetch_add(1UZ);
+                }
+            }
+            std::ignore = nRunningJobs->subAndGet(1UZ);
             nRunningJobs->notify_all();
-            if (nRemaining == 0UZ) { // exactly one thread observes zero -- it owns any deferred graph swap
-                this->applyPendingExchange();
+            if (claimed.has_value()) {
+                applyPendingExchange(std::move(*claimed));
+                gr::atomic_ref(_nDeferredExchanges).fetch_sub(1UZ);
+                gr::atomic_ref(_nDeferredExchanges).notify_all();
             }
         };
 
@@ -844,17 +862,12 @@ protected:
     }
 
     // performs a graph swap that exchange() had to defer because it was requested from a scheduler worker
-    void applyPendingExchange() {
+    void applyPendingExchange(PendingExchange pending) {
         using enum lifecycle::State;
 
-        PendingExchange pending;
-        {
-            std::lock_guard guard(_pendingExchangeMutex);
-            if (!_pendingExchange.has_value()) {
-                return;
-            }
-            pending = std::move(*_pendingExchange);
-            _pendingExchange.reset();
+        waitDone(); // the claiming worker has already released its own count
+        if (!gr::atomic_ref(_valid).load_acquire()) {
+            return; // destruction started: do not touch the graph
         }
 
         if (this->state() == REQUESTED_STOP) {
@@ -1178,10 +1191,16 @@ protected:
             return message;
         }
 
+        // optional: restrict the removal to a single edge of a fan-out
+        const auto destinationBlock = messageData.contains(std::pmr::string(gr::serialization_fields::EDGE_DESTINATION_BLOCK)) ? messageData.at(std::pmr::string(gr::serialization_fields::EDGE_DESTINATION_BLOCK)).value_or(std::string_view{}) : std::string_view{};
+        const auto destinationPort  = messageData.contains(std::pmr::string(gr::serialization_fields::EDGE_DESTINATION_PORT)) ? messageData.at(std::pmr::string(gr::serialization_fields::EDGE_DESTINATION_PORT)).value_or(std::string_view{}) : std::string_view{};
+
         messageData["_targetGraph"] = targetGraph->unique_name.value();
         {
             WorkQuiescenceGuard quiescence(this);
-            if (auto result = targetGraph->removeEdgeBySourcePort(sourceBlock, sourcePort); !result.has_value()) {
+            if (auto result = targetGraph->removeEdgeBySourcePort(sourceBlock, sourcePort, destinationBlock, destinationPort); result.has_value()) {
+                messageData["nEdgesRemoved"] = static_cast<gr::Size_t>(*result);
+            } else {
                 message.data = std::unexpected(result.error());
             }
         }
