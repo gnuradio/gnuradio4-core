@@ -257,8 +257,8 @@ public:
         gr::atomic_ref(_valid).store_release(false); // Mark as invalid
 
         // the watchdog dereferences SchedulerBase, wait until it finishes
-        while (gr::atomic_ref(_nWatchdogsRunning).load_acquire() != 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        for (std::size_t nWatchdogs = gr::atomic_ref(_nWatchdogsRunning).load_acquire(); nWatchdogs != 0UZ; nWatchdogs = gr::atomic_ref(_nWatchdogsRunning).load_acquire()) {
+            gr::atomic_ref(_nWatchdogsRunning).wait(nWatchdogs);
         }
 
         _executionOrder.reset(); // force earlier crashes if this is accessed after destruction (e.g. from thread that was kept running)
@@ -485,8 +485,8 @@ public:
 
     void waitDone() {
         [[maybe_unused]] const auto pe = _profilerHandler->startCompleteEvent("scheduler_base.waitDone");
-        while (_nRunningJobs->value() > 0UZ) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms));
+        for (std::size_t nRunning = _nRunningJobs->value(); nRunning > 0UZ; nRunning = _nRunningJobs->value()) {
+            _nRunningJobs->wait(nRunning);
         }
     }
 
@@ -761,7 +761,10 @@ protected:
     }
 
     void runWatchDog(std::size_t timeOut_ms, std::size_t timeOut_count) {
-        on_scope_exit _ = [this] { gr::atomic_ref(_nWatchdogsRunning).fetch_sub(1UZ); };
+        on_scope_exit _ = [this] {
+            gr::atomic_ref(_nWatchdogsRunning).fetch_sub(1UZ);
+            gr::atomic_ref(_nWatchdogsRunning).notify_all();
+        };
 
         auto thisName = gr::meta::shorten_type_name(this->unique_name);
         gr::thread_pool::thread::setThreadName(std::format("WatchDog-{}", thisName));
@@ -776,10 +779,25 @@ protected:
             return; // abort watchdog: scheduler inactive or jobs already finished.
         }
 
+        // chunked so a cleared _valid is observed well before a full watchdog period
+        auto sleepWhileValid = [this](std::chrono::milliseconds total) {
+            const auto chunk    = std::max(total / 10, std::chrono::milliseconds(1));
+            const auto wakeUpAt = std::chrono::steady_clock::now() + total;
+            while (std::chrono::steady_clock::now() < wakeUpAt) {
+                if (!gr::atomic_ref(_valid).load_acquire()) {
+                    return false;
+                }
+                std::this_thread::sleep_for(chunk);
+            }
+            return gr::atomic_ref(_valid).load_acquire();
+        };
+
         std::size_t lastProgress = _graph->_progress->value();
         std::size_t nWarnings    = 0;
         do {
-            std::this_thread::sleep_for(std::chrono::milliseconds(timeOut_ms));
+            if (!sleepWhileValid(std::chrono::milliseconds(timeOut_ms))) {
+                return;
+            }
             // check and increase progress if there hasn't been none.
 
             std::size_t currentProgress = _graph->_progress->value();
