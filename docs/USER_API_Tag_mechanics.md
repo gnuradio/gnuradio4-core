@@ -324,14 +324,43 @@ block's `settingsChanged(old, new)` callback fires before the next processing ca
   └──────────┘              └──────────┘
 ```
 
-The set of auto-forwarded keys is `settings().autoForwardParameters()` — by default the standard tag
-keys (`kDefaultTags`). Blocks can add custom keys:
+The set of auto-forwarded keys is `settings().autoForwardParameters()` — the standard tag keys
+(`kDefaultTags`), fixed when the block's settings are constructed. The accessor is read-only. It returns a `const` reference because `Block::forwardInputTags()` holds that
+reference for the whole forwarding loop of every work call and takes no lock; a set that changed
+while the graph was running would be a data race on the hot path.
+
+To carry a non-standard key downstream, publish the tag from the block itself (see "Publishing
+tags" above) instead of adding the key to the forwarding set:
 
 ```cpp
-void start() {
-    settings().autoForwardParameters().insert("my_custom_key");
+work::Status processBulk(InputSpanLike auto& input, OutputSpanLike auto& output) {
+    output.publishTag({{"my_custom_key", value}}, 0);
+    return work::Status::OK;
 }
 ```
+
+A pass-through block that must forward _every_ input tag, whatever its keys, declares
+`NoTagPropagation` and republishes the input tags at their own offsets:
+
+```cpp
+struct Delay : gr::Block<Delay, gr::NoTagPropagation> {
+    work::Status processBulk(InputSpanLike auto& input, OutputSpanLike auto& output) {
+        const auto n = std::min(input.size(), output.size());
+        for (const Tag& tag : input.rawTags) {
+            if (tag.index >= input.streamIndex && tag.index - input.streamIndex < n) {
+                output.publishTag(tag.map, tag.index - input.streamIndex);
+            }
+        }
+        std::ranges::copy(input.first(n), output.begin());
+        std::ignore = input.consume(n);
+        output.publish(n);
+        return work::Status::OK;
+    }
+};
+```
+
+To rewrite or filter keys per tag rather than republish them all, override `forwardTags()` (see
+"Custom tag forwarding" above).
 
 ### Init-time settings forwarding
 

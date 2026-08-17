@@ -16,11 +16,22 @@ void CtxSettingsBase::setInitBlockParameters(const property_map& parameters) { _
 
 const SettingsCtx& CtxSettingsBase::activeContext() const noexcept { return _activeCtx; }
 
-std::set<std::string>& CtxSettingsBase::autoForwardParameters() noexcept { return _autoForwardParameters; }
+const std::set<std::string>& CtxSettingsBase::autoForwardParameters() const noexcept { return _autoForwardParameters; }
 
-const property_map& CtxSettingsBase::defaultParameters() const noexcept { return _defaultParameters; }
+void CtxSettingsBase::addAutoForwardParameters(std::set<std::string> parameterKeys) {
+    std::lock_guard guard(_mutex);
+    _autoForwardParameters.merge(parameterKeys);
+}
 
-const property_map& CtxSettingsBase::activeParameters() const noexcept { return _activeParameters; }
+property_map CtxSettingsBase::defaultParameters() const noexcept {
+    std::lock_guard lg(_mutex);
+    return _defaultParameters;
+}
+
+property_map CtxSettingsBase::activeParameters() const noexcept {
+    std::lock_guard lg(_mutex);
+    return _activeParameters;
+}
 
 // --- get() overloads ---
 
@@ -102,15 +113,19 @@ gr::Size_t CtxSettingsBase::getNAutoUpdateParameters() const noexcept {
     return static_cast<gr::Size_t>(_autoUpdateParameters.size());
 }
 
-std::map<pmt::Value, std::vector<SettingsBase::CtxSettingsPair>, settings::PMTCompare> CtxSettingsBase::getStoredAll() const noexcept { return _storedParameters; }
+std::map<pmt::Value, std::vector<SettingsBase::CtxSettingsPair>, settings::PMTCompare> CtxSettingsBase::getStoredAll() const noexcept {
+    std::lock_guard lg(_mutex);
+    return _storedParameters;
+}
 
-const property_map& CtxSettingsBase::stagedParameters() const {
+property_map CtxSettingsBase::stagedParameters() const {
     std::lock_guard lg(_mutex);
     return _stagedParameters;
 }
 
 std::set<std::string> CtxSettingsBase::autoUpdateParameters(SettingsCtx ctx) noexcept {
-    auto bestMatchSettingsCtx = findBestMatchSettingsCtx(ctx);
+    std::lock_guard lg(_mutex);
+    const auto      bestMatchSettingsCtx = findBestMatchSettingsCtx(ctx);
     return bestMatchSettingsCtx == std::nullopt ? std::set<std::string>() : _autoUpdateParameters[bestMatchSettingsCtx.value()];
 }
 
@@ -124,6 +139,11 @@ property_map CtxSettingsBase::setStaged(const property_map& parameters) {
 // --- Context management ---
 
 std::optional<SettingsCtx> CtxSettingsBase::activateContext(SettingsCtx ctx) {
+    std::lock_guard lg(_mutex);
+    return activateContextImpl(ctx);
+}
+
+std::optional<SettingsCtx> CtxSettingsBase::activateContextImpl(SettingsCtx ctx) {
     if (ctx.time == 0ULL) {
         ctx.time = settings::convertTimePointToUint64Ns(std::chrono::system_clock::now());
 #ifdef __EMSCRIPTEN__
@@ -171,6 +191,11 @@ std::optional<SettingsCtx> CtxSettingsBase::activateContext(SettingsCtx ctx) {
 }
 
 bool CtxSettingsBase::removeContext(SettingsCtx ctx) {
+    std::lock_guard lg(_mutex);
+    return removeContextImpl(ctx);
+}
+
+bool CtxSettingsBase::removeContextImpl(SettingsCtx ctx) {
     auto str = ctx.context.value_or(std::string_view{});
     if (str.empty()) {
         return false; // Forbid removing default context
@@ -201,7 +226,7 @@ bool CtxSettingsBase::removeContext(SettingsCtx ctx) {
     }
 
     if (_activeCtx.context == ctx.context) {
-        std::ignore = activateContext(); // Activate default context
+        std::ignore = activateContextImpl({}); // Activate default context
     }
 
     return true;
@@ -249,8 +274,10 @@ std::optional<pmt::Value> CtxSettingsBase::findBestMatchCtx(const pmt::Value& co
         return contextToSearch;
     }
 
-    // retry until we either get a match or std::nullopt
-    for (std::size_t attempt = 0;; ++attempt) {
+    // retry with increasing attempt counts; bounded because a user MatchPredicate that keeps returning
+    // 'no match yet' would otherwise spin forever while holding _mutex
+    constexpr std::size_t kMaxMatchAttempts = 64UZ;
+    for (std::size_t attempt = 0UZ; attempt < kMaxMatchAttempts; ++attempt) {
         for (const auto& i : _storedParameters) {
             const auto matches = _matchPred(i.first, contextToSearch, attempt);
             if (!matches) {
@@ -351,8 +378,13 @@ void CtxSettingsBase::removeExpiredStoredParameters() {
     for (auto& [ctx, vec] : _storedParameters) {
         // remove all expired parameters
         if (expiry_time != std::numeric_limits<std::uint64_t>::max()) {
-            const auto [first, last] = std::ranges::remove_if(vec, [&](const auto& elem) { return elem.context.time + expiry_time <= now; });
-            removeFromAutoUpdateParameters(first, last);
+            const auto isExpired = [&](const auto& elem) { return elem.context.time + expiry_time <= now; };
+            for (const auto& elem : vec) { // collect before remove_if leaves the tail moved-from
+                if (isExpired(elem)) {
+                    _autoUpdateParameters.erase(elem.context);
+                }
+            }
+            const auto [first, last] = std::ranges::remove_if(vec, isExpired);
             vec.erase(first, last);
         }
 

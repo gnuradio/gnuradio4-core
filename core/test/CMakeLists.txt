@@ -36,6 +36,7 @@ set(_CORE_TESTS
     qa_Profiler
     qa_SchedulerExchange
     qa_SchedulerLifecycle
+    qa_SettingsConcurrency
     qa_Tensor
     qa_TensorMath
     qa_SVD
@@ -73,7 +74,11 @@ foreach(TEST_NAME IN LISTS _CORE_TESTS)
 endforeach()
 
 # regression tests for control-plane wedges: a failure shows up as a hang, so cap them
-set(_CORE_DEADLOCK_TESTS qa_MessagePlane qa_SchedulerExchange qa_SchedulerLifecycle)
+set(_CORE_DEADLOCK_TESTS
+    qa_MessagePlane
+    qa_SchedulerExchange
+    qa_SchedulerLifecycle
+    qa_SettingsConcurrency)
 set_tests_properties(${_CORE_DEADLOCK_TESTS} PROPERTIES TIMEOUT 120)
 
 add_ut_test(qa_SubGraphAssets)
