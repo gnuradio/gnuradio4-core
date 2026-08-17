@@ -1459,19 +1459,32 @@ public:
         } result;
 
         auto adjustForInputPort = [&result]<PortLike Port>(Port& port) {
-            if (port.isConnected()) {
-                if constexpr (std::remove_cvref_t<Port>::kIsSynch) {
-                    // get the tag after the one at position 0 that will be evaluated for this chunk.
-                    // nextTag limits the size of the chunk except if this would violate port constraints
-                    result.nextTag                    = std::min(result.nextTag, nSamplesUntilNextTag(port, 1).value_or(std::numeric_limits<std::size_t>::max()));
-                    result.nextEosTag                 = std::min(result.nextEosTag, samples_to_eos_tag(port).value_or(std::numeric_limits<std::size_t>::max()));
-                    const ReaderSpanLike auto tagData = port.tagReader().get();
-                    result.hasAnyTag                  = result.hasAnyTag || !tagData.empty();
-                    result.hasTag                     = result.hasTag || (!tagData.empty() && tagData[0].index == port.streamReader().position() && !tagData[0].map.empty());
-                } else { // async port
-                    if (samples_to_eos_tag(port).transform([&port](auto n) { return n <= port.min_samples; }).value_or(false)) {
-                        result.asyncEoS = true;
-                    }
+            if (!port.isConnected()) {
+                return;
+            }
+            ReaderSpanLike auto tagData = port.tagReader().get();
+            if (tagData.empty()) [[likely]] {
+                return;
+            }
+            std::ignore                    = tagData.consume(0UZ);
+            const std::size_t readPosition = port.streamReader().position();
+            const auto        eosTagIt     = std::ranges::find_if(tagData, [readPosition](const Tag& tag) { return detail::defaultEOSTagMatcher(tag, readPosition); });
+
+            if constexpr (std::remove_cvref_t<Port>::kIsSynch) {
+                // get the tag after the one at position 0 that will be evaluated for this chunk.
+                // nextTag limits the size of the chunk except if this would violate port constraints
+                const auto nextTagIt = std::ranges::find_if(tagData, [readPosition](const Tag& tag) { return detail::defaultTagMatcher(tag, readPosition + 1UZ); });
+                if (nextTagIt != tagData.end()) {
+                    result.nextTag = std::min(result.nextTag, nextTagIt->index - readPosition);
+                }
+                if (eosTagIt != tagData.end()) {
+                    result.nextEosTag = std::min(result.nextEosTag, eosTagIt->index - readPosition);
+                }
+                result.hasAnyTag = true;
+                result.hasTag    = result.hasTag || (tagData[0].index == readPosition && !tagData[0].map.empty());
+            } else { // async port
+                if (eosTagIt != tagData.end() && (eosTagIt->index - readPosition) <= port.min_samples) {
+                    result.asyncEoS = true;
                 }
             }
         };
