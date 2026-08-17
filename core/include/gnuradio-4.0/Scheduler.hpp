@@ -421,7 +421,7 @@ public:
             return;
         }
 
-        if (this->msgOut.buffer().streamBuffer.n_readers() == 0) {
+        if (this->msgOut.nReaders() == 0) {
             // nobody is listening on messages -> convert errors to exceptions
             for (const auto& msg : messagesFromChildren) {
                 if (!msg.data.has_value()) {
