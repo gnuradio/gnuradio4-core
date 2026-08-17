@@ -644,7 +644,13 @@ protected:
         // keep outside of the lambda, as ~SchedulerBase() might finish before watchdog even starts
         gr::atomic_ref(_nWatchdogsRunning).fetch_add(1UZ);
 
-        ioThreadPool->execute([this] { this->runWatchDog(watchdog_timeout.value, timeout_inactivity_count.value); });
+        try {
+            ioThreadPool->execute([this] { this->runWatchDog(watchdog_timeout.value, timeout_inactivity_count.value); });
+        } catch (...) { // a rejected task would strand the count and spin ~SchedulerBase() forever
+            gr::atomic_ref(_nWatchdogsRunning).fetch_sub(1UZ);
+            gr::atomic_ref(_nWatchdogsRunning).notify_all();
+            throw;
+        }
 
         assert(_nRunningJobs->value() == 0UZ);
         assert(!_executionOrder->empty());
