@@ -827,6 +827,9 @@ public:
     bool         _outputTagPending = false;
     property_map _pendingOutputTag{};
 
+    // workInternal() scratch, retained to reuse its buckets
+    property_map _pendingForwardParams{};
+
     // intermediate non-real-time<->real-time setting states
     CtxSettings<Derived> _settings;
 
@@ -1966,8 +1969,10 @@ public:
             inputStreamCache.invalidateStatistic();
             outputStreamCache.invalidateStatistic();
         };
-        property_map pendingForwardParams;
-        applyChangedSettings(true, &pendingForwardParams);
+        if (!_pendingForwardParams.empty()) {
+            _pendingForwardParams.clear();
+        }
+        applyChangedSettings(true, &_pendingForwardParams);
         SampleLimits limits = computeSampleLimits(requestedWork);
 
         if (limits.inputSkipBefore > 0) {
@@ -1996,8 +2001,8 @@ public:
         }
 
         if (limits.resampledIn == 0 && limits.resampledOut == 0 && !limits.hasAsyncIn && !limits.hasAsyncOut) {
-            if (!pendingForwardParams.empty()) {
-                std::ignore = settings().setStaged(pendingForwardParams); // re-stage for next work call
+            if (!_pendingForwardParams.empty()) {
+                std::ignore = settings().setStaged(_pendingForwardParams); // re-stage for next work call
             }
             return {requestedWork, 0UZ, limits.resampledStatus};
         }
@@ -2017,8 +2022,8 @@ public:
             forwardInputTags(inputSpans, outputSpans, processedIn);
         }
 
-        if (!pendingForwardParams.empty()) {
-            for_each_writer_span([&pendingForwardParams](auto& out) { out.publishTag(pendingForwardParams, 0); }, outputSpans);
+        if (!_pendingForwardParams.empty()) {
+            for_each_writer_span([this](auto& out) { out.publishTag(_pendingForwardParams, 0); }, outputSpans);
         }
 
         if constexpr (HasProcessOneFunction<Derived> && !HasProcessBulkFunction<Derived>) {
@@ -2052,7 +2057,9 @@ public:
         if constexpr (HasProcessOneFunction<Derived> && !HasProcessBulkFunction<Derived>) {
             _inputTagPresent  = false;
             _outputTagPending = false;
-            _pendingOutputTag.clear();
+            if (!_pendingOutputTag.empty()) {
+                _pendingOutputTag.clear();
+            }
             _inProcessOneDispatch = false;
         }
         work::sanitiseProcessStatus(userReturnStatus, processedIn, processedOut);
