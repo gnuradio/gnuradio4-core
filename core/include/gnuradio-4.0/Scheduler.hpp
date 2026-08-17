@@ -149,8 +149,9 @@ protected:
     bool                     _messagePortsConnected = false;
 
     std::atomic_flag _processingScheduledMessages;
-    bool             _workQuiescenceRequested{false};
-    std::size_t      _nWorkersInWork{0};
+    // separate cache lines: every worker reads the flag and updates the counter on each iteration
+    alignas(gr::kCacheLine) bool _workQuiescenceRequested{false};
+    alignas(gr::kCacheLine) std::size_t _nWorkersInWork{0};
 
     void rebuildProfiler(const profiling::Options& opt) {
         std::destroy_at(std::addressof(_profiler));
@@ -190,8 +191,9 @@ public:
 
     [[nodiscard]] static constexpr auto executionPolicy() { return execution; }
 
+    // seq_cst: this store and the worker's _nWorkersInWork increment must not sink below the load that follows them
     void requestWorkQuiescence() {
-        gr::atomic_ref(_workQuiescenceRequested).store_release(true);
+        gr::atomic_ref(_workQuiescenceRequested).store_seq_cst(true);
         while (gr::atomic_ref(_nWorkersInWork).load_acquire() > 0) {
             std::this_thread::yield();
         }
@@ -713,7 +715,7 @@ protected:
                 if (gr::atomic_ref(_workQuiescenceRequested).load_acquire()) {
                     std::this_thread::yield();
                 } else {
-                    gr::atomic_ref(_nWorkersInWork).fetch_add(1UZ);
+                    std::ignore = gr::atomic_ref(_nWorkersInWork).fetch_add_seq_cst(1UZ);
                     if (gr::atomic_ref(_workQuiescenceRequested).load_acquire()) {
                         gr::atomic_ref(_nWorkersInWork).fetch_sub(1UZ);
                     } else {
