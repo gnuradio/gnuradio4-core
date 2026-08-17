@@ -529,6 +529,23 @@ protected:
         return result;
     }
 
+    // idle worker backoff: hot spin, then yield, then a sleep doubling up to kMaxIdleSleep
+    static constexpr std::size_t kIdleSpinIterations  = 100UZ;
+    static constexpr std::size_t kIdleYieldIterations = 8UZ;
+    static constexpr auto        kMaxIdleSleep        = std::chrono::microseconds(200);
+
+    static void applyIdleBackoff(std::size_t nIdleIterations) noexcept {
+        if (nIdleIterations <= kIdleSpinIterations) {
+            return;
+        }
+        if (nIdleIterations <= kIdleSpinIterations + kIdleYieldIterations) {
+            std::this_thread::yield();
+            return;
+        }
+        const std::size_t shift = std::min(nIdleIterations - (kIdleSpinIterations + kIdleYieldIterations), 8UZ);
+        std::this_thread::sleep_for(std::min(kMaxIdleSleep, std::chrono::microseconds(static_cast<std::chrono::microseconds::rep>(1UZ << shift))));
+    }
+
     work::Result traverseBlockListOnce(const std::vector<std::shared_ptr<BlockModel>>& blocks) const {
         const std::size_t requestedWorkAllBlocks = max_work_items;
         std::size_t       performedWorkAllBlocks = 0UZ;
@@ -651,6 +668,7 @@ protected:
 
         [[maybe_unused]] auto currentProgress    = this->_graph->progress().value();
         std::size_t           inactiveCycleCount = 0UZ;
+        std::size_t           idleIterations     = 0UZ;
         std::size_t           msgToCount         = 0UZ;
         auto                  activeState        = this->state();
         do {
@@ -663,9 +681,8 @@ protected:
             // Process messages either when the ratio gate opens, or immediately when any entry-point port has
             // pending traffic. This keeps the ratio's amortisation of empty-queue checks while giving arriving
             // messages single-iteration latency (important for multi-hop sub-scheduler message paths).
-            const bool hasMessagesToProcess = msgToCount == 0UZ                //
-                                              || this->msgIn.available() > 0UZ //
-                                              || _fromChildMessagePort.available() > 0UZ;
+            const bool hasPendingMessages   = this->msgIn.available() > 0UZ || _fromChildMessagePort.available() > 0UZ;
+            const bool hasMessagesToProcess = msgToCount == 0UZ || hasPendingMessages;
             if (hasMessagesToProcess) {
                 if (runnerID == 0UZ || nRunningJobs->value() == 0UZ) {
                     this->processScheduledMessages(); // execute the scheduler- and Graph-specific message handler only once globally
@@ -678,7 +695,11 @@ protected:
                 adoptBlocks(runnerID, localBlockList);
 
                 std::ranges::for_each(localBlockList, &BlockModel::processScheduledMessages);
-                activeState = this->state();
+                const auto previousState = activeState;
+                activeState              = this->state();
+                if (hasPendingMessages || activeState != previousState) {
+                    idleIterations = 0UZ;
+                }
                 msgToCount++;
             } else {
                 if (std::has_single_bit(process_stream_to_message_ratio.value)) {
@@ -703,6 +724,11 @@ protected:
                         } else if (result.status == work::Status::ERROR) {
                             this->emitErrorMessageIfAny("LifecycleState (ERROR)", this->changeStateTo(ERROR));
                             break;
+                        }
+                        idleIterations = result.performed_work > 0UZ ? 0UZ : idleIterations + 1UZ;
+                        applyIdleBackoff(idleIterations);
+                        if (idleIterations > kIdleSpinIterations) {
+                            msgToCount = 0UZ; // re-read lifecycle state every backoff period, bounding stop latency
                         }
                     }
                 }
