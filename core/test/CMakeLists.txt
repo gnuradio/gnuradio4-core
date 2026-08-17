@@ -30,6 +30,7 @@ set(_CORE_TESTS
     qa_DynamicPort
     qa_LifeCycle
     qa_MemoryAllocators
+    qa_MessagePlane
     qa_PmtCollections
     qa_Port
     qa_Profiler
@@ -68,6 +69,10 @@ endif()
 foreach(TEST_NAME IN LISTS _CORE_TESTS)
   add_ut_test(${TEST_NAME})
 endforeach()
+
+# regression tests for control-plane wedges: a failure shows up as a hang, so cap them
+set(_CORE_DEADLOCK_TESTS qa_MessagePlane)
+set_tests_properties(${_CORE_DEADLOCK_TESTS} PROPERTIES TIMEOUT 120)
 
 add_ut_test(qa_SubGraphAssets)
 # only the case that instantiates an asset needs the registry; the rest run without one
