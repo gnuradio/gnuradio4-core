@@ -2069,6 +2069,7 @@ public:
         std::size_t    performedWork  = work::computePerformedWork(userReturnStatus, processedIn, processedOut, kIsSourceBlock);
         if (performedWork > 0UZ) {
             progress->incrementAndGet();
+            progress->notify_all();
         }
         return {requestedWork, performedWork, userReturnStatus};
     }
