@@ -77,6 +77,7 @@ inline auto nullMatchPred = [](auto, auto, auto) { return std::nullopt; };
 struct ApplyStagedParametersResult {
     property_map forwardParameters; // parameters that should be forwarded to dependent child blocks
     property_map appliedParameters;
+    property_map failedParameters; // staged values the block's setter rejected -- neither applied nor forwarded
 };
 
 namespace detail {
@@ -1030,8 +1031,10 @@ public:
                 auto it = appliers.find(key);
                 if (it != appliers.end()) {
                     constexpr bool hasCallback = HasSettingsChangedCallback<TBlock>;
-                    std::ignore                = it->second(_block, key, stagedValue, result.appliedParameters, staged, hasCallback);
-                    // Forward parameters check is independent of validation success (matches original behavior)
+                    if (!it->second(_block, key, stagedValue, result.appliedParameters, staged, hasCallback)) {
+                        result.failedParameters.insert_or_assign(key, stagedValue); // rejected: must not reach downstream blocks
+                        continue;
+                    }
                     if (_autoForwardParameters.contains(std::string(key))) {
                         result.forwardParameters.insert_or_assign(key, stagedValue);
                     }
