@@ -1,8 +1,11 @@
 #include <boost/ut.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string_view>
+#include <thread>
 
 #include <gnuradio-4.0/CircularBuffer.hpp>
 
@@ -94,6 +97,45 @@ void testReaderDetachUngates(std::string_view name) {
     expect(writeChunk(writer, chunk)) << name << ": writer wedged after the last reader detached";
 }
 
+template<typename TBuffer>
+void testReaderChurnAgainstProducer(std::string_view name) {
+    using namespace boost::ut;
+
+    constexpr std::size_t kChurnCycles = 500UZ;
+
+    TBuffer                  buffer(1024UZ);
+    auto                     writer = buffer.new_writer();
+    std::atomic<bool>        churnDone{false};
+    std::atomic<std::size_t> nPublished{0UZ};
+
+    std::jthread producer([&writer, &churnDone, &nPublished] {
+        while (!churnDone.load(std::memory_order_acquire)) {
+            if (writeChunk(writer, 64UZ)) {
+                nPublished.fetch_add(1UZ, std::memory_order_relaxed);
+            }
+        }
+    });
+
+    // wait for the producer to be live, so the churn overlaps it even on a loaded machine
+    for (std::size_t i = 0UZ; i < 5000UZ && nPublished.load(std::memory_order_relaxed) == 0UZ; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    for (std::size_t cycle = 0UZ; cycle < kChurnCycles; ++cycle) {
+        auto              reader    = buffer.new_reader();
+        const std::size_t available = reader.available();
+        if (available > 0UZ) {
+            auto readSpan = reader.template get<gr::SpanReleasePolicy::ProcessAll>(available);
+            expect(readSpan.consume(available));
+        }
+    }
+    churnDone.store(true, std::memory_order_release);
+    producer.join();
+
+    expect(gt(nPublished.load(), 0UZ)) << name << ": the producer made no progress during the reader churn";
+    expect(le(writer.available(), buffer.size())) << name << ": capacity is inconsistent after the churn";
+}
+
 } // namespace
 
 const boost::ut::suite<"buffer zero-reader gating"> bufferZeroReaderTests = [] {
@@ -112,6 +154,11 @@ const boost::ut::suite<"buffer zero-reader gating"> bufferZeroReaderTests = [] {
     "detaching the last reader ungates instead of wedging"_test = [] {
         testReaderDetachUngates<CircularBufferSingle>("SPSC");
         testReaderDetachUngates<CircularBufferMulti>("MPSC");
+    };
+
+    "readers may attach and detach while a producer writes"_test = [] {
+        testReaderChurnAgainstProducer<CircularBufferSingle>("SPSC");
+        testReaderChurnAgainstProducer<CircularBufferMulti>("MPSC");
     };
 };
 
