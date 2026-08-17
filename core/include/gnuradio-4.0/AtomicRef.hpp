@@ -126,7 +126,11 @@ struct AtomicRef {
 #endif
     }
 
-    // wait/notify are host-only (no SYCL device equivalent)
+    // seq_cst and wait/notify are host-only (AdaptiveCpp supports only relaxed and acq_rel)
+    forceinline void store_seq_cst(T v) noexcept { std::atomic_ref<T>(_x).store(v, std::memory_order_seq_cst); }
+
+    forceinline T fetch_add_seq_cst(T inc) noexcept { return std::atomic_ref<T>(_x).fetch_add(inc, std::memory_order_seq_cst); }
+
     forceinline constexpr void wait(T oldValue) const noexcept { std::atomic_ref<value_type>(_x).wait(oldValue); }
 
     forceinline constexpr void notify_all() noexcept { std::atomic_ref<value_type>(_x).notify_all(); }
