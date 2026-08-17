@@ -487,6 +487,9 @@ private:
 
         [[nodiscard]] constexpr BufferType buffer() const noexcept { return CircularBuffer(_buffer); };
 
+        [[nodiscard]] std::size_t nReaders() const noexcept { return gr::atomic_ref(_buffer->_reader_count).load_acquire(); }
+        [[nodiscard]] std::size_t nWriters() const noexcept { return gr::atomic_ref(_buffer->_writer_count).load_acquire(); }
+
         [[nodiscard]] std::size_t bufferIndex() const noexcept { return _buffer->calculateIndex(_buffer->_claimStrategy._publishCursor.value()); }
 
         template<SpanReleasePolicy policy = SpanReleasePolicy::ProcessNone>
@@ -744,7 +747,11 @@ private:
             }
         }
 
-        [[nodiscard]] constexpr BufferType  buffer() const noexcept { return CircularBuffer(_buffer); };
+        [[nodiscard]] constexpr BufferType buffer() const noexcept { return CircularBuffer(_buffer); };
+
+        [[nodiscard]] std::size_t nReaders() const noexcept { return gr::atomic_ref(_buffer->_reader_count).load_acquire(); }
+        [[nodiscard]] std::size_t nWriters() const noexcept { return gr::atomic_ref(_buffer->_writer_count).load_acquire(); }
+
         [[nodiscard]] constexpr std::size_t nSamplesConsumed() const noexcept { return _nSamplesConsumed; };
         [[nodiscard]] constexpr bool        isConsumeRequested() const noexcept { return _nRequestedSamplesToConsume != std::numeric_limits<std::size_t>::max(); }
         [[nodiscard]] constexpr std::size_t nRequestedSamplesToConsume() const noexcept { return _nRequestedSamplesToConsume; }
