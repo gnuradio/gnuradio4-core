@@ -28,10 +28,13 @@ Graph::Graph(property_map settings) : gr::Block<Graph>(std::move(settings)), _pl
 }
 
 std::pair<std::shared_ptr<BlockModel>, std::shared_ptr<BlockModel>> Graph::replaceBlock(std::string_view uniqueName, std::string_view type, const property_map& properties) {
-    auto it = std::ranges::find_if(_blocks, [&uniqueName](const auto& block) { return block->uniqueName() == uniqueName; });
-    if (it == _blocks.end()) {
+    auto found = std::ranges::find_if(_blocks, [&uniqueName](const auto& block) { return block->uniqueName() == uniqueName; });
+    if (found == _blocks.end()) {
         throw gr::exception(std::format("Block {} was not found in {}", uniqueName, this->unique_name));
     }
+    // addBlock() may reallocate _blocks, so keep an index rather than the iterator
+    const auto                        oldIndex = static_cast<std::size_t>(std::ranges::distance(_blocks.begin(), found));
+    const std::shared_ptr<BlockModel> replaced = _blocks[oldIndex];
 
     auto newBlock = gr::globalPluginLoader().instantiate(type, properties);
     if (!newBlock) {
@@ -41,17 +44,17 @@ std::pair<std::shared_ptr<BlockModel>, std::shared_ptr<BlockModel>> Graph::repla
     addBlock(newBlock);
 
     for (auto& edge : _edges) {
-        if (edge._sourceBlock == *it) {
+        if (edge._sourceBlock == replaced) {
             edge._sourceBlock = newBlock;
         }
 
-        if (edge._destinationBlock == *it) {
+        if (edge._destinationBlock == replaced) {
             edge._destinationBlock = newBlock;
         }
     }
 
-    std::shared_ptr<BlockModel> oldBlock = std::move(*it);
-    _blocks.erase(it);
+    std::shared_ptr<BlockModel> oldBlock = replaced;
+    _blocks.erase(_blocks.begin() + static_cast<std::ptrdiff_t>(oldIndex));
 
     return {std::move(oldBlock), newBlock};
 }
