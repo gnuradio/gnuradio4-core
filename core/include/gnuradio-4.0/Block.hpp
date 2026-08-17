@@ -91,41 +91,34 @@ template<PortType portType, PortReflectable Self>
 }
 
 namespace detail {
-template<std::ranges::range Range, typename T = std::ranges::range_value_t<Range>>
-[[nodiscard]] constexpr std::optional<T> min_element(Range&& range) {
-    if (auto it = std::ranges::min_element(range); it != std::ranges::end(range)) {
-        return *it;
-    }
-    return std::nullopt;
-}
-
-template<auto... MatchPortEnums, std::ranges::range Range, typename T = std::ranges::range_value_t<Range>>
+template<auto... MatchPortEnums, std::ranges::sized_range Range, typename T = std::ranges::range_value_t<Range>>
+requires std::ranges::random_access_range<Range>
 [[nodiscard]] constexpr std::optional<T> min_element_masked(Range&& range, const std::span<const port::BitMask>& portMaskVec) {
-    auto filtered = std::ranges::views::zip(range, portMaskVec) | std::views::filter([](const auto& pair) {
-        const auto& mask = std::get<1>(pair);
-        return port::pattern<MatchPortEnums...>().matches(mask); // actual & pattern.mask == pattern.value
-    }) | std::views::transform([](const auto& pair) { return std::get<0>(pair); });
+    constexpr port::BitPattern kPattern = port::pattern<MatchPortEnums...>();
+    const std::size_t          nPorts   = std::min(std::ranges::size(range), portMaskVec.size());
 
-    return min_element(filtered);
-}
-
-template<std::ranges::range Range, typename T = std::ranges::range_value_t<Range>>
-std::optional<T> max_element(Range&& range) {
-    if (auto it = std::ranges::max_element(range); it != std::ranges::end(range)) {
-        return *it;
+    std::optional<T> result;
+    for (std::size_t i = 0UZ; i < nPorts; ++i) {
+        if (kPattern.matches(portMaskVec[i]) && (!result.has_value() || range[i] < *result)) {
+            result = range[i];
+        }
     }
-    return std::nullopt;
+    return result;
 }
 
-template<auto... MatchPortEnums, std::ranges::range Range, typename T = std::ranges::range_value_t<Range>>
+template<auto... MatchPortEnums, std::ranges::sized_range Range, typename T = std::ranges::range_value_t<Range>>
+requires std::ranges::random_access_range<Range>
 [[nodiscard]] constexpr std::optional<T> max_element_masked(Range&& range, const std::span<const port::BitMask>& portMaskVec) {
-    auto zipped   = std::ranges::views::zip(range, portMaskVec);
-    auto filtered = zipped | std::views::filter([](const auto& pair) {
-        const auto& mask = std::get<1>(pair);
-        return port::pattern<MatchPortEnums...>().matches(mask); // actual & pattern.mask == pattern.value
-    }) | std::views::transform([](const auto& pair) { return std::get<0>(pair); });
+    constexpr port::BitPattern kPattern = port::pattern<MatchPortEnums...>();
+    const std::size_t          nPorts   = std::min(std::ranges::size(range), portMaskVec.size());
 
-    return max_element(filtered);
+    std::optional<T> result;
+    for (std::size_t i = 0UZ; i < nPorts; ++i) {
+        if (kPattern.matches(portMaskVec[i]) && (!result.has_value() || range[i] > *result)) {
+            result = range[i];
+        }
+    }
+    return result;
 }
 
 template<typename T, std::size_t simd_width = stdx::simd_abi::max_fixed_size<T>>
@@ -157,10 +150,18 @@ template<typename T, std::size_t simd_width = stdx::simd_abi::max_fixed_size<T>>
     return false;
 }
 
-template<auto... MatchPortEnums, std::ranges::input_range RangeA, std::ranges::input_range RangeB, std::ranges::input_range MaskRange>
+template<auto... MatchPortEnums, std::ranges::sized_range RangeA, std::ranges::sized_range RangeB, std::ranges::sized_range MaskRange>
+requires(std::ranges::random_access_range<RangeA> && std::ranges::random_access_range<RangeB> && std::ranges::random_access_range<MaskRange>)
 [[nodiscard]] constexpr bool compareRangesMasked(RangeA&& a, RangeB&& b, MaskRange&& mask) {
-    auto zipped = std::ranges::views::zip(a, b, mask) | std::views::filter([](const auto& tup) { return port::pattern<MatchPortEnums...>().matches(std::get<2>(tup)); });
-    return std::ranges::any_of(zipped, [](const auto& tup) { return std::get<0UZ>(tup) >= std::get<1UZ>(tup); });
+    constexpr port::BitPattern kPattern = port::pattern<MatchPortEnums...>();
+    const std::size_t          nPorts   = std::min({std::ranges::size(a), std::ranges::size(b), std::ranges::size(mask)});
+
+    for (std::size_t i = 0UZ; i < nPorts; ++i) {
+        if (kPattern.matches(mask[i]) && a[i] >= b[i]) {
+            return true;
+        }
+    }
+    return false;
 }
 } // namespace detail
 
