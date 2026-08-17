@@ -141,6 +141,52 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
 
         expect(!flow.removeEdgeBySourcePort(source.unique_name, "out", sinkA.unique_name, "in").has_value()) << "removing an absent edge reported success";
     };
+
+    "emplacing and removing blocks while the graph runs"_test = [] {
+        constexpr std::size_t kCycles = 8UZ;
+
+        qa_edit::registerTestBlocks();
+
+        qa_edit::TestScheduler scheduler;
+        {
+            gr::Graph flow;
+            auto&     source = flow.emplaceBlock<qa_edit::Source>();
+            auto&     sink   = flow.emplaceBlock<qa_edit::Sink>();
+            expect(flow.connect<"out", "in">(source, sink).has_value());
+            expect(scheduler.exchange(std::move(flow)).has_value());
+        }
+
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(toScheduler.connect(scheduler.msgIn).has_value());
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+
+        const std::string blockYaml = std::format("id: {}\nparameters:\n  gain: !!float32 2.0\n", gr::meta::type_name<qa_edit::Tunable>());
+        for (std::size_t cycle = 0UZ; cycle < kCycles; ++cycle) {
+            qa_edit::sendMessage(toScheduler, gr::scheduler::property::kEmplaceBlock, {{"yaml", blockYaml}});
+            expect(qa_edit::awaitReply(fromScheduler, gr::scheduler::property::kBlockEmplaced)) << "cycle " << cycle << ": block was never emplaced";
+
+            std::string emplacedName;
+            for (const auto& block : scheduler.graph().blocks()) {
+                if (block->typeName().find("Tunable") != std::string_view::npos) {
+                    emplacedName = block->uniqueName();
+                }
+            }
+            expect(!emplacedName.empty()) << "cycle " << cycle << ": the emplaced block is not in the graph";
+
+            qa_edit::sendMessage(toScheduler, gr::scheduler::property::kRemoveBlock, {{"uniqueName", emplacedName}});
+            expect(qa_edit::awaitReply(fromScheduler, gr::scheduler::property::kBlockRemoved)) << "cycle " << cycle << ": block was never removed";
+        }
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        for (std::size_t i = 0UZ; i < 3000UZ && scheduler.state() != STOPPED; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        expect(scheduler.state() == STOPPED) << "the scheduler did not stop after the edit cycles";
+    };
 };
 
 int main() { /* tests are statically registered */ }

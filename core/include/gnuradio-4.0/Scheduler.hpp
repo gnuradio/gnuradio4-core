@@ -1121,7 +1121,10 @@ protected:
         const bool   isYamlPath   = messageData.contains("yaml");
         property_map yamlSettings = isYamlPath ? std::exchange(blockProperties, {}) : property_map{};
 
-        auto& newBlock = targetGraph->emplaceBlock(blockType, blockProperties);
+        const std::shared_ptr<BlockModel>& newBlock = [&]() -> const std::shared_ptr<BlockModel>& {
+            WorkQuiescenceGuard quiescence(this); // _blocks is traversed by every worker and by forEachBlock
+            return targetGraph->emplaceBlock(blockType, blockProperties);
+        }();
 
         if (isYamlPath && !yamlSettings.empty()) {
             newBlock->settings().loadParametersFromPropertyMap(yamlSettings);
@@ -1162,10 +1165,13 @@ protected:
         }
 
         messageData["_targetGraph"] = targetGraph->unique_name.value();
-        if (auto removedBlock = targetGraph->removeBlockByName(uniqueName); removedBlock.has_value()) {
-            makeZombie(std::move(*removedBlock));
-        } else {
-            message.data = std::unexpected(removedBlock.error());
+        {
+            WorkQuiescenceGuard quiescence(this); // _blocks is traversed by every worker and by forEachBlock
+            if (auto removedBlock = targetGraph->removeBlockByName(uniqueName); removedBlock.has_value()) {
+                makeZombie(std::move(*removedBlock));
+            } else {
+                message.data = std::unexpected(removedBlock.error());
+            }
         }
 
         return {message};
@@ -1514,7 +1520,10 @@ protected:
             return message;
         }
 
-        auto [oldBlock, newBlockRaw] = targetGraph->replaceBlock(uniqueName, type, properties);
+        auto [oldBlock, newBlockRaw] = [&] {
+            WorkQuiescenceGuard quiescence(this); // _blocks is traversed by every worker and by forEachBlock
+            return targetGraph->replaceBlock(uniqueName, type, properties);
+        }();
         makeZombie(std::move(oldBlock));
 
         std::optional<Message> result = gr::Message{};
