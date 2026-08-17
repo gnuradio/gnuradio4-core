@@ -79,7 +79,10 @@ public:
         return _reserveCursor;
     }
 
-    [[nodiscard]] forceinline std::size_t getRemainingCapacity() const noexcept { return _size - (_reserveCursor - getMinReaderCursor()); }
+    [[nodiscard]] forceinline std::size_t getRemainingCapacity() const noexcept {
+        const std::size_t nClaimed = _reserveCursor - getMinReaderCursor();
+        return nClaimed >= _size ? 0UZ : _size - nClaimed; // unsigned-safe: a reader cursor ahead of the reserve cursor also lands here
+    }
 
     void publish(std::size_t offset, std::size_t nSlotsToClaim) {
         const auto sequence = offset + nSlotsToClaim;
@@ -96,7 +99,7 @@ private:
             return _cachedSingleReader->value(); // O(1): single atomic load, no shared_ptr indirection
         }
         if (_cachedReaderCount == 0UZ) {
-            return kInitialCursorValue;
+            return _reserveCursor; // no readers: nothing gates the writer, published samples are discarded
         }
         return std::ranges::min(*_readSequences | std::views::transform([](const auto& cursor) { return cursor->value(); }));
     }
@@ -230,7 +233,8 @@ public:
     [[nodiscard]] forceinline std::size_t getRemainingCapacity() const noexcept {
         const std::size_t minReader = getMinReaderCursor();
         gr::atomic_ref(_cachedMinReaderCursor).store_relaxed(minReader); // keep cache warm for next()/tryNext()
-        return _size - (_reserveCursor.value() - minReader);
+        const std::size_t nClaimed = _reserveCursor.value() - minReader;
+        return nClaimed >= _size ? 0UZ : _size - nClaimed; // unsigned-safe: a reader cursor ahead of the reserve cursor also lands here
     }
 
     void publish(std::size_t offset, std::size_t nSlotsToClaim) {
@@ -267,7 +271,7 @@ private:
             return _cachedSingleReader->value();
         }
         if (_cachedReaderCount == 0UZ) {
-            return kInitialCursorValue;
+            return _reserveCursor.value(); // no readers: nothing gates the writer, published samples are discarded
         }
         return std::ranges::min(*_readSequences | std::views::transform([](const auto& cursor) { return cursor->value(); }));
     }
