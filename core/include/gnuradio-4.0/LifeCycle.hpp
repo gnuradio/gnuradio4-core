@@ -156,6 +156,18 @@ protected:
         }
     }
 
+    // a transition that is already satisfied: reported as success without running any hook
+    [[nodiscard]] static constexpr bool isSatisfiedTransition(State from, State to) noexcept { //
+        return from == to || (from == State::STOPPED && to == State::REQUESTED_STOP) || (from == State::PAUSED && to == State::REQUESTED_PAUSE);
+    }
+
+    [[nodiscard]] Error invalidTransitionError(State from, State to, const std::source_location& location) {
+        return Error{std::format("Block '{}' invalid state transition in {} from {} -> to {}", //
+                         getBlockName(), gr::meta::type_name<TDerived>(),                      //
+                         gr::meta::enumName(from).value_or(""), gr::meta::enumName(to).value_or("")),
+            location};
+    }
+
     std::string getBlockName() {
         if constexpr (requires(TDerived d) { d.uniqueName(); }) {
             return std::string{static_cast<TDerived*>(this)->uniqueName()};
@@ -212,22 +224,34 @@ public:
     [[nodiscard]] std::expected<void, Error> changeStateTo(State newState, const std::source_location location = std::source_location::current()) {
         State oldState;
         if constexpr (storageType == StorageType::ATOMIC) {
+            // claim the transition with a CAS: a read-validate-write lets two threads both validate against the
+            // same observed state and both write, so the loser's transition is silently lost while its hooks still run
             oldState = gr::atomic_ref(_state).load_acquire();
+            while (!isSatisfiedTransition(oldState, newState)) {
+                if (!isValidTransition(oldState, newState)) {
+                    return std::unexpected(invalidTransitionError(oldState, newState, location));
+                }
+                if (gr::atomic_ref(_state).compare_exchange(oldState, newState)) { // re-validates from the fresh value on failure
+                    break;
+                }
+            }
+            if (isSatisfiedTransition(oldState, newState)) {
+                return {};
+            }
+            if constexpr (requires(TDerived d) { d.stateChanged(newState); }) {
+                static_cast<TDerived*>(this)->stateChanged(newState);
+            }
+            gr::atomic_ref(_state).notify_all();
         } else {
             oldState = _state;
+            if (isSatisfiedTransition(oldState, newState)) {
+                return {};
+            }
+            if (!isValidTransition(oldState, newState)) {
+                return std::unexpected(invalidTransitionError(oldState, newState, location));
+            }
+            setAndNotifyState(newState);
         }
-        if (oldState == newState || (oldState == STOPPED && newState == REQUESTED_STOP) || (oldState == PAUSED && newState == REQUESTED_PAUSE)) {
-            return {};
-        }
-
-        if (!isValidTransition(oldState, newState)) {
-            return std::unexpected(Error{std::format("Block '{}' invalid state transition in {} from {} -> to {}", //
-                                             getBlockName(), gr::meta::type_name<TDerived>(),                      //
-                                             gr::meta::enumName(state()).value_or(""), gr::meta::enumName(newState).value_or("")),
-                location});
-        }
-
-        setAndNotifyState(newState);
 
         if constexpr (std::is_same_v<TDerived, void>) {
             return {};
