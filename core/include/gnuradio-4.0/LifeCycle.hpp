@@ -54,9 +54,9 @@ namespace gr::lifecycle {
  * │ │        └─────┬───────┘           │           │  ║
  * │ │              │ pause()           │           │  ║  isActive(lifecycle::State) ─> true
  * │ │              v                   │ resume()  │  ║
- * │ │    ┌─────────┴─────────┐   ┌─────┴─────┐     │  ║
- * │ │    │  REQUESTED_PAUSE  ├──>┤  PAUSED   │     │  ║
- * │ │    └──────────┬────────┘   └─────┬─────┘     │  ╙
+ * │ │    ┌─────────┴─────────┐   ┌─────┴─────┐     │  ║  N.B. REQUESTED_PAUSE also resumes
+ * │ │    │  REQUESTED_PAUSE  ├──>┤  PAUSED   │     │  ║  directly to RUNNING -- a block that
+ * │ │    └──────────┬────────┘   └─────┬─────┘     │  ╙  never reaches PAUSED is not stranded
  * │ │               │ stop()           │ stop()    │
  * │ │               v                  │           │
  * │ │     ┌─────────┴────────┐         │           │  ╓
@@ -108,7 +108,7 @@ constexpr bool isValidTransition(const State from, const State to) noexcept {
     case State::IDLE: return to == State::INITIALISED || to == State::REQUESTED_STOP || to == State::STOPPED;
     case State::INITIALISED: return to == State::RUNNING || to == State::REQUESTED_STOP || to == State::STOPPED;
     case State::RUNNING: return to == State::REQUESTED_PAUSE || to == State::REQUESTED_STOP;
-    case State::REQUESTED_PAUSE: return to == State::PAUSED;
+    case State::REQUESTED_PAUSE: return to == State::PAUSED || to == State::RUNNING || to == State::REQUESTED_STOP;
     case State::PAUSED: return to == State::RUNNING || to == State::REQUESTED_STOP;
     case State::REQUESTED_STOP: return to == State::STOPPED;
     case State::STOPPED: return to == State::INITIALISED;

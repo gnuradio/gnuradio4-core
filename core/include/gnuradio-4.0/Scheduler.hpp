@@ -248,7 +248,7 @@ public:
     }
 
     ~SchedulerBase() {
-        if (this->state() == lifecycle::RUNNING) {
+        if (lifecycle::isActive(this->state())) { // RUNNING, REQUESTED_PAUSE or PAUSED -- workers are parked, not gone
             if (auto e = this->changeStateTo(lifecycle::REQUESTED_STOP); !e) {
                 std::println(std::cerr, "Failed to stop execution at destruction of scheduler: {} ({})", e.error().message, e.error().srcLoc());
                 std::abort();
@@ -1185,9 +1185,8 @@ protected:
                 break;
             case REQUESTED_STOP: // block will be deleted later
                 break;
-            case REQUESTED_PAUSE: // block will be deleted later
-                // There's no transition from REQUESTED_PAUSE to REQUESTED_STOP
-                // Will be moved to REQUESTED_STOP as soon as it's possible
+            case REQUESTED_PAUSE: // zombie that never reached PAUSED -- stop it directly
+                this->emitErrorMessageIfAny("cleanupZombieBlocks", (*it)->changeStateTo(REQUESTED_STOP));
                 break;
             case PAUSED: // zombie was in REQUESTED_PAUSE and now finally in PAUSED. Can be stopped now.
                 // Will be deleted in a next zombie maintenance period
@@ -1242,7 +1241,7 @@ protected:
     */
     void makeZombie(std::shared_ptr<BlockModel> block) {
         using enum lifecycle::State;
-        if (block->state() == PAUSED || block->state() == RUNNING) {
+        if (lifecycle::isActive(block->state())) {
             this->emitErrorMessageIfAny("makeZombie", block->changeStateTo(REQUESTED_STOP));
         }
 

@@ -1854,6 +1854,9 @@ public:
         if (this->state() == lifecycle::State::REQUESTED_STOP) {
             emitErrorMessageIfAny("workInternal(): REQUESTED_STOP -> STOPPED", this->changeStateTo(lifecycle::State::STOPPED));
         }
+        if (this->state() == lifecycle::State::REQUESTED_PAUSE) {
+            emitErrorMessageIfAny("workInternal(): REQUESTED_PAUSE -> PAUSED", this->changeStateTo(lifecycle::State::PAUSED));
+        }
         if constexpr (TOutputTypes::size.value > 0UZ) {
             if (disconnect_on_done && hasNoDownStreamConnectedChildren()) {
                 this->requestStop();
