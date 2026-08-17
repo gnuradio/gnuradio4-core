@@ -64,7 +64,7 @@ inline std::expected<std::string, ParseError> readUriToString(std::string_view u
         return std::unexpected(ParseError{.message = "HTTP(S) asset loading is not available in gnuradio4-core"});
     }
 
-    const auto path = uriString.starts_with("file://") ? uriString.substr(7) : uriString;
+    const auto    path = uriString.starts_with("file://") ? uriString.substr(7) : uriString;
     std::ifstream input(path, std::ios::binary);
     if (!input) {
         return std::unexpected(ParseError{.message = std::format("Failed to read URI {}", uriString)});
