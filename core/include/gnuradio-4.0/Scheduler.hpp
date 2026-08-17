@@ -418,27 +418,48 @@ public:
             graph::forEachBlock<TransparentBlockGroup>(*_graph, [](auto& block) { block->processScheduledMessages(); });
         }
 
+        forwardMessagesFromChildren();
+    }
+
+    // drains _fromChildMessagePort on every path: the ring is shared by all blocks, so an unconsumed span
+    // both wedges the next emitter and latches the workers' message-poll gate permanently open
+    void forwardMessagesFromChildren() {
         ReaderSpanLike auto messagesFromChildren = _fromChildMessagePort.streamReader().get();
-        if (messagesFromChildren.size() == 0) {
+        const std::size_t   nFromChildren        = messagesFromChildren.size();
+        if (nFromChildren == 0UZ) {
             return;
         }
 
         if (this->msgOut.nReaders() == 0) {
             // nobody is listening on messages -> convert errors to exceptions
+            std::optional<std::string> ignoredError;
             for (const auto& msg : messagesFromChildren) {
                 if (!msg.data.has_value()) {
-                    throw gr::exception(std::format("scheduler {}: throwing ignored exception {:t}", this->name, msg.data.error()));
+                    ignoredError = std::format("scheduler {}: throwing ignored exception {:t}", this->name, msg.data.error());
+                    break;
                 }
+            }
+            if (!messagesFromChildren.consume(nFromChildren)) {
+                this->emitErrorMessage("process child return messages", "Failed to consume messages from child message port");
+            }
+            if (ignoredError.has_value()) {
+                throw gr::exception(*ignoredError);
             }
             return;
         }
 
-        {
-            WriterSpanLike auto msgSpan = this->msgOut.streamWriter().template reserve<SpanReleasePolicy::ProcessAll>(messagesFromChildren.size());
-            std::ranges::copy(messagesFromChildren, msgSpan.begin());
-            msgSpan.publish(messagesFromChildren.size());
-        } // to force publish
-        if (!messagesFromChildren.consume(messagesFromChildren.size())) {
+        // forward what fits, drop the rest: a subscriber that stops consuming must not wedge worker 0
+        auto&             msgWriter  = this->msgOut.streamWriter();
+        const std::size_t nToForward = std::min(nFromChildren, msgWriter.available());
+        if (nToForward > 0UZ) {
+            WriterSpanLike auto msgSpan = msgWriter.template tryReserve<SpanReleasePolicy::ProcessAll>(nToForward);
+            std::ranges::copy_n(messagesFromChildren.begin(), static_cast<std::ptrdiff_t>(msgSpan.size()), msgSpan.begin());
+            msgSpan.publish(msgSpan.size());
+        }
+        if (nToForward < nFromChildren) {
+            message::droppedMessageCount().fetch_add(nFromChildren - nToForward, std::memory_order_relaxed);
+        }
+        if (!messagesFromChildren.consume(nFromChildren)) {
             this->emitErrorMessage("process child return messages", "Failed to consume messages from child message port");
         }
     }
