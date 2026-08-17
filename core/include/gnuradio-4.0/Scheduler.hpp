@@ -1112,6 +1112,11 @@ protected:
 
         if (isYamlPath && !yamlSettings.empty()) {
             newBlock->settings().loadParametersFromPropertyMap(yamlSettings);
+            // loadParametersFromPropertyMap() only stores; without activating the context nothing is ever
+            // staged and the block keeps its constructor defaults (Graph_yaml_importer does this itself)
+            if (newBlock->settings().activateContext() == std::nullopt) {
+                this->emitErrorMessage("propertyCallbackEmplaceBlock", std::format("could not activate the loaded settings context of '{}'", newBlock->uniqueName()));
+            }
         }
 
         adoptBlock(newBlock);
