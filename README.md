@@ -66,6 +66,10 @@ echo 1 | sudo tee /sys/block/zram0/reset
   Also implicitly enabled by `-DCMAKE_BUILD_TYPE=MinSizeRel`.
 - **`WARNINGS_AS_ERRORS`** (default: ON): treats all compiler warnings as errors (`-Werror`).
 - **`TIMETRACE`** (default: OFF): activates Clang’s `-ftime-trace` for per-file compilation timing.
+- **`GR_BLOCKLIB_MAX_REGISTRATIONS_PER_TU`** (default: 16): balanced chunking of generated
+  block-registration translation units; bounds per-TU compile time and memory (0 = one TU
+  per `GR_REGISTER_BLOCK` line).
+- **`GR_BLOCKLIB_PCH`** (default: ON): precompiled headers for the generated registration TUs.
 - **`ADDRESS_SANITIZER`** (default: OFF): enables AddressSanitizer (can’t be combined with the other sanitizer options).
 - **`UB_SANITIZER`** (default: OFF): enables 'Undefined Behavior' checks.
 - **`THREAD_SANITIZER`** (default: OFF): enables threading checks (N.B. strong impact on performance).
@@ -83,6 +87,26 @@ cmake -B build -S . \
   -DTHREAD_SANITIZER=OFF
 cmake --build build -- -j$(nproc)
 ```
+
+### Faster downstream builds (precompiled headers)
+
+Projects consuming GNU Radio 4 via `find_package(gnuradio4)` can precompile the umbrella
+headers (`Block.hpp`, `Graph.hpp`, `Scheduler.hpp`) once per target instead of re-parsing
+them in every translation unit:
+
+```cmake
+find_package(gnuradio4 REQUIRED)
+add_executable(myapp graph.cpp control.cpp)
+target_link_libraries(myapp PRIVATE gnuradio4::gnuradio-core)
+gnuradio4_precompile_headers(myapp) # optional: EXTRA_HEADERS <gnuradio-4.0/basic/SignalGenerator.hpp>
+```
+
+On a typical graph+scheduler translation unit this is worth 10-20% of the GCC compile time; with
+Clang the helper also passes `-fpch-instantiate-templates`, which is worth roughly half the time
+and half the peak memory per TU. Note that consumers must use the same compiler family the install
+was built with (the compiled `gnuradio-core` library exports explicit instantiations of
+constrained templates, whose mangling differs between GCC and Clang). See
+`cmake/GnuRadio4PrecompileHeaders.cmake` for details and caveats.
 
 Feel free to tweak these flags based on your needs (embedded targets, debugging, sanitizing, etc.).
 For more details, see [DEVELOPMENT.md](DEVELOPMENT.md) or comments in the `CMakeLists.txt` file that

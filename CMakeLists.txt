@@ -720,8 +720,10 @@ if(TARGET gnuradio-plugin)
     DESTINATION "${GR_CMAKECONFIG_INSTALL_DIR}")
 endif()
 
-install(FILES "${CMAKE_CURRENT_BINARY_DIR}/gnuradio4Config.cmake"
-              "${CMAKE_CURRENT_BINARY_DIR}/gnuradio4ConfigVersion.cmake" DESTINATION "${GR_CMAKECONFIG_INSTALL_DIR}")
+install(
+  FILES "${CMAKE_CURRENT_BINARY_DIR}/gnuradio4Config.cmake" "${CMAKE_CURRENT_BINARY_DIR}/gnuradio4ConfigVersion.cmake"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GnuRadio4PrecompileHeaders.cmake"
+  DESTINATION "${GR_CMAKECONFIG_INSTALL_DIR}")
 
 # print effective options
 message(STATUS "================================================")
