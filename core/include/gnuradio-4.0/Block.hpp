@@ -1291,6 +1291,9 @@ public:
                 notifyListeners(block::property::kStagedSetting, appliedParametersMap);
             }
             notifyListeners(block::property::kSetting, settings().get());
+            if (!applyResult.failedParameters.empty()) {
+                emitErrorMessage("applyChangedSettings()", std::format("rejected settings: {}", applyResult.failedParameters));
+            }
         });
 
         // update input/output port caches

@@ -44,6 +44,19 @@ struct ReentrantBlock : gr::Block<ReentrantBlock> {
     }
 };
 
+// gain is range-limited, so an out-of-range staged value is rejected by the annotation's validator
+struct ValidatingBlock : gr::Block<ValidatingBlock> {
+    gr::PortIn<float>  in;
+    gr::PortOut<float> out;
+
+    gr::Annotated<float, "gain", gr::Limits<0.0f, 10.0f>> gain        = 1.0f;
+    gr::Annotated<float, "sample rate">                   sample_rate = 1000.0f;
+
+    GR_MAKE_REFLECTABLE(ValidatingBlock, in, out, gain, sample_rate);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
+};
+
 } // namespace qa_settings
 
 const boost::ut::suite<"settings concurrency"> settingsConcurrencyTests = [] {
@@ -100,6 +113,24 @@ const boost::ut::suite<"settings concurrency"> settingsConcurrencyTests = [] {
         expect(gt(block._nCallbacks, 0UZ)) << "settingsChanged was never invoked";
         expect(gt(block._nKeysObserved, 0UZ)) << "the callback could not read the settings back";
         expect(eq(block.gain.value, 2.0f)) << "the staged value was not applied";
+    };
+
+    "a rejected value is neither applied nor forwarded"_test = [] {
+        qa_settings::ValidatingBlock block;
+        block.init(std::make_shared<gr::Sequence>());
+
+        std::ignore                                  = block.settings().set({{"gain", 99.0f}, {"sample_rate", 48000.0f}});
+        std::ignore                                  = block.settings().activateContext();
+        const gr::ApplyStagedParametersResult result = block.settings().applyStagedParameters();
+
+        expect(result.failedParameters.contains("gain")) << "the out-of-range value was not reported as rejected";
+        expect(!result.appliedParameters.contains("gain")) << "the out-of-range value was reported as applied";
+        expect(!result.forwardParameters.contains("gain")) << "the out-of-range value was forwarded downstream";
+        expect(eq(block.gain.value, 1.0f)) << "the out-of-range value reached the block";
+
+        expect(!result.failedParameters.contains("sample_rate")) << "a valid value was reported as rejected";
+        expect(result.forwardParameters.contains("sample_rate")) << "a valid auto-forward value was not forwarded";
+        expect(eq(block.sample_rate.value, 48000.0f)) << "a valid value was not applied";
     };
 };
 
