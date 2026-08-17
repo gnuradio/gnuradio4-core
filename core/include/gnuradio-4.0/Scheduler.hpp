@@ -632,6 +632,10 @@ protected:
 
         nRunningJobs->incrementAndGet();
         nRunningJobs->notify_all();
+        on_scope_exit decrementRunningJobs = [&nRunningJobs] {
+            std::ignore = nRunningJobs->subAndGet(1UZ);
+            nRunningJobs->notify_all();
+        };
         gr::thread_pool::thread::setThreadName(std::format("pW{}-{}", runnerID, gr::meta::shorten_type_name(this->unique_name)));
 
         [[maybe_unused]] auto profiler_handler = _profiler.forThisThread();
@@ -728,8 +732,6 @@ protected:
                 }
             }
         } while (lifecycle::isActive(activeState));
-        std::ignore = nRunningJobs->subAndGet(1UZ);
-        nRunningJobs->notify_all();
     }
 
     void runWatchDog(std::size_t timeOut_ms, std::size_t timeOut_count) {
