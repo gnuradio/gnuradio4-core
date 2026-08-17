@@ -85,6 +85,11 @@ inline std::size_t getMinimumSequence(const std::vector<std::shared_ptr<Sequence
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #endif
 
+// the only safe way to read a gating-sequence list that addSequences()/removeSequence() may be swapping
+inline std::shared_ptr<std::vector<std::shared_ptr<Sequence>>> loadSequences(const std::shared_ptr<std::vector<std::shared_ptr<Sequence>>>& sequences) noexcept { //
+    return std::atomic_load_explicit(&sequences, std::memory_order_acquire);
+}
+
 inline void addSequences(std::shared_ptr<std::vector<std::shared_ptr<Sequence>>>& sequences, const Sequence& cursor, const std::vector<std::shared_ptr<Sequence>>& sequencesToAdd) {
     std::size_t                                             cursorSequence;
     std::shared_ptr<std::vector<std::shared_ptr<Sequence>>> updatedSequences;
