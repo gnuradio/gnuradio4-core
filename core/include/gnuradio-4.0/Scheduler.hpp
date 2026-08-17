@@ -79,6 +79,10 @@ enum class ExecutionPolicy {
 
 using JobLists = std::vector<std::vector<std::shared_ptr<BlockModel>>>;
 
+// identifies the scheduler whose poolWorker() is running on this thread, so a handler invoked from
+// that worker can tell that waiting for the job count to reach zero would include itself
+inline thread_local const void* tActiveSchedulerWorker = nullptr;
+
 template<typename Derived, ExecutionPolicy execution = ExecutionPolicy::singleThreaded, profiling::ProfilerLike TProfiler = profiling::null::Profiler>
 struct SchedulerBase : Block<Derived> {
     friend class lifecycle::StateMachine<Derived>;
@@ -137,6 +141,16 @@ protected:
 
     std::mutex                               _zombieBlocksMutex;
     std::vector<std::shared_ptr<BlockModel>> _zombieBlocks;
+
+    struct PendingExchange {
+        meta::indirect<gr::Graph> graph;
+        profiling::Options        option;
+        bool                      restart{false};
+        std::size_t               stopGeneration{0UZ}; // a later stop request cancels the restart
+    };
+    std::mutex                     _pendingExchangeMutex;
+    std::optional<PendingExchange> _pendingExchange;
+    std::size_t                    _nStopRequests{0UZ};
 
     // for blocks that were added while scheduler was running. They need to be adopted by a thread
     std::mutex _adoptionBlocksMutex;
@@ -254,6 +268,10 @@ public:
                 std::abort();
             }
         }
+        { // a deferred graph swap must not restart a scheduler that is being destroyed
+            std::lock_guard guard(_pendingExchangeMutex);
+            _pendingExchange.reset();
+        }
         waitDone();
 
         gr::atomic_ref(_valid).store_release(false); // Mark as invalid
@@ -266,9 +284,32 @@ public:
         _executionOrder.reset(); // force earlier crashes if this is accessed after destruction (e.g. from thread that was kept running)
     }
 
+    [[nodiscard]] bool isOnOwnWorkerThread() const noexcept { return tActiveSchedulerWorker == static_cast<const void*>(this); }
+
     [[nodiscard]] std::expected<meta::indirect<Graph>, Error> exchange(meta::indirect<Graph>&& newGraph, const profiling::Options& option = {}) {
         using enum lifecycle::State;
         const auto oldState = this->state();
+
+        if (isOnOwnWorkerThread()) {
+            // a message handler on a worker of this scheduler cannot wait for the job count to reach zero --
+            // its own increment is part of it. Request the stop, stash the graph, and let the last worker out swap.
+            // The stop is requested before the record is published so that the record carries its restart from the
+            // moment it is visible: a worker leaving in between would otherwise claim one that still reads as a
+            // plain swap, and the scheduler would never start again.
+            const bool restart = lifecycle::isActive(oldState);
+            if (restart) {
+                if (auto result = this->changeStateTo(REQUESTED_STOP); !result) {
+                    return std::unexpected(result.error());
+                }
+            }
+            {
+                std::lock_guard guard(_pendingExchangeMutex);
+                // the generation is this stop's own; a later one cancels the restart
+                _pendingExchange = PendingExchange{std::move(newGraph), option, restart, gr::atomic_ref(_nStopRequests).load_acquire()};
+            }
+            return meta::indirect<Graph>{};
+        }
+
         if (lifecycle::isActive(oldState)) { // need to stop running scheduler
             if (auto result = this->changeStateTo(REQUESTED_STOP); !result) {
                 return std::unexpected(result.error());
@@ -678,10 +719,18 @@ protected:
 
         nRunningJobs->incrementAndGet();
         nRunningJobs->notify_all();
-        on_scope_exit decrementRunningJobs = [&nRunningJobs] {
-            std::ignore = nRunningJobs->subAndGet(1UZ);
+        on_scope_exit decrementRunningJobs = [this, &nRunningJobs] {
+            const std::size_t nRemaining = nRunningJobs->subAndGet(1UZ);
             nRunningJobs->notify_all();
+            if (nRemaining == 0UZ) { // exactly one thread observes zero -- it owns any deferred graph swap
+                this->applyPendingExchange();
+            }
         };
+
+        // runs out before decrementRunningJobs, so applyPendingExchange() is not seen as on-worker
+        const void*   previousActiveScheduler = std::exchange(tActiveSchedulerWorker, static_cast<const void*>(this));
+        on_scope_exit restoreActiveScheduler  = [previousActiveScheduler] { tActiveSchedulerWorker = previousActiveScheduler; };
+
         gr::thread_pool::thread::setThreadName(std::format("pW{}-{}", runnerID, gr::meta::shorten_type_name(this->unique_name)));
 
         [[maybe_unused]] auto profiler_handler = _profiler.forThisThread();
@@ -789,6 +838,33 @@ protected:
         } while (lifecycle::isActive(activeState));
     }
 
+    // performs a graph swap that exchange() had to defer because it was requested from a scheduler worker
+    void applyPendingExchange() {
+        using enum lifecycle::State;
+
+        PendingExchange pending;
+        {
+            std::lock_guard guard(_pendingExchangeMutex);
+            if (!_pendingExchange.has_value()) {
+                return;
+            }
+            pending = std::move(*_pendingExchange);
+            _pendingExchange.reset();
+        }
+
+        if (this->state() == REQUESTED_STOP) {
+            this->emitErrorMessageIfAny("applyPendingExchange() -> STOPPED", this->changeStateTo(STOPPED));
+        }
+        if (auto result = exchange(std::move(pending.graph), pending.option); !result) {
+            this->emitErrorMessage("applyPendingExchange()", result.error());
+            return;
+        }
+        if (pending.restart && gr::atomic_ref(_nStopRequests).load_acquire() == pending.stopGeneration) {
+            this->emitErrorMessageIfAny("applyPendingExchange() -> INITIALISED", this->changeStateTo(INITIALISED));
+            this->emitErrorMessageIfAny("applyPendingExchange() -> RUNNING", this->changeStateTo(RUNNING));
+        }
+    }
+
     void runWatchDog(std::size_t timeOut_ms, std::size_t timeOut_count) {
         on_scope_exit _ = [this] {
             gr::atomic_ref(_nWatchdogsRunning).fetch_sub(1UZ);
@@ -847,6 +923,7 @@ protected:
 
     void stop() {
         using enum lifecycle::State;
+        gr::atomic_ref(_nStopRequests).fetch_add(1UZ);
         graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) {
             if (block->blockCategory() == ScheduledBlockGroup) {
                 auto* schedulerModel = dynamic_cast<SchedulerModel*>(block.get());
