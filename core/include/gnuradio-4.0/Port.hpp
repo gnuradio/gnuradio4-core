@@ -639,7 +639,11 @@ struct Port {
         [[nodiscard]] static constexpr std::ptrdiff_t relIndex(std::size_t abs, std::size_t base) noexcept { return abs >= base ? static_cast<std::ptrdiff_t>(abs - base) : -static_cast<std::ptrdiff_t>(base - abs); }
 
         auto getTagsInRange(std::size_t nSamples, TagReaderType& reader, std::size_t currentStreamOffset) {
-            const auto tags = reader.get(reader.available());
+            const std::size_t nAvailableTags = reader.available();
+            if (nAvailableTags == 0UZ) [[likely]] {
+                return reader.get(0UZ);
+            }
+            const auto tags = reader.get(nAvailableTags);
             const auto it   = std::ranges::find_if_not(tags, [nSamples, currentStreamOffset](const auto& tag) { return tag.index < currentStreamOffset + nSamples; });
             const auto n    = static_cast<std::size_t>(std::distance(tags.begin(), it));
             return reader.get(n);
