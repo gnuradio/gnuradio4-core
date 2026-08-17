@@ -70,6 +70,9 @@ echo 1 | sudo tee /sys/block/zram0/reset
   block-registration translation units; bounds per-TU compile time and memory (0 = one TU
   per `GR_REGISTER_BLOCK` line).
 - **`GR_BLOCKLIB_PCH`** (default: ON): precompiled headers for the generated registration TUs.
+- **`GR_BLOCKLIB_BUILD_LIBS`** (default: ON): OFF skips the compiled block-registration libraries
+  entirely (headers-only install) — for consumers that instantiate blocks directly and never use
+  the runtime `BlockRegistry`, this removes almost the entire block-library build cost.
 - **`ADDRESS_SANITIZER`** (default: OFF): enables AddressSanitizer (can’t be combined with the other sanitizer options).
 - **`UB_SANITIZER`** (default: OFF): enables 'Undefined Behavior' checks.
 - **`THREAD_SANITIZER`** (default: OFF): enables threading checks (N.B. strong impact on performance).

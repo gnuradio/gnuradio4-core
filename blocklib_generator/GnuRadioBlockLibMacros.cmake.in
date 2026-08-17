@@ -11,6 +11,19 @@ set(GR_BLOCKLIB_MAX_REGISTRATIONS_PER_TU
 # invisible to consumers). Roughly -20% per TU with GCC, -65% with Clang (-fpch-instantiate-templates).
 option(GR_BLOCKLIB_PCH "Use precompiled headers for generated block-registration translation units" ON)
 
+# headers-only mode: skip building the compiled block-registration libraries entirely.
+# Consumers that instantiate blocks directly (emplaceBlock<T>) and never use the runtime
+# BlockRegistry only need the installed headers — with OFF, none of the generated
+# registration TUs are compiled, which removes almost the entire build cost of a blocklib.
+#
+# The contract that follows from that, in full: with OFF the installed headers support direct and
+# static use of every block in the library — naming the type, emplaceBlock<T>, and anything built
+# on those — while runtime discovery and construction by registry key are unavailable for those
+# blocks, because the registration units that would enter them into a BlockRegistry are the units
+# that are not compiled. A consumer that resolves blocks by name at runtime, loads plugins, or
+# builds a graph from a saved description needs this ON.
+option(GR_BLOCKLIB_BUILD_LIBS "Build the compiled block registration libraries (OFF = install headers only)" ON)
+
 function(gr_detail_append_file_to MERGE_OUTPUT_FILE MERGE_INPUT_FILE)
   file(READ ${MERGE_INPUT_FILE} CONTENTS)
   file(APPEND ${MERGE_OUTPUT_FILE} "${CONTENTS}")
@@ -206,6 +219,11 @@ function(gr_add_block_library LIB_NAME)
         return()
     endif()
 
+    if(NOT GR_BLOCKLIB_BUILD_LIBS)
+        message(STATUS "GR_BLOCKLIB_BUILD_LIBS is Off, skipping compiled block library ${LIB_NAME} (headers-only)")
+        return()
+    endif()
+
     set(options "SPLIT_BLOCK_INSTANTIATIONS" "MAKE_SHARED_LIBRARY" "MAKE_STATIC_LIBRARY")
     set(oneValueArgs REGISTRY_HEADER REGISTRY_INSTANCE MAX_REGISTRATIONS_PER_TU)
     set(multiValueArgs HEADERS SOURCES LINK_LIBRARIES)
@@ -300,6 +318,11 @@ function(gr_add_block_plugin LIB_NAME)
 
     if(DEFINED INTERNAL_ENABLE_BLOCK_PLUGINS AND NOT ${INTERNAL_ENABLE_BLOCK_PLUGINS})
         message(WARNING "INTERNAL_ENABLE_BLOCK_PLUGINS is set to Off, not generating plugin ${LIB_NAME}")
+        return()
+    endif()
+
+    if(NOT GR_BLOCKLIB_BUILD_LIBS)
+        message(STATUS "GR_BLOCKLIB_BUILD_LIBS is Off, skipping block plugin ${LIB_NAME} (headers-only)")
         return()
     endif()
 
