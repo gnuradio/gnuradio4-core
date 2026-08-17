@@ -133,9 +133,38 @@ const boost::ut::suite<"scheduler graph exchange"> schedulerExchangeTests = [] {
 
         expect(qa_exchange::awaitFlag(swapReturned)) << "exchange() never returned from the worker thread";
         expect(qa_exchange::awaitState(scheduler, RUNNING)) << "the deferred swap never restarted the scheduler";
+        expect(qa_exchange::awaitCount(qa_exchange::gSecondGraphSamples, 1UZ)) << "the exchanged-in graph never processed samples";
 
         expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
         expect(qa_exchange::awaitState(scheduler, STOPPED)) << "scheduler did not settle after the swap";
+    };
+
+    "a restarted scheduler runs the graph it was given last"_test = [] {
+        qa_exchange::gFirstGraphSamples  = 0UZ;
+        qa_exchange::gSecondGraphSamples = 0UZ;
+
+        qa_exchange::TestScheduler scheduler;
+
+        gr::Graph first;
+        auto&     firstSource = first.emplaceBlock<qa_exchange::SwapRequester>();
+        auto&     firstSink   = first.emplaceBlock<qa_exchange::FirstSink>();
+        expect(first.connect<"out", "in">(firstSource, firstSink).has_value());
+
+        expect(scheduler.exchange(std::move(first)).has_value());
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(qa_exchange::awaitCount(qa_exchange::gFirstGraphSamples, 1UZ)) << "first graph never ran";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_exchange::awaitState(scheduler, STOPPED)) << "first graph did not stop";
+
+        expect(scheduler.exchange(qa_exchange::makeSecondGraph()).has_value());
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(qa_exchange::awaitCount(qa_exchange::gSecondGraphSamples, 1UZ)) << "the second graph's blocks never ran";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_exchange::awaitState(scheduler, STOPPED)) << "second graph did not stop";
     };
 };
 
