@@ -689,11 +689,9 @@ struct Port {
                 return;
             }
 
+            // TODO(error handling): surface this to the scheduler as a port-status flag instead of stderr
             if (tagsPublished >= tags.size()) {
-                // TODO(error handling): Decide how to surface failures.
-                // Option A: throw an exception, but this function is marked noexcept—either remove noexcept or avoid throwing.
-                // Option B: return an error (or set a port-status flag) that the Scheduler can observe and handle accordingly.
-                // std::println("Tags buffer is full (published:{}, size:{}), can not process tag publishing, tagOffset:{}, tagData:{}", tagsPublished, tags.size(), tagOffset, tagData);
+                std::println(stderr, "gr::Port: tag buffer full (published: {}, size: {}), dropping tag at offset {}", tagsPublished, tags.size(), tagOffset);
                 return;
             }
             const auto index = streamIndex + tagOffset;
