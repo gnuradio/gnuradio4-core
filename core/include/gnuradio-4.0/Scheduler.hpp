@@ -1421,25 +1421,26 @@ struct Simple : SchedulerBase<Simple<execution, TProfiler>, execution, TProfiler
         this->_adoptionBlocks.resize(n_batches);
         this->_executionOrder->clear();
         this->_executionOrder->reserve(n_batches);
+        // contiguous slices keep chain neighbors on the same worker
+        const std::span<const std::shared_ptr<BlockModel>> allBlocks = flatGraph.blocks();
         for (std::size_t i = 0; i < n_batches; i++) {
-            // create job-set for thread
-            auto& job = this->_executionOrder->emplace_back(std::vector<std::shared_ptr<BlockModel>>());
-            job.reserve(nBlocks / n_batches + 1);
-            for (std::size_t j = i; j < nBlocks; j += n_batches) {
-                job.push_back(flatGraph.blocks()[j]);
-            }
+            const std::size_t first = i * nBlocks / n_batches;
+            const std::size_t last  = (i + 1UZ) * nBlocks / n_batches;
+            auto&             job   = this->_executionOrder->emplace_back(std::vector<std::shared_ptr<BlockModel>>());
+            job.assign(allBlocks.begin() + static_cast<std::ptrdiff_t>(first), allBlocks.begin() + static_cast<std::ptrdiff_t>(last));
         }
     }
 };
 
 namespace detail {
+// contiguous slices keep chain neighbors on the same worker
 inline JobLists batchBlocks(const std::vector<std::shared_ptr<BlockModel>>& blocks, std::size_t n_batches) {
-    JobLists result(n_batches);
+    JobLists          result(n_batches);
+    const std::size_t nBlocks = blocks.size();
     for (std::size_t batch = 0UZ; batch < n_batches; ++batch) {
-        result[batch].reserve(blocks.size() / n_batches + 1UZ);
-        for (std::size_t i = batch; i < blocks.size(); i += n_batches) {
-            result[batch].push_back(blocks[i]);
-        }
+        const std::size_t first = batch * nBlocks / n_batches;
+        const std::size_t last  = (batch + 1UZ) * nBlocks / n_batches;
+        result[batch].assign(blocks.begin() + static_cast<std::ptrdiff_t>(first), blocks.begin() + static_cast<std::ptrdiff_t>(last));
     }
     return result;
 }
