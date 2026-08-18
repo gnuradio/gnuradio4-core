@@ -667,8 +667,9 @@ private:
                     return false;
                 }
             }
-            _parent->_readIndexCached += nSamples;
-            _parent->_readIndex->setValue(_parent->_readIndexCached); // store(release) — each Reader is the sole writer of its _readIndex
+            const std::size_t nextReadIndex = gr::atomic_ref(_parent->_readIndexCached).load_relaxed() + nSamples;
+            gr::atomic_ref(_parent->_readIndexCached).store_relaxed(nextReadIndex);
+            _parent->_readIndex->setValue(nextReadIndex); // store(release) — each Reader is the sole writer of its _readIndex
             if constexpr (producerType == ProducerType::Single) {
                 if (gr::atomic_ref(_parent->_buffer->_reader_count).load_acquire() > 2) {
 #if defined(__x86_64__) || defined(__i386__)
@@ -694,19 +695,21 @@ private:
         using BufferTypeLocal = std::shared_ptr<BufferImpl>;
 
         std::shared_ptr<Sequence> _readIndex = std::make_shared<Sequence>();
-        std::size_t               _readIndexCached;
-        BufferTypeLocal           _buffer; // controls buffer life-cycle, the rest are cache optimisations
-        std::size_t               _nSamplesFirstGet{std::numeric_limits<std::size_t>::max()};
-        mutable std::size_t       _instanceCount{0UZ}; // tracks live ReaderSpan copies (needed by invokeProcessBulk)
-        std::size_t               _nRequestedSamplesToConsume{std::numeric_limits<std::size_t>::max()};
-        std::size_t               _nSamplesConsumed{0UZ};
+        // read position of the sole consuming thread, but observers on other threads poll it through
+        // available()/position() -- atomic so those polls are defined rather than a data race
+        mutable std::size_t _readIndexCached;
+        BufferTypeLocal     _buffer; // controls buffer life-cycle, the rest are cache optimisations
+        std::size_t         _nSamplesFirstGet{std::numeric_limits<std::size_t>::max()};
+        mutable std::size_t _instanceCount{0UZ}; // tracks live ReaderSpan copies (needed by invokeProcessBulk)
+        std::size_t         _nRequestedSamplesToConsume{std::numeric_limits<std::size_t>::max()};
+        std::size_t         _nSamplesConsumed{0UZ};
 
         constexpr void                      incInstanceCount() const noexcept { _instanceCount++; }
         constexpr void                      decInstanceCount() const noexcept { _instanceCount--; }
         [[nodiscard]] constexpr bool        isLastInstance() const noexcept { return _instanceCount == 0; }
         [[nodiscard]] constexpr std::size_t instanceCount() const noexcept { return _instanceCount; }
 
-        std::size_t bufferIndex() const noexcept { return _buffer->calculateIndex(_readIndexCached); }
+        std::size_t bufferIndex() const noexcept { return _buffer->calculateIndex(gr::atomic_ref(_readIndexCached).load_relaxed()); }
 
     public:
         Reader() = delete;
@@ -714,7 +717,7 @@ private:
             gr::detail::addSequences(_buffer->_claimStrategy._readSequences, _buffer->_claimStrategy._publishCursor, {_readIndex});
             _buffer->_claimStrategy.notifyReaderSetChanged();
             gr::atomic_ref(_buffer->_reader_count).fetch_add(1UZ);
-            _readIndexCached = _readIndex->value();
+            gr::atomic_ref(_readIndexCached).store_relaxed(_readIndex->value());
         }
 
         Reader(Reader&& other) noexcept
@@ -777,9 +780,9 @@ private:
             return ReaderSpan<U, policy>(this, bufferIndex(), nSamples);
         }
 
-        [[nodiscard]] constexpr std::size_t position() const noexcept { return _readIndexCached; }
+        [[nodiscard]] std::size_t position() const noexcept { return gr::atomic_ref(_readIndexCached).load_relaxed(); }
 
-        [[nodiscard]] constexpr std::size_t available() const noexcept { return _buffer->_claimStrategy._publishCursor.value() - _readIndexCached; }
+        [[nodiscard]] std::size_t available() const noexcept { return _buffer->_claimStrategy._publishCursor.value() - gr::atomic_ref(_readIndexCached).load_relaxed(); }
     }; // class Reader
 
     [[nodiscard]] constexpr static Allocator DefaultAllocator() {
