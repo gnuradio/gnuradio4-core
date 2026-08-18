@@ -833,11 +833,10 @@ protected:
                         }
                     }
                 }
-            } else if (activeState == PAUSED) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms));
-                msgToCount = 0UZ;
-            } else { // other states
-                std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms));
+            } else {                                    // PAUSED or any other non-RUNNING state
+                if (lifecycle::isActive(activeState)) { // a terminal state ends the loop below, do not sleep it out
+                    sleepUntilStateChanges(activeState);
+                }
                 msgToCount = 0UZ;
             }
 
@@ -851,7 +850,8 @@ protected:
                 }
 
                 currentProgress = progressAfter;
-                if (inactiveCycleCount > timeout_inactivity_count) {
+                // parking in a non-RUNNING state would hold the worker until the watchdog's next progress bump
+                if (activeState == RUNNING && inactiveCycleCount > timeout_inactivity_count) {
                     // allow a scheduler process to wait on progress before retrying (N.B. intended to save CPU/battery power)
                     // N.B. a watchdog will periodically update the progress to check for non-responsive blocks.
                     waitUntilChanged(*progress, currentProgress, timeout_ms);
@@ -880,6 +880,19 @@ protected:
         if (pending.restart && gr::atomic_ref(_nStopRequests).load_acquire() == pending.stopGeneration) {
             this->emitErrorMessageIfAny("applyPendingExchange() -> INITIALISED", this->changeStateTo(INITIALISED));
             this->emitErrorMessageIfAny("applyPendingExchange() -> RUNNING", this->changeStateTo(RUNNING));
+        }
+    }
+
+    // chunked so a lifecycle change is picked up within a chunk instead of at the end of a full timeout_ms
+    // sleep; only reached when the scheduler is not RUNNING, so it does not touch the idle-worker CPU path
+    void sleepUntilStateChanges(lifecycle::State observedState) {
+        constexpr auto kChunk   = std::chrono::milliseconds(1);
+        const auto     deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms.value);
+        while (std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(kChunk);
+            if (this->state() != observedState) {
+                return;
+            }
         }
     }
 
@@ -939,9 +952,17 @@ protected:
         } while (_nRunningJobs->value() > 0UZ);
     }
 
+    // a worker parked in waitUntilChanged(progress) only wakes on progress, so a lifecycle change must
+    // bump it -- otherwise the wait runs until the watchdog's next tick
+    void wakeProgressWaiters() {
+        _graph->_progress->incrementAndGet();
+        _graph->_progress->notify_all();
+    }
+
     void stop() {
         using enum lifecycle::State;
         gr::atomic_ref(_nStopRequests).fetch_add(1UZ);
+        wakeProgressWaiters();
         graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) {
             if (block->blockCategory() == ScheduledBlockGroup) {
                 auto* schedulerModel = dynamic_cast<SchedulerModel*>(block.get());
@@ -966,6 +987,7 @@ protected:
 
     void pause() {
         using enum lifecycle::State;
+        wakeProgressWaiters();
         graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) {
             this->emitErrorMessageIfAny("pause() -> LifecycleState", block->changeStateTo(REQUESTED_PAUSE));
             if (!block->isBlocking()) { // N.B. no other thread/constraint to consider before shutting down
@@ -980,6 +1002,7 @@ protected:
 
     void resume() {
         using enum lifecycle::State;
+        wakeProgressWaiters();
         {
             WorkQuiescenceGuard quiescence(this);
             auto                result = connectPendingEdges();
