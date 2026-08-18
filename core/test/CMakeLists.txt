@@ -27,6 +27,7 @@ set(_CORE_TESTS
     qa_BlockRegistration
     qa_ComputeDomain
     qa_DataSet
+    qa_DestructionSafety
     qa_DynamicPort
     qa_GraphEdit
     qa_LifeCycle
@@ -76,6 +77,7 @@ endforeach()
 
 # regression tests for control-plane wedges: a failure shows up as a hang, so cap them
 set(_CORE_DEADLOCK_TESTS
+    qa_DestructionSafety
     qa_GraphEdit
     qa_MessagePlane
     qa_SchedulerExchange
