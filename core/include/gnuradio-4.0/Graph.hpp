@@ -12,6 +12,7 @@
 #include <gnuradio-4.0/thread/thread_pool.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <map>
 #include <tuple>
 #include <variant>
@@ -103,6 +104,24 @@ namespace graph {
 inline static constexpr std::size_t  defaultMinBufferSize(bool isArithmeticLike) { return isArithmeticLike ? 65536UZ : 64UZ; }
 inline static constexpr std::int32_t defaultWeight   = 0;
 inline static const std::string      defaultEdgeName = "unnamed edge"; // Emscripten doesn't want constexpr strings
+
+inline constexpr double      kDefaultEdgeBufferSeconds = 0.05;
+inline constexpr std::size_t kMinEdgeBufferSize        = 1UZ << 15;
+inline constexpr std::size_t kMaxEdgeBufferSize        = 1UZ << 22;
+
+/**
+ * @brief Samples an edge carrying @p sampleRate should hold to buffer @p seconds of stream.
+ *
+ * defaultMinBufferSize()'s fixed 65536 samples is 27 ms at 2.4 MS/s and under 3 ms at 24 MS/s, so a
+ * ring long enough to ride out the scheduler's wake-up jitter at one rate is short at a higher one.
+ * Here the duration is fixed and the count follows the rate, rounded up to a power of two and clamped
+ * at both ends against single-chunk rings at very low rates and needless latency at very high ones.
+ */
+[[nodiscard]] inline constexpr std::size_t edgeBufferSizeFor(double sampleRate, double seconds = kDefaultEdgeBufferSeconds) noexcept {
+    const double      wanted = sampleRate > 0.0 && seconds > 0.0 ? sampleRate * seconds : 0.0;
+    const std::size_t count  = wanted >= static_cast<double>(kMaxEdgeBufferSize) ? kMaxEdgeBufferSize : static_cast<std::size_t>(wanted);
+    return std::bit_ceil(std::clamp(count, kMinEdgeBufferSize, kMaxEdgeBufferSize));
+}
 
 inline std::string format(GraphLike auto const& graph) {
     std::ostringstream os;
