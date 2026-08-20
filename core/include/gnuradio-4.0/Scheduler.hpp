@@ -707,15 +707,26 @@ protected:
         waitDone(); // a stop only publishes STOPPED -- the previous generation of workers may still be unwinding
         assert(_executionOrder != nullptr && !_executionOrder->empty());
         if constexpr (executionPolicy() == ExecutionPolicy::singleThreaded || executionPolicy() == ExecutionPolicy::singleThreadedBlocking) {
+            _nRunningJobs->incrementAndGet();
+            _nRunningJobs->notify_all();
             static_cast<Derived*>(this)->poolWorker(0UZ, _executionOrder);
         } else { // run on processing thread pool
             [[maybe_unused]] const auto pe           = _profilerHandler->startCompleteEvent("scheduler_base.runOnPool");
             auto                        jobListsCopy = _executionOrder;
-            for (std::size_t runnerID = 0UZ; runnerID < _executionOrder->size(); runnerID++) {
-                _pool->execute([this, runnerID, jobListsCopy]() { static_cast<Derived*>(this)->poolWorker(runnerID, jobListsCopy); });
-            }
-            if (!_executionOrder->empty()) {
-                _nRunningJobs->wait(0UZ); // waits until at least one pool worker started
+            const std::size_t           nWorkers     = jobListsCopy->size();
+
+            // the whole generation is counted before any of it is queued, so waitDone() also covers the
+            // workers the pool has not started yet
+            std::ignore = _nRunningJobs->addAndGet(nWorkers);
+            _nRunningJobs->notify_all();
+            for (std::size_t runnerID = 0UZ; runnerID < nWorkers; runnerID++) {
+                try {
+                    _pool->execute([this, runnerID, jobListsCopy]() { static_cast<Derived*>(this)->poolWorker(runnerID, jobListsCopy); });
+                } catch (...) { // a rejected task never decrements, and the leaked count spins waitDone() forever
+                    std::ignore = _nRunningJobs->subAndGet(nWorkers - runnerID);
+                    _nRunningJobs->notify_all();
+                    throw;
+                }
             }
         }
         if constexpr (requires(Derived& d) { d.customStart(); }) {
@@ -728,9 +739,7 @@ protected:
         std::shared_ptr<gr::Sequence> progress     = _graph->_progress; // life-time guaranteed
         std::shared_ptr<gr::Sequence> nRunningJobs = _nRunningJobs;
 
-        nRunningJobs->incrementAndGet();
-        nRunningJobs->notify_all();
-        on_scope_exit decrementRunningJobs = [this, &nRunningJobs] {
+        on_scope_exit decrementRunningJobs = [this, &nRunningJobs] { // start() counted this worker in before queueing it
             // claim before releasing the job count, so ~SchedulerBase()'s waitDone() cannot run ahead of the swap
             std::optional<PendingExchange> claimed;
             {
