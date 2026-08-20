@@ -1,5 +1,6 @@
 #include <boost/ut.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <thread>
 
@@ -79,6 +80,40 @@ struct FailingSource : gr::Block<FailingSource> {
         outSpan.publish(nPublish);
         return gr::work::Status::OK;
     }
+};
+
+// the start()/stop() hooks of a start-then-stop cycle, observed from the requesting thread
+inline std::atomic<int> gStartHooks{0};
+inline std::atomic<int> gStopHooks{0};
+
+struct RaceSource : gr::Block<RaceSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(RaceSource, out);
+
+    void start() {
+        gStartHooks.fetch_add(1, std::memory_order_release);
+        gStartHooks.notify_all();
+    }
+
+    void stop() { gStopHooks.fetch_add(1, std::memory_order_relaxed); }
+
+    [[nodiscard]] constexpr float processOne() const noexcept { return 1.0f; }
+};
+
+struct RaceSink : gr::Block<RaceSink> {
+    gr::PortIn<float> in;
+
+    GR_MAKE_REFLECTABLE(RaceSink, in);
+
+    void start() {
+        gStartHooks.fetch_add(1, std::memory_order_release);
+        gStartHooks.notify_all();
+    }
+
+    void stop() { gStopHooks.fetch_add(1, std::memory_order_relaxed); }
+
+    void processOne(float) {}
 };
 
 struct SelfStoppingSource : gr::Block<SelfStoppingSource> {
@@ -219,6 +254,57 @@ const boost::ut::suite<"block stop hook on terminal paths"> stopHookTests = [] {
 
         expect(eq(source._nStopCalls, 1)) << "the REQUESTED_STOP path must not fire stop() a second time on the way to STOPPED";
         expect(eq(sink._nStopCalls, 1));
+    };
+};
+
+const boost::ut::suite<"stop requested during the start transient"> startStopRaceTests = [] {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    "a stop landing inside start() still runs the blocks' stop lifecycle"_test = [] {
+        constexpr int nCycles = 64;
+
+        std::size_t nCyclesLeftActive  = 0UZ;
+        std::size_t nCyclesInError     = 0UZ;
+        std::size_t nCyclesMissingStop = 0UZ;
+
+        for (int cycle = 0; cycle < nCycles; ++cycle) {
+            gr::Graph flow;
+            auto&     source = flow.emplaceBlock<qa_sched::RaceSource>();
+            auto&     sink   = flow.emplaceBlock<qa_sched::RaceSink>();
+            expect(flow.connect<"out", "in">(source, sink).has_value());
+
+            qa_sched::TestScheduler scheduler;
+            expect(scheduler.exchange(std::move(flow)).has_value());
+
+            qa_sched::gStartHooks.store(0, std::memory_order_release);
+            qa_sched::gStopHooks.store(0, std::memory_order_release);
+
+            std::jthread runner([&scheduler] { std::ignore = scheduler.runAndWait(); });
+
+            // every block is RUNNING once both start() hooks have run, so the stop below lands while
+            // start() is dispatching its pool workers
+            for (int seen = qa_sched::gStartHooks.load(std::memory_order_acquire); seen < 2; seen = qa_sched::gStartHooks.load(std::memory_order_acquire)) {
+                qa_sched::gStartHooks.wait(seen);
+            }
+            scheduler.requestStop();
+
+            runner.join();
+
+            if (qa_sched::gStopHooks.load(std::memory_order_acquire) != 2) {
+                nCyclesMissingStop++;
+            }
+            if (gr::lifecycle::isActive(scheduler.state())) {
+                nCyclesLeftActive++;
+            }
+            if (scheduler.state() == ERROR) {
+                nCyclesInError++;
+            }
+        }
+
+        expect(eq(nCyclesMissingStop, 0UZ)) << "cycles in which a block's stop() hook was skipped";
+        expect(eq(nCyclesLeftActive, 0UZ)) << "cycles that left the scheduler in an active state";
+        expect(eq(nCyclesInError, 0UZ)) << "cycles in which a worker drove the scheduler to ERROR";
     };
 };
 
