@@ -898,13 +898,14 @@ gr::Graph flatten(GraphLike auto const& root, std::source_location location = st
     return flattenedGraph;
 }
 
+// keyed on the resolved port, because one port named by index and by name is two PortDefinitions
 using AdjacencyList = std::unordered_map<std::shared_ptr<gr::BlockModel>, //
-    std::unordered_map<gr::PortDefinition, std::vector<const gr::Edge*>>>;
+    std::unordered_map<const gr::DynamicPort*, std::vector<const gr::Edge*>>>;
 
 AdjacencyList computeAdjacencyList(const GraphLike auto& root) {
     AdjacencyList result;
     for (const gr::Edge& edge : root.edges()) {
-        std::vector<const gr::Edge*>& srcMapPort = result[edge.sourceBlock()][edge.sourcePortDefinition()];
+        std::vector<const gr::Edge*>& srcMapPort = result[edge.sourceBlock()][edge.sourceBlock()->dynamicOutputPort(edge.sourcePortDefinition()).value_or(nullptr)];
         srcMapPort.push_back(std::addressof(edge));
     }
     return result;
@@ -1007,7 +1008,7 @@ std::vector<gr::Graph> weaklyConnectedComponents(const GraphLike auto& graph) {
 
 inline std::span<const gr::Edge* const> outgoingEdges(const AdjacencyList& adj, const std::shared_ptr<gr::BlockModel>& block, const gr::PortDefinition& port) {
     if (auto it = adj.find(block); it != adj.end()) {
-        if (auto pit = it->second.find(port); pit != it->second.end()) {
+        if (auto pit = it->second.find(block->dynamicOutputPort(port).value_or(nullptr)); pit != it->second.end()) {
             return std::span(pit->second);
         }
     }
@@ -1205,7 +1206,7 @@ struct std::formatter<gr::graph::AdjacencyList> {
 
         for (const auto& [srcBlock, portMap] : adj) {
             for (const auto& [srcPort, edges] : portMap) {
-                out = std::format_to(out, "{}:{}\n", getName(srcBlock), srcPort);
+                out = std::format_to(out, "{}:{}\n", getName(srcBlock), srcPort == nullptr ? std::string_view{"<unresolved>"} : std::string_view{srcPort->metaInfo.name});
                 for (const gr::Edge* edge : edges) {
                     if (formatSpecifier == 'l') {
                         out = std::format_to(out, "    → {:l}\n", *edge);

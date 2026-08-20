@@ -171,6 +171,23 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         runMixedFanOut(false);
     };
 
+    "a mixed-style fan-out is one adjacency-list entry"_test = [] {
+        gr::Graph flow;
+        auto&     source      = flow.emplaceBlock<qa_edit::Source>();
+        auto&     typedSink   = flow.emplaceBlock<qa_edit::Sink>();
+        auto&     dynamicSink = flow.emplaceBlock<qa_edit::Sink>();
+        expect(flow.connect<"out", "in">(source, typedSink).has_value());
+        expect(flow.connect(source, gr::PortDefinition("out"), dynamicSink, gr::PortDefinition("in")).has_value());
+
+        const gr::graph::AdjacencyList         adjacencyList = gr::graph::computeAdjacencyList(flow);
+        const std::shared_ptr<gr::BlockModel>& sourceModel   = flow.blocks().front();
+
+        expect(fatal(adjacencyList.contains(sourceModel)));
+        expect(eq(adjacencyList.at(sourceModel).size(), 1UZ)) << "one output port must not occupy two entries";
+        expect(eq(gr::graph::outgoingEdges(adjacencyList, sourceModel, gr::PortDefinition("out")).size(), 2UZ)) << "the name-addressed query missed an edge";
+        expect(eq(gr::graph::outgoingEdges(adjacencyList, sourceModel, gr::PortDefinition(0UZ)).size(), 2UZ)) << "the index-addressed query missed an edge";
+    };
+
     "removing one edge of a fan-out leaves the sibling flowing and stays removed"_test = [] {
         gr::Graph flow;
         auto&     source = flow.emplaceBlock<qa_edit::Source>();
