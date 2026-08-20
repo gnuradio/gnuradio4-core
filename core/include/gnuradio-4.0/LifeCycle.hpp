@@ -126,7 +126,7 @@ enum class StorageType { ATOMIC, NON_ATOMIC };
  * If implemented in TDerived, the following specific lifecycle methods are called:
  * - `init()`   when transitioning from IDLE to INITIALISED
  * - `start()`  when transitioning from INITIALISED to RUNNING
- * - `stop()`   when transitioning from any `isActive(State)` to REQUESTED_STOP
+ * - `stop()`   when transitioning to REQUESTED_STOP, or from any `isActive(State)` to ERROR
  * - `pause()`  when transitioning from RUNNING to REQUESTED_PAUSE
  * - `resume()` when transitioning from PAUSED to RUNNING
  * - `reset()`  when transitioning from any state (typically ERROR or STOPPED) to INITIALISED.
@@ -268,7 +268,7 @@ public:
                 }
             }
             if constexpr (requires(TDerived& d) { d.stop(); }) {
-                if (newState == State::REQUESTED_STOP) {
+                if (newState == State::REQUESTED_STOP || (newState == State::ERROR && isActive(oldState))) {
                     return invokeLifecycleMethod(&TDerived::stop, location);
                 }
             }
