@@ -814,6 +814,26 @@ const boost::ut::suite HistoryBufferTest = [] {
         expect(equal(cforward, std::vector{7, 6, 5, 4, 3}));
     };
 
+    "HistoryBuffer - windowed read after every push_front"_test = [] {
+        constexpr std::size_t capacity = 5UZ; // ring is bit_ceil(5) == 8, so the window wraps at a different offset each push
+
+        HistoryBuffer<int> hb(capacity);
+        const auto&        const_hb = hb;
+        std::vector<int>   expected;
+
+        for (int i = 1; i <= 40; ++i) {
+            hb.push_front(i);
+            expected.insert(expected.begin(), i);
+            if (expected.size() > capacity) {
+                expected.pop_back();
+            }
+
+            const auto window = const_hb.get_span(0);
+            expect(eq(window.size(), expected.size()));
+            expect(std::equal(window.begin(), window.end(), expected.begin(), expected.end())) << std::format("push {}: got [{}], expected [{}]", i, gr::join(window, ", "), gr::join(expected, ", "));
+        }
+    };
+
     "HistoryBuffer - interleaved push_front and push_back"_test = [] {
         auto equal = [](const auto& range1, const auto& range2) { return std::equal(range1.begin(), range1.end(), range2.begin(), range2.end()); };
 
