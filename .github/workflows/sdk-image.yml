@@ -63,6 +63,15 @@ jobs:
             cxx: clang++
             cmake_build_type: Debug
             cmake_flags: -DADDRESS_SANITIZER=ON
+          - name: Ubuntu 24.04 | Emscripten | Release
+            tag_suffix: ubuntu-24.04-emscripten-release
+            base_image: ghcr.io/gnuradio/ci:ubuntu-24.04-4.0-emscripten
+            sdk_target: emscripten
+            cc: emcc
+            cxx: em++
+            host_cxx: g++-14
+            cmake_build_type: Release
+            cmake_flags: -DADDRESS_SANITIZER=OFF
 
     steps:
       - uses: actions/checkout@v6
@@ -92,6 +101,8 @@ jobs:
             CXX=${{ matrix.cxx }}
             CMAKE_BUILD_TYPE=${{ matrix.cmake_build_type }}
             CMAKE_FLAGS=${{ matrix.cmake_flags }}
+            SDK_TARGET=${{ matrix.sdk_target || 'native' }}
+            HOST_CXX=${{ matrix.host_cxx || matrix.cxx }}
           tags: |
             ${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ matrix.tag_suffix }}
             ${{ env.IMAGE_NAME }}:main-${{ matrix.tag_suffix }}
@@ -118,4 +129,10 @@ jobs:
               ls -la /opt/gnuradio4/lib64
             fi
             find /opt/gnuradio4 -path "*/cmake/*" \( -name "*Config.cmake" -o -name "*Targets.cmake" \) -print -quit | grep .
+            if [ "${GR4_SDK_TARGET}" = emscripten ]; then
+              test -x /opt/gnuradio4/bin/gnuradio_4_0_parse_registrations
+              file /opt/gnuradio4/bin/gnuradio_4_0_parse_registrations | grep -q ELF
+              command -v emcc
+              command -v node
+            fi
           '

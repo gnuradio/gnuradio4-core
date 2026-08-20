@@ -419,6 +419,7 @@ set_project_warnings(gnuradio-options)
 if(EMSCRIPTEN)
   set(CMAKE_EXECUTABLE_SUFFIX ".js")
   # Make sure consumers of gnuradio4::gnuradio-options don't accidentally build with conflicting arguments
+  target_compile_definitions(gnuradio-options INTERFACE GR_MAX_WASM_THREAD_COUNT=${GR_MAX_WASM_THREAD_COUNT})
   target_compile_options(gnuradio-options INTERFACE -fexceptions -pthread)
   target_link_options(
     gnuradio-options
