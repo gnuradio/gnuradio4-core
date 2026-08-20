@@ -148,7 +148,7 @@ struct Edge {
     [[nodiscard]] property_map&       uiConstraints() noexcept { return *_uiConstraints; }
     [[nodiscard]] const property_map& uiConstraints() const { return *_uiConstraints; }
 
-    constexpr bool hasSameSourcePort(const Edge& other) const noexcept { return sourceBlock() == other.sourceBlock() && sourcePortDefinition().definition == other.sourcePortDefinition().definition; }
+    [[nodiscard]] bool hasSameSourcePort(const Edge& other) const;
 
     constexpr bool operator==(const Edge& other) const noexcept {
         return sourceBlock() == other.sourceBlock()                                                       //
@@ -562,6 +562,21 @@ public:
 
     [[nodiscard]] virtual std::expected<void, Error> exportPort(bool exportFlag, std::string_view uniqueBlockName, PortDirection portDirection, std::string_view portName, std::string_view exportedName, std::source_location location = std::source_location::current()) = 0;
 };
+
+// two edges may name one and the same output port by index or by name, so differing
+// PortDefinitions have to be resolved to port objects before they can be told apart
+inline bool Edge::hasSameSourcePort(const Edge& other) const {
+    if (!_sourceBlock || _sourceBlock != other._sourceBlock) {
+        return false;
+    }
+    if (_sourcePortDefinition.definition == other._sourcePortDefinition.definition) {
+        return true;
+    }
+
+    const auto port      = _sourceBlock->dynamicOutputPort(_sourcePortDefinition);
+    const auto otherPort = other._sourceBlock->dynamicOutputPort(other._sourcePortDefinition);
+    return port.has_value() && otherPort.has_value() && port.value() == otherPort.value();
+}
 
 namespace serialization_fields {
 using namespace std::string_view_literals;
