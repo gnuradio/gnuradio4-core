@@ -31,6 +31,23 @@ struct Source : gr::Block<Source> {
     [[nodiscard]] constexpr float processOne() const noexcept { return 1.0f; }
 };
 
+struct CountingSource : gr::Block<CountingSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(CountingSource, out);
+
+    static constexpr std::size_t kSamples = 4096UZ;
+
+    std::size_t _nProduced = 0UZ;
+
+    float processOne() {
+        if (++_nProduced >= kSamples) {
+            this->requestStop();
+        }
+        return 1.0f;
+    }
+};
+
 struct Sink : gr::Block<Sink> {
     gr::PortIn<float> in;
 
@@ -114,6 +131,44 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(eq(gain->value_or(0.0f), 4.5f)) << "the emplaced block kept its constructor default instead of the serialized value";
 
         expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+    };
+
+    "a fan-out mixing typed and dynamic connects feeds every consumer"_test = [] {
+        auto runMixedFanOut = [](bool typedFirst) {
+            const std::string order = typedFirst ? "typed edge first" : "dynamic edge first";
+
+            gr::Graph flow;
+            auto&     source      = flow.emplaceBlock<qa_edit::CountingSource>();
+            auto&     typedSink   = flow.emplaceBlock<qa_edit::Sink>();
+            auto&     dynamicSink = flow.emplaceBlock<qa_edit::Sink>();
+
+            const auto connectTyped   = [&] { return flow.connect<"out", "in">(source, typedSink).has_value(); };
+            const auto connectDynamic = [&] { return flow.connect(source, gr::PortDefinition("out"), dynamicSink, gr::PortDefinition("in")).has_value(); };
+
+            if (typedFirst) {
+                expect(connectTyped()) << order << ": the typed edge was not accepted";
+                expect(connectDynamic()) << order << ": the dynamic edge was not accepted";
+            } else {
+                expect(connectDynamic()) << order << ": the dynamic edge was not accepted";
+                expect(connectTyped()) << order << ": the typed edge was not accepted";
+            }
+
+            gr::scheduler::Simple scheduler;
+            expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+
+            std::thread runner([&scheduler] { std::ignore = scheduler.runAndWait(); });
+            for (std::size_t i = 0UZ; i < 2000UZ && (typedSink._nReceived == 0UZ || dynamicSink._nReceived == 0UZ); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            std::ignore = scheduler.changeStateTo(REQUESTED_STOP);
+            runner.join();
+
+            expect(gt(typedSink._nReceived, 0UZ)) << order << ": the index-addressed consumer of the fan-out received nothing";
+            expect(gt(dynamicSink._nReceived, 0UZ)) << order << ": the name-addressed consumer of the fan-out received nothing";
+        };
+
+        runMixedFanOut(true);
+        runMixedFanOut(false);
     };
 
     "removing one edge of a fan-out leaves the sibling flowing and stays removed"_test = [] {
