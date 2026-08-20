@@ -40,6 +40,23 @@ ghcr.io/<owner>/gnuradio4-core-sdk:<full-git-sha>-fedora-44-clang-release
 ghcr.io/<owner>/gnuradio4-core-sdk:main-fedora-44-clang-release
 ghcr.io/<owner>/gnuradio4-core-sdk:<full-git-sha>-fedora-44-clang-debug
 ghcr.io/<owner>/gnuradio4-core-sdk:main-fedora-44-clang-debug
+ghcr.io/<owner>/gnuradio4-core-sdk:<full-git-sha>-ubuntu-24.04-emscripten-release
+ghcr.io/<owner>/gnuradio4-core-sdk:main-ubuntu-24.04-emscripten-release
+```
+
+The Emscripten image carries the target SDK and the native registration parser
+in the same prefix. Configure downstream projects with `emcmake`, add the SDK
+prefix to both CMake search paths, and use the system Node executable for
+CTest:
+
+```sh
+system_node="$(command -v node)"
+emcmake cmake -S . -B build \
+  -DCMAKE_PREFIX_PATH=/opt/gnuradio4 \
+  -DCMAKE_FIND_ROOT_PATH=/opt/gnuradio4 \
+  -DCMAKE_CROSSCOMPILING_EMULATOR="${system_node}"
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
 ```
 
 Example downstream GitHub Actions usage:
