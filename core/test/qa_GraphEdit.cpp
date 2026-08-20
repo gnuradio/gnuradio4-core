@@ -1,6 +1,8 @@
 #include <boost/ut.hpp>
 
+#include <bit>
 #include <chrono>
+#include <cstddef>
 #include <format>
 #include <string>
 #include <thread>
@@ -258,6 +260,33 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         expect(scheduler.state() == STOPPED) << "the scheduler did not stop after the edit cycles";
+    };
+
+    "an edge sized by duration follows the sample rate"_test = [] {
+        using gr::graph::edgeBufferSizeFor;
+        using gr::graph::kDefaultEdgeBufferSeconds;
+        using gr::graph::kMaxEdgeBufferSize;
+        using gr::graph::kMinEdgeBufferSize;
+
+        constexpr double rates[] = {48.0e3, 2.4e6, 25.0e6, 61.44e6};
+        for (const double rate : rates) {
+            const std::size_t nSamples = edgeBufferSizeFor(rate);
+            expect(eq(nSamples, std::bit_ceil(nSamples))) << rate << ": the ring is not a power of two";
+            expect(ge(nSamples, kMinEdgeBufferSize)) << rate << ": the ring is below the floor";
+            expect(le(nSamples, kMaxEdgeBufferSize)) << rate << ": the ring is above the ceiling";
+            if (nSamples > kMinEdgeBufferSize && nSamples < kMaxEdgeBufferSize) {
+                expect(ge(static_cast<double>(nSamples) / rate, kDefaultEdgeBufferSeconds)) << rate << ": the ring holds less than the stated duration";
+                expect(lt(static_cast<double>(nSamples) / rate, 2.0 * kDefaultEdgeBufferSeconds)) << rate << ": rounding is the only excess allowed";
+            }
+        }
+
+        expect(gt(edgeBufferSizeFor(25.0e6), edgeBufferSizeFor(2.4e6))) << "ten times the rate must not give the same ring, which is what a fixed count does";
+        expect(eq(edgeBufferSizeFor(48.0e3), kMinEdgeBufferSize)) << "a rate too low to fill the smallest ring must get the smallest ring";
+        expect(eq(edgeBufferSizeFor(61.44e6), kMaxEdgeBufferSize)) << "a rate asking for more than the ceiling must be held at it";
+        expect(eq(edgeBufferSizeFor(0.0), kMinEdgeBufferSize)) << "an unknown rate must get the smallest ring, not an empty one";
+        expect(eq(edgeBufferSizeFor(-1.0), kMinEdgeBufferSize)) << "a negative rate must get the smallest ring, not an empty one";
+        expect(eq(edgeBufferSizeFor(1.0e12), kMaxEdgeBufferSize)) << "a rate asking for hundreds of megabytes must be held at the ceiling";
+        expect(eq(edgeBufferSizeFor(2.4e6, 0.001), kMinEdgeBufferSize)) << "a shorter duration must reach the floor at a rate the default does not";
     };
 };
 
