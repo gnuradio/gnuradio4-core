@@ -1253,7 +1253,9 @@ public:
         for_each_port_and_reader_span(
             [this, tagWindow]<PortLike TPort, ReaderSpanLike TReaderSpan>(TPort& port, TReaderSpan& span) {
                 for (const auto& [_, tagMapRef] : span.tags(tagWindow)) {
-                    emitErrorMessageIfAny("Block::applyInputTagsFromPorts", port.metaInfo.update(tagMapRef.get()));
+                    if (const auto res = port.metaInfo.update(tagMapRef.get()); !res.has_value()) {
+                        emitMessage("Block::applyInputTagsFromPorts - rejected tag", {{"error", res.error().message}});
+                    }
                 }
             },
             inputPorts<PortType::STREAM>(&self()), inputSpans);
@@ -1292,7 +1294,7 @@ public:
             }
             notifyListeners(block::property::kSetting, settings().get());
             if (!applyResult.failedParameters.empty()) {
-                emitErrorMessage("applyChangedSettings()", std::format("rejected settings: {}", applyResult.failedParameters));
+                emitMessage("applyChangedSettings() - rejected settings", applyResult.failedParameters);
             }
         });
 

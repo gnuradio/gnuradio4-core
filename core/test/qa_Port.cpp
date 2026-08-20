@@ -449,29 +449,43 @@ const boost::ut::suite<"PortMetaInfo"> _pmi = [] { // NOSONAR (N.B. lambda size)
         expect(eq(out.at(tag::SIGNAL_MAX.shortKey()).value_or(0.0f), 1.f));
     };
 
+    "update converts a numeric value of another type"_test = [] {
+        PortMetaInfo metaInfo;
+        property_map narrower;
+        narrower[tag::SAMPLE_RATE.shortKey()] = 123; // int reaching a float member
+        expect(metaInfo.update(narrower).has_value());
+        expect(eq(metaInfo.sample_rate.value, 123.f));
+    };
+
     "update wrong type"_test = [] {
         PortMetaInfo metaInfo;
         property_map wrong;
-        wrong[tag::SAMPLE_RATE.shortKey()] = 123; // int instead of float
+        wrong[tag::SAMPLE_RATE.shortKey()] = std::string("not-a-number"); // no conversion to float exists
         expect(!metaInfo.update(wrong).has_value());
+        expect(eq(metaInfo.sample_rate.value, 1.f));
     };
 
-    "update partial changes before wrong type"_test = [] {
+    "update value out of the member's range"_test = [] {
+        PortMetaInfo metaInfo;
+        property_map outOfRange;
+        outOfRange[tag::SAMPLE_RATE.shortKey()] = 1e300; // convertible type, unrepresentable value
+        expect(!metaInfo.update(outOfRange).has_value());
+        expect(eq(metaInfo.sample_rate.value, 1.f));
+    };
+
+    "update applies the convertible keys and reports the others"_test = [] {
         PortMetaInfo metaInfo;
         property_map p;
-        // to be sure in which order settings are applied
         metaInfo.auto_update = {gr::tag::SAMPLE_RATE.shortKey(), gr::tag::SIGNAL_MIN.shortKey(), gr::tag::SIGNAL_MAX.shortKey()};
 
-        p[gr::tag::SAMPLE_RATE.shortKey()] = 42.f;                             // ok
-        p[gr::tag::SIGNAL_MIN.shortKey()]  = std::string("wrong_type_string"); // wrong type
-        p[gr::tag::SIGNAL_MAX.shortKey()]  = 42.;                              // o, but after throw
-        for (const auto& [key, value] : p) {
-            std::println("k={} val={}:{}/{}", std::string_view(key), value, value.value_type(), value.container_type());
-        }
+        p[gr::tag::SAMPLE_RATE.shortKey()] = 42.f;                             // matching type
+        p[gr::tag::SIGNAL_MIN.shortKey()]  = std::string("wrong_type_string"); // no conversion to float exists
+        p[gr::tag::SIGNAL_MAX.shortKey()]  = 42.;                              // float64 narrowed onto the float member
+
         expect(!metaInfo.update(p).has_value());
-        expect(eq(metaInfo.sample_rate.value, 42.f));                                // sample_rate was updated
+        expect(eq(metaInfo.sample_rate.value, 42.f));
+        expect(eq(metaInfo.signal_max.value, 42.f));
         expect(eq(metaInfo.signal_min.value, std::numeric_limits<float>::lowest())); // default value
-        expect(eq(metaInfo.signal_max.value, std::numeric_limits<float>::max()));    // default value, it was not updated after throw
     };
 
     "reset auto_update"_test = [] {

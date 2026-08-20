@@ -232,7 +232,7 @@ Follows the ISO 80000-1:2022 Quantities and Units conventions:
                             maybeError = std::unexpected(Error{std::format("PortMetaInfo invalid-argument: incorrect type for key")});
                         }
                     } else {
-                        const auto converted = pmt::convert_safely<Type, true>(value);
+                        const auto converted = pmt::convert_numerically<Type>(value);
                         if (converted) {
                             std::ignore = member.validate_and_set(*converted);
                         } else {
