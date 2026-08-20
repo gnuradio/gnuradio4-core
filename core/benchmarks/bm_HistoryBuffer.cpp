@@ -1,7 +1,9 @@
 #include <benchmark.hpp>
 
+#include <array>
 #include <chrono>
 #include <iostream>
+#include <numeric>
 #include <thread>
 
 #include <format>
@@ -199,6 +201,60 @@ inline const boost::ut::suite _buffer_tests = [] {
                 counter++;
             }
         };
+    }
+    { // FIR shape: one push per input sample, one dot product over the whole history per output sample
+        constexpr std::size_t nTaps    = 289UZ;
+        constexpr std::size_t nOutputs = 500'000UZ;
+
+        std::vector<float> coefficients(nTaps);
+        for (std::size_t i = 0UZ; i < nTaps; i++) {
+            coefficients[i] = 1.0f / static_cast<float>(i + 1UZ);
+        }
+
+        auto dotProduct = [&coefficients](std::span<const float> window) {
+            std::array<float, 8UZ> partialSums{};
+            std::size_t            tap = 0UZ;
+            for (; tap + partialSums.size() <= window.size(); tap += partialSums.size()) {
+                for (std::size_t lane = 0UZ; lane < partialSums.size(); lane++) {
+                    partialSums[lane] += window[tap + lane] * coefficients[tap + lane];
+                }
+            }
+            for (; tap < window.size(); tap++) {
+                partialSums[0] += window[tap] * coefficients[tap];
+            }
+            return std::reduce(partialSums.begin(), partialSums.end());
+        };
+
+        HistoryBuffer<float> history(nTaps);
+        history.push_front(std::vector<float>(nTaps, 1.0f));
+        float accumulator = 0.0f;
+
+        "history_buffer<float>(289) - push_front + 289-tap dot product"_benchmark.repeat<n_repetitions>(nOutputs) = [&history, &dotProduct, &accumulator] {
+            for (std::size_t i = 0UZ; i < nOutputs; i++) {
+                history.push_front(static_cast<float>(i));
+                accumulator += dotProduct(history.get_span(0UZ, nTaps));
+            }
+        };
+        boost::ut::expect(accumulator != 0.0f);
+
+        std::vector<float> flatWindow(nTaps, 1.0f);
+        std::size_t        flatWritePosition = 0UZ;
+
+        "flat window(289) - 289-tap dot product"_benchmark.repeat<n_repetitions>(nOutputs) = [&flatWindow, &flatWritePosition, &dotProduct, &accumulator] {
+            for (std::size_t i = 0UZ; i < nOutputs; i++) {
+                flatWindow[flatWritePosition] = static_cast<float>(i);
+                flatWritePosition             = (flatWritePosition + 1UZ) < nTaps ? (flatWritePosition + 1UZ) : 0UZ;
+                accumulator += dotProduct(flatWindow);
+            }
+        };
+        boost::ut::expect(accumulator != 0.0f);
+
+        "history_buffer<float>(289) - push_front only"_benchmark.repeat<n_repetitions>(samples) = [&history] {
+            for (std::size_t i = 0UZ; i < samples; i++) {
+                history.push_front(static_cast<float>(i));
+            }
+        };
+        boost::ut::expect(history[0] != 0.0f);
     }
 };
 
