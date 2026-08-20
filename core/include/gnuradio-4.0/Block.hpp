@@ -1956,6 +1956,7 @@ public:
 
         // if the block state changed to DONE, publish EOS tag on the next sample
         if (userReturnStatus == DONE) {
+            emitErrorMessageIfAny("finaliseIO(): DONE -> REQUESTED_STOP", this->changeStateTo(lifecycle::State::REQUESTED_STOP));
             this->setAndNotifyState(lifecycle::State::STOPPED);
             publishEoS(outputSpans);
         }
