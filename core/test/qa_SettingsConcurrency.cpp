@@ -1,11 +1,15 @@
 #include <boost/ut.hpp>
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 
 #include <gnuradio-4.0/Block.hpp>
+#include <gnuradio-4.0/Graph.hpp>
+#include <gnuradio-4.0/Scheduler.hpp>
 #include <gnuradio-4.0/Sequence.hpp>
 #include <gnuradio-4.0/Settings.hpp>
 
@@ -55,6 +59,71 @@ struct ValidatingBlock : gr::Block<ValidatingBlock> {
     GR_MAKE_REFLECTABLE(ValidatingBlock, in, out, gain, sample_rate);
 
     [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
+};
+
+// declares two default-tag keys with types other than the canonical float32 sample_rate and gr::Size_t
+// num_channels, as an application using double rates does
+struct WideRateBlock : gr::Block<WideRateBlock> {
+    gr::PortIn<float>  in;
+    gr::PortOut<float> out;
+
+    gr::Annotated<double, "sample rate">        sample_rate  = 1.0;
+    gr::Annotated<std::int64_t, "num channels"> num_channels = 1;
+
+    GR_MAKE_REFLECTABLE(WideRateBlock, in, out, sample_rate, num_channels);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
+};
+
+struct NarrowRateSink : gr::Block<NarrowRateSink> {
+    gr::PortIn<float> in;
+
+    gr::Annotated<float, "sample rate"> sample_rate = 1.0f;
+
+    GR_MAKE_REFLECTABLE(NarrowRateSink, in, sample_rate);
+
+    std::size_t _nReceived = 0UZ;
+
+    void processOne(float) { _nReceived++; }
+};
+
+struct RateSource : gr::Block<RateSource> {
+    gr::PortOut<float> out;
+
+    gr::Annotated<float, "sample rate"> sample_rate = 1.0f;
+
+    GR_MAKE_REFLECTABLE(RateSource, out, sample_rate);
+
+    static constexpr std::size_t kSamples = 4096UZ;
+
+    std::size_t _nProduced = 0UZ;
+
+    float processOne() {
+        if (++_nProduced >= kSamples) {
+            this->requestStop();
+        }
+        return 1.0f;
+    }
+};
+
+struct BadTagSource : gr::Block<BadTagSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(BadTagSource, out);
+
+    static constexpr std::size_t kSamples = 4096UZ;
+
+    std::size_t _nProduced = 0UZ;
+
+    float processOne() {
+        if (_nProduced == 0UZ) {
+            this->publishTag(gr::property_map{{"sample_rate", std::string("not-a-number")}}, 0UZ);
+        }
+        if (++_nProduced >= kSamples) {
+            this->requestStop();
+        }
+        return 1.0f;
+    }
 };
 
 } // namespace qa_settings
@@ -131,6 +200,85 @@ const boost::ut::suite<"settings concurrency"> settingsConcurrencyTests = [] {
         expect(!result.failedParameters.contains("sample_rate")) << "a valid value was reported as rejected";
         expect(result.forwardParameters.contains("sample_rate")) << "a valid auto-forward value was not forwarded";
         expect(eq(block.sample_rate.value, 48000.0f)) << "a valid value was not applied";
+    };
+
+    "a default-tag value of another numeric type is converted to the member's type"_test = [] {
+        qa_settings::WideRateBlock block;
+        block.init(std::make_shared<gr::Sequence>());
+
+        block.settings().autoUpdate(gr::Tag{0UZ, {{"sample_rate", 2.4e6f}, {"num_channels", 4U}}});
+        const gr::ApplyStagedParametersResult result = block.settings().applyStagedParameters();
+
+        expect(result.failedParameters.empty()) << "a convertible numeric value was reported as rejected";
+        expect(eq(block.sample_rate.value, 2.4e6)) << "the float32 tag did not reach the double member";
+        expect(eq(block.num_channels.value, std::int64_t(4))) << "the gr::Size_t tag did not reach the int64 member";
+        expect(result.forwardParameters.contains("sample_rate")) << "the converted value was not forwarded downstream";
+    };
+
+    "a wider default-tag value is narrowed onto the canonical member type"_test = [] {
+        qa_settings::NarrowRateSink block;
+        block.init(std::make_shared<gr::Sequence>());
+
+        block.settings().autoUpdate(gr::Tag{0UZ, {{"sample_rate", 2.4e6}}});
+        std::ignore = block.settings().applyStagedParameters();
+
+        expect(eq(block.sample_rate.value, 2.4e6f)) << "the float64 tag did not reach the float member";
+    };
+
+    "a default-tag value outside the member's range is not applied"_test = [] {
+        qa_settings::NarrowRateSink block;
+        block.init(std::make_shared<gr::Sequence>());
+
+        block.settings().autoUpdate(gr::Tag{0UZ, {{"sample_rate", 1e300}}});
+        std::ignore = block.settings().applyStagedParameters();
+
+        expect(eq(block.sample_rate.value, 1.0f)) << "an out-of-range value was applied instead of range-checked";
+    };
+
+    "a non-numeric default-tag value is not applied"_test = [] {
+        qa_settings::WideRateBlock block;
+        block.init(std::make_shared<gr::Sequence>());
+
+        block.settings().autoUpdate(gr::Tag{0UZ, {{"sample_rate", std::string("not-a-number")}}});
+        std::ignore = block.settings().applyStagedParameters();
+
+        expect(eq(block.sample_rate.value, 1.0)) << "a string was coerced into a numeric member";
+    };
+
+    "a float32 rate tag crosses a double-typed block and reaches a float sink"_test = [] {
+        gr::scheduler::Simple        scheduler;
+        qa_settings::WideRateBlock*  wideBlock = nullptr;
+        qa_settings::NarrowRateSink* sink      = nullptr;
+        {
+            gr::Graph flow;
+            auto&     source = flow.emplaceBlock<qa_settings::RateSource>({{"sample_rate", 2.4e6f}});
+            wideBlock        = &flow.emplaceBlock<qa_settings::WideRateBlock>();
+            sink             = &flow.emplaceBlock<qa_settings::NarrowRateSink>();
+            expect(flow.connect<"out", "in">(source, *wideBlock).has_value());
+            expect(flow.connect<"out", "in">(*wideBlock, *sink).has_value());
+            expect(scheduler.exchange(std::move(flow)).has_value());
+        }
+
+        expect(scheduler.runAndWait().has_value()) << "the graph did not run to completion";
+        expect(gt(sink->_nReceived, 0UZ)) << "the sink received nothing";
+        expect(eq(wideBlock->sample_rate.value, 2.4e6)) << "the forwarded float32 rate did not reach the double member";
+        expect(eq(sink->sample_rate.value, 2.4e6f)) << "the re-forwarded float64 rate did not reach the float member";
+    };
+
+    "a default-tag value the graph cannot convert does not stop the graph"_test = [] {
+        gr::scheduler::Simple        scheduler;
+        qa_settings::NarrowRateSink* sink = nullptr;
+        {
+            gr::Graph flow;
+            auto&     source = flow.emplaceBlock<qa_settings::BadTagSource>();
+            sink             = &flow.emplaceBlock<qa_settings::NarrowRateSink>();
+            expect(flow.connect<"out", "in">(source, *sink).has_value());
+            expect(scheduler.exchange(std::move(flow)).has_value());
+        }
+
+        expect(scheduler.runAndWait().has_value()) << "a rejected tag value took the graph down";
+        expect(gt(sink->_nReceived, 0UZ)) << "the sink received nothing";
+        expect(eq(sink->sample_rate.value, 1.0f)) << "an unconvertible value reached the member";
     };
 };
 

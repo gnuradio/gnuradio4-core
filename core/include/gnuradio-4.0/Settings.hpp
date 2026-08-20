@@ -297,6 +297,12 @@ inline bool autoUpdateImpl(std::string_view key, const pmt::Value& value, const 
             stagedParameters.insert_or_assign(keyPmr, value);
             return true;
         }
+        if constexpr (std::is_arithmetic_v<Type> && !std::is_same_v<Type, bool>) {
+            if (const auto converted = pmt::convert_numerically<Type>(value); converted) {
+                stagedParameters.insert_or_assign(keyPmr, detail::castToGrSizeIfNeeded(*converted));
+                return true;
+            }
+        }
     }
     return false;
 }
