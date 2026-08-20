@@ -979,7 +979,9 @@ protected:
             }
         });
 
-        this->emitErrorMessageIfAny("stop() -> LifecycleState ->STOPPED", this->changeStateTo(STOPPED));
+        if (this->state() != ERROR) { // stop() also runs on the way into ERROR, which only reset() leaves
+            this->emitErrorMessageIfAny("stop() -> LifecycleState ->STOPPED", this->changeStateTo(STOPPED));
+        }
         if constexpr (requires(Derived& d) { d.customStop(); }) {
             static_cast<Derived*>(this)->customStop();
         }
