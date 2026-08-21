@@ -1203,6 +1203,13 @@ public:
     }
 
     /// default tag forwarding — called by workInternal unless the user provides forwardTags()
+    ///
+    /// The window read here is the window the input span retires: prepareStreams() builds it with
+    /// consumeOnlyFirstTag = !backwardTagPropagation, so the span drops exactly the tags at relIndex <= 0, which is
+    /// what tags(1) yields. A tag interior to a chunk that could not be broken at it — min_samples, or
+    /// input_chunk_size > 1 — stays in the buffer and returns in the next chunk at a negative relIndex, still
+    /// unforwarded, so clamping it to offset 0 publishes it for the first time rather than a second. A forwardTags()
+    /// override reading a wider window sees those tags twice and must skip relIndex < 0.
     template<typename TInputSpans, typename TOutputSpans>
     void forwardInputTags(TInputSpans& inputSpans, TOutputSpans& outputSpans, std::size_t processedIn) noexcept {
         if constexpr (noTagPropagation) {
