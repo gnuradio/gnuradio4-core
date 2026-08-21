@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <format>
+#include <ranges>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -162,11 +163,17 @@ struct MappedForwarder : Block<MappedForwarder, Resampling<kDecim, 1U, true>> {
     PortIn<float>  in;
     PortOut<float> out;
 
-    GR_MAKE_REFLECTABLE(MappedForwarder, in, out);
+    float sample_rate = 1000.f;
+
+    GR_MAKE_REFLECTABLE(MappedForwarder, in, out, sample_rate);
 
     bool        skipDeferred = true; // the resampler's guard: ignore what an earlier chunk already handled
     std::size_t nDeferred    = 0UZ;
     std::size_t nPublished   = 0UZ;
+    std::size_t retuneAfter  = 0UZ; // output samples after which the block stages a new sample_rate, 0 = never
+    float       retuneTo     = 2000.f;
+
+    std::size_t _produced = 0UZ;
 
     template<typename TInputSpans, typename TOutputSpans>
     void forwardTags(TInputSpans& inputSpans, TOutputSpans& outputSpans, std::size_t processedIn) {
@@ -204,9 +211,48 @@ struct MappedForwarder : Block<MappedForwarder, Resampling<kDecim, 1U, true>> {
         }
         std::ignore = inSpan.consume(n * kDecim);
         outSpan.publish(n);
+        _produced += n;
+        if (retuneAfter > 0UZ && _produced >= retuneAfter && sample_rate != retuneTo) {
+            std::ignore = settings().setStaged(property_map{{"sample_rate", retuneTo}});
+        }
         return work::Status::OK;
     }
 };
+
+/// stages a forwardable setting inside its own work call and stops, so the framework applies and forwards those
+/// parameters while it still holds the output span
+struct StageAndStop : Block<StageAndStop> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    float sample_rate = 1000.f;
+
+    GR_MAKE_REFLECTABLE(StageAndStop, in, out, sample_rate);
+
+    std::size_t stopAfter  = 2UZ * kChunk;
+    float       retuneTo   = 2000.f;
+    std::size_t produced   = 0UZ;
+    std::size_t lastWindow = 0UZ; ///< samples of the work call that staged the setting
+
+    work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
+        const std::size_t n = std::min(inSpan.size(), outSpan.size());
+        std::ranges::copy(inSpan | std::views::take(n), outSpan.begin());
+        std::ignore = inSpan.consume(n);
+        outSpan.publish(n);
+        produced += n;
+        if (produced >= stopAfter) {
+            lastWindow  = n;
+            std::ignore = settings().setStaged(property_map{{"sample_rate", retuneTo}});
+            this->requestStop();
+        }
+        return work::Status::OK;
+    }
+};
+
+[[nodiscard]] std::vector<TagRecord> carrying(const std::vector<TagRecord>& tags, std::string_view key) {
+    const auto carriesKey = [key](const TagRecord& record) { return std::ranges::any_of(record.map, [key](const auto& entry) { return entry.first == key; }); };
+    return tags | std::views::filter(carriesKey) | std::ranges::to<std::vector>();
+}
 
 /// the middle block's own state is read while the scheduler that owns it is still alive
 template<typename TMiddle, typename TInspect>
@@ -287,6 +333,50 @@ const boost::ut::suite<"tag forwarding"> _tagForwarding = [] {
                 expect(eq(middle.nPublished, kInteriorTags.size() + middle.nDeferred)) << "the extras are exactly the deferred sightings";
             },
             [](MappedForwarder& middle) { middle.skipDeferred = false; });
+    };
+
+    "forwarded parameters never land before a tag the same work call already published"_test = [] {
+        runChain<MappedForwarder>(
+            {2UZ, 12UZ, 13UZ}, // the first chunk stages the retune, the second maps its tags to a non-zero output offset
+            [&](MappedForwarder& middle, Sink& sink) {
+                const std::vector<TagRecord> retuned = carrying(sink.tags, "sample_rate");
+                expect(eq(retuned.size(), 1UZ)) << "the staged parameters must reach the sink exactly once";
+                expect(std::ranges::is_sorted(sink.tags, {}, &TagRecord::index)) << "a tag published behind one already in the span breaks the span's order";
+                if (retuned.size() == 1UZ) {
+                    const auto sharingIndex = std::ranges::count(sink.tags, retuned.front().index, &TagRecord::index);
+                    expect(ge(static_cast<std::size_t>(sharingIndex), 2UZ)) << "the parameters must ride at the mapped tag of their work call, or the ordering hazard is not reproduced";
+                }
+                expect(eq(middle.nPublished, 3UZ)) << "every source tag is mapped exactly once";
+            },
+            [](MappedForwarder& middle) {
+                middle.in.min_samples = kChunk; // a fixed window: the retune is staged in one work call and forwarded in the next, which carries the mapped tags
+                middle.in.max_samples = kChunk;
+                middle.retuneAfter    = 1UZ;
+            });
+    };
+
+    "a block that stages a setting and stops forwards it through its open output span"_test = [] {
+        gr::Graph flow;
+        auto&     source      = flow.emplaceBlock<Source>(gr::property_map{{"name", std::string("src")}});
+        auto&     middle      = flow.emplaceBlock<StageAndStop>(gr::property_map{{"name", std::string("mid")}});
+        auto&     sink        = flow.emplaceBlock<Sink>(gr::property_map{{"name", std::string("snk")}});
+        middle.in.max_samples = kChunk; // the staging work call must not be the first, so its window does not start at 0
+        expect(flow.connect<"out", "in">(source, middle).has_value());
+        expect(flow.connect<"out", "in">(middle, sink).has_value());
+
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(scheduler.runAndWait().has_value());
+
+        const std::vector<TagRecord> retuned = carrying(sink.tags, "sample_rate");
+        expect(eq(retuned.size(), 1UZ)) << "the staged parameters must reach the sink exactly once";
+        if (retuned.size() == 1UZ) {
+            expect(eq(retuned.front().index, middle.produced - middle.lastWindow)) << "the tag marks the work call the setting was staged in";
+            expect(eq(retuned.front().map.size(), 1UZ)) << "only the staged parameter may be forwarded";
+        }
+        expect(eq(sink.tags.size(), retuned.size())) << "no other tag may surface: an untagged source produces none";
+        expect(gt(middle.lastWindow, 0UZ));
+        expect(gt(middle.produced, middle.lastWindow)) << "the staging work call must not be the first";
     };
 };
 

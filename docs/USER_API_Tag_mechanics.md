@@ -139,6 +139,19 @@ When processOne publishes a tag, the dispatch loop breaks after the current samp
 call continues from the following sample. This ensures tags are positioned at the exact sample where
 `publishTag` was called.
 
+### Publishing while the framework holds the span
+
+Between the moment the framework reserves a work call's output spans and the moment it releases them,
+those spans own the port's tag reservation, and a port-level `publishTag` cannot take a second one:
+the attempt is refused, reported on `stderr` and the tag dropped, rather than retargeting the open
+reservation and handing the downstream block ring slots nobody wrote. Publish through the span —
+`outSpan.publishTag(map, offset)` in `processBulk` — not through the port, and not via
+`this->publishTag(map)`, which goes to the ports directly outside processOne dispatch. The framework
+follows the same rule for the settings tags it forwards on your behalf, including a setting a block
+stages from inside its own `processBulk` before calling `requestStop()`: those parameters are applied
+and forwarded on that same work call, through the span it is already holding, just before the
+end-of-stream tag.
+
 ---
 
 ## Automatic tag forwarding
