@@ -212,6 +212,13 @@ the `snake_case` setting name and values are `pmt::Value`.
 
 Downstream examples: richly annotated hardware and oscillator blocks in `gnuradio4-blocks`.
 
+### Changing a setting while the graph runs
+
+`settings().set(params)` stores `params` against a timestamped settings context; a running block picks
+them up only when that context is activated, so on a live graph the call reports success and changes
+nothing. To retune a running block use `settings().setStaged(params)`, which the block applies at the
+top of its next `work()` call.
+
 ## Processing functions
 
 Implement exactly one: `processOne`, `processBulk`, or — for full control —
