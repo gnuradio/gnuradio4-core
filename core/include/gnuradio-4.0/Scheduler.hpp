@@ -152,6 +152,7 @@ protected:
     std::optional<PendingExchange> _pendingExchange;
     std::size_t                    _nDeferredExchanges{0UZ}; // claimed swaps still running outside the job count
     std::size_t                    _nStopRequests{0UZ};
+    bool                           _pendingStopRequest{false}; // a requested stop that no run loop has consumed yet
 
     // for blocks that were added while scheduler was running. They need to be adopted by a thread
     std::mutex _adoptionBlocksMutex;
@@ -397,7 +398,12 @@ public:
         }
     }
 
-    void stateChanged(lifecycle::State newState) { this->notifyListeners(block::property::kLifeCycleState, {{"state", std::string(gr::meta::enumName(newState).value_or(""))}}); }
+    void stateChanged(lifecycle::State newState) {
+        if (newState == lifecycle::State::REQUESTED_STOP) { // set with the claim, before stop() collapses the state to STOPPED
+            gr::atomic_ref(_pendingStopRequest).store_release(true);
+        }
+        this->notifyListeners(block::property::kLifeCycleState, {{"state", std::string(gr::meta::enumName(newState).value_or(""))}});
+    }
 
     [[nodiscard]] std::span<std::shared_ptr<BlockModel>>       blocks() noexcept { return _graph->blocks(); }
     [[nodiscard]] std::span<const std::shared_ptr<BlockModel>> blocks() const noexcept { return _graph->blocks(); }
@@ -514,7 +520,31 @@ public:
     std::expected<void, Error> runAndWait() {
         using enum lifecycle::State;
         [[maybe_unused]] const auto pe = this->_profilerHandler->startCompleteEvent("scheduler_base.runAndWait");
+
+        // a stop requested before RUNNING is claimed has no run loop to observe it, and the reinitialization
+        // below erases the STOPPED it produced: honor the latch instead, and consume it on the way out
+        on_scope_exit consumeStopRequest = [this] { gr::atomic_ref(_pendingStopRequest).store_release(false); };
+
+        auto settleStopped = [this]() -> std::expected<void, Error> {
+            if (this->state() == RUNNING) {
+                if (auto e = this->changeStateTo(REQUESTED_STOP); !e) {
+                    this->emitErrorMessage("runAndWait() -> LifecycleState", e.error());
+                    return std::unexpected(e.error());
+                }
+            }
+            if (this->state() == REQUESTED_STOP) {
+                if (auto e = this->changeStateTo(STOPPED); !e) {
+                    this->emitErrorMessage("runAndWait() -> LifecycleState", e.error());
+                }
+            }
+            processScheduledMessages();
+            return {};
+        };
+
         processScheduledMessages(); // make sure initial subscriptions are processed
+        if (gr::atomic_ref(_pendingStopRequest).load_acquire()) {
+            return settleStopped();
+        }
         if (this->state() == STOPPED || this->state() == ERROR) {
             if (auto e = this->changeStateTo(INITIALISED); !e) {
                 this->emitErrorMessage("runAndWait() -> LifecycleState", e.error());
@@ -528,8 +558,11 @@ public:
             }
         }
         if (auto e = this->changeStateTo(RUNNING); !e) {
-            this->emitErrorMessage("runAndWait() -> LifecycleState", e.error());
-            return std::unexpected(e.error());
+            if (!lifecycle::isShuttingDown(this->state())) {
+                this->emitErrorMessage("runAndWait() -> LifecycleState", e.error());
+                return std::unexpected(e.error());
+            }
+            return settleStopped(); // a stop claimed the transition first
         }
 
         // N.B. the transition to lifecycle::State::RUNNING will for the ExecutionPolicy:
@@ -537,20 +570,7 @@ public:
         // * multiThreaded[Blocking] spawn two worker and block on 'waitDone()'
         waitDone();
         processScheduledMessages();
-
-        if (this->state() == RUNNING) {
-            if (auto e = this->changeStateTo(REQUESTED_STOP); !e) {
-                this->emitErrorMessage("runAndWait() -> LifecycleState", e.error());
-                return std::unexpected(e.error());
-            }
-        }
-        if (this->state() == REQUESTED_STOP) {
-            if (auto e = this->changeStateTo(STOPPED); !e) {
-                this->emitErrorMessage("runAndWait() -> LifecycleState", e.error());
-            }
-        }
-        processScheduledMessages();
-        return {};
+        return settleStopped();
     }
 
     void waitDone() {

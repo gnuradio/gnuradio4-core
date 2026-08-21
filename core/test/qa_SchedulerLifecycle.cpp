@@ -2,6 +2,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 
 #include <gnuradio-4.0/Graph.hpp>
@@ -139,8 +141,9 @@ struct SelfStoppingSource : gr::Block<SelfStoppingSource> {
     }
 };
 
-using TestScheduler   = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>;
-using SerialScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>;
+using TestScheduler     = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>;
+using SerialScheduler   = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>;
+using BlockingScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking>;
 
 [[nodiscard]] gr::Graph makeGraph() {
     using namespace boost::ut;
@@ -160,6 +163,42 @@ using SerialScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::si
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     return false;
+}
+
+constexpr auto kRunBound = std::chrono::milliseconds(500);
+
+// runAndWait() on its own thread with a deadline, so a stop that fails to take fails the assertion
+// instead of hanging ctest; `duringStartup` runs on the caller's thread the moment the runner exists
+template<typename TDuringStartup>
+[[nodiscard]] bool runAndWaitWithin(BlockingScheduler& scheduler, std::chrono::milliseconds bound, TDuringStartup duringStartup) {
+    std::mutex              mutex;
+    std::condition_variable finished;
+    bool                    returned = false;
+
+    std::thread runner([&scheduler, &mutex, &finished, &returned] {
+        std::ignore = scheduler.runAndWait();
+        {
+            std::lock_guard lock(mutex);
+            returned = true;
+        }
+        finished.notify_one();
+    });
+    duringStartup();
+
+    bool inTime = false;
+    {
+        std::unique_lock lock(mutex);
+        inTime = finished.wait_for(lock, bound, [&returned] { return returned; });
+    }
+    if (!inTime) {
+        scheduler.requestStop(); // release the run loop that the lost stop left behind
+    }
+    runner.join();
+    return inTime;
+}
+
+[[nodiscard]] bool runAndWaitWithin(BlockingScheduler& scheduler, std::chrono::milliseconds bound) {
+    return runAndWaitWithin(scheduler, bound, [] {});
 }
 
 void startAndPause(TestScheduler& scheduler) {
@@ -305,6 +344,70 @@ const boost::ut::suite<"stop requested during the start transient"> startStopRac
         expect(eq(nCyclesMissingStop, 0UZ)) << "cycles in which a block's stop() hook was skipped";
         expect(eq(nCyclesLeftActive, 0UZ)) << "cycles that left the scheduler in an active state";
         expect(eq(nCyclesInError, 0UZ)) << "cycles in which a worker drove the scheduler to ERROR";
+    };
+};
+
+const boost::ut::suite<"stop requested before RUNNING"> preRunningStopTests = [] {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    "a stop requested while IDLE keeps runAndWait from starting the run"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::RaceSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        qa_sched::BlockingScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        scheduler.requestStop();
+
+        expect(qa_sched::runAndWaitWithin(scheduler, qa_sched::kRunBound)) << "runAndWait() blocked on a stop requested before it ran";
+        expect(!gr::lifecycle::isActive(scheduler.state())) << "runAndWait() left the scheduler active";
+        expect(eq(sink._nReceived, 0UZ)) << "a latched stop must not be overwritten by a reinitializing runAndWait()";
+    };
+
+    "a stop requested while INITIALISED keeps runAndWait from starting the run"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::RaceSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        qa_sched::BlockingScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        scheduler.requestStop();
+
+        expect(qa_sched::runAndWaitWithin(scheduler, qa_sched::kRunBound)) << "runAndWait() blocked on a stop requested before it ran";
+        expect(!gr::lifecycle::isActive(scheduler.state())) << "runAndWait() left the scheduler active";
+        expect(eq(sink._nReceived, 0UZ)) << "a latched stop must not be overwritten by a reinitializing runAndWait()";
+    };
+
+    "a stop racing the startup transient always releases runAndWait"_test = [] {
+        constexpr int nCycles = 12;
+
+        std::size_t nCyclesBlocked    = 0UZ;
+        std::size_t nCyclesLeftActive = 0UZ;
+
+        for (int cycle = 0; cycle < nCycles && nCyclesBlocked == 0UZ; ++cycle) {
+            gr::Graph flow;
+            auto&     source = flow.emplaceBlock<qa_sched::RaceSource>();
+            auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+            expect(flow.connect<"out", "in">(source, sink).has_value());
+
+            qa_sched::BlockingScheduler scheduler;
+            expect(scheduler.exchange(std::move(flow)).has_value());
+
+            // no barrier: the stop lands wherever the runner happens to be, IDLE included
+            if (!qa_sched::runAndWaitWithin(scheduler, qa_sched::kRunBound, [&scheduler] { scheduler.requestStop(); })) {
+                nCyclesBlocked++;
+            }
+            if (gr::lifecycle::isActive(scheduler.state())) {
+                nCyclesLeftActive++;
+            }
+        }
+
+        expect(eq(nCyclesBlocked, 0UZ)) << "cycles in which runAndWait() did not return within the deadline";
+        expect(eq(nCyclesLeftActive, 0UZ)) << "cycles that left the scheduler in an active state";
     };
 };
 
