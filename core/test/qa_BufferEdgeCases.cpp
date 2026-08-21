@@ -205,6 +205,128 @@ const boost::ut::suite<"writer span publish bound"> writerSpanPublishTests = [] 
     };
 };
 
+const boost::ut::suite<"nested writer reservation"> nestedWriterReservationTests = [] {
+    using namespace boost::ut;
+
+    "a nested tryReserve is refused and leaves the open reservation intact"_test = [] {
+        CircularBufferSingle buffer(1024UZ);
+        auto                 writer = buffer.new_writer();
+        auto                 reader = buffer.new_reader();
+
+        {
+            auto open = writer.tryReserve<gr::SpanReleasePolicy::ProcessNone>(64UZ);
+            std::ranges::fill(open, 7);
+            open.publish(16UZ);
+            const std::size_t   reserved = open.size();
+            const std::int32_t* slots    = open.data();
+
+            {
+                auto nested = writer.tryReserve<gr::SpanReleasePolicy::ProcessNone>(1UZ); // reports on stderr, claims nothing
+                expect(eq(nested.size(), 0UZ)) << "a refused reservation must expose no slots";
+                expect(nested.empty());
+                nested.publish(1UZ);
+            }
+
+            expect(eq(open.size(), reserved)) << "the open span must keep its reservation";
+            expect(open.data() == slots) << "the open span must keep its slots";
+            expect(eq(open.nRequestedSamplesToPublish(), 16UZ)) << "the accumulated publish count must survive the refusal";
+            expect(std::ranges::all_of(open, [](std::int32_t v) { return v == 7; })) << "no slot of the open span may be overwritten";
+            open.publish(8UZ);
+            expect(eq(open.nRequestedSamplesToPublish(), 24UZ));
+        }
+        expect(eq(writer.position(), 24UZ)) << "the publish cursor must advance by exactly what was published";
+        expect(eq(reader.available(), 24UZ));
+
+        auto readSpan = reader.get<gr::SpanReleasePolicy::ProcessAll>(reader.available());
+        expect(std::ranges::all_of(readSpan, [](std::int32_t v) { return v == 7; }));
+        expect(readSpan.consume(readSpan.size()));
+    };
+
+    "a nested blocking reserve is refused rather than waiting on itself"_test = [] {
+        CircularBufferSingle buffer(1024UZ);
+        auto                 writer = buffer.new_writer();
+        auto                 reader = buffer.new_reader();
+
+        {
+            auto open = writer.reserve<gr::SpanReleasePolicy::ProcessNone>(buffer.size());
+            std::ranges::fill(open, 3);
+            open.publish(32UZ);
+            {
+                auto nested = writer.reserve<gr::SpanReleasePolicy::ProcessNone>(1UZ);
+                expect(nested.empty()) << "a refused blocking reserve must return without claiming";
+            }
+            expect(eq(open.size(), buffer.size()));
+            expect(eq(open.nRequestedSamplesToPublish(), 32UZ));
+        }
+        expect(eq(reader.available(), 32UZ));
+
+        auto readSpan = reader.get<gr::SpanReleasePolicy::ProcessAll>(reader.available());
+        expect(std::ranges::all_of(readSpan, [](std::int32_t v) { return v == 3; }));
+        expect(readSpan.consume(readSpan.size()));
+    };
+
+    "reservations resume once the open span closes"_test = [] {
+        CircularBufferSingle buffer(1024UZ);
+        auto                 writer = buffer.new_writer();
+        auto                 reader = buffer.new_reader();
+
+        {
+            auto open = writer.tryReserve<gr::SpanReleasePolicy::ProcessNone>(64UZ);
+            std::ranges::fill(open, 1);
+            open.publish(64UZ);
+            auto refused = writer.tryReserve<gr::SpanReleasePolicy::ProcessNone>(8UZ);
+            expect(refused.empty());
+        }
+        {
+            auto again = writer.tryReserve<gr::SpanReleasePolicy::ProcessNone>(8UZ);
+            expect(eq(again.size(), 8UZ)) << "the writer must accept a reservation once no span is live";
+            std::ranges::fill(again, 2);
+            again.publish(8UZ);
+        }
+        expect(eq(reader.available(), 72UZ));
+
+        auto readSpan = reader.get<gr::SpanReleasePolicy::ProcessAll>(reader.available());
+        expect(std::ranges::all_of(readSpan | std::views::take(64UZ), [](std::int32_t v) { return v == 1; }));
+        expect(std::ranges::all_of(readSpan | std::views::drop(64UZ), [](std::int32_t v) { return v == 2; }));
+        expect(readSpan.consume(readSpan.size()));
+    };
+
+    // the corruption guarded against: a nested claim retargets the open span, and closing it sets the publish
+    // cursor from the nested claim's offset, handing the reader ring slots the writer never wrote
+    "a nested claim under freed capacity cannot move the publish cursor"_test = [] {
+        CircularBufferSingle buffer(1024UZ);
+        auto                 writer = buffer.new_writer();
+        auto                 reader = buffer.new_reader();
+
+        {
+            auto primed = writer.tryReserve<gr::SpanReleasePolicy::ProcessNone>(100UZ);
+            std::ranges::fill(primed, 1);
+            primed.publish(100UZ);
+        }
+        {
+            auto open = writer.tryReserve<gr::SpanReleasePolicy::ProcessNone>(writer.available());
+            expect(eq(open.size(), buffer.size() - 100UZ));
+            std::ranges::fill(open | std::views::take(8UZ), 7);
+            open.publish(8UZ);
+
+            {
+                auto stale = reader.get<gr::SpanReleasePolicy::ProcessAll>(100UZ); // frees capacity under the open span
+                expect(eq(stale.size(), 100UZ));
+            }
+            expect(gt(writer.available(), 0UZ)) << "the scenario needs capacity to have freed up";
+
+            auto nested = writer.tryReserve<gr::SpanReleasePolicy::ProcessNone>(1UZ);
+            expect(nested.empty()) << "freed capacity must not be claimed under an open span";
+        }
+        expect(eq(writer.position(), 108UZ)) << "the publish cursor must not jump past the open span's claim";
+        expect(eq(reader.available(), 8UZ)) << "the reader must see only the published prefix, never unwritten ring slots";
+
+        auto readSpan = reader.get<gr::SpanReleasePolicy::ProcessAll>(reader.available());
+        expect(std::ranges::all_of(readSpan, [](std::int32_t v) { return v == 7; })) << "no stale ring slot may surface as data";
+        expect(readSpan.consume(readSpan.size()));
+    };
+};
+
 const boost::ut::suite<"buffer zero-reader gating"> bufferZeroReaderTests = [] {
     using namespace boost::ut;
 

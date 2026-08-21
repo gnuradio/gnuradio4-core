@@ -2008,6 +2008,12 @@ public:
         }
     }
 
+    /// publish forwardParams at the head of the span, but never before a tag already placed in it: the span's order check forbids that
+    static void publishForwardParams(OutputSpanLike auto& outSpan, const property_map& forwardParams) {
+        const std::size_t lastIndex = outSpan.tagsPublished > 0UZ ? outSpan.tags[outSpan.tagsPublished - 1UZ].index : 0UZ;
+        outSpan.publishTag(forwardParams, lastIndex > outSpan.streamIndex ? lastIndex - outSpan.streamIndex : 0UZ);
+    }
+
     /// publish tags and samples, consume inputs, handle EOS
     template<typename TInputSpans, typename TOutputSpans>
     void finaliseIO(TInputSpans& inputSpans, TOutputSpans& outputSpans, work::Status& userReturnStatus, std::size_t& processedIn, std::size_t processedOut, std::size_t resampledIn) {
@@ -2018,9 +2024,10 @@ public:
             for_each_writer_span([](auto& outSpan) { outSpan.tagsPublished = 0; }, outputSpans);
         }
 
+        property_map forwardParams;
         if (lifecycle::isShuttingDown(this->state())) {
             emitErrorMessageIfAny("isShuttingDown -> STOPPED", this->changeStateTo(lifecycle::State::REQUESTED_STOP));
-            applyChangedSettings();
+            applyChangedSettings(true, &forwardParams);
             userReturnStatus = DONE;
             processedIn      = 0UZ;
         }
@@ -2046,6 +2053,9 @@ public:
         if (userReturnStatus == DONE) {
             emitErrorMessageIfAny("finaliseIO(): DONE -> REQUESTED_STOP", this->changeStateTo(lifecycle::State::REQUESTED_STOP));
             this->setAndNotifyState(lifecycle::State::STOPPED);
+            if (!forwardParams.empty()) {
+                for_each_writer_span([&forwardParams](auto& outSpan) { publishForwardParams(outSpan, forwardParams); }, outputSpans);
+            }
             publishEoS(outputSpans);
         }
     }
@@ -2108,7 +2118,7 @@ public:
         auto inputSpans  = prepareStreams(inputPorts<PortType::STREAM>(&self()), processedIn);
         auto outputSpans = prepareStreams(outputPorts<PortType::STREAM>(&self()), processedOut);
 
-        applyChangedSettings(); // publishes any additional external settings changes via port fallback
+        applyChangedSettings(true, &_pendingForwardParams); // captures any further external settings change, published through the open spans below
         applyInputTagsAndSettings(inputSpans, processedIn, limits.hasAnyTag);
 
         if constexpr (requires { self().forwardTags(inputSpans, outputSpans, processedIn); }) {
@@ -2118,7 +2128,7 @@ public:
         }
 
         if (!_pendingForwardParams.empty()) {
-            for_each_writer_span([this](auto& out) { out.publishTag(_pendingForwardParams, 0); }, outputSpans);
+            for_each_writer_span([this](auto& out) { publishForwardParams(out, _pendingForwardParams); }, outputSpans);
         }
 
         if constexpr (HasProcessOneFunction<Derived> && !HasProcessBulkFunction<Derived>) {
