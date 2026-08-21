@@ -673,10 +673,10 @@ private:
                 return false;
             }
             if constexpr (strict_check) {
-                if (nSamples > _parent->_nSamplesFirstGet) { // get() already validated availability for up to _nSamplesFirstGet samples
-                    if (nSamples > _parent->available()) {
-                        return false;
-                    }
+                const std::size_t nSamplesHandedOut = _parent->_nSamplesFirstGet == std::numeric_limits<std::size_t>::max() ? 0UZ : _parent->_nSamplesFirstGet;
+                if (nSamples > nSamplesHandedOut) {
+                    std::print(stderr, "CircularBuffer::ReaderSpan::consume({}) exceeds the {}-sample span handed out by get() - refused\n", nSamples, nSamplesHandedOut);
+                    return false;
                 }
             }
             _parent->_nRequestedSamplesToConsume = nSamples;

@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <numeric>
 #include <optional>
 #include <ranges>
 #include <string_view>
@@ -21,6 +22,13 @@ template<typename TWriter>
 [[nodiscard]] bool writeChunk(TWriter& writer, std::size_t chunkSize) {
     auto span = writer.template tryReserve<gr::SpanReleasePolicy::ProcessAll>(chunkSize);
     return span.size() == chunkSize;
+}
+
+template<typename TWriter>
+void publishRamp(TWriter& writer, std::size_t nSamples) {
+    auto span = writer.template tryReserve<gr::SpanReleasePolicy::ProcessNone>(nSamples);
+    std::iota(span.begin(), span.end(), 0);
+    span.publish(nSamples);
 }
 
 template<typename TBuffer>
@@ -324,6 +332,103 @@ const boost::ut::suite<"nested writer reservation"> nestedWriterReservationTests
         auto readSpan = reader.get<gr::SpanReleasePolicy::ProcessAll>(reader.available());
         expect(std::ranges::all_of(readSpan, [](std::int32_t v) { return v == 7; })) << "no stale ring slot may surface as data";
         expect(readSpan.consume(readSpan.size()));
+    };
+};
+
+const boost::ut::suite<"reader over-consume"> readerConsumeBoundTests = [] {
+    using namespace boost::ut;
+
+    "a consume beyond the span handed out is refused and leaves the reader intact"_test = [] {
+        CircularBufferSingle buffer(1024UZ);
+        auto                 writer = buffer.new_writer();
+        auto                 reader = buffer.new_reader();
+        publishRamp(writer, 512UZ);
+
+        {
+            auto span = reader.get<gr::SpanReleasePolicy::ProcessNone>(64UZ);
+            expect(eq(span.size(), 64UZ));
+            expect(!span.consume(100UZ)) << "a consume past the span handed out must be refused";
+            expect(eq(reader.position(), 0UZ)) << "a refused consume must not move the read index";
+            expect(eq(span.front(), 0)) << "the refused span must stay readable";
+            expect(eq(span.back(), 63)) << "the refused span must stay readable";
+            expect(span.consume(64UZ)) << "the span must still be consumable after a refusal";
+        }
+        expect(eq(reader.position(), 64UZ));
+        expect(eq(reader.available(), 448UZ)) << "only the samples the reader saw may be retired";
+
+        auto next = reader.get<gr::SpanReleasePolicy::ProcessNone>(8UZ);
+        expect(eq(next.front(), 64)) << "the stream must resume at the first sample never handed out";
+        expect(next.consume(0UZ));
+    };
+
+    "a consume of exactly the span handed out is accepted"_test = [] {
+        CircularBufferSingle buffer(1024UZ);
+        auto                 writer = buffer.new_writer();
+        auto                 reader = buffer.new_reader();
+        publishRamp(writer, 512UZ);
+
+        {
+            auto span = reader.get<gr::SpanReleasePolicy::ProcessNone>(64UZ);
+            expect(span.consume(span.size()));
+        }
+        expect(eq(reader.position(), 64UZ));
+        expect(eq(reader.nSamplesConsumed(), 64UZ));
+    };
+
+    "the first get bounds the window a later get may consume"_test = [] {
+        CircularBufferSingle buffer(1024UZ);
+        auto                 writer = buffer.new_writer();
+        auto                 reader = buffer.new_reader();
+        publishRamp(writer, 512UZ);
+
+        {
+            auto first  = reader.get<gr::SpanReleasePolicy::ProcessNone>(64UZ);
+            auto second = reader.get<gr::SpanReleasePolicy::ProcessNone>(512UZ);
+            expect(eq(second.size(), 64UZ)) << "a later get cannot grow the window";
+            expect(!second.consume(512UZ)) << "the window the first get opened must still bound the consume";
+            expect(eq(reader.position(), 0UZ));
+            expect(second.consume(64UZ));
+        }
+        expect(eq(reader.position(), 64UZ));
+    };
+
+    "a zero-sample get retires nothing"_test = [] {
+        CircularBufferSingle buffer(1024UZ);
+        auto                 writer = buffer.new_writer();
+        auto                 reader = buffer.new_reader();
+        publishRamp(writer, 512UZ);
+
+        {
+            auto span = reader.get<gr::SpanReleasePolicy::ProcessNone>(0UZ);
+            expect(eq(span.size(), 0UZ));
+            expect(!span.consume(100UZ)) << "a span that showed nothing may retire nothing";
+            expect(span.consume(0UZ));
+        }
+        expect(eq(reader.position(), 0UZ));
+        expect(eq(reader.available(), 512UZ)) << "the stream must be untouched";
+    };
+
+    "consume(0) stays legal in every state"_test = [] {
+        CircularBufferSingle buffer(1024UZ);
+        auto                 writer = buffer.new_writer();
+        auto                 reader = buffer.new_reader();
+        publishRamp(writer, 512UZ);
+
+        {
+            auto span = reader.get<gr::SpanReleasePolicy::ProcessNone>(0UZ);
+            expect(span.consume(0UZ)) << "on an empty span";
+        }
+        {
+            auto span = reader.get<gr::SpanReleasePolicy::ProcessNone>(64UZ);
+            expect(span.consume(0UZ)) << "on a span that showed samples";
+        }
+        {
+            auto span = reader.get<gr::SpanReleasePolicy::ProcessNone>(64UZ);
+            expect(!span.consume(65UZ));
+            expect(span.consume(0UZ)) << "after a refused consume";
+        }
+        expect(eq(reader.position(), 0UZ));
+        expect(eq(reader.available(), 512UZ));
     };
 };
 
