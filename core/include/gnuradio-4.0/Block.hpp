@@ -598,7 +598,60 @@ enum class Category {
     TransparentBlockGroup, ///< Block with children blocks which do not have a dedicated scheduler
     ScheduledBlockGroup    ///< Block with children that have a dedicated scheduler
 };
-}
+
+struct FusedTag {
+    std::ptrdiff_t relIndex{};
+    property_map   map{};
+};
+
+using FusedTagList = std::vector<FusedTag>;
+
+struct FusedFront {
+    std::size_t  nSamples = 0UZ;
+    work::Status status   = work::Status::OK;
+    bool         fallback = false; ///< end-of-stream or a non-RUNNING member: the run must fall back to per-member work()
+};
+
+// the boundary spans live on the stack frame of the typed function that owns them, so the rest of the
+// run is invoked from inside that frame rather than the span being handed out
+using FusedInputBody  = std::size_t (*)(void* context, const void* input, const FusedTagList& inputTags, std::size_t nSamples);
+using FusedOutputBody = std::size_t (*)(void* context, void* output, std::size_t nSamples);
+
+/**
+ * @brief Type-erased view of one synchronous 1:1 `processOne` block, sufficient to drive it from a scratch buffer.
+ *
+ * Resolved once at plan time by `BlockModel::fusedStage()` and stored in the fused run's plan; the per-chunk cost
+ * is one indirect call per entry. A block that does not satisfy the fusion inclusion rules publishes no descriptor.
+ */
+struct FusedStage {
+    std::size_t valueSizeIn{};
+    std::size_t valueSizeOut{};
+    std::size_t valueAlignOut{};
+    bool        isPure{}; ///< const processOne: no mid-chunk tag or lifecycle interaction
+
+    std::size_t (*applyChunk)(void* block, const void* in, void* out, std::size_t nSamples);
+    bool (*takePendingTag)(void* block, property_map& tag);
+
+    FusedFront (*front)(void* block, std::size_t requestedWork);
+    std::size_t (*withInput)(void* block, std::size_t nSamples, FusedInputBody body, void* context);
+    std::size_t (*withOutput)(void* block, std::size_t nSamples, const FusedTagList& outputTags, FusedOutputBody body, void* context);
+    void (*beginChunk)(void* block, bool isFront, const FusedTagList& incoming, FusedTagList& outgoing);
+};
+
+/**
+ * @brief Type-erased view of one `processBulk` block that a fused run drives through its own `work()`, or nullptr.
+ *
+ * Non-null only for a block that implements `processBulk` (not `processOne`) with exactly one stream input and one
+ * stream output port. There is no per-chunk entry point because `BlockModel::work()` already is one; the value sizes
+ * are the one thing the run cannot read elsewhere, and they size the interior edge the member writes into.
+ */
+struct BulkStage {
+    std::size_t valueSizeIn{};
+    std::size_t valueSizeOut{};
+};
+
+inline constexpr std::size_t kFusedShutdownCheckStride = 256UZ; ///< a non-pure stage reads its lifecycle state once per sub-block, not once per sample
+} // namespace block
 
 /**
  * @brief The 'Block<Derived>' is a base class for blocks that perform specific signal processing operations. It stores
@@ -1127,35 +1180,38 @@ public:
         }
     }
 
+    /// keep the auto-forward keys of an incoming tag, substituting this block's own current value for any key it owns
+    [[nodiscard]] property_map filterAndSubstituteTag(const property_map& src, std::optional<property_map>& cachedSettings) {
+        const auto&  autoForwardKeys = settings().autoForwardParameters();
+        const auto&  blockSettings   = CtxSettings<Derived>::allWritableMembers();
+        property_map dst;
+        for (const auto& [key, value] : src) {
+            auto shortKey = convert_string_domain(key);
+            if (!autoForwardKeys.contains(shortKey)) {
+                continue;
+            }
+            if (!cachedSettings) {
+                cachedSettings.emplace(settings().get());
+            }
+            if (auto it = cachedSettings->find(key); blockSettings.contains(shortKey) && it != cachedSettings->end()) {
+                dst.insert_or_assign(key, it->second);
+            } else {
+                dst.insert_or_assign(key, value);
+            }
+        }
+        return dst;
+    }
+
     /// default tag forwarding — called by workInternal unless the user provides forwardTags()
     template<typename TInputSpans, typename TOutputSpans>
     void forwardInputTags(TInputSpans& inputSpans, TOutputSpans& outputSpans, std::size_t processedIn) noexcept {
         if constexpr (noTagPropagation) {
             return;
         }
-        const auto&       autoForwardKeys = settings().autoForwardParameters();
-        const auto&       blockSettings   = CtxSettings<Derived>::allWritableMembers();
-        const std::size_t tagWindow       = backwardTagPropagation ? processedIn : 1UZ;
+        const std::size_t tagWindow = backwardTagPropagation ? processedIn : 1UZ;
 
         std::optional<property_map> cachedSettings;
-        auto                        filterAndSubstitute = [&](const property_map& src) {
-            property_map dst;
-            for (const auto& [key, value] : src) {
-                auto shortKey = convert_string_domain(key);
-                if (!autoForwardKeys.contains(shortKey)) {
-                    continue;
-                }
-                if (!cachedSettings) {
-                    cachedSettings.emplace(settings().get());
-                }
-                if (auto it = cachedSettings->find(key); blockSettings.contains(shortKey) && it != cachedSettings->end()) {
-                    dst.insert_or_assign(key, it->second);
-                } else {
-                    dst.insert_or_assign(key, value);
-                }
-            }
-            return dst;
-        };
+        auto                        filterAndSubstitute = [&](const property_map& src) { return filterAndSubstituteTag(src, cachedSettings); };
 
         auto publishFiltered = [&](std::ptrdiff_t relIndex, const property_map& tagMap) {
             auto forwarded = filterAndSubstitute(tagMap);
@@ -1681,6 +1737,29 @@ public:
             meta::tuple_for_each([i]<typename R>(auto& output_range, R&& result) { output_range[i] = std::forward<R>(result); }, outputSpans, results);
         }
         return work::Status::OK;
+    }
+
+    /// non-const processOne over one fused chunk: the pending tag stays in _pendingOutputTag for the run to place,
+    /// and the shutdown state is read once per sub-block rather than once per sample
+    std::size_t invokeProcessOneNonConstFused(auto& inputSpans, auto& outputSpans, std::size_t nSamplesToProcess) {
+        _inProcessOneDispatch = true;
+        std::size_t i         = 0UZ;
+        while (i < nSamplesToProcess) {
+            const std::size_t until = std::min(nSamplesToProcess, i + block::kFusedShutdownCheckStride);
+            for (; i < until; ++i) {
+                auto results = std::apply([this, i](auto&... inputs) { return this->invoke_processOne(inputs[i]...); }, inputSpans);
+                meta::tuple_for_each([i]<typename R>(auto& output_range, R&& result) { output_range[i] = std::forward<R>(result); }, outputSpans, results);
+                if (_outputTagPending) [[unlikely]] {
+                    _inProcessOneDispatch = false;
+                    return i + 1UZ;
+                }
+            }
+            if (lifecycle::isShuttingDown(this->state())) [[unlikely]] {
+                break;
+            }
+        }
+        _inProcessOneDispatch = false;
+        return i;
     }
 
     auto invokeProcessOneNonConst(auto& inputSpans, auto& outputSpans, std::size_t nSamplesToProcess) {
@@ -2414,6 +2493,220 @@ inline constexpr int registerBlock(TRegisterInstance& registerInstance) {
     ((addBlockType.template operator()<TBlockParameters>()), ...);
     return {};
 }
+
+namespace block {
+namespace detail {
+
+template<typename T>
+concept FusableStageBlock = HasProcessOneFunction<T> && !HasProcessBulkFunction<T>                                                            //
+                            && (T::blockCategory == block::Category::NormalBlock)                                                             //
+                            && (traits::block::stream_input_port_types<T>::size() == 1UZ)                                                     //
+                            && (traits::block::stream_output_port_types<T>::size() == 1UZ)                                                    //
+                            && !T::noTagPropagation && !T::forwardTagPropagation && !T::backwardTagPropagation && !T::mergeTagPropagation     //
+                            && !T::StrideControl::kEnabled && !T::ResamplingControl::kEnabled                                                 //
+                            && !requires(T& block) { block.forwardTags(std::declval<std::tuple<>&>(), std::declval<std::tuple<>&>(), 0UZ); }; //
+
+template<typename T>
+concept BulkStageBlock = HasProcessBulkFunction<T> && !HasProcessOneFunction<T>          //
+                         && (T::blockCategory == block::Category::NormalBlock)           //
+                         && (traits::block::stream_input_port_types<T>::size() == 1UZ)   //
+                         && (traits::block::stream_output_port_types<T>::size() == 1UZ); //
+
+template<typename T>
+using FusedValueTypeIn = typename traits::block::stream_input_port_types<T>::template at<0>;
+template<typename T>
+using FusedValueTypeOut = typename traits::block::stream_output_port_types<T>::template at<0>;
+
+template<FusableStageBlock T>
+std::size_t fusedApplyChunk(void* rawBlock, const void* in, void* out, std::size_t nSamples) {
+    T&   block       = *static_cast<T*>(rawBlock);
+    auto inputSpans  = std::tuple{std::span<const FusedValueTypeIn<T>>(static_cast<const FusedValueTypeIn<T>*>(in), nSamples)};
+    auto outputSpans = std::tuple{std::span<FusedValueTypeOut<T>>(static_cast<FusedValueTypeOut<T>*>(out), nSamples)};
+
+    std::size_t produced = nSamples;
+    if constexpr (HasConstProcessOneFunction<T>) {
+        if constexpr (traits::block::can_processOne_simd<T>) {
+            constexpr std::size_t kMaxWidth = stdx::simd_abi::max_fixed_size<double>;
+            constexpr auto        kWidth    = meta::cw<std::min(kMaxWidth, meta::simdize<typename traits::block::stream_input_port_types<T>::template apply<std::tuple>>::size() * std::size_t(4))>;
+            std::ignore                     = block.invokeProcessOneSimd(inputSpans, outputSpans, kWidth, nSamples);
+        } else {
+            std::ignore = block.invokeProcessOnePure(inputSpans, outputSpans, nSamples);
+        }
+    } else {
+        produced = block.invokeProcessOneNonConstFused(inputSpans, outputSpans, nSamples);
+    }
+    block._inputTagPresent = false;
+    return produced;
+}
+
+template<FusableStageBlock T>
+bool fusedTakePendingTag(void* rawBlock, property_map& tag) {
+    T& block = *static_cast<T*>(rawBlock);
+    if (!block._outputTagPending) {
+        return false;
+    }
+    tag = std::move(block._pendingOutputTag);
+    block._pendingOutputTag.clear();
+    block._outputTagPending = false;
+    return true;
+}
+
+template<FusableStageBlock T>
+FusedFront fusedFront(void* rawBlock, std::size_t requestedWork) {
+    T& block = *static_cast<T*>(rawBlock);
+    if (block.state() != lifecycle::State::RUNNING) {
+        return {0UZ, work::Status::OK, true};
+    }
+    block.inputStreamCache.invalidateStatistic();
+    block.outputStreamCache.invalidateStatistic();
+    if (!block._pendingForwardParams.empty()) {
+        block._pendingForwardParams.clear();
+    }
+    block.applyChangedSettings(true, &block._pendingForwardParams);
+
+    const auto limits  = block.computeSampleLimits(requestedWork);
+    const auto reStage = [&block] {
+        if (!block._pendingForwardParams.empty()) {
+            std::ignore = block.settings().setStaged(block._pendingForwardParams);
+            block._pendingForwardParams.clear();
+        }
+    };
+    if (limits.isEosPresent || limits.asyncEoS || lifecycle::isShuttingDown(block.state())) {
+        reStage();
+        return {0UZ, work::Status::OK, true};
+    }
+    if (limits.resampledIn == 0UZ) {
+        reStage();
+        return {0UZ, limits.resampledStatus, false};
+    }
+    return {limits.resampledIn, work::Status::OK, false};
+}
+
+template<FusableStageBlock T>
+std::size_t fusedWithInput(void* rawBlock, std::size_t nSamples, FusedInputBody body, void* context) {
+    T&   block  = *static_cast<T*>(rawBlock);
+    auto inSpan = inputPort<0, PortType::STREAM>(&block).template get<SpanReleasePolicy::ProcessAll, true>(nSamples);
+
+    FusedTagList inputTags;
+    for (const auto& [relIndex, tagMapRef] : inSpan.tags(1UZ)) {
+        inputTags.emplace_back(relIndex, tagMapRef.get());
+    }
+
+    const std::size_t produced = body(context, static_cast<const void*>(inSpan.data()), inputTags, nSamples);
+    std::ignore                = inSpan.consume(produced);
+    return produced;
+}
+
+template<FusableStageBlock T>
+std::size_t fusedWithOutput(void* rawBlock, std::size_t nSamples, const FusedTagList& outputTags, FusedOutputBody body, void* context) {
+    T&   block   = *static_cast<T*>(rawBlock);
+    auto outSpan = outputPort<0, PortType::STREAM>(&block).template tryReserve<SpanReleasePolicy::ProcessAll>(nSamples);
+    if (outSpan.size() < nSamples) {
+        outSpan.publish(0UZ);
+        return 0UZ;
+    }
+    for (const auto& tag : outputTags) {
+        outSpan.publishTag(tag.map, 0UZ);
+    }
+
+    const std::size_t produced = body(context, static_cast<void*>(outSpan.data()), nSamples);
+    if constexpr (!HasConstProcessOneFunction<T>) {
+        property_map pending;
+        if (fusedTakePendingTag<T>(rawBlock, pending) && produced > 0UZ) {
+            outSpan.publishTag(std::move(pending), produced - 1UZ);
+        }
+    }
+    if (produced == 0UZ) {
+        outSpan.tagsPublished = 0UZ;
+    }
+    outSpan.publish(produced);
+    return produced;
+}
+
+template<FusableStageBlock T>
+void fusedBeginChunk(void* rawBlock, bool isFront, const FusedTagList& incoming, FusedTagList& outgoing) {
+    T& block = *static_cast<T*>(rawBlock);
+    if (!isFront) { // the front member's forward parameters were captured by fusedFront()
+        if (!block._pendingForwardParams.empty()) {
+            block._pendingForwardParams.clear();
+        }
+        block.applyChangedSettings(true, &block._pendingForwardParams);
+    }
+
+    if (!incoming.empty()) {
+        for (const auto& tag : incoming) {
+            block.settings().autoUpdate(Tag{tag.relIndex < 0 ? 0UZ : static_cast<std::size_t>(tag.relIndex), tag.map});
+        }
+        auto& port = inputPort<0, PortType::STREAM>(&block);
+        for (const auto& tag : incoming) {
+            if (const auto result = port.metaInfo.update(tag.map); !result.has_value()) {
+                block.emitMessage("Block::applyInputTagsFromPorts - rejected tag", {{"error", result.error().message}});
+            }
+        }
+        block.applyChangedSettings(false);
+    }
+
+    outgoing.clear();
+    std::optional<property_map> cachedSettings;
+    for (const auto& tag : incoming) {
+        property_map forwarded = block.filterAndSubstituteTag(tag.map, cachedSettings);
+        if (!forwarded.empty()) {
+            outgoing.emplace_back(0, std::move(forwarded));
+        }
+    }
+    if (!block._pendingForwardParams.empty()) {
+        outgoing.emplace_back(0, block._pendingForwardParams);
+    }
+
+    property_map merged;
+    for (const auto& tag : incoming) {
+        if (tag.relIndex != 0) {
+            continue;
+        }
+        for (const auto& [key, value] : tag.map) {
+            merged.insert_or_assign(key, value);
+        }
+    }
+    if (!merged.empty()) {
+        block._mergedInputTag  = Tag{0UZ, std::move(merged)};
+        block._inputTagPresent = true;
+    }
+}
+
+} // namespace detail
+
+template<typename T>
+[[nodiscard]] const FusedStage* fusedStageOf() noexcept {
+    if constexpr (!detail::FusableStageBlock<T>) {
+        return nullptr;
+    } else {
+        static constexpr FusedStage kStage{
+            .valueSizeIn    = sizeof(detail::FusedValueTypeIn<T>),
+            .valueSizeOut   = sizeof(detail::FusedValueTypeOut<T>),
+            .valueAlignOut  = alignof(detail::FusedValueTypeOut<T>),
+            .isPure         = HasConstProcessOneFunction<T>,
+            .applyChunk     = &detail::fusedApplyChunk<T>,
+            .takePendingTag = &detail::fusedTakePendingTag<T>,
+            .front          = &detail::fusedFront<T>,
+            .withInput      = &detail::fusedWithInput<T>,
+            .withOutput     = &detail::fusedWithOutput<T>,
+            .beginChunk     = &detail::fusedBeginChunk<T>,
+        };
+        return &kStage;
+    }
+}
+
+template<typename T>
+[[nodiscard]] const BulkStage* bulkStageOf() noexcept {
+    if constexpr (!detail::BulkStageBlock<T>) {
+        return nullptr;
+    } else {
+        static constexpr BulkStage kStage{sizeof(detail::FusedValueTypeIn<T>), sizeof(detail::FusedValueTypeOut<T>)};
+        return &kStage;
+    }
+}
+
+} // namespace block
 
 template<typename Function, typename Tuple>
 inline constexpr void for_each_port(Function&& function, Tuple&& tuple) {

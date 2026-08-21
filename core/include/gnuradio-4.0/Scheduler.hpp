@@ -10,6 +10,7 @@
 #include <thread>
 #include <utility>
 
+#include <gnuradio-4.0/FusedRun.hpp>
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/Graph_yaml_importer.hpp>
 #include <gnuradio-4.0/LifeCycle.hpp>
@@ -139,6 +140,8 @@ protected:
     std::recursive_mutex          _executionOrderMutex; // only used when modifying and copying the graph->local job list
     std::shared_ptr<JobLists>     _executionOrder = std::make_shared<JobLists>();
 
+    std::vector<std::vector<fusion::RunPlan>> _fusionPlan; // guarded by _executionOrderMutex, indexed like _executionOrder
+
     std::mutex                               _zombieBlocksMutex;
     std::vector<std::shared_ptr<BlockModel>> _zombieBlocks;
 
@@ -200,8 +203,11 @@ public:
     Annotated<std::string, "pool name", Doc<"default pool name">>                                                              poolName                        = std::string(gr::thread_pool::kDefaultCpuPoolId);
     Annotated<std::size_t, "max_work_items", Doc<"number of work items per work scheduling interval (controls latency)">>      max_work_items                  = std::numeric_limits<std::size_t>::max(); // TODO: check whether we can keep this std::size_t or more consistently to gr::Size_t
     Annotated<property_map, "sched_settings", Doc<"scheduler implementation specific settings">>                               sched_settings{};
+    Annotated<bool, "enable_fusion", Doc<"execute maximal runs of processOne and fixed-ratio processBulk blocks as one unit">> enable_fusion                = false;
+    Annotated<gr::Size_t, "fusion_chunk_samples", Doc<"samples per fused chunk, 0 = derive from the run's value sizes">>       fusion_chunk_samples         = 0U;
+    Annotated<gr::Size_t, "fusion_interior_edge_samples", Doc<"ring size of an edge between two fused stages, 0 = derive">>    fusion_interior_edge_samples = 0U;
 
-    GR_MAKE_REFLECTABLE(SchedulerBase, timeout_ms, watchdog_timeout, timeout_inactivity_count, process_stream_to_message_ratio, max_work_items, poolName, sched_settings);
+    GR_MAKE_REFLECTABLE(SchedulerBase, timeout_ms, watchdog_timeout, timeout_inactivity_count, process_stream_to_message_ratio, max_work_items, poolName, sched_settings, enable_fusion, fusion_chunk_samples, fusion_interior_edge_samples);
 
     constexpr static block::Category blockCategory = block::Category::ScheduledBlockGroup;
 
@@ -582,6 +588,8 @@ public:
 
     [[nodiscard]] std::shared_ptr<JobLists> jobs() const noexcept { return _executionOrder; }
 
+    [[nodiscard]] const std::vector<std::vector<fusion::RunPlan>>& fusionPlan() const noexcept { return _fusionPlan; }
+
 protected:
     void disconnectAllEdges() {
         _graph->disconnectAllEdges();
@@ -656,6 +664,116 @@ protected:
         return {max_work_items, performedWorkAllBlocks, unfinishedBlocksExist ? work::Status::OK : work::Status::DONE};
     }
 
+    // graph::flatten copies its edges by value, so a planned edge is a copy and writing it would be a silent no-op
+    [[nodiscard]] Edge* findLiveEdge(const Edge& planned) {
+        for (Edge& edge : _graph->edges()) {
+            if (edge == planned) {
+                return std::addressof(edge);
+            }
+        }
+        Edge* found = nullptr;
+        graph::forEachBlock<TransparentBlockGroup>(*_graph, [&found, &planned](auto& block) {
+            if (found != nullptr || block->blockCategory() != TransparentBlockGroup) {
+                return;
+            }
+            for (Edge& edge : static_cast<GraphWrapper<gr::Graph>*>(block.get())->blockRef().edges()) {
+                if (edge == planned) {
+                    found = std::addressof(edge);
+                    return;
+                }
+            }
+        });
+        return found;
+    }
+
+    // between planFusion() and start()'s connectPendingEdges() every edge is waiting to be connected, so writing
+    // minBufferSize per interior edge suffices: calculateStreamBufferSize() reads it back out on connection
+    void writeInteriorEdgeSizes(bool restore) {
+        for (std::vector<fusion::RunPlan>& runs : _fusionPlan) {
+            for (fusion::RunPlan& run : runs) {
+                for (fusion::InteriorEdge& interior : run.interiorEdges) {
+                    if (restore && interior.previousMinBufferSize == undefined_size) {
+                        continue;
+                    }
+                    Edge* live = findLiveEdge(interior.edge);
+                    if (live == nullptr) {
+                        continue;
+                    }
+                    if (restore) {
+                        live->setMinBufferSize(interior.previousMinBufferSize);
+                        interior.previousMinBufferSize = undefined_size;
+                    } else {
+                        interior.previousMinBufferSize = live->minBufferSize();
+                        live->setMinBufferSize(interior.samples);
+                    }
+                }
+            }
+        }
+    }
+
+    // the plan is rebuilt from scratch here and dissolved by any graph edit
+    void planFusion() {
+        std::lock_guard lock(_executionOrderMutex);
+        writeInteriorEdgeSizes(true);
+        _fusionPlan.clear();
+        if (!enable_fusion) {
+            return;
+        }
+        _fusionPlan = fusion::planFusedRuns(gr::graph::flatten(*_graph), *_executionOrder, static_cast<std::size_t>(fusion_chunk_samples.value), static_cast<std::size_t>(fusion_interior_edge_samples.value));
+
+        for (std::size_t jobIndex = 0UZ; jobIndex < _fusionPlan.size(); ++jobIndex) {
+            const std::vector<fusion::RunPlan>& runs = _fusionPlan[jobIndex];
+            if (runs.empty()) {
+                continue;
+            }
+            std::unordered_map<const BlockModel*, std::size_t> runOfMember;
+            std::vector<std::shared_ptr<BlockModel>>           runEntries;
+            runEntries.reserve(runs.size());
+            for (const fusion::RunPlan& run : runs) {
+                for (const std::shared_ptr<BlockModel>& member : run.members) {
+                    runOfMember[member.get()] = runEntries.size();
+                }
+                runEntries.push_back(std::make_shared<fusion::FusedRun>(run, _graph->_progress));
+            }
+
+            std::vector<std::shared_ptr<BlockModel>> fusedJob;
+            std::vector<bool>                        placed(runEntries.size(), false);
+            for (const std::shared_ptr<BlockModel>& entry : _executionOrder->at(jobIndex)) {
+                const auto it = runOfMember.find(entry.get());
+                if (it == runOfMember.end()) {
+                    fusedJob.push_back(entry);
+                } else if (!placed[it->second]) {
+                    placed[it->second] = true;
+                    fusedJob.push_back(runEntries[it->second]);
+                }
+            }
+            _executionOrder->at(jobIndex) = std::move(fusedJob);
+        }
+        writeInteriorEdgeSizes(false);
+    }
+
+    // a fused run holds its members by shared_ptr, so a graph edit that touches one must not leave it in the job list
+    void dissolveFusedRuns() {
+        std::lock_guard lock(_executionOrderMutex);
+        if (_fusionPlan.empty()) {
+            return;
+        }
+        // a live graph cannot reallocate a ring, so the rings stay small until the next start()
+        writeInteriorEdgeSizes(true);
+        for (std::vector<std::shared_ptr<BlockModel>>& job : *_executionOrder) {
+            std::vector<std::shared_ptr<BlockModel>> dissolved;
+            for (const std::shared_ptr<BlockModel>& entry : job) {
+                if (auto* run = dynamic_cast<fusion::FusedRun*>(entry.get()); run != nullptr) {
+                    std::ranges::copy(run->members(), std::back_inserter(dissolved));
+                } else {
+                    dissolved.push_back(entry);
+                }
+            }
+            job = std::move(dissolved);
+        }
+        _fusionPlan.clear();
+    }
+
     void init() {
         [[maybe_unused]] const auto pe = _profilerHandler->startCompleteEvent("scheduler_base.init");
         base_t::processScheduledMessages(); // make sure initial subscriptions are processed
@@ -664,6 +782,7 @@ protected:
         if constexpr (requires(Derived& d) { d.customInit(); }) {
             static_cast<Derived*>(this)->customInit();
         }
+        planFusion();
     }
 
     // re-entering INITIALISED must rebuild the same execution state that init() builds, because the graph
@@ -678,6 +797,7 @@ protected:
         } else if constexpr (requires(Derived& d) { d.customInit(); }) {
             static_cast<Derived*>(this)->customInit();
         }
+        planFusion();
     }
 
     void start() {
@@ -1177,6 +1297,7 @@ protected:
 
         const std::shared_ptr<BlockModel>& newBlock = [&]() -> const std::shared_ptr<BlockModel>& {
             WorkQuiescenceGuard quiescence(this); // _blocks is traversed by every worker and by forEachBlock
+            dissolveFusedRuns();
             return targetGraph->emplaceBlock(blockType, blockProperties);
         }();
 
@@ -1221,6 +1342,7 @@ protected:
         messageData["_targetGraph"] = targetGraph->unique_name.value();
         {
             WorkQuiescenceGuard quiescence(this); // _blocks is traversed by every worker and by forEachBlock
+            dissolveFusedRuns();
             if (auto removedBlock = targetGraph->removeBlockByName(uniqueName); removedBlock.has_value()) {
                 makeZombie(std::move(*removedBlock));
             } else {
@@ -1258,6 +1380,7 @@ protected:
         messageData["_targetGraph"] = targetGraph->unique_name.value();
         {
             WorkQuiescenceGuard quiescence(this);
+            dissolveFusedRuns();
             if (auto result = targetGraph->removeEdgeBySourcePort(sourceBlock, sourcePort, destinationBlock, destinationPort); result.has_value()) {
                 messageData["nEdgesRemoved"] = static_cast<gr::Size_t>(*result);
             } else {
@@ -1297,7 +1420,8 @@ protected:
         messageData["_targetGraph"] = targetGraph->unique_name.value();
         {
             WorkQuiescenceGuard quiescence(this);
-            const std::size_t   effectiveMinBufferSize = (*minBufferSize == gr::undefined_Size) ? gr::undefined_size : static_cast<std::size_t>(*minBufferSize);
+            dissolveFusedRuns();
+            const std::size_t effectiveMinBufferSize = (*minBufferSize == gr::undefined_Size) ? gr::undefined_size : static_cast<std::size_t>(*minBufferSize);
             if (auto result = targetGraph->emplaceEdge(sourceBlock, std::string(sourcePort), destinationBlock, std::string(destinationPort), effectiveMinBufferSize, *weight, edgeName); !result.has_value()) {
                 message.data = std::unexpected(result.error());
             }
@@ -1327,6 +1451,19 @@ protected:
         }
 
         std::lock_guard guard(_zombieBlocksMutex);
+
+        // a zombie inside a fused run is not addressable as a job entry, so restore that run's members first
+        if (!_zombieBlocks.empty()) {
+            for (std::size_t i = 0UZ; i < localBlockList.size(); ++i) {
+                auto* run = dynamic_cast<fusion::FusedRun*>(localBlockList[i].get());
+                if (run == nullptr || std::ranges::none_of(run->members(), [this](const auto& member) { return std::ranges::find(_zombieBlocks, member) != _zombieBlocks.end(); })) {
+                    continue;
+                }
+                const fusion::RunMembers members = run->members();
+                localBlockList.erase(localBlockList.begin() + static_cast<std::ptrdiff_t>(i));
+                localBlockList.insert(localBlockList.begin() + static_cast<std::ptrdiff_t>(i), members.begin(), members.end());
+            }
+        }
 
         auto it = _zombieBlocks.begin();
 
@@ -1576,6 +1713,7 @@ protected:
 
         auto [oldBlock, newBlockRaw] = [&] {
             WorkQuiescenceGuard quiescence(this); // _blocks is traversed by every worker and by forEachBlock
+            dissolveFusedRuns();
             return targetGraph->replaceBlock(uniqueName, type, properties);
         }();
         makeZombie(std::move(oldBlock));
