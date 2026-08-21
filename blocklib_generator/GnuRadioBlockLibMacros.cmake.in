@@ -96,15 +96,18 @@ function(gr_generate_block_instantiations LIB_NAME)
     set(GEN_OPTIONS_SIG "${PARSER_SPLIT_FLAG}|${EFFECTIVE_MAX_PER_TU}|${CBL_REGISTRY_HEADER}|${CBL_REGISTRY_INSTANCE}")
 
     foreach(HDR IN LISTS CBL_HEADERS)
+        # unconditional: the source list below and the reconfigure trigger are needed for every
+        # header on every configure, not only for the ones that are regenerated this time round
+        get_filename_component(ABS_HDR "${HDR}" ABSOLUTE)
+        get_filename_component(BASENAME "${HDR}" NAME_WE)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${HDR})
+
         # Try to only run the generation when the header is newer than the last time
         set(modified 0)
         file(TIMESTAMP ${HDR} modified "%s")
         if (NOT DEFINED modified_${HDR} OR "${modified}" GREATER modified_${HDR} OR NOT "${genopts_${HDR}}" STREQUAL "${GEN_OPTIONS_SIG}")
             set(modified_${HDR} ${modified} CACHE STRING "Last generated time" FORCE)
             set(genopts_${HDR} "${GEN_OPTIONS_SIG}" CACHE STRING "Last generation options" FORCE)
-
-            get_filename_component(ABS_HDR "${HDR}" ABSOLUTE)
-            get_filename_component(BASENAME "${HDR}" NAME_WE)
 
             # remove any previously generated .cpp files for this header
             # (anchored globs so e.g. 'Math' does not also delete 'MathExtra' outputs).
@@ -119,8 +122,6 @@ function(gr_generate_block_instantiations LIB_NAME)
                 message(STATUS "[BlockLibMacros] deleting old generated files ${OLD_FILES}")
                 file(REMOVE ${OLD_FILES})
             endif()
-
-            set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${HDR})
 
             message(STATUS "[BlockLibMacros] Generating code for header: ${ABS_HDR} -> ${GEN_DIR} with PARSER_SPLIT_FLAG=${PARSER_SPLIT_FLAG}, other options [ ${PARSER_MAX_PER_TU_ARGS} ${PARSER_REGISTRY_HEADER_FLAG} ${PARSER_REGISTRY_HEADER_OPTION} ${PARSER_REGISTRY_INSTANCE_FLAG} ${PARSER_REGISTRY_INSTANCE_OPTION} ]")
 
@@ -159,8 +160,8 @@ function(gr_generate_block_instantiations LIB_NAME)
         endif()
 
         # Glob for the generated .cpp files.
-        file(GLOB GENERATED_FILES "${GEN_DIR}/${BASENAME}*.cpp")
-        # message(STATUS "[BlockLibMacros] Globed for generated files in ${GEN_DIR} named ${BASENAME}*.cpp got:\n${GENERATED_FILES}")
+        # anchored like the delete glob above, so 'Math' does not also collect 'MathExtra' outputs
+        file(GLOB GENERATED_FILES "${GEN_DIR}/${BASENAME}_*.cpp" "${GEN_DIR}/dummy_${BASENAME}.cpp")
         if(NOT GENERATED_FILES)
             # If no .cpp files were generated, create a dummy file.
             set(DUMMY_CPP "${GEN_DIR}/dummy_${BASENAME}.cpp")
