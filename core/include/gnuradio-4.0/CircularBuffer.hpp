@@ -336,14 +336,8 @@ private:
             _parent->incInstanceCount();
         }
         WriterSpan(const WriterSpan& other) : _parent(other._parent), _isRefused(other._isRefused) { _parent->incInstanceCount(); }
-        WriterSpan& operator=(const WriterSpan& other) {
-            if (this != &other) {
-                _parent    = other._parent;
-                _isRefused = other._isRefused;
-                _parent->incInstanceCount();
-            }
-            return *this;
-        }
+        // no assignment: releasing the overwritten span's share of the claim is the destructor's job
+        WriterSpan& operator=(const WriterSpan&) = delete;
 
         ~WriterSpan() {
             _parent->decInstanceCount();
@@ -607,14 +601,8 @@ private:
 
         ReaderSpan(const ReaderSpan& other) : _parent(other._parent), _internalSpan(other._internalSpan) { _parent->incInstanceCount(); }
 
-        ReaderSpan& operator=(const ReaderSpan& other) {
-            if (this != &other) {
-                _parent       = other._parent;
-                _internalSpan = other._internalSpan;
-                _parent->incInstanceCount();
-            }
-            return *this;
-        }
+        // no assignment: releasing the overwritten span's share of the acquisition is the destructor's job
+        ReaderSpan& operator=(const ReaderSpan&) = delete;
 
         ~ReaderSpan() {
             _parent->decInstanceCount();

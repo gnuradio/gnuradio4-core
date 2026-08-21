@@ -9,6 +9,8 @@
 #include <ranges>
 #include <string_view>
 #include <thread>
+#include <type_traits>
+#include <utility>
 
 #include <gnuradio-4.0/CircularBuffer.hpp>
 
@@ -431,6 +433,20 @@ const boost::ut::suite<"reader over-consume"> readerConsumeBoundTests = [] {
         expect(eq(reader.available(), 512UZ));
     };
 };
+
+// every copy of a span shares the parent's claim, and only the release of the last one retires it,
+// so a span may be copied but never assigned over -- the overwritten copy would never be released
+using ReaderUnderTest     = decltype(std::declval<CircularBufferSingle&>().new_reader());
+using WriterUnderTest     = decltype(std::declval<CircularBufferSingle&>().new_writer());
+using ReaderSpanUnderTest = decltype(std::declval<ReaderUnderTest&>().get<gr::SpanReleasePolicy::ProcessNone>(0UZ));
+using WriterSpanUnderTest = decltype(std::declval<WriterUnderTest&>().reserve<gr::SpanReleasePolicy::ProcessNone>(0UZ));
+
+static_assert(std::is_copy_constructible_v<ReaderSpanUnderTest>);
+static_assert(!std::is_copy_assignable_v<ReaderSpanUnderTest>);
+static_assert(!std::is_move_assignable_v<ReaderSpanUnderTest>);
+static_assert(std::is_copy_constructible_v<WriterSpanUnderTest>);
+static_assert(!std::is_copy_assignable_v<WriterSpanUnderTest>);
+static_assert(!std::is_move_assignable_v<WriterSpanUnderTest>);
 
 const boost::ut::suite<"buffer zero-reader gating"> bufferZeroReaderTests = [] {
     using namespace boost::ut;
