@@ -595,8 +595,6 @@ private:
         using reverse_iterator = typename std::span<const T>::reverse_iterator;
         using pointer          = typename std::span<const T>::reverse_iterator;
 
-        explicit ReaderSpan(const Reader<U>* parent) noexcept : _parent(parent) { _parent->incInstanceCount(); }
-
         explicit constexpr ReaderSpan(Reader<U>* parent, std::size_t index, std::size_t nRequested) noexcept : _parent(parent), _internalSpan({&_parent->_buffer->_data.data()[index], nRequested}) { _parent->incInstanceCount(); }
 
         ReaderSpan(const ReaderSpan& other) : _parent(other._parent), _internalSpan(other._internalSpan) { _parent->incInstanceCount(); }
