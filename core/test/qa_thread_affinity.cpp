@@ -4,6 +4,35 @@
 
 #include <gnuradio-4.0/thread/thread_affinity.hpp>
 
+#if not defined(__EMSCRIPTEN__) && not defined(__APPLE__)
+namespace {
+// a real-time policy is denied for lack of CAP_SYS_NICE only while RLIMIT_RTPRIO stays below the
+// requested priority, and hosts that ship a real-time rlimit -- PipeWire and JACK install one, audio
+// and SDR setups raise it further -- grant it to ordinary users. Ask the kernel once on a thread of
+// its own instead of modeling the privilege rules.
+[[nodiscard]] bool realTimeSchedulingPermitted() {
+    static const bool permitted = [] {
+        std::atomic<bool> run = true;
+        std::thread       probe([&run] {
+            while (run) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        });
+        bool              granted = true;
+        try {
+            gr::thread_pool::thread::setThreadSchedulingParameter(gr::thread_pool::thread::ROUND_ROBIN, 5, probe);
+        } catch (const std::system_error&) {
+            granted = false;
+        }
+        run = false;
+        probe.join();
+        return granted;
+    }();
+    return permitted;
+}
+} // namespace
+#endif
+
 const boost::ut::suite ThreadAffinityTests = [] {
     using namespace boost::ut;
 
@@ -130,7 +159,11 @@ const boost::ut::suite ThreadAffinityTests = [] {
         expect(nothrow([] { setProcessSchedulingParameter(OTHER, 0); }));
         expect(throws<std::system_error>([] { setProcessSchedulingParameter(OTHER, 0, -1); }));
         expect(throws<std::system_error>([] { setProcessSchedulingParameter(OTHER, 4); }));
-        expect(throws<std::system_error>([] { setProcessSchedulingParameter(ROUND_ROBIN, 5); })); // missing rights -- because most users do not have CAP_SYS_NICE rights by default -- hard to unit-test
+        if (realTimeSchedulingPermitted()) {
+            boost::ut::log << "skipped: this host grants real-time scheduling, so ROUND_ROBIN cannot be denied here";
+        } else {
+            expect(throws<std::system_error>([] { setProcessSchedulingParameter(ROUND_ROBIN, 5); }));
+        }
         param = getProcessSchedulingParameter();
         expect(that % param.policy == OTHER);
         expect(that % param.priority == 0);
@@ -163,8 +196,12 @@ const boost::ut::suite ThreadAffinityTests = [] {
         expect(throws<std::system_error>([&] { setThreadSchedulingParameter(OTHER, 0, bogusThread); }));
         expect(throws<std::system_error>([&] { setThreadSchedulingParameter(OTHER, 4, testThread); }));
         expect(throws<std::system_error>([&] { setThreadSchedulingParameter(OTHER, 4); }));
-        expect(throws<std::system_error>([&] { setThreadSchedulingParameter(ROUND_ROBIN, 5, testThread); })); // missing rights -- because most users do not have CAP_SYS_NICE rights by default -- hard to unit-test
-        expect(throws<std::system_error>([&] { setThreadSchedulingParameter(ROUND_ROBIN, 5); }));             // missing rights -- because most users do not have CAP_SYS_NICE rights by default -- hard to unit-test
+        if (realTimeSchedulingPermitted()) {
+            boost::ut::log << "skipped: this host grants real-time scheduling, so ROUND_ROBIN cannot be denied here";
+        } else {
+            expect(throws<std::system_error>([&] { setThreadSchedulingParameter(ROUND_ROBIN, 5, testThread); }));
+            expect(throws<std::system_error>([&] { setThreadSchedulingParameter(ROUND_ROBIN, 5); }));
+        }
         param = getThreadSchedulingParameter(testThread);
         expect(that % param.policy == OTHER);
 
