@@ -370,21 +370,27 @@ struct VariableDecimate : Block<VariableDecimate, Resampling<2U, 1U, false>> {
     PortIn<float>  in;
     PortOut<float> out;
 
-    gr::Size_t retune_after = std::numeric_limits<gr::Size_t>::max(); // input samples, a multiple of the initial ratio
-    gr::Size_t retune_to    = 2U;
+    gr::Size_t retune_after   = std::numeric_limits<gr::Size_t>::max(); // input samples, a multiple of the initial ratio
+    gr::Size_t retune_to      = 2U;
+    bool       stop_at_retune = false; // end the chunk exactly at the retune point, leaving the reservation part-published
 
-    GR_MAKE_REFLECTABLE(VariableDecimate, in, out, retune_after, retune_to);
+    GR_MAKE_REFLECTABLE(VariableDecimate, in, out, retune_after, retune_to, stop_at_retune);
 
-    std::size_t nStopCalls = 0UZ;
-    std::size_t consumed   = 0UZ;
-    std::size_t switchedAt = 0UZ; ///< input samples consumed when the ratio changed; where it lands is chunk-dependent
-    bool        retuned    = false;
+    std::size_t nStopCalls     = 0UZ;
+    std::size_t consumed       = 0UZ;
+    std::size_t switchedAt     = 0UZ; ///< input samples consumed when the ratio changed; where it lands is chunk-dependent
+    bool        retuned        = false;
+    bool        underPublished = false;
 
     void stop() { nStopCalls++; }
 
     work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
         const std::size_t decim = static_cast<std::size_t>(input_chunk_size);
-        const std::size_t n     = std::min(inSpan.size() / decim, outSpan.size());
+        std::size_t       n     = std::min(inSpan.size() / decim, outSpan.size());
+        if (stop_at_retune && !retuned && consumed < static_cast<std::size_t>(retune_after)) {
+            n              = std::min(n, (static_cast<std::size_t>(retune_after) - consumed) / decim);
+            underPublished = underPublished || n < outSpan.size();
+        }
         for (std::size_t i = 0UZ; i < n; ++i) {
             outSpan[i] = inSpan[decim * i];
         }
@@ -573,17 +579,18 @@ struct RetuneArm {
     bool               retuned{};
     bool               latched{};
     std::size_t        nRuns{};
+    bool               underPublished{};
 };
 
 // the member's own state is read while the scheduler that owns it is still alive
-[[nodiscard]] inline RetuneArm runRetuneChain(bool fusion, std::size_t chunkSamples) {
+[[nodiscard]] inline RetuneArm runRetuneChain(bool fusion, std::size_t chunkSamples, bool stopAtRetune = false) {
     using namespace boost::ut;
     const gr::EdgeParameters edge{.minBufferSize = 65536UZ};
 
     gr::Graph flow;
     auto&     source = flow.emplaceBlock<Source>(gr::property_map{{"name", std::string("src")}});
     auto&     gain   = flow.emplaceBlock<Gain>(gr::property_map{{"name", std::string("gain")}});
-    auto&     decim  = flow.emplaceBlock<VariableDecimate>(gr::property_map{{"name", std::string("decim")}, {"retune_after", 2048U}, {"retune_to", 4U}});
+    auto&     decim  = flow.emplaceBlock<VariableDecimate>(gr::property_map{{"name", std::string("decim")}, {"retune_after", 2048U}, {"retune_to", 4U}, {"stop_at_retune", stopAtRetune}});
     auto&     sink   = flow.emplaceBlock<Sink>(gr::property_map{{"name", std::string("snk")}});
     expect(flow.connect<"out", "in">(source, gain, edge).has_value());
     expect(flow.connect<"out", "in">(gain, decim, edge).has_value());
@@ -594,7 +601,7 @@ struct RetuneArm {
     expect(scheduler.exchange(std::move(flow)).has_value());
     expect(scheduler.runAndWait().has_value());
 
-    RetuneArm arm{sink.samples, decim.switchedAt, decim.retuned, false, collectRunSizes(scheduler.fusionPlan()).size()};
+    RetuneArm arm{sink.samples, decim.switchedAt, decim.retuned, false, collectRunSizes(scheduler.fusionPlan()).size(), decim.underPublished};
     for (const auto& job : *scheduler.jobs()) {
         for (const auto& entry : job) {
             if (const auto* run = dynamic_cast<const fusion::FusedRun*>(entry.get()); run != nullptr) {
@@ -893,6 +900,25 @@ const boost::ut::suite<"fusion"> _fusion = [] {
             expect(lt(fused.switchedAt, kSamples)) << what << "the switch must leave data for the latched arm to carry";
             expect(fused.latched) << what << "a ratio the run did not plan for must latch it to unfused execution";
             expect(std::ranges::equal(fused.samples, expectedRetuneSamples(fused.switchedAt))) << what << "no sample may be lost or duplicated at the latch";
+        }
+    };
+
+    // a decimator that ends its chunk on the retune point leaves part of the reserved output span unpublished;
+    // the released remainder must not shift the stream, on either path
+    "a bulk block that under-publishes across a live ratio change keeps its stream exact"_test = [] {
+        const RetuneArm unfused = runRetuneChain(false, 0UZ, true);
+        expect(unfused.underPublished) << "the arm must actually leave a reservation part-published";
+        expect(unfused.retuned);
+        expect(eq(unfused.switchedAt, 2048UZ)) << "the clamped chunk must land the switch exactly on the retune point";
+        expect(std::ranges::equal(unfused.samples, expectedRetuneSamples(2048UZ))) << "unfused: 2:1 up to the switch, 4:1 after it";
+
+        for (const std::size_t chunk : {256UZ, 1024UZ}) {
+            const RetuneArm   fused = runRetuneChain(true, chunk, true);
+            const std::string what  = std::format("chunk={}", chunk);
+            expect(fused.underPublished) << what;
+            expect(fused.retuned) << what;
+            expect(eq(fused.switchedAt, 2048UZ)) << what;
+            expect(std::ranges::equal(fused.samples, unfused.samples)) << what << "a part-published reservation must read the same fused";
         }
     };
 

@@ -421,10 +421,17 @@ private:
         explicit(false) operator std::span<T>&() const noexcept { return _parent->_internalSpan; }
         explicit(false) operator std::span<T>&() noexcept { return _parent->_internalSpan; }
 
+        // publishing fewer samples than reserved is allowed: the remainder is released back to the buffer.
+        // publishing more would move the publish cursor past the claim and hand readers slots that were never
+        // written, so an over-publish is clamped and reported.
         constexpr void publish(std::size_t nSamplesToPublish) noexcept {
-            auto&      requested        = _parent->_nRequestedSamplesToPublish;
-            const auto alreadyRequested = (requested == Writer<U>::kNotPublished) ? 0UZ : requested;
-            assert(nSamplesToPublish <= _parent->_internalSpan.size() - alreadyRequested && "n_produced must be <= than unpublished samples");
+            auto&             requested        = _parent->_nRequestedSamplesToPublish;
+            const std::size_t alreadyRequested = (requested == Writer<U>::kNotPublished) ? 0UZ : requested;
+            const std::size_t unpublished      = _parent->_internalSpan.size() - alreadyRequested;
+            if (nSamplesToPublish > unpublished) [[unlikely]] {
+                std::print(stderr, "CircularBuffer::WriterSpan::publish({}) exceeds the {} unpublished samples of a {}-sample reservation - clamped\n", nSamplesToPublish, unpublished, _parent->_internalSpan.size());
+                nSamplesToPublish = unpublished;
+            }
             requested = alreadyRequested + nSamplesToPublish;
         }
     }; // class WriterSpan

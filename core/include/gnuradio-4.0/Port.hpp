@@ -424,6 +424,11 @@ concept InputSpanLike = std::ranges::contiguous_range<T> && ConstSpanLike<T> && 
  *   - Default Behavior:
  *     - For `Synch` ports, all samples are published by default.
  *     - For `Async` ports, no samples are published by default.
+ *   - Publishing fewer samples than the span holds is allowed: the remainder is released back to the buffer, so a
+ *     `processBulk` may end its chunk early — including on the call where `input_chunk_size`/`output_chunk_size`
+ *     changed, which resizes the *next* span, not the one in hand. Ports on a multi-producer buffer are the
+ *     exception and must publish the whole span, since the gap would stall every later publication.
+ *   - Publishing more than the span holds is a contract violation: it is clamped to the reservation and reported.
  * - Publishing Tags: Use `publishTag(tagData, tagOffset)` to publish tags. `tagOffset` is relative to the first sample.
  */
 template<typename T>

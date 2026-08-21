@@ -1,9 +1,11 @@
 #include <boost/ut.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <optional>
+#include <ranges>
 #include <string_view>
 #include <thread>
 
@@ -137,6 +139,71 @@ void testReaderChurnAgainstProducer(std::string_view name) {
 }
 
 } // namespace
+
+const boost::ut::suite<"writer span publish bound"> writerSpanPublishTests = [] {
+    using namespace boost::ut;
+
+    "an under-published reservation releases its remainder"_test = [] {
+        CircularBufferSingle buffer(1024UZ);
+        auto                 writer = buffer.new_writer();
+        auto                 reader = buffer.new_reader();
+
+        {
+            auto span = writer.tryReserve<gr::SpanReleasePolicy::ProcessNone>(64UZ);
+            expect(eq(span.size(), 64UZ));
+            std::ranges::fill(span, 7);
+            span.publish(16UZ);
+        }
+        expect(eq(reader.available(), 16UZ)) << "only the published prefix may reach the reader";
+        expect(eq(writer.available(), buffer.size() - 16UZ)) << "the unpublished tail must return to the writer";
+
+        {
+            auto span = writer.tryReserve<gr::SpanReleasePolicy::ProcessNone>(8UZ);
+            std::ranges::fill(span, 9);
+            span.publish(8UZ);
+        }
+        expect(eq(reader.available(), 24UZ)) << "the next reservation must continue where the published prefix ended";
+
+        auto readSpan = reader.get<gr::SpanReleasePolicy::ProcessAll>(24UZ);
+        expect(std::ranges::all_of(readSpan | std::views::take(16UZ), [](std::int32_t v) { return v == 7; }));
+        expect(std::ranges::all_of(readSpan | std::views::drop(16UZ), [](std::int32_t v) { return v == 9; }));
+        expect(readSpan.consume(24UZ));
+    };
+
+    "publishing past the reservation is clamped, not handed to the reader"_test = [] {
+        CircularBufferSingle buffer(1024UZ);
+        auto                 writer = buffer.new_writer();
+        auto                 reader = buffer.new_reader();
+
+        {
+            auto span = writer.tryReserve<gr::SpanReleasePolicy::ProcessNone>(32UZ);
+            std::ranges::fill(span, 5);
+            span.publish(96UZ); // reports on stderr and clamps to 32
+            expect(eq(span.nRequestedSamplesToPublish(), 32UZ));
+        }
+        expect(eq(reader.available(), 32UZ)) << "the reader must never be offered slots the writer did not claim";
+        expect(eq(writer.available(), buffer.size() - 32UZ)) << "the writer capacity must stay consistent with the claim";
+
+        auto readSpan = reader.get<gr::SpanReleasePolicy::ProcessAll>(reader.available());
+        expect(std::ranges::all_of(readSpan, [](std::int32_t v) { return v == 5; })) << "no unwritten slot may surface as data";
+        expect(readSpan.consume(readSpan.size()));
+    };
+
+    "an over-published increment cannot accumulate past the reservation"_test = [] {
+        CircularBufferSingle buffer(1024UZ);
+        auto                 writer = buffer.new_writer();
+        auto                 reader = buffer.new_reader();
+
+        {
+            auto span = writer.tryReserve<gr::SpanReleasePolicy::ProcessNone>(40UZ);
+            std::ranges::fill(span, 3);
+            span.publish(30UZ);
+            span.publish(30UZ); // only 10 remain
+            expect(eq(span.nRequestedSamplesToPublish(), 40UZ));
+        }
+        expect(eq(reader.available(), 40UZ));
+    };
+};
 
 const boost::ut::suite<"buffer zero-reader gating"> bufferZeroReaderTests = [] {
     using namespace boost::ut;
