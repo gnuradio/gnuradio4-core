@@ -499,6 +499,23 @@ public:
 
     [[nodiscard]] virtual UICategory uiCategory() const { return UICategory::None; }
 
+    /**
+     * @brief Descriptor allowing a synchronous 1:1 `processOne` block to be driven from a scratch buffer, or nullptr.
+     *
+     * Non-null only for a block that implements `processOne` (not `processBulk`), has exactly one stream input and one
+     * stream output port, and uses the default tag-propagation policy with neither `Stride<>` nor `Resampling<>`.
+     */
+    [[nodiscard]] virtual const block::FusedStage* fusedStage() const noexcept { return nullptr; }
+
+    /**
+     * @brief Descriptor of a synchronous single-port `processBulk` block a fused run may drive through `work()`, or nullptr.
+     *
+     * Non-null and `fusedStage() != nullptr` are mutually exclusive: a block implements `processOne` or `processBulk`.
+     * The resampling ratio is not part of the descriptor; the planner reads it from `resamplingRatio()` because it may
+     * change while the graph runs.
+     */
+    [[nodiscard]] virtual const block::BulkStage* bulkStage() const noexcept { return nullptr; }
+
     // port and sample information
     /**
      * @brief returns the input_chunk_size to output_chunk_size ratio for the block
@@ -783,6 +800,9 @@ public:
     [[nodiscard]] block::Category blockCategory() const override { return T::blockCategory; }
 
     [[nodiscard]] UICategory uiCategory() const override { return T::DrawableControl::kCategory; }
+
+    [[nodiscard]] const block::FusedStage* fusedStage() const noexcept override { return block::fusedStageOf<T>(); }
+    [[nodiscard]] const block::BulkStage*  bulkStage() const noexcept override { return block::bulkStageOf<T>(); }
 
     [[nodiscard]] gr::Ratio  resamplingRatio() const noexcept override { return {static_cast<std::int32_t>(blockRef().input_chunk_size), static_cast<std::int32_t>(blockRef().output_chunk_size)}; }
     [[nodiscard]] gr::Size_t stride() const noexcept override { return blockRef().stride; }

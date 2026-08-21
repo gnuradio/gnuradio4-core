@@ -29,6 +29,7 @@ set(_CORE_TESTS
     qa_DataSet
     qa_DestructionSafety
     qa_DynamicPort
+    qa_Fusion
     qa_GraphEdit
     qa_LifeCycle
     qa_MemoryAllocators
