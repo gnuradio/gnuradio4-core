@@ -184,18 +184,21 @@ struct CompleteEvent {
             return;
         }
         const auto elapsed = detail::clock::now() - _start;
-        auto       r       = _handler.reserveEvent();
-        while (r.size() == 0) {
-            std::this_thread::yield();
-            r = _handler.reserveEvent();
+        while (true) {
+            auto r = _handler.reserveEvent();
+            if (r.size() == 0) {
+                std::this_thread::yield();
+                continue;
+            }
+            r[0].name = _name;
+            r[0].type = detail::EventType::Complete;
+            r[0].ts   = std::chrono::duration_cast<std::chrono::microseconds>(_start - _handler.Profiler().start());
+            r[0].dur  = std::chrono::duration_cast<std::chrono::microseconds>(elapsed);
+            r[0].cat  = _categories;
+            r[0].args = _args;
+            r.publish(1);
+            break;
         }
-        r[0].name = _name;
-        r[0].type = detail::EventType::Complete;
-        r[0].ts   = std::chrono::duration_cast<std::chrono::microseconds>(_start - _handler.Profiler().start());
-        r[0].dur  = std::chrono::duration_cast<std::chrono::microseconds>(elapsed);
-        r[0].cat  = _categories;
-        r[0].args = _args;
-        r.publish(1);
         _finished = true;
     }
 };
@@ -229,17 +232,20 @@ public:
 
 private:
     void postEvent(detail::EventType type, std::string_view categories = {}, std::initializer_list<arg_value> args = {}) noexcept {
-        auto r = _handler.reserveEvent();
-        while (r.size() == 0) {
-            std::this_thread::yield();
-            r = _handler.reserveEvent();
+        while (true) {
+            auto r = _handler.reserveEvent();
+            if (r.size() == 0) {
+                std::this_thread::yield();
+                continue;
+            }
+            r[0].name = _name;
+            r[0].type = type;
+            r[0].id   = _id;
+            r[0].cat  = categories;
+            r[0].args = args;
+            r.publish(1);
+            return;
         }
-        r[0].name = _name;
-        r[0].type = type;
-        r[0].id   = _id;
-        r[0].cat  = categories;
-        r[0].args = args;
-        r.publish(1);
     }
 };
 
@@ -271,29 +277,35 @@ public:
     }
 
     void instantEvent(std::string_view name, std::string_view categories = {}, std::initializer_list<arg_value> args = {}) noexcept {
-        auto r = reserveEvent();
-        while (r.size() == 0) {
-            std::this_thread::yield();
-            r = reserveEvent();
+        while (true) {
+            auto r = reserveEvent();
+            if (r.size() == 0) {
+                std::this_thread::yield();
+                continue;
+            }
+            r[0].name = name;
+            r[0].type = detail::EventType::Instant;
+            r[0].cat  = categories;
+            r[0].args = args;
+            r.publish(1);
+            return;
         }
-        r[0].name = name;
-        r[0].type = detail::EventType::Instant;
-        r[0].cat  = categories;
-        r[0].args = args;
-        r.publish(1);
     }
 
     void counterEvent(std::string_view name, std::string_view categories, std::initializer_list<arg_value> args = {}) noexcept {
-        auto r = reserveEvent();
-        while (r.size() == 0) {
-            std::this_thread::yield();
-            r = reserveEvent();
+        while (true) {
+            auto r = reserveEvent();
+            if (r.size() == 0) {
+                std::this_thread::yield();
+                continue;
+            }
+            r[0].name = name;
+            r[0].type = detail::EventType::Counter;
+            r[0].cat  = std::string{categories};
+            r[0].args = args;
+            r.publish(1);
+            return;
         }
-        r[0].name = name;
-        r[0].type = detail::EventType::Counter;
-        r[0].cat  = std::string{categories};
-        r[0].args = args;
-        r.publish(1);
     }
 
     [[nodiscard]] CompleteEvent<this_t> startCompleteEvent(std::string_view name, std::string_view categories = {}, std::initializer_list<arg_value> args = {}) noexcept { return CompleteEvent<this_t>{*this, name, categories, args}; }

@@ -309,9 +309,16 @@ private:
     template<typename U = T>
     class Writer;
 
+    struct RefusedReservation {};
+
     template<typename U = T, SpanReleasePolicy policy = SpanReleasePolicy::ProcessNone>
     class WriterSpan {
-        Writer<U>* _parent = nullptr;
+        Writer<U>*           _parent    = nullptr;
+        bool                 _isRefused = false;
+        mutable std::span<T> _noSlots{};
+
+        // the claim lives in the Writer and is shared by every span that holds it; a refused reservation holds none of it
+        [[nodiscard]] constexpr std::span<T>& view() const noexcept { return _isRefused ? _noSlots : _parent->_internalSpan; }
 
     public:
         using element_type     = T;
@@ -321,16 +328,18 @@ private:
         using pointer          = typename std::span<T>::reverse_iterator;
 
         explicit WriterSpan(Writer<U>* parent) noexcept : _parent(parent) { _parent->incInstanceCount(); };
+        explicit WriterSpan(Writer<U>* parent, RefusedReservation) noexcept : _parent(parent), _isRefused(true) { _parent->incInstanceCount(); };
         explicit constexpr WriterSpan(Writer<U>* parent, std::size_t index, std::size_t sequence, std::size_t nSlotsToClaim) noexcept : _parent(parent) {
             _parent->_index        = index;
             _parent->_offset       = sequence - nSlotsToClaim;
             _parent->_internalSpan = std::span<T>(&_parent->_buffer->_data.data()[index], nSlotsToClaim);
             _parent->incInstanceCount();
         }
-        WriterSpan(const WriterSpan& other) : _parent(other._parent) { _parent->incInstanceCount(); }
+        WriterSpan(const WriterSpan& other) : _parent(other._parent), _isRefused(other._isRefused) { _parent->incInstanceCount(); }
         WriterSpan& operator=(const WriterSpan& other) {
             if (this != &other) {
-                _parent = other._parent;
+                _parent    = other._parent;
+                _isRefused = other._isRefused;
                 _parent->incInstanceCount();
             }
             return *this;
@@ -338,6 +347,9 @@ private:
 
         ~WriterSpan() {
             _parent->decInstanceCount();
+            if (_isRefused) {
+                return;
+            }
             if (_parent->isLastInstance()) {
                 if (!_parent->isPublishRequested()) {
                     if constexpr (spanReleasePolicy() == SpanReleasePolicy::Terminate) {
@@ -406,25 +418,28 @@ private:
         [[nodiscard]] constexpr static bool              isMultiProducerStrategy() noexcept { return std::is_base_of_v<MultiProducerStrategy<SIZE, TWaitStrategy>, ClaimType>; }
         [[nodiscard]] constexpr std::size_t              instanceCount() const noexcept { return _parent->instanceCount(); }
 
-        [[nodiscard]] constexpr std::size_t      size() const noexcept { return _parent->_internalSpan.size(); };
+        [[nodiscard]] constexpr std::size_t      size() const noexcept { return view().size(); };
         [[nodiscard]] constexpr std::size_t      size_bytes() const noexcept { return size() * sizeof(T); };
-        [[nodiscard]] constexpr bool             empty() const noexcept { return _parent->_internalSpan.empty(); }
-        [[nodiscard]] constexpr iterator         cbegin() const noexcept { return _parent->_internalSpan.begin(); }
-        [[nodiscard]] constexpr iterator         begin() const noexcept { return _parent->_internalSpan.begin(); }
-        [[nodiscard]] constexpr iterator         cend() const noexcept { return _parent->_internalSpan.end(); }
-        [[nodiscard]] constexpr iterator         end() const noexcept { return _parent->_internalSpan.end(); }
-        [[nodiscard]] constexpr reverse_iterator rbegin() const noexcept { return _parent->_internalSpan.rbegin(); }
-        [[nodiscard]] constexpr reverse_iterator rend() const noexcept { return _parent->_internalSpan.rend(); }
-        [[nodiscard]] constexpr T*               data() const noexcept { return _parent->_internalSpan.data(); }
-        T&                                       operator[](std::size_t i) const noexcept { return _parent->_internalSpan[i]; }
-        T&                                       operator[](std::size_t i) noexcept { return _parent->_internalSpan[i]; }
-        explicit(false) operator std::span<T>&() const noexcept { return _parent->_internalSpan; }
-        explicit(false) operator std::span<T>&() noexcept { return _parent->_internalSpan; }
+        [[nodiscard]] constexpr bool             empty() const noexcept { return view().empty(); }
+        [[nodiscard]] constexpr iterator         cbegin() const noexcept { return view().begin(); }
+        [[nodiscard]] constexpr iterator         begin() const noexcept { return view().begin(); }
+        [[nodiscard]] constexpr iterator         cend() const noexcept { return view().end(); }
+        [[nodiscard]] constexpr iterator         end() const noexcept { return view().end(); }
+        [[nodiscard]] constexpr reverse_iterator rbegin() const noexcept { return view().rbegin(); }
+        [[nodiscard]] constexpr reverse_iterator rend() const noexcept { return view().rend(); }
+        [[nodiscard]] constexpr T*               data() const noexcept { return view().data(); }
+        T&                                       operator[](std::size_t i) const noexcept { return view()[i]; }
+        T&                                       operator[](std::size_t i) noexcept { return view()[i]; }
+        explicit(false) operator std::span<T>&() const noexcept { return view(); }
+        explicit(false) operator std::span<T>&() noexcept { return view(); }
 
         // publishing fewer samples than reserved is allowed: the remainder is released back to the buffer.
         // publishing more would move the publish cursor past the claim and hand readers slots that were never
         // written, so an over-publish is clamped and reported.
         constexpr void publish(std::size_t nSamplesToPublish) noexcept {
+            if (_isRefused) {
+                return;
+            }
             auto&             requested        = _parent->_nRequestedSamplesToPublish;
             const std::size_t alreadyRequested = (requested == Writer<U>::kNotPublished) ? 0UZ : requested;
             const std::size_t unpublished      = _parent->_internalSpan.size() - alreadyRequested;
@@ -502,6 +517,10 @@ private:
         template<SpanReleasePolicy policy = SpanReleasePolicy::ProcessNone>
         [[nodiscard]] constexpr auto tryReserve(std::size_t nSamples) noexcept -> WriterSpan<U, policy> {
             checkIfCanReserveAndAbortIfNeeded();
+            if (_instanceCount > 0UZ) [[unlikely]] {
+                std::print(stderr, "CircularBuffer::Writer::tryReserve({}) nested inside a live {}-sample reservation - refused\n", nSamples, _internalSpan.size());
+                return WriterSpan<U, policy>(this, RefusedReservation{});
+            }
             _nRequestedSamplesToPublish = kNotPublished;
 
             if (nSamples == 0) {
@@ -520,6 +539,10 @@ private:
         template<SpanReleasePolicy policy = SpanReleasePolicy::ProcessNone>
         [[nodiscard]] constexpr auto reserve(std::size_t nSamples) noexcept -> WriterSpan<U, policy> {
             checkIfCanReserveAndAbortIfNeeded();
+            if (_instanceCount > 0UZ) [[unlikely]] {
+                std::print(stderr, "CircularBuffer::Writer::reserve({}) nested inside a live {}-sample reservation - refused\n", nSamples, _internalSpan.size());
+                return WriterSpan<U, policy>(this, RefusedReservation{});
+            }
             _nRequestedSamplesToPublish = kNotPublished;
 
             if (nSamples == 0) {
