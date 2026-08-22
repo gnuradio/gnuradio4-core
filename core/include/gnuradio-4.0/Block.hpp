@@ -1,8 +1,10 @@
 #ifndef GNURADIO_BLOCK_HPP
 #define GNURADIO_BLOCK_HPP
 
+#include <chrono>
 #include <limits>
 #include <map>
+#include <print>
 #include <source_location>
 
 #include <format>
@@ -882,6 +884,9 @@ public:
 
     // workInternal() scratch, retained to reuse its buckets
     property_map _pendingForwardParams{};
+
+    std::optional<std::chrono::steady_clock::time_point> _zeroProgressSince{};
+    bool                                                 _zeroProgressReported = false;
 
     // intermediate non-real-time<->real-time setting states
     CtxSettings<Derived> _settings;
@@ -2012,6 +2017,27 @@ public:
         }
     }
 
+    /// a processBulk() that returns OK without consuming or publishing keeps the scheduler spinning: report the block once per stall
+    void reportZeroProgressSpin(work::Status status, std::size_t processedIn, std::size_t processedOut) {
+        constexpr auto kReportAfter = std::chrono::seconds(1);
+
+        if (status != work::Status::OK || processedIn != 0UZ || processedOut != 0UZ) {
+            if (_zeroProgressSince.has_value()) {
+                _zeroProgressSince.reset();
+                _zeroProgressReported = false;
+            }
+            return;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (!_zeroProgressSince.has_value()) {
+            _zeroProgressSince = now;
+        } else if (!_zeroProgressReported && now - *_zeroProgressSince >= kReportAfter) {
+            _zeroProgressReported = true;
+            std::println(stderr, "gr::Block: '{}' keeps returning OK with no sample consumed and none published ({} ms and counting) - the scheduler cannot make progress on this block", unique_name, std::chrono::duration_cast<std::chrono::milliseconds>(now - *_zeroProgressSince).count());
+        }
+    }
+
     /// publish forwardParams at the head of the span, but never before a tag already placed in it: the span's order check forbids that
     static void publishForwardParams(OutputSpanLike auto& outSpan, const property_map& forwardParams) {
         const std::size_t lastIndex = outSpan.tagsPublished > 0UZ ? outSpan.tags[outSpan.tagsPublished - 1UZ].index : 0UZ;
@@ -2022,6 +2048,8 @@ public:
     template<typename TInputSpans, typename TOutputSpans>
     void finaliseIO(TInputSpans& inputSpans, TOutputSpans& outputSpans, work::Status& userReturnStatus, std::size_t& processedIn, std::size_t processedOut, std::size_t resampledIn) {
         using enum gr::work::Status;
+
+        reportZeroProgressSpin(userReturnStatus, processedIn, processedOut);
 
         if (processedOut == 0) {
             // if no data is published or consumed => do not publish any tags
