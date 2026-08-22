@@ -1201,6 +1201,30 @@ protected:
         }
     }
 
+    // a sub-scheduler's RUNNING transition runs its whole loop, so it starts through the threaded wrapper
+    // rather than on the thread that adopts it
+    void startAdoptedScheduler(const std::shared_ptr<BlockModel>& newBlock) {
+        using enum lifecycle::State;
+        auto* schedulerModel = dynamic_cast<SchedulerModel*>(newBlock.get());
+        if (schedulerModel == nullptr) {
+            this->emitErrorMessage("adoptBlock", std::format("ScheduledBlockGroup is not a SchedulerModel {}", newBlock->uniqueName()));
+            return;
+        }
+        if (newBlock->state() == STOPPED) {
+            this->emitErrorMessageIfAny("adoptBlock -> INITIALISED", newBlock->changeStateTo(INITIALISED));
+        }
+        schedulerModel->start();
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(watchdog_timeout.value);
+        while (newBlock->state() == INITIALISED) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                this->emitErrorMessage("adoptBlock", std::format("adopted sub-scheduler '{}' did not reach RUNNING", newBlock->uniqueName()));
+                return;
+            }
+            std::this_thread::yield();
+        }
+    }
+
     void adoptBlock(const std::shared_ptr<BlockModel>& newBlock) {
         using enum lifecycle::State;
         if (const auto connectResult = _toChildMessagePort.connect(*newBlock->msgIn); !connectResult.has_value()) {
@@ -1213,14 +1237,20 @@ protected:
             return;
         }
 
-        std::lock_guard guard(_adoptionBlocksMutex);
-        const auto      nBatches = _adoptionBlocks.size();
-        if (nBatches == 0) {
+        {
+            std::lock_guard guard(_adoptionBlocksMutex);
+            const auto      nBatches = _adoptionBlocks.size();
+            if (nBatches == 0) {
+                return;
+            }
+            _adoptionBlocks[std::hash<BlockModel*>{}(newBlock.get()) % nBatches].push_back(newBlock);
+        }
+
+        if (newBlock->blockCategory() == ScheduledBlockGroup) {
+            startAdoptedScheduler(newBlock);
             return;
         }
 
-        auto runnerIndex = std::hash<BlockModel*>{}(newBlock.get()) % nBatches;
-        _adoptionBlocks[runnerIndex].push_back(newBlock);
         switch (newBlock->state()) {
         case STOPPED:
         case IDLE: //

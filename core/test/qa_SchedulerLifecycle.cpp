@@ -12,6 +12,7 @@
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/LifeCycle.hpp>
 #include <gnuradio-4.0/Scheduler.hpp>
+#include <gnuradio-4.0/SchedulerModel.hpp>
 #include <gnuradio-4.0/thread/thread_pool.hpp>
 
 namespace qa_sched {
@@ -199,11 +200,38 @@ using TestScheduler     = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::
 using SerialScheduler   = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>;
 using BlockingScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking>;
 
+// samples the adopted sub-scheduler's graph has moved, observed from outside its thread
+inline std::atomic<std::size_t> gSubSchedulerSamples{0UZ};
+
+struct SharedCountingSink : gr::Block<SharedCountingSink> {
+    gr::PortIn<float> in;
+
+    GR_MAKE_REFLECTABLE(SharedCountingSink, in);
+
+    void processOne(float) { gSubSchedulerSamples.fetch_add(1UZ, std::memory_order_relaxed); }
+};
+
+// adoptBlock is the scheduler's entry point for a block added to an already running graph
+struct AdoptingScheduler : TestScheduler {
+    using TestScheduler::adoptBlock;
+    using TestScheduler::TestScheduler;
+};
+
 [[nodiscard]] gr::Graph makeGraph() {
     using namespace boost::ut;
 
     gr::Graph flow;
     auto&     source = flow.emplaceBlock<BlockingSource>();
+    auto&     sink   = flow.emplaceBlock<CountingSink>();
+    expect(flow.connect<"out", "in">(source, sink).has_value());
+    return flow;
+}
+
+[[nodiscard]] gr::Graph makeEndlessGraph() {
+    using namespace boost::ut;
+
+    gr::Graph flow;
+    auto&     source = flow.emplaceBlock<EndlessSource>();
     auto&     sink   = flow.emplaceBlock<CountingSink>();
     expect(flow.connect<"out", "in">(source, sink).has_value());
     return flow;
@@ -219,7 +247,20 @@ using BlockingScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::
     return false;
 }
 
-constexpr auto kRunBound = std::chrono::milliseconds(500);
+constexpr auto kRunBound   = std::chrono::milliseconds(500);
+constexpr auto kEventBound = std::chrono::seconds(5);
+
+template<typename TPredicate>
+[[nodiscard]] bool awaitCondition(TPredicate satisfied, std::chrono::milliseconds bound = kEventBound) {
+    const auto deadline = std::chrono::steady_clock::now() + bound;
+    while (!satisfied()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+}
 
 // runAndWait() on its own thread with a deadline, so a stop that fails to take fails the assertion
 // instead of hanging ctest; `duringStartup` runs on the caller's thread the moment the runner exists
@@ -491,6 +532,50 @@ const boost::ut::suite<"job lists sized to the free pool threads"> jobListSizing
 
         expect(qa_sched::runAndWaitWithin(scheduler, std::chrono::seconds(5))) << "a job list that got no pool thread stranded its blocks";
         expect(ge(sink._nReceived, qa_sched::kSamplesBeforeTerminal)) << "the sink must run for the stream to end";
+    };
+};
+
+const boost::ut::suite<"adopting a sub-scheduler"> subSchedulerAdoptionTests = [] {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    "an adopted sub-scheduler runs on its own thread"_test = [] {
+        qa_sched::gSubSchedulerSamples.store(0UZ, std::memory_order_relaxed);
+
+        gr::Graph innerFlow;
+        auto&     innerSource = innerFlow.emplaceBlock<qa_sched::EndlessSource>();
+        auto&     innerSink   = innerFlow.emplaceBlock<qa_sched::SharedCountingSink>();
+        expect(innerFlow.connect<"out", "in">(innerSource, innerSink).has_value());
+
+        auto inner = std::make_shared<gr::SchedulerWrapper<qa_sched::SerialScheduler>>();
+        inner->setGraph(std::move(innerFlow));
+        const std::shared_ptr<gr::BlockModel> innerBlock = gr::SchedulerModel::asBlockModelPtr(inner);
+
+        qa_sched::AdoptingScheduler outer;
+        expect(outer.exchange(qa_sched::makeEndlessGraph()).has_value());
+        std::thread runner([&outer] { std::ignore = outer.runAndWait(); });
+        expect(qa_sched::awaitState(outer, RUNNING)) << "the adopting scheduler did not reach RUNNING";
+
+        std::atomic<bool> returned{false};
+        std::atomic<bool> innerRunningOnReturn{false};
+        std::thread       adopter([&outer, &innerBlock, &returned, &innerRunningOnReturn] {
+            outer.adoptBlock(innerBlock);
+            innerRunningOnReturn.store(innerBlock->state() == RUNNING, std::memory_order_relaxed);
+            returned.store(true, std::memory_order_release);
+        });
+
+        // the sub-scheduler's own start() has run to completion once its graph moves samples, whichever
+        // thread that start() ran on, so the stop below cannot race it
+        expect(qa_sched::awaitCondition([] { return qa_sched::gSubSchedulerSamples.load(std::memory_order_relaxed) > 0UZ; })) << "the sub-scheduler's graph never ran";
+        const bool adoptReturned = qa_sched::awaitCondition([&returned] { return returned.load(std::memory_order_acquire); });
+
+        inner->stop(); // releases a sub-scheduler loop that is running on the adopting thread
+        adopter.join();
+        outer.requestStop();
+        runner.join();
+
+        expect(adoptReturned) << "adoptBlock ran the sub-scheduler's whole loop on the adopting thread";
+        expect(innerRunningOnReturn.load(std::memory_order_relaxed)) << "the sub-scheduler must be running when adoptBlock returns";
     };
 };
 
