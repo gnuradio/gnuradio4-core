@@ -40,6 +40,7 @@ set(_CORE_TESTS
     qa_Profiler
     qa_SchedulerExchange
     qa_SchedulerLifecycle
+    qa_Settings
     qa_SettingsConcurrency
     qa_TagForwarding
     qa_Tensor

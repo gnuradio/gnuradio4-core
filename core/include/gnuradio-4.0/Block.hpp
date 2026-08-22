@@ -1185,6 +1185,22 @@ public:
         }
     }
 
+    /// the settings hold the input rate, so a resampling block substitutes the rate it publishes at
+    void scaleSampleRateByChunkRatio(property_map& parameters) const noexcept {
+        if constexpr (ResamplingControl::kEnabled) {
+            if (input_chunk_size == output_chunk_size) {
+                return;
+            }
+            auto it = parameters.find(gr::tag::SAMPLE_RATE.shortKey());
+            if (it == parameters.end()) {
+                return;
+            }
+            if (const float* inputRate = it->second.template get_if<float>(); inputRate != nullptr) {
+                it->second = static_cast<float>(output_chunk_size) / static_cast<float>(input_chunk_size) * (*inputRate);
+            }
+        }
+    }
+
     /// keep the auto-forward keys of an incoming tag, substituting this block's own current value for any key it owns
     [[nodiscard]] property_map filterAndSubstituteTag(const property_map& src, std::optional<property_map>& cachedSettings) {
         const auto&  autoForwardKeys = settings().autoForwardParameters();
@@ -1197,6 +1213,7 @@ public:
             }
             if (!cachedSettings) {
                 cachedSettings.emplace(settings().get());
+                scaleSampleRateByChunkRatio(*cachedSettings);
             }
             if (auto it = cachedSettings->find(key); blockSettings.contains(shortKey) && it != cachedSettings->end()) {
                 dst.insert_or_assign(key, it->second);
