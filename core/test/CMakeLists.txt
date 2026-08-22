@@ -23,6 +23,7 @@ set(_CORE_TESTS
     qa_AtomicRef
     qa_Value
     qa_ValueHelper
+    qa_BlockDiagnostics
     qa_BlockMessages
     qa_BlockRegistration
     qa_ComputeDomain
