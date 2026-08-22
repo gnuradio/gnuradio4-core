@@ -136,6 +136,12 @@ property_map CtxSettingsBase::setStaged(const property_map& parameters) {
     return doSetStagedImpl(parameters);
 }
 
+// re-applying a value the block already holds must cost nothing, so it is never staged
+bool CtxSettingsBase::isActiveValueImpl(const std::pmr::string& key, const pmt::Value& value) const {
+    const auto it = _activeParameters.find(key);
+    return it != _activeParameters.end() && it->second == value;
+}
+
 // --- Context management ---
 
 std::optional<SettingsCtx> CtxSettingsBase::activateContext(SettingsCtx ctx) {
