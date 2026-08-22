@@ -1073,7 +1073,7 @@ public:
 
             updateActiveParametersImpl();
 
-            // Update sample_rate if the block performs decimation or interpolation
+            // the settings keep the input rate; only the forwarded value carries the block's output rate
             if constexpr (TBlock::ResamplingControl::kEnabled) {
                 if (result.forwardParameters.contains(gr::tag::SAMPLE_RATE.shortKey()) && (_block->input_chunk_size != 1ULL || _block->output_chunk_size != 1ULL)) {
                     const auto activeIt = _activeParameters.find(gr::tag::SAMPLE_RATE.shortKey());
@@ -1083,7 +1083,6 @@ public:
                         const float ratio         = static_cast<float>(_block->output_chunk_size) / static_cast<float>(_block->input_chunk_size);
                         const float newSampleRate = ratio * (*activeSampleRate);
                         result.forwardParameters.insert_or_assign(gr::tag::SAMPLE_RATE.shortKey(), newSampleRate);
-                        _activeParameters.insert_or_assign(gr::tag::SAMPLE_RATE.shortKey(), newSampleRate); // update for value substitution in forwardInputTags
                     }
                 }
             }
