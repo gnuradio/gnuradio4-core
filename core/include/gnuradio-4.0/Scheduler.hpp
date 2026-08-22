@@ -173,6 +173,14 @@ protected:
     alignas(gr::kCacheLine) bool _workQuiescenceRequested{false};
     alignas(gr::kCacheLine) std::size_t _nWorkersInWork{0};
 
+    // a worker occupies its pool thread for the scheduler's lifetime, so a job list that never gets one
+    // never runs its blocks and back-pressure stalls the whole graph -- claim only the free threads
+    [[nodiscard]] std::size_t nJobLists(std::size_t nBlocks) const {
+        const std::size_t nThreads = static_cast<std::size_t>(_pool->maxThreads());
+        const std::size_t nBusy    = std::min(_pool->numTasksRunning(), nThreads);
+        return std::min(std::max(nThreads - nBusy, 1UZ), nBlocks);
+    }
+
     void rebuildProfiler(const profiling::Options& opt) {
         std::destroy_at(std::addressof(_profiler));
         std::construct_at(std::addressof(_profiler), opt);
@@ -1772,7 +1780,7 @@ struct Simple : SchedulerBase<Simple<execution, TProfiler>, execution, TProfiler
         switch (this->executionPolicy()) {
         case ExecutionPolicy::singleThreaded:
         case ExecutionPolicy::singleThreadedBlocking: break;
-        case ExecutionPolicy::multiThreaded: n_batches = std::min(static_cast<std::size_t>(this->_pool->maxThreads()), nBlocks); break;
+        case ExecutionPolicy::multiThreaded: n_batches = this->nJobLists(nBlocks); break;
         default:;
         }
 
@@ -1881,7 +1889,7 @@ detecting cycles and blocks which can be reached from several source blocks.)"">
             }
         }
 
-        const std::size_t n_batches = (execution == ExecutionPolicy::multiThreaded) ? std::min(static_cast<std::size_t>(this->_pool->maxThreads()), blockList.size()) : 1UZ;
+        const std::size_t n_batches = (execution == ExecutionPolicy::multiThreaded) ? this->nJobLists(blockList.size()) : 1UZ;
 
         std::lock_guard lock(this->_executionOrderMutex);
         std::lock_guard guard(this->_adoptionBlocksMutex);
@@ -1944,7 +1952,7 @@ struct DepthFirst : SchedulerBase<DepthFirst<execution, TProfiler>, execution, T
             dfs(src);
         }
 
-        const std::size_t n_batches = (execution == ExecutionPolicy::multiThreaded) ? std::min(static_cast<std::size_t>(this->_pool->maxThreads()), blockList.size()) : 1UZ;
+        const std::size_t n_batches = (execution == ExecutionPolicy::multiThreaded) ? this->nJobLists(blockList.size()) : 1UZ;
 
         std::lock_guard lock(this->_executionOrderMutex);
         std::lock_guard guard(this->_adoptionBlocksMutex);
