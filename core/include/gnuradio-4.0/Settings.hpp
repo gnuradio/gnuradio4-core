@@ -522,6 +522,7 @@ public:
 protected:
     // --- Private helpers (defined in Settings.cpp) ---
     // *Impl bodies run without taking _mutex, for callers that already hold it
+    [[nodiscard]] bool                                 isActiveValueImpl(const std::pmr::string& key, const pmt::Value& value) const;
     [[nodiscard]] std::optional<SettingsCtx>           activateContextImpl(SettingsCtx ctx);
     [[nodiscard]] bool                                 removeContextImpl(SettingsCtx ctx);
     [[nodiscard]] std::optional<pmt::Value>            findBestMatchCtx(const pmt::Value& contextToSearch) const;
@@ -995,7 +996,7 @@ public:
             bool        wasChanged = false;
             for (const auto& [key, value] : parameters) {
                 auto it = handlers.find(key);
-                if (it != handlers.end()) {
+                if (it != handlers.end() && (activeCtxChanged || !isActiveValueImpl(key, value))) {
                     if (it->second(key, value, autoUpdateParams, _stagedParameters)) {
                         wasChanged = true;
                     }
