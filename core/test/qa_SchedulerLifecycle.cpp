@@ -3,12 +3,16 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
+#include <string>
+#include <string_view>
 #include <thread>
 
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/LifeCycle.hpp>
 #include <gnuradio-4.0/Scheduler.hpp>
+#include <gnuradio-4.0/thread/thread_pool.hpp>
 
 namespace qa_sched {
 
@@ -141,6 +145,56 @@ struct SelfStoppingSource : gr::Block<SelfStoppingSource> {
     }
 };
 
+struct EndlessSource : gr::Block<EndlessSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(EndlessSource, out);
+
+    [[nodiscard]] constexpr float processOne() const noexcept { return 1.0f; }
+};
+
+// only this block ends the stream, so a job list that never gets a thread hangs the graph
+struct StoppingSink : gr::Block<StoppingSink> {
+    gr::PortIn<float> in;
+
+    GR_MAKE_REFLECTABLE(StoppingSink, in);
+
+    std::size_t _nReceived = 0UZ;
+
+    void processOne(float) {
+        if (++_nReceived >= kSamplesBeforeTerminal) {
+            this->requestStop();
+        }
+    }
+};
+
+// holds one thread of a two-thread pool for as long as it is alive
+struct PoolOccupier {
+    std::atomic<bool> _running{false};
+    std::atomic<bool> _release{false};
+    std::atomic<bool> _returned{false};
+
+    explicit PoolOccupier(gr::thread_pool::TaskExecutor& pool) {
+        pool.execute([this] {
+            _running.store(true, std::memory_order_release);
+            _running.notify_all();
+            _release.wait(false, std::memory_order_acquire);
+            _returned.store(true, std::memory_order_release);
+            _returned.notify_all();
+        });
+        _running.wait(false, std::memory_order_acquire);
+    }
+
+    ~PoolOccupier() {
+        _release.store(true, std::memory_order_release);
+        _release.notify_all();
+        _returned.wait(false, std::memory_order_acquire);
+    }
+
+    PoolOccupier(const PoolOccupier&)            = delete;
+    PoolOccupier& operator=(const PoolOccupier&) = delete;
+};
+
 using TestScheduler     = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>;
 using SerialScheduler   = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>;
 using BlockingScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking>;
@@ -169,8 +223,8 @@ constexpr auto kRunBound = std::chrono::milliseconds(500);
 
 // runAndWait() on its own thread with a deadline, so a stop that fails to take fails the assertion
 // instead of hanging ctest; `duringStartup` runs on the caller's thread the moment the runner exists
-template<typename TDuringStartup>
-[[nodiscard]] bool runAndWaitWithin(BlockingScheduler& scheduler, std::chrono::milliseconds bound, TDuringStartup duringStartup) {
+template<typename TScheduler, typename TDuringStartup>
+[[nodiscard]] bool runAndWaitWithin(TScheduler& scheduler, std::chrono::milliseconds bound, TDuringStartup duringStartup) {
     std::mutex              mutex;
     std::condition_variable finished;
     bool                    returned = false;
@@ -197,8 +251,17 @@ template<typename TDuringStartup>
     return inTime;
 }
 
-[[nodiscard]] bool runAndWaitWithin(BlockingScheduler& scheduler, std::chrono::milliseconds bound) {
+template<typename TScheduler>
+[[nodiscard]] bool runAndWaitWithin(TScheduler& scheduler, std::chrono::milliseconds bound) {
     return runAndWaitWithin(scheduler, bound, [] {});
+}
+
+constexpr std::string_view kOccupiedPoolName = "qa_occupied_cpu";
+
+[[nodiscard]] std::shared_ptr<gr::thread_pool::TaskExecutor> twoThreadPool() {
+    auto pool = std::make_shared<gr::thread_pool::ThreadPoolWrapper>(std::make_unique<gr::thread_pool::BasicThreadPool>(kOccupiedPoolName, gr::thread_pool::TaskType::CPU_BOUND, 2U, 2U), "CPU");
+    gr::thread_pool::Manager::instance().replacePool(std::string(kOccupiedPoolName), pool);
+    return pool;
 }
 
 void startAndPause(TestScheduler& scheduler) {
@@ -408,6 +471,26 @@ const boost::ut::suite<"stop requested before RUNNING"> preRunningStopTests = []
 
         expect(eq(nCyclesBlocked, 0UZ)) << "cycles in which runAndWait() did not return within the deadline";
         expect(eq(nCyclesLeftActive, 0UZ)) << "cycles that left the scheduler in an active state";
+    };
+};
+
+const boost::ut::suite<"job lists sized to the free pool threads"> jobListSizingTests = [] {
+    using namespace boost::ut;
+
+    "a graph runs on a pool whose threads are not all free"_test = [] {
+        auto                   pool = qa_sched::twoThreadPool();
+        qa_sched::PoolOccupier occupier(*pool);
+
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::EndlessSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::StoppingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        qa_sched::TestScheduler scheduler({{"poolName", std::string(qa_sched::kOccupiedPoolName)}});
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        expect(qa_sched::runAndWaitWithin(scheduler, std::chrono::seconds(5))) << "a job list that got no pool thread stranded its blocks";
+        expect(ge(sink._nReceived, qa_sched::kSamplesBeforeTerminal)) << "the sink must run for the stream to end";
     };
 };
 
