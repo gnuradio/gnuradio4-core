@@ -108,6 +108,84 @@ struct RateTagSink : Block<RateTagSink> {
 
 [[nodiscard]] float rateOf(const property_map& map) { return RateTagSink::rateOf(map).value_or(0.0f); }
 
+inline constexpr std::size_t kTagStride   = 16UZ;
+inline constexpr std::size_t kShortStream = 512UZ;
+inline constexpr std::size_t kLongStream  = 2UZ * kShortStream;
+inline constexpr float       kRetunedRate = 2000.0f;
+
+struct RepeatingRateSource : Block<RepeatingRateSource> {
+    PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(RepeatingRateSource, out);
+
+    std::size_t nSamples  = kShortStream;
+    float       finalRate = kInputRate; // the last tag's value, every earlier tag carries kInputRate
+
+    std::size_t _emitted = 0UZ;
+
+    work::Status processBulk(OutputSpanLike auto& outSpan) {
+        if (_emitted >= nSamples) {
+            outSpan.publish(0UZ);
+            return work::Status::DONE;
+        }
+        const std::size_t n = std::min(outSpan.size(), nSamples - _emitted);
+        if (n == 0UZ) {
+            outSpan.publish(0UZ);
+            return work::Status::INSUFFICIENT_OUTPUT_ITEMS;
+        }
+        for (std::size_t i = 0UZ; i < n; ++i) {
+            outSpan[i]              = 1.0f;
+            const std::size_t index = _emitted + i;
+            if (index % kTagStride == 0UZ) {
+                outSpan.publishTag(property_map{{"sample_rate", index + kTagStride >= nSamples ? finalRate : kInputRate}}, i);
+            }
+        }
+        _emitted += n;
+        outSpan.publish(n);
+        return work::Status::OK;
+    }
+};
+
+// the default differs from the streamed rate, so the first tag is a genuine change
+struct RateCountingBlock : Block<RateCountingBlock> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    Annotated<float, "sample rate"> sample_rate = 1.0f;
+
+    GR_MAKE_REFLECTABLE(RateCountingBlock, in, out, sample_rate);
+
+    std::size_t nSettingsChanged = 0UZ;
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
+
+    void settingsChanged(const property_map& /*oldSettings*/, const property_map& /*newSettings*/) { nSettingsChanged++; }
+};
+
+struct RateStreamResult {
+    std::size_t nSettingsChanged;
+    float       finalRate;
+};
+
+[[nodiscard]] RateStreamResult runRateStream(std::size_t nSamples, float finalRate) {
+    using namespace boost::ut;
+
+    gr::Graph flow;
+    auto&     source = flow.emplaceBlock<RepeatingRateSource>();
+    source.nSamples  = nSamples;
+    source.finalRate = finalRate;
+    auto& middle     = flow.emplaceBlock<RateCountingBlock>();
+    auto& sink       = flow.emplaceBlock<RateTagSink>();
+    expect(flow.connect<"out", "in">(source, middle).has_value());
+    expect(flow.connect<"out", "in">(middle, sink).has_value());
+
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+    expect(scheduler.exchange(std::move(flow)).has_value());
+    expect(scheduler.runAndWait().has_value());
+
+    return {middle.nSettingsChanged, middle.sample_rate.value};
+}
+
 [[nodiscard]] Decimator makeDecimator() {
     Decimator block;
     block.init(std::make_shared<gr::Sequence>());
@@ -168,6 +246,24 @@ const boost::ut::suite<"settings"> _settings = [] {
         expect(ge(sink.rates.size(), 1UZ)) << "the sink must see the rate the decimator publishes at";
         expect(std::ranges::all_of(sink.rates, [](float rate) { return rate == kOutputRate; })) << "every forwarded rate must be the output rate";
         expect(eq(middle.sample_rate.value, kInputRate)) << "the tag leaves the block's own setting at the input rate";
+    };
+
+    "an unchanged setting tag costs one apply however often it repeats"_test = [] {
+        const RateStreamResult shortRun = runRateStream(kShortStream, kInputRate);
+        const RateStreamResult longRun  = runRateStream(kLongStream, kInputRate);
+
+        expect(le(shortRun.nSettingsChanged, 1UZ)) << "an unchanged value must apply at most once";
+        expect(eq(shortRun.nSettingsChanged, longRun.nSettingsChanged)) << "the apply count must not scale with the number of identical tags";
+        expect(eq(shortRun.finalRate, kInputRate));
+        expect(eq(longRun.finalRate, kInputRate));
+    };
+
+    "a new value in the same stream still applies"_test = [] {
+        const RateStreamResult unchanged = runRateStream(kLongStream, kInputRate);
+        const RateStreamResult retuned   = runRateStream(kLongStream, kRetunedRate);
+
+        expect(eq(retuned.nSettingsChanged, unchanged.nSettingsChanged + 1UZ)) << "the differing tag must cost exactly one further apply";
+        expect(eq(retuned.finalRate, kRetunedRate)) << "the differing tag must reach the block's setting";
     };
 };
 
