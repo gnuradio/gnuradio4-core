@@ -132,7 +132,8 @@ protected:
 
     bool                          _valid{true};
     std::size_t                   _nWatchdogsRunning{0};
-    std::size_t                   _workerGeneration{0UZ}; // a queued worker runs only while it matches this
+    std::size_t                   _watchdogGeneration{0UZ}; // a watchdog runs only while it matches this
+    std::size_t                   _workerGeneration{0UZ};   // a queued worker runs only while it matches this
     meta::indirect<gr::Graph>     _graph{};
     TProfiler                     _profiler{};
     ProfileHandle                 _profilerHandler{_profiler.forThisThread()};
@@ -172,6 +173,13 @@ protected:
     // separate cache lines: every worker reads the flag and updates the counter on each iteration
     alignas(gr::kCacheLine) bool _workQuiescenceRequested{false};
     alignas(gr::kCacheLine) std::size_t _nWorkersInWork{0};
+
+    // a watchdog only leaves on its own once the run's jobs are gone, which a restart inside its check
+    // interval undoes, so every start retires the previous generation explicitly
+    void stopWatchdogs() {
+        gr::atomic_ref(_watchdogGeneration).fetch_add(1UZ);
+        gr::atomic_ref(_watchdogGeneration).notify_all();
+    }
 
     // a worker occupies its pool thread for the scheduler's lifetime, so a job list that never gets one
     // never runs its blocks and back-pressure stalls the whole graph -- claim only the free threads
@@ -280,7 +288,8 @@ public:
 
     ~SchedulerBase() {
         gr::atomic_ref(_valid).store_release(false); // mark as invalid: also stops a deferred swap from restarting the scheduler
-        {                                            // a deferred graph swap must not restart a scheduler that is being destroyed
+        stopWatchdogs();
+        { // a deferred graph swap must not restart a scheduler that is being destroyed
             std::lock_guard guard(_pendingExchangeMutex);
             _pendingExchange.reset();
         }
@@ -348,6 +357,7 @@ public:
         }
 
         auto oldGraph = std::exchange(_graph, std::move(newGraph));
+        stopWatchdogs(); // the retired graph's watchdog must not observe the new one's progress
 
         if ((option != profiling::Options{})) { // need to update profiler
             rebuildProfiler(option);
@@ -858,11 +868,14 @@ protected:
         // start watchdog
         auto ioThreadPool = gr::thread_pool::Manager::defaultIoPool();
 
+        stopWatchdogs();
+        const std::size_t generation = gr::atomic_ref(_watchdogGeneration).load_acquire();
+
         // keep outside of the lambda, as ~SchedulerBase() might finish before watchdog even starts
         gr::atomic_ref(_nWatchdogsRunning).fetch_add(1UZ);
 
         try {
-            ioThreadPool->execute([this] { this->runWatchDog(watchdog_timeout.value, timeout_inactivity_count.value); });
+            ioThreadPool->execute([this, generation] { this->runWatchDog(watchdog_timeout.value, timeout_inactivity_count.value, generation); });
         } catch (...) { // a rejected task would strand the count and spin ~SchedulerBase() forever
             gr::atomic_ref(_nWatchdogsRunning).fetch_sub(1UZ);
             gr::atomic_ref(_nWatchdogsRunning).notify_all();
@@ -1079,7 +1092,7 @@ protected:
         }
     }
 
-    void runWatchDog(std::size_t timeOut_ms, std::size_t timeOut_count) {
+    void runWatchDog(std::size_t timeOut_ms, std::size_t timeOut_count, std::size_t generation) {
         on_scope_exit _ = [this] {
             gr::atomic_ref(_nWatchdogsRunning).fetch_sub(1UZ);
             gr::atomic_ref(_nWatchdogsRunning).notify_all();
@@ -1088,33 +1101,35 @@ protected:
         auto thisName = gr::meta::shorten_type_name(this->unique_name);
         gr::thread_pool::thread::setThreadName(std::format("WatchDog-{}", thisName));
 
+        auto isCurrent = [this, generation] { return gr::atomic_ref(_valid).load_acquire() && gr::atomic_ref(_watchdogGeneration).load_acquire() == generation; };
+
         const auto deadline      = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
         const auto checkInterval = std::chrono::milliseconds(std::max(timeout_ms / 10UZ, 1UZ));
-        while (gr::atomic_ref(_valid).load_acquire() && _nRunningJobs->value() == 0UZ && std::chrono::steady_clock::now() < deadline && lifecycle::isActive(this->state())) {
+        while (isCurrent() && _nRunningJobs->value() == 0UZ && std::chrono::steady_clock::now() < deadline && lifecycle::isActive(this->state())) {
             std::this_thread::sleep_for(checkInterval);
         }
 
-        if (!gr::atomic_ref(_valid).load_acquire() || _nRunningJobs->value() == 0UZ || !lifecycle::isActive(this->state())) {
-            return; // abort watchdog: scheduler inactive or jobs already finished.
+        if (!isCurrent() || _nRunningJobs->value() == 0UZ || !lifecycle::isActive(this->state())) {
+            return; // abort watchdog: retired, scheduler inactive, or jobs already finished.
         }
 
-        // chunked so a cleared _valid is observed well before a full watchdog period
-        auto sleepWhileValid = [this](std::chrono::milliseconds total) {
+        // chunked so a retired generation is observed well before a full watchdog period
+        auto sleepWhileCurrent = [&isCurrent](std::chrono::milliseconds total) {
             const auto chunk    = std::max(total / 10, std::chrono::milliseconds(1));
             const auto wakeUpAt = std::chrono::steady_clock::now() + total;
             while (std::chrono::steady_clock::now() < wakeUpAt) {
-                if (!gr::atomic_ref(_valid).load_acquire()) {
+                if (!isCurrent()) {
                     return false;
                 }
                 std::this_thread::sleep_for(chunk);
             }
-            return gr::atomic_ref(_valid).load_acquire();
+            return isCurrent();
         };
 
         std::size_t lastProgress = _graph->_progress->value();
         std::size_t nWarnings    = 0;
         do {
-            if (!sleepWhileValid(std::chrono::milliseconds(timeOut_ms))) {
+            if (!sleepWhileCurrent(std::chrono::milliseconds(timeOut_ms))) {
                 return;
             }
             // check and increase progress if there hasn't been none.
@@ -1132,7 +1147,7 @@ protected:
                 lastProgress = currentProgress;
                 nWarnings    = 0UZ;
             }
-        } while (_nRunningJobs->value() > 0UZ);
+        } while (isCurrent() && _nRunningJobs->value() > 0UZ);
     }
 
     // a worker parked in waitUntilChanged(progress) only wakes on progress, so a lifecycle change must

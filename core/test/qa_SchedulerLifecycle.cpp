@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <format>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -215,6 +216,12 @@ struct SharedCountingSink : gr::Block<SharedCountingSink> {
 struct AdoptingScheduler : TestScheduler {
     using TestScheduler::adoptBlock;
     using TestScheduler::TestScheduler;
+};
+
+struct WatchdogProbe : TestScheduler {
+    using TestScheduler::TestScheduler;
+
+    [[nodiscard]] std::size_t nWatchdogsRunning() { return gr::atomic_ref(this->_nWatchdogsRunning).load_acquire(); }
 };
 
 [[nodiscard]] gr::Graph makeGraph() {
@@ -576,6 +583,37 @@ const boost::ut::suite<"adopting a sub-scheduler"> subSchedulerAdoptionTests = [
 
         expect(adoptReturned) << "adoptBlock ran the sub-scheduler's whole loop on the adopting thread";
         expect(innerRunningOnReturn.load(std::memory_order_relaxed)) << "the sub-scheduler must be running when adoptBlock returns";
+    };
+};
+
+const boost::ut::suite<"watchdog lifetime"> watchdogTests = [] {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    "restarts inside one check interval leave a single watchdog"_test = [] {
+        constexpr std::size_t kCycles = 8UZ;
+
+        // every cycle below falls inside one check interval, so no earlier watchdog can time out on its own
+        qa_sched::WatchdogProbe scheduler({{"watchdog_timeout", gr::Size_t(5000)}});
+        expect(scheduler.exchange(qa_sched::makeEndlessGraph()).has_value());
+
+        for (std::size_t cycle = 0UZ; cycle < kCycles; ++cycle) {
+            expect(scheduler.changeStateTo(INITIALISED).has_value());
+            expect(scheduler.changeStateTo(RUNNING).has_value());
+            expect(qa_sched::awaitState(scheduler, RUNNING)) << std::format("cycle {} did not reach RUNNING", cycle);
+            expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+            expect(qa_sched::awaitState(scheduler, STOPPED)) << std::format("cycle {} did not reach STOPPED", cycle);
+        }
+
+        // a watchdog left behind by an earlier cycle keeps going for as long as some run has jobs
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(qa_sched::awaitState(scheduler, RUNNING)) << "the final run did not reach RUNNING";
+
+        expect(qa_sched::awaitCondition([&scheduler] { return scheduler.nWatchdogsRunning() <= 1UZ; })) << std::format("{} watchdogs are alive after {} restarts", scheduler.nWatchdogsRunning(), kCycles);
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_sched::awaitState(scheduler, STOPPED)) << "the final run did not stop";
     };
 };
 
