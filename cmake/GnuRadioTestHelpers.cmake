@@ -39,6 +39,12 @@ endfunction()
 
 function(add_ut_test TEST_NAME)
   add_executable(${TEST_NAME} ${TEST_NAME}.cpp)
+  if(GR_QA_OPTIMIZATION_LEVEL)
+    # GCC's null-dereference analysis false-positives in libstdc++'s inlined string code below -O2; the warning battery
+    # reads this property.
+    set_target_properties(${TEST_NAME} PROPERTIES GR_QA_REDUCED_OPTIMIZATION ON)
+    target_compile_options(${TEST_NAME} PRIVATE $<$<NOT:$<CONFIG:Debug>>:${GR_QA_OPTIMIZATION_LEVEL}>)
+  endif()
   setup_test(${TEST_NAME})
   set_property(TEST ${TEST_NAME} APPEND PROPERTY ENVIRONMENT_MODIFICATION
                                           "GNURADIO4_PLUGIN_DIRECTORIES=set:${CMAKE_CURRENT_BINARY_DIR}/plugins")

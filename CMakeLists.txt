@@ -209,6 +209,12 @@ option(ENABLE_TESTING "Enable Test Builds" ${GR_TOPLEVEL_PROJECT})
 option(MIT_ONLY "Exclude modules with non-MIT/Apache-compatible licences" OFF)
 option(GR_USE_FETCHCONTENT_DEPS "Allow CMake to download selected third-party dependencies with FetchContent" OFF)
 
+# Test executables check correctness, so a lower optimization level roughly halves their compile time and peak memory.
+# Benchmarks pin their own level. Empty keeps the build type's default.
+set(GR_QA_OPTIMIZATION_LEVEL
+    "-O1"
+    CACHE STRING "Optimization level for test executables in optimized build types (empty = build-type default)")
+
 if(NOT DEFINED GR_DATA_CACHE_DIR)
   set(GR_DATA_CACHE_DIR
       "${CMAKE_CURRENT_BINARY_DIR}/gnuradio_cache"
