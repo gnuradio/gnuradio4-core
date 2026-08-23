@@ -1,7 +1,9 @@
 #ifndef GNURADIO_GRAPH_YAML_IMPORTER_H
 #define GNURADIO_GRAPH_YAML_IMPORTER_H
 
+#include <map>
 #include <ranges>
+#include <set>
 
 #include <gnuradio-4.0/meta/indirect.hpp>
 
@@ -64,8 +66,42 @@ T getOrThrow(std::expected<T, gr::Error>&& expectedValue, std::source_location l
     }
 }
 
-inline void loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGraph, gr::property_map yaml, std::source_location location = std::source_location::current()) {
-    std::map<std::string, std::shared_ptr<BlockModel>> createdBlocks;
+/**
+ * The blocks one graph level produced, indexed by the two names a YAML file may address them by.
+ *
+ * `unique_name` identifies a block within a file; `name` is a label and may repeat, so a repeated name
+ * is recorded as ambiguous and reported instead of silently resolving to the last block that carried it.
+ */
+struct LoadedBlocks {
+    std::map<std::string, std::shared_ptr<BlockModel>, std::less<>> byUniqueName;
+    std::map<std::string, std::shared_ptr<BlockModel>, std::less<>> byName;
+    std::set<std::string, std::less<>>                              ambiguousNames;
+
+    void add(std::string_view uniqueName, std::string_view name, std::shared_ptr<BlockModel> block) {
+        if (!uniqueName.empty()) {
+            byUniqueName.insert_or_assign(std::string(uniqueName), block);
+        }
+        if (!name.empty() && !byName.try_emplace(std::string(name), std::move(block)).second) {
+            ambiguousNames.emplace(name);
+        }
+    }
+
+    [[nodiscard]] std::expected<std::shared_ptr<BlockModel>, gr::Error> find(std::string_view key) const {
+        if (const auto it = byUniqueName.find(key); it != byUniqueName.cend()) {
+            return it->second;
+        }
+        if (ambiguousNames.contains(key)) {
+            return std::unexpected(gr::Error(std::format("'{}' is the name of more than one block, address it by its unique_name", key)));
+        }
+        if (const auto it = byName.find(key); it != byName.cend()) {
+            return it->second;
+        }
+        return std::unexpected(gr::Error(std::format("Unknown block '{}'", key)));
+    }
+};
+
+inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGraph, gr::property_map yaml, std::source_location location = std::source_location::current()) {
+    LoadedBlocks createdBlocks;
 
     Tensor<pmt::Value> blks;
     if (auto it = yaml.find("blocks"); it != yaml.end()) {
@@ -81,21 +117,31 @@ inline void loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGraph, gr::p
         }
         const auto& grcBlock = *_grcBlock;
 
-        const auto blockName = getOrThrow(getProperty<std::string>(grcBlock, "parameters"sv, "name"sv));
-        const auto blockType = getOrThrow(getProperty<std::string>(grcBlock, "id"sv));
+        // the type decides which fields are required, so it is read first
+        const auto blockType       = getOrThrow(getProperty<std::string>(grcBlock, "id"sv));
+        const bool isSubgraph      = blockType == "SUBGRAPH";
+        const auto blockUniqueName = getProperty<std::string>(grcBlock, "unique_name"sv).value_or(std::string{});
+        const auto blockName       = [&] {
+            auto fromParameters = getProperty<std::string>(grcBlock, "parameters"sv, "name"sv);
+            if (fromParameters.has_value() || !isSubgraph) {
+                return getOrThrow(std::move(fromParameters));
+            }
+            // subgraphs written before the parameters key carry their name at the top level
+            return getProperty<std::string>(grcBlock, "name"sv).value_or(std::string{});
+        }();
 
-        if (blockType == "SUBGRAPH") {
+        if (isSubgraph) {
             auto loadGraph = [&grcBlock, &loader, &location](auto graphWrapper) {
                 const auto _graphData = checked_access_ptr{grcBlock.at("graph").get_if<property_map>()};
                 if (_graphData == nullptr) {
                     return;
                 }
-                const auto& graphData = *_graphData;
-                gr::Graph&  graph     = *graphWrapper->graph();
-                loadGraphFromMap(loader, graph, graphData);
-
-                const auto& exportedPorts = graphData.at("exported_ports").value_or(Tensor<pmt::Value>());
-                for (const auto& exportedPort_ : exportedPorts) {
+                const auto&        graphData    = *_graphData;
+                gr::Graph&         graph        = *graphWrapper->graph();
+                const LoadedBlocks innerBlocks  = loadGraphFromMap(loader, graph, graphData);
+                const auto         exportedIt   = graphData.find("exported_ports");
+                const auto         exportedList = exportedIt == graphData.cend() ? Tensor<pmt::Value>() : exportedIt->second.value_or(Tensor<pmt::Value>());
+                for (const auto& exportedPort_ : exportedList) {
                     auto exportedPort = checked_access_ptr{exportedPort_.get_if<Tensor<pmt::Value>>()};
                     if (exportedPort == nullptr || exportedPort->size() != 4) {
                         throw gr::exception(std::format("Unable to parse exported port ({} instead of 4 elements)", exportedPort != nullptr ? exportedPort->size() : -1UZ));
@@ -109,18 +155,15 @@ inline void loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGraph, gr::p
                         throw gr::exception(std::format("Required fields for exported ports missing"));
                     }
 
-                    std::string blockUniqueName;
-                    for (auto& b : graph.blocks()) {
-                        if (b->name() == requiredBlockName) {
-                            blockUniqueName = b->uniqueName();
-                        }
+                    // the writer names the inner block by unique_name, a hand-written file by name
+                    const auto innerBlock = innerBlocks.find(requiredBlockName);
+                    if (!innerBlock.has_value()) {
+                        throw gr::exception(std::format("{} in:\n{}", innerBlock.error().message, gr::graph::format(graph)), location);
                     }
-                    if (blockUniqueName.empty()) {
-                        throw gr::exception(std::format("Required Block {} not found in:\n{}", requiredBlockName, gr::graph::format(graph)), location);
-                    }
+                    const std::string innerUniqueName{innerBlock.value()->uniqueName()};
 
                     if (auto result = graphWrapper->exportPort(true,                                       //
-                            blockUniqueName,                                                               //
+                            innerUniqueName,                                                               //
                             portDirectionString == "INPUT" ? PortDirection::INPUT : PortDirection::OUTPUT, //
                             internalPortName,                                                              //
                             exportedPortName);
@@ -154,15 +197,15 @@ inline void loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGraph, gr::p
 
                 auto schedulerBlock = SchedulerModel::asBlockModelPtr(scheduler);
                 resultGraph.addBlock(schedulerBlock);
-                createdBlocks[blockName] = schedulerBlock;
                 schedulerBlock->setName(blockName);
+                createdBlocks.add(blockUniqueName, blockName, schedulerBlock);
 
                 loadGraph(schedulerBlock);
 
             } else {
                 const std::shared_ptr<BlockModel>& subGraph = resultGraph.addBlock(std::make_shared<GraphWrapper<gr::Graph>>());
-                createdBlocks[blockName]                    = subGraph;
                 subGraph->setName(blockName);
+                createdBlocks.add(blockUniqueName, blockName, subGraph);
 
                 loadGraph(static_cast<GraphWrapper<gr::Graph>*>(subGraph.get()));
             }
@@ -209,7 +252,7 @@ inline void loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGraph, gr::p
                 throw gr::exception("Settings for context could not be activated");
             }
 
-            createdBlocks[blockName] = resultGraph.addBlock(std::move(currentBlock));
+            createdBlocks.add(blockUniqueName, blockName, resultGraph.addBlock(std::move(currentBlock)));
         }
     } // for blocks
 
@@ -232,14 +275,14 @@ inline void loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGraph, gr::p
             if (blockName.empty()) {
                 throw gr::exception(std::format("Invalid blockField"));
             }
-            auto block = createdBlocks.find(std::string(blockName));
-            if (block == createdBlocks.end()) {
-                throw gr::exception(std::format("Unknown block '{}'", blockName));
+            auto block = createdBlocks.find(blockName);
+            if (!block.has_value()) {
+                throw gr::exception(block.error().message);
             }
 
             struct result {
-                decltype(block) block_it;
-                PortDefinition  port_definition;
+                std::shared_ptr<BlockModel> block;
+                PortDefinition              port_definition;
             };
 
             if (const auto portFields = checked_access_ptr<const Tensor<pmt::Value>, false>{portField.template get_if<Tensor<pmt::Value>>()}; portFields != nullptr) {
@@ -252,17 +295,17 @@ inline void loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGraph, gr::p
                     throw gr::exception(std::format("Port definition missing values"));
                 }
 
-                return result{block, {static_cast<std::size_t>(*index), static_cast<std::size_t>(*subIndex)}};
+                return result{*block, {static_cast<std::size_t>(*index), static_cast<std::size_t>(*subIndex)}};
 
             } else if (const auto portFieldString = portField.value_or(std::string_view{}); portFieldString.data()) {
-                return result{block, {std::string(portFieldString)}};
+                return result{*block, {std::string(portFieldString)}};
 
             } else {
                 const auto index = checked_access_ptr{portField.template get_if<std::int64_t>()};
                 if (index == nullptr) {
                     throw gr::exception(std::format("Port definition missing values"));
                 }
-                return result{block, {static_cast<std::size_t>(*index)}};
+                return result{*block, {static_cast<std::size_t>(*index)}};
             }
         };
 
@@ -270,7 +313,7 @@ inline void loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGraph, gr::p
         auto dst = parseBlockPort(connection[2], connection[3]);
 
         if (connection.size() == 4) {
-            if (auto r = resultGraph.connect(src.block_it->second, src.port_definition, dst.block_it->second, dst.port_definition, EdgeParameters{.minBufferSize = undefined_size, .weight = graph::defaultWeight, .name = graph::defaultEdgeName}, location); !r) {
+            if (auto r = resultGraph.connect(src.block, src.port_definition, dst.block, dst.port_definition, EdgeParameters{.minBufferSize = undefined_size, .weight = graph::defaultWeight, .name = graph::defaultEdgeName}, location); !r) {
                 throw gr::exception(std::format("connection failed: {}", r.error().message));
             }
         } else {
@@ -285,11 +328,13 @@ inline void loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGraph, gr::p
                 }
             }).visit(connection[4]);
 
-            if (auto r = resultGraph.connect(src.block_it->second, src.port_definition, dst.block_it->second, dst.port_definition, EdgeParameters{.minBufferSize = minBufferSize, .weight = graph::defaultWeight, .name = graph::defaultEdgeName}, location); !r) {
+            if (auto r = resultGraph.connect(src.block, src.port_definition, dst.block, dst.port_definition, EdgeParameters{.minBufferSize = minBufferSize, .weight = graph::defaultWeight, .name = graph::defaultEdgeName}, location); !r) {
                 throw gr::exception(std::format("connection failed: {}", r.error().message));
             }
         }
     } // for connections
+
+    return createdBlocks;
 }
 
 inline gr::property_map saveGraphToMap(PluginLoader& loader, const gr::Graph& rootGraph) {
@@ -328,10 +373,11 @@ inline gr::property_map saveGraphToMap(PluginLoader& loader, const gr::Graph& ro
                 }
             };
 
-            seq.push_back(edge.sourceBlock()->name());
+            // an edge names its ends by unique_name: a name may repeat, and two blocks sharing one lose an edge on load
+            seq.push_back(std::string(edge.sourceBlock()->uniqueName()));
             writePortDefinition(edge.sourcePortDefinition());
 
-            seq.push_back(edge.destinationBlock()->name());
+            seq.push_back(std::string(edge.destinationBlock()->uniqueName()));
             writePortDefinition(edge.destinationPortDefinition());
 
             if (edge.minBufferSize() != std::numeric_limits<std::size_t>::max()) {
