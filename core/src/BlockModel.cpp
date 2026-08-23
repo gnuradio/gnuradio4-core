@@ -147,6 +147,11 @@ property_map serializeBlock(PluginLoader& pluginLoader, const std::shared_ptr<Bl
         subgraphParameters[convert_string_domain(serialization_fields::BLOCK_NAME)] = std::string(block->name());
         map[convert_string_domain(serialization_fields::BLOCK_PARAMETERS)]          = std::move(subgraphParameters);
 
+        // and it carries meta_information the way every other block does
+        if (!block->metaInformation().empty()) {
+            map.emplace(serialization_fields::BLOCK_META_INFORMATION, block->metaInformation());
+        }
+
         {
             property_map subgraphMap;
 
