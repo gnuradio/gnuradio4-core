@@ -673,7 +673,14 @@ protected:
 
             if (status == work::Status::ERROR) {
                 return {requested_work, performedWorkAllBlocks, work::Status::ERROR};
-            } else if (status != work::Status::DONE) {
+            }
+            // A block group performs no work of its own: Block::work() reports OK for every non-NormalBlock
+            // category without consulting anything. graph::flatten puts the group in the execution order next
+            // to the children it contains, so counting its permanent OK as unfinished work makes the all-DONE
+            // condition unreachable and runAndWait() never returns. The children are in this same list and are
+            // what termination is decided on. The group stays in the list because it also has to drain its
+            // message port.
+            if (status != work::Status::DONE && currentBlock->blockCategory() == block::Category::NormalBlock) {
                 unfinishedBlocksExist = true;
             }
         }
