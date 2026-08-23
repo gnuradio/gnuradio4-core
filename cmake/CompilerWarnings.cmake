@@ -43,7 +43,9 @@ function(set_project_warnings project_name)
       -Wpedantic # warn if non-standard C++ is used
       -Wconversion # warn on type conversions that may lose data
       -Wsign-conversion # warn on sign conversions
-      -Wnull-dereference # warn if a null dereference is detected
+      # warn if a null dereference is detected; unreliable below -O2, so reduced-optimization test targets opt out
+      # through the property
+      $<$<NOT:$<BOOL:$<TARGET_PROPERTY:GR_QA_REDUCED_OPTIMIZATION>>>:-Wnull-dereference>
       -Wdouble-promotion # warn if float is implicit promoted to double
       -Wformat=2 # warn on security issues around functions that format output (ie printf)
       -Wno-unknown-pragmas # ignore IDE, GCC/CLANG specific pragmas
