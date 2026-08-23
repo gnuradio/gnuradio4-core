@@ -713,6 +713,15 @@ struct SettingsBase {
      */
     [[nodiscard]] virtual property_map stagedParameters() const = 0;
 
+    /**
+     * @brief the member names set() and loadParametersFromPropertyMap() accept
+     *
+     * A block's readable members are a superset of these: input_chunk_size, output_chunk_size and stride
+     * are const unless the block is declared Resampling<>/Stride<>, and unique_name is immutable. A
+     * consumer writing parameters out for someone else to read back needs to know which is which.
+     */
+    [[nodiscard]] virtual const std::set<std::string>& writableMembers() const = 0;
+
     [[nodiscard]] virtual std::set<std::string> autoUpdateParameters(SettingsCtx ctx = {}) noexcept = 0;
 
     // N.B. by reference: fixed once the block runs, and read on the per-work() tag-forwarding

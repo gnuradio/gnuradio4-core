@@ -32,6 +32,7 @@ set(_CORE_TESTS
     qa_DynamicPort
     qa_Fusion
     qa_GraphEdit
+    qa_grc
     qa_LifeCycle
     qa_MemoryAllocators
     qa_MessagePlane
@@ -67,6 +68,11 @@ set(_STANDARD_BLOCK_INTEGRATION_TESTS
     qa_Messages
     qa_PerformanceMonitor)
 
+# loadGrc resolves a block id through the registry, so the round trip needs one
+if(NOT GR_ENABLE_BLOCK_REGISTRY)
+  list(REMOVE_ITEM _CORE_TESTS qa_grc)
+endif()
+
 message(
   STATUS
     "Standard-block integration tests removed from gnuradio4-core and should move to gnuradio4-blocks or cross-repo CI: ${_STANDARD_BLOCK_INTEGRATION_TESTS}"
@@ -94,6 +100,9 @@ set(_CORE_DEADLOCK_TESTS
     qa_SchedulerExchange
     qa_SchedulerLifecycle
     qa_SettingsConcurrency)
+if(GR_ENABLE_BLOCK_REGISTRY)
+  list(APPEND _CORE_DEADLOCK_TESTS qa_grc)
+endif()
 set_tests_properties(${_CORE_DEADLOCK_TESTS} PROPERTIES TIMEOUT 120)
 
 add_ut_test(qa_SubGraphAssets)

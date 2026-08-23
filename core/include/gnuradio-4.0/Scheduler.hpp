@@ -1394,6 +1394,9 @@ protected:
             if (newBlock->settings().activateContext() == std::nullopt) {
                 this->emitErrorMessage("propertyCallbackEmplaceBlock", std::format("could not activate the loaded settings context of '{}'", newBlock->uniqueName()));
             }
+            // and applying them is what makes the block report them: it is not connected or adopted yet, so
+            // this is the same point in its life at which Graph::addBlock() applies a constructor's settings
+            std::ignore = newBlock->settings().applyStagedParameters();
         }
 
         adoptBlock(newBlock);
