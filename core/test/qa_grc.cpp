@@ -354,6 +354,11 @@ const boost::ut::suite<"GRC round trip"> grcTests = [] {
         const std::string difference = describeDifference(before, after);
         expect(difference.empty()) << difference;
 
+        // the document is skimmable and deterministic: a block's id is the first thing under it
+        const std::string dump = gr::saveGrc(loader, flow);
+        expect(dump.find("id:") != std::string::npos && dump.find("id:") < dump.find("parameters:")) << "a block must lead with its id";
+        expect(eq(dump, gr::saveGrc(loader, flow))) << "two saves of one graph must be byte-identical";
+
         auto loaded = gr::loadGrc(loader, gr::saveGrc(loader, flow));
         expect(eq(countCategory(*loaded, block::Category::TransparentBlockGroup), 1UZ)) << "the subgraph did not come back";
 
