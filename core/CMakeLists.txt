@@ -37,6 +37,7 @@ set(public_headers
     include/gnuradio-4.0/Scheduler.hpp
     include/gnuradio-4.0/Sequence.hpp
     include/gnuradio-4.0/Settings.hpp
+    include/gnuradio-4.0/SettingsCtx.hpp
     include/gnuradio-4.0/Tag.hpp
     include/gnuradio-4.0/Tensor.hpp
     include/gnuradio-4.0/TensorMath.hpp
