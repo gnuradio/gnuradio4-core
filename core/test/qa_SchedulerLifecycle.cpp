@@ -655,4 +655,54 @@ const boost::ut::suite<"a transparent subgraph in the execution order"> subgraph
     };
 };
 
+const boost::ut::suite<"a subgraph's progress sequence"> subgraphProgressTests = [] {
+    using namespace boost::ut;
+
+    // A subgraph's blocks were initialized with the subgraph's own progress sequence while the scheduler
+    // waits on the top-level one. Under singleThreadedBlocking the worker then parks on a sequence the work
+    // inside the subgraph cannot move, and the stop that follows never releases it. Neither half triggers
+    // it alone: the same graph stops in a millisecond under singleThreaded, and so does a flat chain under
+    // singleThreadedBlocking.
+    "a subgraph's blocks publish progress where the scheduler waits"_test = [] {
+        gr::Graph flow;
+        std::ignore = flow.emplaceBlock<qa_sched::BlockingSource>();
+
+        auto  wrapper  = std::make_shared<gr::GraphWrapper<gr::Graph>>();
+        auto& interior = *wrapper->graph();
+        auto& sink     = interior.emplaceBlock<qa_sched::CountingSink>();
+
+        const std::shared_ptr<gr::BlockModel>& subgraph = flow.addBlock(wrapper);
+        subgraph->setName("inner");
+        expect(wrapper->exportPort(true, std::string(sink.unique_name), gr::PortDirection::INPUT, "in", "in").has_value());
+        expect(flow.connect(flow.blocks()[0], gr::PortDefinition{"out"}, subgraph, gr::PortDefinition{"in"}).has_value());
+
+        expect(std::addressof(interior.progress()) == std::addressof(flow.progress())) //
+            << "a subgraph's blocks must publish to the sequence its parent's scheduler waits on";
+
+        qa_sched::BlockingScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        std::atomic<bool> running{true};
+        std::thread       worker([&scheduler, &running] {
+            std::ignore = scheduler.runAndWait();
+            running.store(false);
+        });
+
+        const auto started = std::chrono::steady_clock::now();
+        while (sink._nReceived < qa_sched::kSamplesBeforeTerminal && std::chrono::steady_clock::now() - started < std::chrono::seconds(5)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        expect(sink._nReceived > 0UZ) << "the chain must run at all";
+
+        expect(scheduler.changeStateTo(gr::lifecycle::State::REQUESTED_STOP).has_value());
+
+        const auto stopRequested = std::chrono::steady_clock::now();
+        while (running.load() && std::chrono::steady_clock::now() - stopRequested < std::chrono::seconds(10)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        expect(!running.load()) << "the worker did not leave the progress wait after a stop";
+        worker.join(); // the failure above is already reported; the suite timeout covers a true hang
+    };
+};
+
 int main() { /* tests are statically registered */ }
