@@ -18,8 +18,9 @@
 /**
  * The GRC round trip: a graph saved by gr::saveGrc and read back by gr::loadGrc is the same graph.
  *
- * Blocks, settings, collection ports, transparent subgraphs and exported ports all travel through the
- * YAML, and a graph that came back through it runs and terminates like the one it was written from.
+ * Blocks, settings, meta_information, collection ports, transparent subgraphs and exported ports all
+ * travel through the YAML, and a graph that came back through it runs and terminates like the one it
+ * was written from.
  *
  * gnuradio4-core carries no standard block library, so the blocks are defined and registered here.
  */
@@ -339,6 +340,8 @@ const boost::ut::suite<"GRC round trip"> grcTests = [] {
 
         const std::shared_ptr<BlockModel>& subgraph = flow.addBlock(wrapper);
         subgraph->setName("inner");
+        subgraph->metaInformation()["application:role"] = std::string("demodulator");
+        scale.meta_information["application:disabled"]  = false;
         expect(wrapper->exportPort(true, std::string(scale.unique_name), PortDirection::INPUT, "in", "in").has_value());
         expect(wrapper->exportPort(true, std::string(scale.unique_name), PortDirection::OUTPUT, "out", "out").has_value());
 
@@ -360,6 +363,13 @@ const boost::ut::suite<"GRC round trip"> grcTests = [] {
         expect(eq((*group)->dynamicInputPorts().size(), 1UZ)) << "the exported input port did not come back";
         expect(eq((*group)->dynamicOutputPorts().size(), 1UZ)) << "the exported output port did not come back";
         expect(eq(loaded->edges().size(), 2UZ)) << "the edges onto the subgraph did not come back";
+
+        const auto& groupMeta = (*group)->metaInformation();
+        const auto  role      = groupMeta.find("application:role");
+        expect(role != groupMeta.cend() && role->second == pmt::Value(std::string("demodulator"))) << "the subgraph's meta_information did not come back";
+        const auto& innerMeta = (*group)->graph()->blocks().front()->metaInformation();
+        const auto  disabled  = innerMeta.find("application:disabled");
+        expect(disabled != innerMeta.cend() && disabled->second == pmt::Value(false)) << "an interior block's meta_information did not come back";
     };
 
     "a collection port survives the round trip"_test = [] {

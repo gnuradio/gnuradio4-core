@@ -130,6 +130,22 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
             return getProperty<std::string>(grcBlock, "name"sv).value_or(std::string{});
         }();
 
+        // the block's own entries win: a block regenerates what it says about itself when it is
+        // constructed, so the file only contributes the keys the block does not regenerate
+        auto restoreMetaInformation = [&grcBlock](BlockModel& createdBlock) {
+            const auto metaIt = grcBlock.find("meta_information");
+            if (metaIt == grcBlock.cend()) {
+                return;
+            }
+            const auto meta = checked_access_ptr<const property_map, false>{metaIt->second.get_if<property_map>()};
+            if (meta == nullptr) {
+                return;
+            }
+            for (const auto& [key, value] : *meta) {
+                createdBlock.metaInformation().try_emplace(key, value);
+            }
+        };
+
         if (isSubgraph) {
             auto loadGraph = [&grcBlock, &loader, &location](auto graphWrapper) {
                 const auto _graphData = checked_access_ptr{grcBlock.at("graph").get_if<property_map>()};
@@ -198,6 +214,7 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
                 auto schedulerBlock = SchedulerModel::asBlockModelPtr(scheduler);
                 resultGraph.addBlock(schedulerBlock);
                 schedulerBlock->setName(blockName);
+                restoreMetaInformation(*schedulerBlock);
                 createdBlocks.add(blockUniqueName, blockName, schedulerBlock);
 
                 loadGraph(schedulerBlock);
@@ -205,6 +222,7 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
             } else {
                 const std::shared_ptr<BlockModel>& subGraph = resultGraph.addBlock(std::make_shared<GraphWrapper<gr::Graph>>());
                 subGraph->setName(blockName);
+                restoreMetaInformation(*subGraph);
                 createdBlocks.add(blockUniqueName, blockName, subGraph);
 
                 loadGraph(static_cast<GraphWrapper<gr::Graph>*>(subGraph.get()));
@@ -252,6 +270,7 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
                 throw gr::exception("Settings for context could not be activated");
             }
 
+            restoreMetaInformation(*currentBlock);
             createdBlocks.add(blockUniqueName, blockName, resultGraph.addBlock(std::move(currentBlock)));
         }
     } // for blocks
