@@ -1147,4 +1147,40 @@ const boost::ut::suite<"yaml error formatter"> _yamlFormatter = [] {
     "long error message @ column=0"_test = [] { expect(nothrow([] { std::println("long error message:\n{}", yaml::formatAsLines(testString, 2, 0, "long error @column=0")); })); };
 };
 
+const boost::ut::suite<"deterministic serialization"> _yamlOrdering = [] {
+    using namespace boost::ut;
+    using namespace std::string_literals;
+    using namespace std::string_view_literals;
+
+    "maps serialize identically regardless of insertion order"_test = [] {
+        gr::property_map first;
+        first["zeta"]  = 1;
+        first["id"]    = "block"s;
+        first["alpha"] = 2;
+        gr::property_map second;
+        second["alpha"] = 2;
+        second["zeta"]  = 1;
+        second["id"]    = "block"s;
+        expect(eq(yaml::serialize(first), yaml::serialize(second)));
+    };
+
+    "a key priority emits those keys first, the remainder sorted"_test = [] {
+        gr::property_map map;
+        map["alpha"] = 1;
+        map["id"]    = "block"s;
+        map["beta"]  = 2;
+        gr::property_map nested;
+        nested["gamma"] = 3;
+        nested["id"]    = "inner"s;
+        map["nest"]     = nested;
+
+        constexpr std::array<std::string_view, 1> priority{"id"};
+        const std::string                         out = yaml::serialize(map, priority);
+        expect(out.starts_with("\nid:")) << "the document leads with the priority key: " << out;
+        expect(out.find("alpha") != std::string::npos && out.find("alpha") < out.find("beta")) << out;
+        const std::size_t nestedStart = out.find("nest:");
+        expect(nestedStart != std::string::npos && out.find("id:", nestedStart) < out.find("gamma", nestedStart)) << "the priority must reach nested maps: " << out;
+    };
+};
+
 int main() { /* tests are statically executed */ }

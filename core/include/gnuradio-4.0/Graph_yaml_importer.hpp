@@ -1,6 +1,7 @@
 #ifndef GNURADIO_GRAPH_YAML_IMPORTER_H
 #define GNURADIO_GRAPH_YAML_IMPORTER_H
 
+#include <array>
 #include <map>
 #include <ranges>
 #include <set>
@@ -424,7 +425,13 @@ inline gr::meta::indirect<gr::Graph> loadGrc(PluginLoader& loader, std::string_v
     return resultGraph;
 }
 
-inline std::string saveGrc(PluginLoader& loader, const gr::Graph& rootGraph) { return pmt::yaml::serialize(detail::saveGraphToMap(loader, rootGraph)); }
+/// The key order a GRC document is emitted in: identity first, structure last, so a reader
+/// skimming a block sees what it is before how it is configured. Every map in the document is
+/// emitted with these keys first and the remainder lexicographically, which also makes the
+/// output deterministic (the underlying map's own iteration order is a hash artifact).
+inline constexpr std::array<std::string_view, 12> grcYamlKeyOrder{"id", "name", "unique_name", "block_category", "meta_information", "parameters", "ctx_parameters", "scheduler", "exported_ports", "blocks", "connections", "graph"};
+
+inline std::string saveGrc(PluginLoader& loader, const gr::Graph& rootGraph) { return pmt::yaml::serialize(detail::saveGraphToMap(loader, rootGraph), grcYamlKeyOrder); }
 
 inline std::expected<std::shared_ptr<gr::BlockModel>, gr::Error> detail::instantiateBlockFromYamlDefinition(PluginLoader& loader, const detail::YamlDefinitionsLoader::Definition& def) noexcept {
     try {
