@@ -397,6 +397,26 @@ public:
      */
     [[nodiscard]] const Sequence& progress() const noexcept { return *_progress.get(); }
 
+    /**
+     * A graph added to another graph adopts that graph's progress sequence for its own blocks.
+     *
+     * A transparent subgraph is flattened into its parent's execution order, so the scheduler drives its
+     * children but waits on the top-level sequence. Without this the children publish to a sequence nobody
+     * watches: the scheduler observes no progress while they work, and a worker under a blocking execution
+     * policy parks on a sequence their work cannot move.
+     */
+    void init(std::shared_ptr<gr::Sequence> parentProgress, std::string_view computeDomain = gr::thread_pool::kDefaultIoPoolId) {
+        std::shared_ptr<gr::Sequence> adopted = parentProgress;
+        gr::Block<Graph>::init(std::move(parentProgress), computeDomain);
+        if (_progress == adopted) {
+            return;
+        }
+        _progress = std::move(adopted);
+        for (const std::shared_ptr<BlockModel>& block : _blocks) { // blocks added before this graph joined its parent
+            block->init(_progress, this->compute_domain);
+        }
+    }
+
     std::shared_ptr<BlockModel> const& addBlock(std::shared_ptr<BlockModel> block, bool initBlock = true) {
         const std::shared_ptr<BlockModel>& newBlock = _blocks.emplace_back(block);
         if (initBlock) {
