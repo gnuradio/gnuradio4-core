@@ -617,4 +617,42 @@ const boost::ut::suite<"watchdog lifetime"> watchdogTests = [] {
     };
 };
 
+const boost::ut::suite<"a transparent subgraph in the execution order"> subgraphTerminationTests = [] {
+    using namespace boost::ut;
+
+    // graph::flatten puts the group's own block next to the children it contains, and Block::work reports
+    // OK for every non-NormalBlock category without consulting anything, so the all-DONE condition was
+    // unreachable and runAndWait() never returned
+    "a transparent subgraph does not keep the scheduler running"_test = [] {
+        gr::Graph flow;
+        std::ignore = flow.emplaceBlock<qa_sched::DoneSource>();
+
+        auto  wrapper = std::make_shared<gr::GraphWrapper<gr::Graph>>();
+        auto& sink    = wrapper->graph()->emplaceBlock<qa_sched::CountingSink>();
+
+        const std::shared_ptr<gr::BlockModel>& subgraph = flow.addBlock(wrapper);
+        subgraph->setName("inner");
+        expect(wrapper->exportPort(true, std::string(sink.unique_name), gr::PortDirection::INPUT, "in", "in").has_value());
+        expect(flow.connect(flow.blocks()[0], gr::PortDefinition{"out"}, subgraph, gr::PortDefinition{"in"}).has_value());
+
+        qa_sched::SerialScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        std::atomic<bool> running{true};
+        std::thread       worker([&scheduler, &running] {
+            std::ignore = scheduler.runAndWait();
+            running.store(false);
+        });
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (running.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        expect(!running.load()) << "a finished chain inside a subgraph must still reach DONE";
+        worker.join(); // the failure above is already reported; the suite timeout covers a true hang
+
+        expect(eq(sink._nReceived, qa_sched::kSamplesBeforeTerminal));
+    };
+};
+
 int main() { /* tests are statically registered */ }
