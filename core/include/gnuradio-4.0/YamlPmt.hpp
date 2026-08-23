@@ -106,7 +106,7 @@ inline constexpr std::string_view trimAndStripComment(std::string_view sv) { ret
 inline void indent(std::ostream& os, int level) { os << std::setw(level * 2) << std::setfill(' ') << ""; }
 
 template<TypeTagMode tagMode = TypeTagMode::Auto>
-void serialize(std::ostream& os, const pmt::Value& value, int level = 0);
+void serialize(std::ostream& os, const pmt::Value& value, int level = 0, std::span<const std::string_view> keyPriority = {});
 
 template<TypeTagMode tagMode>
 inline void serializeString(std::ostream& os, std::string_view value, int level, bool useMultiline = false) noexcept {
@@ -177,8 +177,8 @@ constexpr std::string_view tag_for_type() noexcept {
 }
 
 template<TypeTagMode tagMode>
-void serialize(std::ostream& os, const pmt::Value& var, int level) {
-    gr::pmt::ValueVisitor([&os, level]<typename T>(const T& value) {
+void serialize(std::ostream& os, const pmt::Value& var, int level, std::span<const std::string_view> keyPriority) {
+    gr::pmt::ValueVisitor([&os, level, keyPriority]<typename T>(const T& value) {
         if constexpr (tagMode == TypeTagMode::Auto && !std::is_same_v<T, pmt::Value::Map>) {
             if constexpr (!std::is_same_v<T, std::string> && !std::is_same_v<T, std::string_view> && !std::is_same_v<T, std::pmr::string> && std::ranges::random_access_range<T>) {
                 os << tag_for_type<typename T::value_type>();
@@ -217,16 +217,33 @@ void serialize(std::ostream& os, const pmt::Value& var, int level) {
                 os << " {}\n";
                 return;
             }
-            // block-style formatting
+            // block-style formatting. The map's own iteration order is a hash
+            // artifact, so keys are emitted deterministically: keys named in
+            // keyPriority first, in that order, the remainder lexicographically.
             os << "\n";
-            for (const auto& [key, val] : value) {
+            std::vector<const typename T::value_type*> entries;
+            entries.reserve(value.size());
+            for (const auto& entry : value) {
+                entries.push_back(std::addressof(entry));
+            }
+            auto rank = [&keyPriority](std::string_view key) {
+                const auto it = std::ranges::find(keyPriority, key);
+                return static_cast<std::size_t>(it - keyPriority.begin());
+            };
+            std::ranges::sort(entries, [&rank](const auto* lhs, const auto* rhs) {
+                const std::size_t lhsRank = rank(lhs->first);
+                const std::size_t rhsRank = rank(rhs->first);
+                return lhsRank != rhsRank ? lhsRank < rhsRank : lhs->first < rhs->first;
+            });
+            for (const auto* entry : entries) {
+                const auto& [key, val] = *entry;
                 indent(os, level + 1);
                 if (key.contains(':') || !std::ranges::all_of(key, ::isprint)) {
                     os << std::format("\"{}\": ", escapeString(key, true));
                 } else {
                     os << key << ": ";
                 }
-                serialize<tagMode>(os, val, level + 1);
+                serialize<tagMode>(os, val, level + 1, keyPriority);
             }
         } else if constexpr (std::ranges::random_access_range<T>) {
             // flow-style formatting
@@ -240,7 +257,7 @@ void serialize(std::ostream& os, const pmt::Value& var, int level) {
                 indent(os, level + 1);
                 os << "- ";
                 constexpr TypeTagMode childTagMode = tagMode == TypeTagMode::Auto ? std::is_same_v<typename T::value_type, pmt::Value> ? TypeTagMode::Auto : TypeTagMode::None : tagMode;
-                serialize<childTagMode>(os, pmt::Value(item), level + 1);
+                serialize<childTagMode>(os, pmt::Value(item), level + 1, keyPriority);
             }
         }
     }).visit(var);
@@ -1238,10 +1255,10 @@ inline std::expected<pmt::Value, ParseError> parseList(ParseContext& ctx, std::s
 } // namespace detail
 
 template<TypeTagMode tagMode = TypeTagMode::Auto>
-std::string serialize(const pmt::Value::Map& map) {
+std::string serialize(const pmt::Value::Map& map, std::span<const std::string_view> keyPriority = {}) {
     std::ostringstream oss;
     if (!map.empty()) {
-        detail::serialize<tagMode>(oss, map, -1); // Start at level -1 to avoid indenting top-level keys
+        detail::serialize<tagMode>(oss, map, -1, keyPriority); // Start at level -1 to avoid indenting top-level keys
     }
     return oss.str();
 }
