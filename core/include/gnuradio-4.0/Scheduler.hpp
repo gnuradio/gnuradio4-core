@@ -1,6 +1,7 @@
 #ifndef GNURADIO_SCHEDULER_HPP
 #define GNURADIO_SCHEDULER_HPP
 
+#include <algorithm>
 #include <bit>
 #include <chrono>
 #include <mutex>
@@ -32,22 +33,15 @@
 #endif // #ifdef ERROR
 #endif // #ifdef _WIN32
 
+// returns when the sequence leaves oldValue or after timeout_ms, whichever comes first. The wait
+// polls deliberately: the caller may be the only thread of its runtime, so a sequence nothing else
+// advances or notifies must not hold it. The 1 ms chunk bounds the resume latency once the value moves.
 template<typename T>
-inline void waitUntilChanged(gr::Sequence& sequence, T oldValue, [[maybe_unused]] unsigned int delay_ms = 1U) {
-    if (sequence.value() != oldValue) {
-        return;
+inline void waitUntilChanged(gr::Sequence& sequence, T oldValue, unsigned int timeout_ms = 1U) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (sequence.value() == oldValue && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    do {
-#ifdef __EMSCRIPTEN__
-#ifdef __EMSCRIPTEN_PTHREADS__
-        sequence.wait(oldValue); // only works in worker threads with PThreads
-#else
-        std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms)); // fallback spin sleep
-#endif
-#else
-        sequence.wait(oldValue); // C++ native
-#endif
-    } while (sequence.value() == oldValue);
 }
 
 namespace gr::scheduler {
@@ -1110,9 +1104,10 @@ protected:
 
         auto isCurrent = [this, generation] { return gr::atomic_ref(_valid).load_acquire() && gr::atomic_ref(_watchdogGeneration).load_acquire() == generation; };
 
-        const auto deadline      = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        // the startup wait has no deadline: start() may spend arbitrarily long in waitDone() before
+        // the run's jobs register, and a watchdog that gives up then leaves the run without one
         const auto checkInterval = std::chrono::milliseconds(std::max(timeout_ms / 10UZ, 1UZ));
-        while (isCurrent() && _nRunningJobs->value() == 0UZ && std::chrono::steady_clock::now() < deadline && lifecycle::isActive(this->state())) {
+        while (isCurrent() && _nRunningJobs->value() == 0UZ && lifecycle::isActive(this->state())) {
             std::this_thread::sleep_for(checkInterval);
         }
 
@@ -1120,9 +1115,10 @@ protected:
             return; // abort watchdog: retired, scheduler inactive, or jobs already finished.
         }
 
-        // chunked so a retired generation is observed well before a full watchdog period
+        // chunked with a capped interval so a retired generation is observed within 100 ms however
+        // long the watchdog period is; a destructor waits on exactly this observation
         auto sleepWhileCurrent = [&isCurrent](std::chrono::milliseconds total) {
-            const auto chunk    = std::max(total / 10, std::chrono::milliseconds(1));
+            const auto chunk    = std::clamp(total / 10, std::chrono::milliseconds(1), std::chrono::milliseconds(100));
             const auto wakeUpAt = std::chrono::steady_clock::now() + total;
             while (std::chrono::steady_clock::now() < wakeUpAt) {
                 if (!isCurrent()) {
@@ -1157,8 +1153,8 @@ protected:
         } while (isCurrent() && _nRunningJobs->value() > 0UZ);
     }
 
-    // a worker parked in waitUntilChanged(progress) only wakes on progress, so a lifecycle change must
-    // bump it -- otherwise the wait runs until the watchdog's next tick
+    // a worker parked in waitUntilChanged(progress) resumes when progress moves or its timeout expires,
+    // so a lifecycle change bumps progress to be observed now rather than at the timeout
     void wakeProgressWaiters() {
         _graph->_progress->incrementAndGet();
         _graph->_progress->notify_all();

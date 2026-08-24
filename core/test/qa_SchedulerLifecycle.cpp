@@ -147,6 +147,37 @@ struct SelfStoppingSource : gr::Block<SelfStoppingSource> {
     }
 };
 
+// produces nothing until gSourceGate opens, then a bounded stream. The gate is read before the call is
+// counted, so a test that flips the gate after seeing a call knows that call ran gated
+inline std::atomic<bool>        gSourceGate{false};
+inline std::atomic<std::size_t> gGatedSourceCalls{0UZ};
+
+struct GatedSource : gr::Block<GatedSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(GatedSource, out);
+
+    std::size_t _nEmitted = 0UZ;
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        const bool open = gSourceGate.load(std::memory_order_acquire);
+        gGatedSourceCalls.fetch_add(1UZ, std::memory_order_release);
+        gGatedSourceCalls.notify_all();
+        if (!open) {
+            outSpan.publish(0UZ);
+            return gr::work::Status::OK;
+        }
+        if (_nEmitted >= kSamplesBeforeTerminal) {
+            outSpan.publish(0UZ);
+            return gr::work::Status::DONE;
+        }
+        const std::size_t nPublish = std::min(outSpan.size(), 8UZ);
+        _nEmitted += nPublish;
+        outSpan.publish(nPublish);
+        return gr::work::Status::OK;
+    }
+};
+
 struct EndlessSource : gr::Block<EndlessSource> {
     gr::PortOut<float> out;
 
@@ -702,6 +733,37 @@ const boost::ut::suite<"a subgraph's progress sequence"> subgraphProgressTests =
         }
         expect(!running.load()) << "the worker did not leave the progress wait after a stop";
         worker.join(); // the failure above is already reported; the suite timeout covers a true hang
+    };
+};
+
+const boost::ut::suite<"the zero-progress park"> zeroProgressParkTests = [] {
+    using namespace boost::ut;
+
+    // under singleThreadedBlocking the worker parks on the progress sequence once it has seen more than
+    // timeout_inactivity_count zero-progress traversals. Opening the gate moves no sequence, and the
+    // watchdog's first tick sits beyond the run bound, so the run completes only if the park releases
+    // on its own timeout. With timeout_inactivity_count 0 a park necessarily separates the source's
+    // first, gated call from its second.
+    "a parked scheduler resumes within its timeout without a progress notify"_test = [] {
+        qa_sched::gSourceGate.store(false, std::memory_order_release);
+        qa_sched::gGatedSourceCalls.store(0UZ, std::memory_order_release);
+
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::GatedSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        qa_sched::BlockingScheduler scheduler({{"timeout_ms", gr::Size_t(25)}, {"timeout_inactivity_count", gr::Size_t(0)}, {"watchdog_timeout", gr::Size_t(10'000)}});
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        const bool completed = qa_sched::runAndWaitWithin(scheduler, qa_sched::kEventBound, [] {
+            for (std::size_t seen = qa_sched::gGatedSourceCalls.load(std::memory_order_acquire); seen == 0UZ; seen = qa_sched::gGatedSourceCalls.load(std::memory_order_acquire)) {
+                qa_sched::gGatedSourceCalls.wait(seen);
+            }
+            qa_sched::gSourceGate.store(true, std::memory_order_release);
+        });
+        expect(completed) << "the parked worker never re-ran the source";
+        expect(eq(sink._nReceived, qa_sched::kSamplesBeforeTerminal));
     };
 };
 
