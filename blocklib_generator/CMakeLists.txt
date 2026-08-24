@@ -4,6 +4,7 @@ project(MyProject LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 23)
 
 option(ENABLE_SPLIT "Enable splitting of generated files (pass --split to the parser)" OFF)
+option(GNURADIO_INSTALL_PARSE_REGISTRATIONS_TOOL "Install the block-registration parser tool" ON)
 
 # This program is run while CMake configures block libraries.  A cross build therefore needs a host-native compiler for
 # it, even though the generated block libraries use CMAKE_CXX_COMPILER.
@@ -96,4 +97,6 @@ install(
   DESTINATION "${GR_BLOCKLIB_CMAKECONFIG_INSTALL_DIR}"
   COMPONENT Devel)
 
-install(PROGRAMS ${PARSER_EXECUTABLE} DESTINATION ${CMAKE_INSTALL_BINDIR})
+if(GNURADIO_INSTALL_PARSE_REGISTRATIONS_TOOL)
+  install(PROGRAMS ${PARSER_EXECUTABLE} DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
