@@ -50,6 +50,22 @@ struct Decimator : Block<Decimator, Resampling<>> {
     }
 };
 
+/// the same decimator without a rate of its own: the chunk ratio is all it knows about the rate it publishes at
+struct RatelessDecimator : Block<RatelessDecimator, Resampling<>> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(RatelessDecimator, in, out);
+
+    work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
+        const std::size_t ratio = static_cast<std::size_t>(input_chunk_size.value);
+        for (std::size_t i = 0UZ; i < outSpan.size(); ++i) {
+            outSpan[i] = inSpan[i * ratio];
+        }
+        return work::Status::OK;
+    }
+};
+
 struct RateTagSource : Block<RateTagSource> {
     PortOut<float> out;
 
@@ -246,6 +262,22 @@ const boost::ut::suite<"settings"> _settings = [] {
         expect(ge(sink.rates.size(), 1UZ)) << "the sink must see the rate the decimator publishes at";
         expect(std::ranges::all_of(sink.rates, [](float rate) { return rate == kOutputRate; })) << "every forwarded rate must be the output rate";
         expect(eq(middle.sample_rate.value, kInputRate)) << "the tag leaves the block's own setting at the input rate";
+    };
+
+    "a rate tag through a decimator that declares no sample_rate arrives scaled"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<RateTagSource>(property_map{{"name", std::string("src")}});
+        auto&     middle = flow.emplaceBlock<RatelessDecimator>(property_map{{"name", std::string("mid")}, {"input_chunk_size", kDecimation}, {"output_chunk_size", gr::Size_t(1)}});
+        auto&     sink   = flow.emplaceBlock<RateTagSink>(property_map{{"name", std::string("snk")}});
+        expect(flow.connect<"out", "in">(source, middle).has_value());
+        expect(flow.connect<"out", "in">(middle, sink).has_value());
+
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(scheduler.runAndWait().has_value());
+
+        expect(ge(sink.rates.size(), 1UZ)) << "the sink must see the rate the decimator publishes at";
+        expect(std::ranges::all_of(sink.rates, [](float rate) { return rate == kOutputRate; })) << "the chunk ratio must scale the forwarded rate whether or not the block owns one";
     };
 
     "an unchanged setting tag costs one apply however often it repeats"_test = [] {

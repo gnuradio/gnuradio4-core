@@ -470,8 +470,10 @@ Example — a 10× decimator:
            ─┴──┴─
 ```
 
-This happens in `applyStagedParameters()` — the block author does not need to handle it manually.
-The decimation block only needs to set `input_chunk_size` in `settingsChanged`:
+The ratio is applied wherever the rate is published — to the parameters a settings change forwards,
+and to the `sample_rate` a forwarded tag carries — so the block's own stored `sample_rate` stays at
+the rate it is fed. A block that declares no `sample_rate` of its own publishes the scaled value all
+the same. The decimation block only needs to set `input_chunk_size` in `settingsChanged`:
 
 ```cpp
 void settingsChanged(const property_map&, const property_map&) {
