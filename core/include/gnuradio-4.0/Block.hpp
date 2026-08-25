@@ -1214,6 +1214,7 @@ public:
     }
 
     /// keep the auto-forward keys of an incoming tag, substituting this block's own current value for any key it owns
+    /// and, on a resampling block, the rate it publishes at for the rate it is fed
     [[nodiscard]] property_map filterAndSubstituteTag(const property_map& src, std::optional<property_map>& cachedSettings) {
         const auto&  autoForwardKeys = settings().autoForwardParameters();
         const auto&  blockSettings   = CtxSettings<Derived>::allWritableMembers();
@@ -1225,7 +1226,6 @@ public:
             }
             if (!cachedSettings) {
                 cachedSettings.emplace(settings().get());
-                scaleSampleRateByChunkRatio(*cachedSettings);
             }
             if (auto it = cachedSettings->find(key); blockSettings.contains(shortKey) && it != cachedSettings->end()) {
                 dst.insert_or_assign(key, it->second);
@@ -1233,6 +1233,9 @@ public:
                 dst.insert_or_assign(key, value);
             }
         }
+        // the chunk ratio is a property of the block, not of its member list: a decimator that declares no sample_rate
+        // of its own still publishes at the decimated rate, and the value it hands on is the one the tag arrived with
+        scaleSampleRateByChunkRatio(dst);
         return dst;
     }
 
