@@ -79,16 +79,17 @@ struct Visible {};
 struct NoTagPropagation {};
 
 /**
- * @brief For fixed-chunk blocks: tags NOT at position 0 are delayed to the next chunk’s start.
+ * @brief For fixed-chunk blocks: tags NOT at position 0 are delayed to the next chunk's start.
  * Tags at position 0 are forwarded immediately. Chunk size is NOT broken by tag positions.
- * Use for blocks like FFT where the chunk size must remain fixed.
+ * Use where a full-length chunk is worth more than placing a tag in the chunk it arrived in.
  */
 struct ForwardTagPropagation {};
 
 /**
  * @brief For fixed-chunk blocks: ALL tags within the chunk are mapped to output position 0.
- * All tags are consumed per chunk. Use for decimation blocks where multiple input samples
- * map to one output sample.
+ * All tags are consumed per chunk. Use wherever several input samples map to one output sample
+ * or to one DataSet — every decimating and interpolating block, the FFT among them — so that a tag
+ * interior to a chunk describes the output that chunk produces rather than the next chunk's.
  */
 struct BackwardTagPropagation {};
 
