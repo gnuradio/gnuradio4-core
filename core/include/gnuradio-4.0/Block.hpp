@@ -1049,6 +1049,7 @@ public:
                 }
             }
         });
+        checkBlockArgumentContracts();
         if constexpr (gr::meta::kDebugBuild) {
             checkBlockParameterConsistency();
         }
@@ -1080,7 +1081,9 @@ public:
     template<fixed_string Name, typename Self>
     friend constexpr auto& outputPort(Self* self) noexcept;
 
-    constexpr void checkBlockParameterConsistency() {
+    /// contracts between a block's declared Arguments, its ports and its processing function; the body is
+    /// static_asserts only, so the check costs nothing at run time and holds in every build configuration
+    constexpr void checkBlockArgumentContracts() const noexcept {
         constexpr bool kIsSourceBlock = traits::block::stream_input_port_types<Derived>::size == 0;
         constexpr bool kIsSinkBlock   = traits::block::stream_output_port_types<Derived>::size == 0;
 
@@ -1088,16 +1091,21 @@ public:
             static_assert(!kIsSinkBlock, "input_chunk_size and output_chunk_size are not available for sink blocks. Remove 'Resampling<>' from the block definition.");
             static_assert(!kIsSourceBlock, "input_chunk_size and output_chunk_size are not available for source blocks. Remove 'Resampling<>' from the block definition.");
             static_assert(HasProcessBulkFunction<Derived>, "Blocks which allow input_chunk_size and output_chunk_size must implement processBulk(...) method. Remove 'Resampling<>' from the block definition.");
-        } else {
+        }
+        if constexpr (StrideControl::kEnabled) {
+            static_assert(!kIsSourceBlock, "Stride is not available for source blocks. Remove 'Stride<>' from the block definition.");
+        }
+    }
+
+    constexpr void checkBlockParameterConsistency() {
+        if constexpr (!ResamplingControl::kEnabled) {
             if (input_chunk_size != 1ULL || output_chunk_size != 1ULL) {
                 emitErrorMessage("Block::checkParametersAndThrowIfNeeded:", std::format("Block is not defined as `Resampling<>`, but input_chunk_size = {}, output_chunk_size = {}, they both must equal to 1.", input_chunk_size, output_chunk_size));
                 requestStop();
                 return;
             }
         }
-        if constexpr (StrideControl::kEnabled) {
-            static_assert(!kIsSourceBlock, "Stride is not available for source blocks. Remove 'Stride<>' from the block definition.");
-        } else {
+        if constexpr (!StrideControl::kEnabled) {
             if (stride != 0ULL) {
                 emitErrorMessage("Block::checkParametersAndThrowIfNeeded:", std::format("Block is not defined as `Stride<>`, but stride = {}, it must equal to 0.", stride));
                 requestStop();
