@@ -581,13 +581,6 @@ if(EMSCRIPTEN OR GR_USE_FETCHCONTENT_DEPS)
   install(DIRECTORY ${vir-simd_SOURCE_DIR}/vir DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 endif()
 
-# the script configure won't run on win32 without asking bash to do it
-if(WIN32)
-  set(BASH "bash.exe")
-else()
-  set(BASH "")
-endif()
-
 # check for CPython and Numpy dependencies
 set(PYTHON_FORCE_INCLUDE OFF)
 if(PYTHON_FORCE_INCLUDE)
