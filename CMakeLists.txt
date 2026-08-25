@@ -572,13 +572,6 @@ target_include_directories(vir INTERFACE $<BUILD_INTERFACE:${vir-simd_SOURCE_DIR
 install(TARGETS vir EXPORT gnuradio4Targets)
 install(DIRECTORY ${vir-simd_SOURCE_DIR}/vir DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
-# the script configure won't run on win32 without asking bash to do it
-if(WIN32)
-  set(BASH "bash.exe")
-else()
-  set(BASH "")
-endif()
-
 # check for CPython and Numpy dependencies
 set(PYTHON_FORCE_INCLUDE OFF)
 if(PYTHON_FORCE_INCLUDE)
