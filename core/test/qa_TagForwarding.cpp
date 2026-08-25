@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <format>
+#include <limits>
 #include <ranges>
 #include <string>
 #include <string_view>
@@ -30,6 +31,12 @@ using namespace gr;
 inline constexpr std::size_t kSamples = 64UZ;
 inline constexpr gr::Size_t  kDecim   = 4U;
 inline constexpr gr::Size_t  kChunk   = 8U;
+
+/// a fixed input window for a decimator, and an input index inside it that no chunk boundary can fall on
+inline constexpr std::size_t kWindow       = 16UZ;
+inline constexpr std::size_t kWindowOutput = kWindow / kDecim;
+inline constexpr std::size_t kInteriorAt   = 5UZ;
+static_assert(kInteriorAt < kWindow && kInteriorAt % kDecim != 0UZ);
 
 /// `trigger_name` because only the standard tag keys survive the default forwarder's key filter
 inline constexpr std::string_view kNameKey = "trigger_name";
@@ -129,6 +136,24 @@ struct Decimate : Block<Decimate, Resampling<kDecim, 1U, true>> {
 
     work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
         census(inSpan, counts);
+        const std::size_t n = std::min(outSpan.size(), inSpan.size() / kDecim);
+        for (std::size_t i = 0UZ; i < n; ++i) {
+            outSpan[i] = inSpan[i * kDecim];
+        }
+        std::ignore = inSpan.consume(n * kDecim);
+        outSpan.publish(n);
+        return work::Status::OK;
+    }
+};
+
+/// the same decimator under the policy written for it: the whole retired window is read and mapped to output offset 0
+struct BackwardDecimate : Block<BackwardDecimate, BackwardTagPropagation, Resampling<kDecim, 1U, true>> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(BackwardDecimate, in, out);
+
+    work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
         const std::size_t n = std::min(outSpan.size(), inSpan.size() / kDecim);
         for (std::size_t i = 0UZ; i < n; ++i) {
             outSpan[i] = inSpan[i * kDecim];
@@ -296,6 +321,26 @@ const boost::ut::suite<"tag forwarding"> _tagForwarding = [] {
             expect(eq(middle.counts.deferred + middle.counts.atStart, kInteriorTags.size())) << "every tag is forwarded from exactly one sighting";
             expect(gt(middle.counts.deferred, 0UZ)) << "input_chunk_size forbids a boundary at every tag, and dropping the deferred ones would lose exactly those";
         });
+    };
+
+    "BackwardTagPropagation places an interior tag on the chunk that consumed it"_test = [&] {
+        const std::vector<std::size_t> oneInteriorTag{kInteriorAt};
+        const auto                     fixedWindow = [](auto& middle) {
+            middle.in.min_samples = kWindow; // a chunk then starts only on a multiple of the window, never at the tag
+            middle.in.max_samples = kWindow;
+        };
+        const auto onlyTagIndex = [](Sink& sink) {
+            expect(eq(sink.tags.size(), 1UZ)) << "the tag must arrive exactly once";
+            return sink.tags.size() == 1UZ ? sink.tags.front().index : std::numeric_limits<std::size_t>::max();
+        };
+
+        std::size_t defaultIndex  = 0UZ;
+        std::size_t backwardIndex = 0UZ;
+        runChain<Decimate>(oneInteriorTag, [&](Decimate&, Sink& sink) { defaultIndex = onlyTagIndex(sink); }, fixedWindow);
+        runChain<BackwardDecimate>(oneInteriorTag, [&](BackwardDecimate&, Sink& sink) { backwardIndex = onlyTagIndex(sink); }, fixedWindow);
+
+        expect(lt(backwardIndex, kWindowOutput)) << "the tag must land on an output sample the chunk holding it produced";
+        expect(ge(defaultIndex, kWindowOutput)) << "the default forwarder reads only tags(1), so it first sees the tag one chunk later";
     };
 
     "a fixed-chunk block defers every tag that is not at its chunk boundary"_test = [&] {
