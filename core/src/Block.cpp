@@ -19,6 +19,76 @@ void BlockBase::initStandardPropertyCallbacks() noexcept {
     };
 }
 
+void BlockBase::emitMessage(std::string_view endpoint, property_map message, std::string_view clientRequestID) noexcept { //
+    sendMessage<message::Command::Notify>(cbMsgOut(), cbUniqueName() /* serviceName */, endpoint, std::move(message), clientRequestID);
+}
+
+void BlockBase::notifyListeners(std::string_view endpoint, property_map message) noexcept {
+    const auto it = propertySubscriptions.find(std::string(endpoint));
+    if (it != propertySubscriptions.end()) {
+        for (const auto& clientID : it->second) {
+            emitMessage(endpoint, message, clientID);
+        }
+    }
+}
+
+void BlockBase::emitErrorMessage(std::string_view endpoint, std::string_view errorMsg, std::string_view clientRequestID, std::source_location location) noexcept { //
+    emitErrorMessageIfAny(endpoint, std::unexpected(Error(errorMsg, location)), clientRequestID);
+}
+
+void BlockBase::emitErrorMessage(std::string_view endpoint, Error e, std::string_view clientRequestID) noexcept { emitErrorMessageIfAny(endpoint, std::unexpected(e), clientRequestID); }
+
+void BlockBase::emitErrorMessageIfAny(std::string_view endpoint, std::expected<void, Error> e, std::string_view clientRequestID) noexcept {
+    if (!e.has_value()) [[unlikely]] {
+        sendMessage<message::Command::Notify>(cbMsgOut(), cbUniqueName() /* serviceName */, endpoint, std::move(e.error()), clientRequestID);
+    }
+}
+
+void BlockBase::processMessages([[maybe_unused]] const MsgPortInBuiltin& port, std::span<const Message> messages) {
+    using enum gr::message::Command;
+    assert(std::addressof(port) == std::addressof(cbMsgIn()) && "got a message on wrong port");
+
+    for (const auto& message : messages) {
+        if (!message.serviceName.empty() && message.serviceName != cbUniqueName() && message.serviceName != cbName()) {
+            // Skip if target does not match the block's (unique) name and is not empty.
+            continue;
+        }
+
+        auto it = propertyCallbacks.find(message.endpoint);
+        if (it == propertyCallbacks.end()) {
+            continue; // did not find matching property callback
+        }
+        BlockBase::PropertyCallback callback = it->second;
+
+        std::optional<Message> retMessage;
+        try {
+            retMessage = (this->*callback)(message.endpoint, message); // N.B. life-time: message is copied
+        } catch (const gr::exception& e) {
+            retMessage       = Message{message};
+            retMessage->data = std::unexpected(Error(e));
+        } catch (const std::exception& e) {
+            retMessage       = Message{message};
+            retMessage->data = std::unexpected(Error(e));
+        } catch (...) {
+            retMessage       = Message{message};
+            retMessage->data = std::unexpected(Error(std::format("unknown exception in Block {} property '{}'\n request message: {} ", cbUniqueName(), message.endpoint, message)));
+        }
+
+        if (!retMessage.has_value()) {
+            continue; // function does not produce any return message
+        }
+
+        retMessage->cmd             = Final; // N.B. could enable/allow for partial if we return multiple messages (e.g. using coroutines?)
+        retMessage->serviceName     = cbUniqueName();
+        WriterSpanLike auto msgSpan = cbMsgOut().streamWriter().tryReserve<SpanReleasePolicy::ProcessAll>(1UZ);
+        if (msgSpan.empty()) {
+            throw gr::exception(std::format("{}::processMessages() can not reserve span for message\n", cbName()));
+        } else {
+            msgSpan[0] = *retMessage;
+        }
+    } // - end - for (const auto &message : messages) { ..
+}
+
 std::optional<Message> BlockBase::propertyCallbackHeartbeat(std::string_view propertyName, Message message) {
     using enum gr::message::Command;
     assert(propertyName == block::property::kHeartbeat);
