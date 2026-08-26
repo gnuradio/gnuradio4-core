@@ -490,6 +490,7 @@ integers:
 doubles:
   normal: !!float64 123.456
   scientific: !!float64 1.23e-4
+  full_precision: !!float64 433921337
   infinity: !!float64 .inf
   infinity2: !!float64 .Inf
   infinity3: !!float64 .INF
@@ -539,6 +540,7 @@ doubles:
         gr::property_map doubles;
         doubles["normal"]                 = 123.456;
         doubles["scientific"]             = 1.23e-4;
+        doubles["full_precision"]         = 433921337.0;
         doubles["infinity"]               = std::numeric_limits<double>::infinity();
         doubles["infinity2"]              = std::numeric_limits<double>::infinity();
         doubles["infinity3"]              = std::numeric_limits<double>::infinity();
@@ -1180,6 +1182,77 @@ const boost::ut::suite<"deterministic serialization"> _yamlOrdering = [] {
         expect(out.find("alpha") != std::string::npos && out.find("alpha") < out.find("beta")) << out;
         const std::size_t nestedStart = out.find("nest:");
         expect(nestedStart != std::string::npos && out.find("id:", nestedStart) < out.find("gamma", nestedStart)) << "the priority must reach nested maps: " << out;
+    };
+};
+
+const boost::ut::suite<"round-trip precision"> _yamlPrecision = [] {
+    using namespace boost::ut;
+
+    static auto roundTrip = [](const gr::property_map& map, std::source_location location = std::source_location::current()) {
+        const std::string text = yaml::serialize(map);
+        const auto        back = yaml::deserialize(text);
+        expect(back.has_value(), location) << std::format("deserialization failed:\n{}\n", text);
+        expect(eq(diff(map, back.value_or(gr::property_map{})), false), location) << std::format("a value changed across serialization:\n{}\n", text);
+        return text;
+    };
+
+    "doubles serialize at round-trip precision"_test = [] {
+        gr::property_map map;
+        map["centre_frequency"]      = 433921337.0; // six significant digits would read back as 433921000
+        map["one_third"]             = 1.0 / 3.0;
+        map["smallest_normal"]       = std::numeric_limits<double>::min();
+        map["largest"]               = std::numeric_limits<double>::max();
+        const std::string serialized = roundTrip(map);
+        expect(serialized.contains("433921337")) << serialized;
+    };
+
+    "floats serialize at round-trip precision"_test = [] {
+        gr::property_map map;
+        map["mantissa_limit"]        = 8388609.0f; // 2^23 + 1, the smallest float needing seven digits
+        map["one_third"]             = 1.0f / 3.0f;
+        map["largest"]               = std::numeric_limits<float>::max();
+        const std::string serialized = roundTrip(map);
+        expect(serialized.contains("8388609")) << serialized;
+    };
+
+    "complex components serialize at round-trip precision"_test = [] {
+        gr::property_map map;
+        map["complex64"]             = std::complex<double>{433921337.0, -433921337.0};
+        map["complex32"]             = std::complex<float>{8388609.0f, -8388609.0f};
+        map["infinite"]              = std::complex<double>{std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity()};
+        const std::string serialized = roundTrip(map);
+        expect(serialized.contains("(433921337,-433921337)")) << serialized;
+        expect(serialized.contains("(.inf,-.inf)")) << serialized;
+    };
+
+    "vectors of floating point values serialize at round-trip precision"_test = [] {
+        gr::property_map map;
+        map["doubles"]               = Tensor<double>(data_from, {433921337.0, 1.0 / 3.0});
+        map["floats"]                = Tensor<float>(data_from, {8388609.0f, 1.0f / 3.0f});
+        const std::string serialized = roundTrip(map);
+        expect(serialized.contains("433921337")) << serialized;
+        expect(serialized.contains("8388609")) << serialized;
+    };
+
+    "special values keep their YAML spellings"_test = [] {
+        gr::property_map map;
+        map["positive_infinity"]     = std::numeric_limits<double>::infinity();
+        map["negative_infinity"]     = -std::numeric_limits<double>::infinity();
+        map["not_a_number"]          = std::numeric_limits<double>::quiet_NaN();
+        map["negative_zero"]         = -0.0;
+        map["float_infinity"]        = std::numeric_limits<float>::infinity();
+        map["float_not_a_number"]    = std::numeric_limits<float>::quiet_NaN();
+        const std::string serialized = roundTrip(map);
+        expect(serialized.contains("!!float64 .inf")) << serialized;
+        expect(serialized.contains("!!float64 -.inf")) << serialized;
+        expect(serialized.contains("!!float64 .nan")) << serialized;
+        expect(serialized.contains("!!float32 .inf")) << serialized;
+        expect(serialized.contains("!!float32 .nan")) << serialized;
+        expect(serialized.contains("!!float64 -0\n")) << serialized;
+
+        const auto back = yaml::deserialize(serialized);
+        expect(back.has_value());
+        expect(std::signbit(back->at("negative_zero").value_or(0.0))) << "negative zero lost its sign: " << serialized;
     };
 };
 
