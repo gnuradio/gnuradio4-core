@@ -1,13 +1,17 @@
 #ifndef GNURADIO_SETTINGS_HPP
 #define GNURADIO_SETTINGS_HPP
 
+#include <array>
 #include <chrono>
 #include <concepts>
 #include <format>
 #include <mutex>
 #include <optional>
 #include <set>
+#include <span>
+#include <unordered_map>
 #include <variant>
+#include <vector>
 
 #include <gnuradio-4.0/AtomicRef.hpp>
 #include <gnuradio-4.0/BlockTraits.hpp>
@@ -19,14 +23,6 @@
 #include <gnuradio-4.0/meta/formatter.hpp>
 #include <gnuradio-4.0/meta/immutable.hpp>
 #include <gnuradio-4.0/meta/reflection.hpp>
-
-#if defined(__clang__)
-#define NO_INLINE [[gnu::noinline]]
-#elif defined(__GNUC__)
-#define NO_INLINE [[gnu::noinline, gnu::noipa]]
-#else
-#define NO_INLINE
-#endif
 
 namespace gr {
 
@@ -308,6 +304,298 @@ inline bool autoUpdateImpl(std::string_view key, const pmt::Value& value, const 
 }
 } // namespace detail
 
+namespace settings {
+
+/**
+ * @brief Convert a staged `pmt::Value` to the member type `Type` on the apply path.
+ *
+ * One instantiation per member type, shared by every block declaring a member of that type,
+ * rather than one per (block, member).
+ */
+template<typename Type>
+[[nodiscard]] std::expected<Type, std::string> extractStagedValue(const pmt::Value& stagedValue, std::string_view key) {
+    std::expected<Type, std::string> maybeValue;
+    if constexpr (std::is_enum_v<Type>) {
+        maybeValue = detail::tryExtractEnumValue<Type>(stagedValue, key);
+    } else if constexpr (std::is_same_v<Type, std::string> || std::is_same_v<Type, std::pmr::string>) {
+        auto str = stagedValue.value_or(std::string_view{});
+        if (str.data() != nullptr) {
+            maybeValue = Type(str);
+        } else {
+            maybeValue = std::unexpected("Unexpected type in stagedValue");
+        }
+    } else if constexpr (meta::array_or_vector_type<Type>) {
+        using TValue       = typename Type::value_type;
+        using TTensorValue = std::conditional_t<std::is_same_v<std::string, TValue> || std::is_same_v<std::pmr::string, TValue>, pmt::Value, TValue>;
+        auto tensor        = checked_access_ptr{stagedValue.get_if<Tensor<TTensorValue>>()};
+        if (tensor != nullptr) {
+            maybeValue = settings::convertParameter<Type>(key, stagedValue);
+        } else {
+            maybeValue = std::unexpected("Unexpected type in stagedValue");
+        }
+#ifdef __EMSCRIPTEN__
+    } else if constexpr (std::is_same_v<Type, std::size_t> && !std::is_same_v<std::size_t, gr::Size_t>) {
+        auto ptr = checked_access_ptr{stagedValue.get_if<gr::Size_t>()};
+        if (ptr != nullptr) {
+            maybeValue = static_cast<std::size_t>(*ptr);
+        } else {
+            maybeValue = std::unexpected("Unexpected type in stagedValue");
+        }
+#endif
+    } else {
+        auto ptr = checked_access_ptr{stagedValue.get_if<Type>()};
+        if (ptr != nullptr) {
+            maybeValue = *ptr;
+        } else {
+            maybeValue = std::unexpected("Unexpected type in stagedValue");
+        }
+    }
+    return maybeValue;
+}
+
+// the type-independent tail of the apply path, compiled once in Settings.cpp
+[[nodiscard]] bool recordAppliedValue(std::string_view key, const pmt::Value& stagedValue, property_map& appliedParameters, property_map& stagedForCallback, bool hasSettingsChangedCallback);
+void               reportValidationFailure(std::string_view key, const pmt::Value& value);
+void               reportConversionFailure(std::string_view key, std::string_view error);
+
+/**
+ * @brief One reflected member of a block, as the compiled settings machinery sees it.
+ *
+ * The accessors reach the block through an erased pointer, so the only code a block type
+ * contributes per member is the accessor pair; everything that reads this table is compiled
+ * once in Settings.cpp. A null accessor means the member does not take part in that path:
+ * `setParameter`/`autoUpdate`/`applyStaged` are set for writable members, `readParameter`
+ * for readable ones.
+ */
+struct MemberDescriptor {
+    using ParameterSetter   = std::optional<std::string> (*)(std::string_view key, const pmt::Value& value, property_map& newParameters);
+    using AutoUpdateHandler = bool (*)(std::string_view key, const pmt::Value& value, const std::set<std::string>& autoUpdateParams, property_map& stagedParameters);
+    using StagedApplier     = bool (*)(void* block, std::string_view key, const pmt::Value& stagedValue, property_map& appliedParameters, property_map& stagedForCallback, bool hasSettingsChangedCallback);
+    using ParameterReader   = void (*)(const void* block, std::string_view key, property_map& parameters);
+    using TypeNameReader    = std::string (*)();
+
+    std::string_view name{};
+
+    ParameterSetter   setParameter{nullptr};
+    AutoUpdateHandler autoUpdate{nullptr};
+    StagedApplier     applyStaged{nullptr};
+    ParameterReader   readParameter{nullptr};
+
+    bool             isAnnotated{false};
+    std::string_view description{};
+    std::string_view documentation{};
+    std::string_view unit{};
+    bool             visible{false};
+
+    bool                              isEnum{false};
+    TypeNameReader                    enumTypeName{nullptr};
+    std::span<const std::string_view> enumValueNames{};
+};
+
+/**
+ * @brief What a block type contributes to the settings machinery beyond its member list:
+ * the optional user callbacks and the framework members reached through them.
+ */
+struct BlockHooks {
+    using MetaInformationAccessor = property_map& (*)(void* block);
+    using DescriptionReader       = std::string_view (*)(const void* block);
+    using SettingsChangedInvoker  = void (*)(void* block, property_map& oldSettings, property_map& newSettings, property_map& forwardSettings);
+    using ResetInvoker            = void (*)(void* block);
+    using ChunkRatioReader        = bool (*)(const void* block, float& ratio);
+
+    std::span<const MemberDescriptor> members{};
+    bool                              reflectable{false};
+
+    MetaInformationAccessor metaInformation{nullptr};
+    DescriptionReader       blockDescription{nullptr};
+    SettingsChangedInvoker  settingsChanged{nullptr};
+    ResetInvoker            reset{nullptr};
+    ChunkRatioReader        chunkRatio{nullptr};
+};
+
+/**
+ * @brief The per-block-type settings table: the reflected member list, the block's hooks and
+ * the lookups derived from them once. One instance per block type, reached through
+ * `settings::blockDescriptor<TBlock>()`.
+ */
+struct BlockDescriptor {
+    explicit BlockDescriptor(const BlockHooks& blockHooks);
+
+    BlockHooks                                                    hooks;
+    std::set<std::string>                                         writableMembers{};
+    std::unordered_map<std::string_view, const MemberDescriptor*> writableByName{};
+    std::vector<const MemberDescriptor*>                          readableMembers{};
+};
+
+} // namespace settings
+
+namespace detail {
+
+template<typename TBlock, std::size_t kIdx, typename RawType, typename Type>
+bool applyStagedMember(void* block, std::string_view key, const pmt::Value& stagedValue, property_map& appliedParameters, property_map& stagedForCallback, bool hasSettingsChangedCallback) {
+    auto& member = refl::data_member<kIdx>(*static_cast<TBlock*>(block));
+
+    std::expected<Type, std::string> maybeValue = settings::extractStagedValue<Type>(stagedValue, key);
+
+    if constexpr (is_annotated<RawType>()) {
+        if (maybeValue && member.validate_and_set(*maybeValue)) {
+            return settings::recordAppliedValue(key, stagedValue, appliedParameters, stagedForCallback, hasSettingsChangedCallback);
+        }
+        settings::reportValidationFailure(key, stagedValue);
+        return false;
+    } else {
+        if (!maybeValue) {
+            settings::reportConversionFailure(key, maybeValue.error());
+            return false;
+        }
+        member = *maybeValue;
+        return settings::recordAppliedValue(key, stagedValue, appliedParameters, stagedForCallback, hasSettingsChangedCallback);
+    }
+}
+
+template<typename TBlock, std::size_t kIdx, typename RawType, typename Type>
+void readMember(const void* block, std::string_view key, property_map& parameters) {
+    const auto  keyPmr = std::pmr::string(key);
+    const auto& member = refl::data_member<kIdx>(*static_cast<const TBlock*>(block));
+    if constexpr (detail::isEnumOrAnnotatedEnum<RawType>) {
+        parameters.insert_or_assign(keyPmr, detail::enumToString(member));
+    } else if constexpr (meta::array_or_vector_type<Type>) {
+        parameters.insert_or_assign(keyPmr, pmt::Value(detail::collectionToTensor(detail::unwrap_decorated_reference(member))));
+    } else {
+        parameters.insert_or_assign(keyPmr, detail::unwrap_decorated_value(member));
+    }
+}
+
+template<typename TBlock>
+property_map& blockMetaInformation(void* block) {
+    auto& metaInformation = static_cast<TBlock*>(block)->meta_information;
+    if constexpr (AnnotatedType<std::remove_cvref_t<decltype(metaInformation)>>) {
+        return metaInformation.value;
+    } else {
+        return metaInformation;
+    }
+}
+
+template<typename TBlock>
+std::string_view readBlockDescription(const void* block) {
+    return detail::unwrap_decorated_reference(static_cast<const TBlock*>(block)->description);
+}
+
+template<typename TBlock>
+void invokeSettingsChanged(void* block, property_map& oldSettings, property_map& newSettings, [[maybe_unused]] property_map& forwardSettings) {
+    TBlock* self = static_cast<TBlock*>(block);
+    if constexpr (requires { self->settingsChanged(oldSettings, newSettings); }) {
+        self->settingsChanged(oldSettings, newSettings);
+    } else if constexpr (requires { self->settingsChanged(oldSettings, newSettings, forwardSettings); }) {
+        self->settingsChanged(oldSettings, newSettings, forwardSettings);
+    }
+}
+
+template<typename TBlock>
+void invokeReset(void* block) {
+    static_cast<TBlock*>(block)->reset();
+}
+
+template<typename TBlock>
+bool readChunkRatio(const void* block, float& ratio) {
+    const TBlock* self = static_cast<const TBlock*>(block);
+    if (self->input_chunk_size == 1ULL && self->output_chunk_size == 1ULL) {
+        return false;
+    }
+    ratio = static_cast<float>(self->output_chunk_size) / static_cast<float>(self->input_chunk_size);
+    return true;
+}
+
+} // namespace detail
+
+namespace settings {
+
+template<typename TEnum>
+inline constexpr auto kEnumValueNames = [] {
+    constexpr auto                              values = gr::meta::enumValues<TEnum>();
+    std::array<std::string_view, values.size()> names{};
+    for (std::size_t i = 0UZ; i < values.size(); ++i) {
+        names[i] = gr::meta::enumName(values[i]).value_or(std::string_view{});
+    }
+    return names;
+}();
+
+template<typename TBlock>
+inline constexpr auto kMemberDescriptors = [] {
+    std::array<MemberDescriptor, refl::data_member_count<TBlock>> table{};
+    if constexpr (refl::reflectable<TBlock>) {
+        refl::for_each_data_member_index<TBlock>([&table](auto kIdx) {
+            using MemberType = refl::data_member_type<TBlock, kIdx>;
+            using RawType    = std::remove_cvref_t<MemberType>;
+            using Type       = unwrap_if_wrapped_t<RawType>;
+
+            MemberDescriptor& entry = table[kIdx];
+            entry.name              = refl::data_member_name<TBlock, kIdx>.view();
+
+            if constexpr (settings::isReadableMember<Type>()) {
+                entry.readParameter = &detail::readMember<TBlock, kIdx, RawType, Type>;
+            }
+            if constexpr (settings::isWritableMember<Type, MemberType>()) {
+                entry.setParameter = &detail::setParameterImpl<Type>;
+                entry.autoUpdate   = &detail::autoUpdateImpl<Type>;
+                entry.applyStaged  = &detail::applyStagedMember<TBlock, kIdx, RawType, Type>;
+            }
+            if constexpr (AnnotatedType<RawType>) {
+                entry.isAnnotated   = true;
+                entry.description   = RawType::description();
+                entry.documentation = RawType::documentation();
+                entry.unit          = RawType::unit();
+                entry.visible       = RawType::visible();
+            }
+            if constexpr (std::is_enum_v<Type>) {
+                entry.isEnum         = true;
+                entry.enumTypeName   = &gr::meta::type_name<Type>;
+                entry.enumValueNames = std::span<const std::string_view>(kEnumValueNames<Type>);
+            }
+        });
+    }
+    return table;
+}();
+
+template<typename TBlock>
+[[nodiscard]] constexpr BlockHooks makeBlockHooks() {
+    BlockHooks hooks;
+    hooks.members     = std::span<const MemberDescriptor>(kMemberDescriptors<TBlock>);
+    hooks.reflectable = refl::reflectable<TBlock>;
+
+    constexpr bool hasMetaInformation = requires(TBlock block) {
+        {
+            unwrap_if_wrapped_t<decltype(block.meta_information)> {}
+        } -> std::same_as<property_map>;
+    };
+    if constexpr (hasMetaInformation) {
+        hooks.metaInformation = &detail::blockMetaInformation<TBlock>;
+        if constexpr (requires(TBlock block) { block.description; }) {
+            hooks.blockDescription = &detail::readBlockDescription<TBlock>;
+        }
+    }
+    if constexpr (HasSettingsChangedCallback<TBlock>) {
+        hooks.settingsChanged = &detail::invokeSettingsChanged<TBlock>;
+    }
+    if constexpr (HasSettingsResetCallback<TBlock>) {
+        hooks.reset = &detail::invokeReset<TBlock>;
+    }
+    if constexpr (requires { TBlock::ResamplingControl::kEnabled; }) {
+        if constexpr (TBlock::ResamplingControl::kEnabled) {
+            hooks.chunkRatio = &detail::readChunkRatio<TBlock>;
+        }
+    }
+    return hooks;
+}
+
+template<typename TBlock>
+[[nodiscard]] const BlockDescriptor& blockDescriptor() {
+    static const BlockDescriptor descriptor{makeBlockHooks<TBlock>()};
+    return descriptor;
+}
+
+} // namespace settings
+
 struct SettingsBase {
     struct CtxSettingsPair {
         SettingsCtx  context;
@@ -451,14 +739,20 @@ struct SettingsBase {
 }; // struct SettingsBase
 
 /**
- * @brief Non-templated base class for CtxSettings containing all type-independent data and logic.
- * This is compiled once in Settings.cpp rather than instantiated per block type. (Optimization I)
+ * @brief Non-templated implementation of the settings machinery.
+ *
+ * The owning block is reached through an erased pointer and its reflected members through
+ * `settings::BlockDescriptor`, so every body below is compiled once in `Settings.cpp` rather
+ * than instantiated per block type.
  */
 class CtxSettingsBase : public SettingsBase {
 public:
     using MatchPredicate = std::function<std::optional<bool>(const pmt::Value&, const pmt::Value&, std::size_t)>;
 
 protected:
+    void*                            _block      = nullptr;
+    const settings::BlockDescriptor* _descriptor = nullptr;
+
     mutable bool       _changed{false};
     mutable std::mutex _mutex{};
 
@@ -475,19 +769,19 @@ protected:
 
     const std::size_t _timePrecisionTolerance = 100; // ns, now used for emscripten
 
-    // Virtual hooks for type-dependent logic called from type-independent methods
-    [[nodiscard]] virtual property_map                 doSetStagedImpl(const property_map& parameters) = 0;
-    [[nodiscard]] virtual const std::set<std::string>& doGetAllWritableMembers() const                 = 0;
+    CtxSettingsBase(void* block, const settings::BlockDescriptor& descriptor) noexcept;
 
 public:
     // Settings configuration
     std::uint64_t expiry_time{std::numeric_limits<std::uint64_t>::max()};
 
-    // --- Type-independent virtual method implementations (defined in Settings.cpp) ---
+    [[nodiscard]] const std::set<std::string>& writableMembers() const override;
 
     [[nodiscard]] bool changed() const noexcept override;
     void               setChanged(bool b) noexcept override;
     void               setInitBlockParameters(const property_map& parameters) override;
+
+    void init() override;
 
     [[nodiscard]] const SettingsCtx& activeContext() const noexcept override;
 
@@ -511,17 +805,35 @@ public:
 
     [[nodiscard]] std::set<std::string> autoUpdateParameters(SettingsCtx ctx = {}) noexcept override;
 
+    [[nodiscard]] property_map set(const property_map& parameters, SettingsCtx ctx = {}) override;
     [[nodiscard]] property_map setStaged(const property_map& parameters) override;
+
+    void storeDefaults() override;
+    void resetDefaults() override;
 
     [[nodiscard]] std::optional<SettingsCtx> activateContext(SettingsCtx ctx = {}) override;
     [[nodiscard]] bool                       removeContext(SettingsCtx ctx) override;
+
+    void autoUpdate(const Tag& tag) override;
+
+    [[nodiscard]] ApplyStagedParametersResult applyStagedParameters() override;
+
+    void updateActiveParameters() noexcept override;
+
+    void loadParametersFromPropertyMap(const property_map& parameters, SettingsCtx ctx = {}) override;
 
     void assignFrom(const CtxSettingsBase& other);
     void assignFrom(CtxSettingsBase&& other) noexcept;
 
 protected:
-    // --- Private helpers (defined in Settings.cpp) ---
     // *Impl bodies run without taking _mutex, for callers that already hold it
+    [[nodiscard]] property_map setImpl(const property_map& parameters, SettingsCtx ctx);
+    [[nodiscard]] property_map setStagedImpl(const property_map& parameters);
+    void                       resetDefaultsImpl();
+    // reentrantLock is null when a caller already holds _mutex and cannot have it released underneath it
+    [[nodiscard]] ApplyStagedParametersResult          applyStagedParametersImpl(std::unique_lock<std::mutex>* reentrantLock = nullptr);
+    void                                               updateActiveParametersImpl() noexcept;
+    void                                               storeCurrentParameters(property_map& parameters);
     [[nodiscard]] bool                                 isActiveValueImpl(const std::pmr::string& key, const pmt::Value& value) const;
     [[nodiscard]] std::optional<SettingsCtx>           activateContextImpl(SettingsCtx ctx);
     [[nodiscard]] bool                                 removeContextImpl(SettingsCtx ctx);
@@ -537,263 +849,17 @@ protected:
     [[nodiscard]] std::optional<SettingsCtx>           createSettingsCtxFromTag(const Tag& tag) const;
 }; // class CtxSettingsBase
 
+/**
+ * @brief The typed face of the settings machinery: it binds a block to its
+ * `settings::BlockDescriptor` and checks the block's optional callback signatures. All behaviour
+ * lives in `CtxSettingsBase`.
+ */
 template<typename TBlock>
 class CtxSettings : public CtxSettingsBase {
-    TBlock* _block = nullptr;
-
-    // Virtual hook: delegates to type-dependent setStagedImpl using static dispatch table
-    [[nodiscard]] property_map doSetStagedImpl(const property_map& parameters) override {
-        property_map ret;
-        if constexpr (refl::reflectable<TBlock>) {
-            const auto& setters = parameterSetters();
-            for (const auto& [key, value] : parameters) {
-                auto it = setters.find(key);
-                if (it != setters.end()) {
-                    if (auto error = it->second(key, value, _stagedParameters)) {
-                        throw gr::exception(*error);
-                    }
-                } else {
-                    ret.insert_or_assign(key, value);
-                }
-            }
-        }
-        if (!_stagedParameters.empty()) {
-            setChanged(true);
-        }
-        return ret;
-    }
-
-    // Virtual hook: returns the static allWritableMembers set for this block type
-    [[nodiscard]] const std::set<std::string>& doGetAllWritableMembers() const override { return allWritableMembers(); }
-
 public:
-    // Static function - computed once per block type (Optimization B)
-    [[nodiscard]] static const std::set<std::string>& allWritableMembers() {
-        static const std::set<std::string> members = [] {
-            std::set<std::string> result;
-            if constexpr (refl::reflectable<TBlock>) {
-                refl::for_each_data_member_index<TBlock>([&result](auto kIdx) {
-                    using MemberType = refl::data_member_type<TBlock, kIdx>;
-                    using RawType    = std::remove_cvref_t<MemberType>;
-                    using Type       = unwrap_if_wrapped_t<RawType>;
-                    if constexpr (settings::isWritableMember<Type, MemberType>()) {
-                        result.emplace(std::string(refl::data_member_name<TBlock, kIdx>.view()));
-                    }
-                });
-            }
-            return result;
-        }();
-        return members;
-    }
+    [[nodiscard]] static const std::set<std::string>& allWritableMembers() { return settings::blockDescriptor<TBlock>().writableMembers; }
 
-    // ===== Static dispatch tables for compile-time optimization (Optimization F) =====
-
-    // Type aliases for dispatch function pointers
-    using ParameterSetter       = std::optional<std::string> (*)(std::string_view key, const pmt::Value& value, property_map& newParameters);
-    using StagedParameterSetter = std::optional<std::string> (*)(std::string_view key, const pmt::Value& value, property_map& stagedParameters);
-    using AutoUpdateHandler     = bool (*)(std::string_view key, const pmt::Value& value, const std::set<std::string>& autoUpdateParams, property_map& stagedParameters);
-    using StagedApplier         = bool (*)(TBlock* block, std::string_view key, const pmt::Value& value, property_map& applied, property_map& staged, bool hasCallback);
-    using ParameterReader       = void (*)(const TBlock* block, property_map& parameters);
-    using ActiveParameterReader = void (*)(const TBlock* block, property_map& activeParameters);
-
-private:
-    // Helper template for applyStagedParameters - applies value to block member
-    template<std::size_t kIdx, typename RawType, typename Type>
-    static bool applyStagedImpl(TBlock* block, std::string_view key, const pmt::Value& stagedValue, property_map& applied, property_map& staged, bool hasCallback) {
-        auto&      member = refl::data_member<kIdx>(*block);
-        const auto keyPmr = std::pmr::string(key);
-
-        std::expected<Type, std::string> maybe_value;
-        if constexpr (detail::isEnumOrAnnotatedEnum<RawType>) {
-            maybe_value = detail::tryExtractEnumValue<Type>(stagedValue, key);
-        } else if constexpr (std::is_same_v<Type, std::string> || std::is_same_v<Type, std::pmr::string>) {
-            auto str = stagedValue.value_or(std::string_view{});
-            if (str.data() != nullptr) {
-                maybe_value = Type(str);
-            } else {
-                maybe_value = std::unexpected("Unexpected type in stagedValue");
-            }
-        } else if constexpr (meta::array_or_vector_type<Type>) {
-            using TValue       = typename Type::value_type;
-            using TTensorValue = std::conditional_t<std::is_same_v<std::string, TValue> || std::is_same_v<std::pmr::string, TValue>, pmt::Value, TValue>;
-            auto tensor        = checked_access_ptr{stagedValue.get_if<Tensor<TTensorValue>>()};
-            if (tensor != nullptr) {
-                maybe_value = settings::convertParameter<Type>(key, stagedValue);
-            } else {
-                maybe_value = std::unexpected("Unexpected type in stagedValue");
-            }
-#ifdef __EMSCRIPTEN__
-        } else if constexpr (std::is_same_v<Type, std::size_t> && !std::is_same_v<std::size_t, gr::Size_t>) {
-            auto ptr = checked_access_ptr{stagedValue.get_if<gr::Size_t>()};
-            if (ptr != nullptr) {
-                maybe_value = static_cast<std::size_t>(*ptr);
-            } else {
-                maybe_value = std::unexpected("Unexpected type in stagedValue");
-            }
-#endif
-        } else {
-            auto ptr = checked_access_ptr{stagedValue.get_if<Type>()};
-            if (ptr != nullptr) {
-                maybe_value = *ptr;
-            } else {
-                maybe_value = std::unexpected("Unexpected type in stagedValue");
-            }
-        }
-
-        if constexpr (is_annotated<RawType>()) {
-            if (maybe_value && member.validate_and_set(*maybe_value)) {
-                applied.insert_or_assign(keyPmr, stagedValue);
-                if (hasCallback) {
-                    staged.insert_or_assign(keyPmr, stagedValue);
-                }
-                return true;
-            } else {
-                std::fputs(std::format("Failed to validate field '{}' with value '{}'.\n", std::string_view(key), stagedValue).c_str(), stderr);
-                return false;
-            }
-        } else {
-            if (!maybe_value) {
-                std::fputs(std::format("Failed to convert key '{}': {}\n", std::string_view(key), maybe_value.error()).c_str(), stderr);
-                return false;
-            }
-            member = *maybe_value;
-            applied.insert_or_assign(keyPmr, stagedValue);
-            if (hasCallback) {
-                staged.insert_or_assign(keyPmr, stagedValue);
-            }
-            return true;
-        }
-    }
-
-    // Helper template for storeCurrentParameters - reads member value into property_map
-    template<std::size_t kIdx, typename Type>
-    static void storeParameterImpl(const TBlock* block, property_map& parameters) {
-        const auto& key    = std::pmr::string(refl::data_member_name<TBlock, kIdx>.view());
-        const auto& member = refl::data_member<kIdx>(*block);
-        if constexpr (detail::isEnumOrAnnotatedEnum<Type>) {
-            parameters.insert_or_assign(key, detail::enumToString(member));
-        } else if constexpr (meta::array_or_vector_type<Type>) {
-            const auto& from = detail::unwrap_decorated_value(member);
-            parameters.insert_or_assign(key, detail::collectionToTensor(from));
-        } else {
-            parameters.insert_or_assign(key, detail::unwrap_decorated_value(member));
-        }
-    }
-
-    // Helper template for updateActiveParameters - reads member value for active parameters
-    template<std::size_t kIdx, typename RawType, typename Type>
-    static void updateActiveParameterImpl(const TBlock* block, property_map& activeParameters) {
-        const auto  key    = std::pmr::string(refl::data_member_name<TBlock, kIdx>.view());
-        const auto& member = refl::data_member<kIdx>(*block);
-        if constexpr (detail::isEnumOrAnnotatedEnum<RawType>) {
-            activeParameters.insert_or_assign(key, detail::enumToString(member));
-        } else if constexpr (meta::array_or_vector_type<Type>) {
-            const auto& from = detail::unwrap_decorated_reference(member);
-            activeParameters.insert_or_assign(key, pmt::Value(detail::collectionToTensor(from)));
-        } else {
-            activeParameters.insert_or_assign(key, detail::unwrap_decorated_value(member));
-        }
-    }
-
-public:
-    // Static dispatch table for set() method
-    [[nodiscard]] static const std::unordered_map<std::string_view, ParameterSetter>& parameterSetters() {
-        static const std::unordered_map<std::string_view, ParameterSetter> setters = [] {
-            std::unordered_map<std::string_view, ParameterSetter> result;
-            if constexpr (refl::reflectable<TBlock>) {
-                refl::for_each_data_member_index<TBlock>([&result](auto kIdx) {
-                    using MemberType = refl::data_member_type<TBlock, kIdx>;
-                    using RawType    = std::remove_cvref_t<MemberType>;
-                    using Type       = unwrap_if_wrapped_t<RawType>;
-                    if constexpr (settings::isWritableMember<Type, MemberType>()) {
-                        constexpr auto fieldName = refl::data_member_name<TBlock, kIdx>;
-                        result[fieldName.view()] = &detail::setParameterImpl<Type>;
-                    }
-                });
-            }
-            return result;
-        }();
-        return setters;
-    }
-
-    // Static dispatch table for autoUpdate() method
-    [[nodiscard]] static const std::unordered_map<std::string_view, AutoUpdateHandler>& autoUpdateHandlers() {
-        static const std::unordered_map<std::string_view, AutoUpdateHandler> handlers = [] {
-            std::unordered_map<std::string_view, AutoUpdateHandler> result;
-            if constexpr (refl::reflectable<TBlock>) {
-                refl::for_each_data_member_index<TBlock>([&result](auto kIdx) {
-                    using MemberType = refl::data_member_type<TBlock, kIdx>;
-                    using Type       = unwrap_if_wrapped_t<std::remove_cvref_t<MemberType>>;
-                    if constexpr (settings::isWritableMember<Type, MemberType>()) {
-                        constexpr auto fieldName = refl::data_member_name<TBlock, kIdx>;
-                        result[fieldName.view()] = &detail::autoUpdateImpl<Type>;
-                    }
-                });
-            }
-            return result;
-        }();
-        return handlers;
-    }
-
-    // Static dispatch table for applyStagedParameters() method
-    [[nodiscard]] static const std::unordered_map<std::string_view, StagedApplier>& stagedAppliers() {
-        static const std::unordered_map<std::string_view, StagedApplier> appliers = [] {
-            std::unordered_map<std::string_view, StagedApplier> result;
-            if constexpr (refl::reflectable<TBlock>) {
-                refl::for_each_data_member_index<TBlock>([&result](auto kIdx) {
-                    using MemberType = refl::data_member_type<TBlock, kIdx>;
-                    using RawType    = std::remove_cvref_t<MemberType>;
-                    using Type       = unwrap_if_wrapped_t<RawType>;
-                    if constexpr (settings::isWritableMember<Type, MemberType>()) {
-                        constexpr auto fieldName = refl::data_member_name<TBlock, kIdx>;
-                        result[fieldName.view()] = &applyStagedImpl<kIdx, RawType, Type>;
-                    }
-                });
-            }
-            return result;
-        }();
-        return appliers;
-    }
-
-    // Static list of parameter readers for storeCurrentParameters()
-    [[nodiscard]] static const std::vector<ParameterReader>& parameterReaders() {
-        static const std::vector<ParameterReader> readers = [] {
-            std::vector<ParameterReader> result;
-            if constexpr (refl::reflectable<TBlock>) {
-                refl::for_each_data_member_index<TBlock>([&result](auto kIdx) {
-                    using MemberType = refl::data_member_type<TBlock, kIdx>;
-                    using Type       = unwrap_if_wrapped_t<std::remove_cvref_t<MemberType>>;
-                    if constexpr (settings::isReadableMember<Type>()) {
-                        result.push_back(&storeParameterImpl<kIdx, Type>);
-                    }
-                });
-            }
-            return result;
-        }();
-        return readers;
-    }
-
-    // Static list of active parameter readers for updateActiveParameters()
-    [[nodiscard]] static const std::vector<ActiveParameterReader>& activeParameterReaders() {
-        static const std::vector<ActiveParameterReader> readers = [] {
-            std::vector<ActiveParameterReader> result;
-            if constexpr (refl::reflectable<TBlock>) {
-                refl::for_each_data_member_index<TBlock>([&result](auto kIdx) {
-                    using MemberType = refl::data_member_type<TBlock, kIdx>;
-                    using RawType    = std::remove_cvref_t<MemberType>;
-                    using Type       = unwrap_if_wrapped_t<RawType>;
-                    if constexpr (settings::isReadableMember<Type>()) {
-                        result.push_back(&updateActiveParameterImpl<kIdx, RawType, Type>);
-                    }
-                });
-            }
-            return result;
-        }();
-        return readers;
-    }
-
-public:
-    explicit CtxSettings(TBlock& block, MatchPredicate matchPred = settings::nullMatchPred) noexcept : CtxSettingsBase(), _block(&block) {
+    explicit CtxSettings(TBlock& block, MatchPredicate matchPred = settings::nullMatchPred) noexcept : CtxSettingsBase(std::addressof(block), settings::blockDescriptor<TBlock>()) {
         _matchPred = std::move(matchPred);
         if constexpr (requires { &TBlock::settingsChanged; }) { // if settingsChanged is defined
             static_assert(HasSettingsChangedCallback<TBlock>, "if provided, settingsChanged must have either a `(const property_map& old, property_map& new, property_map& fwd)`"
@@ -803,8 +869,6 @@ public:
         if constexpr (requires { &TBlock::reset; }) { // if reset is defined
             static_assert(HasSettingsResetCallback<TBlock>, "if provided, reset() may have no function parameters");
         }
-        // meta_information population deferred to init() (Optimization B)
-        _autoForwardParameters.insert(gr::tag::kDefaultTags.begin(), gr::tag::kDefaultTags.end());
     }
 
     // Not safe as CtxSettings has a pointer back to the block
@@ -814,346 +878,9 @@ public:
     CtxSettings& operator=(const CtxSettings& other) = delete;
     CtxSettings& operator=(CtxSettings&& other)      = delete;
 
-    CtxSettings(TBlock& block, const CtxSettings& other) : CtxSettingsBase() {
-        _block = std::addressof(block);
-        assignFrom(other);
-    }
+    CtxSettings(TBlock& block, const CtxSettings& other) : CtxSettingsBase(std::addressof(block), settings::blockDescriptor<TBlock>()) { assignFrom(other); }
 
-    CtxSettings(TBlock& block, CtxSettings&& other) noexcept : CtxSettingsBase() {
-        _block = std::addressof(block);
-        assignFrom(std::move(other));
-    }
-
-    NO_INLINE void init() override {
-        // Populate meta_information at runtime (deferred from constructor - Optimization B)
-        if constexpr (refl::reflectable<TBlock>) {
-            constexpr bool hasMetaInfo = requires(TBlock t) {
-                {
-                    unwrap_if_wrapped_t<decltype(t.meta_information)> {}
-                } -> std::same_as<property_map>;
-            };
-
-            if constexpr (hasMetaInfo && requires(TBlock t) { t.description; }) {
-                static_assert(std::is_same_v<std::remove_cvref_t<unwrap_if_wrapped_t<decltype(TBlock::description)>>, std::string_view>);
-                _block->meta_information.value["description"] = std::string(_block->description);
-            }
-
-            // handle meta-information for UI and other non-processing-related purposes
-            refl::for_each_data_member_index<TBlock>([this](auto kIdx) {
-                using MemberType = refl::data_member_type<TBlock, kIdx>;
-                using RawType    = std::remove_cvref_t<MemberType>;
-                using Type       = unwrap_if_wrapped_t<RawType>;
-
-                if constexpr (hasMetaInfo && std::is_enum_v<Type>) {
-                    auto  memberName                                               = std::string(refl::data_member_name<TBlock, kIdx>.view());
-                    auto& meta_info                                                = _block->meta_information;
-                    meta_info[convert_string_domain(memberName) + "::enum_values"] = [] {
-                        constexpr auto           values = gr::meta::enumValues<Type>();
-                        std::vector<std::string> result;
-                        result.reserve(values.size());
-                        for (auto v : values) {
-                            if (auto name = gr::meta::enumName(v); name.has_value()) {
-                                result.emplace_back(*name);
-                            }
-                        }
-                        return result;
-                    }();
-                    meta_info[convert_string_domain(memberName) + "::enum_type"] = std::string(gr::meta::type_name<Type>());
-                }
-
-                if constexpr (hasMetaInfo && AnnotatedType<RawType>) {
-                    auto  memberName                                                        = std::string(refl::data_member_name<TBlock, kIdx>.view());
-                    auto& meta_information                                                  = _block->meta_information;
-                    meta_information[convert_string_domain(memberName) + "::description"]   = std::string(RawType::description());
-                    meta_information[convert_string_domain(memberName) + "::documentation"] = std::string(RawType::documentation());
-                    meta_information[convert_string_domain(memberName) + "::unit"]          = std::string(RawType::unit());
-                    meta_information[convert_string_domain(memberName) + "::visible"]       = RawType::visible();
-                }
-            });
-        }
-
-        storeDefaults();
-
-        if (const property_map failed = set(_initBlockParameters); !failed.empty()) {
-            throw gr::exception(std::format("settings could not be applied: {}", failed));
-        }
-
-        if (const auto failed = activateContext(); failed == std::nullopt) {
-            throw gr::exception("Settings for context could not be activated");
-        }
-    }
-
-    [[nodiscard]] property_map set(const property_map& parameters, SettingsCtx ctx = {}) override {
-        std::lock_guard lg(_mutex);
-        return setImpl(parameters, ctx);
-    }
-
-    [[nodiscard]] property_map setImpl(const property_map& parameters, SettingsCtx ctx) {
-        property_map ret;
-        if constexpr (refl::reflectable<TBlock>) {
-            if (ctx.time == 0ULL) {
-                ctx.time = settings::convertTimePointToUint64Ns(std::chrono::system_clock::now());
-            }
-#ifdef __EMSCRIPTEN__
-            resolveDuplicateTimestamp(ctx);
-#endif
-            // initialize with empty property_map when best match parameters not found
-            property_map newParameters = getBestMatchStoredParameters(ctx).value_or(_defaultParameters);
-            if (!_autoUpdateParameters.contains(ctx)) {
-                _autoUpdateParameters[ctx] = getBestMatchAutoUpdateParameters(ctx).value_or(allWritableMembers());
-            }
-            auto& currentAutoUpdateParameters = _autoUpdateParameters[ctx];
-
-            // Use static dispatch table for O(1) lookup instead of O(members) iteration (Optimization F)
-            const auto& setters = parameterSetters();
-            for (const auto& [key, value] : parameters) {
-                if (value.is_monostate()) {
-                    continue;
-                }
-
-                auto it = setters.find(key);
-                if (it != setters.end()) {
-                    if (auto error = it->second(key, value, newParameters)) {
-                        throw gr::exception(*error);
-                    }
-                    // Remove from auto-update set if present
-                    if (auto autoIt = currentAutoUpdateParameters.find(std::string(key)); autoIt != currentAutoUpdateParameters.end()) {
-                        currentAutoUpdateParameters.erase(autoIt);
-                    }
-                } else {
-                    ret.insert_or_assign(key, value);
-                }
-            }
-            addStoredParameters(newParameters, ctx);
-            removeExpiredStoredParameters();
-        }
-
-        // copy items that could not be matched to the node's meta_information map (if available)
-        if constexpr (requires(TBlock t) {
-                          {
-                              unwrap_if_wrapped_t<decltype(t.meta_information)> {}
-                          } -> std::same_as<property_map>;
-                      }) {
-            updateMaps(ret, _block->meta_information);
-        }
-
-        return ret; // N.B. returns those <key:value> parameters that could not be set
-    }
-
-    void storeDefaults() override { this->storeCurrentParameters(_defaultParameters); }
-
-    NO_INLINE void resetDefaults() override {
-        std::lock_guard lg(_mutex);
-        resetDefaultsImpl();
-    }
-
-    NO_INLINE void resetDefaultsImpl() {
-        // add default parameters to stored and apply the parameters
-        auto ctx = SettingsCtx{settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), std::string()};
-#ifdef __EMSCRIPTEN__
-        resolveDuplicateTimestamp(ctx);
-#endif
-        addStoredParameters(_defaultParameters, ctx);
-        std::ignore = activateContextImpl({});
-        std::ignore = applyStagedParametersImpl();
-
-        removeExpiredStoredParameters();
-
-        if constexpr (HasSettingsResetCallback<TBlock>) {
-            _block->reset();
-        }
-    }
-
-    NO_INLINE void autoUpdate(const Tag& tag) override {
-        if constexpr (refl::reflectable<TBlock>) {
-            std::lock_guard lg(_mutex);
-            const auto      tagCtx      = createSettingsCtxFromTag(tag);
-            const auto      previousCtx = _activeCtx; // capture before activateContext may change it
-
-            SettingsCtx ctx;
-            if (tagCtx != std::nullopt) {
-                const auto bestMatchSettingsCtx = activateContextImpl(tagCtx.value());
-                if (bestMatchSettingsCtx == std::nullopt) {
-                    ctx = _activeCtx;
-                } else {
-                    ctx = bestMatchSettingsCtx.value();
-                }
-            } else {
-                ctx = _activeCtx;
-            }
-
-            const bool activeCtxChanged = previousCtx != ctx;
-
-            // fuzzy-match auto-update parameters (exact lookup may fail due to timestamp mismatch)
-            if (!_autoUpdateParameters.contains(ctx)) {
-                _autoUpdateParameters[ctx] = getBestMatchAutoUpdateParameters(ctx).value_or(allWritableMembers());
-            }
-            auto& autoUpdateParams = _autoUpdateParameters[ctx];
-
-            // Use static dispatch table for O(1) lookup instead of O(members) iteration (Optimization F)
-            const auto& handlers   = autoUpdateHandlers();
-            const auto& parameters = tag.map;
-            bool        wasChanged = false;
-            for (const auto& [key, value] : parameters) {
-                auto it = handlers.find(key);
-                if (it != handlers.end() && (activeCtxChanged || !isActiveValueImpl(key, value))) {
-                    if (it->second(key, value, autoUpdateParams, _stagedParameters)) {
-                        wasChanged = true;
-                    }
-                }
-            }
-
-            if (tagCtx == std::nullopt && !wasChanged && _stagedParameters.empty()) {
-                setChanged(false);
-            } else if (activeCtxChanged || wasChanged) {
-                setChanged(true);
-            }
-        }
-    }
-
-    [[nodiscard]] NO_INLINE ApplyStagedParametersResult applyStagedParameters() override {
-        std::unique_lock lock(_mutex);
-        return applyStagedParametersImpl(&lock);
-    }
-
-    // reentrantLock is null when a caller already holds _mutex and cannot have it released underneath it
-    [[nodiscard]] NO_INLINE ApplyStagedParametersResult applyStagedParametersImpl(std::unique_lock<std::mutex>* reentrantLock = nullptr) {
-        ApplyStagedParametersResult result;
-        if constexpr (refl::reflectable<TBlock>) {
-            // prepare old settings if required
-            property_map oldSettings;
-            if constexpr (HasSettingsChangedCallback<TBlock>) {
-                storeCurrentParameters(oldSettings);
-            }
-
-            // The batch is moved out of the shared map before anything below can release the
-            // lock. A setStaged() call that arrives during the settingsChanged() window then stages
-            // for the next apply instead of being cleared with this one, and a concurrent apply
-            // takes an empty map rather than repeating this batch.
-            const property_map batch = std::exchange(_stagedParameters, {});
-
-            // check if reset of settings should be performed
-            if (batch.contains(static_cast<std::pmr::string>(gr::tag::RESET_DEFAULTS))) {
-                resetDefaultsImpl();
-            }
-
-            // Use static dispatch table for O(1) lookup instead of O(members) iteration (Optimization F)
-            const auto&  appliers = stagedAppliers();
-            property_map staged;
-            for (const auto& [key, stagedValue] : batch) {
-                auto it = appliers.find(key);
-                if (it != appliers.end()) {
-                    constexpr bool hasCallback = HasSettingsChangedCallback<TBlock>;
-                    if (!it->second(_block, key, stagedValue, result.appliedParameters, staged, hasCallback)) {
-                        result.failedParameters.insert_or_assign(key, stagedValue); // rejected: must not reach downstream blocks
-                        continue;
-                    }
-                    if (_autoForwardParameters.contains(std::string(key))) {
-                        result.forwardParameters.insert_or_assign(key, stagedValue);
-                    }
-                }
-            }
-
-            updateActiveParametersImpl();
-
-            // invoke user-callback function if staged is not empty; oldSettings, staged and result are local
-            // copies, so the callback may read or write settings() without _mutex being held across it
-            if (!staged.empty()) {
-                if (reentrantLock != nullptr) {
-                    reentrantLock->unlock();
-                }
-                if constexpr (requires { _block->settingsChanged(/* old settings */ _activeParameters, /* new settings */ staged); }) {
-                    _block->settingsChanged(/* old settings */ oldSettings, /* new settings */ staged);
-                } else if constexpr (requires { _block->settingsChanged(/* old settings */ _activeParameters, /* new settings */ staged, /* new forward settings */ result.forwardParameters); }) {
-                    _block->settingsChanged(/* old settings */ oldSettings, /* new settings */ staged, /* new forward settings */ result.forwardParameters);
-                }
-                if (reentrantLock != nullptr) {
-                    reentrantLock->lock();
-                }
-            }
-
-            updateActiveParametersImpl();
-
-            // the settings keep the input rate; only the forwarded value carries the block's output rate
-            if constexpr (TBlock::ResamplingControl::kEnabled) {
-                if (result.forwardParameters.contains(gr::tag::SAMPLE_RATE.shortKey()) && (_block->input_chunk_size != 1ULL || _block->output_chunk_size != 1ULL)) {
-                    const auto activeIt = _activeParameters.find(gr::tag::SAMPLE_RATE.shortKey());
-                    // a sample_rate that is not a float (e.g. loaded as double from a GRC file) must not be dereferenced blindly
-                    const float* activeSampleRate = activeIt != _activeParameters.end() ? activeIt->second.template get_if<float>() : nullptr;
-                    if (activeSampleRate != nullptr) {
-                        const float ratio         = static_cast<float>(_block->output_chunk_size) / static_cast<float>(_block->input_chunk_size);
-                        const float newSampleRate = ratio * (*activeSampleRate);
-                        result.forwardParameters.insert_or_assign(gr::tag::SAMPLE_RATE.shortKey(), newSampleRate);
-                    }
-                }
-            }
-
-            if (batch.contains(static_cast<std::pmr::string>(gr::tag::STORE_DEFAULTS))) {
-                storeDefaults();
-            }
-
-            if constexpr (HasSettingsResetCallback<TBlock>) {
-                if (batch.contains(static_cast<std::pmr::string>(gr::tag::RESET_DEFAULTS))) {
-                    _block->reset();
-                }
-            }
-        } else {
-            _stagedParameters.clear(); // a block with no reflectable members cannot apply these
-        }
-        // anything staged while the lock was released is work for the next apply, so the map
-        // reports unchanged only when it is empty
-        gr::atomic_ref(_changed).store_release(!_stagedParameters.empty());
-        return result;
-    }
-
-    NO_INLINE void updateActiveParameters() noexcept override {
-        if constexpr (refl::reflectable<TBlock>) {
-            std::lock_guard lg(_mutex);
-            updateActiveParametersImpl();
-        }
-    }
-
-    NO_INLINE void loadParametersFromPropertyMap(const property_map& parameters, SettingsCtx ctx = {}) override {
-        std::lock_guard lg(_mutex);
-        // Use static dispatch table for O(1) membership check instead of O(members) iteration (Optimization F)
-        const auto&  setters = parameterSetters();
-        property_map newProperties;
-
-        for (const auto& [key, value] : parameters) {
-            if (setters.contains(key)) {
-                newProperties[key] = value;
-            } else {
-                auto str = ctx.context.value_or(std::string_view{});
-                if (str.empty()) { // store meta_information only for default
-                    _block->meta_information[key] = value;
-                }
-            }
-        }
-
-        if (const property_map failed = setImpl(newProperties, ctx); !failed.empty()) {
-            throw gr::exception(std::format("settings from property_map could not be loaded: {}", failed));
-        }
-    }
-
-private:
-    NO_INLINE void updateActiveParametersImpl() noexcept {
-        // Use static dispatch table for reduced template instantiation (Optimization F)
-        const auto& readers = activeParameterReaders();
-        for (const auto& reader : readers) {
-            reader(_block, _activeParameters);
-        }
-    }
-
-    NO_INLINE void storeCurrentParameters(property_map& parameters) {
-        // Use static dispatch table for reduced template instantiation (Optimization F)
-        if constexpr (refl::reflectable<TBlock>) {
-            const auto& readers = parameterReaders();
-            for (const auto& reader : readers) {
-                reader(_block, parameters);
-            }
-        }
-    }
-
+    CtxSettings(TBlock& block, CtxSettings&& other) noexcept : CtxSettingsBase(std::addressof(block), settings::blockDescriptor<TBlock>()) { assignFrom(std::move(other)); }
 }; // class CtxSettings
 
 } // namespace gr
@@ -1164,7 +891,5 @@ struct hash<gr::SettingsCtx> {
     [[nodiscard]] size_t operator()(const gr::SettingsCtx& ctx) const noexcept { return ctx.hash(); }
 };
 } // namespace std
-
-#undef NO_INLINE
 
 #endif // GNURADIO_SETTINGS_HPP
