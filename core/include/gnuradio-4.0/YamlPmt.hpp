@@ -6,6 +6,7 @@
 #include <cctype>
 #include <charconv>
 #include <complex>
+#include <concepts>
 #include <cstdint>
 #include <cstdio>
 #include <expected>
@@ -176,6 +177,19 @@ constexpr std::string_view tag_for_type() noexcept {
     }
 }
 
+template<std::floating_point T>
+void serializeFloatingPoint(std::ostream& os, T value) {
+    if (std::isnan(value)) {
+        os << ".nan";
+    } else if (std::isinf(value)) {
+        os << (value < 0 ? "-.inf" : ".inf");
+    } else {
+        // shortest form that parses back to the same value; the stream's default of six
+        // significant digits would emit 433921337.0 as 4.33921e+08 and read back 433921000
+        os << std::format("{}", value);
+    }
+}
+
 template<TypeTagMode tagMode>
 void serialize(std::ostream& os, const pmt::Value& var, int level, std::span<const std::string_view> keyPriority) {
     gr::pmt::ValueVisitor([&os, level, keyPriority]<typename T>(const T& value) {
@@ -198,15 +212,14 @@ void serialize(std::ostream& os, const pmt::Value& var, int level, std::span<con
                 os << value << "\n";
             }
         } else if constexpr (std::is_floating_point_v<T>) {
-            if (std::isnan(value)) {
-                os << ".nan\n";
-            } else if (std::isinf(value)) {
-                os << (value < 0 ? "-.inf" : ".inf") << "\n";
-            } else {
-                os << value << "\n";
-            }
+            serializeFloatingPoint(os, value);
+            os << "\n";
         } else if constexpr (is_complex_v<T>) {
-            os << "(" << value.real() << "," << value.imag() << ")\n";
+            os << "(";
+            serializeFloatingPoint(os, value.real());
+            os << ",";
+            serializeFloatingPoint(os, value.imag());
+            os << ")\n";
         } else if constexpr (std::is_same_v<T, std::string> || std::is_same_v<T, std::string_view> || std::is_same_v<T, std::pmr::string>) {
             // Use multiline for strings containing newlines and printable characters only
             bool multiline = value.contains('\n') && std::ranges::all_of(value, [](unsigned char c) { return std::isprint(c) || c == '\n'; });
