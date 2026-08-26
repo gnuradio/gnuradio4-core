@@ -1,6 +1,8 @@
 #ifndef GNURADIO_BLOCK_MERGING_HPP
 #define GNURADIO_BLOCK_MERGING_HPP
 
+#include <gnuradio-4.0/meta/simd.hpp>
+
 #include <gnuradio-4.0/Block.hpp>
 #include <gnuradio-4.0/Graph.hpp>
 

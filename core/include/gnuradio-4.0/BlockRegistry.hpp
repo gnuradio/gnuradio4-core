@@ -1,6 +1,8 @@
 #ifndef GNURADIO_BLOCK_REGISTRY_HPP
 #define GNURADIO_BLOCK_REGISTRY_HPP
 
+#include <gnuradio-4.0/meta/simd.hpp>
+
 #include <memory>
 #include <string>
 #include <string_view>

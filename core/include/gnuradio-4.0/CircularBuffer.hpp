@@ -15,6 +15,7 @@ using polymorphic_allocator = std::experimental::pmr::polymorphic_allocator<T>;
 #include <algorithm>
 #include <bit>
 #include <cassert> // to assert if compiled for debugging
+#include <cstring>
 #include <functional>
 #include <numeric>
 #include <ranges>
