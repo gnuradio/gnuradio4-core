@@ -16,11 +16,31 @@
 ///   e.g. parse_registrations block0.hpp build/generated
 ///        parse_registrations blockN.hpp build/generated --split
 ///        parse_registrations blockN.hpp build/generated --max-per-tu 16
-/// * default: each macro line => one .cpp file.
-/// * --split (-s): cartesian expansion -> each block-type combination generates its own .cpp.
+///
+/// Each registered (block, type) produces two translation units:
+///
+/// * a DEFINITION unit, <stem>_block_<n>.cpp, which names the block type: it defines the factory
+///   that builds a BlockWrapper<TBlock>, explicitly instantiates that wrapper, and exports the
+///   registry key and alias the typed insert<TBlock>() path would derive. This is the only unit
+///   that parses the block header, and the only one that materialises the framework's per-type
+///   machinery.
+/// * a share of a REGISTRATION unit, which declares the definition unit's exported symbol and
+///   registers it through gr::insertBlockFactory(). A registration unit includes
+///   gnuradio-4.0/BlockRegistration.hpp alone and instantiates nothing.
+///
+/// Both generated initializers -- gr_blocklib_init_unit_<stem> per registration unit, and
+/// gr_blocklib_init_module_<module> over all of them -- return the number of blocks the call newly
+/// entered into the registry they are given. Registering a block the registry already holds is a
+/// no-op and not a failure, so calling an initializer on a registry the definition units' own static
+/// initializers have already populated returns zero and changes nothing. That makes initialization
+/// idempotent and safe to repeat, and still leaves a caller building its own registry a usable
+/// count.
+///
+/// The switches below group the registration units; definition units are always one per (block, type).
+/// * default: each macro line => one registration .cpp file.
+/// * --split (-s): cartesian expansion -> each block-type combination gets its own registration .cpp.
 /// * --max-per-tu <N>: balanced chunking -> all registrations of the header (across macro lines)
-///   are packed into .cpp files of at most N instantiations each. This both splits large
-///   cartesian expansions and merges small macro lines, bounding per-TU compile time and memory.
+///   are packed into registration .cpp files of at most N entries each.
 
 #include <algorithm>
 #include <cstdlib>
@@ -29,11 +49,12 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
-#include <functional>
 #include <iostream>
+#include <numeric>
 #include <ranges>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 constexpr std::string_view kRegistrationMacroName = "GR_REGISTER_BLOCK";
@@ -135,31 +156,6 @@ struct GeneratedFiles {
           rawCalls(outFileBase + "_raw_calls.hpp.in") {}
 };
 
-// Returns the name of the generated function
-[[nodiscard]] std::string emitRegistrationCode(auto& registrationsOutput, std::string_view namePrefix, std::string_view uniqueId, std::string_view templateName, std::string_view finalName, std::size_t lineNum, const Options& options) {
-    registrationsOutput << std::format(R"cppcode(
-    namespace gr {{ class BlockRegistry; }}
-    namespace {{
-        bool reg_{}_{}(gr::BlockRegistry& registry) {{
-            return gr::registerBlock<{}, "{}">(registry); // for details: {}:{}\n"
-        }}
-    }}
-)cppcode", //
-        namePrefix, uniqueId, templateName, finalName.empty() ? "" : finalName, options.registryInstance, options.headerPath.string(), lineNum);
-    return std::format("reg_{}_{}", namePrefix, uniqueId);
-}
-
-[[nodiscard]] std::string emitInitAllCode(auto& fout, std::string_view namePrefix, const std::vector<std::string>& generatedRegistrationFunctions, const Options& options) {
-    fout << std::format("\nextern \"C\" {{\nGNURADIO_EXPORT std::size_t gr_blocklib_init_unit_{}(gr::BlockRegistry& registry) {{\n    std::size_t result = 0UZ; \n", namePrefix);
-    for (const auto& generatedRegistrationFunction : generatedRegistrationFunctions) {
-        fout << "    result += ( !" << generatedRegistrationFunction << "(registry) ? 1UZ : 0UZ );\n";
-    }
-    fout << "    return result;\n}\n}\n\n";
-
-    fout << std::format("auto gr_blocklib_init_unit_{0}_invoked = gr_blocklib_init_unit_{0}({1}());\n", namePrefix, options.registryInstance);
-    return std::format("gr_blocklib_init_unit_{}", namePrefix);
-}
-
 struct InstantiationNames {
     std::string templateName; // e.g. "gr::basic::Block1<float, double>"
     std::string finalName;    // registry name override, empty if none
@@ -169,7 +165,65 @@ struct PendingRegistration {
     std::string templateName;
     std::string finalName;
     std::size_t lineNum;
+    std::size_t macroIndex;
 };
+
+// the symbol a definition unit exports and a registration unit declares
+[[nodiscard]] std::string registrationSymbol(std::string_view stem, std::size_t index) { return std::format("gr_blocklib_registration_{}_{}", stem, index); }
+
+[[nodiscard]] std::string factorySymbol(std::string_view stem, std::size_t index) { return std::format("gr_blocklib_factory_{}_{}", stem, index); }
+
+// the only unit that names the block type, and so the only one that materialises it
+void emitDefinitionUnit(std::string_view commandPath, std::string_view stem, std::size_t index, const PendingRegistration& registration, const Options& options) {
+    std::ofstream fout = openFile((options.outDir / std::format("{}_block_{}.cpp", stem, index)).string());
+
+    fout << std::format("// auto-generated by {}, do not edit.\n", commandPath);
+    fout << std::format("#include <{}>\n#include \"{}\" // for details: {}:{}\n\n", options.registryHeader, options.headerPath.string(), options.headerPath.string(), registration.lineNum);
+    fout << "#ifdef GR_ENABLE_BLOCK_REGISTRY\n\n";
+    // The factory below is what materialises the wrapper: constructing and destroying it here
+    // odr-uses every member this unit must emit, with ordinary vague linkage. An explicit
+    // `template class gr::BlockWrapper<...>` on top of it adds nothing a consumer can link
+    // against — no unit declares an extern template — and under Clang it suppresses emission of
+    // the wrapped members' implicitly instantiated destructors, which then stay undefined in the
+    // whole build.
+    fout << std::format("std::unique_ptr<gr::BlockModel> {}(gr::property_map params) {{ return std::make_unique<gr::BlockWrapper<{}>>(std::move(params)); }}\n\n", factorySymbol(stem, index), registration.templateName);
+    fout << std::format("const gr::BlockRegistration& {}() {{\n", registrationSymbol(stem, index));
+    fout << std::format("    static const gr::BlockRegistration registration = gr::makeBlockRegistration<{}, \"{}\">(&{});\n", registration.templateName, registration.finalName, factorySymbol(stem, index));
+    fout << "    return registration;\n}\n\n";
+    fout << "#endif // GR_ENABLE_BLOCK_REGISTRY\n";
+    fout << "// end of auto-generated code\n";
+}
+
+// declaration-only: it names no block type, so it instantiates nothing
+[[nodiscard]] std::string emitRegistrationUnit(std::string_view commandPath, std::string_view stem, std::string_view namePrefix, const std::vector<std::size_t>& indices, const std::vector<PendingRegistration>& registrations, const Options& options) {
+    GeneratedFiles output((options.outDir / namePrefix).string());
+
+    output.registrations << std::format("// auto-generated by {}, do not edit.\n", commandPath);
+    output.registrations << "#include <gnuradio-4.0/BlockRegistration.hpp>\n\n#include <cstddef>\n\n";
+    output.registrations << "#ifdef GR_ENABLE_BLOCK_REGISTRY\n\n";
+    for (std::size_t index : indices) {
+        output.registrations << std::format("extern const gr::BlockRegistration& {}(); // {} -- for details: {}:{}\n", registrationSymbol(stem, index), registrations[index].templateName, options.headerPath.string(), registrations[index].lineNum);
+    }
+
+    const std::string initFunction = std::format("gr_blocklib_init_unit_{}", namePrefix);
+    output.registrations << std::format("\nextern \"C\" {{\nGNURADIO_EXPORT std::size_t {}(gr::BlockRegistry& registry) {{\n    std::size_t result = 0UZ;\n", initFunction);
+    for (std::size_t index : indices) {
+        output.registrations << std::format("    result += ( gr::insertBlockFactory(registry, {}()) ? 1UZ : 0UZ );\n", registrationSymbol(stem, index));
+    }
+    output.registrations << "    return result;\n}\n}\n\n";
+    output.registrations << std::format("auto {0}_invoked = {0}({1}());\n\n", initFunction, options.registryInstance);
+    output.registrations << "#endif // GR_ENABLE_BLOCK_REGISTRY\n";
+    output.registrations << std::format("// To initialize, call {}\n", initFunction);
+    output.registrations << "// end of auto-generated code\n";
+
+    const std::string declarationsGuard = std::format("HEADER_GUARD_{}_HPP", initFunction);
+    output.declarations << std::format("#ifndef {}\n#define {}\n", declarationsGuard, declarationsGuard);
+    output.declarations << "extern \"C\" { std::size_t " << initFunction << "(gr::BlockRegistry&); }\n";
+    output.declarations << std::format("#endif // {}\n", declarationsGuard);
+    output.rawCalls << "result += " << initFunction << "(registry);\n";
+
+    return initFunction;
+}
 
 static std::expected<RegisterBlock, std::string> parseRegisterBlockMacro(std::string_view line) {
     auto macroPos = line.find(kRegistrationMacroName);
@@ -378,7 +432,7 @@ int main(int argc, char** argv) try {
 
     std::string                      line;
     std::size_t                      lineNum = 0UZ;
-    std::vector<PendingRegistration> pendingRegistrations; // only used with --max-per-tu
+    std::vector<PendingRegistration> pendingRegistrations; // every registration of this header, in source order
     while (std::getline(fin, line)) {
         lineNum++;
         auto trimmed = detail::trim(line);
@@ -395,121 +449,56 @@ int main(int argc, char** argv) try {
         }
         auto& info = *maybe;
 
-        // one .cpp per macro line, balanced chunks when maxPerTu is set, or one .cpp per expansion when expansionsSplit is set
-        auto combos = cartesianProduct(info.expansions);
-        if (options.maxPerTu > 0UZ) {
-            // balanced chunking => collect all registrations of this header first, emit after the scan
-            for (const auto& vars : combos) {
-                auto [templateName, finalName] = makeInstantiationNames(info, vars);
-                pendingRegistrations.push_back({std::move(templateName), std::move(finalName), lineNum});
-            }
-        } else if (!options.expansionsSplit || combos.empty()) {
-            std::vector<std::string> generatedRegistrationFunctions;
-
-            // Single .cpp for all expansions of this macro
-            const auto namePrefix  = std::format("{}_{}", stem, macroCount);
-            const auto outFileBase = (options.outDir / namePrefix).string();
-
-            GeneratedFiles output(outFileBase);
-
-            output.registrations << std::format("// auto-generated by {}, do not edit.\n", commandPath.string());
-            output.registrations << std::format("#include <{1}>\n#include \"{0}\" // for details: {0}:1\n\n", options.headerPath.string(), options.registryHeader);
-
-            if (combos.empty()) {
-                // No expansions => single call
-                auto [templateName, finalName] = makeInstantiationNames(info, {});
-                const std::size_t hashValue    = std::hash<std::string>{}(templateName);
-                generatedRegistrationFunctions.push_back(emitRegistrationCode(output.registrations, namePrefix, std::to_string(hashValue), templateName, finalName, lineNum, options));
-            } else {
-                // multiple expansions => all in one file
-                for (const auto& vars : combos) {
-                    auto [templateName, finalName] = makeInstantiationNames(info, vars);
-                    const std::size_t hashValue    = std::hash<std::string>{}(templateName);
-                    generatedRegistrationFunctions.push_back(emitRegistrationCode(output.registrations, namePrefix, std::to_string(hashValue), templateName, finalName, lineNum, options));
-                }
-            }
-
-            auto generatedInitFunction = emitInitAllCode(output.registrations, namePrefix, generatedRegistrationFunctions, options);
-            output.registrations << "// To initialize, call " << generatedInitFunction << "\n";
-
-            const std::string declarationsGuard = std::format("HEADER_GUARD_{}_HPP", generatedInitFunction);
-            output.declarations << std::format("#ifndef {}\n#define {}\n", declarationsGuard, declarationsGuard);
-            output.declarations << "extern \"C\" { std::size_t " << generatedInitFunction << "(gr::BlockRegistry&); }\n";
-            output.declarations << std::format("#endif // {}\n", declarationsGuard);
-            output.rawCalls << "result += !" << generatedInitFunction << "(registry);\n";
-
-            output.registrations << "// end of auto-generated code\n";
-            fileCount++;
-        } else {
-            // expansionsSplit => each expansion => its own file
-            int localIdx = 0;
-            for (const auto& vars : combos) {
-                std::vector<std::string> generatedRegistrationFunctions;
-
-                const auto namePrefix  = std::format("{}_{}_{}", stem, macroCount, localIdx);
-                const auto outFileBase = (options.outDir / namePrefix).string();
-
-                GeneratedFiles output(outFileBase);
-
-                output.registrations << std::format("// auto-generated by {}, do not edit.\n", commandPath.string());
-                output.registrations << std::format("#include <{1}>\n#include \"{0}\" // for details: {0}:1\n\n", options.headerPath.string(), options.registryHeader);
-
-                auto [templateName, finalName] = makeInstantiationNames(info, vars);
-                const std::size_t hashValue    = std::hash<std::string>{}(templateName);
-                generatedRegistrationFunctions.push_back(emitRegistrationCode(output.registrations, namePrefix, std::to_string(hashValue), templateName, finalName, lineNum, options));
-                auto generatedInitFunction = emitInitAllCode(output.registrations, namePrefix, generatedRegistrationFunctions, options);
-                output.registrations << "// To initialize, call " << generatedInitFunction << "\n";
-
-                const std::string declarationsGuard = std::format("HEADER_GUARD_{}_HPP", generatedInitFunction);
-                output.declarations << std::format("#ifndef {}\n#define {}\n", declarationsGuard, declarationsGuard);
-                output.declarations << "extern \"C\" { std::size_t " << generatedInitFunction << "(gr::BlockRegistry&); }\n";
-                output.declarations << std::format("#endif // {}\n", declarationsGuard);
-                output.rawCalls << "result += !" << generatedInitFunction << "(registry);\n";
-
-                output.registrations << "// end of auto-generated code\n";
-
-                fileCount++;
-                localIdx++;
-            }
+        for (const auto& vars : cartesianProduct(info.expansions)) {
+            auto [templateName, finalName] = makeInstantiationNames(info, vars);
+            pendingRegistrations.push_back({std::move(templateName), std::move(finalName), lineNum, static_cast<std::size_t>(macroCount)});
         }
 
         macroCount++;
         std::cout << std::endl;
     }
 
+    for (std::size_t index = 0UZ; index < pendingRegistrations.size(); index++) {
+        emitDefinitionUnit(commandPath.string(), stem, index, pendingRegistrations[index], options);
+        fileCount++;
+    }
+
+    // group the registrations into declaration-only units: balanced chunks when maxPerTu is set,
+    // one unit per registration when expansionsSplit is set, one unit per macro line otherwise
+    std::vector<std::pair<std::string, std::vector<std::size_t>>> registrationUnits;
     if (options.maxPerTu > 0UZ && !pendingRegistrations.empty()) {
-        // emit balanced chunks: sizes differ by at most one, none exceeding maxPerTu
+        // sizes differ by at most one, none exceeding maxPerTu
         const std::size_t total   = pendingRegistrations.size();
         const std::size_t nChunks = (total + options.maxPerTu - 1UZ) / options.maxPerTu;
         std::size_t       next    = 0UZ;
         for (std::size_t chunk = 0UZ; chunk < nChunks; chunk++) {
-            const std::size_t count      = (total / nChunks) + ((chunk < (total % nChunks)) ? 1UZ : 0UZ);
-            const auto        namePrefix = std::format("{}_{}", stem, chunk);
+            const std::size_t count = (total / nChunks) + ((chunk < (total % nChunks)) ? 1UZ : 0UZ);
 
-            GeneratedFiles output((options.outDir / namePrefix).string());
-
-            output.registrations << std::format("// auto-generated by {}, do not edit.\n", commandPath.string());
-            output.registrations << std::format("#include <{1}>\n#include \"{0}\" // for details: {0}:1\n\n", options.headerPath.string(), options.registryHeader);
-
-            std::vector<std::string> generatedRegistrationFunctions;
-            for (std::size_t i = next; i < next + count; i++) {
-                const auto& reg = pendingRegistrations[i];
-                generatedRegistrationFunctions.push_back(emitRegistrationCode(output.registrations, namePrefix, std::to_string(i - next), reg.templateName, reg.finalName, reg.lineNum, options));
-            }
+            std::vector<std::size_t> indices(count);
+            std::ranges::iota(indices, next);
             next += count;
-
-            auto generatedInitFunction = emitInitAllCode(output.registrations, namePrefix, generatedRegistrationFunctions, options);
-            output.registrations << "// To initialize, call " << generatedInitFunction << "\n";
-
-            const std::string declarationsGuard = std::format("HEADER_GUARD_{}_HPP", generatedInitFunction);
-            output.declarations << std::format("#ifndef {}\n#define {}\n", declarationsGuard, declarationsGuard);
-            output.declarations << "extern \"C\" { std::size_t " << generatedInitFunction << "(gr::BlockRegistry&); }\n";
-            output.declarations << std::format("#endif // {}\n", declarationsGuard);
-            output.rawCalls << "result += !" << generatedInitFunction << "(registry);\n";
-
-            output.registrations << "// end of auto-generated code\n";
-            fileCount++;
+            registrationUnits.emplace_back(std::format("{}_{}", stem, chunk), std::move(indices));
         }
+    } else {
+        std::size_t localIdx = 0UZ;
+        for (std::size_t index = 0UZ; index < pendingRegistrations.size(); index++) {
+            const std::size_t macroIndex = pendingRegistrations[index].macroIndex;
+            localIdx                     = (index > 0UZ && pendingRegistrations[index - 1UZ].macroIndex == macroIndex) ? localIdx + 1UZ : 0UZ;
+
+            if (options.expansionsSplit) {
+                registrationUnits.emplace_back(std::format("{}_{}_{}", stem, macroIndex, localIdx), std::vector{index});
+            } else if (localIdx == 0UZ) {
+                registrationUnits.emplace_back(std::format("{}_{}", stem, macroIndex), std::vector{index});
+            } else {
+                registrationUnits.back().second.push_back(index);
+            }
+        }
+    }
+
+    for (const auto& [namePrefix, indices] : registrationUnits) {
+        const std::string initFunction = emitRegistrationUnit(commandPath.string(), stem, namePrefix, indices, pendingRegistrations, options);
+        std::cout << std::format("\t=> To initialize, call {}\n", initFunction);
+        fileCount++;
     }
 
     std::cout << std::format("parse_registrations: Wrote {} file(s) for {} macro definition(s).\n", fileCount, macroCount);

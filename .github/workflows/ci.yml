@@ -224,7 +224,9 @@ jobs:
           fi
           cmake --build "${{ runner.workspace }}/build-smoke"
           if [[ "${{ matrix.cmake_wrapper }}" == "emcmake" ]]; then
-            "${system_node}" "${{ runner.workspace }}/build-smoke/minimal_blocklib_consumer.js"
+            for consumer in minimal_blocklib_consumer_Shared minimal_blocklib_consumer_Static; do
+              "${system_node}" "${{ runner.workspace }}/build-smoke/${consumer}.js"
+            done
           fi
 
       - name: Show final sccache and build directory stats

@@ -14,3 +14,8 @@ smoke_build_dir="${build_dir}/installed-sdk-smoke"
 cmake --install "${build_dir}" --prefix "${install_prefix}"
 cmake -S "${script_dir}/minimal_blocklib" -B "${smoke_build_dir}" -DCMAKE_PREFIX_PATH="${install_prefix}"
 cmake --build "${smoke_build_dir}"
+
+# building verifies the headers and link line; running verifies the generated registration path
+for linkage in Shared Static; do
+  "${smoke_build_dir}/minimal_blocklib_consumer_${linkage}"
+done
