@@ -9,6 +9,7 @@
 #include <gnuradio-4.0/thread/thread_pool.hpp>
 
 #include <charconv>
+#include <concepts>
 #include <memory_resource>
 #include <mutex>
 
@@ -749,7 +750,7 @@ public:
     }
 
     explicit BlockWrapper(T&& original)
-    requires kOwning
+    requires(kOwning && std::move_constructible<T>)
         : BlockModel(gr::meta::type_name<T>()), _block(std::move(original)) {
         initMessagePorts();
         _dynamicPortsLoader.fn       = &BlockWrapper::blockWrapperDynamicPortsLoader;
