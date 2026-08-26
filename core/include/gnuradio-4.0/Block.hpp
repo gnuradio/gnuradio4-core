@@ -7,6 +7,8 @@
 
 #include <format>
 
+#include <gnuradio-4.0/meta/simd.hpp>
+
 #include <gnuradio-4.0/meta/RangesHelper.hpp>
 #include <gnuradio-4.0/meta/formatter.hpp>
 #include <gnuradio-4.0/meta/immutable.hpp>

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cstring>
 #include <format>
 #include <fstream>
 #include <mutex>

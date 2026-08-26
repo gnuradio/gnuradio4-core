@@ -1,6 +1,8 @@
 #ifndef GNURADIO_PMRCOLLECTIONS_HPP
 #define GNURADIO_PMRCOLLECTIONS_HPP
 
+#include <cstring>
+
 #include <gnuradio-4.0/MemoryAllocators.hpp>
 
 namespace gr::pmr {
