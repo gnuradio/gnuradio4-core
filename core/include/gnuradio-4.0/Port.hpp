@@ -203,62 +203,19 @@ Follows the ISO 80000-1:2022 Quantities and Units conventions:
     explicit PortMetaInfo(std::string_view dataTypeName) noexcept : data_type(dataTypeName) {};
     explicit PortMetaInfo(std::initializer_list<std::pair<const std::string, pmt::Value>> initMetaInfo) noexcept(false) //
         : PortMetaInfo(property_map{initMetaInfo.begin(), initMetaInfo.end()}) {}
-    explicit PortMetaInfo(const property_map& metaInfo) noexcept(false) {
-        if (auto res = update(metaInfo); !res.has_value()) {
-            throw gr::exception(res.error().message, res.error().sourceLocation);
-        }
-    }
+    explicit PortMetaInfo(const property_map& metaInfo) noexcept(false);
 
-    void reset() { auto_update = {gr::tag::kDefaultTags.begin(), gr::tag::kDefaultTags.end()}; }
+    /**
+     * The bodies below walk this fixed eight-field aggregate by reflection, which drags the pmt
+     * conversions, the std::format refusal paths and the type-name machinery in behind them. None
+     * of that varies with the including translation unit -- PortMetaInfo is not a template -- so
+     * the bodies are compiled once in Port.cpp instead of once per port element type.
+     */
+    void reset();
 
-    [[nodiscard]] std::expected<void, Error> update(const property_map& metaInfo, const std::source_location location = std::source_location::current()) noexcept {
-        std::expected<void, Error> maybeError = {};
-        for (const auto& [key, value] : metaInfo) {
-            if (!auto_update.contains(convert_string_domain(key))) {
-                continue;
-            }
-            refl::for_each_data_member_index<PortMetaInfo>([&key, &value, &maybeError, &location, this](auto kIdx) {
-                using MemberType = refl::data_member_type<PortMetaInfo, kIdx>;
-                using Type       = unwrap_if_wrapped_t<std::remove_cvref_t<MemberType>>;
+    [[nodiscard]] std::expected<void, Error> update(const property_map& metaInfo, const std::source_location location = std::source_location::current()) noexcept;
 
-                const auto fieldName = refl::data_member_name<PortMetaInfo, kIdx>.view();
-                if (fieldName == key) {
-                    auto& member = refl::data_member<kIdx>(*this);
-                    if constexpr (std::is_same_v<Type, std::string>) {
-                        const auto str = value.value_or(std::string_view{});
-                        if (str.data()) {
-                            std::ignore = member.validate_and_set(std::string(str));
-                        } else {
-                            maybeError = std::unexpected(Error{std::format("PortMetaInfo invalid-argument: incorrect type for key")});
-                        }
-                    } else {
-                        const auto converted = pmt::convert_numerically<Type>(value);
-                        if (converted) {
-                            std::ignore = member.validate_and_set(*converted);
-                        } else {
-                            maybeError = std::unexpected(Error{std::format("PortMetaInfo invalid-argument: incorrect type for key {} (expected:{}, got:{} {}, value:{})", //
-                                                                   std::string_view(key), gr::meta::type_name<Type>(), value.value_type(), value.container_type(), value),
-                                location});
-                        }
-                    }
-                }
-            });
-        }
-
-        if (!maybeError.has_value()) {
-            return maybeError;
-        }
-        return {};
-    }
-
-    [[nodiscard]] property_map get() const noexcept {
-        property_map metaInfo;
-        refl::for_each_data_member_index<PortMetaInfo>([&metaInfo, this](auto kIdx) { //
-            metaInfo.insert_or_assign(std::pmr::string(refl::data_member_name<PortMetaInfo, kIdx>.view()), refl::data_member<kIdx>(*this).value);
-        });
-
-        return metaInfo;
-    }
+    [[nodiscard]] property_map get() const noexcept;
 };
 
 template<class T>
