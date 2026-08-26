@@ -900,6 +900,18 @@ public:
     std::optional<std::chrono::steady_clock::time_point> _zeroProgressSince{};
     bool                                                 _zeroProgressReported = false;
 
+    /// everything a block draining an async input can be waiting on; two equal readings mean the next call sees
+    /// exactly what this one saw
+    struct DrainWatermark {
+        std::size_t moved{}; // monotonic sum of the stream positions of every port: what the block took in and put out
+        std::size_t room{};  // output capacity, which grows again as the blocks downstream take their share
+
+        [[nodiscard]] constexpr bool operator==(const DrainWatermark&) const noexcept = default;
+    };
+
+    DrainWatermark _drainMark{};
+    std::size_t    _nDrainStalls = 0UZ;
+
     // intermediate non-real-time<->real-time setting states
     CtxSettings<Derived> _settings;
 
@@ -1569,14 +1581,18 @@ public:
             std::size_t nextTag    = std::numeric_limits<std::size_t>::max();
             std::size_t nextEosTag = std::numeric_limits<std::size_t>::max();
             bool        asyncEoS   = false;
+            bool        asyncDrain = false; // an async input still holds items in front of its end-of-stream marker
         } result;
 
-        auto adjustForInputPort = [&result]<PortLike Port>(Port& port) {
+        bool hasInputStillToCome = false; // a connected input that has not seen the end of its stream is still owed samples
+
+        auto adjustForInputPort = [&result, &hasInputStillToCome]<PortLike Port>(Port& port) {
             if (!port.isConnected()) {
                 return;
             }
             ReaderSpanLike auto tagData = port.tagReader().get();
             if (tagData.empty()) [[likely]] {
+                hasInputStillToCome = true;
                 return;
             }
             std::ignore                    = tagData.consume(0UZ);
@@ -1592,16 +1608,31 @@ public:
                 }
                 if (eosTagIt != tagData.end()) {
                     result.nextEosTag = std::min(result.nextEosTag, eosTagIt->index - readPosition);
+                } else {
+                    hasInputStillToCome = true;
                 }
                 result.hasAnyTag = true;
                 result.hasTag    = result.hasTag || (tagData[0].index == readPosition && !tagData[0].map.empty());
             } else { // async port
-                if (eosTagIt != tagData.end() && (eosTagIt->index - readPosition) <= port.min_samples) {
-                    result.asyncEoS = true;
+                if (eosTagIt != tagData.end()) {
+                    // the port can still serve a call as long as a whole request's worth of items precedes the
+                    // marker; the stream ends where the block can no longer be given what it asks for, and not
+                    // while items it was handed are still queued in front of it
+                    const std::size_t nBeforeEoS = eosTagIt->index - readPosition;
+                    if (nBeforeEoS == 0UZ || nBeforeEoS < port.min_samples) {
+                        result.asyncEoS = true;
+                    } else {
+                        result.asyncDrain = true;
+                    }
+                } else {
+                    hasInputStillToCome = true;
                 }
             }
         };
         for_each_port([&adjustForInputPort](PortLike auto& port) { adjustForInputPort(port); }, inputPorts<PortType::STREAM>(&self()));
+        // draining is the end of the graph, where what the block still holds is all it will ever get; while any
+        // input is still owed samples the block is in its steady state and nothing about its remainder is settled
+        result.asyncDrain = result.asyncDrain && !hasInputStillToCome;
         return result;
     }
 
@@ -2009,7 +2040,7 @@ public:
         std::size_t  resampledIn{}, resampledOut{}, inputSkipBefore{};
         work::Status resampledStatus = work::Status::OK;
         bool         hasTag{}, hasAnyTag{}, asyncEoS{}, isEosPresent{};
-        bool         hasAsyncIn{}, hasAsyncOut{};
+        bool         hasAsyncIn{}, hasAsyncOut{}, asyncDrain{};
     };
 
     SampleLimits computeSampleLimits(std::size_t requestedWork) {
@@ -2022,7 +2053,7 @@ public:
         std::size_t maxSyncAvailableOut = outputStreamCache.maxSyncAvailable();
         bool        hasAsyncOut         = outputStreamCache.hasASyncAvailable();
 
-        auto [hasTag, hasAnyTag, nextTag, nextEosTag, asyncEoS] = getNextTagAndEosPosition();
+        auto [hasTag, hasAnyTag, nextTag, nextEosTag, asyncEoS, asyncDrain] = getNextTagAndEosPosition();
         if constexpr (forwardTagPropagation) {
             nextTag = std::numeric_limits<std::size_t>::max(); // don't break chunks at tags — tags carry forward
         }
@@ -2037,7 +2068,45 @@ public:
         const std::size_t availableToPublish              = std::min({maxSyncOut, maxSyncAvailableOut});
         auto [resampledIn, resampledOut, resampledStatus] = computeResampling(std::min(minSyncIn, nextEosTag), availableToProcess, minSyncOut, availableToPublish, requestedWork);
         const bool isEosPresent                           = nextEosTag <= 0 || eosAfterSkip < minSyncIn || eosAfterSkip < input_chunk_size || output_chunk_size * (eosAfterSkip / input_chunk_size) < minSyncOut;
-        return {.resampledIn = resampledIn, .resampledOut = resampledOut, .inputSkipBefore = inputSkipBefore, .resampledStatus = resampledStatus, .hasTag = hasTag, .hasAnyTag = hasAnyTag, .asyncEoS = asyncEoS, .isEosPresent = isEosPresent, .hasAsyncIn = hasAsyncIn, .hasAsyncOut = hasAsyncOut};
+        return {.resampledIn = resampledIn, .resampledOut = resampledOut, .inputSkipBefore = inputSkipBefore, .resampledStatus = resampledStatus, .hasTag = hasTag, .hasAnyTag = hasAnyTag, .asyncEoS = asyncEoS, .isEosPresent = isEosPresent, .hasAsyncIn = hasAsyncIn, .hasAsyncOut = hasAsyncOut, .asyncDrain = asyncDrain};
+    }
+
+    [[nodiscard]] DrainWatermark drainWatermark() {
+        DrainWatermark mark;
+        for_each_port(
+            [&mark]<PortLike TPort>(TPort& port) {
+                if (port.isConnected()) {
+                    mark.moved += port.streamReader().position();
+                }
+            },
+            inputPorts<PortType::STREAM>(&self()));
+        for_each_port(
+            [&mark]<PortLike TPort>(TPort& port) {
+                mark.moved += port.streamWriter().position();
+                mark.room += port.streamWriter().available();
+            },
+            outputPorts<PortType::STREAM>(&self()));
+        return mark;
+    }
+
+    /// a draining block is kept running so that it can emit what it was handed: report the point at which nothing
+    /// it waits on has moved for so many calls that nothing ever will, which is the only thing that bounds a block
+    /// that never takes its remainder
+    [[nodiscard]] bool isDrainStalled(bool isDraining) {
+        constexpr std::size_t kStallLimit = 1024UZ;
+
+        if (!isDraining) {
+            _nDrainStalls = 0UZ;
+            _drainMark    = DrainWatermark{};
+            return false;
+        }
+        if (const DrainWatermark mark = drainWatermark(); mark != _drainMark) {
+            _drainMark    = mark;
+            _nDrainStalls = 0UZ;
+            return false;
+        }
+        _nDrainStalls++;
+        return _nDrainStalls >= kStallLimit;
     }
 
     /// apply input tags and settings from all sync ports
@@ -2150,7 +2219,8 @@ public:
             consumeReaders(limits.inputSkipBefore, skipSpans);
         }
 
-        if (limits.isEosPresent || lifecycle::isShuttingDown(this->state()) || limits.asyncEoS) {
+        const bool drainStalled = isDrainStalled(limits.asyncDrain); // evaluated before the test below, which would short-circuit past the bookkeeping
+        if (limits.isEosPresent || lifecycle::isShuttingDown(this->state()) || limits.asyncEoS || drainStalled) {
             if constexpr (HasProcessEpilogueFunction<Derived>) {
                 inputStreamCache.invalidateStatistic();
                 const std::size_t trailing = inputStreamCache.maxSyncAvailable();
