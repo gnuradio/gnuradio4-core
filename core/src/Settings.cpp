@@ -1,15 +1,47 @@
 #include <gnuradio-4.0/Settings.hpp>
 
+#include <cstdio>
+#include <utility>
+
 namespace gr {
 
 namespace settings {
 void throwInvalidContextType(const pmt::Value& value) { throw gr::exception("Invalid CtxSettings context type " + std::string(typeid(value).name())); }
+
+bool recordAppliedValue(std::string_view key, const pmt::Value& stagedValue, property_map& appliedParameters, property_map& stagedForCallback, bool hasSettingsChangedCallback) {
+    const auto keyPmr = std::pmr::string(key);
+    appliedParameters.insert_or_assign(keyPmr, stagedValue);
+    if (hasSettingsChangedCallback) {
+        stagedForCallback.insert_or_assign(keyPmr, stagedValue);
+    }
+    return true;
+}
+
+void reportValidationFailure(std::string_view key, const pmt::Value& value) { std::fputs(std::format("Failed to validate field '{}' with value '{}'.\n", key, value).c_str(), stderr); }
+
+void reportConversionFailure(std::string_view key, std::string_view error) { std::fputs(std::format("Failed to convert key '{}': {}\n", key, error).c_str(), stderr); }
+
+BlockDescriptor::BlockDescriptor(const BlockHooks& blockHooks) : hooks(blockHooks) {
+    for (const MemberDescriptor& member : hooks.members) {
+        if (member.setParameter != nullptr) {
+            writableMembers.emplace(member.name);
+            writableByName.emplace(member.name, &member);
+        }
+        if (member.readParameter != nullptr) {
+            readableMembers.push_back(&member);
+        }
+    }
+}
+
 } // namespace settings
+
+CtxSettingsBase::CtxSettingsBase(void* block, const settings::BlockDescriptor& descriptor) noexcept : _block(block), _descriptor(&descriptor) { _autoForwardParameters.insert(gr::tag::kDefaultTags.begin(), gr::tag::kDefaultTags.end()); }
 
 // --- Simple accessors ---
 
-bool CtxSettingsBase::changed() const noexcept { return gr::atomic_ref(_changed).load_acquire(); }
+const std::set<std::string>& CtxSettingsBase::writableMembers() const { return _descriptor->writableMembers; }
 
+bool CtxSettingsBase::changed() const noexcept { return gr::atomic_ref(_changed).load_acquire(); }
 void CtxSettingsBase::setChanged(bool b) noexcept { gr::atomic_ref(_changed).store_release(b); }
 
 void CtxSettingsBase::setInitBlockParameters(const property_map& parameters) { _initBlockParameters = parameters; }
@@ -133,7 +165,7 @@ std::set<std::string> CtxSettingsBase::autoUpdateParameters(SettingsCtx ctx) noe
 
 property_map CtxSettingsBase::setStaged(const property_map& parameters) {
     std::lock_guard lg(_mutex);
-    return doSetStagedImpl(parameters);
+    return setStagedImpl(parameters);
 }
 
 // re-applying a value the block already holds must cost nothing, so it is never staged
@@ -166,7 +198,7 @@ std::optional<SettingsCtx> CtxSettingsBase::activateContextImpl(SettingsCtx ctx)
         std::optional<property_map> parameters = getBestMatchStoredParameters(ctx);
         if (parameters) {
             if (!_autoUpdateParameters.contains(bestMatchSettingsCtx.value())) {
-                _autoUpdateParameters[bestMatchSettingsCtx.value()] = getBestMatchAutoUpdateParameters(bestMatchSettingsCtx.value()).value_or(doGetAllWritableMembers());
+                _autoUpdateParameters[bestMatchSettingsCtx.value()] = getBestMatchAutoUpdateParameters(bestMatchSettingsCtx.value()).value_or(_descriptor->writableMembers);
             }
             const std::set<std::string>& currentAutoUpdateParams = _autoUpdateParameters.at(bestMatchSettingsCtx.value());
 
@@ -177,7 +209,7 @@ std::optional<SettingsCtx> CtxSettingsBase::activateContextImpl(SettingsCtx ctx)
                 }
             }
 
-            std::ignore = doSetStagedImpl(std::move(notAutoUpdateParams));
+            std::ignore = setStagedImpl(std::move(notAutoUpdateParams));
             _activeCtx  = bestMatchSettingsCtx.value();
             setChanged(true);
         }
@@ -362,7 +394,7 @@ void CtxSettingsBase::resolveDuplicateTimestamp(SettingsCtx& ctx) {
 
 void CtxSettingsBase::addStoredParameters(const property_map& newParameters, const SettingsCtx& ctx) {
     if (!_autoUpdateParameters.contains(ctx)) {
-        _autoUpdateParameters[ctx] = getBestMatchAutoUpdateParameters(ctx).value_or(doGetAllWritableMembers());
+        _autoUpdateParameters[ctx] = getBestMatchAutoUpdateParameters(ctx).value_or(_descriptor->writableMembers);
     }
 
     std::vector<CtxSettingsPair>& sortedVectorForContext = _storedParameters[ctx.context];
@@ -456,6 +488,326 @@ std::optional<SettingsCtx> CtxSettingsBase::createSettingsCtxFromTag(const Tag& 
         return ctx;
     } else {
         return std::nullopt;
+    }
+}
+
+void CtxSettingsBase::init() {
+    const settings::BlockHooks& hooks = _descriptor->hooks;
+
+    if (hooks.reflectable && hooks.metaInformation != nullptr) {
+        property_map& metaInformation = hooks.metaInformation(_block);
+
+        if (hooks.blockDescription != nullptr) {
+            metaInformation["description"] = std::string(hooks.blockDescription(_block));
+        }
+
+        // handle meta-information for UI and other non-processing-related purposes
+        for (const settings::MemberDescriptor& member : hooks.members) {
+            const std::string memberName = std::string(member.name);
+
+            if (member.isEnum) {
+                std::vector<std::string> enumValues;
+                enumValues.reserve(member.enumValueNames.size());
+                for (std::string_view enumValueName : member.enumValueNames) {
+                    if (!enumValueName.empty()) {
+                        enumValues.emplace_back(enumValueName);
+                    }
+                }
+                metaInformation[convert_string_domain(memberName) + "::enum_values"] = enumValues;
+                metaInformation[convert_string_domain(memberName) + "::enum_type"]   = member.enumTypeName();
+            }
+
+            if (member.isAnnotated) {
+                metaInformation[convert_string_domain(memberName) + "::description"]   = std::string(member.description);
+                metaInformation[convert_string_domain(memberName) + "::documentation"] = std::string(member.documentation);
+                metaInformation[convert_string_domain(memberName) + "::unit"]          = std::string(member.unit);
+                metaInformation[convert_string_domain(memberName) + "::visible"]       = member.visible;
+            }
+        }
+    }
+
+    storeDefaults();
+
+    if (const property_map failed = set(_initBlockParameters); !failed.empty()) {
+        throw gr::exception(std::format("settings could not be applied: {}", failed));
+    }
+
+    if (const auto failed = activateContext(); failed == std::nullopt) {
+        throw gr::exception("Settings for context could not be activated");
+    }
+}
+
+property_map CtxSettingsBase::set(const property_map& parameters, SettingsCtx ctx) {
+    std::lock_guard lg(_mutex);
+    return setImpl(parameters, ctx);
+}
+
+property_map CtxSettingsBase::setImpl(const property_map& parameters, SettingsCtx ctx) {
+    const settings::BlockHooks& hooks = _descriptor->hooks;
+
+    property_map ret;
+    if (hooks.reflectable) {
+        if (ctx.time == 0ULL) {
+            ctx.time = settings::convertTimePointToUint64Ns(std::chrono::system_clock::now());
+        }
+#ifdef __EMSCRIPTEN__
+        resolveDuplicateTimestamp(ctx);
+#endif
+        // initialize with empty property_map when best match parameters not found
+        property_map newParameters = getBestMatchStoredParameters(ctx).value_or(_defaultParameters);
+        if (!_autoUpdateParameters.contains(ctx)) {
+            _autoUpdateParameters[ctx] = getBestMatchAutoUpdateParameters(ctx).value_or(_descriptor->writableMembers);
+        }
+        auto& currentAutoUpdateParameters = _autoUpdateParameters[ctx];
+
+        for (const auto& [key, value] : parameters) {
+            if (value.is_monostate()) {
+                continue;
+            }
+
+            auto it = _descriptor->writableByName.find(key);
+            if (it != _descriptor->writableByName.end()) {
+                if (auto error = it->second->setParameter(key, value, newParameters)) {
+                    throw gr::exception(*error);
+                }
+                // Remove from auto-update set if present
+                if (auto autoIt = currentAutoUpdateParameters.find(std::string(key)); autoIt != currentAutoUpdateParameters.end()) {
+                    currentAutoUpdateParameters.erase(autoIt);
+                }
+            } else {
+                ret.insert_or_assign(key, value);
+            }
+        }
+        addStoredParameters(newParameters, ctx);
+        removeExpiredStoredParameters();
+    }
+
+    // copy items that could not be matched to the node's meta_information map (if available)
+    if (hooks.metaInformation != nullptr) {
+        updateMaps(ret, hooks.metaInformation(_block));
+    }
+
+    return ret; // N.B. returns those <key:value> parameters that could not be set
+}
+
+property_map CtxSettingsBase::setStagedImpl(const property_map& parameters) {
+    property_map ret;
+    if (_descriptor->hooks.reflectable) {
+        for (const auto& [key, value] : parameters) {
+            auto it = _descriptor->writableByName.find(key);
+            if (it != _descriptor->writableByName.end()) {
+                if (auto error = it->second->setParameter(key, value, _stagedParameters)) {
+                    throw gr::exception(*error);
+                }
+            } else {
+                ret.insert_or_assign(key, value);
+            }
+        }
+    }
+    if (!_stagedParameters.empty()) {
+        setChanged(true);
+    }
+    return ret;
+}
+
+void CtxSettingsBase::storeDefaults() { storeCurrentParameters(_defaultParameters); }
+
+void CtxSettingsBase::resetDefaults() {
+    std::lock_guard lg(_mutex);
+    resetDefaultsImpl();
+}
+
+void CtxSettingsBase::resetDefaultsImpl() {
+    // add default parameters to stored and apply the parameters
+    auto ctx = SettingsCtx{settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), std::string()};
+#ifdef __EMSCRIPTEN__
+    resolveDuplicateTimestamp(ctx);
+#endif
+    addStoredParameters(_defaultParameters, ctx);
+    std::ignore = activateContextImpl({});
+    std::ignore = applyStagedParametersImpl();
+
+    removeExpiredStoredParameters();
+
+    if (_descriptor->hooks.reset != nullptr) {
+        _descriptor->hooks.reset(_block);
+    }
+}
+
+void CtxSettingsBase::autoUpdate(const Tag& tag) {
+    if (!_descriptor->hooks.reflectable) {
+        return;
+    }
+    std::lock_guard lg(_mutex);
+    const auto      tagCtx      = createSettingsCtxFromTag(tag);
+    const auto      previousCtx = _activeCtx; // capture before activateContext may change it
+
+    SettingsCtx ctx;
+    if (tagCtx != std::nullopt) {
+        const auto bestMatchSettingsCtx = activateContextImpl(tagCtx.value());
+        if (bestMatchSettingsCtx == std::nullopt) {
+            ctx = _activeCtx;
+        } else {
+            ctx = bestMatchSettingsCtx.value();
+        }
+    } else {
+        ctx = _activeCtx;
+    }
+
+    const bool activeCtxChanged = previousCtx != ctx;
+
+    // fuzzy-match auto-update parameters (exact lookup may fail due to timestamp mismatch)
+    if (!_autoUpdateParameters.contains(ctx)) {
+        _autoUpdateParameters[ctx] = getBestMatchAutoUpdateParameters(ctx).value_or(_descriptor->writableMembers);
+    }
+    auto& autoUpdateParams = _autoUpdateParameters[ctx];
+
+    const auto& parameters = tag.map;
+    bool        wasChanged = false;
+    for (const auto& [key, value] : parameters) {
+        auto it = _descriptor->writableByName.find(key);
+        if (it != _descriptor->writableByName.end() && (activeCtxChanged || !isActiveValueImpl(key, value))) {
+            if (it->second->autoUpdate(key, value, autoUpdateParams, _stagedParameters)) {
+                wasChanged = true;
+            }
+        }
+    }
+
+    if (tagCtx == std::nullopt && !wasChanged && _stagedParameters.empty()) {
+        setChanged(false);
+    } else if (activeCtxChanged || wasChanged) {
+        setChanged(true);
+    }
+}
+
+ApplyStagedParametersResult CtxSettingsBase::applyStagedParameters() {
+    std::unique_lock lock(_mutex);
+    return applyStagedParametersImpl(&lock);
+}
+
+ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::unique_lock<std::mutex>* reentrantLock) {
+    const settings::BlockHooks& hooks = _descriptor->hooks;
+
+    ApplyStagedParametersResult result;
+    if (hooks.reflectable) {
+        // prepare old settings if required
+        const bool   hasSettingsChangedCallback = hooks.settingsChanged != nullptr;
+        property_map oldSettings;
+        if (hasSettingsChangedCallback) {
+            storeCurrentParameters(oldSettings);
+        }
+
+        // The batch is moved out of the shared map before anything below can release the lock. A
+        // setStaged() call that arrives during the settingsChanged() window then stages for the
+        // next apply instead of being cleared with this one, and a concurrent apply takes an empty
+        // map rather than repeating this batch.
+        const property_map batch = std::exchange(_stagedParameters, {});
+
+        // check if reset of settings should be performed
+        if (batch.contains(static_cast<std::pmr::string>(gr::tag::RESET_DEFAULTS))) {
+            resetDefaultsImpl();
+        }
+
+        property_map staged;
+        for (const auto& [key, stagedValue] : batch) {
+            auto it = _descriptor->writableByName.find(key);
+            if (it != _descriptor->writableByName.end()) {
+                if (!it->second->applyStaged(_block, key, stagedValue, result.appliedParameters, staged, hasSettingsChangedCallback)) {
+                    result.failedParameters.insert_or_assign(key, stagedValue); // rejected: must not reach downstream blocks
+                    continue;
+                }
+                if (_autoForwardParameters.contains(std::string(key))) {
+                    result.forwardParameters.insert_or_assign(key, stagedValue);
+                }
+            }
+        }
+
+        updateActiveParametersImpl();
+
+        // invoke user-callback function if staged is not empty; oldSettings, staged and result are local
+        // copies, so the callback may read or write settings() without _mutex being held across it
+        if (!staged.empty()) {
+            if (reentrantLock != nullptr) {
+                reentrantLock->unlock();
+            }
+            hooks.settingsChanged(_block, oldSettings, staged, result.forwardParameters);
+            if (reentrantLock != nullptr) {
+                reentrantLock->lock();
+            }
+        }
+
+        updateActiveParametersImpl();
+
+        // the settings keep the input rate; only the forwarded value carries the block's output rate
+        if (hooks.chunkRatio != nullptr && result.forwardParameters.contains(gr::tag::SAMPLE_RATE.shortKey())) {
+            float ratio = 1.0f;
+            if (hooks.chunkRatio(_block, ratio)) {
+                const auto activeIt = _activeParameters.find(gr::tag::SAMPLE_RATE.shortKey());
+                // a sample_rate that is not a float (e.g. loaded as double from a GRC file) must not be dereferenced blindly
+                const float* activeSampleRate = activeIt != _activeParameters.end() ? activeIt->second.get_if<float>() : nullptr;
+                if (activeSampleRate != nullptr) {
+                    const float newSampleRate = ratio * (*activeSampleRate);
+                    result.forwardParameters.insert_or_assign(gr::tag::SAMPLE_RATE.shortKey(), newSampleRate);
+                }
+            }
+        }
+
+        if (batch.contains(static_cast<std::pmr::string>(gr::tag::STORE_DEFAULTS))) {
+            storeDefaults();
+        }
+
+        if (hooks.reset != nullptr && batch.contains(static_cast<std::pmr::string>(gr::tag::RESET_DEFAULTS))) {
+            hooks.reset(_block);
+        }
+    } else {
+        _stagedParameters.clear(); // a block with no reflectable members cannot apply these
+    }
+    // anything staged while the lock was released is work for the next apply, so the map reports
+    // unchanged only when it is empty
+    gr::atomic_ref(_changed).store_release(!_stagedParameters.empty());
+    return result;
+}
+
+void CtxSettingsBase::updateActiveParameters() noexcept {
+    if (!_descriptor->hooks.reflectable) {
+        return;
+    }
+    std::lock_guard lg(_mutex);
+    updateActiveParametersImpl();
+}
+
+void CtxSettingsBase::updateActiveParametersImpl() noexcept {
+    for (const settings::MemberDescriptor* member : _descriptor->readableMembers) {
+        member->readParameter(_block, member->name, _activeParameters);
+    }
+}
+
+void CtxSettingsBase::storeCurrentParameters(property_map& parameters) {
+    if (!_descriptor->hooks.reflectable) {
+        return;
+    }
+    for (const settings::MemberDescriptor* member : _descriptor->readableMembers) {
+        member->readParameter(_block, member->name, parameters);
+    }
+}
+
+void CtxSettingsBase::loadParametersFromPropertyMap(const property_map& parameters, SettingsCtx ctx) {
+    std::lock_guard lg(_mutex);
+    property_map    newProperties;
+
+    for (const auto& [key, value] : parameters) {
+        if (_descriptor->writableByName.contains(key)) {
+            newProperties[key] = value;
+        } else {
+            auto str = ctx.context.value_or(std::string_view{});
+            if (str.empty() && _descriptor->hooks.metaInformation != nullptr) { // store meta_information only for default
+                _descriptor->hooks.metaInformation(_block)[key] = value;
+            }
+        }
+    }
+
+    if (const property_map failed = setImpl(newProperties, ctx); !failed.empty()) {
+        throw gr::exception(std::format("settings from property_map could not be loaded: {}", failed));
     }
 }
 
