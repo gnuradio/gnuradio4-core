@@ -302,7 +302,6 @@ struct FusedRun : BlockModel {
     std::shared_ptr<gr::Sequence>         _progress;
     std::string                           _name;
     std::string                           _uniqueName;
-    std::string                           _typeName = "gr::fusion::FusedRun";
 
     std::size_t                              _chunkSamples;
     std::size_t                              _quantum;
@@ -318,7 +317,7 @@ struct FusedRun : BlockModel {
     std::size_t         _activeLast   = 0UZ;
     bool                _ratioLatched = false;
 
-    explicit FusedRun(const RunPlan& plan, std::shared_ptr<gr::Sequence> progress) : _members(plan.members), _stages(plan.stages), _progress(std::move(progress)) {
+    explicit FusedRun(const RunPlan& plan, std::shared_ptr<gr::Sequence> progress) : BlockModel("gr::fusion::FusedRun"), _members(plan.members), _stages(plan.stages), _progress(std::move(progress)) {
         msgIn  = nullptr; // a run is never a graph member, so it is never wired into the message plane
         msgOut = nullptr;
 
@@ -432,7 +431,6 @@ struct FusedRun : BlockModel {
 
     [[nodiscard]] std::string_view name() const override { return _name; }
     [[nodiscard]] std::string_view uniqueName() const override { return _uniqueName; }
-    [[nodiscard]] std::string_view typeName() const override { return _typeName; }
     void                           setName(std::string name) noexcept override { _name = std::move(name); }
 
     [[nodiscard]] property_map&       metaInformation() noexcept override { return _members.front()->metaInformation(); }
@@ -470,9 +468,6 @@ struct FusedRun : BlockModel {
     [[nodiscard]] std::span<const Edge>                        edges() const noexcept override { return {}; }
 
     [[nodiscard]] void*                      raw() override { return nullptr; }
-    [[nodiscard]] gr::Graph*                 graph() override { return nullptr; }
-    [[nodiscard]] gr::property_map           exportedInputPorts() override { return {}; }
-    [[nodiscard]] gr::property_map           exportedOutputPorts() override { return {}; }
     [[nodiscard]] std::expected<void, Error> exportPort(bool, std::string_view, PortDirection, std::string_view, std::string_view, std::source_location location = std::source_location::current()) override { return std::unexpected(Error("a fused run does not export ports", location)); }
 
     [[nodiscard]] bool isRatioLatched() const noexcept { return _ratioLatched; }

@@ -5,6 +5,17 @@
 #include <gnuradio-4.0/PluginLoader.hpp>
 
 namespace gr {
+
+std::string_view BlockModel::typeName() const { return _typeName; }
+
+gr::Graph* BlockModel::graph() { return nullptr; }
+
+gr::property_map BlockModel::exportedInputPorts() { return {}; }
+
+gr::property_map BlockModel::exportedOutputPorts() { return {}; }
+
+std::expected<void, Error> BlockModel::exportPort(bool, std::string_view, PortDirection, std::string_view, std::string_view, std::source_location) { return {}; }
+
 property_map serializeBlockImpl(gr::PluginLoader& pluginLoader, const std::shared_ptr<BlockModel>& block, int flags) {
     using namespace std::string_literals;
 
