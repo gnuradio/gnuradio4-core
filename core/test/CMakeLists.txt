@@ -42,6 +42,7 @@ set(_CORE_TESTS
     qa_SchedulerLifecycle
     qa_Settings
     qa_SettingsConcurrency
+    qa_SettingsTable
     qa_TagForwarding
     qa_Tensor
     qa_TensorMath
