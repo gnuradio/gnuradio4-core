@@ -234,8 +234,11 @@ protected:
     DynamicPortsLoader     _dynamicPortsLoader;
     DynamicPorts           _dynamicInputPorts;
     DynamicPorts           _dynamicOutputPorts;
+    std::string            _typeName;
 
     BlockModel() = default;
+
+    explicit BlockModel(std::string typeName) noexcept : _typeName(std::move(typeName)) {}
 
     [[nodiscard]] std::expected<gr::DynamicPort*, Error> dynamicPortFromName(DynamicPorts& what, std::string_view name, std::source_location location = std::source_location::current()) {
         initDynamicPorts();
@@ -455,9 +458,9 @@ public:
     [[nodiscard]] virtual std::string_view name() const = 0;
 
     /**
-     * @brief the type of the node as a string
+     * @brief the type of the node as a string, as the derived type named it on construction
      */
-    [[nodiscard]] virtual std::string_view typeName() const = 0;
+    [[nodiscard]] virtual std::string_view typeName() const;
 
     /**
      * @brief user-defined name
@@ -572,12 +575,14 @@ public:
 
     [[nodiscard]] virtual void* raw() = 0;
 
-    // Common interface between managed and unmanaged graphs
-    [[nodiscard]] virtual gr::Graph*       graph()               = 0;
-    [[nodiscard]] virtual gr::property_map exportedInputPorts()  = 0;
-    [[nodiscard]] virtual gr::property_map exportedOutputPorts() = 0;
+    // Common interface between managed and unmanaged graphs. A block that owns no sub-graph
+    // exports nothing and has no graph to hand out, which is the answer for every block but a
+    // GraphWrapper -- so it is given here once rather than stamped into every wrapper.
+    [[nodiscard]] virtual gr::Graph*       graph();
+    [[nodiscard]] virtual gr::property_map exportedInputPorts();
+    [[nodiscard]] virtual gr::property_map exportedOutputPorts();
 
-    [[nodiscard]] virtual std::expected<void, Error> exportPort(bool exportFlag, std::string_view uniqueBlockName, PortDirection portDirection, std::string_view portName, std::string_view exportedName, std::source_location location = std::source_location::current()) = 0;
+    [[nodiscard]] virtual std::expected<void, Error> exportPort(bool exportFlag, std::string_view uniqueBlockName, PortDirection portDirection, std::string_view portName, std::string_view exportedName, std::source_location location = std::source_location::current());
 };
 
 // two edges may name one and the same output port by index or by name, so differing
@@ -693,7 +698,6 @@ class BlockWrapper : public BlockModel {
 protected:
     static_assert(std::is_same_v<T, std::remove_reference_t<T>>);
     std::conditional_t<kOwning, T, T*> _block;
-    std::string                        _type_name = gr::meta::type_name<T>();
 
     void initMessagePorts() {
         msgIn  = std::addressof(blockRef().msgIn);
@@ -738,7 +742,7 @@ protected:
 public:
     explicit BlockWrapper(gr::property_map initParameter = {})
     requires(kOwning && std::is_constructible_v<T, property_map>)
-        : _block(std::move(initParameter)) {
+        : BlockModel(gr::meta::type_name<T>()), _block(std::move(initParameter)) {
         initMessagePorts();
         _dynamicPortsLoader.fn       = &BlockWrapper::blockWrapperDynamicPortsLoader;
         _dynamicPortsLoader.instance = this;
@@ -746,7 +750,7 @@ public:
 
     explicit BlockWrapper(T&& original)
     requires kOwning
-        : _block(std::move(original)) {
+        : BlockModel(gr::meta::type_name<T>()), _block(std::move(original)) {
         initMessagePorts();
         _dynamicPortsLoader.fn       = &BlockWrapper::blockWrapperDynamicPortsLoader;
         _dynamicPortsLoader.instance = this;
@@ -754,7 +758,7 @@ public:
 
     explicit BlockWrapper(T& ref)
     requires(!kOwning)
-        : _block(std::addressof(ref)) {
+        : BlockModel(gr::meta::type_name<T>()), _block(std::addressof(ref)) {
         initMessagePorts();
         _dynamicPortsLoader.fn       = &BlockWrapper::blockWrapperDynamicPortsLoader;
         _dynamicPortsLoader.instance = this;
@@ -864,7 +868,6 @@ public:
     [[nodiscard]] lifecycle::State           state() const noexcept override { return blockRef().state(); }
     [[nodiscard]] std::string_view           name() const override { return blockRef().name; }
     void                                     setName(std::string name) noexcept override { blockRef().name = std::move(name); }
-    [[nodiscard]] std::string_view           typeName() const override { return _type_name; }
     [[nodiscard]] property_map&              metaInformation() noexcept override { return blockRef().meta_information; } // TODO: to be removed (read-only)
     [[nodiscard]] const property_map&        metaInformation() const override { return blockRef().meta_information; }
     [[nodiscard]] property_map&              uiConstraints() noexcept override { return blockRef().ui_constraints; }
@@ -873,12 +876,6 @@ public:
     [[nodiscard]] SettingsBase&              settings() override { return blockRef().settings(); }
     [[nodiscard]] const SettingsBase&        settings() const override { return blockRef().settings(); }
     [[nodiscard]] void*                      raw() override { return std::addressof(blockRef()); }
-
-    // Common interface between managed and unmanaged graphs
-    [[nodiscard]] gr::Graph*                 graph() override { return nullptr; }
-    [[nodiscard]] gr::property_map           exportedInputPorts() override { return {}; }
-    [[nodiscard]] gr::property_map           exportedOutputPorts() override { return {}; }
-    [[nodiscard]] std::expected<void, Error> exportPort(bool, std::string_view, PortDirection, std::string_view, std::string_view, std::source_location = std::source_location::current()) override { return {}; }
 };
 
 namespace detail {
