@@ -170,6 +170,28 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
     };
 #endif
 
+    "an exported output with interior consumers feeds both sides of the boundary"_test = [] {
+        gr::Graph flow;
+        auto      wrapper   = std::make_shared<gr::GraphWrapper<gr::Graph>>();
+        auto&     inner     = *wrapper->graph();
+        auto&     producer  = inner.emplaceBlock<qa_edit::CountingSource>();
+        auto&     innerSink = inner.emplaceBlock<qa_edit::Sink>();
+        expect(inner.connect<"out", "in">(producer, innerSink).has_value());
+
+        const std::shared_ptr<gr::BlockModel>& subgraph = flow.addBlock(wrapper);
+        expect(wrapper->exportPort(true, producer.unique_name, gr::PortDirection::OUTPUT, "out", "out").has_value());
+        std::ignore = flow.emplaceBlock<qa_edit::Sink>();
+        expect(flow.connect(subgraph, gr::PortDefinition{"out"}, flow.blocks()[1], gr::PortDefinition{"in"}).has_value());
+
+        expect(flow.edges()[0].hasSameSourcePort(inner.edges()[0])) << "the exported alias and the interior edge reference the same port and must compare equal";
+
+        // the wiring order a scheduler uses: the top-level graph's edges, then the subgraph's
+        expect(flow.connectPendingEdges());
+        expect(inner.connectPendingEdges());
+
+        expect(eq(producer.out.nReaders(), 2UZ)) << "the boundary split the fan-out across two buffers, so one consumer starves";
+    };
+
     "a fan-out mixing typed and dynamic connects feeds every consumer"_test = [] {
         auto runMixedFanOut = [](bool typedFirst) {
             const std::string order = typedFirst ? "typed edge first" : "dynamic edge first";

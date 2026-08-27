@@ -768,7 +768,11 @@ public:
         if (sourcePort.typeName() != destinationPort.typeName()) {
             edge._state = Edge::EdgeState::IncompatiblePorts;
         } else {
-            const bool hasConnectedEdges = std::ranges::any_of(_edges, [&](const Edge& e) { return edge.hasSameSourcePort(e) && e._state == Edge::EdgeState::Connected; });
+            // the source port may already carry readers wired by another graph — a subgraph's
+            // exported port is connected from both sides of the boundary — and replacing its
+            // buffer would orphan them, so the port's own state decides, not this graph's edge
+            // list
+            const bool hasConnectedEdges = sourcePort.isConnected();
             bool       resizeResult      = true;
             if (!hasConnectedEdges) {
                 const std::size_t bufferSize = calculateStreamBufferSize(edge);
