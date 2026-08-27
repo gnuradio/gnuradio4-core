@@ -82,7 +82,7 @@ std::string commandName() noexcept {
     return std::string(gr::meta::enumName(command).value_or(""));
 }
 
-inline static const std::string defaultBlockProtocol  = "MDPW03";
+inline const std::string        defaultBlockProtocol  = "MDPW03";
 inline static const std::string defaultClientProtocol = "MDPC03";
 
 } // namespace message

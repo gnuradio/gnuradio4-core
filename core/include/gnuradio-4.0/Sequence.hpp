@@ -21,7 +21,7 @@ namespace gr {
 // consequently slow down execution
 #define forceinline inline __attribute__((always_inline))
 #endif
-static constexpr const std::size_t kInitialCursorValue = 0L;
+inline constexpr std::size_t kInitialCursorValue = 0L;
 
 /**
  * Concurrent sequence class used for tracking the progress of the ring buffer and event
