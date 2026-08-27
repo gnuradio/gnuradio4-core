@@ -2,6 +2,7 @@
 #define GNURADIO_GRAPH_UTILS_HPP
 
 #include <cassert>
+#include <cctype>
 #include <complex>
 #include <cstdint>
 #include <cxxabi.h>
@@ -581,7 +582,9 @@ template<typename T>
     return detail::makePortableTypeName(detail::local_type_name<T>());
 }
 
-inline std::string shorten_type_name(std::string_view name) {
+namespace detail {
+
+inline std::string shorten_qualified_name(std::string_view name) {
     using namespace std::string_view_literals;
 
     const bool hasLeading   = name.starts_with("::"sv);
@@ -620,6 +623,31 @@ inline std::string shorten_type_name(std::string_view name) {
         result += "::";
     }
 
+    return result;
+}
+
+} // namespace detail
+
+// shortens every qualified name in the string to the initials of its leading components plus
+// the final one, leaving template brackets and other separators in place — a templated name
+// is a sequence of qualified names, and shortening across its brackets scrambles it
+inline std::string shorten_type_name(std::string_view name) {
+    const auto isNamePart = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_' || c == ':'; };
+
+    std::string result;
+    std::size_t i = 0UZ;
+    while (i < name.size()) {
+        if (isNamePart(name[i])) {
+            std::size_t j = i;
+            while (j < name.size() && isNamePart(name[j])) {
+                ++j;
+            }
+            result += detail::shorten_qualified_name(name.substr(i, j - i));
+            i = j;
+        } else {
+            result += name[i++];
+        }
+    }
     return result;
 }
 
