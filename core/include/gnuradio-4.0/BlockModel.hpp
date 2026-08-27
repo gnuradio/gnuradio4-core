@@ -586,19 +586,22 @@ public:
     [[nodiscard]] virtual std::expected<void, Error> exportPort(bool exportFlag, std::string_view uniqueBlockName, PortDirection portDirection, std::string_view portName, std::string_view exportedName, std::source_location location = std::source_location::current());
 };
 
-// two edges may name one and the same output port by index or by name, so differing
-// PortDefinitions have to be resolved to port objects before they can be told apart
+// two edges may name one and the same output port by index, by name, or — across a subgraph
+// boundary — through the subgraph's exported alias of an interior port, so differing
+// PortDefinitions have to be resolved and compared by the port they reference: an exported
+// port is a distinct DynamicPort wrapping the same underlying port, which is what
+// DynamicPort's equality compares
 inline bool Edge::hasSameSourcePort(const Edge& other) const {
-    if (!_sourceBlock || _sourceBlock != other._sourceBlock) {
+    if (!_sourceBlock || !other._sourceBlock) {
         return false;
     }
-    if (_sourcePortDefinition.definition == other._sourcePortDefinition.definition) {
+    if (_sourceBlock == other._sourceBlock && _sourcePortDefinition.definition == other._sourcePortDefinition.definition) {
         return true;
     }
 
     const auto port      = _sourceBlock->dynamicOutputPort(_sourcePortDefinition);
     const auto otherPort = other._sourceBlock->dynamicOutputPort(other._sourcePortDefinition);
-    return port.has_value() && otherPort.has_value() && port.value() == otherPort.value();
+    return port.has_value() && otherPort.has_value() && *port.value() == *otherPort.value();
 }
 
 namespace serialization_fields {
