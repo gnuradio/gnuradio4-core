@@ -436,26 +436,9 @@ public:
             return *result;
         }
 
-#ifndef NDEBUG
-        std::print("Available blocks in the registry\n");
-        for (const auto& block : _registry->keys()) {
-            std::print("    {}\n", block);
-        }
-        std::print("]\n");
-
-        std::print("Available blocks from plugins [\n");
-        for (const auto& [blockName, _] : _pluginForBlockName) {
-            std::print("    {}\n", blockName);
-        }
-        std::print("]\n");
-
-        std::print("Available YAML definitions[\n");
-        for (const auto& [blockName, _] : _yamlRegistry._definitionForBlockName) {
-            std::print("    {}\n", blockName);
-        }
-        std::print("]\n");
-#endif
-        std::print("Error: Plugin not found for '{}', returning nullptr.\n", name);
+        // a miss is an ordinary probe result (block, scheduler and YAML lookups are tried in
+        // sequence): the null return is the signal, and the caller that treats it as terminal
+        // reports it together with what was requested
         return {};
     }
 
@@ -467,20 +450,7 @@ public:
         auto* plugin = pluginForSchedulerName(name);
 
         if (plugin == nullptr) {
-#ifndef NDEBUG
-            std::println("Could not find scheduler {}. Available schedulers in the registry", name);
-            for (const auto& scheduler : _schedulerRegistry->keys()) {
-                std::print("    {}\n", scheduler);
-            }
-            std::print("]\n");
-
-            std::print("Available schedulers from plugins [\n");
-            for (const auto& [schedulerName, _] : _pluginForSchedulerName) {
-                std::print("    {}\n", schedulerName);
-            }
-            std::print("]\n");
-#endif
-            std::print("Error: Scheduler plugin not found for '{}', returning nullptr.\n", name);
+            // a miss is an ordinary probe result, as for instantiate() above
             return {};
         }
 
