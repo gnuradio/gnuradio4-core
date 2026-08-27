@@ -851,6 +851,39 @@ public:
                 allConnected = allConnected && wasConnected;
             }
         }
+
+        // an unconnected optional synchronous output is still written by processBulk, whose
+        // item sizing may include it, yet only connected ports are resized to their edge
+        // size: left at the default capacity, a span request beyond that capacity returns an
+        // empty span in a release build with nothing signaled, silently throttling the block
+        // to zero — so it is sized with the block's largest connected output
+        for (auto& block : _blocks) {
+            auto forEachOutputPort = [&block](auto&& fn) {
+                for (auto& portOrCollection : block->dynamicOutputPorts()) {
+                    if (auto* port = std::get_if<gr::DynamicPort>(&portOrCollection)) {
+                        fn(*port);
+                    } else {
+                        for (auto& collectionPort : std::get<BlockModel::NamedPortCollection>(portOrCollection).ports) {
+                            fn(collectionPort);
+                        }
+                    }
+                }
+            };
+            std::size_t maxConnectedSize = 0UZ;
+            forEachOutputPort([&maxConnectedSize](gr::DynamicPort& port) {
+                if (port.isConnected()) {
+                    maxConnectedSize = std::max(maxConnectedSize, port.bufferSize());
+                }
+            });
+            if (maxConnectedSize == 0UZ) {
+                continue;
+            }
+            forEachOutputPort([maxConnectedSize](gr::DynamicPort& port) {
+                if (!port.isConnected() && port.isSynchronous() && port.isOptional() && port.bufferSize() < maxConnectedSize) {
+                    std::ignore = port.resizeBuffer(maxConnectedSize);
+                }
+            });
+        }
         return allConnected;
     }
 };
