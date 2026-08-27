@@ -6,6 +6,12 @@ project(
   LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# No target in this tree declares a C++20 module, so dependency scanning would only add a preprocessor pass per
+# translation unit and a dynamic-dependency file per object. This records the tree's current state, not a policy: the
+# scan is what discovers module interfaces, so a target that declares a module cannot build while it is off. Delete this
+# line the day one does.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 set(GR4_PKG_VERSION
