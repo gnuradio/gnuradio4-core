@@ -60,6 +60,20 @@ struct Sink : gr::Block<Sink> {
     void processOne(float) { _nReceived++; }
 };
 
+// one connected and one deliberately unconnected optional output
+struct DualSource : gr::Block<DualSource> {
+    gr::PortOut<float>               out;
+    gr::PortOut<float, gr::Optional> monitor;
+
+    GR_MAKE_REFLECTABLE(DualSource, out, monitor);
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan, gr::OutputSpanLike auto& monitorSpan) {
+        outSpan.publish(0UZ);
+        monitorSpan.publish(0UZ);
+        return gr::work::Status::DONE;
+    }
+};
+
 // resolvable only through a test-local registry, never the global one, so a lookup that
 // succeeds proves which loader served it
 struct LoaderCanary : gr::Block<LoaderCanary> {
@@ -190,6 +204,15 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(inner.connectPendingEdges());
 
         expect(eq(producer.out.nReaders(), 2UZ)) << "the boundary split the fan-out across two buffers, so one consumer starves";
+    };
+
+    "an unconnected optional output is sized with its connected sibling"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_edit::DualSource>();
+        auto&     sink   = flow.emplaceBlock<qa_edit::Sink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+        expect(flow.connectPendingEdges());
+        expect(eq(source.monitor.bufferSize(), source.out.bufferSize())) << "a span request past the default capacity returns empty with nothing signaled";
     };
 
     "a fan-out mixing typed and dynamic connects feeds every consumer"_test = [] {
