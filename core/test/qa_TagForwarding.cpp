@@ -183,6 +183,32 @@ struct FixedChunk : Block<FixedChunk, ForwardTagPropagation, Resampling<kChunk, 
     }
 };
 
+/// a fixed-chunk copier whose trailing samples arrive through processEpilogue
+struct EpilogueChunk : Block<EpilogueChunk, ForwardTagPropagation, Resampling<kChunk, kChunk, true>> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(EpilogueChunk, in, out);
+
+    std::size_t epilogueRuns = 0UZ;
+
+    work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
+        const std::size_t n = std::min(inSpan.size(), outSpan.size());
+        std::ranges::copy(inSpan | std::views::take(n), outSpan.begin());
+        std::ignore = inSpan.consume(n);
+        outSpan.publish(n);
+        return work::Status::OK;
+    }
+
+    work::Status processEpilogue(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
+        ++epilogueRuns;
+        const std::size_t n = std::min(inSpan.size(), outSpan.size());
+        std::ranges::copy(inSpan | std::views::take(n), outSpan.begin());
+        outSpan.publish(n);
+        return work::Status::OK;
+    }
+};
+
 /// the rate-changing shape: its own forwardTags() maps each tag to the output offset the rate change puts it at
 struct MappedForwarder : Block<MappedForwarder, Resampling<kDecim, 1U, true>> {
     PortIn<float>  in;
@@ -341,6 +367,25 @@ const boost::ut::suite<"tag forwarding"> _tagForwarding = [] {
 
         expect(lt(backwardIndex, kWindowOutput)) << "the tag must land on an output sample the chunk holding it produced";
         expect(ge(defaultIndex, kWindowOutput)) << "the default forwarder reads only tags(1), so it first sees the tag one chunk later";
+    };
+
+    "tags ride the tail through processEpilogue"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<Source>(gr::property_map{{"name", std::string("src")}});
+        source.nTotal    = 62UZ; // seven full chunks of kChunk, then a six-sample tail
+        source.tagAt     = {56UZ, 60UZ};
+        auto& middle     = flow.emplaceBlock<EpilogueChunk>(gr::property_map{{"name", std::string("mid")}});
+        auto& sink       = flow.emplaceBlock<Sink>(gr::property_map{{"name", std::string("snk")}});
+        expect(flow.connect<"out", "in">(source, middle).has_value());
+        expect(flow.connect<"out", "in">(middle, sink).has_value());
+
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(scheduler.runAndWait().has_value());
+
+        expect(eq(middle.epilogueRuns, 1UZ)) << "the tail did not go through the epilogue, so this test discriminates nothing";
+        expect(eq(countNamed(sink.tags, "t56"), 1UZ)) << "the tag at the tail's first sample was dropped";
+        expect(eq(countNamed(sink.tags, "t60"), 1UZ)) << "the tag interior to the tail was dropped";
     };
 
     "a fixed-chunk block defers every tag that is not at its chunk boundary"_test = [&] {
