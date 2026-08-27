@@ -495,6 +495,20 @@ std::optional<Message> BlockBase::propertyCallbackSubgraphExport([[maybe_unused]
     return std::nullopt;
 }
 
+namespace detail {
+
+Error primePortNotIdleError(std::size_t portIdx, std::size_t nSamples, std::source_location loc) { return Error(std::format("primePort({}, {}) - block must not be in RUNNING state", portIdx, nSamples), loc); }
+
+Error primePortIndexError(std::size_t portIdx, std::size_t nSamples, std::size_t nPorts, std::source_location loc) { return Error(std::format("primePort({}, {}) failed: portIdx out of range [0, {}]", portIdx, nSamples, nPorts), loc); }
+
+Error primePortUnexpectedError(std::size_t portIdx, std::size_t nSamples, std::source_location loc) { return Error(std::format("primePort({}, {}) - unexpected failure", portIdx, nSamples), loc); }
+
+Error primePortUnconnectedError(std::size_t portIdx, std::size_t nSamples, std::string_view portName, std::source_location loc) { return Error(std::format("primePort({}, {}) - port {} ({}) is not connected", portIdx, nSamples, portIdx, portName), loc); }
+
+Error primePortSampleCountError(std::size_t portIdx, std::size_t nRequested, std::size_t nPublished, std::source_location loc) { return Error(std::format("primePort({}, {}) - failed requested {} and got {} samples", portIdx, nRequested, nRequested, nPublished), loc); }
+
+} // namespace detail
+
 // the settings thunks for Block<>'s own reflected members, declared at the end of Block.hpp
 // clang-format off
 #define X(kIdx) template void detail::readMember<block::detail::FrameworkMemberRaw<kIdx>, block::detail::FrameworkMemberType<kIdx>>(const void*, std::string_view, property_map&);

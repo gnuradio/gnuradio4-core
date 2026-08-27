@@ -165,6 +165,18 @@ requires(std::ranges::random_access_range<RangeA> && std::ranges::random_access_
     }
     return false;
 }
+/**
+ * primePort's diagnostics, compiled once rather than stamped per (block, direction, port type).
+ * None of the messages mentions the block or the port's value type, so the std::format calls --
+ * and, through the port name, the whole formatter and magic_enum tier behind them -- were pure
+ * duplication in every translation unit that named a block.
+ */
+Error primePortNotIdleError(std::size_t portIdx, std::size_t nSamples, std::source_location loc);
+Error primePortIndexError(std::size_t portIdx, std::size_t nSamples, std::size_t nPorts, std::source_location loc);
+Error primePortUnexpectedError(std::size_t portIdx, std::size_t nSamples, std::source_location loc);
+Error primePortUnconnectedError(std::size_t portIdx, std::size_t nSamples, std::string_view portName, std::source_location loc);
+Error primePortSampleCountError(std::size_t portIdx, std::size_t nRequested, std::size_t nPublished, std::source_location loc);
+
 } // namespace detail
 
 template<typename Derived, PortDirection portDirection, PortType portType>
@@ -331,7 +343,7 @@ public:
     std::expected<std::size_t, gr::Error> primePort(std::size_t portIdx, std::size_t nSamples, std::source_location loc = std::source_location::current()) noexcept {
         if constexpr (requires { _self.state(); }) {
             if (_self.state() == lifecycle::State::RUNNING) {
-                return std::unexpected(Error(std::format("primePort({}, {}) - block must not be in RUNNING state", portIdx, nSamples), loc));
+                return std::unexpected(detail::primePortNotIdleError(portIdx, nSamples, loc));
             }
         }
         if (nSamples == 0UZ) {
@@ -342,10 +354,10 @@ public:
             updateConfig();
         }
         if (portIdx >= _types.size()) {
-            return std::unexpected(Error(std::format("primePort({}, {}) failed: portIdx out of range [0, {}]", portIdx, nSamples, _types.size()), loc));
+            return std::unexpected(detail::primePortIndexError(portIdx, nSamples, _types.size(), loc));
         }
 
-        std::expected<std::size_t, gr::Error> result = std::unexpected(Error(std::format("primePort({}, {}) - unexpected failure", portIdx, nSamples), loc));
+        std::expected<std::size_t, gr::Error> result = std::unexpected(detail::primePortUnexpectedError(portIdx, nSamples, loc));
 
         std::size_t idx        = 0UZ;
         auto        primerFunc = [&result, &loc, &idx, &portIdx, &nSamples](PortLike auto& port) {
@@ -354,7 +366,7 @@ public:
             }
 
             if (!port.isConnected()) {
-                result = std::unexpected(gr::Error(std::format("primePort({}, {}) - port {} ({}) is not connected", portIdx, nSamples, portIdx, port.metaInfo.name), loc));
+                result = std::unexpected(detail::primePortUnconnectedError(portIdx, nSamples, std::string_view(port.metaInfo.name), loc));
                 return;
             }
 
@@ -365,7 +377,7 @@ public:
             // prime port
             auto publishSamples = [&result, &loc, &portIdx](WriterSpanLike auto& publishSpan, std::size_t nRequested) {
                 if (publishSpan.size() < nRequested) {
-                    result = std::unexpected(gr::Error(std::format("primePort({}, {}) - failed requested {} and got {} samples", portIdx, nRequested, nRequested, publishSpan.size()), loc));
+                    result = std::unexpected(detail::primePortSampleCountError(portIdx, nRequested, publishSpan.size(), loc));
                     return;
                 }
                 using T = typename std::remove_reference_t<decltype(port)>::value_type;
@@ -391,12 +403,12 @@ public:
 
             if constexpr (portDirection == PortDirection::INPUT) {
                 if (availableAfter - availableBefore != nSamples) {
-                    result = std::unexpected(gr::Error(std::format("primePort({}, {}) - failed requested {} and got {} samples", portIdx, nSamples, nSamples, availableAfter - availableBefore), loc));
+                    result = std::unexpected(detail::primePortSampleCountError(portIdx, nSamples, availableAfter - availableBefore, loc));
                     return;
                 }
             } else { // N.B. available decreases on output ports
                 if (availableBefore - availableAfter != nSamples) {
-                    result = std::unexpected(gr::Error(std::format("primePort({}, {}) - failed requested {} and got {} samples", portIdx, nSamples, nSamples, availableBefore - availableAfter), loc));
+                    result = std::unexpected(detail::primePortSampleCountError(portIdx, nSamples, availableBefore - availableAfter, loc));
                     return;
                 }
             }
