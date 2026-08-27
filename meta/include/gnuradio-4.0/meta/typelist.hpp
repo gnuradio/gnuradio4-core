@@ -417,22 +417,19 @@ struct typelist {
     template<template<typename...> typename Pred>
     constexpr static bool none_of = (!Pred<Ts>::value && ...);
 
-    template<typename DefaultType>
-    using safe_head_default = std::remove_pointer_t<decltype([] {
-        if constexpr (sizeof...(Ts) > 0) {
-            return static_cast<this_t::at<0>*>(nullptr);
-        } else {
-            return static_cast<DefaultType*>(nullptr);
-        }
-    }())>;
+    template<bool NonEmpty, typename DefaultType, typename List>
+    struct safe_head_impl {
+        using type = DefaultType;
+    };
+    template<typename DefaultType, typename List>
+    struct safe_head_impl<true, DefaultType, List> {
+        using type = typename List::template at<0>;
+    };
 
-    using safe_head = std::remove_pointer_t<decltype([] {
-        if constexpr (sizeof...(Ts) > 0) {
-            return static_cast<this_t::at<0>*>(nullptr);
-        } else {
-            return static_cast<void*>(nullptr);
-        }
-    }())>;
+    template<typename DefaultType>
+    using safe_head_default = typename safe_head_impl<(sizeof...(Ts) > 0), DefaultType, this_t>::type;
+
+    using safe_head = typename safe_head_impl<(sizeof...(Ts) > 0), void, this_t>::type;
 
     template<typename Matcher = typename this_t::safe_head>
     constexpr static bool all_same = ((std::is_same_v<Matcher, Ts> && ...));
@@ -485,8 +482,11 @@ namespace detail {
 template<template<typename...> typename OtherTypelist, typename... Args>
 meta::typelist<Args...> to_typelist_helper(OtherTypelist<Args...>*);
 
+template<typename T, size_t>
+using repeat_type_for_index = T;
+
 template<typename T, size_t... Is>
-meta::typelist<std::remove_pointer_t<decltype([](size_t) -> std::add_pointer_t<T> { return nullptr; }(Is))>...> array_to_typelist_helper(std::index_sequence<Is...>);
+meta::typelist<repeat_type_for_index<T, Is>...> array_to_typelist_helper(std::index_sequence<Is...>);
 
 template<template<typename, size_t> typename ArrayLike, typename T, size_t N>
 decltype(array_to_typelist_helper<T>(std::make_index_sequence<N>())) to_typelist_helper(ArrayLike<T, N>*);

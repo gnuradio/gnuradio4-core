@@ -117,7 +117,7 @@ template<typename T, bool managed, std::size_t... Ex>
 struct TensorBase;
 
 template<typename T, std::size_t... Ex>
-inline static constexpr bool is_tensor = false;
+inline constexpr bool is_tensor = false;
 
 template<typename Tensor>
 struct tensor_traits {
