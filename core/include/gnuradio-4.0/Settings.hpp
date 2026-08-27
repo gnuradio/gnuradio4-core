@@ -235,9 +235,11 @@ template<typename T>
 
 namespace detail {
 // Free templates (not CtxSettings<TBlock>::) so the bodies instantiate once per Type
-// instead of once per (TBlock, Type).
+// instead of once per (TBlock, Type). Deliberately not `inline`: an explicit instantiation
+// declaration does not suppress the implicit instantiation of an inline function, and the
+// list at the end of this header exists to keep these bodies out of every block's TU.
 template<typename Type>
-inline std::optional<std::string> setParameterImpl(std::string_view key, const pmt::Value& value, property_map& newParameters) {
+std::optional<std::string> setParameterImpl(std::string_view key, const pmt::Value& value, property_map& newParameters) {
     if (auto convertedValue = settings::convertParameter<Type>(key, value); convertedValue) [[likely]] {
         const auto keyStr = std::pmr::string(key);
         if constexpr (detail::isEnumOrAnnotatedEnum<Type>) {
@@ -254,7 +256,7 @@ inline std::optional<std::string> setParameterImpl(std::string_view key, const p
 }
 
 template<typename Type>
-inline bool autoUpdateImpl(std::string_view key, const pmt::Value& value, const std::set<std::string>& autoUpdateParams, property_map& stagedParameters) {
+bool autoUpdateImpl(std::string_view key, const pmt::Value& value, const std::set<std::string>& autoUpdateParams, property_map& stagedParameters) {
     const auto keyStr = std::string(key);
     if (!autoUpdateParams.contains(keyStr)) {
         return false;
@@ -884,6 +886,49 @@ public:
 }; // class CtxSettings
 
 } // namespace gr
+
+/**
+ * The settings machinery a member contributes depends on the member's TYPE, never on the block
+ * declaring it, so the four leaves below are compiled once in Settings.cpp for the types the
+ * framework and the block library actually use. Every block reflects the eight members
+ * `Block<>` declares on its behalf, so without this list every block's translation unit paid
+ * for the bool/string/property_map/Size_t conversion tier again.
+ *
+ * The list is an optimisation, not a contract: a member of an unlisted type instantiates its
+ * leaves in the using translation unit exactly as before.
+ */
+// clang-format off
+#define GR_SETTINGS_MEMBER_TYPES \
+    X(bool)                      \
+    X(std::int8_t)               \
+    X(std::int16_t)              \
+    X(std::int32_t)              \
+    X(std::int64_t)              \
+    X(std::uint8_t)              \
+    X(std::uint16_t)             \
+    X(std::uint32_t)             \
+    X(std::uint64_t)             \
+    X(float)                     \
+    X(double)                    \
+    X(std::complex<float>)       \
+    X(std::complex<double>)      \
+    X(std::string)               \
+    X(std::pmr::string)          \
+    X(gr::property_map)
+
+namespace gr {
+
+#define X(T)                                                                                                                       \
+    extern template std::optional<std::string> detail::setParameterImpl<T>(std::string_view, const pmt::Value&, property_map&);     \
+    extern template bool detail::autoUpdateImpl<T>(std::string_view, const pmt::Value&, const std::set<std::string>&, property_map&); \
+    extern template std::expected<T, std::string> settings::convertParameter<T>(std::string_view, const pmt::Value&);               \
+    extern template std::expected<T, std::string> settings::extractStagedValue<T>(const pmt::Value&, std::string_view);
+
+GR_SETTINGS_MEMBER_TYPES
+#undef X
+
+} // namespace gr
+// clang-format on
 
 namespace std {
 template<>

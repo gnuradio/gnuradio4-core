@@ -811,4 +811,16 @@ void CtxSettingsBase::loadParametersFromPropertyMap(const property_map& paramete
     }
 }
 
+// the member-type leaves the declarations at the end of Settings.hpp promise
+// clang-format off
+#define X(T)                                                                                                                \
+    template std::optional<std::string> detail::setParameterImpl<T>(std::string_view, const pmt::Value&, property_map&);     \
+    template bool detail::autoUpdateImpl<T>(std::string_view, const pmt::Value&, const std::set<std::string>&, property_map&); \
+    template std::expected<T, std::string> settings::convertParameter<T>(std::string_view, const pmt::Value&);               \
+    template std::expected<T, std::string> settings::extractStagedValue<T>(const pmt::Value&, std::string_view);
+
+GR_SETTINGS_MEMBER_TYPES
+#undef X
+// clang-format on
+
 } // namespace gr
