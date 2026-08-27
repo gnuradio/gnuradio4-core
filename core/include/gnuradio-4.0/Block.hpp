@@ -1260,11 +1260,13 @@ public:
     /// unforwarded, so clamping it to offset 0 publishes it for the first time rather than a second. A forwardTags()
     /// override reading a wider window sees those tags twice and must skip relIndex < 0.
     template<typename TInputSpans, typename TOutputSpans>
-    void forwardInputTags(TInputSpans& inputSpans, TOutputSpans& outputSpans, std::size_t processedIn) noexcept {
+    void forwardInputTags(TInputSpans& inputSpans, TOutputSpans& outputSpans, std::size_t processedIn, std::optional<std::size_t> tagWindowOverride = {}) noexcept {
         if constexpr (noTagPropagation) {
             return;
         }
-        const std::size_t tagWindow = backwardTagPropagation ? processedIn : 1UZ;
+        // the override widens the window for the stream's final window, where no later chunk
+        // exists to retire a deferred interior tag
+        const std::size_t tagWindow = tagWindowOverride.value_or(backwardTagPropagation ? processedIn : 1UZ);
 
         std::optional<property_map> cachedSettings;
         auto                        filterAndSubstitute = [&](const property_map& src) { return filterAndSubstituteTag(src, cachedSettings); };
@@ -2228,6 +2230,19 @@ public:
                     const std::size_t epilogueOutSize = std::max<std::size_t>((input_chunk_size > 0) ? (trailing * output_chunk_size + input_chunk_size - 1) / input_chunk_size : trailing, output_chunk_size);
                     auto              epilogueIn      = prepareStreams(inputPorts<PortType::STREAM>(&self()), trailing);
                     auto              epilogueOut     = prepareStreams(outputPorts<PortType::STREAM>(&self()), epilogueOutSize);
+                    // tags ride the tail like any chunk's: the same settings-and-forward
+                    // sequence the ordinary path runs, with the whole trailing span as the
+                    // forward window because nothing after it can retire a deferred tag
+                    applyChangedSettings(true, &_pendingForwardParams);
+                    applyInputTagsAndSettings(epilogueIn, trailing, limits.hasAnyTag);
+                    if constexpr (requires { self().forwardTags(epilogueIn, epilogueOut, trailing); }) {
+                        self().forwardTags(epilogueIn, epilogueOut, trailing);
+                    } else {
+                        forwardInputTags(epilogueIn, epilogueOut, trailing, trailing);
+                    }
+                    if (!_pendingForwardParams.empty()) {
+                        for_each_writer_span([this](auto& out) { publishForwardParams(out, _pendingForwardParams); }, epilogueOut);
+                    }
                     invokeProcessEpilogue(epilogueIn, epilogueOut);
                     publishSamples(0UZ, epilogueOut); // publish only what the block explicitly requested via out.publish(n)
                     consumeReaders(trailing, epilogueIn);
