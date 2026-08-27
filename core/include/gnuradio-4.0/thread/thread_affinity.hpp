@@ -2,6 +2,7 @@
 #define THREADAFFINITY_HPP
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cstring>
 #include <format>
@@ -145,7 +146,13 @@ inline void setThreadName(const std::string_view& threadName, thread_type auto&.
     if (handle == 0U) {
         throw std::system_error(THREAD_UNINITIALISED, thread_exception(), std::format("setThreadName({}, thread_type)", threadName, detail::getThreadName(handle)));
     }
-    if (int rc = pthread_setname_np(handle, threadName.data()); rc < 0) {
+    // the kernel limit is 15 characters plus the terminator, so a longer name is truncated to
+    // let the rename succeed; the bounded copy also guarantees the NUL termination a
+    // string_view does not. pthread_setname_np reports failure as a positive errno, never a
+    // negative value.
+    std::array<char, THREAD_MAX_NAME_LENGTH> boundedName{};
+    threadName.copy(boundedName.data(), boundedName.size() - 1UZ);
+    if (const int rc = pthread_setname_np(handle, boundedName.data()); rc != 0) {
         throw std::system_error(rc, thread_exception(), std::format("setThreadName({},{}) - error code '{}'", threadName, detail::getThreadName(handle), rc));
     }
 }
