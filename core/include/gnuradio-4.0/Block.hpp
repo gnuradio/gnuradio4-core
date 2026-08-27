@@ -2855,6 +2855,60 @@ inline constexpr void for_each_port_and_reader_span(TFunction&& function, TPorts
 }
 } // namespace gr
 
+/**
+ * Every block reflects the members `Block<>` declares on its behalf before its own, so their
+ * settings thunks were stamped once per block type although the block never appears in them.
+ * Naming their types through a block that adds nothing of its own keeps the list in step with
+ * the GR_MAKE_REFLECTABLE above by construction; the static_asserts below fail loudly if a
+ * member is added, removed or changes its writability.
+ */
+namespace gr::block::detail {
+
+struct FrameworkMembersOnly : Block<FrameworkMembersOnly> {
+    GR_MAKE_REFLECTABLE(FrameworkMembersOnly);
+};
+
+inline constexpr std::size_t kFrameworkMemberCount = refl::data_member_count<FrameworkMembersOnly>;
+
+template<std::size_t kIdx>
+using FrameworkMemberRaw = std::remove_cvref_t<refl::data_member_type<FrameworkMembersOnly, kIdx>>;
+
+template<std::size_t kIdx>
+using FrameworkMemberType = unwrap_if_wrapped_t<FrameworkMemberRaw<kIdx>>;
+
+template<std::size_t kIdx>
+inline constexpr bool kFrameworkMemberIsReadable = settings::isReadableMember<FrameworkMemberType<kIdx>>();
+
+template<std::size_t kIdx>
+inline constexpr bool kFrameworkMemberIsWritable = settings::isWritableMember<FrameworkMemberType<kIdx>, refl::data_member_type<FrameworkMembersOnly, kIdx>>();
+
+} // namespace gr::block::detail
+
+// clang-format off
+#define GR_BLOCK_FRAMEWORK_READABLE_MEMBERS X(2) X(3) X(4) X(5) X(6) X(7)
+#define GR_BLOCK_FRAMEWORK_WRITABLE_MEMBERS X(3) X(4) X(6) X(7)
+
+namespace gr {
+
+static_assert(block::detail::kFrameworkMemberCount == 8UZ, "the framework member lists below no longer cover Block<>'s reflected members");
+
+#define X(kIdx)                                                                                                                                                          \
+    static_assert(block::detail::kFrameworkMemberIsReadable<kIdx>, "framework member " #kIdx " is listed as readable but no longer is");                                  \
+    extern template void detail::readMember<block::detail::FrameworkMemberRaw<kIdx>, block::detail::FrameworkMemberType<kIdx>>(const void*, std::string_view, property_map&);
+
+GR_BLOCK_FRAMEWORK_READABLE_MEMBERS
+#undef X
+
+#define X(kIdx)                                                                                                                                                          \
+    static_assert(block::detail::kFrameworkMemberIsWritable<kIdx>, "framework member " #kIdx " is listed as writable but no longer is");                                  \
+    extern template bool detail::applyStagedMember<block::detail::FrameworkMemberRaw<kIdx>, block::detail::FrameworkMemberType<kIdx>>(void*, std::string_view, const pmt::Value&, property_map&, property_map&, bool);
+
+GR_BLOCK_FRAMEWORK_WRITABLE_MEMBERS
+#undef X
+
+} // namespace gr
+// clang-format on
+
 template<>
 struct std::formatter<gr::work::Result, char> {
     constexpr auto parse(std::format_parse_context& ctx) {
