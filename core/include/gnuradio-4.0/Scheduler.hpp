@@ -1131,6 +1131,7 @@ protected:
 
         std::size_t lastProgress = _graph->_progress->value();
         std::size_t nWarnings    = 0;
+        std::size_t warnAt       = timeOut_count; // doubles after each warning, so a permanently stalled graph logs at a decaying rate instead of every period
         do {
             if (!sleepWhileCurrent(std::chrono::milliseconds(timeOut_ms))) {
                 return;
@@ -1142,13 +1143,15 @@ protected:
                 nWarnings++;
                 lastProgress = _graph->_progress->incrementAndGet(); // watchdog triggered manual update
                 _graph->_progress->notify_all();
-                if (nWarnings >= timeOut_count) {
+                if (nWarnings >= warnAt) {
                     std::println(stderr, "trigger watchdog update {} of {} in {}", nWarnings, timeOut_count, thisName);
                     // log or escalate (e.g., throw, abort, notify external watchdog)
+                    warnAt *= 2UZ;
                 }
             } else {
                 lastProgress = currentProgress;
                 nWarnings    = 0UZ;
+                warnAt       = timeOut_count;
             }
         } while (isCurrent() && _nRunningJobs->value() > 0UZ);
     }
