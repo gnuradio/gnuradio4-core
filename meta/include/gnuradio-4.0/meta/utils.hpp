@@ -628,8 +628,8 @@ struct message_type {};
 template<class... T>
 constexpr bool always_false = false;
 
-constexpr std::size_t invalid_index              = std::numeric_limits<std::size_t>::max();
-constexpr std::size_t default_message_port_index = std::numeric_limits<std::size_t>::max() - 1UZ;
+inline constexpr std::size_t invalid_index              = std::numeric_limits<std::size_t>::max();
+inline constexpr std::size_t default_message_port_index = std::numeric_limits<std::size_t>::max() - 1UZ;
 
 /**
  * T is tuple-like if it implements std::tuple_size, std::tuple_element, and std::get.

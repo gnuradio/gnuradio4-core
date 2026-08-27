@@ -38,18 +38,18 @@ using polymorphic_allocator = std::experimental::pmr::polymorphic_allocator<T>;
 
 #ifdef __NR_memfd_create
 namespace gr {
-static constexpr bool has_posix_mmap_interface = true;
+inline constexpr bool has_posix_mmap_interface = true;
 }
 
 #define HAS_POSIX_MAP_INTERFACE
 #else
 namespace gr {
-static constexpr bool has_posix_mmap_interface = false;
+inline constexpr bool has_posix_mmap_interface = false;
 }
 #endif
 #else // #if defined __has_include -- required for portability
 namespace gr {
-static constexpr bool has_posix_mmap_interface = false;
+inline constexpr bool has_posix_mmap_interface = false;
 }
 #endif
 

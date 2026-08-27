@@ -70,7 +70,7 @@ inline constexpr uint64_t convertTimePointToUint64Ns(const std::chrono::time_poi
     return static_cast<uint64_t>(ns);
 }
 
-static auto nullMatchPred = [](auto, auto, auto) { return std::nullopt; };
+inline auto nullMatchPred = [](auto, auto, auto) { return std::nullopt; };
 
 } // namespace settings
 
