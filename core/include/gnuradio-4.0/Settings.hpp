@@ -329,7 +329,7 @@ template<typename Type>
     } else if constexpr (meta::array_or_vector_type<Type>) {
         using TValue       = typename Type::value_type;
         using TTensorValue = std::conditional_t<std::is_same_v<std::string, TValue> || std::is_same_v<std::pmr::string, TValue>, pmt::Value, TValue>;
-        auto tensor        = checked_access_ptr{stagedValue.get_if<Tensor<TTensorValue>>()};
+        auto tensor        = checked_access_ptr<const Tensor<TTensorValue>, false>{stagedValue.get_if<Tensor<TTensorValue>>()};
         if (tensor != nullptr) {
             maybeValue = settings::convertParameter<Type>(key, stagedValue);
         } else {
@@ -337,7 +337,7 @@ template<typename Type>
         }
 #ifdef __EMSCRIPTEN__
     } else if constexpr (std::is_same_v<Type, std::size_t> && !std::is_same_v<std::size_t, gr::Size_t>) {
-        auto ptr = checked_access_ptr{stagedValue.get_if<gr::Size_t>()};
+        auto ptr = checked_access_ptr<const gr::Size_t, false>{stagedValue.get_if<gr::Size_t>()};
         if (ptr != nullptr) {
             maybeValue = static_cast<std::size_t>(*ptr);
         } else {
@@ -345,7 +345,7 @@ template<typename Type>
         }
 #endif
     } else {
-        auto ptr = checked_access_ptr{stagedValue.get_if<Type>()};
+        auto ptr = checked_access_ptr<const Type, false>{stagedValue.get_if<Type>()};
         if (ptr != nullptr) {
             maybeValue = *ptr;
         } else {
