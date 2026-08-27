@@ -202,6 +202,22 @@ struct RateStreamResult {
     return {middle.nSettingsChanged, middle.sample_rate.value};
 }
 
+[[nodiscard]] Decimator makeDecimator();
+
+const boost::ut::suite<"staged type refusals"> stagedRefusalTests = [] {
+    using namespace boost::ut;
+
+    // setStaged, set and the tag auto-update leaves each type-check before staging, so a
+    // wrong-typed value reaches the apply path only through the unchecked entrances (raw
+    // context activation of deserialized state). The extraction itself must therefore
+    // report the mismatch rather than terminate the process.
+    "a wrong-typed staged value yields an error, not termination"_test = [] {
+        const pmt::Value wrong{std::string("not a number")};
+        expect(!gr::settings::extractStagedValue<gr::Size_t>(wrong, "input_chunk_size").has_value()) << "scalar mismatch reports";
+        expect(!gr::settings::extractStagedValue<std::vector<float>>(wrong, "taps").has_value()) << "tensor mismatch reports";
+    };
+};
+
 [[nodiscard]] Decimator makeDecimator() {
     Decimator block;
     block.init(std::make_shared<gr::Sequence>());
