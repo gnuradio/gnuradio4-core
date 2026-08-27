@@ -370,13 +370,17 @@ void               reportConversionFailure(std::string_view key, std::string_vie
  * for readable ones.
  */
 struct MemberDescriptor {
+    using MemberAddress     = void* (*)(void* block);
     using ParameterSetter   = std::optional<std::string> (*)(std::string_view key, const pmt::Value& value, property_map& newParameters);
     using AutoUpdateHandler = bool (*)(std::string_view key, const pmt::Value& value, const std::set<std::string>& autoUpdateParams, property_map& stagedParameters);
-    using StagedApplier     = bool (*)(void* block, std::string_view key, const pmt::Value& stagedValue, property_map& appliedParameters, property_map& stagedForCallback, bool hasSettingsChangedCallback);
-    using ParameterReader   = void (*)(const void* block, std::string_view key, property_map& parameters);
+    using StagedApplier     = bool (*)(void* member, std::string_view key, const pmt::Value& stagedValue, property_map& appliedParameters, property_map& stagedForCallback, bool hasSettingsChangedCallback);
+    using ParameterReader   = void (*)(const void* member, std::string_view key, property_map& parameters);
     using TypeNameReader    = std::string (*)();
 
     std::string_view name{};
+
+    /// the block type's only per-member contribution: where the member sits inside the block
+    MemberAddress address{nullptr};
 
     ParameterSetter   setParameter{nullptr};
     AutoUpdateHandler autoUpdate{nullptr};
@@ -433,9 +437,17 @@ struct BlockDescriptor {
 
 namespace detail {
 
-template<typename TBlock, std::size_t kIdx, typename RawType, typename Type>
-bool applyStagedMember(void* block, std::string_view key, const pmt::Value& stagedValue, property_map& appliedParameters, property_map& stagedForCallback, bool hasSettingsChangedCallback) {
-    auto& member = refl::data_member<kIdx>(*static_cast<TBlock*>(block));
+/// the only thing a block type contributes per member: a pointer adjustment, reflected once.
+/// const-qualified reflected members are read-only by the writable-member gate, so no writer
+/// ever reaches this address and shedding the qualifier here cannot enable a mutation
+template<typename TBlock, std::size_t kIdx>
+void* memberAddress(void* block) {
+    return const_cast<void*>(static_cast<const void*>(std::addressof(refl::data_member<kIdx>(*static_cast<TBlock*>(block)))));
+}
+
+template<typename RawType, typename Type>
+bool applyStagedMember(void* memberPointer, std::string_view key, const pmt::Value& stagedValue, property_map& appliedParameters, property_map& stagedForCallback, bool hasSettingsChangedCallback) {
+    RawType& member = *static_cast<RawType*>(memberPointer);
 
     std::expected<Type, std::string> maybeValue = settings::extractStagedValue<Type>(stagedValue, key);
 
@@ -455,10 +467,10 @@ bool applyStagedMember(void* block, std::string_view key, const pmt::Value& stag
     }
 }
 
-template<typename TBlock, std::size_t kIdx, typename RawType, typename Type>
-void readMember(const void* block, std::string_view key, property_map& parameters) {
-    const auto  keyPmr = std::pmr::string(key);
-    const auto& member = refl::data_member<kIdx>(*static_cast<const TBlock*>(block));
+template<typename RawType, typename Type>
+void readMember(const void* memberPointer, std::string_view key, property_map& parameters) {
+    const auto     keyPmr = std::pmr::string(key);
+    const RawType& member = *static_cast<const RawType*>(memberPointer);
     if constexpr (detail::isEnumOrAnnotatedEnum<RawType>) {
         parameters.insert_or_assign(keyPmr, detail::enumToString(member));
     } else if constexpr (meta::array_or_vector_type<Type>) {
@@ -533,14 +545,15 @@ inline constexpr auto kMemberDescriptors = [] {
 
             MemberDescriptor& entry = table[kIdx];
             entry.name              = refl::data_member_name<TBlock, kIdx>.view();
+            entry.address           = &detail::memberAddress<TBlock, kIdx>;
 
             if constexpr (settings::isReadableMember<Type>()) {
-                entry.readParameter = &detail::readMember<TBlock, kIdx, RawType, Type>;
+                entry.readParameter = &detail::readMember<RawType, Type>;
             }
             if constexpr (settings::isWritableMember<Type, MemberType>()) {
                 entry.setParameter = &detail::setParameterImpl<Type>;
                 entry.autoUpdate   = &detail::autoUpdateImpl<Type>;
-                entry.applyStaged  = &detail::applyStagedMember<TBlock, kIdx, RawType, Type>;
+                entry.applyStaged  = &detail::applyStagedMember<RawType, Type>;
             }
             if constexpr (AnnotatedType<RawType>) {
                 entry.isAnnotated   = true;

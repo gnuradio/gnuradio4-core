@@ -712,7 +712,7 @@ ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::uniq
         for (const auto& [key, stagedValue] : batch) {
             auto it = _descriptor->writableByName.find(key);
             if (it != _descriptor->writableByName.end()) {
-                if (!it->second->applyStaged(_block, key, stagedValue, result.appliedParameters, staged, hasSettingsChangedCallback)) {
+                if (!it->second->applyStaged(it->second->address(_block), key, stagedValue, result.appliedParameters, staged, hasSettingsChangedCallback)) {
                     result.failedParameters.insert_or_assign(key, stagedValue); // rejected: must not reach downstream blocks
                     continue;
                 }
@@ -778,7 +778,7 @@ void CtxSettingsBase::updateActiveParameters() noexcept {
 
 void CtxSettingsBase::updateActiveParametersImpl() noexcept {
     for (const settings::MemberDescriptor* member : _descriptor->readableMembers) {
-        member->readParameter(_block, member->name, _activeParameters);
+        member->readParameter(member->address(_block), member->name, _activeParameters);
     }
 }
 
@@ -787,7 +787,7 @@ void CtxSettingsBase::storeCurrentParameters(property_map& parameters) {
         return;
     }
     for (const settings::MemberDescriptor* member : _descriptor->readableMembers) {
-        member->readParameter(_block, member->name, parameters);
+        member->readParameter(member->address(_block), member->name, parameters);
     }
 }
 

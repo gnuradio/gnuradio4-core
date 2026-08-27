@@ -495,4 +495,17 @@ std::optional<Message> BlockBase::propertyCallbackSubgraphExport([[maybe_unused]
     return std::nullopt;
 }
 
+// the settings thunks for Block<>'s own reflected members, declared at the end of Block.hpp
+// clang-format off
+#define X(kIdx) template void detail::readMember<block::detail::FrameworkMemberRaw<kIdx>, block::detail::FrameworkMemberType<kIdx>>(const void*, std::string_view, property_map&);
+
+GR_BLOCK_FRAMEWORK_READABLE_MEMBERS
+#undef X
+
+#define X(kIdx) template bool detail::applyStagedMember<block::detail::FrameworkMemberRaw<kIdx>, block::detail::FrameworkMemberType<kIdx>>(void*, std::string_view, const pmt::Value&, property_map&, property_map&, bool);
+
+GR_BLOCK_FRAMEWORK_WRITABLE_MEMBERS
+#undef X
+// clang-format on
+
 } // namespace gr
