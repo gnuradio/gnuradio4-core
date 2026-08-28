@@ -15,12 +15,14 @@ Graph::Graph(property_map settings) : gr::Block<Graph>(std::move(settings)), _pl
 
 [[maybe_unused]] std::shared_ptr<BlockModel> const& Graph::emplaceBlock(std::string_view type, property_map initialSettings) {
     if (type.starts_with("gr::Graph")) {
-        auto subGraphModel = std::unique_ptr<BlockModel>(std::make_unique<GraphWrapper<Graph>>().release());
+        // the nested graph inherits this graph's plugin loader, so blocks resolvable here stay
+        // resolvable inside the subgraph
+        auto subGraphModel = std::unique_ptr<BlockModel>(std::make_unique<GraphWrapper<Graph>>(Graph(*_pluginLoader, std::move(initialSettings))).release());
         return addBlock(std::move(subGraphModel));
-    } else if (std::shared_ptr<BlockModel> block_load = _pluginLoader->instantiate(type, std::move(initialSettings)); block_load) {
+    } else if (std::shared_ptr<BlockModel> block_load = _pluginLoader->instantiate(type, initialSettings); block_load) {
         const std::shared_ptr<BlockModel>& newBlock = addBlock(block_load);
         return newBlock;
-    } else if (std::shared_ptr<SchedulerModel> scheduler_load = _pluginLoader->instantiateScheduler(type, std::move(initialSettings)); scheduler_load) {
+    } else if (std::shared_ptr<SchedulerModel> scheduler_load = _pluginLoader->instantiateScheduler(type, initialSettings); scheduler_load) {
         const std::shared_ptr<BlockModel>& newBlock = addBlock(SchedulerModel::asBlockModelPtr(scheduler_load));
         return newBlock;
     }
@@ -36,7 +38,7 @@ std::pair<std::shared_ptr<BlockModel>, std::shared_ptr<BlockModel>> Graph::repla
     const auto                        oldIndex = static_cast<std::size_t>(std::ranges::distance(_blocks.begin(), found));
     const std::shared_ptr<BlockModel> replaced = _blocks[oldIndex];
 
-    auto newBlock = gr::globalPluginLoader().instantiate(type, properties);
+    auto newBlock = _pluginLoader->instantiate(type, properties);
     if (!newBlock) {
         throw gr::exception(std::format("Can not create block {}", type));
     }

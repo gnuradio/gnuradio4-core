@@ -221,7 +221,7 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
                 loadGraph(schedulerBlock);
 
             } else {
-                const std::shared_ptr<BlockModel>& subGraph = resultGraph.addBlock(std::make_shared<GraphWrapper<gr::Graph>>());
+                const std::shared_ptr<BlockModel>& subGraph = resultGraph.addBlock(std::make_shared<GraphWrapper<gr::Graph>>(gr::Graph(loader)));
                 subGraph->setName(blockName);
                 restoreMetaInformation(*subGraph);
                 createdBlocks.add(blockUniqueName, blockName, subGraph);
@@ -415,7 +415,7 @@ inline gr::property_map saveGraphToMap(PluginLoader& loader, const gr::Graph& ro
 } // namespace detail
 
 inline gr::meta::indirect<gr::Graph> loadGrc(PluginLoader& loader, std::string_view yamlSrc, std::source_location location = std::source_location::current()) {
-    gr::meta::indirect<gr::Graph> resultGraph;
+    gr::meta::indirect<gr::Graph> resultGraph{loader};
     const auto                    yaml = pmt::yaml::deserialize(yamlSrc);
     if (!yaml) {
         throw gr::exception(std::format("Could not parse yaml: {}:{}\n{}", yaml.error().message, yaml.error().line, yamlSrc));
