@@ -60,6 +60,16 @@ struct Sink : gr::Block<Sink> {
     void processOne(float) { _nReceived++; }
 };
 
+// resolvable only through a test-local registry, never the global one, so a lookup that
+// succeeds proves which loader served it
+struct LoaderCanary : gr::Block<LoaderCanary> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(LoaderCanary, out);
+
+    [[nodiscard]] constexpr float processOne() const noexcept { return 0.0f; }
+};
+
 using TestScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>;
 
 void registerTestBlocks() {
@@ -136,6 +146,28 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
     };
 
+    "a subgraph emplaced by name inherits its parent's plugin loader"_test = [] {
+        gr::BlockRegistry     localRegistry;
+        gr::SchedulerRegistry localSchedulers;
+        std::ignore = localRegistry.insert<qa_edit::LoaderCanary>();
+        gr::PluginLoader localLoader(localRegistry, localSchedulers, {});
+
+        const std::string canaryType{gr::meta::type_name<qa_edit::LoaderCanary>()};
+        expect(gr::globalPluginLoader().instantiate(canaryType) == nullptr) << "the canary resolves globally, so this test cannot discriminate the loaders";
+
+        gr::Graph                              flow(localLoader);
+        const std::shared_ptr<gr::BlockModel>& wrapped = flow.emplaceBlock("gr::Graph", {{"name", std::string("inner")}});
+        expect(fatal(wrapped != nullptr));
+        expect(eq(std::string{wrapped->name()}, std::string{"inner"})) << "the emplaced subgraph dropped its settings";
+
+        gr::Graph* inner = wrapped->graph();
+        expect(fatal(inner != nullptr));
+        expect(inner->_pluginLoader == &localLoader) << "the nested graph bound a loader other than its parent's";
+        expect(nothrow([&] { std::ignore = inner->emplaceBlock(canaryType, {}); })) << "a type the parent's loader resolves must resolve inside the subgraph";
+
+        auto& toReplace = flow.emplaceBlock<qa_edit::Source>();
+        expect(nothrow([&] { std::ignore = flow.replaceBlock(toReplace.unique_name, canaryType, {}); })) << "replaceBlock must consult the graph's own loader";
+    };
 #endif
 
     "a fan-out mixing typed and dynamic connects feeds every consumer"_test = [] {

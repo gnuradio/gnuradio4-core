@@ -471,6 +471,34 @@ const boost::ut::suite<"GRC round trip"> grcTests = [] {
         expect(eq(flatSamples.size(), 512UZ));
         expect(flatSamples == nestedSamples) << "the round-tripped subgraph changed the stream";
     };
+
+    "a loaded graph and its subgraphs bind the loader that loaded them"_test = [] {
+        registerTestBlocks();
+
+        BlockRegistry     localRegistry;
+        SchedulerRegistry localSchedulers;
+        expect(localRegistry.insert<RampSource>("=qa::RampSource") && localRegistry.insert<Scale>("=qa::Scale"));
+        PluginLoader localLoader(localRegistry, localSchedulers, {});
+        expect(&localLoader != &gr::globalPluginLoader());
+
+        gr::Graph nested;
+        std::ignore  = nested.emplaceBlock<RampSource>({{"name", std::string("source")}, {"n_samples", 16U}});
+        auto wrapper = std::make_shared<GraphWrapper<gr::Graph>>();
+        std::ignore  = wrapper->graph()->emplaceBlock<Scale>({{"name", std::string("scale")}});
+        nested.addBlock(wrapper)->setName("inner");
+
+        auto loaded = gr::loadGrc(localLoader, gr::saveGrc(localLoader, nested));
+        expect(loaded->_pluginLoader == &localLoader) << "the root graph bound a loader other than the one that loaded it";
+
+        bool sawSubgraph = false;
+        for (const auto& block : loaded->blocks()) {
+            if (gr::Graph* interior = block->graph(); interior != nullptr) {
+                sawSubgraph = true;
+                expect(interior->_pluginLoader == &localLoader) << "a loaded subgraph bound a loader other than the one that loaded it";
+            }
+        }
+        expect(sawSubgraph) << "the loaded graph carries no subgraph, so nothing was checked";
+    };
 };
 
 int main() { /* tests are run by the ut suite */ }
