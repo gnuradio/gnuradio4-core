@@ -98,7 +98,8 @@ jobs:
             cc: emcc
             cmake_wrapper: emcmake
             cmake-build-type: Release
-            cmake_flags: "-DENABLE_COVERAGE=OFF -DCMAKE_CROSSCOMPILING_EMULATOR=${SYSTEM_NODE} -DGNURADIO_PARSE_REGISTRATIONS_TOOL_CXX_COMPLILER=g++-14"
+            cmake_flags: "-DENABLE_COVERAGE=OFF -DCMAKE_CROSSCOMPILING_EMULATOR=${SYSTEM_NODE}"
+            block-builder-tool_flags: "-DCMAKE_CXX_COMPILER=g++-14"
 
     steps:
       - uses: actions/checkout@v6
@@ -124,6 +125,23 @@ jobs:
           key: fetchContent-${{ runner.os }}-${{ matrix.cache_key }}-${{ hashFiles('CMakeLists.txt') }}
           restore-keys: |
             fetchContent-${{ runner.os }}-${{ matrix.cache_key }}
+
+      - name: Clone, build and install Block Parser Tool
+        # FIXME: as soon as we migrate the repo to gnuradio/, change this url
+        run: git clone -b v1.1 https://github.com/marcusmueller/gnuradio4-block-parser-tool /tmp/gnuradio4-block-parser-tool
+
+      - name: Configure Block Parser Tool
+        run: >
+          cmake -S /tmp/gnuradio4-block-parser-tool \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            ${{ steps.enable_sccache.outputs.CXX_LAUNCHER }} \
+            ${{ steps.enable_sccache.outputs.C_LAUNCHER }} \
+            ${{ matrix.block-builder-tool_flags }} \
+            -B /tmp/bpt-build 
+      - name: Build Block Parser Tool
+        run: cmake --build /tmp/bpt-build
+      - name: Install Block Parser Tool
+        run: cmake --install /tmp/bpt-build
 
       - name: Configure
         if: matrix.cmake_wrapper == null
