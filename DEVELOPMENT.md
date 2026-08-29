@@ -56,6 +56,7 @@ Required tools:
 - Git
 - pkg-config
 - Ninja or GNU Make
+- [gnuradio4-block-parser-tool](https://github.com/gnuradio/gnuradio4-block-parser-tool)
 
 Native package availability varies by distribution. If Boost.UT, cpp-httplib, or
 vir-simd are not packaged for your system, configure with

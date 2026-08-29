@@ -80,35 +80,37 @@ function(gr_generate_block_instantiations LIB_NAME)
             # remove any previously generated .cpp files for this header.
             file(GLOB OLD_FILES "${GEN_DIR}/*${BASENAME}*.cpp")
             if(OLD_FILES)
-                message(STATUS "[BlockLibMacros] deleting old generated files ${OLD_FILES}")
+                message(VERBOSE "[BlockLibMacros] deleting old generated files ${OLD_FILES}")
                 file(REMOVE ${OLD_FILES})
             endif()
 
             file(GLOB OLD_FILES "${GEN_DIR}/*${BASENAME}*.hpp.in")
             if(OLD_FILES)
-                message(STATUS "[BlockLibMacros] deleting old generated files ${OLD_FILES}")
+                message(VERBOSE "[BlockLibMacros] deleting old generated files ${OLD_FILES}")
                 file(REMOVE ${OLD_FILES})
             endif()
 
             set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${HDR})
 
-            message(STATUS "[BlockLibMacros] Generating code for header: ${ABS_HDR} -> ${GEN_DIR} with PARSER_SPLIT_FLAG=${PARSER_SPLIT_FLAG}, other options [ ${PARSER_REGISTRY_HEADER_FLAG} ${PARSER_REGISTRY_HEADER_OPTION} ${PARSER_REGISTRY_INSTANCE_FLAG} ${PARSER_REGISTRY_INSTANCE_OPTION} ]")
+            message(VERBOSE "[BlockLibMacros] Generating code for header: ${ABS_HDR} -> ${GEN_DIR} with PARSER_SPLIT_FLAG=${PARSER_SPLIT_FLAG}, other options [ ${PARSER_REGISTRY_HEADER_FLAG} ${PARSER_REGISTRY_HEADER_OPTION} ${PARSER_REGISTRY_INSTANCE_FLAG} ${PARSER_REGISTRY_INSTANCE_OPTION} ]")
 
-            # GnuRadioBlockLibConfig.cmake sets this when GnuRadioBlockLib is found via find_package
-            # However when FetchContent is used that doesn't happen, so fall back to the build path
-            if (NOT PARSER_EXECUTABLE)
-                set(PARSER_EXECUTABLE @PROJECT_BINARY_DIR@/tools_build/gnuradio_4_0_parse_registrations)
+            if(NOT DEFINED GR_BLOCK_PARSER_TOOL)
+                get_target_property(GR_BLOCK_PARSER_TOOL gnuradio4::gnuradio-options BLOCK_PARSER_TOOL)
             endif()
-
+            execute_process(
+                    COMMAND "${GR_BLOCK_PARSER_TOOL}" "--version"
+                    OUTPUT_VARIABLE _BLOCK_PARSER_TOOL_VERSION
+                    OUTPUT_STRIP_TRAILING_WHITESPACE)
+            message(VERBOSE "[BlockLibMacros] block parser tool version: ${_BLOCK_PARSER_TOOL_VERSION}")
             # run the parser tool immediately at configuration time.
-            message(STATUS "[BlockLibMacros] Running: ${PARSER_EXECUTABLE} ${ABS_HDR} ${GEN_DIR}
+            message(VERBOSE "[BlockLibMacros] Running: ${GR_BLOCK_PARSER_TOOL} ${ABS_HDR} ${GEN_DIR}
                     ${PARSER_SPLIT_FLAG}
                     ${PARSER_REGISTRY_HEADER_FLAG}
                     ${PARSER_REGISTRY_HEADER_OPTION}
                     ${PARSER_REGISTRY_INSTANCE_FLAG}
                     ${PARSER_REGISTRY_INSTANCE_OPTION}")
             execute_process(
-                    COMMAND ${PARSER_EXECUTABLE} # command
+                    COMMAND ${GR_BLOCK_PARSER_TOOL} # command
                     "${ABS_HDR}" "${GEN_DIR}" # paths
                     ${PARSER_SPLIT_FLAG}
                     ${PARSER_REGISTRY_HEADER_FLAG}
@@ -121,9 +123,9 @@ function(gr_generate_block_instantiations LIB_NAME)
                     OUTPUT_STRIP_TRAILING_WHITESPACE
                     ERROR_STRIP_TRAILING_WHITESPACE
             )
-            message(STATUS "[BlockLibMacros] Output from gnuradio_4_0_parse_registrations for ${ABS_HDR}:\n${gen_out}")
+            message(VERBOSE "[BlockLibMacros] Output from '${GR_BLOCK_PARSER_TOOL}' for ${ABS_HDR}:\n${gen_out}\nERR:${gen_err}")
             if(NOT gen_res EQUAL 0)
-                message(FATAL_ERROR "Error running gnuradio_4_0_parse_registrations on ${HDR}: ${gen_err}")
+                message(FATAL_ERROR "Error '${gen_res}' running '${GR_BLOCK_PARSER_TOOL}' on ${HDR}: ${gen_err}")
             endif()
         endif()
 
@@ -143,13 +145,13 @@ function(gr_generate_block_instantiations LIB_NAME)
 
         # Merge generated declarations.hpp.in into single declarations.hpp
         # and raw_calls.hpp.in into a single raw_calls.hpp
-        message(STATUS "[BlockLibMacros] generating ${GEN_DIR}/declarations.hpp from ${GEN_DIR}/*_declarations.hpp.in")
+    message(VERBOSE "[BlockLibMacros] generating ${GEN_DIR}/declarations.hpp from ${GEN_DIR}/*_declarations.hpp.in")
         file(GLOB DECLARATIONS_FILES "${GEN_DIR}/*_declarations.hpp.in")
         if(DECLARATIONS_FILES)
             gr_detail_merge_files_into(${GEN_DIR}/declarations.hpp "${DECLARATIONS_FILES}")
         endif()
 
-        message(STATUS "[BlockLibMacros] generating ${GEN_DIR}/raw_calls.hpp from ${GEN_DIR}/*_raw_calls.hpp.in")
+    message(VERBOSE "[BlockLibMacros] generating ${GEN_DIR}/raw_calls.hpp from ${GEN_DIR}/*_raw_calls.hpp.in")
         file(GLOB RAW_CALLS_FILES "${GEN_DIR}/*_raw_calls.hpp.in")
         if(RAW_CALLS_FILES)
             gr_detail_merge_files_into(${GEN_DIR}/raw_calls.hpp "${RAW_CALLS_FILES}")

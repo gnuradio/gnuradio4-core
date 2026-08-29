@@ -17,49 +17,6 @@ message(
 )
 
 # --------------------------------------------------------------------------
-# Manually configure and build the parser tool in a separate directory
-# --------------------------------------------------------------------------
-set(TOOLS_BUILD_DIR "${PROJECT_BINARY_DIR}/tools_build")
-if(NOT EXISTS "${TOOLS_BUILD_DIR}/CMakeCache.txt")
-  message(STATUS "Configuring parser tool in ${TOOLS_BUILD_DIR}...")
-  execute_process(
-    COMMAND ${CMAKE_COMMAND} -S ${PROJECT_SOURCE_DIR}/tools -B ${TOOLS_BUILD_DIR} -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
-            -DCMAKE_CXX_COMPILER=${GNURADIO_PARSE_REGISTRATIONS_TOOL_CXX_COMPLILER}
-    RESULT_VARIABLE config_result
-    OUTPUT_VARIABLE config_output
-    ERROR_VARIABLE config_error
-    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_STRIP_TRAILING_WHITESPACE)
-  if(NOT
-     config_result
-     EQUAL
-     0)
-    message(FATAL_ERROR "Failed to configure parser tool: ${config_error}")
-  endif()
-endif()
-
-message(STATUS "Building parser tool in ${TOOLS_BUILD_DIR}...")
-execute_process(
-  COMMAND ${CMAKE_COMMAND} --build ${TOOLS_BUILD_DIR} --target gnuradio_4_0_parse_registrations
-  WORKING_DIRECTORY ${TOOLS_BUILD_DIR}
-  RESULT_VARIABLE build_result
-  OUTPUT_VARIABLE build_output
-  ERROR_VARIABLE build_error
-  OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_STRIP_TRAILING_WHITESPACE)
-if(NOT
-   build_result
-   EQUAL
-   0)
-  message(FATAL_ERROR "Failed to build gnuradio_4_0_parse_registrations tool: ${build_error} ${build_output}")
-else()
-  if(WIN32)
-    set(PARSER_EXECUTABLE "${TOOLS_BUILD_DIR}/gnuradio_4_0_parse_registrations.exe")
-  else()
-    set(PARSER_EXECUTABLE "${TOOLS_BUILD_DIR}/gnuradio_4_0_parse_registrations")
-  endif()
-  message(STATUS "Parser tool built: ${PARSER_EXECUTABLE}")
-endif()
-
-# --------------------------------------------------------------------------
 # Configure the rest of the project
 # --------------------------------------------------------------------------
 
@@ -79,5 +36,3 @@ install(
         "${CMAKE_CURRENT_BINARY_DIR}/GnuRadioBlockLibMacros.cmake"
   DESTINATION "${GR_BLOCKLIB_CMAKECONFIG_INSTALL_DIR}"
   COMPONENT Devel)
-
-install(PROGRAMS ${PARSER_EXECUTABLE} DESTINATION ${CMAKE_INSTALL_BINDIR})
