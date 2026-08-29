@@ -7,7 +7,7 @@ install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/benchmark.hpp DESTINATION ${CMAKE_INST
 
 function(append_compiler_flags TARGET_NAME)
   set(FLAGS_COMMON -Wall)
-  if(EMSCRIPTEN)
+  if(EMSCRIPTEN OR CMAKE_CROSSCOMPILING)
     set(FLAGS_SPECIAL "")
   else()
     set(FLAGS_SPECIAL -march=native)
