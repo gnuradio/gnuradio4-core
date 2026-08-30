@@ -1489,12 +1489,12 @@ public:
 
     inline constexpr void publishEoS() noexcept {
         const property_map tag_data{{static_cast<std::pmr::string>(gr::tag::END_OF_STREAM), true}};
-        for_each_port([&tag_data](PortLike auto& outPort) { outPort.publishTag(tag_data, static_cast<std::size_t>(outPort.streamWriter().nRequestedSamplesToPublish())); }, outputPorts<PortType::STREAM>(&self()));
+        for_each_port([&tag_data](PortLike auto& outPort) { outPort.publishEoSTag(tag_data, static_cast<std::size_t>(outPort.streamWriter().nRequestedSamplesToPublish())); }, outputPorts<PortType::STREAM>(&self()));
     }
 
     inline constexpr void publishEoS(auto& outputSpanTuple) noexcept {
         const property_map& tagData{{gr::tag::END_OF_STREAM, true}};
-        for_each_writer_span([&tagData](auto& outSpan) { outSpan.publishTag(tagData, static_cast<std::size_t>(outSpan.nRequestedSamplesToPublish())); }, outputSpanTuple);
+        for_each_writer_span([&tagData](auto& outSpan) { outSpan.publishEoSTag(tagData, static_cast<std::size_t>(outSpan.nRequestedSamplesToPublish())); }, outputSpanTuple);
     }
 
     constexpr void requestStop() noexcept { emitErrorMessageIfAny("requestStop()", this->changeStateTo(lifecycle::State::REQUESTED_STOP)); }

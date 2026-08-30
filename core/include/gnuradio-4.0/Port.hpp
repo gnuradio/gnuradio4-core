@@ -3,9 +3,11 @@
 
 #include <algorithm>
 #include <any>
+#include <chrono>
 #include <complex>
 #include <set>
 #include <span>
+#include <thread>
 #include <variant>
 
 #include <gnuradio-4.0/PmtTypeHelpers.hpp>
@@ -622,20 +624,26 @@ struct Port {
         TagWriterSpanType tags;
         std::size_t       streamIndex;
         std::size_t       tagsPublished{0UZ};
+        std::size_t       tagsDropped{0UZ};   // tags refused because the reservation was exhausted
         bool              isConnected = true; // true if Port is connected
         bool              isSync      = true; // true if  Port is Sync
 
-        constexpr OutputSpan(std::size_t nSamples, WriterType& streamWriter, TagWriterType& tagsWriter, std::size_t streamOffset, bool connected, bool sync) noexcept //
+        // The span's counter is discarded with the reservation, so it is added to the port's
+        // persistent counter when the span publishes. nTagsDropped is the counter a post-run
+        // diagnostic reads.
+        std::size_t* portTagsDropped{nullptr};
+
+        constexpr OutputSpan(std::size_t nSamples, WriterType& streamWriter, TagWriterType& tagsWriter, std::size_t streamOffset, bool connected, bool sync, std::size_t* portDropCounter = nullptr) noexcept //
         requires(spanReservePolicy == WriterSpanReservePolicy::Reserve)
             : WriterSpanType<spanReleasePolicy>(streamWriter.template reserve<spanReleasePolicy>(nSamples)), //
               tags(tagsWriter.template reserve<SpanReleasePolicy::ProcessNone>(tagsWriter.available())),     //
-              streamIndex{streamOffset}, isConnected(connected), isSync(sync) {}
+              streamIndex{streamOffset}, isConnected(connected), isSync(sync), portTagsDropped(portDropCounter) {}
 
-        constexpr OutputSpan(std::size_t nSamples_, WriterType& streamWriter, TagWriterType& tagsWriter, std::size_t streamOffset, bool connected, bool sync) noexcept //
+        constexpr OutputSpan(std::size_t nSamples_, WriterType& streamWriter, TagWriterType& tagsWriter, std::size_t streamOffset, bool connected, bool sync, std::size_t* portDropCounter = nullptr) noexcept //
         requires(spanReservePolicy == WriterSpanReservePolicy::TryReserve)
             : WriterSpanType<spanReleasePolicy>(streamWriter.template tryReserve<spanReleasePolicy>(nSamples_)), //
               tags(tagsWriter.template tryReserve<SpanReleasePolicy::ProcessNone>(tagsWriter.available())),      //
-              streamIndex{streamOffset}, isConnected(connected), isSync(sync) {}
+              streamIndex{streamOffset}, isConnected(connected), isSync(sync), portTagsDropped(portDropCounter) {}
 
         OutputSpan(const OutputSpan&)                = delete;
         OutputSpan& operator=(const OutputSpan&)     = delete;
@@ -645,6 +653,9 @@ struct Port {
         ~OutputSpan() {
             if (WriterSpanType<spanReleasePolicy>::instanceCount() == 1UZ) { // has to be one, because the parent destructor which decrements it to zero is only called afterward
                 tags.publish(tagsPublished);
+                if (portTagsDropped != nullptr) {
+                    *portTagsDropped += tagsDropped;
+                }
             }
         }
 
@@ -655,11 +666,36 @@ struct Port {
                 return;
             }
 
-            // TODO(error handling): surface this to the scheduler as a port-status flag instead of stderr
-            if (tagsPublished >= tags.size()) {
-                std::println(stderr, "gr::Port: tag buffer full (published: {}, size: {}), dropping tag at offset {}", tagsPublished, tags.size(), tagOffset);
+            // the reservation's final slot is held back for the end-of-stream marker: a tag flood
+            // that exhausts the reservation must not also be able to swallow the stream's ending
+            if (tagsPublished + 1UZ >= tags.size()) {
+                ++tagsDropped;
+                if (tagsDropped == 1UZ) { // one line per reservation: a flood is counted, not narrated
+                    std::println(stderr, "gr::Port: tag buffer full (published: {}, size: {}), dropping tag at offset {}; further drops in this span are counted in tagsDropped", tagsPublished, tags.size(), tagOffset);
+                }
                 return;
             }
+            placeTag(std::forward<TPropertyMap>(tagData), tagOffset);
+        }
+
+        // publishes the end-of-stream marker, which alone may take the reservation's final slot:
+        // an ordinary tag is an annotation, this one is what lets a finite graph terminate
+        template<PropertyMapType TPropertyMap>
+        inline constexpr void publishEoSTag(TPropertyMap&& tagData, std::size_t tagOffset = 0UZ) noexcept {
+            if (!isConnected) {
+                return;
+            }
+            if (tagsPublished >= tags.size()) {
+                ++tagsDropped;
+                std::println(stderr, "gr::Port: tag buffer full (published: {}, size: {}), dropping the end-of-stream tag at offset {}", tagsPublished, tags.size(), tagOffset);
+                return;
+            }
+            placeTag(std::forward<TPropertyMap>(tagData), tagOffset);
+        }
+
+    private:
+        template<PropertyMapType TPropertyMap>
+        inline constexpr void placeTag(TPropertyMap&& tagData, std::size_t tagOffset) noexcept {
             const auto index = streamIndex + tagOffset;
 
 #ifndef NDEBUG
@@ -677,6 +713,14 @@ struct Port {
     static_assert(WriterSpanLike<OutputSpan<gr::SpanReleasePolicy::ProcessAll, WriterSpanReservePolicy::Reserve>>);
     static_assert(OutputSpanLike<OutputSpan<gr::SpanReleasePolicy::ProcessAll, WriterSpanReservePolicy::Reserve>>);
 
+public:
+    // Post-run drop accounting. Every tag this port refused for lack of ring space is counted
+    // here, whether it was refused on the direct path or inside a reservation whose own counter is
+    // discarded with the span. An end-of-stream marker that cannot be published is not counted
+    // here: it is a terminal failure rather than a dropped annotation, and has its own counter.
+    std::size_t nTagsDropped{0UZ};
+    std::size_t nEoSTagsLost{0UZ}; // end-of-stream markers this port could not publish
+
 private:
     IoType    _ioHandler    = newIoHandler();
     TagIoType _tagIoHandler = newTagIoHandler();
@@ -690,11 +734,17 @@ private:
         }
     }
 
+    // The tag ring is allocated one slot beyond the requested size. Every ordinary publish path
+    // stops one slot short, which reserves that slot for the end-of-stream marker. Taking the slot
+    // out of the requested size would reduce the port's usable tag capacity by one; the extra
+    // element costs nothing unless the requested size already falls on a page-rounding boundary.
+    static constexpr std::size_t kTagRingReserve = 1UZ;
+
     [[nodiscard]] constexpr auto newTagIoHandler(std::size_t bufferSize = kDefaultBufferSize) const noexcept {
         if constexpr (kIsInput) {
             return TagBufferType(bufferSize).new_reader();
         } else {
-            return TagBufferType(bufferSize).new_writer();
+            return TagBufferType(bufferSize + kTagRingReserve).new_writer();
         }
     }
 
@@ -829,9 +879,9 @@ public:
                     _ioHandler = BufferType(min_size).new_writer();
                 }
                 if (tagResource) {
-                    _tagIoHandler = TagBufferType(min_size, typename TagBufferType::Allocator(tagResource)).new_writer();
+                    _tagIoHandler = TagBufferType(min_size + kTagRingReserve, typename TagBufferType::Allocator(tagResource)).new_writer();
                 } else {
-                    _tagIoHandler = TagBufferType(min_size).new_writer();
+                    _tagIoHandler = TagBufferType(min_size + kTagRingReserve).new_writer();
                 }
             } catch (const std::exception& e) {
                 return std::unexpected(Error(std::format("failed to resize buffer to {}: {}", min_size, e.what())));
@@ -947,14 +997,14 @@ public:
     auto reserve(std::size_t nSamples)
     requires(kIsOutput)
     {
-        return OutputSpan<spanReleasePolicy, WriterSpanReservePolicy::Reserve>(nSamples, streamWriter(), tagWriter(), streamWriter().position(), this->isConnected(), this->isSynchronous());
+        return OutputSpan<spanReleasePolicy, WriterSpanReservePolicy::Reserve>(nSamples, streamWriter(), tagWriter(), streamWriter().position(), this->isConnected(), this->isSynchronous(), &nTagsDropped);
     }
 
     template<SpanReleasePolicy spanReleasePolicy>
     auto tryReserve(std::size_t nSamples)
     requires(kIsOutput)
     {
-        return OutputSpan<spanReleasePolicy, WriterSpanReservePolicy::TryReserve>(nSamples, streamWriter(), tagWriter(), streamWriter().position(), this->isConnected(), this->isSynchronous());
+        return OutputSpan<spanReleasePolicy, WriterSpanReservePolicy::TryReserve>(nSamples, streamWriter(), tagWriter(), streamWriter().position(), this->isConnected(), this->isSynchronous(), &nTagsDropped);
     }
 
     template<PropertyMapType TPropertyMap>
@@ -962,15 +1012,46 @@ public:
     requires(kIsOutput)
     {
         if (isConnected()) {
-            WriterSpanLike auto outTags = tagWriter().tryReserve(1UZ);
+            // two reserved, one published: the ring's last free slot is held back for the
+            // end-of-stream marker exactly as the reservation's last slot is, so a tag flood
+            // cannot take the space the stream's ending needs
+            WriterSpanLike auto outTags = tagWriter().tryReserve(2UZ);
             if (!outTags.empty()) {
                 outTags[0].index = streamWriter().position() + tagOffset;
                 outTags[0].map   = std::forward<TPropertyMap>(tagData);
                 outTags.publish(1UZ);
             } else {
-                // TODO(error handling): Decide how to surface failures. Function is noexcept now
+                ++nTagsDropped;
+                if (nTagsDropped == 1UZ) { // as above: the first drop is news, the next half million are a number
+                    std::println(stderr, "gr::Port: tag ring full, dropping tag at offset {}; further drops on this port are counted in nTagsDropped", tagOffset);
+                }
             }
         }
+    }
+
+    // Publishes the end-of-stream marker without waiting. The reserved slot is available because
+    // every ordinary publish path stops one slot short of the ring's end and the ring carries
+    // kTagRingReserve slots beyond its nominal size, so tag traffic from this port cannot consume
+    // it. The reservation does not cover a downstream that has stopped consuming, since only the
+    // consumer frees ring space. Waiting here would block a scheduler thread, possibly on work
+    // scheduled to its own pool, so a marker that cannot be published is reported and counted as a
+    // terminal failure instead.
+    template<PropertyMapType TPropertyMap>
+    inline void publishEoSTag(TPropertyMap&& tagData, std::size_t tagOffset = 0UZ) noexcept
+    requires(kIsOutput)
+    {
+        if (!isConnected()) {
+            return;
+        }
+        WriterSpanLike auto outTags = tagWriter().tryReserve(1UZ);
+        if (!outTags.empty()) {
+            outTags[0].index = streamWriter().position() + tagOffset;
+            outTags[0].map   = std::forward<TPropertyMap>(tagData);
+            outTags.publish(1UZ);
+            return;
+        }
+        ++nEoSTagsLost;
+        std::println(stderr, "gr::Port: tag ring full and unconsumed, the end-of-stream tag at offset {} could not be published; downstream will not observe the end of the stream", tagOffset);
     }
 
 private:
