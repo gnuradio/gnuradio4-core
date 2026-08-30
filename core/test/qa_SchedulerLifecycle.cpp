@@ -90,6 +90,23 @@ struct FailingSource : gr::Block<FailingSource> {
     }
 };
 
+// a source whose device is absent: start() throws, so the block lands in ERROR before one sample moves
+struct ThrowingStartSource : gr::Block<ThrowingStartSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(ThrowingStartSource, out);
+
+    std::size_t _nEmitted = 0UZ;
+
+    void start() { throw gr::exception("the device refused to open"); }
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        _nEmitted += outSpan.size();
+        outSpan.publish(outSpan.size());
+        return gr::work::Status::OK;
+    }
+};
+
 // the start()/stop() hooks of a start-then-stop cycle, observed from the requesting thread
 inline std::atomic<int> gStartHooks{0};
 inline std::atomic<int> gStopHooks{0};
@@ -416,11 +433,37 @@ const boost::ut::suite<"block stop hook on terminal paths"> stopHookTests = [] {
 
         qa_sched::SerialScheduler scheduler;
         expect(scheduler.exchange(std::move(flow)).has_value());
-        expect(scheduler.runAndWait().has_value());
+        expect(!scheduler.runAndWait().has_value()) << "a run the scheduler finished in ERROR is reported as failed, not as a successful run";
 
         expect(scheduler.state() == ERROR) << "a failing block drives the scheduler to ERROR";
         expect(eq(source._nStopCalls, 1)) << "stop() must run for the block that failed";
         expect(eq(sink._nStopCalls, 1)) << "stop() must run for the blocks torn down alongside it";
+    };
+
+    "a start() that throws fails runAndWait"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::ThrowingStartSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        qa_sched::SerialScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(!scheduler.runAndWait().has_value()) << "a graph whose source never started must not report a successful run";
+        expect(eq(source._nEmitted, 0UZ)) << "no sample moves through a block that refused to start";
+    };
+
+    "a start() that throws fails runAndWait with a message subscriber attached"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::ThrowingStartSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        qa_sched::SerialScheduler scheduler;
+        gr::MsgPortIn             fromScheduler;
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(!scheduler.runAndWait().has_value()) << "a delivered error message must not turn the failed run into a success";
+        expect(eq(source._nEmitted, 0UZ));
     };
 
     "an ordinary requestStop runs the stop hook once"_test = [] {
