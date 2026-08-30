@@ -170,6 +170,7 @@ protected:
     std::size_t                    _nDeferredExchanges{0UZ}; // claimed swaps still running outside the job count
     std::size_t                    _nStopRequests{0UZ};
     bool                           _pendingStopRequest{false}; // a requested stop that no run loop has consumed yet
+    std::optional<Error>           _firstChildStartError;      // written by start()'s child sweep before workers exist, returned by runAndWait()
 
     // for blocks that were added while scheduler was running. They need to be adopted by a thread
     std::mutex _adoptionBlocksMutex;
@@ -606,8 +607,29 @@ public:
         // * singleThreaded[Blocking] naturally block in the calling thread
         // * multiThreaded[Blocking] spawn two worker and block on 'waitDone()'
         waitDone();
-        processScheduledMessages();
-        return settleStopped();
+
+        // the message drain can throw when a child's error message would otherwise be dropped
+        // (no msgOut subscriber); at this boundary that becomes the call's own error vocabulary
+        std::expected<void, Error> settled = [&]() -> std::expected<void, Error> {
+            try {
+                processScheduledMessages();
+                return settleStopped();
+            } catch (const std::exception& e) {
+                return std::unexpected(Error{std::format("runAndWait(): {}", e.what())});
+            }
+        }();
+        if (!settled) {
+            return settled;
+        }
+        if (_firstChildStartError.has_value()) {
+            std::expected<void, Error> failed = std::unexpected(*_firstChildStartError);
+            _firstChildStartError.reset();
+            return failed;
+        }
+        if (this->state() == ERROR) {
+            return std::unexpected(Error{"a block error ended the run: the scheduler finished in the ERROR state"});
+        }
+        return {};
     }
 
     void waitDone() {
@@ -869,6 +891,7 @@ protected:
 
         std::lock_guard lock(_executionOrderMutex);
 
+        _firstChildStartError.reset();
         graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) { //
             if (block->blockCategory() == ScheduledBlockGroup) {
                 // We don't simply move to RUNNING, as schedulers block. This code path
@@ -880,9 +903,30 @@ protected:
                     throw gr::exception(std::format("ScheduledBlockGroup is not a SchedulerModel {}", block->uniqueName()));
                 }
             } else {
-                this->emitErrorMessageIfAny("LifecycleState -> RUNNING", block->changeStateTo(lifecycle::RUNNING));
+                // a child that refuses to start — a throwing start() hook lands here in the ERROR
+                // state — must fail the run itself, not only the message stream: the first such
+                // error is what runAndWait() returns
+                std::expected<void, Error> transitioned = block->changeStateTo(lifecycle::RUNNING);
+                if (!transitioned && !_firstChildStartError.has_value()) {
+                    _firstChildStartError = transitioned.error();
+                }
+                this->emitErrorMessageIfAny("LifecycleState -> RUNNING", std::move(transitioned));
             }
         });
+
+        if (_firstChildStartError.has_value()) {
+            // a graph that could not start completely must not run degraded: a failed source never
+            // publishes an end-of-stream, so the run would also never terminate on its own. The
+            // children that did start are wound back down, no worker or watchdog is spawned, and
+            // runAndWait() returns the captured error
+            graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) {
+                if (block->state() == lifecycle::State::RUNNING) {
+                    this->emitErrorMessageIfAny("LifecycleState -> REQUESTED_STOP", block->changeStateTo(lifecycle::REQUESTED_STOP));
+                    this->emitErrorMessageIfAny("LifecycleState -> STOPPED", block->changeStateTo(lifecycle::STOPPED));
+                }
+            });
+            return;
+        }
 
         // start watchdog
         auto ioThreadPool = gr::thread_pool::Manager::defaultIoPool();
