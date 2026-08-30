@@ -10,6 +10,7 @@
 #include <string_view>
 #include <thread>
 
+#include <gnuradio-4.0/BlockingSync.hpp>
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/LifeCycle.hpp>
 #include <gnuradio-4.0/Scheduler.hpp>
@@ -201,6 +202,38 @@ struct EndlessSource : gr::Block<EndlessSource> {
     GR_MAKE_REFLECTABLE(EndlessSource, out);
 
     [[nodiscard]] constexpr float processOne() const noexcept { return 1.0f; }
+};
+
+// paces itself to wall-clock time rather than to buffer availability: the clock port is left unconnected,
+// so BlockingSync's timer thread is what releases the next chunk. Nothing in the block ends the stream
+struct PacedSource : gr::Block<PacedSource>, gr::BlockingSync<PacedSource> {
+    gr::PortIn<std::uint8_t, gr::Optional> clk_in;
+    gr::PortOut<float>                     out;
+
+    gr::Annotated<float, "sample_rate">     sample_rate = 100'000.f;
+    gr::Annotated<gr::Size_t, "chunk_size"> chunk_size  = 16U;
+
+    GR_MAKE_REFLECTABLE(PacedSource, clk_in, out, sample_rate, chunk_size);
+
+    // the timer task reads members of this class, which ~Block() would already have outlived
+    ~PacedSource() { this->stopTimerAndJoin(); }
+
+    void start() { this->blockingSyncStart(); }
+    void stop() { this->blockingSyncStop(); }
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& clkIn, gr::OutputSpanLike auto& outSpan) {
+        const std::size_t nSamples = this->syncSamples(clkIn, outSpan);
+        std::ignore                = clkIn.consume(0UZ);
+        if (nSamples == 0UZ) {
+            outSpan.publish(0UZ);
+            return gr::work::Status::INSUFFICIENT_INPUT_ITEMS;
+        }
+        for (std::size_t i = 0UZ; i < nSamples; ++i) {
+            outSpan[i] = 1.0f;
+        }
+        outSpan.publish(nSamples);
+        return gr::work::Status::OK;
+    }
 };
 
 // only this block ends the stream, so a job list that never gets a thread hangs the graph
@@ -866,6 +899,42 @@ const boost::ut::suite<"the zero-progress park"> zeroProgressParkTests = [] {
         });
         expect(completed) << "the parked worker never re-ran the source";
         expect(eq(sink._nReceived, qa_sched::kSamplesBeforeTerminal));
+    };
+};
+
+const boost::ut::suite<"a job list that finishes before the others"> upstreamReleaseTests = [] {
+    using namespace boost::ut;
+
+    // A worker leaves as soon as every block of its job list reports DONE, and under multiThreaded a job
+    // list may hold a single block, so the block that ends the stream gets no further work() call. An
+    // upstream source learns that its last consumer is gone only from the reader counts of its output
+    // ports, which the finished block lowers by releasing its input.
+    "the finished consumer releases its upstream source"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::EndlessSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::StoppingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        qa_sched::TestScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        expect(qa_sched::runAndWaitWithin(scheduler, qa_sched::kEventBound)) << "the source kept running after its only consumer finished";
+        expect(ge(sink._nReceived, qa_sched::kSamplesBeforeTerminal));
+    };
+
+    // the same shutdown for a source paced by wall-clock time rather than by back-pressure: it never
+    // reports DONE of its own accord, so the released input port is the only thing that ends the run
+    "a wall-clock paced source stops with its consumer"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::PacedSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::StoppingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        qa_sched::TestScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        expect(qa_sched::runAndWaitWithin(scheduler, qa_sched::kEventBound)) << "the paced source kept running after its only consumer finished";
+        expect(ge(sink._nReceived, qa_sched::kSamplesBeforeTerminal));
     };
 };
 

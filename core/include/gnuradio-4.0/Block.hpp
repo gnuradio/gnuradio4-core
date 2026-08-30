@@ -2393,7 +2393,19 @@ public:
         if constexpr (Derived::blockCategory != block::Category::NormalBlock) {
             return {requestedWork, 0UZ, gr::work::Status::OK};
         } else {
-            return workInternal(requestedWork);
+            const work::Result result = workInternal(requestedWork);
+            if (result.status == gr::work::Status::DONE) {
+                // A scheduler worker leaves its loop as soon as every block of its job list reports DONE, and
+                // under a multi-threaded execution policy a job list may hold a single block, so the call that
+                // reports DONE is the last one this block is guaranteed to get. Releasing the upstream readers
+                // on that call is what lets a shutdown travel against the stream: an upstream block recognises
+                // that its last consumer is gone through hasNoDownStreamConnectedChildren(), which reads the
+                // reader counts of its output ports, and only a released input port lowers one. It happens here
+                // rather than inside workInternal() because the input spans of the finished call are still alive
+                // there and hold the very readers this releases.
+                disconnectFromUpStreamParents();
+            }
+            return result;
         }
     }
 
