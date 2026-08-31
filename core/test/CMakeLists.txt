@@ -77,6 +77,12 @@ foreach(TEST_NAME IN LISTS _CORE_TESTS)
   add_ut_test(${TEST_NAME})
 endforeach()
 
+# only the cases that emplace a block by name need the registry, so those cases are compiled out rather than the whole
+# test being dropped
+if(NOT GR_ENABLE_BLOCK_REGISTRY)
+  target_compile_definitions(qa_GraphEdit PRIVATE GR_TEST_WITHOUT_BLOCK_REGISTRY)
+endif()
+
 # regression tests for control-plane wedges: a failure shows up as a hang, so cap them
 set(_CORE_DEADLOCK_TESTS
     qa_DestructionSafety

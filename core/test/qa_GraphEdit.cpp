@@ -94,6 +94,7 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
     using namespace boost::ut;
     using enum gr::lifecycle::State;
 
+#ifndef GR_TEST_WITHOUT_BLOCK_REGISTRY // emplacement by name resolves the type through the registry
     "a block emplaced from yaml applies its serialized settings"_test = [] {
         qa_edit::registerTestBlocks();
 
@@ -134,6 +135,8 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
 
         expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
     };
+
+#endif
 
     "a fan-out mixing typed and dynamic connects feeds every consumer"_test = [] {
         auto runMixedFanOut = [](bool typedFirst) {
@@ -216,6 +219,7 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(!flow.removeEdgeBySourcePort(source.unique_name, "out", sinkA.unique_name, "in").has_value()) << "removing an absent edge reported success";
     };
 
+#ifndef GR_TEST_WITHOUT_BLOCK_REGISTRY // emplacement by name resolves the type through the registry
     "emplacing and removing blocks while the graph runs"_test = [] {
         constexpr std::size_t kCycles = 8UZ;
 
@@ -261,6 +265,8 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         }
         expect(scheduler.state() == STOPPED) << "the scheduler did not stop after the edit cycles";
     };
+
+#endif
 
     "an edge sized by duration follows the sample rate"_test = [] {
         using gr::graph::edgeBufferSizeFor;
