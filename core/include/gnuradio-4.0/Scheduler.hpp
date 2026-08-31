@@ -132,6 +132,7 @@ protected:
 
     bool                          _valid{true};
     std::size_t                   _nWatchdogsRunning{0};
+    std::size_t                   _workerGeneration{0UZ}; // a queued worker runs only while it matches this
     meta::indirect<gr::Graph>     _graph{};
     TProfiler                     _profiler{};
     ProfileHandle                 _profilerHandler{_profiler.forThisThread()};
@@ -803,6 +804,22 @@ protected:
     void start() {
         using enum gr::lifecycle::State;
 
+        // stop() only publishes STOPPED, so the previous run can leave workers that the pool
+        // counted but never started. Those workers are retired and then drained before this run
+        // begins.
+        //
+        // Retiring them first is required because a worker that starts after this point would run
+        // the previous job list, whose blocks are stopped. It would make no progress, would not
+        // reach a terminal state, and would hold _nRunningJobs above zero indefinitely.
+        //
+        // The drain must happen before _executionOrderMutex is acquired: a queued worker acquires
+        // that mutex to copy its job list before it can decrement _nRunningJobs, so waiting for it
+        // while holding the mutex deadlocks the restart. A recursive mutex does not help, because
+        // the two are different threads. Draining first also keeps the graph from being rewired and
+        // keeps children and the watchdog from starting while the previous run unwinds.
+        const std::size_t workerGeneration = gr::atomic_ref(_workerGeneration).fetch_add(1UZ) + 1UZ;
+        waitDone();
+
         disconnectAllEdges();
         if (auto result = connectPendingEdges(); !result) {
             this->emitErrorMessage("start()", "Failed to connect blocks in graph");
@@ -844,7 +861,6 @@ protected:
             throw;
         }
 
-        waitDone(); // a stop only publishes STOPPED -- the previous generation of workers may still be unwinding
         assert(_executionOrder != nullptr && !_executionOrder->empty());
         if constexpr (executionPolicy() == ExecutionPolicy::singleThreaded || executionPolicy() == ExecutionPolicy::singleThreadedBlocking) {
             _nRunningJobs->incrementAndGet();
@@ -861,7 +877,13 @@ protected:
             _nRunningJobs->notify_all();
             for (std::size_t runnerID = 0UZ; runnerID < nWorkers; runnerID++) {
                 try {
-                    _pool->execute([this, runnerID, jobListsCopy]() { static_cast<Derived*>(this)->poolWorker(runnerID, jobListsCopy); });
+                    _pool->execute([this, runnerID, jobListsCopy, workerGeneration]() {
+                        if (gr::atomic_ref(_workerGeneration).load_acquire() != workerGeneration) { // a restart occurred before the pool reached this task
+                            releaseWorkerCount(*_nRunningJobs);
+                            return;
+                        }
+                        static_cast<Derived*>(this)->poolWorker(runnerID, jobListsCopy);
+                    });
                 } catch (...) { // a rejected task never decrements, and the leaked count spins waitDone() forever
                     std::ignore = _nRunningJobs->subAndGet(nWorkers - runnerID);
                     _nRunningJobs->notify_all();
@@ -874,30 +896,34 @@ protected:
         }
     }
 
+    // The single path by which a counted worker releases its count, whether it ran its job list or
+    // was retired before starting. The pending graph exchange is claimed before the count is
+    // released so that ~SchedulerBase()'s waitDone() cannot complete before the swap is applied.
+    void releaseWorkerCount(gr::Sequence& nRunningJobs) {
+        std::optional<PendingExchange> claimed;
+        {
+            std::lock_guard guard(_pendingExchangeMutex);
+            if (_pendingExchange.has_value()) {
+                claimed = std::move(_pendingExchange);
+                _pendingExchange.reset();
+                gr::atomic_ref(_nDeferredExchanges).fetch_add(1UZ);
+            }
+        }
+        std::ignore = nRunningJobs.subAndGet(1UZ);
+        nRunningJobs.notify_all();
+        if (claimed.has_value()) {
+            applyPendingExchange(std::move(*claimed));
+            gr::atomic_ref(_nDeferredExchanges).fetch_sub(1UZ);
+            gr::atomic_ref(_nDeferredExchanges).notify_all();
+        }
+    }
+
     void poolWorker(const std::size_t runnerID, std::shared_ptr<std::vector<std::vector<std::shared_ptr<BlockModel>>>> jobList) {
         using enum lifecycle::State;
         std::shared_ptr<gr::Sequence> progress     = _graph->_progress; // life-time guaranteed
         std::shared_ptr<gr::Sequence> nRunningJobs = _nRunningJobs;
 
-        on_scope_exit decrementRunningJobs = [this, &nRunningJobs] { // start() counted this worker in before queueing it
-            // claim before releasing the job count, so ~SchedulerBase()'s waitDone() cannot run ahead of the swap
-            std::optional<PendingExchange> claimed;
-            {
-                std::lock_guard guard(_pendingExchangeMutex);
-                if (_pendingExchange.has_value()) {
-                    claimed = std::move(_pendingExchange);
-                    _pendingExchange.reset();
-                    gr::atomic_ref(_nDeferredExchanges).fetch_add(1UZ);
-                }
-            }
-            std::ignore = nRunningJobs->subAndGet(1UZ);
-            nRunningJobs->notify_all();
-            if (claimed.has_value()) {
-                applyPendingExchange(std::move(*claimed));
-                gr::atomic_ref(_nDeferredExchanges).fetch_sub(1UZ);
-                gr::atomic_ref(_nDeferredExchanges).notify_all();
-            }
-        };
+        on_scope_exit decrementRunningJobs = [this, &nRunningJobs] { releaseWorkerCount(*nRunningJobs); }; // start() counted this worker in before queueing it
 
         // runs out before decrementRunningJobs, so applyPendingExchange() is not seen as on-worker
         const void*   previousActiveScheduler = std::exchange(tActiveSchedulerWorker, static_cast<const void*>(this));
