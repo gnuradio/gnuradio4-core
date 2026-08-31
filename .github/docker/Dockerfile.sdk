@@ -22,7 +22,7 @@ RUN set -eux; \
     system_node="$(command -v node || true)"; \
     if [ "${SDK_TARGET}" = emscripten ]; then \
       configure_command="emcmake cmake"; \
-      cross_flags="-DCMAKE_CROSSCOMPILING_EMULATOR=${system_node} -DGNURADIO_PARSE_REGISTRATIONS_TOOL_CXX_COMPLILER=${HOST_CXX}"; \
+      cross_flags="-DCMAKE_CROSSCOMPILING_EMULATOR=${system_node} -DGNURADIO_PARSE_REGISTRATIONS_TOOL_CXX_COMPILER=${HOST_CXX}"; \
     else \
       configure_command="cmake"; \
       cross_flags=""; \

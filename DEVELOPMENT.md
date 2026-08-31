@@ -107,7 +107,7 @@ emcmake cmake -S . -B build-wasm \
   -DCMAKE_BUILD_TYPE=Release \
   -DENABLE_COVERAGE=OFF \
   -DCMAKE_CROSSCOMPILING_EMULATOR="$SYSTEM_NODE" \
-  -DGNURADIO_PARSE_REGISTRATIONS_TOOL_CXX_COMPLILER=g++-14
+  -DGNURADIO_PARSE_REGISTRATIONS_TOOL_CXX_COMPILER=g++-14
 cmake --build build-wasm --parallel
 ctest --test-dir build-wasm --output-on-failure
 ```
