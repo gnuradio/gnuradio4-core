@@ -571,6 +571,61 @@ const boost::ut::suite<"job lists sized to the free pool threads"> jobListSizing
         expect(qa_sched::runAndWaitWithin(scheduler, std::chrono::seconds(5))) << "a job list that got no pool thread stranded its blocks";
         expect(ge(sink._nReceived, qa_sched::kSamplesBeforeTerminal)) << "the sink must run for the stream to end";
     };
+
+    // start() counts a worker generation before queueing it, so a stop that publishes STOPPED can
+    // leave counted workers that never ran. start() drains those before acquiring
+    // _executionOrderMutex, since a queued worker acquires the same mutex to copy its job list
+    // before it can decrement. The drain terminates only because the workers are retired first: a
+    // task that reaches the pool after a restart releases its count instead of running. Occupying
+    // every thread of a fixed-size pool is what keeps a worker queued across the stop.
+    "a restart completes while a worker of the previous generation is still queued"_test = [] {
+        using enum gr::lifecycle::State;
+
+        auto pool      = qa_sched::twoThreadPool();
+        auto occupierA = std::make_unique<qa_sched::PoolOccupier>(*pool);
+        auto occupierB = std::make_unique<qa_sched::PoolOccupier>(*pool);
+
+        qa_sched::TestScheduler scheduler({{"poolName", std::string(qa_sched::kOccupiedPoolName)}});
+        expect(scheduler.exchange(qa_sched::makeGraph()).has_value());
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value()); // the generation is counted and queued behind the occupiers
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_sched::awaitState(scheduler, STOPPED)) << "the scheduler did not publish STOPPED with its workers still queued";
+
+        std::mutex              mutex;
+        std::condition_variable finished;
+        bool                    restarted = false;
+
+        std::thread restarter([&scheduler, &mutex, &finished, &restarted] {
+            std::ignore = scheduler.changeStateTo(INITIALISED);
+            std::ignore = scheduler.changeStateTo(RUNNING);
+            {
+                std::lock_guard lock(mutex);
+                restarted = true;
+            }
+            finished.notify_one();
+        });
+
+        expect(qa_sched::awaitState(scheduler, INITIALISED)) << "the restart never left STOPPED";
+        std::this_thread::sleep_for(std::chrono::milliseconds(100)); // let the restart reach the drain
+
+        occupierA.reset(); // the queued generation becomes runnable only now
+        occupierB.reset();
+
+        bool inTime = false;
+        {
+            std::unique_lock lock(mutex);
+            inTime = finished.wait_for(lock, std::chrono::seconds(5), [&restarted] { return restarted; });
+        }
+        expect(inTime) << "start() deadlocked against a queued worker of the previous generation";
+        if (inTime) {
+            restarter.join();
+            std::ignore = scheduler.changeStateTo(REQUESTED_STOP);
+            expect(qa_sched::awaitState(scheduler, STOPPED)) << "the restarted scheduler did not stop again";
+        } else {
+            restarter.detach(); // joining a thread stuck on the mutex would hang the suite instead of failing it
+        }
+    };
 };
 
 const boost::ut::suite<"adopting a sub-scheduler"> subSchedulerAdoptionTests = [] {
