@@ -1,6 +1,8 @@
+#include <gnuradio-4.0/LifeCycle.hpp>
 #include <gnuradio-4.0/Settings.hpp>
 
 #include <cstdio>
+#include <print>
 #include <utility>
 
 namespace gr {
@@ -51,6 +53,12 @@ const SettingsCtx& CtxSettingsBase::activeContext() const noexcept { return _act
 const std::set<std::string>& CtxSettingsBase::autoForwardParameters() const noexcept { return _autoForwardParameters; }
 
 void CtxSettingsBase::addAutoForwardParameters(std::set<std::string> parameterKeys) {
+    // the per-work() read of this set is unlocked because the set is fixed for the duration of a
+    // run, so a mutation while the block is running is refused rather than allowed to race
+    if (_descriptor->hooks.blockState != nullptr && lifecycle::isActive(_descriptor->hooks.blockState(_block))) {
+        std::println(stderr, "gr::Settings: addAutoForwardParameters() refused on a running block; the auto-forward set is fixed for the duration of a run");
+        return;
+    }
     std::lock_guard guard(_mutex);
     _autoForwardParameters.merge(parameterKeys);
 }

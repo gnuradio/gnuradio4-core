@@ -233,6 +233,27 @@ const boost::ut::suite<"settings concurrency"> settingsConcurrencyTests = [] {
         expect(eq(block.gain.value, 3.0f)) << "the surviving staged value was never applied";
     };
 
+    // the per-work() read of the auto-forward set is unlocked because the set is fixed for the run
+    "the auto-forward set cannot be added to while the block is running"_test = [] {
+        qa_settings::TunableBlock block;
+        block.init(std::make_shared<gr::Sequence>());
+
+        block.settings().addAutoForwardParameters({"before_start"});
+        expect(block.settings().autoForwardParameters().contains("before_start")) << "a key added before the run was refused";
+
+        expect(block.changeStateTo(gr::lifecycle::State::INITIALISED).has_value());
+        expect(block.changeStateTo(gr::lifecycle::State::RUNNING).has_value());
+
+        block.settings().addAutoForwardParameters({"after_start"});
+        expect(not block.settings().autoForwardParameters().contains("after_start")) << "a key added on a running block reached the set the work path reads unlocked";
+
+        expect(block.changeStateTo(gr::lifecycle::State::REQUESTED_STOP).has_value());
+        expect(block.changeStateTo(gr::lifecycle::State::STOPPED).has_value());
+
+        block.settings().addAutoForwardParameters({"after_stop"});
+        expect(block.settings().autoForwardParameters().contains("after_stop")) << "the run is over, so the set is writable again";
+    };
+
     "a rejected value is neither applied nor forwarded"_test = [] {
         qa_settings::ValidatingBlock block;
         block.init(std::make_shared<gr::Sequence>());

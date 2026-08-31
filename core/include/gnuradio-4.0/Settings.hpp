@@ -26,6 +26,13 @@
 
 namespace gr {
 
+// Declared in LifeCycle.hpp. Forward-declared here so that the settings table can query a block's
+// lifecycle state without this header participating in that include cycle.
+namespace lifecycle {
+enum class State : char;
+[[nodiscard]] constexpr bool isActive(State state) noexcept;
+} // namespace lifecycle
+
 namespace settings {
 
 template<typename T>
@@ -408,6 +415,7 @@ struct BlockHooks {
     using SettingsChangedInvoker  = void (*)(void* block, property_map& oldSettings, property_map& newSettings, property_map& forwardSettings);
     using ResetInvoker            = void (*)(void* block);
     using ChunkRatioReader        = bool (*)(const void* block, float& ratio);
+    using BlockStateReader        = lifecycle::State (*)(const void* block);
 
     std::span<const MemberDescriptor> members{};
     bool                              reflectable{false};
@@ -417,6 +425,7 @@ struct BlockHooks {
     SettingsChangedInvoker  settingsChanged{nullptr};
     ResetInvoker            reset{nullptr};
     ChunkRatioReader        chunkRatio{nullptr};
+    BlockStateReader        blockState{nullptr};
 };
 
 /**
@@ -520,6 +529,11 @@ bool readChunkRatio(const void* block, float& ratio) {
     return true;
 }
 
+template<typename TBlock>
+lifecycle::State readBlockState(const void* block) {
+    return static_cast<const TBlock*>(block)->state();
+}
+
 } // namespace detail
 
 namespace settings {
@@ -599,6 +613,11 @@ template<typename TBlock>
         if constexpr (TBlock::ResamplingControl::kEnabled) {
             hooks.chunkRatio = &detail::readChunkRatio<TBlock>;
         }
+    }
+    if constexpr (requires(const TBlock block) {
+                      { block.state() } -> std::same_as<lifecycle::State>;
+                  }) {
+        hooks.blockState = &detail::readBlockState<TBlock>;
     }
     return hooks;
 }
@@ -733,7 +752,8 @@ struct SettingsBase {
      *
      * The set is read unlocked on the per-work() path, so it is fixed for the duration of a
      * run: add to it while the block is not running -- at construction, or while the graph is
-     * being built.
+     * being built. The rule is enforced rather than documented only: a call on a running block is
+     * refused and reported, so the unlocked read cannot race a mutation.
      */
     virtual void addAutoForwardParameters(std::set<std::string> parameterKeys) = 0;
 
