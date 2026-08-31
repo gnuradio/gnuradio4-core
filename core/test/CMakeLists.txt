@@ -32,6 +32,7 @@ set(_CORE_TESTS
     qa_Tensor
     qa_TensorMath
     qa_SVD
+    qa_Settings
     qa_TriggerMatcher
     qa_YamlPmt
     qa_PortableTypeName
