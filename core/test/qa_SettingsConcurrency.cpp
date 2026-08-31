@@ -48,6 +48,28 @@ struct ReentrantBlock : gr::Block<ReentrantBlock> {
     }
 };
 
+// settingsChanged blocks until a second thread has staged a value, which makes the lost update
+// deterministic. The loops above reach that window only by chance.
+struct BarrierBlock : gr::Block<BarrierBlock> {
+    gr::PortIn<float>  in;
+    gr::PortOut<float> out;
+
+    gr::Annotated<float, "gain"> gain = 1.0f;
+
+    GR_MAKE_REFLECTABLE(BarrierBlock, in, out, gain);
+
+    std::atomic<bool> _inCallback{false};
+    std::atomic<bool> _mayLeave{false};
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
+
+    void settingsChanged(const gr::property_map& /*oldSettings*/, const gr::property_map& /*newSettings*/) {
+        _inCallback.store(true);
+        _inCallback.notify_all();
+        _mayLeave.wait(false); // released by the second thread once it has staged
+    }
+};
+
 // gain is range-limited, so an out-of-range staged value is rejected by the annotation's validator
 struct ValidatingBlock : gr::Block<ValidatingBlock> {
     gr::PortIn<float>  in;
@@ -182,6 +204,33 @@ const boost::ut::suite<"settings concurrency"> settingsConcurrencyTests = [] {
         expect(gt(block._nCallbacks, 0UZ)) << "settingsChanged was never invoked";
         expect(gt(block._nKeysObserved, 0UZ)) << "the callback could not read the settings back";
         expect(eq(block.gain.value, 2.0f)) << "the staged value was not applied";
+    };
+
+    "a value staged inside the settingsChanged callback survives the apply that is running"_test = [] {
+        qa_settings::BarrierBlock block;
+        block.init(std::make_shared<gr::Sequence>());
+
+        std::ignore = block.settings().set({{"gain", 2.0f}});
+        std::ignore = block.settings().activateContext();
+
+        std::atomic<bool> staged{false};
+        std::thread       stager([&block, &staged] {
+            block._inCallback.wait(false);                              // the apply has released the lock for the callback
+            std::ignore = block.settings().setStaged({{"gain", 3.0f}}); // which is what lets this succeed
+            staged.store(true);
+            block._mayLeave.store(true);
+            block._mayLeave.notify_all();
+        });
+
+        std::ignore = block.settings().applyStagedParameters();
+        stager.join();
+
+        expect(staged.load()) << "the second thread never reached setStaged inside the callback window";
+        expect(eq(block.gain.value, 2.0f)) << "the first batch was not applied";
+        expect(block.settings().stagedParameters().contains(std::pmr::string("gain"))) << "the value staged inside the callback was erased by the apply that was running";
+
+        std::ignore = block.settings().applyStagedParameters();
+        expect(eq(block.gain.value, 3.0f)) << "the surviving staged value was never applied";
     };
 
     "a rejected value is neither applied nor forwarded"_test = [] {
