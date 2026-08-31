@@ -1025,15 +1025,21 @@ public:
                 storeCurrentParameters(oldSettings);
             }
 
+            // The batch is moved out of the shared map before anything below can release the
+            // lock. A setStaged() call that arrives during the settingsChanged() window then stages
+            // for the next apply instead of being cleared with this one, and a concurrent apply
+            // takes an empty map rather than repeating this batch.
+            const property_map batch = std::exchange(_stagedParameters, {});
+
             // check if reset of settings should be performed
-            if (_stagedParameters.contains(static_cast<std::pmr::string>(gr::tag::RESET_DEFAULTS))) {
+            if (batch.contains(static_cast<std::pmr::string>(gr::tag::RESET_DEFAULTS))) {
                 resetDefaultsImpl();
             }
 
             // Use static dispatch table for O(1) lookup instead of O(members) iteration (Optimization F)
             const auto&  appliers = stagedAppliers();
             property_map staged;
-            for (const auto& [key, stagedValue] : _stagedParameters) {
+            for (const auto& [key, stagedValue] : batch) {
                 auto it = appliers.find(key);
                 if (it != appliers.end()) {
                     constexpr bool hasCallback = HasSettingsChangedCallback<TBlock>;
@@ -1082,18 +1088,21 @@ public:
                 }
             }
 
-            if (_stagedParameters.contains(static_cast<std::pmr::string>(gr::tag::STORE_DEFAULTS))) {
+            if (batch.contains(static_cast<std::pmr::string>(gr::tag::STORE_DEFAULTS))) {
                 storeDefaults();
             }
 
             if constexpr (HasSettingsResetCallback<TBlock>) {
-                if (_stagedParameters.contains(static_cast<std::pmr::string>(gr::tag::RESET_DEFAULTS))) {
+                if (batch.contains(static_cast<std::pmr::string>(gr::tag::RESET_DEFAULTS))) {
                     _block->reset();
                 }
             }
+        } else {
+            _stagedParameters.clear(); // a block with no reflectable members cannot apply these
         }
-        _stagedParameters.clear(); // inside the lock: setStaged()/activateContext() insert into the same map
-        gr::atomic_ref(_changed).store_release(false);
+        // anything staged while the lock was released is work for the next apply, so the map
+        // reports unchanged only when it is empty
+        gr::atomic_ref(_changed).store_release(!_stagedParameters.empty());
         return result;
     }
 
