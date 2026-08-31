@@ -8,12 +8,12 @@ option(ENABLE_SPLIT "Enable splitting of generated files (pass --split to the pa
 include(CMakePackageConfigHelpers)
 include(GNUInstallDirs)
 
-if(NOT GNURADIO_PARSE_REGISTRATIONS_TOOL_CXX_COMPLILER)
-  set(GNURADIO_PARSE_REGISTRATIONS_TOOL_CXX_COMPLILER ${CMAKE_CXX_COMPILER})
+if(NOT GNURADIO_PARSE_REGISTRATIONS_TOOL_CXX_COMPILER)
+  set(GNURADIO_PARSE_REGISTRATIONS_TOOL_CXX_COMPILER ${CMAKE_CXX_COMPILER})
 endif()
 
 message(
-  STATUS "Using ${GNURADIO_PARSE_REGISTRATIONS_TOOL_CXX_COMPLILER} to compile the gnuradio_4_0_parse_registrations tool"
+  STATUS "Using ${GNURADIO_PARSE_REGISTRATIONS_TOOL_CXX_COMPILER} to compile the gnuradio_4_0_parse_registrations tool"
 )
 
 # --------------------------------------------------------------------------
@@ -24,7 +24,7 @@ if(NOT EXISTS "${TOOLS_BUILD_DIR}/CMakeCache.txt")
   message(STATUS "Configuring parser tool in ${TOOLS_BUILD_DIR}...")
   execute_process(
     COMMAND ${CMAKE_COMMAND} -S ${PROJECT_SOURCE_DIR}/tools -B ${TOOLS_BUILD_DIR} -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
-            -DCMAKE_CXX_COMPILER=${GNURADIO_PARSE_REGISTRATIONS_TOOL_CXX_COMPLILER}
+            -DCMAKE_CXX_COMPILER=${GNURADIO_PARSE_REGISTRATIONS_TOOL_CXX_COMPILER}
     RESULT_VARIABLE config_result
     OUTPUT_VARIABLE config_output
     ERROR_VARIABLE config_error
