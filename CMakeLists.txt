@@ -572,6 +572,15 @@ target_include_directories(vir INTERFACE $<BUILD_INTERFACE:${vir-simd_SOURCE_DIR
                                          $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 install(TARGETS vir EXPORT gnuradio4Targets)
 
+# Install these headers only when they are the copy this project fetched and pinned above. Nothing else provides that
+# copy, and an isolated prefix needs it, because the exported vir target points consumers at ${CMAKE_INSTALL_INCLUDEDIR}
+# and the installed CMake package declares no dependency on an external vir-simd. When vir-simd was instead found on the
+# system, the headers belong to whatever provides them and are already on the default include path, so copying them here
+# would stage the same files from a second place.
+if(EMSCRIPTEN OR GR_USE_FETCHCONTENT_DEPS)
+  install(DIRECTORY ${vir-simd_SOURCE_DIR}/vir DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+endif()
+
 # the script configure won't run on win32 without asking bash to do it
 if(WIN32)
   set(BASH "bash.exe")
