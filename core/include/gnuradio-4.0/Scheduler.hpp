@@ -33,14 +33,32 @@
 #endif // #ifdef ERROR
 #endif // #ifdef _WIN32
 
-// returns when the sequence leaves oldValue or after timeout_ms, whichever comes first. The wait
-// polls deliberately: the caller may be the only thread of its runtime, so a sequence nothing else
-// advances or notifies must not hold it. The 1 ms chunk bounds the resume latency once the value moves.
+// Returns when the sequence leaves oldValue or after timeout_ms, whichever comes first.
+//
+// The timeout is a wall-clock bound and not merely a hint: the caller may be the only thread of its
+// runtime, and a sequence that nothing else advances or notifies must not hold it. That is why this
+// cannot be the atomic's own wait, which has no timed form before C++26 — and why a raw futex is no
+// substitute, since a sequence is register-width and the standard library notifies one through a
+// proxy rather than through its address.
+//
+// So it waits in chunks, but the chunk doubles: a value that moves does so most often right after
+// the park begins, where a millisecond keeps the resume prompt, while a park that runs its full
+// length costs a handful of wake-ups rather than one per millisecond. The cap keeps the resume
+// bounded however long the timeout is.
 template<typename T>
 inline void waitUntilChanged(gr::Sequence& sequence, T oldValue, unsigned int timeout_ms = 1U) {
+    constexpr auto firstChunk = std::chrono::milliseconds(1);
+    constexpr auto chunkCap   = std::chrono::milliseconds(16);
+
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    while (sequence.value() == oldValue && std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    auto       chunk    = firstChunk;
+    while (sequence.value() == oldValue) {
+        const auto remaining = deadline - std::chrono::steady_clock::now();
+        if (remaining <= std::chrono::steady_clock::duration::zero()) {
+            return;
+        }
+        std::this_thread::sleep_for(std::min(std::chrono::duration_cast<std::chrono::steady_clock::duration>(chunk), remaining));
+        chunk = std::min(chunk * 2, chunkCap);
     }
 }
 
