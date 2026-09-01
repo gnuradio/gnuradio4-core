@@ -2152,8 +2152,6 @@ public:
     void finaliseIO(TInputSpans& inputSpans, TOutputSpans& outputSpans, work::Status& userReturnStatus, std::size_t& processedIn, std::size_t processedOut, std::size_t resampledIn) {
         using enum gr::work::Status;
 
-        reportZeroProgressSpin(userReturnStatus, processedIn, processedOut);
-
         if (processedOut == 0) {
             // if no data is published or consumed => do not publish any tags
             for_each_writer_span([](auto& outSpan) { outSpan.tagsPublished = 0; }, outputSpans);
@@ -2192,6 +2190,51 @@ public:
                 for_each_writer_span([&forwardParams](auto& outSpan) { publishForwardParams(outSpan, forwardParams); }, outputSpans);
             }
             publishEoS(outputSpans);
+        }
+    }
+
+    // Sync ports auto-consume/auto-publish processedIn/processedOut (ProcessAll), so those counts
+    // are real moved work. Async ports move nothing without an explicit span request (ProcessNone),
+    // so a processBulk() block whose connected inputs (or, for the output side, outputs) are all
+    // Async leaves the counts at the sample limit even when the call moved nothing — the scheduler
+    // would then see fabricated performed work and its idle back-off and park never engage. For
+    // those blocks the explicit span requests are the only truthful record.
+    template<typename TInputSpans, typename TOutputSpans>
+    [[nodiscard]] std::pair<std::size_t, std::size_t> accountedStreamWork(TInputSpans& inputSpans, TOutputSpans& outputSpans, std::size_t processedIn, std::size_t processedOut) const noexcept {
+        if constexpr (!HasProcessBulkFunction<Derived>) {
+            return {processedIn, processedOut};
+        } else {
+            bool        anySyncInput  = false;
+            std::size_t asyncConsumed = 0UZ;
+            for_each_reader_span(
+                [&anySyncInput, &asyncConsumed](auto& in) {
+                    if (!in.isConnected) {
+                        return;
+                    }
+                    if (in.isSync) {
+                        anySyncInput = true;
+                    } else if (in.isConsumeRequested()) {
+                        asyncConsumed += in.nRequestedSamplesToConsume();
+                    }
+                },
+                inputSpans);
+
+            bool        anySyncOutput  = false;
+            std::size_t asyncPublished = 0UZ;
+            for_each_writer_span(
+                [&anySyncOutput, &asyncPublished](auto& out) {
+                    if (!out.isConnected) {
+                        return;
+                    }
+                    if (out.isSync) {
+                        anySyncOutput = true;
+                    } else if (out.isPublishRequested()) {
+                        asyncPublished += out.nRequestedSamplesToPublish();
+                    }
+                },
+                outputSpans);
+
+            return {anySyncInput ? processedIn : asyncConsumed, anySyncOutput ? processedOut : asyncPublished};
         }
     }
 
@@ -2316,11 +2359,13 @@ public:
             }
             _inProcessOneDispatch = false;
         }
+        const auto [accountedIn, accountedOut] = accountedStreamWork(inputSpans, outputSpans, processedIn, processedOut);
+        reportZeroProgressSpin(userReturnStatus, accountedIn, accountedOut);
         work::sanitiseProcessStatus(userReturnStatus, processedIn, processedOut);
         finaliseIO(inputSpans, outputSpans, userReturnStatus, processedIn, processedOut, limits.resampledIn);
 
         constexpr bool kIsSourceBlock = TInputTypes::size.value == 0;
-        std::size_t    performedWork  = work::computePerformedWork(userReturnStatus, processedIn, processedOut, kIsSourceBlock);
+        std::size_t    performedWork  = work::computePerformedWork(userReturnStatus, accountedIn, accountedOut, kIsSourceBlock);
         if (performedWork > 0UZ) {
             progress->incrementAndGet();
             progress->notify_all();
