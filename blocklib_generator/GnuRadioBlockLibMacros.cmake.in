@@ -343,7 +343,7 @@ function(gr_add_block_plugin LIB_NAME)
     endif()
 
     set(options "SPLIT_BLOCK_INSTANTIATIONS" "NO_INSTALL")
-    set(oneValueArgs MAX_REGISTRATIONS_PER_TU)
+    set(oneValueArgs MAX_REGISTRATIONS_PER_TU REGISTRY_HEADER REGISTRY_INSTANCE)
     set(multiValueArgs HEADERS SOURCES LINK_LIBRARIES)
     cmake_parse_arguments(CBL "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
@@ -359,6 +359,15 @@ function(gr_add_block_plugin LIB_NAME)
       set(MAX_REGISTRATIONS_PER_TU_ARG "")
     endif()
 
+    # the registry the plugin's blocks go into: the one GR_PLUGIN defines, unless the plugin declares
+    # its own instance in a header of its own
+    if(NOT CBL_REGISTRY_HEADER)
+      set(CBL_REGISTRY_HEADER gnuradio-4.0/Plugin.hpp)
+    endif()
+    if(NOT CBL_REGISTRY_INSTANCE)
+      set(CBL_REGISTRY_INSTANCE grPluginBlockRegistry)
+    endif()
+
     set(OBJECT_LIB_NAME "${LIB_NAME}")
     add_library(${OBJECT_LIB_NAME} OBJECT
         ${CBL_SOURCES}
@@ -372,9 +381,9 @@ function(gr_add_block_plugin LIB_NAME)
         ${SPLIT_BLOCK_INSTANTIATIONS_ARG}
         ${MAX_REGISTRATIONS_PER_TU_ARG}
         REGISTRY_HEADER
-        gnuradio-4.0/Plugin.hpp
+        ${CBL_REGISTRY_HEADER}
         REGISTRY_INSTANCE
-        grPluginBlockRegistry)
+        ${CBL_REGISTRY_INSTANCE})
     target_link_libraries(${OBJECT_LIB_NAME} PUBLIC gnuradio4::gnuradio-core gnuradio4::gnuradio-blocklib-core gnuradio4::gnuradio-plugin ${CBL_LINK_LIBRARIES})
     if(TARGET gnuradio-options)
         target_link_libraries(${OBJECT_LIB_NAME} PRIVATE gnuradio-options)
