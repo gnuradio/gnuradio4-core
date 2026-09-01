@@ -9,7 +9,7 @@ if(NOT EMSCRIPTEN)
               gnuradio-plugin
               ut
               ut-benchmark)
-    if(EMSCRIPTEN) # performance benchmarks should be optimised
+    if(EMSCRIPTEN OR CMAKE_CROSSCOMPILING) # performance benchmarks should be optimised
       target_compile_options(${BM_NAME} PRIVATE -O3)
     else()
       target_compile_options(${BM_NAME} PRIVATE -O3 -march=native)
