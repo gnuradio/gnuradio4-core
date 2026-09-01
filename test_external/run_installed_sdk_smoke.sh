@@ -17,6 +17,7 @@ cmake --build "${smoke_build_dir}"
 
 # building verifies the headers and link line; running verifies the generated registration path
 for consumer in minimal_blocklib_consumer_Shared minimal_blocklib_consumer_Static \
-  minimal_blocklib_collision_Shared minimal_blocklib_collision_Static; do
+  minimal_blocklib_collision_Shared minimal_blocklib_collision_Static \
+  minimal_blocklib_named_registry; do
   "${smoke_build_dir}/${consumer}"
 done
