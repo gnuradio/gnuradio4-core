@@ -191,7 +191,8 @@ jobs:
           cmake --build "${{ runner.workspace }}/build-smoke"
           if [[ "${{ matrix.cmake_wrapper }}" == "emcmake" ]]; then
             for consumer in minimal_blocklib_consumer_Shared minimal_blocklib_consumer_Static \
-                            minimal_blocklib_collision_Shared minimal_blocklib_collision_Static; do
+                            minimal_blocklib_collision_Shared minimal_blocklib_collision_Static \
+                            minimal_blocklib_named_registry; do
               "${system_node}" "${{ runner.workspace }}/build-smoke/${consumer}.js"
             done
           fi

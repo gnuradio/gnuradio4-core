@@ -27,6 +27,9 @@ gr_add_block_library(
 # registered-header check sees only its own include tree
 add_subdirectory(other)
 
+# a third block library, whose blocks go into a registry the project declares rather than into the global one
+add_subdirectory(named_registry)
+
 # both linkage forms run the same consumer: it instantiates the block directly, calls the generated initializer, and
 # then constructs a block through the registry, which is how the installed SDK is used
 foreach(_linkage Shared Static)
@@ -41,3 +44,7 @@ foreach(_linkage Shared Static)
                         PRIVATE MinimalBlockLib${_linkage} OtherBlockLib${_linkage} gnuradio4::gnuradio-core)
   target_include_directories(minimal_blocklib_collision_${_linkage} PRIVATE ${CMAKE_BINARY_DIR}/include)
 endforeach()
+
+add_executable(minimal_blocklib_named_registry src/named_registry_consumer.cpp)
+target_link_libraries(minimal_blocklib_named_registry PRIVATE NamedRegistryBlockLibStatic gnuradio4::gnuradio-core)
+target_include_directories(minimal_blocklib_named_registry PRIVATE ${CMAKE_BINARY_DIR}/include)

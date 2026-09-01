@@ -10,6 +10,7 @@ function(add_app_test TEST_NAME)
   add_dependencies(
     ${TEST_NAME}
     GoodBasePlugin
+    GoodRegistryPlugin
     good_math_plugin
     good_conversion_plugin
     bad_plugin)
@@ -99,6 +100,8 @@ if(GR_ENABLE_BLOCK_REGISTRY AND INTERNAL_ENABLE_BLOCK_PLUGINS)
     good_math_plugin
     good_conversion_plugin
     bad_plugin)
+
+  add_app_test(qa_PluginRegistration)
 endif()
 
 if(GR_ENABLE_BLOCK_REGISTRY AND INTERNAL_ENABLE_BLOCK_PLUGINS)
