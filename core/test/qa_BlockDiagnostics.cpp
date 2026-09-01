@@ -22,8 +22,13 @@
  * A processBulk() that returns OK while consuming and publishing nothing leaves the scheduler with no reason to stop
  * and no reason to wait, so the graph spins at full speed and produces nothing. The framework does not break that
  * cycle - it only names the block once the cycle has lasted about a second.
- * The blocks below are three shapes a work call can take: stuck, out of output space, and out of
- * input, and only the first of them may be reported.
+ * The blocks below are the shapes a work call can take: stuck, out of output space, out of
+ * input, and the two Async-input variants of stuck and productive; only the stuck shapes may be reported.
+ *
+ * The Async pair also pins the performed-work accounting: an Async port moves nothing without an explicit
+ * span request, so a block whose only input is Async and which requests nothing has performed no work,
+ * however its status reads. Misaccounting that as work both masks this diagnostic and pins the
+ * scheduler's idle back-off and park off, which turns an idle graph into a spinning one.
  */
 
 namespace qa_block_diagnostics {
@@ -115,6 +120,38 @@ struct DiscardingSink : Block<DiscardingSink> {
     }
 };
 
+/// the same defect behind an Async port, where no sync port constrains the processed count
+struct AsyncStuckSink : Block<AsyncStuckSink> {
+    PortIn<float, Async> in;
+
+    GR_MAKE_REFLECTABLE(AsyncStuckSink, in);
+
+    std::size_t nWorkCalls = 0UZ;
+
+    work::Status processBulk(InputSpanLike auto& inSpan) {
+        nWorkCalls++;
+        std::ignore = inSpan.consume(0UZ);
+        return work::Status::OK;
+    }
+};
+
+/// the productive Async counterpart: explicit consumption is the work record
+struct AsyncDiscardingSink : Block<AsyncDiscardingSink> {
+    PortIn<float, Async> in;
+
+    GR_MAKE_REFLECTABLE(AsyncDiscardingSink, in);
+
+    std::size_t nWorkCalls = 0UZ;
+    std::size_t nConsumed  = 0UZ;
+
+    work::Status processBulk(InputSpanLike auto& inSpan) {
+        nWorkCalls++;
+        nConsumed += inSpan.size();
+        std::ignore = inSpan.consume(inSpan.size());
+        return work::Status::OK;
+    }
+};
+
 } // namespace qa_block_diagnostics
 
 const boost::ut::suite<"block diagnostics"> _blockDiagnostics = [] {
@@ -156,6 +193,58 @@ const boost::ut::suite<"block diagnostics"> _blockDiagnostics = [] {
         expect(keptSpinning) << "diagnose only: the report must not stop the graph";
         expect(gt(stuck.nWorkCalls, 1UZ)) << "the block must be dispatched throughout, not parked";
         expect(eq(sink.nWorkCalls, 0UZ)) << "a sink without input is never dispatched, so it cannot be reported";
+    };
+
+    "a block whose only input is Async is reported when it returns OK requesting nothing"_test = [] {
+        StderrCapture capture;
+
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<EndlessSource>();
+        auto&     stuck  = flow.emplaceBlock<AsyncStuckSink>();
+        expect(flow.connect<"out", "in">(source, stuck).has_value());
+
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        std::jthread runner([&scheduler] { std::ignore = scheduler.runAndWait(); });
+
+        const auto  deadline = std::chrono::steady_clock::now() + kReportDeadline;
+        std::string reported;
+        while (reported.empty() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            reported = capture.text();
+        }
+        const bool keptSpinning = gr::lifecycle::isActive(scheduler.state());
+
+        scheduler.requestStop();
+        runner.join();
+
+        expect(!reported.empty()) << "an Async port constrains nothing, so its zero-request OK must still be seen as zero progress";
+        expect(reported.contains(std::string_view(stuck.unique_name))) << std::format("the report must name the stuck Async sink, got: {}", reported);
+        expect(keptSpinning) << "diagnose only: the report must not stop the graph";
+        expect(gt(stuck.nWorkCalls, 1UZ)) << "the block must be dispatched throughout, not parked";
+    };
+
+    "an Async sink that consumes what it is offered is doing work and is never reported"_test = [] {
+        StderrCapture capture;
+
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<EndlessSource>();
+        auto&     sink   = flow.emplaceBlock<AsyncDiscardingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        std::jthread runner([&scheduler] { std::ignore = scheduler.runAndWait(); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(1600)); // past the one-second reporting threshold
+        const std::string reported = capture.text();
+
+        scheduler.requestStop();
+        runner.join();
+
+        expect(reported.empty()) << std::format("explicit Async consumption is performed work, not a stuck block, got: {}", reported);
+        expect(gt(sink.nConsumed, 0UZ)) << "the sink must actually have consumed samples for this scenario to prove anything";
     };
 };
 
