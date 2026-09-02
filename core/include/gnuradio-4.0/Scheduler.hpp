@@ -1500,14 +1500,17 @@ protected:
     std::optional<Message> propertyCallbackEmplaceEdge([[maybe_unused]] std::string_view propertyName, Message message) {
         assert(propertyName == scheduler::property::kEmplaceEdge);
         using namespace std::string_literals;
-        auto&                       messageData      = message.data.value();
-        const auto                  sourceBlock      = messageData.at(std::pmr::string(gr::serialization_fields::EDGE_SOURCE_BLOCK)).value_or(std::string_view{});
-        const auto                  sourcePort       = messageData.at(std::pmr::string(gr::serialization_fields::EDGE_SOURCE_PORT)).value_or(std::string_view{});
-        const auto                  destinationBlock = messageData.at(std::pmr::string(gr::serialization_fields::EDGE_DESTINATION_BLOCK)).value_or(std::string_view{});
-        const auto                  destinationPort  = messageData.at(std::pmr::string(gr::serialization_fields::EDGE_DESTINATION_PORT)).value_or(std::string_view{});
-        [[maybe_unused]] const auto minBufferSize    = checked_access_ptr{messageData.at(std::pmr::string(gr::serialization_fields::EDGE_MIN_BUFFER_SIZE)).get_if<gr::Size_t>()};
-        [[maybe_unused]] const auto weight           = checked_access_ptr{messageData.at(std::pmr::string(gr::serialization_fields::EDGE_WEIGHT)).get_if<std::int32_t>()};
-        const auto                  edgeName         = messageData.at(std::pmr::string(gr::serialization_fields::EDGE_NAME)).value_or(std::string_view{});
+        auto&      messageData      = message.data.value();
+        const auto sourceBlock      = messageData.at(std::pmr::string(gr::serialization_fields::EDGE_SOURCE_BLOCK)).value_or(std::string_view{});
+        const auto sourcePort       = messageData.at(std::pmr::string(gr::serialization_fields::EDGE_SOURCE_PORT)).value_or(std::string_view{});
+        const auto destinationBlock = messageData.at(std::pmr::string(gr::serialization_fields::EDGE_DESTINATION_BLOCK)).value_or(std::string_view{});
+        const auto destinationPort  = messageData.at(std::pmr::string(gr::serialization_fields::EDGE_DESTINATION_PORT)).value_or(std::string_view{});
+        // checked_access_ptr terminates on a null unless not_null is turned off, so the
+        // non-terminating form is what keeps the incompleteness report below reachable: a message
+        // whose buffer size or weight is of the wrong type is a sender's input and is refused as one
+        [[maybe_unused]] const auto minBufferSize = checked_access_ptr<gr::Size_t, false>{messageData.at(std::pmr::string(gr::serialization_fields::EDGE_MIN_BUFFER_SIZE)).get_if<gr::Size_t>()};
+        [[maybe_unused]] const auto weight        = checked_access_ptr<std::int32_t, false>{messageData.at(std::pmr::string(gr::serialization_fields::EDGE_WEIGHT)).get_if<std::int32_t>()};
+        const auto                  edgeName      = messageData.at(std::pmr::string(gr::serialization_fields::EDGE_NAME)).value_or(std::string_view{});
 
         if (sourceBlock.empty() || sourcePort.empty() || destinationBlock.empty() || destinationPort.empty() || minBufferSize == nullptr || weight == nullptr || edgeName.empty()) {
             message.data = std::unexpected(Error{std::format("Message is incomplete {}", message)});

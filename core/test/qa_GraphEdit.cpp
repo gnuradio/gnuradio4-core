@@ -110,6 +110,20 @@ void registerTestBlocks() {
     return false;
 }
 
+[[nodiscard]] std::string awaitError(gr::MsgPortIn& port, std::string_view endpoint) {
+    for (std::size_t i = 0UZ; i < 3000UZ; ++i) {
+        auto messages = port.streamReader().get();
+        for (const gr::Message& message : messages) {
+            if (message.endpoint == endpoint && !message.data.has_value()) {
+                return message.data.error().message;
+            }
+        }
+        std::ignore = messages.consume(messages.size());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return {};
+}
+
 void sendMessage(gr::MsgPortOut& port, std::string_view endpoint, gr::property_map data) { gr::sendMessage<gr::message::Command::Set>(port, "", endpoint, std::move(data)); }
 
 } // namespace qa_edit
@@ -344,6 +358,41 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
     };
 
 #endif
+
+    // the fields of an edge message come from whoever sent it, so a value of the wrong type is
+    // unusable input: the message is answered as incomplete rather than ending the process, which
+    // is what a terminating pointer read of the buffer size or the weight would do
+    "an edge message whose weight is of the wrong type is refused"_test = [] {
+        using namespace gr::serialization_fields;
+
+        qa_edit::TestScheduler scheduler;
+        {
+            gr::Graph flow;
+            auto&     source = flow.emplaceBlock<qa_edit::Source>();
+            auto&     sink   = flow.emplaceBlock<qa_edit::Sink>();
+            expect(flow.connect<"out", "in">(source, sink).has_value());
+            expect(scheduler.exchange(std::move(flow)).has_value());
+        }
+
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(toScheduler.connect(scheduler.msgIn).has_value());
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+
+        qa_edit::sendMessage(toScheduler, gr::scheduler::property::kEmplaceEdge,
+            {{std::pmr::string(EDGE_SOURCE_BLOCK), std::string("source")}, {std::pmr::string(EDGE_SOURCE_PORT), std::string("out")},           //
+                {std::pmr::string(EDGE_DESTINATION_BLOCK), std::string("sink")}, {std::pmr::string(EDGE_DESTINATION_PORT), std::string("in")}, //
+                {std::pmr::string(EDGE_MIN_BUFFER_SIZE), gr::undefined_Size}, {std::pmr::string(EDGE_WEIGHT), std::string("heavy")},           //
+                {std::pmr::string(EDGE_NAME), std::string("wrong weight")}});
+
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+
+        const std::string reported = qa_edit::awaitError(fromScheduler, gr::scheduler::property::kEmplaceEdge);
+        expect(!reported.empty()) << "a weight of the wrong type must be reported, not end the process";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+    };
 
     "an edge sized by duration follows the sample rate"_test = [] {
         using gr::graph::edgeBufferSizeFor;
