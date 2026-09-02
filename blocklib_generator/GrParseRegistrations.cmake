@@ -207,6 +207,20 @@ function(
       PARENT_SCOPE)
 endfunction()
 
+# The two files that belong to the module rather than to a header are written by every header's run. Rewriting one only
+# when its content changed keeps the build quiet, and still lets a change to what the generator emits reach a tree an
+# older generator already wrote.
+function(gr_pr_write_module_file PATH TEXT)
+  if(EXISTS "${PATH}")
+    file(READ "${PATH}" _current)
+    if(_current STREQUAL "${TEXT}")
+      return()
+    endif()
+  endif()
+  message(STATUS "\t=> Generating file: '${PATH}'")
+  file(WRITE "${PATH}" "${TEXT}")
+endfunction()
+
 if(NOT DEFINED HEADER OR NOT DEFINED OUT_DIR)
   message(FATAL_ERROR "GrParseRegistrations: HEADER and OUT_DIR are required")
 endif()
@@ -244,11 +258,9 @@ endif()
 message(STATUS "parsing header: '${HEADER}' -> '${OUT_DIR}'  split: ${GR_PR_SPLIT_REPORT}  max-per-tu: ${MAX_PER_TU}")
 
 set(GR_PR_INTEGRATOR_SOURCE "${OUT_DIR}/integrator.cpp")
-if(NOT EXISTS "${GR_PR_INTEGRATOR_SOURCE}")
-  message(STATUS "\t=> Generating file: '${GR_PR_INTEGRATOR_SOURCE}'")
-  file(
-    WRITE "${GR_PR_INTEGRATOR_SOURCE}"
-    "
+gr_pr_write_module_file(
+  "${GR_PR_INTEGRATOR_SOURCE}"
+  "
             #include <gnuradio-4.0/BlockRegistry.hpp>
 
             #include \"declarations.hpp\"
@@ -262,16 +274,17 @@ if(NOT EXISTS "${GR_PR_INTEGRATOR_SOURCE}")
                 }
             }
 ")
-endif()
 
 set(GR_PR_INTEGRATOR_HEADER "${OUT_DIR}/${GR_PR_MODULE}.hpp")
-if(NOT EXISTS "${GR_PR_INTEGRATOR_HEADER}")
-  message(STATUS "\t=> Generating file: '${GR_PR_INTEGRATOR_HEADER}'")
-  file(
-    WRITE "${GR_PR_INTEGRATOR_HEADER}"
-    "
+gr_pr_write_module_file(
+  "${GR_PR_INTEGRATOR_HEADER}"
+  "
             #ifndef GR_BLOCKLIB_INIT_MODULE_${GR_PR_MODULE}
             #define GR_BLOCKLIB_INIT_MODULE_${GR_PR_MODULE}
+            #include <cstddef>
+
+            #include <gnuradio-4.0/Export.hpp>
+
             namespace gr { class BlockRegistry; }
 
             extern \"C\" {
@@ -287,7 +300,6 @@ if(NOT EXISTS "${GR_PR_INTEGRATOR_HEADER}")
             }
             #endif
 ")
-endif()
 
 # Read the header and cut it into lines by hand. A CMake list is not usable here: its separator is escaped by an
 # unbalanced '[' or ']' anywhere in the text, which C++ source carries freely, and the lines after such a character

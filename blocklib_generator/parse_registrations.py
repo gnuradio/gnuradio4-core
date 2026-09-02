@@ -45,6 +45,10 @@ INTEGRATOR_SOURCE_TEMPLATE = """
 INTEGRATOR_HEADER_TEMPLATE = """
             #ifndef GR_BLOCKLIB_INIT_MODULE_@MODULE@
             #define GR_BLOCKLIB_INIT_MODULE_@MODULE@
+            #include <cstddef>
+
+            #include <gnuradio-4.0/Export.hpp>
+
             namespace gr { class BlockRegistry; }
 
             extern "C" {
@@ -237,6 +241,19 @@ def write_file(path, text):
         target.write(text)
 
 
+def write_module_file(path, text):
+    """The two files that belong to the module rather than to a header, rewritten only when their
+    content changed: that keeps the build quiet and still carries a change in what the generator
+    emits into a tree an older generator already wrote."""
+    if os.path.exists(path):
+        with open(
+            path, "r", encoding="utf-8", errors="surrogateescape", newline=""
+        ) as current:
+            if current.read() == text:
+                return
+    write_file(path, text)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(add_help=True, description=__doc__)
     parser.add_argument("--header", required=True)
@@ -271,19 +288,14 @@ def main(argv=None):
 
     # the two module-wide files are written once; a second header of the same module leaves them alone.
     # Literal braces are everywhere in these two, so the module name is substituted rather than formatted.
-    integrator_source = os.path.join(out_dir, "integrator.cpp")
-    if not os.path.exists(integrator_source):
-        write_file(
-            integrator_source,
-            INTEGRATOR_SOURCE_TEMPLATE.replace("@MODULE@", module),
-        )
-
-    integrator_header = os.path.join(out_dir, module + ".hpp")
-    if not os.path.exists(integrator_header):
-        write_file(
-            integrator_header,
-            INTEGRATOR_HEADER_TEMPLATE.replace("@MODULE@", module),
-        )
+    write_module_file(
+        os.path.join(out_dir, "integrator.cpp"),
+        INTEGRATOR_SOURCE_TEMPLATE.replace("@MODULE@", module),
+    )
+    write_module_file(
+        os.path.join(out_dir, module + ".hpp"),
+        INTEGRATOR_HEADER_TEMPLATE.replace("@MODULE@", module),
+    )
 
     pending, macro_count = registrations_of(header, read_lines(header))
     file_count = 0
