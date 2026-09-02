@@ -1,7 +1,10 @@
+// TensorMath.hpp declares TransposeOp and the tensor concepts this file uses, and includes this
+// file in turn: the include stays ahead of the guard so that a direct include of this header
+// enters through TensorMath.hpp and finds them.
+#include <gnuradio-4.0/TensorMath.hpp>
+
 #ifndef GNURADIO_GEMV_SIMD_HPP
 #define GNURADIO_GEMV_SIMD_HPP
-
-#include "gnuradio-4.0/TensorMath.hpp"
 
 #include <algorithm>
 #include <array>
