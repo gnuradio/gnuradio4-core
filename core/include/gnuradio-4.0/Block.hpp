@@ -2276,28 +2276,32 @@ public:
         if (limits.isEosPresent || lifecycle::isShuttingDown(this->state()) || limits.asyncEoS || drainStalled) {
             if constexpr (HasProcessEpilogueFunction<Derived>) {
                 inputStreamCache.invalidateStatistic();
-                const std::size_t trailing = inputStreamCache.maxSyncAvailable();
-                if (trailing > 0 && trailing != gr::undefined_size) {
-                    const std::size_t epilogueOutSize = std::max<std::size_t>((input_chunk_size > 0) ? (trailing * output_chunk_size + input_chunk_size - 1) / input_chunk_size : trailing, output_chunk_size);
-                    auto              epilogueIn      = prepareStreams(inputPorts<PortType::STREAM>(&self()), trailing);
-                    auto              epilogueOut     = prepareStreams(outputPorts<PortType::STREAM>(&self()), epilogueOutSize);
-                    // tags ride the tail like any chunk's: the same settings-and-forward
-                    // sequence the ordinary path runs, with the whole trailing span as the
-                    // forward window because nothing after it can retire a deferred tag
-                    applyChangedSettings(true, &_pendingForwardParams);
-                    applyInputTagsAndSettings(epilogueIn, trailing, limits.hasAnyTag);
-                    if constexpr (requires { self().forwardTags(epilogueIn, epilogueOut, trailing); }) {
-                        self().forwardTags(epilogueIn, epilogueOut, trailing);
-                    } else {
-                        forwardInputTags(epilogueIn, epilogueOut, trailing, trailing);
-                    }
-                    if (!_pendingForwardParams.empty()) {
-                        for_each_writer_span([this](auto& out) { publishForwardParams(out, _pendingForwardParams); }, epilogueOut);
-                    }
-                    invokeProcessEpilogue(epilogueIn, epilogueOut);
-                    publishSamples(0UZ, epilogueOut); // publish only what the block explicitly requested via out.publish(n)
-                    consumeReaders(trailing, epilogueIn);
+                // the epilogue is the block's only end-of-stream hook, so it runs once per stream
+                // whatever the tail holds: a block that consumed everything it was given has nothing
+                // trailing, and one with no synchronous input has no trailing count at all, yet both
+                // may still have accumulated state to emit
+                const std::size_t available = inputStreamCache.maxSyncAvailable();
+                const std::size_t trailing  = available == gr::undefined_size ? 0UZ : available;
+
+                const std::size_t epilogueOutSize = std::max<std::size_t>((input_chunk_size > 0) ? (trailing * output_chunk_size + input_chunk_size - 1) / input_chunk_size : trailing, output_chunk_size);
+                auto              epilogueIn      = prepareStreams(inputPorts<PortType::STREAM>(&self()), trailing);
+                auto              epilogueOut     = prepareStreams(outputPorts<PortType::STREAM>(&self()), epilogueOutSize);
+                // tags ride the tail like any chunk's: the same settings-and-forward
+                // sequence the ordinary path runs, with the whole trailing span as the
+                // forward window because nothing after it can retire a deferred tag
+                applyChangedSettings(true, &_pendingForwardParams);
+                applyInputTagsAndSettings(epilogueIn, trailing, limits.hasAnyTag);
+                if constexpr (requires { self().forwardTags(epilogueIn, epilogueOut, trailing); }) {
+                    self().forwardTags(epilogueIn, epilogueOut, trailing);
+                } else {
+                    forwardInputTags(epilogueIn, epilogueOut, trailing, trailing);
                 }
+                if (!_pendingForwardParams.empty()) {
+                    for_each_writer_span([this](auto& out) { publishForwardParams(out, _pendingForwardParams); }, epilogueOut);
+                }
+                invokeProcessEpilogue(epilogueIn, epilogueOut);
+                publishSamples(0UZ, epilogueOut); // publish only what the block explicitly requested via out.publish(n)
+                consumeReaders(trailing, epilogueIn);
             }
             emitErrorMessageIfAny("workInternal(): EOS tag arrived -> REQUESTED_STOP", this->changeStateTo(lifecycle::State::REQUESTED_STOP));
             publishEoS();

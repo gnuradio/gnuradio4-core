@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <format>
 #include <limits>
+#include <numeric>
 #include <ranges>
 #include <string>
 #include <string_view>
@@ -113,9 +114,11 @@ struct Sink : Block<Sink> {
     GR_MAKE_REFLECTABLE(Sink, in);
 
     std::vector<TagRecord> tags;
+    std::vector<float>     samples;
 
     work::Status processBulk(InputSpanLike auto& inSpan) {
         const std::size_t n = inSpan.size();
+        samples.insert(samples.end(), inSpan.begin(), inSpan.end());
         for (const Tag& tag : inSpan.rawTags) {
             tags.push_back(TagRecord{tag.index, tag.map});
         }
@@ -205,6 +208,35 @@ struct EpilogueChunk : Block<EpilogueChunk, ForwardTagPropagation, Resampling<kC
         const std::size_t n = std::min(inSpan.size(), outSpan.size());
         std::ranges::copy(inSpan | std::views::take(n), outSpan.begin());
         outSpan.publish(n);
+        return work::Status::OK;
+    }
+};
+
+/// the accumulate-then-emit shape: it consumes every sample it is offered and has nothing to
+/// publish until the stream ends, so the epilogue is the only call that can carry its result out
+struct EpilogueFlush : Block<EpilogueFlush> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(EpilogueFlush, in, out);
+
+    std::size_t epilogueRuns = 0UZ;
+    float       accumulated  = 0.f;
+
+    work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
+        accumulated += std::accumulate(inSpan.begin(), inSpan.end(), 0.f);
+        std::ignore = inSpan.consume(inSpan.size());
+        outSpan.publish(0UZ);
+        return work::Status::OK;
+    }
+
+    work::Status processEpilogue(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
+        ++epilogueRuns;
+        accumulated += std::accumulate(inSpan.begin(), inSpan.end(), 0.f);
+        if (!outSpan.empty()) {
+            outSpan[0] = accumulated;
+            outSpan.publish(1UZ);
+        }
         return work::Status::OK;
     }
 };
@@ -386,6 +418,29 @@ const boost::ut::suite<"tag forwarding"> _tagForwarding = [] {
         expect(eq(middle.epilogueRuns, 1UZ)) << "the tail did not go through the epilogue, so this test discriminates nothing";
         expect(eq(countNamed(sink.tags, "t56"), 1UZ)) << "the tag at the tail's first sample was dropped";
         expect(eq(countNamed(sink.tags, "t60"), 1UZ)) << "the tag interior to the tail was dropped";
+    };
+
+    "a block that consumes all of its input still runs its epilogue at end of stream"_test = [] {
+        constexpr std::size_t kTotal = 40UZ;
+
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<Source>(gr::property_map{{"name", std::string("src")}});
+        source.nTotal    = kTotal;
+        auto& middle     = flow.emplaceBlock<EpilogueFlush>(gr::property_map{{"name", std::string("mid")}});
+        auto& sink       = flow.emplaceBlock<Sink>(gr::property_map{{"name", std::string("snk")}});
+        expect(flow.connect<"out", "in">(source, middle).has_value());
+        expect(flow.connect<"out", "in">(middle, sink).has_value());
+
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(scheduler.runAndWait().has_value());
+
+        expect(eq(middle.epilogueRuns, 1UZ)) << "a block that leaves nothing trailing got no end-of-stream call";
+        expect(eq(sink.samples.size(), 1UZ)) << "the epilogue's flush did not reach the sink";
+        if (sink.samples.size() == 1UZ) {
+            const float expected = static_cast<float>(kTotal * (kTotal - 1UZ) / 2UZ);
+            expect(eq(sink.samples.front(), expected)) << "the flush carried a total the block never accumulated";
+        }
     };
 
     "a fixed-chunk block defers every tag that is not at its chunk boundary"_test = [&] {
