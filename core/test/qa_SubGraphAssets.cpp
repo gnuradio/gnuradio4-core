@@ -207,6 +207,41 @@ const boost::ut::suite AssetsLoadingTests = [] {
         std::filesystem::remove_all(root);
     };
 
+    // the three skips an index can produce, in one root with a sound definition beside them
+    "a skipped asset is reported and counted, and the sound one still loads"_test = [] {
+        const auto root = std::filesystem::temp_directory_path() / "gr4_qa_asset_skips";
+        std::filesystem::remove_all(root);
+        std::filesystem::create_directories(root);
+
+        const auto listAsset = [](std::ofstream& index, std::string_view file) { //
+            index << "  - file: " << file << "\n    created: \"2024-01-01-00:00:00\"\n    modified: \"2024-01-15-10:00:00\"\n";
+        };
+        {
+            std::ofstream index(root / "index.yaml");
+            index << "assets:\n";
+            listAsset(index, "sound.yaml");
+            listAsset(index, "absent.yaml"); // deliberately never written
+            listAsset(index, "malformed.yaml");
+            listAsset(index, "untyped.yaml");
+        }
+        {
+            std::ofstream sound(root / "sound.yaml");
+            sound << "definition_metadata:\n  block_type: SoundBlock\n";
+            std::ofstream malformed(root / "malformed.yaml");
+            malformed << ": this is not valid yaml: [unclosed\n  - malformed\n";
+            std::ofstream untyped(root / "untyped.yaml");
+            untyped << "definition_metadata:\n  plugin_name: UntypedPlugin\n";
+        }
+
+        auto        loader = makeLoader({root.string()});
+        const auto& defs   = loader.definitionForBlockName();
+        expect(eq(defs.size(), 1uz)) << "only the sound definition may register";
+        expect(defs.contains("SoundBlock")) << "the sound definition must still resolve";
+        expect(eq(loader.nSkippedAssets(), 3uz)) << "the unreadable, the malformed and the untyped asset must each count as a skip";
+
+        std::filesystem::remove_all(root);
+    };
+
     // ── remote tests (server started by CMake fixture) ────────────────────────
 
 #endif
