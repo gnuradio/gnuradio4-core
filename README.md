@@ -70,6 +70,9 @@ echo 1 | sudo tee /sys/block/zram0/reset
   block-registration translation units; bounds per-TU compile time and memory (0 = one TU
   per `GR_REGISTER_BLOCK` line).
 - **`GR_BLOCKLIB_PCH`** (default: ON): precompiled headers for the generated registration TUs.
+- **`GR_QA_PCH`** (default: ON): one precompiled header shared across the test executables,
+  which pay for the same `Block`/`Graph`/`Scheduler` closure. Tests that pin their own
+  optimization level keep parsing the headers, since the shared one no longer matches them.
 - **`GR_BLOCKLIB_BUILD_LIBS`** (default: ON): OFF skips the compiled block-registration libraries
   entirely (headers-only install) — for consumers that instantiate blocks directly and never use
   the runtime `BlockRegistry`, this removes almost the entire block-library build cost.
