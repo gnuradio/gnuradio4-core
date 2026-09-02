@@ -28,6 +28,11 @@ option(GR_BLOCKLIB_PCH "Use precompiled headers for generated block-registration
 # builds a graph from a saved description needs this ON.
 option(GR_BLOCKLIB_BUILD_LIBS "Build the compiled block registration libraries (OFF = install headers only)" ON)
 
+# refuse to configure a block library when one of its module's headers registers blocks and the
+# module's CMake files name it nowhere. Turn it off while writing a new block header, so that the
+# unfinished header does not stop the build directory it sits in; leave it on everywhere else.
+option(GR_BLOCKLIB_REQUIRE_REGISTERED_HEADERS "Fail the configure on a registering header no CMake file names" ON)
+
 function(gr_detail_append_file_to MERGE_OUTPUT_FILE MERGE_INPUT_FILE)
   file(READ ${MERGE_INPUT_FILE} CONTENTS)
   file(APPEND ${MERGE_OUTPUT_FILE} "${CONTENTS}")
@@ -242,8 +247,51 @@ function(gr_add_block_library LIB_NAME)
 
     set(options "SPLIT_BLOCK_INSTANTIATIONS" "MAKE_SHARED_LIBRARY" "MAKE_STATIC_LIBRARY")
     set(oneValueArgs REGISTRY_HEADER REGISTRY_INSTANCE MAX_REGISTRATIONS_PER_TU)
-    set(multiValueArgs HEADERS SOURCES LINK_LIBRARIES)
+    set(multiValueArgs HEADERS SOURCES LINK_LIBRARIES UNREGISTERED_HEADERS)
     cmake_parse_arguments(CBL "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
+
+    # A header that registers blocks but never reaches HEADERS is not handed to the parser, so its
+    # blocks are simply missing from the library and nothing else says so. Read the module's own
+    # include tree rather than a list of ids kept by hand, and refuse the configure naming the
+    # header. UNREGISTERED_HEADERS is how a module says it meant it: a header kept for reference,
+    # or one an optional dependency leaves out of HEADERS in this configuration, is named there
+    # instead. The line filter is the parser's own: any line naming the macro, except one
+    # commented out.
+    set(MODULE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    if(GR_BLOCKLIB_REQUIRE_REGISTERED_HEADERS AND IS_DIRECTORY "${MODULE_INCLUDE_DIR}")
+        set(ACCOUNTED_HEADERS "")
+        foreach(HDR IN LISTS CBL_HEADERS CBL_UNREGISTERED_HEADERS)
+            get_filename_component(ABS_HDR "${HDR}" ABSOLUTE)
+            list(APPEND ACCOUNTED_HEADERS "${ABS_HDR}")
+        endforeach()
+
+        file(GLOB_RECURSE MODULE_HEADERS
+             "${MODULE_INCLUDE_DIR}/*.hpp" "${MODULE_INCLUDE_DIR}/*.h" "${MODULE_INCLUDE_DIR}/*.hh")
+        set(UNDECLARED_HEADERS "")
+        foreach(CANDIDATE IN LISTS MODULE_HEADERS)
+            # the glob is a moment old, and a file the build does not own can be written and removed
+            # between it and this read; file(STRINGS) on a path that has gone ends the configure
+            if(CANDIDATE IN_LIST ACCOUNTED_HEADERS OR NOT EXISTS "${CANDIDATE}")
+                continue()
+            endif()
+            file(STRINGS "${CANDIDATE}" REGISTRATION_LINES REGEX "GR_REGISTER_BLOCK")
+            list(FILTER REGISTRATION_LINES EXCLUDE REGEX "^[ \t]*//")
+            if(REGISTRATION_LINES)
+                file(RELATIVE_PATH CANDIDATE_RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}" "${CANDIDATE}")
+                list(APPEND UNDECLARED_HEADERS "${CANDIDATE_RELATIVE}")
+            endif()
+        endforeach()
+
+        if(UNDECLARED_HEADERS)
+            list(JOIN UNDECLARED_HEADERS "\n  " UNDECLARED_REPORT)
+            message(FATAL_ERROR "${LIB_NAME}: headers carry GR_REGISTER_BLOCK but are in neither HEADERS nor "
+                                "UNREGISTERED_HEADERS, so no registration is generated for the blocks they declare:"
+                                "\n  ${UNDECLARED_REPORT}"
+                                "\nAdd each to HEADERS; or to UNREGISTERED_HEADERS if it is deliberately not "
+                                "registered; or configure with -DGR_BLOCKLIB_REQUIRE_REGISTERED_HEADERS=OFF while "
+                                "the header is still being written.")
+        endif()
+    endif()
 
     if(CBL_SPLIT_BLOCK_INSTANTIATIONS)
       set(SPLIT_BLOCK_INSTANTIATIONS_ARG "SPLIT_BLOCK_INSTANTIATIONS")
