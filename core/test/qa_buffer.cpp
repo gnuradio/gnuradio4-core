@@ -100,9 +100,7 @@ const boost::ut::suite SequenceTests = [] {
 
     "Sequence"_test = [] {
         using namespace gr;
-#if not defined(__APPLE__)
-        expect(eq(alignof(Sequence), 64UZ));
-#endif
+        expect(eq(alignof(Sequence), gr::kCacheLine));
         expect(eq(0UZ, kInitialCursorValue));
         expect(nothrow([] { Sequence(); }));
         expect(nothrow([] { Sequence(2); }));
@@ -620,9 +618,7 @@ const boost::ut::suite StreamTagConcept = [] {
             int64_t     index;
             std::string data;
         };
-#if not defined(__APPLE__)
-        expect(eq(sizeof(buffer_tag), 64UZ)) << "tag size";
-#endif
+        expect(eq(sizeof(buffer_tag), gr::kCacheLine)) << "tag size";
         BufferLike auto buffer    = CircularBuffer<int32_t>(1024);
         BufferLike auto tagBuffer = CircularBuffer<buffer_tag>(32);
         expect(ge(buffer.size(), 1024u));
