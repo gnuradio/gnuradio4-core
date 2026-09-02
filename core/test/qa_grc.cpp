@@ -548,6 +548,76 @@ const boost::ut::suite<"GRC round trip"> grcTests = [] {
         expect(reported.contains("SUBGRAPH")) << reported;
         expect(reported.contains("graph")) << reported;
     };
+
+    // the same shape in the rest of the reader: each of these fields carries a report for a value
+    // of the wrong type, and the non-terminating read is what lets that report be emitted
+    "a malformed field elsewhere in the document is refused"_test = [] {
+        registerTestBlocks();
+        PluginLoader& loader = gr::globalPluginLoader();
+
+        const std::vector<std::pair<std::string, std::string>> documents{
+            {"parameters is not a map", R"yaml(blocks:
+  - id: qa::Scale
+    parameters: 42
+)yaml"},
+            {"a scheduler is not a map", R"yaml(blocks:
+  - id: SUBGRAPH
+    parameters:
+      name: group
+    scheduler: 42
+    graph:
+      blocks: []
+)yaml"},
+            {"an exported_ports entry is not a list", R"yaml(blocks:
+  - id: SUBGRAPH
+    parameters:
+      name: group
+    graph:
+      blocks:
+        - id: qa::Scale
+          parameters:
+            name: inner
+      exported_ports:
+        - 42
+)yaml"},
+            {"a connections entry is not a list", R"yaml(blocks:
+  - id: qa::Scale
+    parameters:
+      name: scale
+connections:
+  - 42
+)yaml"},
+            {"a port index is neither a name nor a number", R"yaml(blocks:
+  - id: qa::RampSource
+    parameters:
+      name: src
+  - id: qa::Scale
+    parameters:
+      name: scale
+connections:
+  - [src, {}, scale, in]
+)yaml"},
+        };
+
+        for (const auto& [what, document] : documents) {
+            bool refused = false;
+            try {
+                const auto loaded = gr::loadGrc(loader, document);
+                expect(false) << std::format("{}: {} blocks loaded, the file must be refused", what, loaded->blocks().size());
+            } catch (const gr::exception&) {
+                refused = true;
+            }
+            expect(refused) << what;
+        }
+    };
+
+    "a blocks entry that is not a map is passed over"_test = [] {
+        registerTestBlocks();
+        PluginLoader& loader = gr::globalPluginLoader();
+
+        const auto loaded = gr::loadGrc(loader, "blocks:\n  - 42\n");
+        expect(eq(loaded->blocks().size(), 0UZ)) << "an entry that is not a block must be passed over, not fatal";
+    };
 };
 
 int main() { /* tests are run by the ut suite */ }

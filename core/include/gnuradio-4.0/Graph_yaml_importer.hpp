@@ -50,7 +50,7 @@ requires(sizeof...(propertySubNames) > 0)
         return std::unexpected(gr::Error(std::format("Missing field {} in YAML object", propertyName)));
     }
 
-    auto value = checked_access_ptr{it->second.get_if<gr::property_map>()};
+    auto value = checked_access_ptr<const gr::property_map, false>{it->second.get_if<gr::property_map>()};
     if (value == nullptr) {
         return std::unexpected(gr::Error(std::format("Field {} in YAML object has an incorrect type {}:{} instead of gr::property_map", propertyName, it->second.value_type(), it->second.container_type())));
     }
@@ -112,7 +112,7 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
     }
 
     for (const auto& blk : blks) {
-        const auto _grcBlock = checked_access_ptr{blk.get_if<property_map>()};
+        const auto _grcBlock = checked_access_ptr<const property_map, false>{blk.get_if<property_map>()};
         if (_grcBlock == nullptr) {
             continue;
         }
@@ -162,9 +162,12 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
                 const auto         exportedIt   = graphData.find("exported_ports");
                 const auto         exportedList = exportedIt == graphData.cend() ? Tensor<pmt::Value>() : exportedIt->second.value_or(Tensor<pmt::Value>());
                 for (const auto& exportedPort_ : exportedList) {
-                    auto exportedPort = checked_access_ptr{exportedPort_.get_if<Tensor<pmt::Value>>()};
-                    if (exportedPort == nullptr || exportedPort->size() != 4) {
-                        throw gr::exception(std::format("Unable to parse exported port ({} instead of 4 elements)", exportedPort != nullptr ? exportedPort->size() : -1UZ));
+                    auto exportedPort = checked_access_ptr<const Tensor<pmt::Value>, false>{exportedPort_.get_if<Tensor<pmt::Value>>()};
+                    if (exportedPort == nullptr) {
+                        throw gr::exception("Unable to parse exported port (not a list)");
+                    }
+                    if (exportedPort->size() != 4) {
+                        throw gr::exception(std::format("Unable to parse exported port ({} instead of 4 elements)", exportedPort->size()));
                     }
 
                     const auto requiredBlockName   = (*exportedPort)[0].value_or(std::string_view{});
@@ -197,7 +200,7 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
             const bool isManaged   = schedulerIt != grcBlock.end();
 
             if (isManaged) {
-                auto schedulerPmt = checked_access_ptr{schedulerIt->second.get_if<property_map>()};
+                auto schedulerPmt = checked_access_ptr<const property_map, false>{schedulerIt->second.get_if<property_map>()};
                 if (schedulerPmt == nullptr) {
                     throw gr::exception(std::format("scheduler is not a property_map"));
                 }
@@ -205,7 +208,7 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
 
                 property_map schedulerParams;
                 if (auto paramsIt = schedulerPmt->find("parameters"); paramsIt != schedulerPmt->end()) {
-                    if (const auto params = checked_access_ptr{paramsIt->second.get_if<property_map>()}; params != nullptr) {
+                    if (const auto params = checked_access_ptr<const property_map, false>{paramsIt->second.get_if<property_map>()}; params != nullptr) {
                         schedulerParams = *params;
                     }
                 }
@@ -289,9 +292,12 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
     }
 
     for (const auto& conn : connections) {
-        const auto _connection = checked_access_ptr{conn.get_if<Tensor<pmt::Value>>()};
-        if (_connection == nullptr || _connection->size() < 4) {
-            throw gr::exception(std::format("Unable to parse connection ({} instead of >=4 elements)", _connection == nullptr ? -1UZ : _connection->size()));
+        const auto _connection = checked_access_ptr<const Tensor<pmt::Value>, false>{conn.get_if<Tensor<pmt::Value>>()};
+        if (_connection == nullptr) {
+            throw gr::exception("Unable to parse connection (not a list)");
+        }
+        if (_connection->size() < 4) {
+            throw gr::exception(std::format("Unable to parse connection ({} instead of >=4 elements)", _connection->size()));
         }
         const auto& connection = *_connection;
 
@@ -314,8 +320,8 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
                 if (portFields->size() != 2) {
                     throw gr::exception(std::format("Port definition has invalid length ({} instead of 2)", portFields->size()));
                 }
-                const auto index    = checked_access_ptr{portFields->at(0).template get_if<std::int64_t>()};
-                const auto subIndex = checked_access_ptr{portFields->at(1).template get_if<std::int64_t>()};
+                const auto index    = checked_access_ptr<const std::int64_t, false>{portFields->at(0).template get_if<std::int64_t>()};
+                const auto subIndex = checked_access_ptr<const std::int64_t, false>{portFields->at(1).template get_if<std::int64_t>()};
                 if (index == nullptr || subIndex == nullptr) {
                     throw gr::exception(std::format("Port definition missing values"));
                 }
@@ -326,7 +332,7 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
                 return result{*block, {std::string(portFieldString)}};
 
             } else {
-                const auto index = checked_access_ptr{portField.template get_if<std::int64_t>()};
+                const auto index = checked_access_ptr<const std::int64_t, false>{portField.template get_if<std::int64_t>()};
                 if (index == nullptr) {
                     throw gr::exception(std::format("Port definition missing values"));
                 }
