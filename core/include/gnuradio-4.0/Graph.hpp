@@ -201,7 +201,10 @@ protected:
         const auto  uniqueBlockName     = data.at("uniqueBlockName").value_or(std::string_view{});
         const auto  portDirectionString = data.at("portDirection").value_or(std::string_view{});
         const auto  portName            = data.at("portName").value_or(std::string_view{});
-        const auto  exportFlag          = checked_access_ptr{data.at("exportFlag").get_if<bool>()};
+        // checked_access_ptr terminates on a null unless not_null is turned off, so the
+        // non-terminating form is what keeps the report below reachable: the message comes over the
+        // message plane, so an exportFlag that is not a bool is a sender's input and is refused as one
+        const auto exportFlag = checked_access_ptr<const bool, false>{data.at("exportFlag").get_if<bool>()};
         if (uniqueBlockName.data() == nullptr || portDirectionString.data() == nullptr || portName.data() == nullptr || exportFlag == nullptr) {
             message.data = std::unexpected(Error{std::format("Invalid definition for the kSubgraphExportPort message {}", message)});
             return message;

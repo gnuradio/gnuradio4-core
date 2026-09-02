@@ -31,7 +31,8 @@ inline std::expected<T, gr::Error> getProperty(const gr::property_map& map, std:
             return std::string(value);
         }
     } else {
-        auto value = checked_access_ptr{it->second.get_if<T>()};
+        // the non-terminating form, so that the incorrect-type report below is reachable for every T
+        auto value = checked_access_ptr<const T, false>{it->second.get_if<T>()};
         if (value != nullptr) {
             return *value;
         }
