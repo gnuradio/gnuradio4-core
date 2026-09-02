@@ -394,6 +394,31 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
     };
 
+    // the same shape on the subgraph export path, and reached without a scheduler because the
+    // handler answers the message the wrapper processes
+    "a subgraph export message whose exportFlag is of the wrong type is refused"_test = [] {
+        gr::GraphWrapper<gr::Graph> subgraph;
+
+        gr::MsgPortOut toSubgraph;
+        gr::MsgPortIn  fromSubgraph;
+        expect(toSubgraph.connect(*subgraph.msgIn).has_value());
+        expect(subgraph.msgOut->connect(fromSubgraph).has_value());
+
+        qa_edit::sendMessage(toSubgraph, gr::graph::property::kSubgraphExportPort,
+            {{"uniqueBlockName", std::string("inner")}, {"portDirection", std::string("output")}, //
+                {"portName", std::string("out")}, {"exportFlag", std::string("yes")}});
+
+        subgraph.processScheduledMessages();
+
+        bool refused = false;
+        auto replies = fromSubgraph.streamReader().get();
+        for (const gr::Message& reply : replies) {
+            refused = refused || !reply.data.has_value();
+        }
+        std::ignore = replies.consume(replies.size());
+        expect(refused) << "an exportFlag that is not a bool must be reported, not end the process";
+    };
+
     "an edge sized by duration follows the sample rate"_test = [] {
         using gr::graph::edgeBufferSizeFor;
         using gr::graph::kDefaultEdgeBufferSeconds;

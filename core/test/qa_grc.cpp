@@ -8,6 +8,7 @@
 #include <gnuradio-4.0/Scheduler.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <format>
 #include <map>
 #include <mutex>
@@ -617,6 +618,19 @@ connections:
 
         const auto loaded = gr::loadGrc(loader, "blocks:\n  - 42\n");
         expect(eq(loaded->blocks().size(), 0UZ)) << "an entry that is not a block must be passed over, not fatal";
+    };
+
+    // the reader asks getProperty for a std::string everywhere today, which takes the other branch
+    // of its if constexpr; the non-string branch is exercised directly so that its incorrect-type
+    // report is pinned for the first T that needs it
+    "getProperty reports a non-string field of the wrong type"_test = [] {
+        const gr::property_map object{{"count", std::string("many")}};
+
+        const auto read = gr::detail::getProperty<std::int64_t>(object, "count");
+        expect(!read.has_value()) << "a string where an integer belongs must not be read as one";
+        if (!read.has_value()) {
+            expect(read.error().message.contains("count")) << read.error().message;
+        }
     };
 };
 
