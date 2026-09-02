@@ -499,6 +499,55 @@ const boost::ut::suite<"GRC round trip"> grcTests = [] {
         }
         expect(sawSubgraph) << "the loaded graph carries no subgraph, so nothing was checked";
     };
+
+    // a field of the wrong type is a defect in the document, so the reader names the block and the
+    // field rather than ending the process; the reads that reach these fields are the
+    // non-terminating checked_access_ptr form, which is what keeps the report reachable
+    "a block whose ctx_parameters is not a list is refused"_test = [] {
+        registerTestBlocks();
+        PluginLoader& loader = gr::globalPluginLoader();
+
+        const std::string document = R"yaml(blocks:
+  - id: qa::Scale
+    parameters:
+      name: scale
+    ctx_parameters: 42
+)yaml";
+
+        std::string reported;
+        try {
+            const auto loaded = gr::loadGrc(loader, document);
+            expect(false) << std::format("{} blocks loaded; a ctx_parameters that is not a list must be refused", loaded->blocks().size());
+        } catch (const gr::exception& e) {
+            reported = e.message;
+        }
+        expect(reported.contains("scale")) << reported;
+        expect(reported.contains("qa::Scale")) << reported;
+        expect(reported.contains("ctx_parameters")) << reported;
+    };
+
+    "a subgraph whose graph field is not a map is refused"_test = [] {
+        registerTestBlocks();
+        PluginLoader& loader = gr::globalPluginLoader();
+
+        const std::string document = R"yaml(blocks:
+  - id: SUBGRAPH
+    parameters:
+      name: group
+    graph: 42
+)yaml";
+
+        std::string reported;
+        try {
+            const auto loaded = gr::loadGrc(loader, document);
+            expect(false) << std::format("{} blocks loaded; a subgraph whose graph field is a scalar must be refused", loaded->blocks().size());
+        } catch (const gr::exception& e) {
+            reported = e.message;
+        }
+        expect(reported.contains("group")) << reported;
+        expect(reported.contains("SUBGRAPH")) << reported;
+        expect(reported.contains("graph")) << reported;
+    };
 };
 
 int main() { /* tests are run by the ut suite */ }
