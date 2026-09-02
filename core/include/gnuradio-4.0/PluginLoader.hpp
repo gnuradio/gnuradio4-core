@@ -2,7 +2,6 @@
 #define GNURADIO_PLUGIN_LOADER_HPP
 
 #include <algorithm>
-#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -13,10 +12,6 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
-
-#if defined(_LIBCPP_VERSION)
-#include <regex>
-#endif
 
 #include "BlockRegistry.hpp"
 
@@ -58,9 +53,11 @@ inline std::string joinUri(const std::string& base, const std::string& file) {
                                  : base + '/' + file;
 }
 
+inline bool isRemoteUri(std::string_view uri) noexcept { return uri.starts_with("http://") || uri.starts_with("https://"); }
+
 inline std::expected<std::string, ParseError> readUriToString(std::string_view uri) {
     const auto uriString = std::string(uri);
-    if (uriString.starts_with("http://") || uriString.starts_with("https://")) {
+    if (isRemoteUri(uriString)) {
         return std::unexpected(ParseError{.message = "HTTP(S) asset loading is not available in gnuradio4-core"});
     }
 
@@ -72,36 +69,6 @@ inline std::expected<std::string, ParseError> readUriToString(std::string_view u
     std::ostringstream content;
     content << input.rdbuf();
     return content.str();
-}
-
-inline std::expected<std::chrono::sys_seconds, ParseError> parseTimestamp(const std::string& ts) {
-    // clang/libc++ does not implement std::chrono::parse
-#if not defined(_LIBCPP_VERSION)
-    std::istringstream ss{ts};
-    if (std::chrono::sys_seconds tp{}; ss >> std::chrono::parse("%Y-%m-%d-%H:%M:%S", tp)) {
-        return tp;
-    }
-#else
-    static const std::regex pattern(R"(^(\d{4})-(\d{2})-(\d{2})-(\d{2}):(\d{2}):(\d{2})$)");
-
-    std::smatch match;
-    if (std::regex_match(ts, match, pattern)) {
-        int y  = std::stoi(match[1]);
-        int m  = std::stoi(match[2]);
-        int d  = std::stoi(match[3]);
-        int hh = std::stoi(match[4]);
-        int mm = std::stoi(match[5]);
-        int ss = std::stoi(match[6]);
-
-        std::chrono::year_month_day ymd{std::chrono::year{y}, std::chrono::month{static_cast<unsigned>(m)}, std::chrono::day{static_cast<unsigned>(d)}};
-
-        auto days = std::chrono::sys_days{ymd};
-        auto time = std::chrono::hours{hh} + std::chrono::minutes{mm} + std::chrono::seconds{ss};
-
-        return days + time;
-    }
-#endif
-    return std::unexpected(ParseError{.message = std::format("Invalid timestamp {}", ts)});
 }
 
 inline std::string uriToCacheFilename(std::string_view uri) {
@@ -135,13 +102,21 @@ struct YamlDefinitionsLoader {
     explicit YamlDefinitionsLoader(std::span<const std::string> uris) { loadBlockDefinitions(uris); }
 
     void loadBlockDefinitions(std::span<const std::string> uris) {
-        const auto      cacheDir = std::filesystem::path(assetsCacheDir()) / "asset_cache";
-        std::error_code createEc;
-        std::filesystem::create_directories(cacheDir, createEc);
-        const bool cacheAvailable = !createEc && std::filesystem::is_directory(cacheDir);
-        if (!cacheAvailable) {
-            std::println("warning: plugin cache directory {} is not available; caching disabled", cacheDir.string());
-        }
+        const auto cacheDir = std::filesystem::path(assetsCacheDir()) / "asset_cache";
+        // the directory is made on first use, so a run that reaches no remote asset makes none and
+        // says nothing about a cache it never needed
+        std::optional<bool> cacheReady;
+        auto                cacheAvailable = [&] {
+            if (!cacheReady.has_value()) {
+                std::error_code createEc;
+                std::filesystem::create_directories(cacheDir, createEc);
+                cacheReady = !createEc && std::filesystem::is_directory(cacheDir);
+                if (!*cacheReady) {
+                    std::println("warning: plugin cache directory {} is not available; caching disabled", cacheDir.string());
+                }
+            }
+            return *cacheReady;
+        };
 
         auto getMapField = []<typename R>(const auto& map, const auto& key, const R& defaultValue) {
             auto it = map.find(key);
@@ -177,17 +152,28 @@ struct YamlDefinitionsLoader {
                 const auto blockUri = joinUri(uriBase, file);
 
                 std::expected<std::string, ParseError> blockContent;
-                if (cacheAvailable) {
-                    const auto modified     = getMapField(*assetMap, "modified", "undefined"s);
-                    const auto modifiedTime = parseTimestamp(modified);
-                    const auto cachePath    = cacheDir / uriToCacheFilename(blockUri);
-                    if (const bool cacheHit = modifiedTime && std::filesystem::exists(cachePath) && std::chrono::file_clock::to_sys(std::filesystem::last_write_time(cachePath)) >= *modifiedTime; cacheHit) {
+                // Only a remote asset is cached, and its copy is valid for exactly the `modified` stamp it was
+                // taken at: that stamp is written to a sidecar and compared as text, so the decision is between
+                // two versions of the same thing. A local asset is read straight from disk — copying a file that
+                // is already there buys nothing, and the copy is the only thing that can fall behind it.
+                if (isRemoteUri(blockUri) && cacheAvailable()) {
+                    const auto modified      = getMapField(*assetMap, "modified", "undefined"s);
+                    const auto cachePath     = cacheDir / uriToCacheFilename(blockUri);
+                    const auto versionPath   = std::filesystem::path(cachePath).replace_extension(".version");
+                    const auto cachedVersion = readUriToString(versionPath.string());
+                    if (cachedVersion && *cachedVersion == modified) {
                         blockContent = readUriToString(cachePath.string());
                     } else {
                         blockContent = readUriToString(blockUri);
                         if (blockContent) {
-                            if (std::ofstream f(cachePath); f) {
-                                f << *blockContent;
+                            // the stamp is written last, so an interrupted write leaves a miss rather than a
+                            // fresh stamp over stale content
+                            if (std::ofstream body(cachePath); body) {
+                                body << *blockContent;
+                                body.close();
+                                if (std::ofstream version(versionPath); version) {
+                                    version << modified;
+                                }
                             }
                         }
                     }
