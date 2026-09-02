@@ -16,6 +16,16 @@ set(meta_public_headers
     include/gnuradio-4.0/meta/utils.hpp
     include/gnuradio-4.0/meta/UncertainValue.hpp)
 
+# Overrides the value gr::kCacheLine resolves to; empty leaves the platform chain in CacheLineSize.hpp to decide. It is
+# carried on the interface because that value is the alignment, and so the layout, of public types such as gr::Tag and
+# gr::Sequence: a consumer built against a different one disagrees with the library about them, where nothing warns.
+set(GR_CACHE_LINE_SIZE
+    ""
+    CACHE STRING "Cache line size gr::kCacheLine resolves to, in bytes (empty: detect from the platform)")
+if(GR_CACHE_LINE_SIZE)
+  target_compile_definitions(gnuradio-meta INTERFACE GR_CACHE_LINE_SIZE=${GR_CACHE_LINE_SIZE})
+endif()
+
 set_target_properties(gnuradio-meta PROPERTIES PUBLIC_HEADER "${meta_public_headers}")
 install(
   TARGETS gnuradio-meta
