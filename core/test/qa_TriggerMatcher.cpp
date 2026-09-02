@@ -250,6 +250,24 @@ const boost::ut::suite<"BasicTriggerNameCtxMatcher"> triggerTest = [] {
             expect(eq(matcher(filter, createTag("alarm", "room1"), state), Matching));
         };
     };
+
+    // the state map is the caller's, so a value of the wrong type in it is unusable input rather
+    // than a broken invariant: the matcher reports the state as unusable instead of ending the
+    // process, which is what a terminating pointer read would do
+    "a state map carrying the wrong types is refused, not fatal"_test = [] {
+        using enum gr::trigger::MatchResult;
+        constexpr auto filter = "[alarm/room1, alarm/room3]";
+
+        // the criteria already stored, so the matcher keeps the values below instead of rebuilding them
+        property_map state{{"filter", std::string(filter)}, {"startDefined", 42}, {"stopDefined", 42}, {"triggerActive", 42}, //
+            {"startTriggerName", std::string("alarm")}, {"startCtx", std::string("room1")},                                   //
+            {"stopTriggerName", std::string("alarm")}, {"stopCtx", std::string("room3")},                                     //
+            {"startTriggerNameEnds", 42}, {"startCtxEnds", 42}, {"stopTriggerNameEnds", 42}, {"stopCtxEnds", 42}};
+
+        const Tag tag(0, {{gr::tag::TRIGGER_NAME.shortKey(), std::string("alarm")}, {gr::tag::CONTEXT.shortKey(), std::string("room1")}});
+        expect(nothrow([&] { expect(eq(trigger::BasicTriggerNameCtxMatcher::filter(filter, tag, state), Ignore)); }));
+        expect(nothrow([&] { expect(!trigger::BasicTriggerNameCtxMatcher::isSingleTrigger(state)); }));
+    };
 };
 
 int main() { /* not needed for UT */ }

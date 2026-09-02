@@ -148,10 +148,13 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
         };
 
         if (isSubgraph) {
-            auto loadGraph = [&grcBlock, &loader, &location](auto graphWrapper) {
-                const auto _graphData = checked_access_ptr{grcBlock.at("graph").get_if<property_map>()};
+            auto loadGraph = [&grcBlock, &loader, &location, &blockName, &blockType](auto graphWrapper) {
+                // checked_access_ptr terminates on a null unless not_null is turned off, so the
+                // non-terminating form is what keeps the report below reachable: a subgraph whose
+                // graph field is present but not a map is a defect in the document and is named as one
+                const auto _graphData = checked_access_ptr<const property_map, false>{grcBlock.at("graph").get_if<property_map>()};
                 if (_graphData == nullptr) {
-                    return;
+                    throw gr::exception(std::format("Unable to create block '{}' of type '{}': graph is not a map", blockName, blockType));
                 }
                 const auto&        graphData    = *_graphData;
                 gr::Graph&         graph        = *graphWrapper->graph();
@@ -245,22 +248,24 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
             }
 
             if (auto it = grcBlock.find("ctx_parameters"); it != grcBlock.end()) {
-                const auto parametersCtx = checked_access_ptr{it->second.get_if<Tensor<pmt::Value>>()};
+                // as with the graph field above, the null tests below are reachable only because the
+                // pointers they test are the non-terminating form
+                const auto parametersCtx = checked_access_ptr<const Tensor<pmt::Value>, false>{it->second.get_if<Tensor<pmt::Value>>()};
                 if (parametersCtx == nullptr) {
-                    throw gr::exception(std::format("ctx_parameters is not a vector<pmt::Value>"));
+                    throw gr::exception(std::format("Unable to create block '{}' of type '{}': ctx_parameters is not a list", blockName, blockType));
                 }
 
                 for (const auto& ctxPmt : *parametersCtx) {
-                    const auto ctxPar = checked_access_ptr{ctxPmt.get_if<property_map>()};
+                    const auto ctxPar = checked_access_ptr<const property_map, false>{ctxPmt.get_if<property_map>()};
                     if (ctxPar == nullptr) {
-                        throw gr::exception(std::format("ctxPar is not a property_map"));
+                        throw gr::exception(std::format("Unable to create block '{}' of type '{}': a ctx_parameters entry is not a map", blockName, blockType));
                     }
 
                     const auto ctxName       = ctxPar->at(gr::tag::CONTEXT.shortKey()).value_or(std::string_view{});
-                    const auto ctxTime       = checked_access_ptr{ctxPar->at(gr::tag::CONTEXT_TIME.shortKey()).get_if<std::uint64_t>()};
-                    const auto ctxParameters = checked_access_ptr{ctxPar->at("parameters").get_if<property_map>()};
+                    const auto ctxTime       = checked_access_ptr<const std::uint64_t, false>{ctxPar->at(gr::tag::CONTEXT_TIME.shortKey()).get_if<std::uint64_t>()};
+                    const auto ctxParameters = checked_access_ptr<const property_map, false>{ctxPar->at("parameters").get_if<property_map>()};
                     if (ctxName.data() == nullptr || ctxTime == nullptr || ctxParameters == nullptr) {
-                        throw gr::exception(std::format("Missing context values for loadParametersFromPropertyMap"));
+                        throw gr::exception(std::format("Unable to create block '{}' of type '{}': a ctx_parameters entry needs a context, a context_time and a parameters map", blockName, blockType));
                     }
 
                     currentBlock->settings().loadParametersFromPropertyMap(*ctxParameters, SettingsCtx{*ctxTime, ctxName});
