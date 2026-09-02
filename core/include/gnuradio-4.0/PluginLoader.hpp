@@ -99,6 +99,11 @@ struct YamlDefinitionsLoader {
 
     std::unordered_map<std::string, Definition> _definitionForBlockName;
 
+    /// assets an index named that did not register; each was reported as it was skipped
+    std::size_t _nSkippedAssets = 0UZ;
+
+    [[nodiscard]] std::size_t nSkippedAssets() const noexcept { return _nSkippedAssets; }
+
     explicit YamlDefinitionsLoader(std::span<const std::string> uris) { loadBlockDefinitions(uris); }
 
     void loadBlockDefinitions(std::span<const std::string> uris) {
@@ -180,12 +185,19 @@ struct YamlDefinitionsLoader {
                 } else {
                     blockContent = readUriToString(blockUri);
                 }
+                // a skip is reported and counted where it happens: a definition that fails to
+                // register is otherwise indistinguishable from one nobody listed, and the first
+                // sign of it is a registry miss somewhere else entirely
                 if (!blockContent) {
+                    ++_nSkippedAssets;
+                    std::println("warning: block definition {} skipped: could not be read ({})", blockUri, blockContent.error().message);
                     continue;
                 }
 
                 auto blockMap = gr::pmt::yaml::deserialize(*blockContent);
                 if (!blockMap) {
+                    ++_nSkippedAssets;
+                    std::println("warning: block definition {} skipped: not valid YAML ({}, line {})", blockUri, blockMap.error().message, blockMap.error().line);
                     continue;
                 }
 
@@ -203,6 +215,8 @@ struct YamlDefinitionsLoader {
                 };
 
                 if (metadata.block_type.empty()) {
+                    ++_nSkippedAssets;
+                    std::println("warning: block definition {} skipped: definition_metadata carries no block_type", blockUri);
                     continue;
                 }
 
@@ -463,6 +477,10 @@ public:
     bool isSchedulerAvailable(std::string_view scheduler) const { return _schedulerRegistry->contains(scheduler) || pluginForSchedulerName(scheduler) != nullptr; }
 
     const auto& definitionForBlockName() const { return _yamlRegistry._definitionForBlockName; }
+
+    /// how many assets the definition roots named that did not register: unreadable, not
+    /// deserializable, or carrying no block_type. Each was reported as it was skipped.
+    [[nodiscard]] std::size_t nSkippedAssets() const noexcept { return _yamlRegistry.nSkippedAssets(); }
 };
 #else
 // PluginLoader on WASM is just a wrapper on BlockRegistry to provide the
@@ -508,6 +526,9 @@ public:
     bool isSchedulerAvailable(std::string_view scheduler) const { return _schedulerRegistry->contains(scheduler); }
 
     const auto& definitionForBlockName() const { return _yamlRegistry._definitionForBlockName; }
+
+    /// see the non-WASM PluginLoader::nSkippedAssets
+    [[nodiscard]] std::size_t nSkippedAssets() const noexcept { return _yamlRegistry.nSkippedAssets(); }
 };
 #endif
 
