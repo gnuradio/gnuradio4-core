@@ -147,10 +147,11 @@ struct TensorOps {
         if (!same_shape(self.extents(), other.extents())) {
             throw std::runtime_error("Tensor dimensions must match for element-wise operations");
         }
+        constexpr auto add = [](const T& x, const T& y) { return static_cast<T>(x + y); };
 #if defined(__GLIBCXX__) && !defined(__ACPP__)
-        std::transform(std::execution::unseq, self.begin(), self.end(), other.begin(), self.begin(), std::plus<>{});
+        std::transform(std::execution::unseq, self.begin(), self.end(), other.begin(), self.begin(), add);
 #else
-        std::transform(self.begin(), self.end(), other.begin(), self.begin(), std::plus<>{});
+        std::transform(self.begin(), self.end(), other.begin(), self.begin(), add);
 #endif
         return self;
     }
@@ -165,10 +166,12 @@ struct TensorOps {
         if (!same_shape(self.extents(), other.extents())) {
             throw std::runtime_error("Tensor dimensions must match for element-wise operations");
         }
+        // the transparent functors return the promoted operand type, which narrows on write-back for sub-int T
+        constexpr auto subtract = [](const T& x, const T& y) { return static_cast<T>(x - y); };
 #if defined(__GLIBCXX__) && !defined(__ACPP__)
-        std::transform(std::execution::unseq, self.begin(), self.end(), other.begin(), self.begin(), std::minus<>{});
+        std::transform(std::execution::unseq, self.begin(), self.end(), other.begin(), self.begin(), subtract);
 #else
-        std::transform(self.begin(), self.end(), other.begin(), self.begin(), std::minus<>{});
+        std::transform(self.begin(), self.end(), other.begin(), self.begin(), subtract);
 #endif
         return self;
     }
@@ -180,9 +183,9 @@ struct TensorOps {
 
     [[maybe_unused]] static constexpr TensorType& multiply_scalar_inplace(TensorType& self, const T& scalar) {
 #if defined(__GLIBCXX__) && !defined(__ACPP__)
-        std::transform(std::execution::unseq, self.begin(), self.end(), self.begin(), [scalar](const T& x) { return x * scalar; });
+        std::transform(std::execution::unseq, self.begin(), self.end(), self.begin(), [scalar](const T& x) { return static_cast<T>(x * scalar); });
 #else
-        std::transform(self.begin(), self.end(), self.begin(), [scalar](const T& x) { return x * scalar; });
+        std::transform(self.begin(), self.end(), self.begin(), [scalar](const T& x) { return static_cast<T>(x * scalar); });
 #endif
         return self;
     }
@@ -197,9 +200,9 @@ struct TensorOps {
             throw std::runtime_error("Division by zero");
         }
 #if defined(__GLIBCXX__) && !defined(__ACPP__)
-        std::transform(std::execution::unseq, self.begin(), self.end(), self.begin(), [scalar](const T& x) { return x / scalar; });
+        std::transform(std::execution::unseq, self.begin(), self.end(), self.begin(), [scalar](const T& x) { return static_cast<T>(x / scalar); });
 #else
-        std::ranges::transform(self.begin(), self.end(), self.begin(), [scalar](const T& x) { return x / scalar; });
+        std::ranges::transform(self.begin(), self.end(), self.begin(), [scalar](const T& x) { return static_cast<T>(x / scalar); });
 #endif
         return self;
     }
@@ -216,10 +219,12 @@ struct TensorOps {
             throw std::runtime_error("Tensor dimensions must match for element-wise operations");
         }
 
+        // the transparent functors return the promoted operand type, which narrows on write-back for sub-int T
+        constexpr auto multiply = [](const T& x, const T& y) { return static_cast<T>(x * y); };
 #if defined(__GLIBCXX__) && !defined(__ACPP__)
-        std::ranges::transform(std::execution::unseq, self, other.begin(), self.begin(), std::multiplies<>{});
+        std::ranges::transform(std::execution::unseq, self, other.begin(), self.begin(), multiply);
 #else
-        std::ranges::transform(self, other.begin(), self.begin(), std::multiplies<>{});
+        std::ranges::transform(self, other.begin(), self.begin(), multiply);
 #endif
         return self;
     }
@@ -234,10 +239,12 @@ struct TensorOps {
         if (!same_shape(self.extents(), other.extents())) {
             throw std::runtime_error("Tensor dimensions must match for element-wise operations");
         }
+        // the transparent functors return the promoted operand type, which narrows on write-back for sub-int T
+        constexpr auto divide = [](const T& x, const T& y) { return static_cast<T>(x / y); };
 #if defined(__GLIBCXX__) && !defined(__ACPP__)
-        std::ranges::transform(std::execution::unseq, self, other.begin(), self.begin(), std::divides<>{});
+        std::ranges::transform(std::execution::unseq, self, other.begin(), self.begin(), divide);
 #else
-        std::ranges::transform(self, other.begin(), self.begin(), std::divides<>{});
+        std::ranges::transform(self, other.begin(), self.begin(), divide);
 #endif
         return self;
     }
@@ -249,7 +256,7 @@ struct TensorOps {
 
     [[nodiscard]] static constexpr T sum(const TensorType& self) { return std::accumulate(self.begin(), self.end(), T{0}); }
 
-    [[nodiscard]] static constexpr T product(const TensorType& self) { return std::reduce(self.begin(), self.end(), T{1}, std::multiplies<>{}); }
+    [[nodiscard]] static constexpr T product(const TensorType& self) { return std::reduce(self.begin(), self.end(), T{1}, [](T lhs, T rhs) { return static_cast<T>(lhs * rhs); }); } // N.B. explicit cast: small integer types promote to int and wrap on the way back
 
     [[nodiscard]] static constexpr auto mean(const TensorType& self) {
         if (self.empty()) {
