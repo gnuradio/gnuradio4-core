@@ -606,7 +606,11 @@ const boost::ut::suite<"job lists sized to the free pool threads"> jobListSizing
             finished.notify_one();
         });
 
-        expect(qa_sched::awaitState(scheduler, INITIALISED)) << "the restart never left STOPPED";
+        // changeStateTo() publishes the new state and only then runs the hook, so RUNNING is
+        // already visible while start() sits in its drain, and INITIALISED is observable for no
+        // longer than reset() takes. What this step needs is that the restart has begun, which is
+        // what leaving STOPPED means.
+        expect(qa_sched::awaitCondition([&scheduler] { return scheduler.state() != STOPPED; })) << "the restart never left STOPPED";
         std::this_thread::sleep_for(std::chrono::milliseconds(100)); // let the restart reach the drain
 
         occupierA.reset(); // the queued generation becomes runnable only now
