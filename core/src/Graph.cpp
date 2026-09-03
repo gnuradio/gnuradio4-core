@@ -65,7 +65,7 @@ std::optional<Message> Graph::propertyCallbackRegistryBlockTypes([[maybe_unused]
 }
 
 std::optional<Message> Graph::propertyCallbackRegistrySchedulerTypes([[maybe_unused]] std::string_view propertyName, Message message) {
-    assert(propertyName == graph::property::kRegistryBlockTypes);
+    assert(propertyName == graph::property::kRegistrySchedulerTypes);
     const auto&        availableSchedulers = _pluginLoader->availableSchedulers();
     Tensor<pmt::Value> types(availableSchedulers | std::views::transform([](const std::string& type) { return pmt::Value(type); }));
     message.data = property_map{{"types", types}};
