@@ -21,20 +21,14 @@ message(
 # --------------------------------------------------------------------------
 set(TOOLS_BUILD_DIR "${PROJECT_BINARY_DIR}/tools_build")
 
-# tools/CMakeLists.txt pins its own build type, so the tool is always this configuration -- for
+# tools/CMakeLists.txt pins its own build type, for
 # multi-config generators that has to be repeated on the command line, which ignore CMAKE_BUILD_TYPE.
 set(PARSER_TOOL_CONFIG Release)
 
-# Where the sub-build records the executable's real path. It sits at the root of the tool build
-# directory rather than next to the binary, because multi-config generators put the binary in a
-# per-config subdirectory whose name this project cannot predict. Keeping it inside TOOLS_BUILD_DIR
-# means deleting that directory invalidates the stamp along with it.
 set(PARSER_STAMP_FILE "${TOOLS_BUILD_DIR}/gnuradio_4_0_parse_registrations-${PARSER_TOOL_CONFIG}.stamp")
 
 if(NOT EXISTS "${PARSER_STAMP_FILE}")
   if(EXISTS "${TOOLS_BUILD_DIR}/CMakeCache.txt")
-    # Either a tool build from before the stamp existed, or one made with a different generator --
-    # CMake refuses to reconfigure that in place, so start over rather than fail.
     message(STATUS "Discarding stale parser tool build in ${TOOLS_BUILD_DIR}")
     file(REMOVE_RECURSE "${TOOLS_BUILD_DIR}")
   endif()

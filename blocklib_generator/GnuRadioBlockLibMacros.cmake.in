@@ -37,10 +37,6 @@ function(gr_generate_block_instantiations LIB_NAME)
         message(FATAL_ERROR "No headers passed to gr_generate_block_instantiations")
     endif()
 
-    # GnuRadioBlockLibConfig.cmake sets PARSER_EXECUTABLE when GnuRadioBlockLib is found via
-    # find_package; for FetchContent/add_subdirectory the path resolved by the tool sub-build is
-    # baked in here instead. Never guess -- a missing parser silently generates no integrator.cpp,
-    # which then surfaces as an unrelated "missing source file" error at generate time.
     if (NOT PARSER_EXECUTABLE)
         set(PARSER_EXECUTABLE "@PARSER_EXECUTABLE@")
     endif()
@@ -82,15 +78,7 @@ function(gr_generate_block_instantiations LIB_NAME)
         get_filename_component(ABS_HDR "${HDR}" ABSOLUTE)
         get_filename_component(BASENAME "${HDR}" NAME_WE)
 
-        # re-run CMake when the header changes, so the generated sources follow it
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${ABS_HDR})
-
-        # Skip headers that have not changed since they were last parsed. The record lives beside the
-        # generated sources -- not in a cache variable as it once did -- so that deleting GEN_DIR
-        # forces regeneration, two modules with same-named headers cannot collide, and above all it is
-        # written only *after* the parser succeeds: the previous version recorded the header before
-        # running the tool, so an interrupted configure left a claim to output that was never created
-        # and nothing ever regenerated it.
         set(HEADER_STAMP "${GEN_DIR}/${BASENAME}.stamp")
         file(TIMESTAMP "${ABS_HDR}" HEADER_MODIFIED "%s")
         set(NEEDS_GENERATION TRUE)
