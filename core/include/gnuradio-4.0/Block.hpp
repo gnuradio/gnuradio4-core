@@ -1460,8 +1460,12 @@ public:
 
     constexpr void processScheduledMessages() {
         using namespace std::chrono;
-        const std::uint64_t nanoseconds_count = static_cast<uint64_t>(duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count());
-        notifyListeners(block::property::kHeartbeat, pmt::Value::Map{{"heartbeat", nanoseconds_count}});
+        // notifyListeners() is a no-op without a kHeartbeat subscriber, which is the common case on every poll,
+        // so the payload map is built only where a subscription exists.
+        if (propertySubscriptions.contains(block::property::kHeartbeat)) {
+            const std::uint64_t nanoseconds_count = static_cast<uint64_t>(duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count());
+            notifyListeners(block::property::kHeartbeat, pmt::Value::Map{{"heartbeat", nanoseconds_count}});
+        }
 
         auto processPort = [this]<PortLike TPort>(TPort& inPort) {
             const auto available = inPort.streamReader().available();
