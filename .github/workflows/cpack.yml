@@ -12,7 +12,7 @@ jobs:
     container:
       image: ghcr.io/gnuradio/ci:ubuntu-24.04-4.0
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
         with:
           fetch-depth: 0
 
@@ -28,7 +28,7 @@ jobs:
 
 
       - name: Cache fetchContent
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # 5.1
         with:
           path: ${{ github.workspace }}/build/_deps
           key: fetchContent-cpack-gcc14-relwithdebinfo-${{ hashFiles('CMakeLists.txt') }}
@@ -62,7 +62,7 @@ jobs:
         run: sudo apt install ./build/*.deb ./build/*.ddeb -y
 
       - name: Upload packages
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # 7.0.1
         with:
           name: ubuntu-gcc14-relwithdebinfo-deb-${{ github.run_number }}
           path: |
@@ -82,7 +82,7 @@ jobs:
     container:
       image: ghcr.io/gnuradio/ci:ubuntu-24.04-4.0-emscripten
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
         with:
           fetch-depth: 0
 
@@ -95,7 +95,7 @@ jobs:
         run: .github/ci-tools/setup_cmake_cache_flags.bash "CPack package emscripten"
 
       - name: Cache fetchContent
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # 5.1
         with:
           path: ${{ github.workspace }}/build/_deps
           key: fetchContent-cpack-emscripten-relwithdebinfo-${{ hashFiles('CMakeLists.txt') }}
@@ -133,7 +133,7 @@ jobs:
           cmake --build build --target package
 
       - name: Upload packages
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # 7.0.1
         with:
           name: emscripten-relwithdebinfo-deb-${{ github.run_number }}
           path: build/*.deb

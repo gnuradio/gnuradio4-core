@@ -25,7 +25,7 @@ jobs:
       CXX: ${{ matrix.compiler.prefix }}/bin/clang++
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
         with:
           fetch-depth: 0
 
@@ -36,7 +36,7 @@ jobs:
           echo "SDK path: ${sdk_path}"
 
       - name: Set up Homebrew
-        uses: Homebrew/actions/setup-homebrew@main
+        uses: Homebrew/actions/setup-homebrew@3cdb78d0f62ad29dd32de765782654f4eedea607
 
       - name: Install LLVM and sccache and dependencies
         run: brew install ${{ matrix.compiler.brew_pkg }} sccache cpp-httplib pkgconf
@@ -56,7 +56,7 @@ jobs:
 
       - name: Restore FetchContent
         id: restore-fetchcontent
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # 5.1
         with:
           path: ${{ github.workspace }}/build/_deps
           key: fetchContent-macos-${{ matrix.compiler.cache_key }}-${{ hashFiles('CMakeLists.txt') }}
@@ -108,7 +108,7 @@ jobs:
 
       - name: Save FetchContent
         if: always() && steps.restore-fetchcontent.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # 5.1
         with:
           path: ${{ github.workspace }}/build/_deps
           key: ${{ steps.restore-fetchcontent.outputs.cache-primary-key }}
