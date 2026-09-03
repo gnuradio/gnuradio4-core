@@ -358,9 +358,9 @@ public:
 
     [[nodiscard]] consteval std::string_view view() const noexcept { return S.view(); }
 
-    consteval operator std::string_view() const noexcept { return S.view(); }
+    constexpr operator std::string_view() const noexcept { return S.view(); }
 
-    consteval operator std::string() const noexcept { return static_cast<std::string>(S); }
+    constexpr operator std::string() const noexcept { return static_cast<std::string>(S); }
 
     template<fixed_string S2>
     consteval friend constexpr_string<S + S2> operator+(constexpr_string, constexpr_string<S2>) noexcept {
