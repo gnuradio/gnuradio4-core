@@ -44,6 +44,11 @@ struct NullSink : gr::Block<NullSink> {
     void processOne(float) { _nReceived++; }
 };
 
+// no ports: exists only to call processScheduledMessages() directly, outside a graph
+struct SilentBlock : gr::Block<SilentBlock> {
+    GR_MAKE_REFLECTABLE(SilentBlock);
+};
+
 [[nodiscard]] gr::Graph makeFloodGraph(gr::Size_t nMessages) {
     using namespace boost::ut;
 
@@ -101,6 +106,19 @@ const boost::ut::suite<"message plane back-pressure"> messagePlaneTests = [] {
 
         expect(gt(stalledSubscriber.streamReader().available(), 0UZ)) << "the subscriber should have received what fitted";
         expect(gt(message::droppedMessageCount().load(std::memory_order_relaxed) - nBefore, 0UZ)) << "messages that did not fit must be counted as drops";
+    };
+
+    "processScheduledMessages() sends a kHeartbeat notify only where a subscriber is registered"_test = [] {
+        qa_msg::SilentBlock block;
+        MsgPortIn           reader;
+        expect(block.msgOut.connect(reader).has_value());
+
+        block.processScheduledMessages();
+        expect(eq(reader.streamReader().available(), 0UZ)) << "no subscriber is registered yet, so nothing should have been sent";
+
+        block.propertySubscriptions[std::string(block::property::kHeartbeat)].insert("test-client");
+        block.processScheduledMessages();
+        expect(eq(reader.streamReader().available(), 1UZ)) << "a registered subscriber must still receive exactly one heartbeat per poll";
     };
 };
 
