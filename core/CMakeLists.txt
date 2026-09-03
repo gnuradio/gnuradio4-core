@@ -78,7 +78,6 @@ target_include_directories(gnuradio-blocklib-core PUBLIC $<BUILD_INTERFACE:${CMA
 target_link_libraries(gnuradio-blocklib-core PUBLIC gnuradio-core)
 if(WIN32)
   target_compile_definitions(gnuradio-core PUBLIC BUILDING_MYPLUGIN)
-  target_link_libraries(gnuradio-blocklib-core INTERFACE dl)
 endif()
 
 # configure a header file to pass the CMake settings to the source code
