@@ -486,14 +486,16 @@ class results {
     using EntryType = std::pair<std::string, ResultMap>;
     using Data      = std::vector<EntryType>;
 
-    // lazy init (Meyer's singleton) — avoids static init order issues
+    // Lazy init (Meyer's singleton) — avoids static init order issues. Deliberately never destroyed:
+    // boost::ut runs the registered suites from ~runner during static destruction, i.e. after a plain
+    // function-local static would already have been torn down
     static Data& storage() noexcept {
-        static Data d;
-        return d;
+        static Data* d = new Data();
+        return *d;
     }
     static std::mutex& lock() noexcept {
-        static std::mutex m;
-        return m;
+        static std::mutex* m = new std::mutex();
+        return *m;
     }
 
 public:

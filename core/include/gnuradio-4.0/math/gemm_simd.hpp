@@ -14,6 +14,13 @@
 #include <span>
 #include <vir/simd.h>
 
+// GCC and clang spell the restrict qualifier `__restrict__`, MSVC spells it `__restrict`
+#ifdef _MSC_VER
+#define GR_RESTRICT __restrict
+#else
+#define GR_RESTRICT __restrict__
+#endif
+
 namespace gr::math {
 
 namespace detail {
@@ -76,9 +83,9 @@ struct CacheOptimizedGemm {
             for (std::size_t i = 0; i < M; ++i) {
                 T* c_row = &C[i, 0];
 #if defined(__GLIBCXX__) && !defined(__ACPP__)
-                std::transform(std::execution::unseq, c_row, c_row + N, c_row, [beta](T x) { return beta * x; });
+                std::transform(std::execution::unseq, c_row, c_row + N, c_row, [beta](T x) { return static_cast<T>(beta * x); });
 #else
-                std::transform(c_row, c_row + N, c_row, [beta](T x) { return beta * x; });
+                std::transform(c_row, c_row + N, c_row, [beta](T x) { return static_cast<T>(beta * x); });
 #endif
             }
         }
@@ -101,12 +108,12 @@ struct CacheOptimizedGemm {
 
                 // process this M x K block against full N
                 for (std::size_t i = ic; i < m_end; ++i) {
-                    T* __restrict__ c_row = &C[i, 0];
+                    T* GR_RESTRICT c_row = &C[i, 0];
 
                     // rank-1 updates for this row
                     for (std::size_t k = kc; k < k_end; ++k) {
-                        const T a_ik                = alpha * A[i, k];
-                        const T* __restrict__ b_row = &B[k, 0];
+                        const T              a_ik  = alpha * A[i, k];
+                        const T* GR_RESTRICT b_row = &B[k, 0];
 
                         if (N >= 64) { // large N -> use explicit SIMD with unrolling
                             simd_t      a_vec(a_ik);
@@ -181,9 +188,9 @@ struct SmallGemm {
             for (std::size_t i = 0; i < M; ++i) {
                 T* c_row = &C[i, 0];
 #if defined(__GLIBCXX__) && !defined(__ACPP__)
-                std::transform(std::execution::unseq, c_row, c_row + N, c_row, [beta](T x) { return beta * x; });
+                std::transform(std::execution::unseq, c_row, c_row + N, c_row, [beta](T x) { return static_cast<T>(beta * x); });
 #else
-                std::transform(c_row, c_row + N, c_row, [beta](T x) { return beta * x; });
+                std::transform(c_row, c_row + N, c_row, [beta](T x) { return static_cast<T>(beta * x); });
 #endif
             }
         }
@@ -265,5 +272,7 @@ void gemm(ExecutionPolicy&& /*policy*/, TensorC& C, const TensorA& A, const Tens
 } // namespace detail
 
 } // namespace gr::math
+
+#undef GR_RESTRICT
 
 #endif // GNURADIO_GEMM_SIMD_HPP
