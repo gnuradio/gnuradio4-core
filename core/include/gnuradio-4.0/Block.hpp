@@ -894,7 +894,7 @@ public:
     bool         _outputTagPending = false;
     property_map _pendingOutputTag{};
 
-    // workInternal() scratch, retained to reuse its buckets
+    // the block's own output parameters, held until a work call has an output span to publish them into
     property_map _pendingForwardParams{};
 
     std::optional<std::chrono::steady_clock::time_point> _zeroProgressSince{};
@@ -1037,16 +1037,14 @@ public:
 
         settings().init();
 
-        // apply initial settings — forward params re-staged so first workInternal publishes them
+        // apply initial settings — forward params pend until a work call has an output span
         invokeUserProvidedFunction("init() - applyStagedParameters", [this] noexcept(false) {
             auto applyResult = settings().applyStagedParameters();
             if (!applyResult.appliedParameters.empty()) {
                 notifyListeners(block::property::kSetting, settings().get());
             }
             if constexpr (!noTagPropagation) {
-                if (!applyResult.forwardParameters.empty()) {
-                    std::ignore = settings().setStaged(applyResult.forwardParameters);
-                }
+                mergeForwardParams(_pendingForwardParams, std::move(applyResult.forwardParameters));
             }
         });
         checkBlockArgumentContracts();
@@ -1398,7 +1396,7 @@ public:
             if constexpr (!noTagPropagation) {
                 if (publishForwardTags && !applyResult.forwardParameters.empty()) {
                     if (capturedForwardParams) {
-                        capturedForwardParams->merge(std::move(applyResult.forwardParameters));
+                        mergeForwardParams(*capturedForwardParams, std::move(applyResult.forwardParameters));
                     } else {
                         publishTag(applyResult.forwardParameters, 0);
                     }
@@ -2149,6 +2147,13 @@ public:
         }
     }
 
+    /// a fresh apply supersedes a value still pending for the same key
+    static void mergeForwardParams(property_map& pending, property_map&& fresh) {
+        for (auto& [key, value] : fresh) {
+            pending.insert_or_assign(key, std::move(value));
+        }
+    }
+
     /// publish forwardParams at the head of the span, but never before a tag already placed in it: the span's order check forbids that
     static void publishForwardParams(OutputSpanLike auto& outSpan, const property_map& forwardParams) {
         const std::size_t lastIndex = outSpan.tagsPublished > 0UZ ? outSpan.tags[outSpan.tagsPublished - 1UZ].index : 0UZ;
@@ -2260,9 +2265,6 @@ public:
             inputStreamCache.invalidateStatistic();
             outputStreamCache.invalidateStatistic();
         };
-        if (!_pendingForwardParams.empty()) {
-            _pendingForwardParams.clear();
-        }
         applyChangedSettings(true, &_pendingForwardParams);
         SampleLimits limits = computeSampleLimits(requestedWork);
 
@@ -2298,6 +2300,7 @@ public:
                 }
                 if (!_pendingForwardParams.empty()) {
                     for_each_writer_span([this](auto& out) { publishForwardParams(out, _pendingForwardParams); }, epilogueOut);
+                    _pendingForwardParams.clear();
                 }
                 invokeProcessEpilogue(epilogueIn, epilogueOut);
                 publishSamples(0UZ, epilogueOut); // publish only what the block explicitly requested via out.publish(n)
@@ -2310,9 +2313,6 @@ public:
         }
 
         if (limits.resampledIn == 0 && limits.resampledOut == 0 && !limits.hasAsyncIn && !limits.hasAsyncOut) {
-            if (!_pendingForwardParams.empty()) {
-                std::ignore = settings().setStaged(_pendingForwardParams); // re-stage for next work call
-            }
             return {requestedWork, 0UZ, limits.resampledStatus};
         }
 
@@ -2333,6 +2333,7 @@ public:
 
         if (!_pendingForwardParams.empty()) {
             for_each_writer_span([this](auto& out) { publishForwardParams(out, _pendingForwardParams); }, outputSpans);
+            _pendingForwardParams.clear();
         }
 
         if constexpr (HasProcessOneFunction<Derived> && !HasProcessBulkFunction<Derived>) {
@@ -2800,24 +2801,13 @@ FusedFront fusedFront(void* rawBlock, std::size_t requestedWork) {
     };
     block.inputStreamCache.invalidateStatistic();
     block.outputStreamCache.invalidateStatistic();
-    if (!block._pendingForwardParams.empty()) {
-        block._pendingForwardParams.clear();
-    }
     block.applyChangedSettings(true, &block._pendingForwardParams);
 
-    const auto limits  = block.computeSampleLimits(requestedWork);
-    const auto reStage = [&block] {
-        if (!block._pendingForwardParams.empty()) {
-            std::ignore = block.settings().setStaged(block._pendingForwardParams);
-            block._pendingForwardParams.clear();
-        }
-    };
+    const auto limits = block.computeSampleLimits(requestedWork);
     if (limits.isEosPresent || limits.asyncEoS || lifecycle::isShuttingDown(block.state())) {
-        reStage();
         return {0UZ, work::Status::OK, true};
     }
     if (limits.resampledIn == 0UZ) {
-        reStage();
         return {0UZ, limits.resampledStatus, false};
     }
     return {limits.resampledIn, work::Status::OK, false};
@@ -2868,9 +2858,6 @@ template<FusableStageBlock T>
 void fusedBeginChunk(void* rawBlock, bool isFront, const FusedTagList& incoming, FusedTagList& outgoing) {
     T& block = *static_cast<T*>(rawBlock);
     if (!isFront) { // the front member's forward parameters were captured by fusedFront()
-        if (!block._pendingForwardParams.empty()) {
-            block._pendingForwardParams.clear();
-        }
         block.applyChangedSettings(true, &block._pendingForwardParams);
     }
 
@@ -2897,6 +2884,7 @@ void fusedBeginChunk(void* rawBlock, bool isFront, const FusedTagList& incoming,
     }
     if (!block._pendingForwardParams.empty()) {
         outgoing.emplace_back(0, block._pendingForwardParams);
+        block._pendingForwardParams.clear();
     }
 
     property_map merged;
