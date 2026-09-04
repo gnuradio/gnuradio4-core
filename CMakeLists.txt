@@ -618,8 +618,11 @@ install(
   NAMESPACE gnuradio4::
   DESTINATION "${GR_CMAKECONFIG_INSTALL_DIR}")
 
-install(TARGETS vir EXPORT gnuradio4Targets
-        FILE_SET HEADERS DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/vir
+install(
+  TARGETS vir
+  EXPORT gnuradio4Targets
+  FILE_SET HEADERS
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/vir
 )
 
 if(TARGET gnuradio-plugin)
