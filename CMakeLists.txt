@@ -622,8 +622,7 @@ install(
   TARGETS vir
   EXPORT gnuradio4Targets
   FILE_SET HEADERS
-  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/vir
-)
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/vir)
 
 if(TARGET gnuradio-plugin)
   install(
