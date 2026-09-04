@@ -476,15 +476,6 @@ if(EMSCRIPTEN AND TARGET ut)
   endif()
 endif()
 
-# Install these headers only when they are the copy this project fetched and pinned above. Nothing else provides that
-# copy, and an isolated prefix needs it, because the exported vir target points consumers at ${CMAKE_INSTALL_INCLUDEDIR}
-# and the installed CMake package declares no dependency on an external vir-simd. When vir-simd was instead found on the
-# system, the headers belong to whatever provides them and are already on the default include path, so copying them here
-# would stage the same files from a second place.
-if(EMSCRIPTEN OR GR_USE_FETCHCONTENT_DEPS)
-  install(DIRECTORY ${vir-simd_SOURCE_DIR}/vir DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-endif()
-
 # check for CPython and Numpy dependencies
 set(PYTHON_FORCE_INCLUDE OFF)
 if(PYTHON_FORCE_INCLUDE)
@@ -618,11 +609,15 @@ install(
   NAMESPACE gnuradio4::
   DESTINATION "${GR_CMAKECONFIG_INSTALL_DIR}")
 
-install(
-  TARGETS vir
-  EXPORT gnuradio4Targets
-  FILE_SET HEADERS
-  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/vir)
+if(FETCH) # set by GnuRadioDependencies.cmake: EMSCRIPTEN OR GR_USE_FETCHCONTENT_DEPS
+  install(
+    TARGETS vir
+    EXPORT gnuradio4Targets
+    FILE_SET HEADERS
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+else()
+  install(TARGETS vir EXPORT gnuradio4Targets)
+endif()
 
 if(TARGET gnuradio-plugin)
   install(

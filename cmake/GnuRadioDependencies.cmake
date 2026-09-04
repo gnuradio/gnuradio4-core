@@ -52,17 +52,40 @@ function(ObtainOrFindVirSIMD)
           "vir-simd was not found. Install the vir headers under an include path, for example /usr/local/include/vir.")
     endif()
   endif()
+endfunction()
+
+# must run after FetchContent_MakeAvailable(): a fetched vir-simd_SOURCE_DIR does not exist until then, and a file set
+# whose files fall outside its base directories is a hard generate-step error rather than a warning.
+function(DefineVirTarget)
   add_library(vir INTERFACE)
   add_library(gnuradio4::vir ALIAS vir)
+  if(NOT FETCH)
+    # the headers belong to whatever provides them, so carry only a build-time include path and stage nothing. an
+    # interface file set is deliberately not used here: CMake refuses to export a target whose interface file sets are
+    # not installed, and installing these would copy a second copy of somebody else's headers into our prefix.
+    target_include_directories(vir SYSTEM INTERFACE $<BUILD_INTERFACE:${vir-simd_SOURCE_DIR}>)
+    return()
+  endif()
+  # transitive quoted-include closure of <vir/simd.h> and <vir/simdize.h>, the only two vir headers GR4 includes
+  # directly. an installed prefix needs the whole closure, not just the two entry points.
+  set(_vir_headers
+      simd.h
+      simdize.h
+      simd_version.h
+      simd_concepts.h
+      simd_permute.h
+      detail.h
+      constexpr_wrapper.h
+      struct_reflect.h)
+  list(TRANSFORM _vir_headers PREPEND "${vir-simd_SOURCE_DIR}/vir/")
   target_sources(vir
     INTERFACE
     FILE_SET HEADERS
     BASE_DIRS ${vir-simd_SOURCE_DIR}
-    FILES
-      ${vir-simd_SOURCE_DIR}/vir/simd.h
-      ${vir-simd_SOURCE_DIR}/vir/simdize.h
-  )
-
+    FILES ${_vir_headers})
+  # BASE_DIRS is the whole fetched source tree, which would otherwise reach every consumer of gnuradio4::vir as a plain
+  # -I under -Werror / /WX.
+  set_target_properties(vir PROPERTIES SYSTEM ON)
 endfunction()
 
 function(ObtainOrFindHttpLib)
@@ -112,3 +135,5 @@ endif()
 if(GR_FETCH_MAKE_AVAILABLE_DEPS)
   FetchContent_MakeAvailable(${GR_FETCH_MAKE_AVAILABLE_DEPS})
 endif()
+
+DefineVirTarget()
