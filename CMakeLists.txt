@@ -293,8 +293,7 @@ if(MSVC)
               /external:env:INCLUDE # the STL and Windows SDK headers are external too
               /vmg)
   target_compile_definitions(
-    gnuradio-options
-    INTERFACE _CRT_SECURE_NO_WARNINGS _SILENCE_CXX20_OLD_SHARED_PTR_ATOMIC_SUPPORT_DEPRECATION_WARNING)
+    gnuradio-options INTERFACE _CRT_SECURE_NO_WARNINGS _SILENCE_CXX20_OLD_SHARED_PTR_ATOMIC_SUPPORT_DEPRECATION_WARNING)
 endif()
 
 message(
