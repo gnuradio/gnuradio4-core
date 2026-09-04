@@ -19,7 +19,9 @@
  * A block's own settings hold the rate it is fed at. The chunk ratio belongs to the value it publishes — the
  * forwarded parameters and the tags it substitutes its own value into. Scaling the stored
  * value instead makes every further application scale again, so the rate drops further with each of the save/load or
- * re-apply cycles that a running graph performs routinely.
+ * re-apply cycles that a running graph performs routinely. The forwarded map therefore waits for an output span
+ * rather than going back through the block's own settings, which a work call that moves nothing would otherwise do
+ * once per call.
  *
  * The blocks are defined here: gnuradio4-core carries no standard block library, so a core test may not depend on one.
  */
@@ -74,6 +76,73 @@ struct RateTagSource : Block<RateTagSource> {
     std::size_t _emitted = 0UZ;
 
     work::Status processBulk(OutputSpanLike auto& outSpan) {
+        if (_emitted >= kSamples) {
+            outSpan.publish(0UZ);
+            return work::Status::DONE;
+        }
+        const std::size_t n = std::min(outSpan.size(), kSamples - _emitted);
+        if (n == 0UZ) {
+            outSpan.publish(0UZ);
+            return work::Status::INSUFFICIENT_OUTPUT_ITEMS;
+        }
+        std::ranges::fill(outSpan | std::views::take(n), 1.0f);
+        if (_emitted == 0UZ) {
+            outSpan.publishTag(property_map{{"sample_rate", kInputRate}}, 0UZ);
+        }
+        _emitted += n;
+        outSpan.publish(n);
+        return work::Status::OK;
+    }
+};
+
+inline constexpr std::size_t kStarvedCalls = 100UZ;
+inline constexpr std::size_t kDecayCalls   = 200UZ;
+inline constexpr std::size_t kCallsToZero  = 81UZ; ///< kInputRate scaled by the 4:1 chunk ratio once per call, in float
+
+/// the same decimator, recording every rate it is asked to run at rather than only the last; the
+/// default differs from the rate it is built with, so that first application is a genuine change
+struct WatchingDecimator : Block<WatchingDecimator, Resampling<>> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    Annotated<float, "sample rate"> sample_rate = 1.0f;
+
+    GR_MAKE_REFLECTABLE(WatchingDecimator, in, out, sample_rate);
+
+    std::vector<float> appliedRates;
+
+    work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
+        const std::size_t ratio = static_cast<std::size_t>(input_chunk_size.value);
+        for (std::size_t i = 0UZ; i < outSpan.size(); ++i) {
+            outSpan[i] = inSpan[i * ratio];
+        }
+        return work::Status::OK;
+    }
+
+    void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings) {
+        if (newSettings.contains(gr::tag::SAMPLE_RATE.shortKey())) {
+            appliedRates.push_back(sample_rate.value);
+        }
+    }
+};
+
+/// publishes nothing for its first kStarvedCalls calls, so the chain behind it is driven with calls
+/// that can move no sample — what a source whose reader thread has not yet delivered leaves behind it
+struct LateSource : Block<LateSource> {
+    PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(LateSource, out);
+
+    std::size_t idleCalls = 0UZ;
+
+    std::size_t _emitted = 0UZ;
+
+    work::Status processBulk(OutputSpanLike auto& outSpan) {
+        if (idleCalls < kStarvedCalls) {
+            ++idleCalls;
+            outSpan.publish(0UZ);
+            return work::Status::INSUFFICIENT_INPUT_ITEMS;
+        }
         if (_emitted >= kSamples) {
             outSpan.publish(0UZ);
             return work::Status::DONE;
@@ -294,6 +363,49 @@ const boost::ut::suite<"settings"> _settings = [] {
 
         expect(ge(sink.rates.size(), 1UZ)) << "the sink must see the rate the decimator publishes at";
         expect(std::ranges::all_of(sink.rates, [](float rate) { return rate == kOutputRate; })) << "the chunk ratio must scale the forwarded rate whether or not the block owns one";
+    };
+
+    "a decimator starved by its source keeps the rate it is fed at"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<LateSource>(property_map{{"name", std::string("src")}});
+        auto&     middle = flow.emplaceBlock<WatchingDecimator>(property_map{{"name", std::string("mid")}, {"sample_rate", kInputRate}, {"input_chunk_size", kDecimation}, {"output_chunk_size", gr::Size_t(1)}});
+        auto&     sink   = flow.emplaceBlock<RateTagSink>(property_map{{"name", std::string("snk")}});
+        expect(flow.connect<"out", "in">(source, middle).has_value());
+        expect(flow.connect<"out", "in">(middle, sink).has_value());
+
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(scheduler.runAndWait().has_value());
+
+        expect(eq(source.idleCalls, kStarvedCalls)) << "the source must have driven the chain while it could publish nothing";
+        expect(eq(middle.sample_rate.value, kInputRate)) << "a call that moves nothing must leave the block's own rate alone";
+        expect(eq(rateOf(middle.settings().get()), kInputRate)) << "and must leave the stored rate alone with it";
+        expect(eq(middle.appliedRates.size(), 1UZ)) << "the rate it is built at applies once, not once per call that moved nothing";
+        expect(std::ranges::all_of(middle.appliedRates, [](float rate) { return rate == kInputRate; })) << "the block must never be run at the rate it publishes at";
+        expect(ge(sink.rates.size(), 1UZ)) << "the forwarded rate must still reach the sink once there is a span to publish into";
+        expect(std::ranges::all_of(sink.rates, [](float rate) { return rate == kOutputRate; })) << "and that tag carries the output rate";
+    };
+
+    // the instrument, against what it is for: staging the forwarded map back into the block runs it
+    // at the rate it publishes at, and every further application scales again from there
+    "staging the forwarded rate back into a decimator decays it to zero"_test = [] {
+        Decimator block = makeDecimator();
+        std::ignore     = block.settings().setStaged({{"sample_rate", kInputRate}});
+
+        std::size_t nCallsToZero = 0UZ;
+        for (std::size_t nCall = 1UZ; nCall <= kDecayCalls && nCallsToZero == 0UZ; ++nCall) {
+            const auto result = block.settings().applyStagedParameters();
+            if (nCall == 1UZ) {
+                expect(eq(block.sample_rate.value, kInputRate)) << "the first application is the honest one";
+                expect(eq(rateOf(result.forwardParameters), kOutputRate)) << "and it forwards the output rate";
+            }
+            if (block.sample_rate.value == 0.0f) {
+                nCallsToZero = nCall;
+            }
+            std::ignore = block.settings().setStaged(result.forwardParameters);
+        }
+
+        expect(eq(nCallsToZero, kCallsToZero)) << "the chunk ratio applied once per call reaches zero in float";
     };
 
     "an unchanged setting tag costs one apply however often it repeats"_test = [] {
