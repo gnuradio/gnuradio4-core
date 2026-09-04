@@ -1,8 +1,8 @@
-include(FetchContent)
 
 set(FETCH OFF)
 if(EMSCRIPTEN OR GR_USE_FETCHCONTENT_DEPS)
   set(FETCH ON)
+  include(FetchContent)
 endif()
 
 function(ObtainOrFindUT)
