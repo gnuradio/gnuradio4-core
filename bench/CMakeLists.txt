@@ -6,6 +6,10 @@ install(TARGETS ut-benchmark EXPORT gnuradio4Targets)
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/benchmark.hpp DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 function(append_compiler_flags TARGET_NAME)
+  if(MSVC)
+    # None of these flags apply to msvc frontend type compilers
+    return()
+  endif()
   set(FLAGS_COMMON -Wall)
   if(EMSCRIPTEN)
     set(FLAGS_SPECIAL "")

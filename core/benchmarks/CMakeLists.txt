@@ -11,6 +11,8 @@ if(NOT EMSCRIPTEN)
               ut-benchmark)
     if(EMSCRIPTEN) # performance benchmarks should be optimised
       target_compile_options(${BM_NAME} PRIVATE -O3)
+    elseif(MSVC)
+      target_compile_options(${BM_NAME} PRIVATE /O2) # cl.exe understands neither -O3 nor -march=native
     else()
       target_compile_options(${BM_NAME} PRIVATE -O3 -march=native)
     endif()
