@@ -282,6 +282,21 @@ add_library(gnuradio-options INTERFACE)
 add_library(gnuradio4::gnuradio-options ALIAS gnuradio-options)
 install(TARGETS gnuradio-options EXPORT gnuradio4Targets)
 
+if(MSVC)
+  target_compile_options(
+    gnuradio-options
+    INTERFACE /Zc:preprocessor # conforming preprocessor, required for __VA_OPT__ (GR_MAKE_REFLECTABLE et al.)
+              /Zc:__cplusplus # report the real __cplusplus value rather than 199711L
+              /bigobj # required for sections larger than 2^16 (most GR template tus)
+              /utf-8
+              /external:W0 # required for /external:I
+              /external:env:INCLUDE # the STL and Windows SDK headers are external too
+              /vmg)
+  target_compile_definitions(
+    gnuradio-options
+    INTERFACE _CRT_SECURE_NO_WARNINGS _SILENCE_CXX20_OLD_SHARED_PTR_ATOMIC_SUPPORT_DEPRECATION_WARNING)
+endif()
+
 message(
   STATUS
     "Is block registry enabled? (faster compile-times and when runtime or Python wrapping APIs are not required) ${GR_ENABLE_BLOCK_REGISTRY}"
@@ -326,8 +341,10 @@ if((CMAKE_GENERATOR STREQUAL "Ninja" OR (CCACHE_PROGRAM AND USE_CCACHE)) AND NOT
   set(CMAKE_COLOR_DIAGNOSTICS ON)
 endif()
 
+# Keep third party header diagnostic warnings out of GR's builds
+option(DISABLE_EXTERNAL_DEPS_WARNINGS "Treat external dependency headers as SYSTEM includes" ON)
 set(CMAKE_EXT_DEP_WARNING_GUARD "")
-if(DISABLE_EXTERNAL_DEPS_WARNINGS) # enable warnings for external dependencies
+if(DISABLE_EXTERNAL_DEPS_WARNINGS)
   set(CMAKE_EXT_DEP_WARNING_GUARD SYSTEM)
 endif()
 
@@ -567,8 +584,12 @@ endif()
 
 add_library(vir INTERFACE)
 add_library(gnuradio4::vir ALIAS vir)
-target_include_directories(vir INTERFACE $<BUILD_INTERFACE:${vir-simd_SOURCE_DIR}/>
-                                         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+target_include_directories(
+  vir ${CMAKE_EXT_DEP_WARNING_GUARD} INTERFACE $<BUILD_INTERFACE:${vir-simd_SOURCE_DIR}/>
+                                               $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+if(MSVC)
+  target_compile_definitions(vir INTERFACE NOMINMAX)
+endif()
 install(TARGETS vir EXPORT gnuradio4Targets)
 install(DIRECTORY ${vir-simd_SOURCE_DIR}/vir DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 

@@ -12,7 +12,9 @@ function(add_non_blocklib_plugin PLUGIN_NAME)
   add_library(${PLUGIN_NAME} MODULE ${PLUGIN_NAME}.cpp)
 
   # target_compile_options(${PLUGIN_NAME} PRIVATE -fsanitize=address -Wall)
-  target_compile_options(${PLUGIN_NAME} PRIVATE -Wall)
+  if(NOT MSVC) # existing /W4 setting from general GR compilation applies here for msvc
+    target_compile_options(${PLUGIN_NAME} PRIVATE -Wall)
+  endif()
 
   target_include_directories(${PLUGIN_NAME} PUBLIC ${CMAKE_BINARY_DIR}/include)
   target_link_libraries(${PLUGIN_NAME} PUBLIC gnuradio-options gnuradio-core gnuradio-plugin)
