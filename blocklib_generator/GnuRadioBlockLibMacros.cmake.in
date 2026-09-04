@@ -37,6 +37,13 @@ function(gr_generate_block_instantiations LIB_NAME)
         message(FATAL_ERROR "No headers passed to gr_generate_block_instantiations")
     endif()
 
+    if (NOT PARSER_EXECUTABLE)
+        set(PARSER_EXECUTABLE "@PARSER_EXECUTABLE@")
+    endif()
+    if (NOT EXISTS "${PARSER_EXECUTABLE}")
+        message(FATAL_ERROR "gnuradio_4_0_parse_registrations not found at '${PARSER_EXECUTABLE}' -- cannot generate block instantiations for ${LIB_NAME}")
+    endif()
+
     if(GR_SPLIT_BLOCK_INSTANTIATIONS OR CBL_SPLIT_BLOCK_INSTANTIATIONS)
         set(PARSER_SPLIT_FLAG "--split")
     else()
@@ -68,15 +75,22 @@ function(gr_generate_block_instantiations LIB_NAME)
     set(GEN_CPP_LIST "${GEN_DIR}/integrator.cpp")
 
     foreach(HDR IN LISTS CBL_HEADERS)
-        # Try to only run the generation when the header is newer than the last time
-        set(modified 0)
-        file(TIMESTAMP ${HDR} modified "%s")
-        if (NOT DEFINED modified_${HDR} OR "${modified}" GREATER modified_${HDR})
-            set(modified_${HDR} ${modified} CACHE STRING "Last generated time" FORCE)
+        get_filename_component(ABS_HDR "${HDR}" ABSOLUTE)
+        get_filename_component(BASENAME "${HDR}" NAME_WE)
 
-            get_filename_component(ABS_HDR "${HDR}" ABSOLUTE)
-            get_filename_component(BASENAME "${HDR}" NAME_WE)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${ABS_HDR})
+        set(HEADER_STAMP "${GEN_DIR}/${BASENAME}.stamp")
+        file(TIMESTAMP "${ABS_HDR}" HEADER_MODIFIED "%s")
+        set(NEEDS_GENERATION TRUE)
+        if(EXISTS "${HEADER_STAMP}")
+            file(READ "${HEADER_STAMP}" PREVIOUSLY_PARSED)
+            string(STRIP "${PREVIOUSLY_PARSED}" PREVIOUSLY_PARSED)
+            if(PREVIOUSLY_PARSED STREQUAL HEADER_MODIFIED)
+                set(NEEDS_GENERATION FALSE)
+            endif()
+        endif()
 
+        if (NEEDS_GENERATION)
             # remove any previously generated .cpp files for this header.
             file(GLOB OLD_FILES "${GEN_DIR}/*${BASENAME}*.cpp")
             if(OLD_FILES)
@@ -90,15 +104,7 @@ function(gr_generate_block_instantiations LIB_NAME)
                 file(REMOVE ${OLD_FILES})
             endif()
 
-            set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${HDR})
-
             message(STATUS "[BlockLibMacros] Generating code for header: ${ABS_HDR} -> ${GEN_DIR} with PARSER_SPLIT_FLAG=${PARSER_SPLIT_FLAG}, other options [ ${PARSER_REGISTRY_HEADER_FLAG} ${PARSER_REGISTRY_HEADER_OPTION} ${PARSER_REGISTRY_INSTANCE_FLAG} ${PARSER_REGISTRY_INSTANCE_OPTION} ]")
-
-            # GnuRadioBlockLibConfig.cmake sets this when GnuRadioBlockLib is found via find_package
-            # However when FetchContent is used that doesn't happen, so fall back to the build path
-            if (NOT PARSER_EXECUTABLE)
-                set(PARSER_EXECUTABLE @PROJECT_BINARY_DIR@/tools_build/gnuradio_4_0_parse_registrations)
-            endif()
 
             # run the parser tool immediately at configuration time.
             message(STATUS "[BlockLibMacros] Running: ${PARSER_EXECUTABLE} ${ABS_HDR} ${GEN_DIR}
@@ -125,6 +131,8 @@ function(gr_generate_block_instantiations LIB_NAME)
             if(NOT gen_res EQUAL 0)
                 message(FATAL_ERROR "Error running gnuradio_4_0_parse_registrations on ${HDR}: ${gen_err}")
             endif()
+
+            file(WRITE "${HEADER_STAMP}" "${HEADER_MODIFIED}")
         endif()
 
         # Glob for the generated .cpp files.
@@ -141,27 +149,27 @@ function(gr_generate_block_instantiations LIB_NAME)
 
     endforeach()
 
-        # Merge generated declarations.hpp.in into single declarations.hpp
-        # and raw_calls.hpp.in into a single raw_calls.hpp
-        message(STATUS "[BlockLibMacros] generating ${GEN_DIR}/declarations.hpp from ${GEN_DIR}/*_declarations.hpp.in")
-        file(GLOB DECLARATIONS_FILES "${GEN_DIR}/*_declarations.hpp.in")
-        if(DECLARATIONS_FILES)
-            gr_detail_merge_files_into(${GEN_DIR}/declarations.hpp "${DECLARATIONS_FILES}")
-        endif()
+    # Merge generated declarations.hpp.in into single declarations.hpp
+    # and raw_calls.hpp.in into a single raw_calls.hpp
+    message(STATUS "[BlockLibMacros] generating ${GEN_DIR}/declarations.hpp from ${GEN_DIR}/*_declarations.hpp.in")
+    file(GLOB DECLARATIONS_FILES "${GEN_DIR}/*_declarations.hpp.in")
+    if(DECLARATIONS_FILES)
+        gr_detail_merge_files_into(${GEN_DIR}/declarations.hpp "${DECLARATIONS_FILES}")
+    endif()
 
-        message(STATUS "[BlockLibMacros] generating ${GEN_DIR}/raw_calls.hpp from ${GEN_DIR}/*_raw_calls.hpp.in")
-        file(GLOB RAW_CALLS_FILES "${GEN_DIR}/*_raw_calls.hpp.in")
-        if(RAW_CALLS_FILES)
-            gr_detail_merge_files_into(${GEN_DIR}/raw_calls.hpp "${RAW_CALLS_FILES}")
-        endif()
+    message(STATUS "[BlockLibMacros] generating ${GEN_DIR}/raw_calls.hpp from ${GEN_DIR}/*_raw_calls.hpp.in")
+    file(GLOB RAW_CALLS_FILES "${GEN_DIR}/*_raw_calls.hpp.in")
+    if(RAW_CALLS_FILES)
+        gr_detail_merge_files_into(${GEN_DIR}/raw_calls.hpp "${RAW_CALLS_FILES}")
+    endif()
 
-        set(GENERATED_PUBLIC_HEADER_SOURCE "${GEN_DIR}/${MODULE_NAME_BASE}.hpp")
-        if(EXISTS "${GENERATED_PUBLIC_HEADER_SOURCE}")
-            set(GENERATED_PUBLIC_HEADER_BUILD_DIR "${CMAKE_BINARY_DIR}/include/gnuradio-4.0")
-            set(GENERATED_PUBLIC_HEADER_BUILD_PATH "${GENERATED_PUBLIC_HEADER_BUILD_DIR}/${MODULE_NAME_BASE}.hpp")
-            file(MAKE_DIRECTORY "${GENERATED_PUBLIC_HEADER_BUILD_DIR}")
-            configure_file("${GENERATED_PUBLIC_HEADER_SOURCE}" "${GENERATED_PUBLIC_HEADER_BUILD_PATH}" COPYONLY)
-        endif()
+    set(GENERATED_PUBLIC_HEADER_SOURCE "${GEN_DIR}/${MODULE_NAME_BASE}.hpp")
+    if(EXISTS "${GENERATED_PUBLIC_HEADER_SOURCE}")
+        set(GENERATED_PUBLIC_HEADER_BUILD_DIR "${CMAKE_BINARY_DIR}/include/gnuradio-4.0")
+        set(GENERATED_PUBLIC_HEADER_BUILD_PATH "${GENERATED_PUBLIC_HEADER_BUILD_DIR}/${MODULE_NAME_BASE}.hpp")
+        file(MAKE_DIRECTORY "${GENERATED_PUBLIC_HEADER_BUILD_DIR}")
+        configure_file("${GENERATED_PUBLIC_HEADER_SOURCE}" "${GENERATED_PUBLIC_HEADER_BUILD_PATH}" COPYONLY)
+    endif()
 
     target_sources(${LIB_NAME} PRIVATE ${GEN_CPP_LIST})
 endfunction()

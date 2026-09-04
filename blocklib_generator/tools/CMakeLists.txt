@@ -9,6 +9,14 @@ set(CMAKE_BUILD_TYPE Release)
 
 add_executable(gnuradio_4_0_parse_registrations parse_registrations.cpp)
 
+if(NOT GR_PARSER_STAMP_DIR)
+  set(GR_PARSER_STAMP_DIR "${PROJECT_BINARY_DIR}")
+endif()
+file(
+  GENERATE
+  OUTPUT "${GR_PARSER_STAMP_DIR}/gnuradio_4_0_parse_registrations-$<CONFIG>.stamp"
+  CONTENT "$<TARGET_FILE:gnuradio_4_0_parse_registrations>")
+
 if(CMAKE_CXX_COMPILER_ID MATCHES ".*Clang") # set default C++ STL to Clang's libc++ when using Clang
   target_compile_options(gnuradio_4_0_parse_registrations PRIVATE -stdlib=libc++)
   target_link_options(

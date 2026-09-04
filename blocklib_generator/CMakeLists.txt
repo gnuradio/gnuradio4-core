@@ -20,11 +20,32 @@ message(
 # Manually configure and build the parser tool in a separate directory
 # --------------------------------------------------------------------------
 set(TOOLS_BUILD_DIR "${PROJECT_BINARY_DIR}/tools_build")
-if(NOT EXISTS "${TOOLS_BUILD_DIR}/CMakeCache.txt")
+
+# tools/CMakeLists.txt pins its own build type, for
+# multi-config generators that has to be repeated on the command line, which ignore CMAKE_BUILD_TYPE.
+set(PARSER_TOOL_CONFIG Release)
+
+set(PARSER_STAMP_FILE "${TOOLS_BUILD_DIR}/gnuradio_4_0_parse_registrations-${PARSER_TOOL_CONFIG}.stamp")
+
+if(NOT EXISTS "${PARSER_STAMP_FILE}")
+  if(EXISTS "${TOOLS_BUILD_DIR}/CMakeCache.txt")
+    message(STATUS "Discarding stale parser tool build in ${TOOLS_BUILD_DIR}")
+    file(REMOVE_RECURSE "${TOOLS_BUILD_DIR}")
+  endif()
+
+  set(PARSER_GENERATOR_ARGS -G${CMAKE_GENERATOR})
+  if(CMAKE_GENERATOR_PLATFORM)
+    list(APPEND PARSER_GENERATOR_ARGS -A${CMAKE_GENERATOR_PLATFORM})
+  endif()
+  if(CMAKE_GENERATOR_TOOLSET)
+    list(APPEND PARSER_GENERATOR_ARGS -T${CMAKE_GENERATOR_TOOLSET})
+  endif()
+
   message(STATUS "Configuring parser tool in ${TOOLS_BUILD_DIR}...")
   execute_process(
-    COMMAND ${CMAKE_COMMAND} -S ${PROJECT_SOURCE_DIR}/tools -B ${TOOLS_BUILD_DIR} -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+    COMMAND ${CMAKE_COMMAND} -S ${PROJECT_SOURCE_DIR}/tools -B ${TOOLS_BUILD_DIR} ${PARSER_GENERATOR_ARGS}
             -DCMAKE_CXX_COMPILER=${GNURADIO_PARSE_REGISTRATIONS_TOOL_CXX_COMPLILER}
+            -DGR_PARSER_STAMP_DIR=${TOOLS_BUILD_DIR}
     RESULT_VARIABLE config_result
     OUTPUT_VARIABLE config_output
     ERROR_VARIABLE config_error
@@ -39,7 +60,8 @@ endif()
 
 message(STATUS "Building parser tool in ${TOOLS_BUILD_DIR}...")
 execute_process(
-  COMMAND ${CMAKE_COMMAND} --build ${TOOLS_BUILD_DIR} --target gnuradio_4_0_parse_registrations
+  COMMAND ${CMAKE_COMMAND} --build ${TOOLS_BUILD_DIR} --target gnuradio_4_0_parse_registrations --config
+          ${PARSER_TOOL_CONFIG}
   WORKING_DIRECTORY ${TOOLS_BUILD_DIR}
   RESULT_VARIABLE build_result
   OUTPUT_VARIABLE build_output
@@ -50,14 +72,19 @@ if(NOT
    EQUAL
    0)
   message(FATAL_ERROR "Failed to build gnuradio_4_0_parse_registrations tool: ${build_error} ${build_output}")
-else()
-  if(WIN32)
-    set(PARSER_EXECUTABLE "${TOOLS_BUILD_DIR}/gnuradio_4_0_parse_registrations.exe")
-  else()
-    set(PARSER_EXECUTABLE "${TOOLS_BUILD_DIR}/gnuradio_4_0_parse_registrations")
-  endif()
-  message(STATUS "Parser tool built: ${PARSER_EXECUTABLE}")
 endif()
+
+if(NOT EXISTS "${PARSER_STAMP_FILE}")
+  message(FATAL_ERROR "The parser tool build produced no ${PARSER_STAMP_FILE}. "
+                      "Delete ${TOOLS_BUILD_DIR} and re-run CMake.")
+endif()
+file(READ "${PARSER_STAMP_FILE}" PARSER_EXECUTABLE)
+string(STRIP "${PARSER_EXECUTABLE}" PARSER_EXECUTABLE)
+if(NOT EXISTS "${PARSER_EXECUTABLE}")
+  message(FATAL_ERROR "The parser tool build reported '${PARSER_EXECUTABLE}', which does not exist. "
+                      "Delete ${TOOLS_BUILD_DIR} and re-run CMake.")
+endif()
+message(STATUS "Parser tool built: ${PARSER_EXECUTABLE}")
 
 # --------------------------------------------------------------------------
 # Configure the rest of the project

@@ -4,6 +4,6 @@ include(CMakeFindDependencyMacro)
 
 find_dependency(gnuradio4 CONFIG)
 
-set(PARSER_EXECUTABLE ${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_BINDIR@/gnuradio_4_0_parse_registrations)
+set(PARSER_EXECUTABLE ${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_BINDIR@/gnuradio_4_0_parse_registrations${CMAKE_EXECUTABLE_SUFFIX})
 
 include("${CMAKE_CURRENT_LIST_DIR}/GnuRadioBlockLibMacros.cmake")
