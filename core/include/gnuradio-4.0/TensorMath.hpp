@@ -256,7 +256,9 @@ struct TensorOps {
 
     [[nodiscard]] static constexpr T sum(const TensorType& self) { return std::accumulate(self.begin(), self.end(), T{0}); }
 
-    [[nodiscard]] static constexpr T product(const TensorType& self) { return std::reduce(self.begin(), self.end(), T{1}, [](T lhs, T rhs) { return static_cast<T>(lhs * rhs); }); } // N.B. explicit cast: small integer types promote to int and wrap on the way back
+    [[nodiscard]] static constexpr T product(const TensorType& self) {
+        return std::reduce(self.begin(), self.end(), T{1}, [](T lhs, T rhs) { return static_cast<T>(lhs * rhs); });
+    }
 
     [[nodiscard]] static constexpr auto mean(const TensorType& self) {
         if (self.empty()) {

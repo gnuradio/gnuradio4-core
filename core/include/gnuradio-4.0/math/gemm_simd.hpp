@@ -112,7 +112,7 @@ struct CacheOptimizedGemm {
 
                     // rank-1 updates for this row
                     for (std::size_t k = kc; k < k_end; ++k) {
-                        const T a_ik                = alpha * A[i, k];
+                        const T              a_ik  = alpha * A[i, k];
                         const T* GR_RESTRICT b_row = &B[k, 0];
 
                         if (N >= 64) { // large N -> use explicit SIMD with unrolling
