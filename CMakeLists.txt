@@ -215,6 +215,23 @@ if(NOT DEFINED GR_DATA_CACHE_DIR)
       CACHE PATH "Writeable system path where GR should store its cached data (for example, /var/lib/gnuradio4/cache)")
 endif()
 
+if(NOT DEFINED GR_BLOCK_PARSER_TOOL)
+  set(_BLOCK_PARSER_TOOL_DOC
+      "GR4-specific block parser tool, used for registry; https://github.com/gnuradio/gnuradio4-block-parser-tool")
+  if(GR_ENABLE_BLOCK_REGISTRY)
+    find_program(
+      GR_BLOCK_PARSER_TOOL
+      NAMES gnuradio_4_0_parse_registrations gnuradio4-block-parser REQUIRED
+      DOC "${_BLOCK_PARSER_TOOL_DOC}")
+  else()
+    find_program(
+      GR_BLOCK_PARSER_TOOL
+      NAMES gnuradio_4_0_parse_registrations gnuradio4-block-parser OPTIONAL
+      DOC "${_BLOCK_PARSER_TOOL_DOC}")
+  endif()
+endif()
+# TODO: execute_process("${GR_BLOCK_PARSER_TOOL}" "--version" RESULT_VARIABLE …) to check --version >= 0.1
+
 set(GR_MAX_WASM_THREAD_COUNT
     60
     CACHE STRING "Max number of threads for WASM pthread pool")
@@ -281,6 +298,7 @@ add_subdirectory(blocklib_generator)
 add_library(gnuradio-options INTERFACE)
 add_library(gnuradio4::gnuradio-options ALIAS gnuradio-options)
 install(TARGETS gnuradio-options EXPORT gnuradio4Targets)
+set_target_properties(gnuradio-options PROPERTIES BLOCK_PARSER_TOOL "${GR_BLOCK_PARSER_TOOL}")
 
 message(
   STATUS
