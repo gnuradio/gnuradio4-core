@@ -156,8 +156,9 @@ end-of-stream tag.
 
 ## Automatic tag forwarding
 
-The framework forwards tags from input to output automatically. Three built-in policies are selected
-via CRTP arguments. For full custom control, override `forwardTags()` (see below).
+The framework forwards tags from input to output automatically. The built-in policies below are
+selected via CRTP arguments; the first four choose where a forwarded tag lands, the fifth chooses
+which keys it carries. For full custom control, override `forwardTags()` (see below).
 
 ### Default (forward tag forwarding)
 
@@ -297,6 +298,45 @@ struct MyBlock : gr::Block<MyBlock, gr::NoTagPropagation> { ... };
 
 The framework does not forward any tags. The block handles tag propagation entirely in `processBulk`
 or via a custom `forwardTags()` override.
+
+### Unfiltered tag propagation (`UnfilteredTagPropagation`)
+
+```cpp
+struct MyBlock : gr::Block<MyBlock, gr::UnfilteredTagPropagation> { ... };
+```
+
+The other four policies decide _where_ a forwarded tag lands. This one decides _which keys_ it still carries. Under
+every other policy the forwarder keeps only the reserved keys of `kDefaultTags` and drops the rest, so a protocol
+carrying its own key cannot cross a single stock block. Under `UnfilteredTagPropagation` every key of every forwarded
+tag survives. The offsets, the retired window, the multi-input dedup and the merge rule stay those of the default
+forwarder.
+
+Value substitution works as it does elsewhere and reaches further: a key the block declares as a setting is forwarded
+with the block's own current value, whether or not that key is reserved. A key named after one of the settings `Block<>`
+declares for every block — `input_chunk_size`, `output_chunk_size`, `stride`, `disconnect_on_done`, `compute_domain`,
+`unique_name`, `name`, `ui_constraints` — is forwarded with the upstream value instead, because a tag using `name`
+for its own purpose must not be rewritten with the block's name.
+
+```
+  input tag:  {trigger_name: "burst", record_id: "r7", gain: 10}
+
+  default policy   ─►  {trigger_name: "burst"}                       record_id and gain dropped
+  unfiltered       ─►  {trigger_name: "burst", record_id: "r7",      record_id passes through,
+                        gain: 2}                                     gain substituted (the block owns it)
+```
+
+The policy is refused at compile time for a block that declares `Resampling<>` or `Stride<>`, has an asynchronous
+stream port, declares another tag-propagation policy, or supplies its own `forwardTags()`. The predicate is
+`gr::block::kUnfilteredTagPropagationAdmissible<TBlock>`, and the assertion fires in every build configuration.
+
+What the guard cannot check is the obligation that matters, so the block author owns it: **a tag arriving at input
+offset `t` must belong at output offset `t`.** A block that shifts sample positions, an integer delay for instance, or
+drops them, as one that keeps every Nth sample does, qualifies mechanically and is still wrong under the policy; those
+write a `forwardTags()` override.
+
+One consequence is intended and worth stating plainly. Tags drive settings, which a later section covers in full, so
+a key that now crosses a block will also drive any downstream setting of the same name. That is the mechanism that
+makes `sample_rate` work, applied to a wider key set — pick key names accordingly.
 
 ### Custom tag forwarding — `forwardTags()`
 
@@ -625,7 +665,7 @@ short key in code (`"sample_rate"`). Keys are aligned with the
 - `inputTagsPresent()` is a `bool` check — zero cost in the no-tag path.
 - `input.tags()` is a lazy view over the tag buffer — no allocation.
 - `settings().get()` (for value substitution during forwarding) is allocated lazily via
-  `std::optional` — only when an auto-forward key is actually found in a tag.
+  `std::optional` — only when a key the block itself declares as a setting is found in a tag.
 - The processOne dispatch loop checks `_outputTagPending` (a `bool`) per sample —
   branch-predicted, no overhead when no tags are published.
 - Single-input blocks skip multi-port dedup entirely (compile-time `if constexpr`).

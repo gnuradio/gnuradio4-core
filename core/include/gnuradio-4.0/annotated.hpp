@@ -101,6 +101,24 @@ struct BackwardTagPropagation {};
 struct MergeTagPropagation {};
 
 /**
+ * @brief Forward every input tag key, not only the auto-forward (reserved) keys.
+ *
+ * The default forwarder keeps only the keys in `gr::tag::kDefaultTags`. A block annotated with
+ * `UnfilteredTagPropagation` keeps every key of every tag it forwards, substituting its own current value for a key
+ * it declares as a setting. The offsets, the retired window, the multi-input dedup and the merge rule stay those of
+ * the default forwarder: this policy governs which keys survive, and nothing else. A surviving key that names a
+ * setting of a downstream block drives that setting, exactly as `sample_rate` does.
+ *
+ * Refused at compile time for a block that declares `Resampling<>`, declares `Stride<>`, has an asynchronous stream
+ * port, declares another tag-propagation policy, or supplies its own `forwardTags()` — see Block.hpp.
+ *
+ * The remaining obligation is the author's, because no compile-time fact expresses it: a tag arriving at input
+ * offset `t` must belong at output offset `t`. A block that shifts sample positions, an integer delay for instance,
+ * or drops them, as one that keeps every Nth sample does, writes its own `forwardTags()` instead.
+ */
+struct UnfilteredTagPropagation {};
+
+/**
  * @brief Annotates block, indicating to perform resampling based on the provided `inputChunkSize` and `outputChunkSize`.
  * For each `inputChunkSize` input samples, `outputChunkSize` output samples are published.
  * Thus the total number of input/output samples can be calculated as `nInput = k * inputChunkSize` and `nOutput = k * outputChunkSize`.
