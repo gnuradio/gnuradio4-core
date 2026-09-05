@@ -24,5 +24,6 @@ install(
   FILES "${CMAKE_CURRENT_BINARY_DIR}/GnuRadioBlockLibConfig.cmake"
         "${CMAKE_CURRENT_BINARY_DIR}/GnuRadioBlockLibMacros.cmake"
         "${CMAKE_CURRENT_SOURCE_DIR}/GrParseRegistrations.cmake"
+        "${CMAKE_CURRENT_SOURCE_DIR}/parse_registrations.py"
   DESTINATION "${GR_BLOCKLIB_CMAKECONFIG_INSTALL_DIR}"
   COMPONENT Devel)

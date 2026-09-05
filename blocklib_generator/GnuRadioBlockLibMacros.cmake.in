@@ -1,5 +1,65 @@
 # define global block building command
 
+# which of the two generators writes the registration units. They produce the same files with the
+# same contents; the Python one is faster to run, the CMake one needs nothing but CMake. AUTO takes
+# Python when an interpreter is found and the CMake script otherwise.
+set(GR_BLOCKLIB_GENERATOR
+    "AUTO"
+    CACHE STRING "Block-registration generator: AUTO, PYTHON or CMAKE")
+set_property(CACHE GR_BLOCKLIB_GENERATOR PROPERTY STRINGS AUTO PYTHON CMAKE)
+
+# Both generators sit beside these macros in an installed package; in this project's own build tree
+# the configured macros are in the binary directory, so fall back to the source they came from.
+# These are read by gr_generate_block_instantiations(), which a consumer calls from any directory it
+# likes, so they are cache entries rather than variables of the scope that included these macros.
+set(GR_BLOCKLIB_CMAKE_GENERATOR_PATH "${CMAKE_CURRENT_LIST_DIR}/GrParseRegistrations.cmake")
+if(NOT EXISTS "${GR_BLOCKLIB_CMAKE_GENERATOR_PATH}")
+    set(GR_BLOCKLIB_CMAKE_GENERATOR_PATH @CMAKE_CURRENT_SOURCE_DIR@/GrParseRegistrations.cmake)
+endif()
+set(GR_BLOCKLIB_CMAKE_GENERATOR
+    "${GR_BLOCKLIB_CMAKE_GENERATOR_PATH}"
+    CACHE INTERNAL "the CMake block-registration generator")
+set(GR_BLOCKLIB_PYTHON_GENERATOR_PATH "${CMAKE_CURRENT_LIST_DIR}/parse_registrations.py")
+if(NOT EXISTS "${GR_BLOCKLIB_PYTHON_GENERATOR_PATH}")
+    set(GR_BLOCKLIB_PYTHON_GENERATOR_PATH @CMAKE_CURRENT_SOURCE_DIR@/parse_registrations.py)
+endif()
+set(GR_BLOCKLIB_PYTHON_GENERATOR
+    "${GR_BLOCKLIB_PYTHON_GENERATOR_PATH}"
+    CACHE INTERNAL "the Python block-registration generator")
+
+# The generator uses the standard library alone, so an interpreter is the whole dependency. A project
+# that already looked for Python keeps its result; nothing here is REQUIRED, and nothing is looked up
+# when the CMake generator is the one asked for.
+if(NOT GR_BLOCKLIB_GENERATOR STREQUAL "CMAKE" AND NOT Python3_Interpreter_FOUND)
+    find_package(Python3 QUIET COMPONENTS Interpreter)
+endif()
+
+if(GR_BLOCKLIB_GENERATOR STREQUAL "PYTHON")
+    if(NOT Python3_Interpreter_FOUND)
+        message(FATAL_ERROR "GR_BLOCKLIB_GENERATOR=PYTHON, but no Python 3 interpreter was found")
+    endif()
+    set(GR_BLOCKLIB_GENERATOR_CHOICE PYTHON)
+elseif(GR_BLOCKLIB_GENERATOR STREQUAL "CMAKE")
+    set(GR_BLOCKLIB_GENERATOR_CHOICE CMAKE)
+elseif(GR_BLOCKLIB_GENERATOR STREQUAL "AUTO")
+    if(Python3_Interpreter_FOUND)
+        set(GR_BLOCKLIB_GENERATOR_CHOICE PYTHON)
+    else()
+        set(GR_BLOCKLIB_GENERATOR_CHOICE CMAKE)
+    endif()
+else()
+    message(FATAL_ERROR "GR_BLOCKLIB_GENERATOR is '${GR_BLOCKLIB_GENERATOR}', not AUTO, PYTHON or CMAKE")
+endif()
+set(GR_BLOCKLIB_GENERATOR_USED
+    "${GR_BLOCKLIB_GENERATOR_CHOICE}"
+    CACHE INTERNAL "the block-registration generator this build tree uses")
+
+if(GR_BLOCKLIB_GENERATOR_USED STREQUAL "PYTHON")
+    message(STATUS "[BlockLibMacros] block-registration generator: ${GR_BLOCKLIB_PYTHON_GENERATOR} (${Python3_EXECUTABLE})")
+else()
+    message(STATUS "[BlockLibMacros] block-registration generator: ${GR_BLOCKLIB_CMAKE_GENERATOR}")
+endif()
+
 function(gr_detail_append_file_to MERGE_OUTPUT_FILE MERGE_INPUT_FILE)
   file(READ ${MERGE_INPUT_FILE} CONTENTS)
   file(APPEND ${MERGE_OUTPUT_FILE} "${CONTENTS}")
@@ -40,21 +100,27 @@ function(gr_generate_block_instantiations LIB_NAME)
     if(GR_SPLIT_BLOCK_INSTANTIATIONS OR CBL_SPLIT_BLOCK_INSTANTIATIONS)
         set(PARSER_SPLIT ON)
         set(PARSER_SPLIT_ARG "-DSPLIT=ON")
+        set(PARSER_SPLIT_PY_ARG "--split")
     else()
         set(PARSER_SPLIT OFF)
         set(PARSER_SPLIT_ARG "")
+        set(PARSER_SPLIT_PY_ARG "")
     endif()
 
     if(CBL_REGISTRY_HEADER)
         set(PARSER_REGISTRY_HEADER_ARG "-DREGISTRY_HEADER=${CBL_REGISTRY_HEADER}")
+        set(PARSER_REGISTRY_HEADER_PY_ARG "--registry-header" "${CBL_REGISTRY_HEADER}")
     else()
         set(PARSER_REGISTRY_HEADER_ARG "")
+        set(PARSER_REGISTRY_HEADER_PY_ARG "")
     endif()
 
     if(CBL_REGISTRY_INSTANCE)
         set(PARSER_REGISTRY_INSTANCE_ARG "-DREGISTRY_INSTANCE=${CBL_REGISTRY_INSTANCE}")
+        set(PARSER_REGISTRY_INSTANCE_PY_ARG "--registry-instance" "${CBL_REGISTRY_INSTANCE}")
     else()
         set(PARSER_REGISTRY_INSTANCE_ARG "")
+        set(PARSER_REGISTRY_INSTANCE_PY_ARG "")
     endif()
 
     # directory where the generator script will output .cpp files.
@@ -92,35 +158,37 @@ function(gr_generate_block_instantiations LIB_NAME)
 
             message(STATUS "[BlockLibMacros] Generating code for header: ${ABS_HDR} -> ${GEN_DIR} with SPLIT=${PARSER_SPLIT}, other options [ ${PARSER_REGISTRY_HEADER_ARG} ${PARSER_REGISTRY_INSTANCE_ARG} ]")
 
-            # The script sits beside these macros in an installed package. In this project's own build tree the
-            # configured macros are in the binary directory, so fall back to the source it was configured from.
-            set(PARSER_SCRIPT "${CMAKE_CURRENT_LIST_DIR}/GrParseRegistrations.cmake")
-            if (NOT EXISTS "${PARSER_SCRIPT}")
-                set(PARSER_SCRIPT @CMAKE_CURRENT_SOURCE_DIR@/GrParseRegistrations.cmake)
+            # the two generators take the same options under their own spellings
+            if(GR_BLOCKLIB_GENERATOR_USED STREQUAL "PYTHON")
+                set(PARSER_COMMAND
+                    ${Python3_EXECUTABLE} "${GR_BLOCKLIB_PYTHON_GENERATOR}"
+                    "--header" "${ABS_HDR}" "--out-dir" "${GEN_DIR}"
+                    ${PARSER_SPLIT_PY_ARG}
+                    ${PARSER_REGISTRY_HEADER_PY_ARG}
+                    ${PARSER_REGISTRY_INSTANCE_PY_ARG})
+            else()
+                set(PARSER_COMMAND
+                    ${CMAKE_COMMAND}
+                    "-DHEADER=${ABS_HDR}" "-DOUT_DIR=${GEN_DIR}"
+                    ${PARSER_SPLIT_ARG}
+                    ${PARSER_REGISTRY_HEADER_ARG}
+                    ${PARSER_REGISTRY_INSTANCE_ARG}
+                    -P "${GR_BLOCKLIB_CMAKE_GENERATOR}")
             endif()
 
             # run the generator immediately at configuration time.
-            message(STATUS "[BlockLibMacros] Running: ${CMAKE_COMMAND} -DHEADER=${ABS_HDR} -DOUT_DIR=${GEN_DIR}
-                    ${PARSER_SPLIT_ARG}
-                    ${PARSER_REGISTRY_HEADER_ARG}
-                    ${PARSER_REGISTRY_INSTANCE_ARG}
-                    -P ${PARSER_SCRIPT}")
+            message(STATUS "[BlockLibMacros] Running: ${PARSER_COMMAND}")
             execute_process(
-                    COMMAND ${CMAKE_COMMAND} # command
-                    "-DHEADER=${ABS_HDR}" "-DOUT_DIR=${GEN_DIR}" # paths
-                    ${PARSER_SPLIT_ARG}
-                    ${PARSER_REGISTRY_HEADER_ARG}
-                    ${PARSER_REGISTRY_INSTANCE_ARG}
-                    -P "${PARSER_SCRIPT}"
+                    COMMAND ${PARSER_COMMAND}
                     RESULT_VARIABLE gen_res
                     OUTPUT_VARIABLE gen_out
                     ERROR_VARIABLE gen_err
                     OUTPUT_STRIP_TRAILING_WHITESPACE
                     ERROR_STRIP_TRAILING_WHITESPACE
             )
-            message(STATUS "[BlockLibMacros] Output from GrParseRegistrations.cmake for ${ABS_HDR}:\n${gen_out}")
+            message(STATUS "[BlockLibMacros] Output from the generator for ${ABS_HDR}:\n${gen_out}")
             if(NOT gen_res EQUAL 0)
-                message(FATAL_ERROR "Error running GrParseRegistrations.cmake on ${HDR}: ${gen_err}")
+                message(FATAL_ERROR "Error running the block-registration generator on ${HDR}: ${gen_err}")
             endif()
         endif()
 

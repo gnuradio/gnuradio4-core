@@ -99,8 +99,8 @@ In the split layout:
 - `gnuradio4-library` may depend on the installed core SDK.
 - `gnuradio4-blocks` may depend on the installed core SDK and `gnuradio4-library`.
 - External blocklib repositories should use the installed `gnuradio4` and
-  `GnuRadioBlockLib` CMake packages, which carry the `GrParseRegistrations.cmake`
-  generator script the block-library macros run.
+  `GnuRadioBlockLib` CMake packages, which carry the block-registration
+  generator the block-library macros run.
 
 ```bash
 cmake --install build --prefix "$HOME/gr4-core"
@@ -147,7 +147,7 @@ keeping standard blocks and reusable DSP libraries in downstream repositories.
   block development direct, type-safe, and maintainable.
 
 - **Blocklib SDK**: Installed CMake packages, code-generation macros, and the
-  `GrParseRegistrations.cmake` generator script for out-of-tree block libraries.
+  block-registration generator for out-of-tree block libraries.
 
 - **Plugin Infrastructure**: Core plugin loading and block registry support for
   runtime discovery of installed block libraries.

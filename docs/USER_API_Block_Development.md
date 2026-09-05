@@ -20,7 +20,7 @@ propagation, SIMD vectorisation, and settings synchronisation. Lean on `std::ran
 #include <gnuradio-4.0/Block.hpp>
 #include <gnuradio-4.0/BlockRegistry.hpp>
 
-// marker macro — parsed at build time by `GrParseRegistrations.cmake`
+// marker macro — parsed at build time by the block-registration generator
 // syntax: GR_REGISTER_BLOCK(fully::qualified::Name, [T], [type1, type2, ...])
 //   [T]              — template parameter placeholder expanded over the type list
 //   [float, double]  — types to instantiate the block for
@@ -654,7 +654,7 @@ sched.runAndWait();
 
 ## Block registration
 
-`GR_REGISTER_BLOCK` is a marker macro parsed at build time by `GrParseRegistrations.cmake`.
+`GR_REGISTER_BLOCK` is a marker macro parsed at build time by the block-registration generator.
 It **must** appear inside the namespace, immediately **before** the block's `template`
 declaration. It does not generate code itself — the generator script scans for it
 while the library configures and writes the required template instantiations and
