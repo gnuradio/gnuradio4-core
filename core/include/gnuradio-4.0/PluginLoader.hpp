@@ -2,6 +2,7 @@
 #define GNURADIO_PLUGIN_LOADER_HPP
 
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -241,6 +242,15 @@ std::expected<std::shared_ptr<gr::BlockModel>, gr::Error> instantiateBlockFromYa
 using plugin_create_function_t  = void (*)(gr_plugin_base**);
 using plugin_destroy_function_t = void (*)(gr_plugin_base*);
 
+/// the file extensions a plugin directory scan opens; a name that only contains one, `libfoo.so.1`, is reported instead
+#if defined(_WIN32)
+inline constexpr std::array<std::string_view, 1> kLibraryExtensions{".dll"};
+#elif defined(__APPLE__)
+inline constexpr std::array<std::string_view, 2> kLibraryExtensions{".so", ".dylib"};
+#else
+inline constexpr std::array<std::string_view, 1> kLibraryExtensions{".so"};
+#endif
+
 class PluginHandler {
 private:
     void*                     _dl_handle  = nullptr;
@@ -250,11 +260,16 @@ private:
 
     std::string _status;
 
-    void release() {
+    /// destroys the plugin instance, leaving the library mapped
+    void releaseInstance() {
         if (_instance && _destroy_fn) {
             _destroy_fn(_instance);
             _instance = nullptr;
         }
+    }
+
+    void release() {
+        releaseInstance();
 
         if (_dl_handle) {
             dlclose(_dl_handle);
@@ -286,27 +301,24 @@ public:
         _create_fn = reinterpret_cast<plugin_create_function_t>(dlsym(_dl_handle, "gr_plugin_make"));
         if (!_create_fn) {
             _status = "Failed to load symbol gr_plugin_make";
-            release();
             return;
         }
 
         _destroy_fn = reinterpret_cast<plugin_destroy_function_t>(dlsym(_dl_handle, "gr_plugin_free"));
         if (!_destroy_fn) {
             _status = "Failed to load symbol gr_plugin_free";
-            release();
             return;
         }
 
         _create_fn(&_instance);
         if (!_instance) {
             _status = "Failed to create an instance of the plugin";
-            release();
             return;
         }
 
         if (_instance->abiVersion() != GR_PLUGIN_CURRENT_ABI_VERSION) {
             _status = "Wrong ABI version";
-            release();
+            releaseInstance();
             return;
         }
     }
@@ -329,15 +341,41 @@ public:
 
     explicit operator bool() const { return _instance; }
 
+    /// whether the library is mapped, which it is even when it is not a plugin
+    [[nodiscard]] bool isLoaded() const noexcept { return _dl_handle != nullptr; }
+
+    /**
+     * @brief Gives up the unload: the library stays mapped for the lifetime of the process.
+     *
+     * A library whose static initializers registered blocks or schedulers leaves factory pointers into its own
+     * code in the registries, and those outlive every handle to it.
+     */
+    void keepMapped() noexcept { _dl_handle = nullptr; }
+
     [[nodiscard]] const std::string& status() const { return _status; }
 
     auto* operator->() const { return _instance; }
 };
 
 class PluginLoader {
+public:
+    /**
+     * @brief A shared object that is not a plugin but registered blocks or schedulers when it loaded.
+     *
+     * It carries no `gr_plugin_make`; its entries reach the registries from static initializers, and it is kept
+     * mapped for the lifetime of the process because those entries point into its code.
+     */
+    struct BlockLibrary {
+        std::string file;
+        std::size_t nBlockRegistrations     = 0UZ;
+        std::size_t nSchedulerRegistrations = 0UZ;
+    };
+
 private:
     detail::YamlDefinitionsLoader                _yamlRegistry;
     std::vector<PluginHandler>                   _pluginHandlers;
+    std::vector<BlockLibrary>                    _blockLibraries;
+    std::vector<std::string>                     _skippedFiles;
     std::unordered_map<std::string, std::string> _failedPlugins;
     std::unordered_set<std::string>              _loadedPluginFiles;
 
@@ -355,6 +393,21 @@ private:
         return detail::optionalMapAt<gr_plugin_base*>(_pluginForSchedulerName, name, nullptr);
     }
 
+    /// How many registrations the registries a load can reach have taken. A library registers into the process-wide
+    /// registries rather than the pair this loader was handed, so both are counted when they differ. A registration
+    /// that replaces a key an earlier library registered leaves the entry count where it was.
+    [[nodiscard]] std::pair<std::size_t, std::size_t> registryGenerations() const {
+        std::size_t blockGeneration     = _registry->generation();
+        std::size_t schedulerGeneration = _schedulerRegistry->generation();
+        if (BlockRegistry& global = gr::globalBlockRegistry(); &global != _registry) {
+            blockGeneration += global.generation();
+        }
+        if (SchedulerRegistry& global = gr::globalSchedulerRegistry(); &global != _schedulerRegistry) {
+            schedulerGeneration += global.generation();
+        }
+        return {blockGeneration, schedulerGeneration};
+    }
+
 public:
     PluginLoader(BlockRegistry& registry, SchedulerRegistry& scheduler_registry, std::span<const std::string> paths) : _yamlRegistry(paths), _registry(&registry), _schedulerRegistry(&scheduler_registry) {
         for (const auto& pathStr : paths) {
@@ -364,32 +417,45 @@ public:
             }
 
             for (const auto& file : std::filesystem::directory_iterator{directory}) {
-#if defined(_WIN32)
-                if (file.is_regular_file() && file.path().extension() == ".dll") {
-#elif defined(__APPLE__)
-                if (file.is_regular_file() && (file.path().extension() == ".so" || file.path().extension() == ".dylib")) {
-#else
-                if (file.is_regular_file() && file.path().extension() == ".so") {
-#endif
-                    auto fileString = file.path().string();
-                    if (_loadedPluginFiles.contains(fileString)) {
-                        continue;
+                const std::filesystem::path& path     = file.path();
+                const std::string            fileName = path.filename().string();
+
+                if (!file.is_regular_file() || !std::ranges::contains(kLibraryExtensions, path.extension().string())) {
+                    if (std::ranges::any_of(kLibraryExtensions, [&fileName](std::string_view extension) { return fileName.contains(extension); })) {
+                        _skippedFiles.push_back(path.string());
                     }
-                    _loadedPluginFiles.insert(fileString);
+                    continue;
+                }
 
-                    if (PluginHandler handler(file.path().string()); handler) {
-                        for (std::string_view blockName : handler->availableBlocks()) {
-                            _pluginForBlockName.emplace(std::string(blockName), handler.operator->());
-                        }
+                auto fileString = path.string();
+                if (_loadedPluginFiles.contains(fileString)) {
+                    continue;
+                }
+                _loadedPluginFiles.insert(fileString);
 
-                        for (std::string_view schedulerName : handler->availableSchedulers()) {
-                            _pluginForSchedulerName.emplace(std::string(schedulerName), handler.operator->());
-                        }
+                const auto [blockGenerationBefore, schedulerGenerationBefore] = registryGenerations();
 
-                        _pluginHandlers.push_back(std::move(handler));
+                if (PluginHandler handler(fileString); handler) {
+                    for (std::string_view blockName : handler->availableBlocks()) {
+                        _pluginForBlockName.emplace(std::string(blockName), handler.operator->());
+                    }
 
+                    for (std::string_view schedulerName : handler->availableSchedulers()) {
+                        _pluginForSchedulerName.emplace(std::string(schedulerName), handler.operator->());
+                    }
+
+                    _pluginHandlers.push_back(std::move(handler));
+
+                } else {
+                    const auto [blockGenerationAfter, schedulerGenerationAfter] = registryGenerations();
+                    const std::size_t blockRegistrations                        = blockGenerationAfter - blockGenerationBefore;
+                    const std::size_t schedulerRegistrations                    = schedulerGenerationAfter - schedulerGenerationBefore;
+
+                    if (handler.isLoaded() && (blockRegistrations != 0UZ || schedulerRegistrations != 0UZ)) {
+                        handler.keepMapped();
+                        _blockLibraries.push_back({.file = fileString, .nBlockRegistrations = blockRegistrations, .nSchedulerRegistrations = schedulerRegistrations});
                     } else {
-                        _failedPlugins[file.path().string()] = handler.status();
+                        _failedPlugins[fileString] = handler.status();
                     }
                 }
             }
@@ -400,6 +466,12 @@ public:
     SchedulerRegistry& schedulerRegistry() { return *_schedulerRegistry; }
 
     const auto& plugins() const { return _pluginHandlers; }
+
+    /// the shared objects that registered blocks or schedulers without being plugins
+    const std::vector<BlockLibrary>& blockLibraries() const { return _blockLibraries; }
+
+    /// directory entries whose name reads as a shared object but which the scan did not open, so that a directory of them is not indistinguishable from an empty one
+    const std::vector<std::string>& skippedFiles() const { return _skippedFiles; }
 
     const auto& failedPlugins() const { return _failedPlugins; }
 

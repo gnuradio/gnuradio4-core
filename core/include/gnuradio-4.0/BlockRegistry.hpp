@@ -88,6 +88,7 @@ class GeneralRegistry {
     };
 
     std::map<std::string, TTypeHandler, std::less<>> _blockTypeHandlers;
+    std::size_t                                      _generation = 0UZ;
 
 public:
     GeneralRegistry()                               = default;
@@ -108,12 +109,14 @@ public:
         auto handler = TTypeHandler{.alias = std::string(alias), .createFunction = factory};
 
         auto resName = _blockTypeHandlers.insert_or_assign(std::string(name), handler);
+        ++_generation;
 
         bool aliasInserted = false;
         if (!alias.empty()) {
             handler.alias.clear();
             auto resAlias = _blockTypeHandlers.insert_or_assign(std::string(alias), handler);
             aliasInserted = resAlias.second;
+            ++_generation;
         }
 
         return resName.second || aliasInserted;
@@ -148,6 +151,9 @@ public:
         auto view = _blockTypeHandlers | std::views::keys;
         return {view.begin(), view.end()};
     }
+
+    /// increments once per registered key, whether the key is new or replaces one already held
+    [[nodiscard]] std::size_t generation() const noexcept { return _generation; }
 
     [[nodiscard]] bool contains(std::string_view blockName) const { return _blockTypeHandlers.contains(blockName); }
 
