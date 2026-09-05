@@ -141,6 +141,28 @@ const boost::ut::suite<"gr::thread_pool GR4 default"> defaultThreadPool = [] {
         expect(throws<std::runtime_error>([&] { (void)fut.get(); }));
     };
 
+    "ThreadPool: a throwing void task must not kill the worker"_test = [] {
+        using namespace gr::thread_pool;
+
+        BasicThreadPool pool("ThrowingTaskTest", TaskType::IO_BOUND, 1U, 1U);
+        pool.waitUntilInitialised();
+
+        const std::size_t nFailedBefore = pool.numTasksFailed();
+        pool.execute([] { throw std::runtime_error("expected failure"); });
+        for (std::size_t i = 0UZ; i < 2000UZ && pool.numTasksFailed() == nFailedBefore; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        expect(eq(pool.numTasksFailed(), nFailedBefore + 1UZ)) << "the escaping exception should be caught and counted";
+
+        std::atomic<bool> ranAfterThrow{false};
+        pool.execute([&ranAfterThrow] {
+            ranAfterThrow = true;
+            ranAfterThrow.notify_all();
+        });
+        ranAfterThrow.wait(false);
+        expect(ranAfterThrow.load()) << "the worker must keep serving tasks after one threw";
+    };
+
     "ThreadPool: recycled task count increases"_test = [] {
         using namespace gr::thread_pool;
 

@@ -92,6 +92,13 @@ const boost::ut::suite<"shorten type name tests"> _shorten_type_name = [] {
         expect(eq(gr::meta::shorten_type_name("::a::b::"sv), "::ab::"sv));
         expect(eq(gr::meta::shorten_type_name("x::::"sv), "x::"sv));
     };
+
+    "shorten_type_name(sv) – templated names"_test = [] {
+        expect(eq(gr::meta::shorten_type_name("gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking, gr::profiling::Profiler>"sv), //
+            "gs::Simple<gsE::singleThreadedBlocking, gp::Profiler>"sv));
+        expect(eq(gr::meta::shorten_type_name("std::vector<std::pair<int, ns::Type>>"sv), "s::vector<s::pair<int, n::Type>>"sv));
+        expect(eq(gr::meta::shorten_type_name("Outer<Inner>"sv), "Outer<Inner>"sv));
+    };
 };
 
 int main() { /* tests are statically executed */ }

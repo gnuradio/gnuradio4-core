@@ -1,5 +1,6 @@
 #include <boost/ut.hpp>
 
+#include <chrono>
 #include <format>
 #include <numeric>
 #include <ranges>
@@ -208,6 +209,116 @@ const boost::ut::suite<"Port"> _portTests = [] { // NOSONAR (N.B. lambda size)
             expect(eq(tags[1].map.at("k2").value_or(-1), 2));
             expect(std::ranges::equal(data, std::vector<int>{11, 22}));
         }
+    };
+
+    "a tag flood cannot swallow the end-of-stream marker"_test = [] {
+        PortOut<int> out;
+        auto         reader    = out.buffer().streamBuffer.new_reader();
+        auto         tagReader = out.buffer().tagBuffer.new_reader();
+        std::size_t  capacity  = 0UZ;
+        {
+            auto span = out.tryReserve<SpanReleasePolicy::ProcessAll>(8UZ);
+            capacity  = span.tags.size();
+            expect(gt(capacity, 1UZ));
+
+            const std::size_t attempts = capacity + 16UZ;
+            for (std::size_t i = 0UZ; i < attempts; ++i) {
+                span.publishTag(propMap({{"n", static_cast<int>(i)}}), 0UZ);
+            }
+            expect(eq(span.tagsPublished, capacity - 1UZ)) << "ordinary tags stop one short of the reservation";
+            expect(eq(span.tagsDropped, attempts - (capacity - 1UZ))) << "every refused tag is counted";
+
+            span.publishEoSTag(property_map{{static_cast<std::pmr::string>(gr::tag::END_OF_STREAM), true}}, 7UZ);
+            expect(eq(span.tagsPublished, capacity)) << "the marker alone takes the final slot";
+            expect(eq(span.tagsDropped, attempts - (capacity - 1UZ))) << "the marker was not refused";
+
+            std::iota(span.begin(), span.end(), 0);
+            span.publish(8UZ);
+        }
+        {
+            auto tags = tagReader.get<SpanReleasePolicy::ProcessAll>();
+            expect(eq(tags.size(), capacity));
+            expect(tags[tags.size() - 1UZ].map.contains(static_cast<std::pmr::string>(gr::tag::END_OF_STREAM))) << "the ending survived the flood";
+            std::ignore = reader.get<SpanReleasePolicy::ProcessAll>();
+        }
+    };
+
+    // The tag ring is allocated one slot beyond the requested size, so reserving a slot for the
+    // marker does not reduce the port's nominal tag capacity. The direct path fills the ring to one
+    // slot short of its end and the marker still fits.
+    "the direct path keeps a slot for the end-of-stream marker"_test = [] {
+        PortOut<int> out;
+        expect(out.resizeBuffer(16UZ).has_value());
+        auto              reader    = out.buffer().streamBuffer.new_reader(); // an output port counts as connected once its stream has a reader
+        auto              tagReader = out.buffer().tagBuffer.new_reader();
+        const std::size_t ringSize  = out.buffer().tagBuffer.size();
+        expect(ge(ringSize - 1UZ, 16UZ)) << std::format("a ring asked for 16 tags holds {} minus the marker's slot: the reservation must not cost the capacity that was asked for", ringSize);
+
+        const std::size_t attempts = ringSize + 8UZ;
+        for (std::size_t i = 0UZ; i < attempts; ++i) {
+            out.publishTag(propMap({{"n", static_cast<int>(i)}}), 0UZ);
+        }
+        expect(eq(out.nTagsDropped, attempts - (ringSize - 1UZ))) << "ordinary tags must stop one short of the ring";
+        expect(eq(out.nEoSTagsLost, 0UZ)) << "no marker has been published yet";
+
+        out.publishEoSTag(property_map{{static_cast<std::pmr::string>(gr::tag::END_OF_STREAM), true}}, 0UZ);
+        expect(eq(out.nEoSTagsLost, 0UZ)) << "the marker found no slot on a ring only its own port had filled";
+
+        auto tags = tagReader.get<SpanReleasePolicy::ProcessAll>();
+        expect(eq(tags.size(), ringSize)) << "the ring holds its nominal tags plus the marker";
+        expect(tags[tags.size() - 1UZ].map.contains(static_cast<std::pmr::string>(gr::tag::END_OF_STREAM))) << "the ending survived the flood";
+        std::ignore = reader.get<SpanReleasePolicy::ProcessAll>();
+    };
+
+    // The span's counter is discarded with the reservation, so a post-run diagnostic can read only
+    // the port's. This is the common processBulk path, which was previously unaccounted for.
+    "a reservation's dropped tags reach the port's counter"_test = [] {
+        PortOut<int> out;
+        expect(out.resizeBuffer(16UZ).has_value());
+        auto        reader    = out.buffer().streamBuffer.new_reader();
+        auto        tagReader = out.buffer().tagBuffer.new_reader();
+        std::size_t dropped   = 0UZ;
+        {
+            auto              span     = out.tryReserve<SpanReleasePolicy::ProcessAll>(8UZ);
+            const std::size_t attempts = span.tags.size() + 4UZ;
+            for (std::size_t i = 0UZ; i < attempts; ++i) {
+                span.publishTag(propMap({{"n", static_cast<int>(i)}}), 0UZ);
+            }
+            dropped = span.tagsDropped;
+            expect(gt(dropped, 0UZ)) << "the reservation was not driven past its end";
+            expect(eq(out.nTagsDropped, 0UZ)) << "the count folds in when the span publishes, not before";
+
+            std::iota(span.begin(), span.end(), 0);
+            span.publish(8UZ);
+        }
+        expect(eq(out.nTagsDropped, dropped)) << "the reservation's drops died with it";
+        std::ignore = tagReader.get<SpanReleasePolicy::ProcessAll>();
+    };
+
+    // Only the consumer frees ring space, so a downstream that has stopped consuming is the one
+    // case the reservation cannot cover. Waiting here would block a scheduler thread on work that
+    // may never arrive, possibly work scheduled to its own pool, so the marker is reported lost
+    // instead and counted separately from ordinary tag drops.
+    "a marker that cannot be published is a terminal loss, not a wait"_test = [] {
+        PortOut<int> out;
+        expect(out.resizeBuffer(16UZ).has_value());
+        auto              reader    = out.buffer().streamBuffer.new_reader();
+        auto              tagReader = out.buffer().tagBuffer.new_reader(); // never consumes
+        const std::size_t ringSize  = out.buffer().tagBuffer.size();
+
+        for (std::size_t i = 0UZ; i < ringSize; ++i) {
+            out.publishTag(propMap({{"n", static_cast<int>(i)}}), 0UZ);
+        }
+        out.publishEoSTag(property_map{{static_cast<std::pmr::string>(gr::tag::END_OF_STREAM), true}}, 0UZ);
+        expect(eq(out.nEoSTagsLost, 0UZ)) << "the first marker had its reserved slot";
+
+        const auto before = std::chrono::steady_clock::now();
+        out.publishEoSTag(property_map{{static_cast<std::pmr::string>(gr::tag::END_OF_STREAM), true}}, 0UZ);
+        const auto elapsed = std::chrono::steady_clock::now() - before;
+
+        expect(eq(out.nEoSTagsLost, 1UZ)) << "a marker with nowhere to go must be counted as the terminal failure it is";
+        expect(lt(elapsed, std::chrono::milliseconds(50))) << "the marker path waited on a consumer that was never going to run";
+        std::ignore = tagReader.get<SpanReleasePolicy::ProcessAll>();
     };
 
     "Async/Optional attribute flags"_test = [] {
@@ -449,29 +560,43 @@ const boost::ut::suite<"PortMetaInfo"> _pmi = [] { // NOSONAR (N.B. lambda size)
         expect(eq(out.at(tag::SIGNAL_MAX.shortKey()).value_or(0.0f), 1.f));
     };
 
+    "update converts a numeric value of another type"_test = [] {
+        PortMetaInfo metaInfo;
+        property_map narrower;
+        narrower[tag::SAMPLE_RATE.shortKey()] = 123; // int reaching a float member
+        expect(metaInfo.update(narrower).has_value());
+        expect(eq(metaInfo.sample_rate.value, 123.f));
+    };
+
     "update wrong type"_test = [] {
         PortMetaInfo metaInfo;
         property_map wrong;
-        wrong[tag::SAMPLE_RATE.shortKey()] = 123; // int instead of float
+        wrong[tag::SAMPLE_RATE.shortKey()] = std::string("not-a-number"); // no conversion to float exists
         expect(!metaInfo.update(wrong).has_value());
+        expect(eq(metaInfo.sample_rate.value, 1.f));
     };
 
-    "update partial changes before wrong type"_test = [] {
+    "update value out of the member's range"_test = [] {
+        PortMetaInfo metaInfo;
+        property_map outOfRange;
+        outOfRange[tag::SAMPLE_RATE.shortKey()] = 1e300; // convertible type, unrepresentable value
+        expect(!metaInfo.update(outOfRange).has_value());
+        expect(eq(metaInfo.sample_rate.value, 1.f));
+    };
+
+    "update applies the convertible keys and reports the others"_test = [] {
         PortMetaInfo metaInfo;
         property_map p;
-        // to be sure in which order settings are applied
         metaInfo.auto_update = {gr::tag::SAMPLE_RATE.shortKey(), gr::tag::SIGNAL_MIN.shortKey(), gr::tag::SIGNAL_MAX.shortKey()};
 
-        p[gr::tag::SAMPLE_RATE.shortKey()] = 42.f;                             // ok
-        p[gr::tag::SIGNAL_MIN.shortKey()]  = std::string("wrong_type_string"); // wrong type
-        p[gr::tag::SIGNAL_MAX.shortKey()]  = 42.;                              // o, but after throw
-        for (const auto& [key, value] : p) {
-            std::println("k={} val={}:{}/{}", std::string_view(key), value, value.value_type(), value.container_type());
-        }
+        p[gr::tag::SAMPLE_RATE.shortKey()] = 42.f;                             // matching type
+        p[gr::tag::SIGNAL_MIN.shortKey()]  = std::string("wrong_type_string"); // no conversion to float exists
+        p[gr::tag::SIGNAL_MAX.shortKey()]  = 42.;                              // float64 narrowed onto the float member
+
         expect(!metaInfo.update(p).has_value());
-        expect(eq(metaInfo.sample_rate.value, 42.f));                                // sample_rate was updated
+        expect(eq(metaInfo.sample_rate.value, 42.f));
+        expect(eq(metaInfo.signal_max.value, 42.f));
         expect(eq(metaInfo.signal_min.value, std::numeric_limits<float>::lowest())); // default value
-        expect(eq(metaInfo.signal_max.value, std::numeric_limits<float>::max()));    // default value, it was not updated after throw
     };
 
     "reset auto_update"_test = [] {

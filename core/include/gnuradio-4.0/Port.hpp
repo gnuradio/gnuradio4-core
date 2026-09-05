@@ -3,9 +3,11 @@
 
 #include <algorithm>
 #include <any>
+#include <chrono>
 #include <complex>
 #include <set>
 #include <span>
+#include <thread>
 #include <variant>
 
 #include <gnuradio-4.0/PmtTypeHelpers.hpp>
@@ -203,62 +205,19 @@ Follows the ISO 80000-1:2022 Quantities and Units conventions:
     explicit PortMetaInfo(std::string_view dataTypeName) noexcept : data_type(dataTypeName) {};
     explicit PortMetaInfo(std::initializer_list<std::pair<const std::string, pmt::Value>> initMetaInfo) noexcept(false) //
         : PortMetaInfo(property_map{initMetaInfo.begin(), initMetaInfo.end()}) {}
-    explicit PortMetaInfo(const property_map& metaInfo) noexcept(false) {
-        if (auto res = update(metaInfo); !res.has_value()) {
-            throw gr::exception(res.error().message, res.error().sourceLocation);
-        }
-    }
+    explicit PortMetaInfo(const property_map& metaInfo) noexcept(false);
 
-    void reset() { auto_update = {gr::tag::kDefaultTags.begin(), gr::tag::kDefaultTags.end()}; }
+    /**
+     * The bodies below walk this fixed eight-field aggregate by reflection, which drags the pmt
+     * conversions, the std::format refusal paths and the type-name machinery in behind them. None
+     * of that varies with the including translation unit -- PortMetaInfo is not a template -- so
+     * the bodies are compiled once in Port.cpp instead of once per port element type.
+     */
+    void reset();
 
-    [[nodiscard]] std::expected<void, Error> update(const property_map& metaInfo, const std::source_location location = std::source_location::current()) noexcept {
-        std::expected<void, Error> maybeError = {};
-        for (const auto& [key, value] : metaInfo) {
-            if (!auto_update.contains(convert_string_domain(key))) {
-                continue;
-            }
-            refl::for_each_data_member_index<PortMetaInfo>([&key, &value, &maybeError, &location, this](auto kIdx) {
-                using MemberType = refl::data_member_type<PortMetaInfo, kIdx>;
-                using Type       = unwrap_if_wrapped_t<std::remove_cvref_t<MemberType>>;
+    [[nodiscard]] std::expected<void, Error> update(const property_map& metaInfo, const std::source_location location = std::source_location::current()) noexcept;
 
-                const auto fieldName = refl::data_member_name<PortMetaInfo, kIdx>.view();
-                if (fieldName == key) {
-                    auto& member = refl::data_member<kIdx>(*this);
-                    if constexpr (std::is_same_v<Type, std::string>) {
-                        const auto str = value.value_or(std::string_view{});
-                        if (str.data()) {
-                            std::ignore = member.validate_and_set(std::string(str));
-                        } else {
-                            maybeError = std::unexpected(Error{std::format("PortMetaInfo invalid-argument: incorrect type for key")});
-                        }
-                    } else {
-                        const auto converted = pmt::convert_safely<Type, true>(value);
-                        if (converted) {
-                            std::ignore = member.validate_and_set(*converted);
-                        } else {
-                            maybeError = std::unexpected(Error{std::format("PortMetaInfo invalid-argument: incorrect type for key {} (expected:{}, got:{} {}, value:{})", //
-                                                                   std::string_view(key), gr::meta::type_name<Type>(), value.value_type(), value.container_type(), value),
-                                location});
-                        }
-                    }
-                }
-            });
-        }
-
-        if (!maybeError.has_value()) {
-            return maybeError;
-        }
-        return {};
-    }
-
-    [[nodiscard]] property_map get() const noexcept {
-        property_map metaInfo;
-        refl::for_each_data_member_index<PortMetaInfo>([&metaInfo, this](auto kIdx) { //
-            metaInfo.insert_or_assign(std::pmr::string(refl::data_member_name<PortMetaInfo, kIdx>.view()), refl::data_member<kIdx>(*this).value);
-        });
-
-        return metaInfo;
-    }
+    [[nodiscard]] property_map get() const noexcept;
 };
 
 template<class T>
@@ -424,6 +383,11 @@ concept InputSpanLike = std::ranges::contiguous_range<T> && ConstSpanLike<T> && 
  *   - Default Behavior:
  *     - For `Synch` ports, all samples are published by default.
  *     - For `Async` ports, no samples are published by default.
+ *   - Publishing fewer samples than the span holds is allowed: the remainder is released back to the buffer, so a
+ *     `processBulk` may end its chunk early — including on the call where `input_chunk_size`/`output_chunk_size`
+ *     changed, which resizes the *next* span, not the one in hand. Ports on a multi-producer buffer are the
+ *     exception and must publish the whole span, since the gap would stall every later publication.
+ *   - Publishing more than the span holds is a contract violation: it is clamped to the reservation and reported.
  * - Publishing Tags: Use `publishTag(tagData, tagOffset)` to publish tags. `tagOffset` is relative to the first sample.
  */
 template<typename T>
@@ -639,7 +603,11 @@ struct Port {
         [[nodiscard]] static constexpr std::ptrdiff_t relIndex(std::size_t abs, std::size_t base) noexcept { return abs >= base ? static_cast<std::ptrdiff_t>(abs - base) : -static_cast<std::ptrdiff_t>(base - abs); }
 
         auto getTagsInRange(std::size_t nSamples, TagReaderType& reader, std::size_t currentStreamOffset) {
-            const auto tags = reader.get(reader.available());
+            const std::size_t nAvailableTags = reader.available();
+            if (nAvailableTags == 0UZ) [[likely]] {
+                return reader.get(0UZ);
+            }
+            const auto tags = reader.get(nAvailableTags);
             const auto it   = std::ranges::find_if_not(tags, [nSamples, currentStreamOffset](const auto& tag) { return tag.index < currentStreamOffset + nSamples; });
             const auto n    = static_cast<std::size_t>(std::distance(tags.begin(), it));
             return reader.get(n);
@@ -656,20 +624,26 @@ struct Port {
         TagWriterSpanType tags;
         std::size_t       streamIndex;
         std::size_t       tagsPublished{0UZ};
+        std::size_t       tagsDropped{0UZ};   // tags refused because the reservation was exhausted
         bool              isConnected = true; // true if Port is connected
         bool              isSync      = true; // true if  Port is Sync
 
-        constexpr OutputSpan(std::size_t nSamples, WriterType& streamWriter, TagWriterType& tagsWriter, std::size_t streamOffset, bool connected, bool sync) noexcept //
+        // The span's counter is discarded with the reservation, so it is added to the port's
+        // persistent counter when the span publishes. nTagsDropped is the counter a post-run
+        // diagnostic reads.
+        std::size_t* portTagsDropped{nullptr};
+
+        constexpr OutputSpan(std::size_t nSamples, WriterType& streamWriter, TagWriterType& tagsWriter, std::size_t streamOffset, bool connected, bool sync, std::size_t* portDropCounter = nullptr) noexcept //
         requires(spanReservePolicy == WriterSpanReservePolicy::Reserve)
             : WriterSpanType<spanReleasePolicy>(streamWriter.template reserve<spanReleasePolicy>(nSamples)), //
               tags(tagsWriter.template reserve<SpanReleasePolicy::ProcessNone>(tagsWriter.available())),     //
-              streamIndex{streamOffset}, isConnected(connected), isSync(sync) {}
+              streamIndex{streamOffset}, isConnected(connected), isSync(sync), portTagsDropped(portDropCounter) {}
 
-        constexpr OutputSpan(std::size_t nSamples_, WriterType& streamWriter, TagWriterType& tagsWriter, std::size_t streamOffset, bool connected, bool sync) noexcept //
+        constexpr OutputSpan(std::size_t nSamples_, WriterType& streamWriter, TagWriterType& tagsWriter, std::size_t streamOffset, bool connected, bool sync, std::size_t* portDropCounter = nullptr) noexcept //
         requires(spanReservePolicy == WriterSpanReservePolicy::TryReserve)
             : WriterSpanType<spanReleasePolicy>(streamWriter.template tryReserve<spanReleasePolicy>(nSamples_)), //
               tags(tagsWriter.template tryReserve<SpanReleasePolicy::ProcessNone>(tagsWriter.available())),      //
-              streamIndex{streamOffset}, isConnected(connected), isSync(sync) {}
+              streamIndex{streamOffset}, isConnected(connected), isSync(sync), portTagsDropped(portDropCounter) {}
 
         OutputSpan(const OutputSpan&)                = delete;
         OutputSpan& operator=(const OutputSpan&)     = delete;
@@ -679,6 +653,9 @@ struct Port {
         ~OutputSpan() {
             if (WriterSpanType<spanReleasePolicy>::instanceCount() == 1UZ) { // has to be one, because the parent destructor which decrements it to zero is only called afterward
                 tags.publish(tagsPublished);
+                if (portTagsDropped != nullptr) {
+                    *portTagsDropped += tagsDropped;
+                }
             }
         }
 
@@ -689,13 +666,36 @@ struct Port {
                 return;
             }
 
-            if (tagsPublished >= tags.size()) {
-                // TODO(error handling): Decide how to surface failures.
-                // Option A: throw an exception, but this function is marked noexcept—either remove noexcept or avoid throwing.
-                // Option B: return an error (or set a port-status flag) that the Scheduler can observe and handle accordingly.
-                // std::println("Tags buffer is full (published:{}, size:{}), can not process tag publishing, tagOffset:{}, tagData:{}", tagsPublished, tags.size(), tagOffset, tagData);
+            // the reservation's final slot is held back for the end-of-stream marker: a tag flood
+            // that exhausts the reservation must not also be able to swallow the stream's ending
+            if (tagsPublished + 1UZ >= tags.size()) {
+                ++tagsDropped;
+                if (tagsDropped == 1UZ) { // one line per reservation: a flood is counted, not narrated
+                    std::println(stderr, "gr::Port: tag buffer full (published: {}, size: {}), dropping tag at offset {}; further drops in this span are counted in tagsDropped", tagsPublished, tags.size(), tagOffset);
+                }
                 return;
             }
+            placeTag(std::forward<TPropertyMap>(tagData), tagOffset);
+        }
+
+        // publishes the end-of-stream marker, which alone may take the reservation's final slot:
+        // an ordinary tag is an annotation, this one is what lets a finite graph terminate
+        template<PropertyMapType TPropertyMap>
+        inline constexpr void publishEoSTag(TPropertyMap&& tagData, std::size_t tagOffset = 0UZ) noexcept {
+            if (!isConnected) {
+                return;
+            }
+            if (tagsPublished >= tags.size()) {
+                ++tagsDropped;
+                std::println(stderr, "gr::Port: tag buffer full (published: {}, size: {}), dropping the end-of-stream tag at offset {}", tagsPublished, tags.size(), tagOffset);
+                return;
+            }
+            placeTag(std::forward<TPropertyMap>(tagData), tagOffset);
+        }
+
+    private:
+        template<PropertyMapType TPropertyMap>
+        inline constexpr void placeTag(TPropertyMap&& tagData, std::size_t tagOffset) noexcept {
             const auto index = streamIndex + tagOffset;
 
 #ifndef NDEBUG
@@ -713,6 +713,14 @@ struct Port {
     static_assert(WriterSpanLike<OutputSpan<gr::SpanReleasePolicy::ProcessAll, WriterSpanReservePolicy::Reserve>>);
     static_assert(OutputSpanLike<OutputSpan<gr::SpanReleasePolicy::ProcessAll, WriterSpanReservePolicy::Reserve>>);
 
+public:
+    // Post-run drop accounting. Every tag this port refused for lack of ring space is counted
+    // here, whether it was refused on the direct path or inside a reservation whose own counter is
+    // discarded with the span. An end-of-stream marker that cannot be published is not counted
+    // here: it is a terminal failure rather than a dropped annotation, and has its own counter.
+    std::size_t nTagsDropped{0UZ};
+    std::size_t nEoSTagsLost{0UZ}; // end-of-stream markers this port could not publish
+
 private:
     IoType    _ioHandler    = newIoHandler();
     TagIoType _tagIoHandler = newTagIoHandler();
@@ -726,11 +734,17 @@ private:
         }
     }
 
+    // The tag ring is allocated one slot beyond the requested size. Every ordinary publish path
+    // stops one slot short, which reserves that slot for the end-of-stream marker. Taking the slot
+    // out of the requested size would reduce the port's usable tag capacity by one; the extra
+    // element costs nothing unless the requested size already falls on a page-rounding boundary.
+    static constexpr std::size_t kTagRingReserve = 1UZ;
+
     [[nodiscard]] constexpr auto newTagIoHandler(std::size_t bufferSize = kDefaultBufferSize) const noexcept {
         if constexpr (kIsInput) {
             return TagBufferType(bufferSize).new_reader();
         } else {
-            return TagBufferType(bufferSize).new_writer();
+            return TagBufferType(bufferSize + kTagRingReserve).new_writer();
         }
     }
 
@@ -780,9 +794,9 @@ public:
 
     [[nodiscard]] constexpr bool isConnected() const noexcept {
         if constexpr (kIsInput) {
-            return _ioHandler.buffer().n_writers() > 0;
+            return nWriters() > 0;
         } else {
-            return _ioHandler.buffer().n_readers() > 0;
+            return nReaders() > 0;
         }
     }
 
@@ -799,6 +813,8 @@ public:
     [[nodiscard]] constexpr std::size_t nReaders() const noexcept {
         if constexpr (kIsInput) {
             return -1UZ;
+        } else if constexpr (requires { _ioHandler.nReaders(); }) {
+            return _ioHandler.nReaders();
         } else {
             return _ioHandler.buffer().n_readers();
         }
@@ -806,7 +822,11 @@ public:
 
     [[nodiscard]] constexpr std::size_t nWriters() const noexcept {
         if constexpr (kIsInput) {
-            return _ioHandler.buffer().n_writers();
+            if constexpr (requires { _ioHandler.nWriters(); }) {
+                return _ioHandler.nWriters();
+            } else {
+                return _ioHandler.buffer().n_writers();
+            }
         } else {
             return -1UZ;
         }
@@ -859,9 +879,9 @@ public:
                     _ioHandler = BufferType(min_size).new_writer();
                 }
                 if (tagResource) {
-                    _tagIoHandler = TagBufferType(min_size, typename TagBufferType::Allocator(tagResource)).new_writer();
+                    _tagIoHandler = TagBufferType(min_size + kTagRingReserve, typename TagBufferType::Allocator(tagResource)).new_writer();
                 } else {
-                    _tagIoHandler = TagBufferType(min_size).new_writer();
+                    _tagIoHandler = TagBufferType(min_size + kTagRingReserve).new_writer();
                 }
             } catch (const std::exception& e) {
                 return std::unexpected(Error(std::format("failed to resize buffer to {}: {}", min_size, e.what())));
@@ -977,14 +997,14 @@ public:
     auto reserve(std::size_t nSamples)
     requires(kIsOutput)
     {
-        return OutputSpan<spanReleasePolicy, WriterSpanReservePolicy::Reserve>(nSamples, streamWriter(), tagWriter(), streamWriter().position(), this->isConnected(), this->isSynchronous());
+        return OutputSpan<spanReleasePolicy, WriterSpanReservePolicy::Reserve>(nSamples, streamWriter(), tagWriter(), streamWriter().position(), this->isConnected(), this->isSynchronous(), &nTagsDropped);
     }
 
     template<SpanReleasePolicy spanReleasePolicy>
     auto tryReserve(std::size_t nSamples)
     requires(kIsOutput)
     {
-        return OutputSpan<spanReleasePolicy, WriterSpanReservePolicy::TryReserve>(nSamples, streamWriter(), tagWriter(), streamWriter().position(), this->isConnected(), this->isSynchronous());
+        return OutputSpan<spanReleasePolicy, WriterSpanReservePolicy::TryReserve>(nSamples, streamWriter(), tagWriter(), streamWriter().position(), this->isConnected(), this->isSynchronous(), &nTagsDropped);
     }
 
     template<PropertyMapType TPropertyMap>
@@ -992,15 +1012,46 @@ public:
     requires(kIsOutput)
     {
         if (isConnected()) {
-            WriterSpanLike auto outTags = tagWriter().tryReserve(1UZ);
+            // two reserved, one published: the ring's last free slot is held back for the
+            // end-of-stream marker exactly as the reservation's last slot is, so a tag flood
+            // cannot take the space the stream's ending needs
+            WriterSpanLike auto outTags = tagWriter().tryReserve(2UZ);
             if (!outTags.empty()) {
                 outTags[0].index = streamWriter().position() + tagOffset;
                 outTags[0].map   = std::forward<TPropertyMap>(tagData);
                 outTags.publish(1UZ);
             } else {
-                // TODO(error handling): Decide how to surface failures. Function is noexcept now
+                ++nTagsDropped;
+                if (nTagsDropped == 1UZ) { // as above: the first drop is news, the next half million are a number
+                    std::println(stderr, "gr::Port: tag ring full, dropping tag at offset {}; further drops on this port are counted in nTagsDropped", tagOffset);
+                }
             }
         }
+    }
+
+    // Publishes the end-of-stream marker without waiting. The reserved slot is available because
+    // every ordinary publish path stops one slot short of the ring's end and the ring carries
+    // kTagRingReserve slots beyond its nominal size, so tag traffic from this port cannot consume
+    // it. The reservation does not cover a downstream that has stopped consuming, since only the
+    // consumer frees ring space. Waiting here would block a scheduler thread, possibly on work
+    // scheduled to its own pool, so a marker that cannot be published is reported and counted as a
+    // terminal failure instead.
+    template<PropertyMapType TPropertyMap>
+    inline void publishEoSTag(TPropertyMap&& tagData, std::size_t tagOffset = 0UZ) noexcept
+    requires(kIsOutput)
+    {
+        if (!isConnected()) {
+            return;
+        }
+        WriterSpanLike auto outTags = tagWriter().tryReserve(1UZ);
+        if (!outTags.empty()) {
+            outTags[0].index = streamWriter().position() + tagOffset;
+            outTags[0].map   = std::forward<TPropertyMap>(tagData);
+            outTags.publish(1UZ);
+            return;
+        }
+        ++nEoSTagsLost;
+        std::println(stderr, "gr::Port: tag ring full and unconsumed, the end-of-stream tag at offset {} could not be published; downstream will not observe the end of the stream", tagOffset);
     }
 
 private:

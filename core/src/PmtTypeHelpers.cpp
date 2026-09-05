@@ -38,4 +38,35 @@ template std::expected<Tensor<std::complex<float>>, std::string>  convert_safely
 template std::expected<Tensor<std::complex<double>>, std::string> convert_safely<Tensor<std::complex<double>>, false>(const pmt::Value&);
 template std::expected<pmt::Value::Map, std::string>              convert_safely<pmt::Value::Map, false>(const pmt::Value&);
 
+// ---- the strict variant, and the numeric entry point that settings and port meta-information use ----
+template std::expected<bool, std::string>                 convert_safely<bool, true>(const pmt::Value&);
+template std::expected<std::int8_t, std::string>          convert_safely<std::int8_t, true>(const pmt::Value&);
+template std::expected<std::uint8_t, std::string>         convert_safely<std::uint8_t, true>(const pmt::Value&);
+template std::expected<std::int16_t, std::string>         convert_safely<std::int16_t, true>(const pmt::Value&);
+template std::expected<std::uint16_t, std::string>        convert_safely<std::uint16_t, true>(const pmt::Value&);
+template std::expected<std::int32_t, std::string>         convert_safely<std::int32_t, true>(const pmt::Value&);
+template std::expected<std::uint32_t, std::string>        convert_safely<std::uint32_t, true>(const pmt::Value&);
+template std::expected<std::int64_t, std::string>         convert_safely<std::int64_t, true>(const pmt::Value&);
+template std::expected<std::uint64_t, std::string>        convert_safely<std::uint64_t, true>(const pmt::Value&);
+template std::expected<float, std::string>                convert_safely<float, true>(const pmt::Value&);
+template std::expected<double, std::string>               convert_safely<double, true>(const pmt::Value&);
+template std::expected<std::complex<float>, std::string>  convert_safely<std::complex<float>, true>(const pmt::Value&);
+template std::expected<std::complex<double>, std::string> convert_safely<std::complex<double>, true>(const pmt::Value&);
+template std::expected<std::string, std::string>          convert_safely<std::string, true>(const pmt::Value&);
+
+template std::expected<bool, std::string>                 convert_numerically<bool>(const pmt::Value&);
+template std::expected<std::int8_t, std::string>          convert_numerically<std::int8_t>(const pmt::Value&);
+template std::expected<std::uint8_t, std::string>         convert_numerically<std::uint8_t>(const pmt::Value&);
+template std::expected<std::int16_t, std::string>         convert_numerically<std::int16_t>(const pmt::Value&);
+template std::expected<std::uint16_t, std::string>        convert_numerically<std::uint16_t>(const pmt::Value&);
+template std::expected<std::int32_t, std::string>         convert_numerically<std::int32_t>(const pmt::Value&);
+template std::expected<std::uint32_t, std::string>        convert_numerically<std::uint32_t>(const pmt::Value&);
+template std::expected<std::int64_t, std::string>         convert_numerically<std::int64_t>(const pmt::Value&);
+template std::expected<std::uint64_t, std::string>        convert_numerically<std::uint64_t>(const pmt::Value&);
+template std::expected<float, std::string>                convert_numerically<float>(const pmt::Value&);
+template std::expected<double, std::string>               convert_numerically<double>(const pmt::Value&);
+template std::expected<std::complex<float>, std::string>  convert_numerically<std::complex<float>>(const pmt::Value&);
+template std::expected<std::complex<double>, std::string> convert_numerically<std::complex<double>>(const pmt::Value&);
+template std::expected<std::string, std::string>          convert_numerically<std::string>(const pmt::Value&);
+
 } // namespace gr::pmt

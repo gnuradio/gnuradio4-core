@@ -92,7 +92,7 @@ struct DataSet {
     using pmt_map              = gr::property_map;
     using idx_pmt_map          = std::pair<std::ptrdiff_t, pmt_map>;
     T            default_value = T(); // default value for padding, ZOH etc.
-    std::int64_t timestamp     = 0;   // UTC timestamp [ns]
+    std::int64_t timestamp     = 0;   // UTC timestamp [ns]; optional — 0 means unset, and a consumer must not derive a time from it
 
     // axis layout:
     std::vector<std::string>    axis_names{};  // axis quantity, e.g. time, frequency, …

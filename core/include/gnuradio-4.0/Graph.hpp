@@ -12,6 +12,7 @@
 #include <gnuradio-4.0/thread/thread_pool.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <map>
 #include <tuple>
 #include <variant>
@@ -104,6 +105,24 @@ inline static constexpr std::size_t  defaultMinBufferSize(bool isArithmeticLike)
 inline static constexpr std::int32_t defaultWeight   = 0;
 inline static const std::string      defaultEdgeName = "unnamed edge"; // Emscripten doesn't want constexpr strings
 
+inline constexpr double      kDefaultEdgeBufferSeconds = 0.05;
+inline constexpr std::size_t kMinEdgeBufferSize        = 1UZ << 15;
+inline constexpr std::size_t kMaxEdgeBufferSize        = 1UZ << 22;
+
+/**
+ * @brief Samples an edge carrying @p sampleRate should hold to buffer @p seconds of stream.
+ *
+ * defaultMinBufferSize()'s fixed 65536 samples is 27 ms at 2.4 MS/s and under 3 ms at 24 MS/s, so a
+ * ring long enough to ride out the scheduler's wake-up jitter at one rate is short at a higher one.
+ * Here the duration is fixed and the count follows the rate, rounded up to a power of two and clamped
+ * at both ends against single-chunk rings at very low rates and needless latency at very high ones.
+ */
+[[nodiscard]] inline constexpr std::size_t edgeBufferSizeFor(double sampleRate, double seconds = kDefaultEdgeBufferSeconds) noexcept {
+    const double      wanted = sampleRate > 0.0 && seconds > 0.0 ? sampleRate * seconds : 0.0;
+    const std::size_t count  = wanted >= static_cast<double>(kMaxEdgeBufferSize) ? kMaxEdgeBufferSize : static_cast<std::size_t>(wanted);
+    return std::bit_ceil(std::clamp(count, kMinEdgeBufferSize, kMaxEdgeBufferSize));
+}
+
 inline std::string format(GraphLike auto const& graph) {
     std::ostringstream os;
     for (const auto& block : graph.blocks()) {
@@ -182,7 +201,10 @@ protected:
         const auto  uniqueBlockName     = data.at("uniqueBlockName").value_or(std::string_view{});
         const auto  portDirectionString = data.at("portDirection").value_or(std::string_view{});
         const auto  portName            = data.at("portName").value_or(std::string_view{});
-        const auto  exportFlag          = checked_access_ptr{data.at("exportFlag").get_if<bool>()};
+        // checked_access_ptr terminates on a null unless not_null is turned off, so the
+        // non-terminating form is what keeps the report below reachable: the message comes over the
+        // message plane, so an exportFlag that is not a bool is a sender's input and is refused as one
+        const auto exportFlag = checked_access_ptr<const bool, false>{data.at("exportFlag").get_if<bool>()};
         if (uniqueBlockName.data() == nullptr || portDirectionString.data() == nullptr || portName.data() == nullptr || exportFlag == nullptr) {
             message.data = std::unexpected(Error{std::format("Invalid definition for the kSubgraphExportPort message {}", message)});
             return message;
@@ -378,6 +400,26 @@ public:
      */
     [[nodiscard]] const Sequence& progress() const noexcept { return *_progress.get(); }
 
+    /**
+     * A graph added to another graph adopts that graph's progress sequence for its own blocks.
+     *
+     * A transparent subgraph is flattened into its parent's execution order, so the scheduler drives its
+     * children but waits on the top-level sequence. Without this the children publish to a sequence nobody
+     * watches: the scheduler observes no progress while they work, and a worker under a blocking execution
+     * policy parks on a sequence their work cannot move.
+     */
+    void init(std::shared_ptr<gr::Sequence> parentProgress, std::string_view computeDomain = gr::thread_pool::kDefaultIoPoolId) {
+        std::shared_ptr<gr::Sequence> adopted = parentProgress;
+        gr::Block<Graph>::init(std::move(parentProgress), computeDomain);
+        if (_progress == adopted) {
+            return;
+        }
+        _progress = std::move(adopted);
+        for (const std::shared_ptr<BlockModel>& block : _blocks) { // blocks added before this graph joined its parent
+            block->init(_progress, this->compute_domain);
+        }
+    }
+
     std::shared_ptr<BlockModel> const& addBlock(std::shared_ptr<BlockModel> block, bool initBlock = true) {
         const std::shared_ptr<BlockModel>& newBlock = _blocks.emplace_back(block);
         if (initBlock) {
@@ -476,7 +518,9 @@ public:
         return {};
     }
 
-    std::expected<void, Error> removeEdgeBySourcePort(std::string_view sourceBlock, std::string_view sourcePort) {
+    // an empty destination removes every edge fanning out from the source port; the port's buffer is shared by
+    // all of them, so the ones that stay must be reconnected afterwards
+    std::expected<std::size_t, Error> removeEdgeBySourcePort(std::string_view sourceBlock, std::string_view sourcePort, std::string_view destinationBlock = {}, std::string_view destinationPort = {}) {
         auto sourceBlockIt = std::ranges::find_if(_blocks, [&sourceBlock](const auto& block) { return block->uniqueName() == sourceBlock; });
         if (sourceBlockIt == _blocks.end()) {
             return std::unexpected(Error(std::format("Block {} was not found in {}", sourceBlock, this->unique_name)));
@@ -488,11 +532,50 @@ public:
         }
         auto& sourcePortRef = *srcPortResult.value();
 
+        // resolve both sides to port objects: an edge may name its ports by index or by name
+        const auto resolvedOutput = [](const Edge& edge) {
+            auto port = edge.sourceBlock()->dynamicOutputPort(edge.sourcePortDefinition());
+            return port ? port.value() : nullptr;
+        };
+        const auto resolvedInput = [](const Edge& edge) {
+            auto port = edge.destinationBlock()->dynamicInputPort(edge.destinationPortDefinition());
+            return port ? port.value() : nullptr;
+        };
+        const auto sharesSourcePort = [&](const Edge& edge) { return resolvedOutput(edge) == std::addressof(sourcePortRef); };
+        const auto isRequestedEdge  = [&](const Edge& edge) {
+            if (!sharesSourcePort(edge)) {
+                return false;
+            }
+            if (destinationBlock.empty() || edge.destinationBlock()->uniqueName() != destinationBlock) {
+                return destinationBlock.empty();
+            }
+            if (destinationPort.empty()) {
+                return true;
+            }
+            auto requestedPort = edge.destinationBlock()->dynamicInputPort(destinationPort);
+            return requestedPort && requestedPort.value() == resolvedInput(edge);
+        };
+
+        if (std::ranges::none_of(_edges, isRequestedEdge)) {
+            return std::unexpected(Error(std::format("No edge from {}.{} in {}", sourceBlock, sourcePort, this->unique_name)));
+        }
+
         if (auto result = sourcePortRef.disconnect(); !result) {
             return std::unexpected(Error(std::format("Block {} sourcePortRef could not be disconnected {}: {}", sourceBlock, this->unique_name, result.error().message)));
         }
 
-        return {};
+        const auto [first, last] = std::ranges::remove_if(_edges, isRequestedEdge);
+        const auto nRemoved      = static_cast<std::size_t>(std::ranges::distance(first, last));
+        _edges.erase(first, last);
+
+        for (auto& edge : _edges) { // siblings lost their buffer with the port teardown
+            if (sharesSourcePort(edge)) {
+                edge._state = Edge::EdgeState::WaitingToBeConnected;
+            }
+        }
+        std::ignore = connectPendingEdges();
+
+        return nRemoved;
     }
 
     std::optional<Message> propertyCallbackGraphInspect([[maybe_unused]] std::string_view propertyName, Message message);
@@ -688,7 +771,11 @@ public:
         if (sourcePort.typeName() != destinationPort.typeName()) {
             edge._state = Edge::EdgeState::IncompatiblePorts;
         } else {
-            const bool hasConnectedEdges = std::ranges::any_of(_edges, [&](const Edge& e) { return edge.hasSameSourcePort(e) && e._state == Edge::EdgeState::Connected; });
+            // the source port may already carry readers wired by another graph — a subgraph's
+            // exported port is connected from both sides of the boundary — and replacing its
+            // buffer would orphan them, so the port's own state decides, not this graph's edge
+            // list
+            const bool hasConnectedEdges = sourcePort.isConnected();
             bool       resizeResult      = true;
             if (!hasConnectedEdges) {
                 const std::size_t bufferSize = calculateStreamBufferSize(edge);
@@ -766,6 +853,39 @@ public:
                 }
                 allConnected = allConnected && wasConnected;
             }
+        }
+
+        // an unconnected optional synchronous output is still written by processBulk, whose
+        // item sizing may include it, yet only connected ports are resized to their edge
+        // size: left at the default capacity, a span request beyond that capacity returns an
+        // empty span in a release build with nothing signaled, silently throttling the block
+        // to zero — so it is sized with the block's largest connected output
+        for (auto& block : _blocks) {
+            auto forEachOutputPort = [&block](auto&& fn) {
+                for (auto& portOrCollection : block->dynamicOutputPorts()) {
+                    if (auto* port = std::get_if<gr::DynamicPort>(&portOrCollection)) {
+                        fn(*port);
+                    } else {
+                        for (auto& collectionPort : std::get<BlockModel::NamedPortCollection>(portOrCollection).ports) {
+                            fn(collectionPort);
+                        }
+                    }
+                }
+            };
+            std::size_t maxConnectedSize = 0UZ;
+            forEachOutputPort([&maxConnectedSize](gr::DynamicPort& port) {
+                if (port.isConnected()) {
+                    maxConnectedSize = std::max(maxConnectedSize, port.bufferSize());
+                }
+            });
+            if (maxConnectedSize == 0UZ) {
+                continue;
+            }
+            forEachOutputPort([maxConnectedSize](gr::DynamicPort& port) {
+                if (!port.isConnected() && port.isSynchronous() && port.isOptional() && port.bufferSize() < maxConnectedSize) {
+                    std::ignore = port.resizeBuffer(maxConnectedSize);
+                }
+            });
         }
         return allConnected;
     }
@@ -857,13 +977,14 @@ gr::Graph flatten(GraphLike auto const& root, std::source_location location = st
     return flattenedGraph;
 }
 
+// keyed on the resolved port, because one port named by index and by name is two PortDefinitions
 using AdjacencyList = std::unordered_map<std::shared_ptr<gr::BlockModel>, //
-    std::unordered_map<gr::PortDefinition, std::vector<const gr::Edge*>>>;
+    std::unordered_map<const gr::DynamicPort*, std::vector<const gr::Edge*>>>;
 
 AdjacencyList computeAdjacencyList(const GraphLike auto& root) {
     AdjacencyList result;
     for (const gr::Edge& edge : root.edges()) {
-        std::vector<const gr::Edge*>& srcMapPort = result[edge.sourceBlock()][edge.sourcePortDefinition()];
+        std::vector<const gr::Edge*>& srcMapPort = result[edge.sourceBlock()][edge.sourceBlock()->dynamicOutputPort(edge.sourcePortDefinition()).value_or(nullptr)];
         srcMapPort.push_back(std::addressof(edge));
     }
     return result;
@@ -966,7 +1087,7 @@ std::vector<gr::Graph> weaklyConnectedComponents(const GraphLike auto& graph) {
 
 inline std::span<const gr::Edge* const> outgoingEdges(const AdjacencyList& adj, const std::shared_ptr<gr::BlockModel>& block, const gr::PortDefinition& port) {
     if (auto it = adj.find(block); it != adj.end()) {
-        if (auto pit = it->second.find(port); pit != it->second.end()) {
+        if (auto pit = it->second.find(block->dynamicOutputPort(port).value_or(nullptr)); pit != it->second.end()) {
             return std::span(pit->second);
         }
     }
@@ -1164,7 +1285,7 @@ struct std::formatter<gr::graph::AdjacencyList> {
 
         for (const auto& [srcBlock, portMap] : adj) {
             for (const auto& [srcPort, edges] : portMap) {
-                out = std::format_to(out, "{}:{}\n", getName(srcBlock), srcPort);
+                out = std::format_to(out, "{}:{}\n", getName(srcBlock), srcPort == nullptr ? std::string_view{"<unresolved>"} : std::string_view{srcPort->metaInfo.name});
                 for (const gr::Edge* edge : edges) {
                     if (formatSpecifier == 'l') {
                         out = std::format_to(out, "    → {:l}\n", *edge);

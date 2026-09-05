@@ -43,7 +43,9 @@ function(set_project_warnings project_name)
       -Wpedantic # warn if non-standard C++ is used
       -Wconversion # warn on type conversions that may lose data
       -Wsign-conversion # warn on sign conversions
-      -Wnull-dereference # warn if a null dereference is detected
+      # warn if a null dereference is detected; unreliable below -O2, so reduced-optimization test targets opt out
+      # through the property
+      $<$<NOT:$<BOOL:$<TARGET_PROPERTY:GR_QA_REDUCED_OPTIMIZATION>>>:-Wnull-dereference>
       -Wdouble-promotion # warn if float is implicit promoted to double
       -Wformat=2 # warn on security issues around functions that format output (ie printf)
       -Wno-unknown-pragmas # ignore IDE, GCC/CLANG specific pragmas
@@ -57,8 +59,7 @@ function(set_project_warnings project_name)
     message(STATUS "Setting compiler warning as errors: ${WARNINGS_AS_ERRORS}")
   endif()
 
-  set(GCC_WARNINGS
-      ${CLANG_WARNINGS}
+  set(GCC_EXTRA_WARNINGS
       -Wno-dangling-reference # TODO: remove this once the fmt dangling reference bug is fixed
       -Wmisleading-indentation # warn if indentation implies blocks where blocks do not exist
       -Wduplicated-cond # warn if if / else chain has duplicated conditions
@@ -73,6 +74,7 @@ function(set_project_warnings project_name)
       -Wno-missing-field-initializers # confusing warning which is not what most users expect:
                                       # https://gcc.gnu.org/bugzilla/show_bug.cgi?id=96868#c3
   )
+  set(GCC_WARNINGS ${CLANG_WARNINGS} ${GCC_EXTRA_WARNINGS})
 
   if(MSVC)
     set(PROJECT_WARNINGS ${MSVC_WARNINGS})
@@ -97,6 +99,13 @@ function(set_project_warnings project_name)
       "${ALL_COMPILER_FLAGS}${PROJECT_WARNINGS_MOD}"
       PARENT_SCOPE)
 
-  target_compile_options(${project_name} INTERFACE ${PROJECT_WARNINGS})
+  # the warning battery is this project's policy, not a usage requirement: $<BUILD_INTERFACE:...> keeps it out of the
+  # installed export, and the compiler-id expressions keep the configure-time selection above from leaking foreign flags
+  # into TUs built with a different compiler
+  target_compile_options(
+    ${project_name}
+    INTERFACE "$<BUILD_INTERFACE:$<$<CXX_COMPILER_ID:MSVC>:${MSVC_WARNINGS}>>"
+              "$<BUILD_INTERFACE:$<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang,GNU>:${CLANG_WARNINGS}>>"
+              "$<BUILD_INTERFACE:$<$<COMPILE_LANG_AND_ID:CXX,GNU>:${GCC_EXTRA_WARNINGS}>>")
 
 endfunction()

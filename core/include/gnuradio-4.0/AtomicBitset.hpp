@@ -2,6 +2,7 @@
 #define GNURADIO_ATOMICBITSET_HPP
 
 #include <cassert>
+#include <span>
 #include <vector>
 
 #include <gnuradio-4.0/AtomicRef.hpp>

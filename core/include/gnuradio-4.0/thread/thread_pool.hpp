@@ -343,6 +343,7 @@ class BasicThreadPool {
     std::condition_variable _condition;
     std::atomic_size_t      _numTaskedQueued = 0U; // cache for _taskQueue.size()
     std::atomic_size_t      _numTasksRunning = 0U;
+    std::atomic_size_t      _numTasksFailed  = 0U;
     TaskQueue               _taskQueue;
     TaskQueue               _recycledTasks;
 
@@ -392,6 +393,7 @@ public:
     [[nodiscard]] std::size_t      numThreads() const noexcept { return std::atomic_load_explicit(&_numThreads, std::memory_order_acquire); }
     [[nodiscard]] std::size_t      numTasksRunning() const noexcept { return std::atomic_load_explicit(&_numTasksRunning, std::memory_order_acquire); }
     [[nodiscard]] std::size_t      numTasksQueued() const { return std::atomic_load_explicit(&_numTaskedQueued, std::memory_order_acquire); }
+    [[nodiscard]] std::size_t      numTasksFailed() const noexcept { return std::atomic_load_explicit(&_numTasksFailed, std::memory_order_acquire); }
     [[nodiscard]] std::size_t      numTasksRecycled() const { return _recycledTasks.size(); }
     [[nodiscard]] bool             isInitialised() const { return _initialised.load(std::memory_order::acquire); }
     void                           waitUntilInitialised() const { _initialised.wait(false); }
@@ -622,7 +624,16 @@ private:
                 if (nameSet) {
                     thread::setThreadName(currentTask.name);
                 }
-                currentTask.func();
+                // a task escaping an exception would unwind into std::thread and terminate the process
+                try {
+                    currentTask.func();
+                } catch (const std::exception& e) {
+                    _numTasksFailed.fetch_add(1U);
+                    std::print(stderr, "{}: task '{}' threw: {}\n", _poolName, currentTask.name, e.what());
+                } catch (...) {
+                    _numTasksFailed.fetch_add(1U);
+                    std::print(stderr, "{}: task '{}' threw an unknown exception\n", _poolName, currentTask.name);
+                }
                 // execute dependent children
                 currentTask.reset();
                 _recycledTasks.push(std::move(currentTaskContainer));
