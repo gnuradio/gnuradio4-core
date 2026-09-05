@@ -1,6 +1,7 @@
 #ifndef GNURADIO_BLOCK_HPP
 #define GNURADIO_BLOCK_HPP
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <limits>
@@ -731,6 +732,27 @@ template<ImplicitLifetimeType T>
     return beginArrayLifetimeByImplicitCreation<T>(storage, nElements);
 #endif
 }
+
+/// the settings `Block<>` declares on every block's behalf, mirroring its own GR_MAKE_REFLECTABLE list; tag forwarding
+/// never substitutes a block's value for one of these, so an incoming key that happens to share a name keeps its value
+inline constexpr std::array<std::string_view, 8UZ> kFrameworkOwnedSettings{"input_chunk_size", "output_chunk_size", "stride", "disconnect_on_done", "compute_domain", "unique_name", "name", "ui_constraints"};
+
+/**
+ * @brief Whether `UnfilteredTagPropagation` may be declared for `TBlock`.
+ *
+ * The policy promises that a tag arriving at input offset `t` leaves at output offset `t`. Declared resampling and
+ * declared stride both break that; the default forwarder never reads an asynchronous input port, and an asynchronous
+ * output port publishes a sample count the forwarded offset does not derive from; each of the other four
+ * tag-propagation policies moves or suppresses the forwarded tag; and a `forwardTags()` override replaces the default
+ * forwarder outright. What the predicate cannot express is the block's own obligation to preserve sample positions.
+ */
+template<typename TBlock>
+constexpr bool kUnfilteredTagPropagationAdmissible =                                                                                  //
+    !TBlock::ResamplingControl::kEnabled && !TBlock::StrideControl::kEnabled                                                          //
+    && traits::block::stream_input_ports<TBlock>::template all_of<traits::port::is_synchronous>                                       //
+    && traits::block::stream_output_ports<TBlock>::template all_of<traits::port::is_synchronous>                                      //
+    && !TBlock::noTagPropagation && !TBlock::forwardTagPropagation && !TBlock::backwardTagPropagation && !TBlock::mergeTagPropagation //
+    && !requires(TBlock& block) { block.forwardTags(std::declval<std::tuple<>&>(), std::declval<std::tuple<>&>(), 0UZ); };
 } // namespace block
 
 /**
@@ -872,10 +894,11 @@ public:
     using AllowIncompleteFinalUpdate = ArgumentsTypeList::template find_or_default<is_incompleteFinalUpdatePolicy, IncompleteFinalUpdatePolicy<IncompleteFinalUpdateEnum::DROP>>;
     using DrawableControl            = ArgumentsTypeList::template find_or_default<is_drawable, Drawable<UICategory::None, "">>;
 
-    constexpr static bool noTagPropagation       = std::disjunction_v<std::is_same<NoTagPropagation, Arguments>...>;
-    constexpr static bool forwardTagPropagation  = std::disjunction_v<std::is_same<ForwardTagPropagation, Arguments>...>;
-    constexpr static bool backwardTagPropagation = std::disjunction_v<std::is_same<BackwardTagPropagation, Arguments>...>;
-    constexpr static bool mergeTagPropagation    = std::disjunction_v<std::is_same<MergeTagPropagation, Arguments>...>;
+    constexpr static bool noTagPropagation         = std::disjunction_v<std::is_same<NoTagPropagation, Arguments>...>;
+    constexpr static bool forwardTagPropagation    = std::disjunction_v<std::is_same<ForwardTagPropagation, Arguments>...>;
+    constexpr static bool backwardTagPropagation   = std::disjunction_v<std::is_same<BackwardTagPropagation, Arguments>...>;
+    constexpr static bool mergeTagPropagation      = std::disjunction_v<std::is_same<MergeTagPropagation, Arguments>...>;
+    constexpr static bool unfilteredTagPropagation = std::disjunction_v<std::is_same<UnfilteredTagPropagation, Arguments>...>;
 
     constexpr static block::Category blockCategory = block::Category::NormalBlock;
 
@@ -938,6 +961,7 @@ public:
     A<property_map, "ui-constraints", Doc<"store non-graph-processing information like UI block position etc.">>         ui_constraints;
     A<property_map, "meta-information", Doc<"store static non-graph-processing information like Annotated<> info etc.">> meta_information = initMetaInfo();
 
+    // these names are mirrored in gr::block::kFrameworkOwnedSettings, which keeps them out of tag-value substitution
     GR_MAKE_REFLECTABLE(Block, input_chunk_size, output_chunk_size, stride, disconnect_on_done, compute_domain, unique_name, name, ui_constraints);
 
     // TODO: C++26 make sure these are not reflected
@@ -1173,6 +1197,15 @@ public:
         if constexpr (StrideControl::kEnabled) {
             static_assert(!kIsSourceBlock, "Stride is not available for source blocks. Remove 'Stride<>' from the block definition.");
         }
+        if constexpr (unfilteredTagPropagation) {
+            static_assert(!ResamplingControl::kEnabled, "UnfilteredTagPropagation is not available for a block declaring Resampling<>: a rate-changing block must map tag offsets itself in forwardTags().");
+            static_assert(!StrideControl::kEnabled, "UnfilteredTagPropagation is not available for a block declaring Stride<>: skipped or overlapping input leaves a consumed sample without an output sample at the same offset, so forwardTags() must map the offsets.");
+            static_assert(traits::block::stream_input_ports<Derived>::template all_of<traits::port::is_synchronous>, "UnfilteredTagPropagation is not available for a block with an asynchronous stream input port: the default forwarder never reads such a port, so nothing would be forwarded from it.");
+            static_assert(traits::block::stream_output_ports<Derived>::template all_of<traits::port::is_synchronous>, "UnfilteredTagPropagation is not available for a block with an asynchronous stream output port: the forwarded offset is derived from the synchronous sample count and means nothing on a port that publishes its own.");
+            static_assert(!noTagPropagation && !forwardTagPropagation && !backwardTagPropagation && !mergeTagPropagation, "UnfilteredTagPropagation cannot be combined with another tag-propagation policy: each of the other four either suppresses forwarding or moves the output offset the policy promises to preserve.");
+            static_assert(!requires(Derived& block) { block.forwardTags(std::declval<std::tuple<>&>(), std::declval<std::tuple<>&>(), 0UZ); }, "UnfilteredTagPropagation is not available for a block supplying forwardTags(): the override replaces the default forwarder entirely, so the policy would have no effect.");
+            static_assert(block::kUnfilteredTagPropagationAdmissible<Derived>, "UnfilteredTagPropagation admissibility and the assertions above must state the same conditions.");
+        }
     }
 
     constexpr void checkBlockParameterConsistency() {
@@ -1311,25 +1344,31 @@ public:
         }
     }
 
-    /// keep the auto-forward keys of an incoming tag, substituting this block's own current value for any key it owns
-    /// and, on a resampling block, the rate it publishes at for the rate it is fed
+    /// keep the auto-forward keys of an incoming tag — every key under UnfilteredTagPropagation — substituting this
+    /// block's own current value for a key it declares as a setting, and on a resampling block the rate it publishes
+    /// at for the rate it is fed. The settings snapshot is taken lazily, and only where a key is actually owned, so a
+    /// tag of keys this block knows nothing about costs no copy.
     [[nodiscard]] property_map filterAndSubstituteTag(const property_map& src, std::optional<property_map>& cachedSettings) {
-        const auto&  autoForwardKeys = settings().autoForwardParameters();
-        const auto&  blockSettings   = CtxSettings<Derived>::allWritableMembers();
-        property_map dst;
+        [[maybe_unused]] const auto& autoForwardKeys = settings().autoForwardParameters();
+        const auto&                  blockSettings   = CtxSettings<Derived>::allWritableMembers();
+        property_map                 dst;
         for (const auto& [key, value] : src) {
             auto shortKey = convert_string_domain(key);
-            if (!autoForwardKeys.contains(shortKey)) {
-                continue;
+            if constexpr (!unfilteredTagPropagation) {
+                if (!autoForwardKeys.contains(shortKey)) {
+                    continue;
+                }
             }
-            if (!cachedSettings) {
-                cachedSettings.emplace(settings().get());
+            if (blockSettings.contains(shortKey) && !std::ranges::contains(block::kFrameworkOwnedSettings, shortKey)) {
+                if (!cachedSettings) {
+                    cachedSettings.emplace(settings().get());
+                }
+                if (auto it = cachedSettings->find(key); it != cachedSettings->end()) {
+                    dst.insert_or_assign(key, it->second);
+                    continue;
+                }
             }
-            if (auto it = cachedSettings->find(key); blockSettings.contains(shortKey) && it != cachedSettings->end()) {
-                dst.insert_or_assign(key, it->second);
-            } else {
-                dst.insert_or_assign(key, value);
-            }
+            dst.insert_or_assign(key, value);
         }
         // the chunk ratio is a property of the block, not of its member list: a decimator that declares no sample_rate
         // of its own still publishes at the decimated rate, and the value it hands on is the one the tag arrived with
@@ -2813,6 +2852,9 @@ inline constexpr int registerBlock(TRegisterInstance& registerInstance) {
 namespace block {
 namespace detail {
 
+// The tag-policy clause enumerates the four policies that move or suppress a forwarded tag. T::unfilteredTagPropagation
+// is deliberately not among them: it governs the surviving key set, not the tag window, the offsets or the merge rule,
+// and fusedBeginChunk() runs the same filterAndSubstituteTag().
 template<typename T>
 using FusedValueTypeIn = typename traits::block::stream_input_port_types<T>::template at<0>;
 template<typename T>
