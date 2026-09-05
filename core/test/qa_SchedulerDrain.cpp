@@ -111,6 +111,48 @@ struct FailingRelay : gr::Block<FailingRelay> {
     }
 };
 
+constexpr std::size_t kWindow = 4UZ;
+
+// needs a window of samples to make one item and takes one sample per call, so what it still owes the loop is
+// known only where the call ends: it publishes that requirement as its input port minimum from processBulk().
+// The window it cannot fill is the tail the end of the stream leaves, and the epilogue is where it says so.
+struct WindowedRelay : gr::Block<WindowedRelay> {
+    gr::PortIn<int>  in;
+    gr::PortOut<int> out;
+
+    GR_MAKE_REFLECTABLE(WindowedRelay, in, out);
+
+    std::size_t _nShortCalls = 0UZ; // calls offered fewer samples than the minimum the previous call published
+    std::size_t _tail        = 0UZ; // what the stream left that no window could be filled from
+    bool        _epilogueRan = false;
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& inSpan, gr::OutputSpanLike auto& outSpan) {
+        in.min_samples = kWindow;
+        if (inSpan.size() < kWindow) {
+            _nShortCalls++;
+            std::ignore = inSpan.consume(0UZ);
+            outSpan.publish(0UZ);
+            return gr::work::Status::INSUFFICIENT_INPUT_ITEMS;
+        }
+        if (outSpan.size() == 0UZ) {
+            std::ignore = inSpan.consume(0UZ);
+            outSpan.publish(0UZ);
+            return gr::work::Status::INSUFFICIENT_OUTPUT_ITEMS;
+        }
+        outSpan[0UZ] = inSpan[0UZ];
+        std::ignore  = inSpan.consume(1UZ);
+        outSpan.publish(1UZ);
+        return gr::work::Status::OK;
+    }
+
+    gr::work::Status processEpilogue(gr::InputSpanLike auto& inSpan, gr::OutputSpanLike auto& outSpan) {
+        _epilogueRan = true;
+        _tail        = inSpan.size();
+        outSpan.publish(0UZ);
+        return gr::work::Status::OK;
+    }
+};
+
 struct CountingSink : gr::Block<CountingSink> {
     gr::PortIn<int> in;
 
@@ -191,6 +233,24 @@ const boost::ut::suite<"end-of-stream drain"> drainTests = [] {
         expect(gt(relay._nCalls, 1UZ)) << "the block was not offered its remainder at all";
         expect(eq(sink._nReceived, 0UZ));
         expect(relay.state() == STOPPED);
+    };
+
+    "an input minimum published from processBulk governs the next call and ends the stream"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_drain::BurstSource>();
+        auto&     relay  = flow.emplaceBlock<qa_drain::WindowedRelay>();
+        auto&     sink   = flow.emplaceBlock<qa_drain::CountingSink>();
+        expect(flow.connect<"out", "in">(source, relay).has_value());
+        expect(flow.connect<"out", "in">(relay, sink).has_value());
+
+        qa_drain::SerialScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(qa_drain::runWithin(scheduler, std::chrono::duration_cast<std::chrono::milliseconds>(qa_drain::kRunBound))) << "the block was offered a span it cannot use and the graph never ended";
+
+        expect(eq(relay._nShortCalls, 0UZ)) << "the scheduler kept offering less than the published minimum";
+        expect(eq(sink._nReceived, qa_drain::kBurst - qa_drain::kWindow + 1UZ)) << "one item per sample the window could be filled from";
+        expect(relay._epilogueRan) << "a block whose minimum can no longer be met was not driven to its epilogue";
+        expect(eq(relay._tail, qa_drain::kWindow - 1UZ)) << "the tail is what no window could be filled from";
     };
 
     "a graph ending on an error does not drain"_test = [] {
