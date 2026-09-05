@@ -142,6 +142,14 @@ if(GR_ENABLE_BLOCK_REGISTRY AND INTERNAL_ENABLE_BLOCK_PLUGINS)
     bad_plugin)
 
   add_app_test(qa_PluginRegistration)
+
+  add_app_test(qa_PluginBlockLibrary)
+  add_dependencies(
+    qa_PluginBlockLibrary
+    block_library
+    block_library_second
+    block_library_duplicate
+    block_library_duplicate_second)
 endif()
 
 if(GR_ENABLE_BLOCK_REGISTRY AND INTERNAL_ENABLE_BLOCK_PLUGINS)

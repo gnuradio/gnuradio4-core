@@ -36,3 +36,23 @@ endfunction()
 add_non_blocklib_plugin(good_math_plugin)
 add_non_blocklib_plugin(good_conversion_plugin)
 add_non_blocklib_plugin(bad_plugin)
+
+# Shared objects that register blocks without being plugins: no gr_plugin_make, entries reaching the registry from
+# static initializers. Two go in one directory, because one alone does not show what unloading it does to a neighbor.
+function(add_block_library LIBRARY_NAME DIRECTORY_NAME)
+  add_library(${LIBRARY_NAME} MODULE ${LIBRARY_NAME}.cpp)
+  target_link_libraries(${LIBRARY_NAME} PRIVATE gnuradio-options gnuradio-core gnuradio-blocklib-core)
+  set_target_properties(${LIBRARY_NAME} PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${TESTS_BINARY_PATH}/${DIRECTORY_NAME})
+endfunction()
+
+add_block_library(block_library block_library)
+add_block_library(block_library_second block_library)
+
+# The pair in this directory register one block under the same type name and alias, as duplicate installations of a
+# block library do. The second to load replaces the first one's entries without changing how many there are.
+add_block_library(block_library_duplicate block_library_duplicate)
+add_block_library(block_library_duplicate_second block_library_duplicate)
+
+# a name that reads as a shared object but is not one the scan opens; it is never dlopened, so an empty file suffices
+file(MAKE_DIRECTORY ${TESTS_BINARY_PATH}/block_library_skipped)
+file(TOUCH ${TESTS_BINARY_PATH}/block_library_skipped/libnotopened.so.1)
