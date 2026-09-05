@@ -203,62 +203,19 @@ Follows the ISO 80000-1:2022 Quantities and Units conventions:
     explicit PortMetaInfo(std::string_view dataTypeName) noexcept : data_type(dataTypeName) {};
     explicit PortMetaInfo(std::initializer_list<std::pair<const std::string, pmt::Value>> initMetaInfo) noexcept(false) //
         : PortMetaInfo(property_map{initMetaInfo.begin(), initMetaInfo.end()}) {}
-    explicit PortMetaInfo(const property_map& metaInfo) noexcept(false) {
-        if (auto res = update(metaInfo); !res.has_value()) {
-            throw gr::exception(res.error().message, res.error().sourceLocation);
-        }
-    }
+    explicit PortMetaInfo(const property_map& metaInfo) noexcept(false);
 
-    void reset() { auto_update = {gr::tag::kDefaultTags.begin(), gr::tag::kDefaultTags.end()}; }
+    /**
+     * The bodies below walk this fixed eight-field aggregate by reflection, which drags the pmt
+     * conversions, the std::format refusal paths and the type-name machinery in behind them. None
+     * of that varies with the including translation unit -- PortMetaInfo is not a template -- so
+     * the bodies are compiled once in Port.cpp instead of once per port element type.
+     */
+    void reset();
 
-    [[nodiscard]] std::expected<void, Error> update(const property_map& metaInfo, const std::source_location location = std::source_location::current()) noexcept {
-        std::expected<void, Error> maybeError = {};
-        for (const auto& [key, value] : metaInfo) {
-            if (!auto_update.contains(convert_string_domain(key))) {
-                continue;
-            }
-            refl::for_each_data_member_index<PortMetaInfo>([&key, &value, &maybeError, &location, this](auto kIdx) {
-                using MemberType = refl::data_member_type<PortMetaInfo, kIdx>;
-                using Type       = unwrap_if_wrapped_t<std::remove_cvref_t<MemberType>>;
+    [[nodiscard]] std::expected<void, Error> update(const property_map& metaInfo, const std::source_location location = std::source_location::current()) noexcept;
 
-                const auto fieldName = refl::data_member_name<PortMetaInfo, kIdx>.view();
-                if (fieldName == key) {
-                    auto& member = refl::data_member<kIdx>(*this);
-                    if constexpr (std::is_same_v<Type, std::string>) {
-                        const auto str = value.value_or(std::string_view{});
-                        if (str.data()) {
-                            std::ignore = member.validate_and_set(std::string(str));
-                        } else {
-                            maybeError = std::unexpected(Error{std::format("PortMetaInfo invalid-argument: incorrect type for key")});
-                        }
-                    } else {
-                        const auto converted = pmt::convert_safely<Type, true>(value);
-                        if (converted) {
-                            std::ignore = member.validate_and_set(*converted);
-                        } else {
-                            maybeError = std::unexpected(Error{std::format("PortMetaInfo invalid-argument: incorrect type for key {} (expected:{}, got:{} {}, value:{})", //
-                                                                   std::string_view(key), gr::meta::type_name<Type>(), value.value_type(), value.container_type(), value),
-                                location});
-                        }
-                    }
-                }
-            });
-        }
-
-        if (!maybeError.has_value()) {
-            return maybeError;
-        }
-        return {};
-    }
-
-    [[nodiscard]] property_map get() const noexcept {
-        property_map metaInfo;
-        refl::for_each_data_member_index<PortMetaInfo>([&metaInfo, this](auto kIdx) { //
-            metaInfo.insert_or_assign(std::pmr::string(refl::data_member_name<PortMetaInfo, kIdx>.view()), refl::data_member<kIdx>(*this).value);
-        });
-
-        return metaInfo;
-    }
+    [[nodiscard]] property_map get() const noexcept;
 };
 
 template<class T>
@@ -424,6 +381,11 @@ concept InputSpanLike = std::ranges::contiguous_range<T> && ConstSpanLike<T> && 
  *   - Default Behavior:
  *     - For `Synch` ports, all samples are published by default.
  *     - For `Async` ports, no samples are published by default.
+ *   - Publishing fewer samples than the span holds is allowed: the remainder is released back to the buffer, so a
+ *     `processBulk` may end its chunk early — including on the call where `input_chunk_size`/`output_chunk_size`
+ *     changed, which resizes the *next* span, not the one in hand. Ports on a multi-producer buffer are the
+ *     exception and must publish the whole span, since the gap would stall every later publication.
+ *   - Publishing more than the span holds is a contract violation: it is clamped to the reservation and reported.
  * - Publishing Tags: Use `publishTag(tagData, tagOffset)` to publish tags. `tagOffset` is relative to the first sample.
  */
 template<typename T>
@@ -639,7 +601,11 @@ struct Port {
         [[nodiscard]] static constexpr std::ptrdiff_t relIndex(std::size_t abs, std::size_t base) noexcept { return abs >= base ? static_cast<std::ptrdiff_t>(abs - base) : -static_cast<std::ptrdiff_t>(base - abs); }
 
         auto getTagsInRange(std::size_t nSamples, TagReaderType& reader, std::size_t currentStreamOffset) {
-            const auto tags = reader.get(reader.available());
+            const std::size_t nAvailableTags = reader.available();
+            if (nAvailableTags == 0UZ) [[likely]] {
+                return reader.get(0UZ);
+            }
+            const auto tags = reader.get(nAvailableTags);
             const auto it   = std::ranges::find_if_not(tags, [nSamples, currentStreamOffset](const auto& tag) { return tag.index < currentStreamOffset + nSamples; });
             const auto n    = static_cast<std::size_t>(std::distance(tags.begin(), it));
             return reader.get(n);
@@ -689,11 +655,9 @@ struct Port {
                 return;
             }
 
+            // TODO(error handling): surface this to the scheduler as a port-status flag instead of stderr
             if (tagsPublished >= tags.size()) {
-                // TODO(error handling): Decide how to surface failures.
-                // Option A: throw an exception, but this function is marked noexcept—either remove noexcept or avoid throwing.
-                // Option B: return an error (or set a port-status flag) that the Scheduler can observe and handle accordingly.
-                // std::println("Tags buffer is full (published:{}, size:{}), can not process tag publishing, tagOffset:{}, tagData:{}", tagsPublished, tags.size(), tagOffset, tagData);
+                std::println(stderr, "gr::Port: tag buffer full (published: {}, size: {}), dropping tag at offset {}", tagsPublished, tags.size(), tagOffset);
                 return;
             }
             const auto index = streamIndex + tagOffset;
@@ -780,9 +744,9 @@ public:
 
     [[nodiscard]] constexpr bool isConnected() const noexcept {
         if constexpr (kIsInput) {
-            return _ioHandler.buffer().n_writers() > 0;
+            return nWriters() > 0;
         } else {
-            return _ioHandler.buffer().n_readers() > 0;
+            return nReaders() > 0;
         }
     }
 
@@ -799,6 +763,8 @@ public:
     [[nodiscard]] constexpr std::size_t nReaders() const noexcept {
         if constexpr (kIsInput) {
             return -1UZ;
+        } else if constexpr (requires { _ioHandler.nReaders(); }) {
+            return _ioHandler.nReaders();
         } else {
             return _ioHandler.buffer().n_readers();
         }
@@ -806,7 +772,11 @@ public:
 
     [[nodiscard]] constexpr std::size_t nWriters() const noexcept {
         if constexpr (kIsInput) {
-            return _ioHandler.buffer().n_writers();
+            if constexpr (requires { _ioHandler.nWriters(); }) {
+                return _ioHandler.nWriters();
+            } else {
+                return _ioHandler.buffer().n_writers();
+            }
         } else {
             return -1UZ;
         }

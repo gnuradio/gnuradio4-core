@@ -2,11 +2,20 @@
 #define GNURADIO_SCHEDULER_MODEL_HPP
 
 #include <gnuradio-4.0/BlockModel.hpp>
-#include <gnuradio-4.0/Graph.hpp>
 
 #include <thread>
 
 namespace gr {
+
+// Graph.hpp is not parsed here. SchedulerModel names gr::Graph only through a reference, and
+// SchedulerWrapper is a template whose base and body are instantiated at the point of use -- which
+// is a translation unit that builds a scheduler and therefore includes Graph.hpp already. Every
+// block header reaches this file through BlockRegistry.hpp for the GR_REGISTER_BLOCK marker, so the
+// graph machinery would otherwise be parsed by every translation unit that mentions a block.
+struct Graph;
+
+template<typename TSelf, typename TSubGraph>
+class GraphWrapper;
 
 class SchedulerModel {
 public:
@@ -51,7 +60,8 @@ public:
     SchedulerWrapper& operator=(const SchedulerWrapper& other) = delete;
     SchedulerWrapper& operator=(SchedulerWrapper&& other)      = delete;
 
-    ~SchedulerWrapper() override = default;
+    // members are destroyed before bases, so a joinable _schedulerThread here would terminate the process
+    ~SchedulerWrapper() override { stop(); }
 
     void setGraph(gr::Graph&& graph) final { std::ignore = this->blockRef().exchange(std::move(graph)); }
 
@@ -60,11 +70,16 @@ public:
     void start() override {
         auto& sched = this->blockRef();
 
+        if (_schedulerThread.joinable()) { // a previous run may have finished without a stop()
+            _schedulerThread.join();
+        }
+
         if (sched.state() == gr::lifecycle::State::IDLE) {
             std::ignore = sched.changeStateTo(gr::lifecycle::State::INITIALISED);
         }
 
         if (sched.state() != gr::lifecycle::State::INITIALISED) {
+            sched.emitErrorMessage("SchedulerWrapper::start()", std::format("sub-scheduler '{}' is {}, not INITIALISED -- not started", sched.unique_name, gr::meta::enumName(sched.state()).value_or("")));
             return;
         }
 

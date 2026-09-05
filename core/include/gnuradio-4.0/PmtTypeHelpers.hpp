@@ -356,11 +356,28 @@ template<class T, bool strictCheck = false, typename From>
     return std::unexpected(std::format("no safe conversion for <{}> -> <{}>", typeid(S).name(), typeid(T).name()));
 }
 
+// not constexpr: a pmt::Value owns allocated storage and can never be a constant expression, and the
+// qualifier would make it implicitly inline, which is what an explicit instantiation declaration
+// cannot suppress -- the declarations at the bottom of this header only take effect without it. The
+// visitor this instantiates costs one dispatch thunk per Value alternative for every T it is called
+// with, which is the largest repeated cluster in a unit that materialises a block.
 template<class T, bool strictCheck = false>
-[[nodiscard]] constexpr std::expected<T, std::string> convert_safely(const pmt::Value& v) {
+[[nodiscard]] std::expected<T, std::string> convert_safely(const pmt::Value& v) {
     std::expected<T, std::string> result;
     ValueVisitor([&result](const auto& from) { result = convert_safely<T, strictCheck>(from); }).visit(v);
     return result;
+}
+
+// as strict as convert_safely<T, true>, except that a numeric scalar reaching a numeric target is
+// converted across width and signedness with the range and precision checks of convert_safely<T, false>
+template<class T>
+[[nodiscard]] std::expected<T, std::string> convert_numerically(const pmt::Value& v) {
+    if constexpr (std::is_arithmetic_v<T> && !std::is_same_v<T, bool>) {
+        if (v.is_integral() || v.is_floating_point()) {
+            return convert_safely<T, false>(v);
+        }
+    }
+    return convert_safely<T, true>(v);
 }
 
 template<typename TMinimalNumericVariant, typename R = std::expected<TMinimalNumericVariant, std::string>>
@@ -521,6 +538,37 @@ extern template std::expected<Tensor<double>, std::string>               convert
 extern template std::expected<Tensor<std::complex<float>>, std::string>  convert_safely<Tensor<std::complex<float>>, false>(const pmt::Value&);
 extern template std::expected<Tensor<std::complex<double>>, std::string> convert_safely<Tensor<std::complex<double>>, false>(const pmt::Value&);
 extern template std::expected<pmt::Value::Map, std::string>              convert_safely<pmt::Value::Map, false>(const pmt::Value&);
+
+// ---- the strict variant, and the numeric entry point that settings and port meta-information use ----
+extern template std::expected<bool, std::string>                 convert_safely<bool, true>(const pmt::Value&);
+extern template std::expected<std::int8_t, std::string>          convert_safely<std::int8_t, true>(const pmt::Value&);
+extern template std::expected<std::uint8_t, std::string>         convert_safely<std::uint8_t, true>(const pmt::Value&);
+extern template std::expected<std::int16_t, std::string>         convert_safely<std::int16_t, true>(const pmt::Value&);
+extern template std::expected<std::uint16_t, std::string>        convert_safely<std::uint16_t, true>(const pmt::Value&);
+extern template std::expected<std::int32_t, std::string>         convert_safely<std::int32_t, true>(const pmt::Value&);
+extern template std::expected<std::uint32_t, std::string>        convert_safely<std::uint32_t, true>(const pmt::Value&);
+extern template std::expected<std::int64_t, std::string>         convert_safely<std::int64_t, true>(const pmt::Value&);
+extern template std::expected<std::uint64_t, std::string>        convert_safely<std::uint64_t, true>(const pmt::Value&);
+extern template std::expected<float, std::string>                convert_safely<float, true>(const pmt::Value&);
+extern template std::expected<double, std::string>               convert_safely<double, true>(const pmt::Value&);
+extern template std::expected<std::complex<float>, std::string>  convert_safely<std::complex<float>, true>(const pmt::Value&);
+extern template std::expected<std::complex<double>, std::string> convert_safely<std::complex<double>, true>(const pmt::Value&);
+extern template std::expected<std::string, std::string>          convert_safely<std::string, true>(const pmt::Value&);
+
+extern template std::expected<bool, std::string>                 convert_numerically<bool>(const pmt::Value&);
+extern template std::expected<std::int8_t, std::string>          convert_numerically<std::int8_t>(const pmt::Value&);
+extern template std::expected<std::uint8_t, std::string>         convert_numerically<std::uint8_t>(const pmt::Value&);
+extern template std::expected<std::int16_t, std::string>         convert_numerically<std::int16_t>(const pmt::Value&);
+extern template std::expected<std::uint16_t, std::string>        convert_numerically<std::uint16_t>(const pmt::Value&);
+extern template std::expected<std::int32_t, std::string>         convert_numerically<std::int32_t>(const pmt::Value&);
+extern template std::expected<std::uint32_t, std::string>        convert_numerically<std::uint32_t>(const pmt::Value&);
+extern template std::expected<std::int64_t, std::string>         convert_numerically<std::int64_t>(const pmt::Value&);
+extern template std::expected<std::uint64_t, std::string>        convert_numerically<std::uint64_t>(const pmt::Value&);
+extern template std::expected<float, std::string>                convert_numerically<float>(const pmt::Value&);
+extern template std::expected<double, std::string>               convert_numerically<double>(const pmt::Value&);
+extern template std::expected<std::complex<float>, std::string>  convert_numerically<std::complex<float>>(const pmt::Value&);
+extern template std::expected<std::complex<double>, std::string> convert_numerically<std::complex<double>>(const pmt::Value&);
+extern template std::expected<std::string, std::string>          convert_numerically<std::string>(const pmt::Value&);
 
 } // namespace gr::pmt
 

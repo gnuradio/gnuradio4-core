@@ -46,6 +46,10 @@ gr::PluginLoader makeLoaderWithPlugins(const std::vector<std::string>& assetPath
 
 std::filesystem::path cachePathFor(std::string_view uri) { return std::filesystem::path(kCacheDir) / gr::detail::uriToCacheFilename(uri); }
 
+std::filesystem::path versionPathFor(std::string_view uri) { return cachePathFor(uri).replace_extension(".version"); }
+
+const std::string kDeltaStamp = "2020-06-15-12:00:00";
+
 void clearCache() { std::filesystem::remove_all(kCacheDir); }
 
 } // namespace
@@ -152,6 +156,7 @@ const boost::ut::suite AssetsLoadingTests = [] {
     // instantiate a YAML-defined composite block from an asset definition.
     // The definition embeds a SUBGRAPH with two chained multiply blocks whose
     // exported ports are named 'in' and 'out'.
+#ifndef GR_TEST_WITHOUT_BLOCK_REGISTRY // the asset's interior blocks are resolved by name through the registry
     "instantiate: YAML asset creates a composite block with exported ports"_test = [] {
         auto loader = makeLoaderWithPlugins({kAssetsDir + "/root_a"});
 
@@ -170,7 +175,76 @@ const boost::ut::suite AssetsLoadingTests = [] {
     };
 #endif
 
+    // a definition on disk is read on every load, so an edit reaches the loader immediately; the
+    // cache holds only assets that were expensive to fetch, and there are none of those here
+    "local asset: an edit between loads is served without clearing the cache"_test = [] {
+        const auto root = std::filesystem::temp_directory_path() / "gr4_qa_local_asset_edit";
+        std::filesystem::remove_all(root);
+        std::filesystem::create_directories(root);
+
+        // the `modified` stamp deliberately never moves: nothing about invalidation may depend on it
+        const auto writeAsset = [&root](std::string_view blockType) {
+            std::ofstream index(root / "index.yaml");
+            index << "assets:\n  - file: block_edited.yaml\n    created: \"2024-01-01-00:00:00\"\n    modified: \"2024-01-15-10:00:00\"\n    block_type: " << blockType << "\n";
+            std::ofstream asset(root / "block_edited.yaml");
+            asset << "definition_metadata:\n  block_type: " << blockType << "\n";
+        };
+
+        writeAsset("FirstEdition");
+        {
+            auto first = makeLoader({root.string()});
+            expect(first.definitionForBlockName().contains("FirstEdition"));
+        }
+
+        writeAsset("SecondEdition");
+        auto        second = makeLoader({root.string()});
+        const auto& defs   = second.definitionForBlockName();
+        expect(defs.contains("SecondEdition")) << "the edited definition must reach the loader";
+        expect(!defs.contains("FirstEdition")) << "the previous definition must not be served from a cache";
+
+        expect(!std::filesystem::exists(cachePathFor(root.string() + "/block_edited.yaml"))) << "a local asset must not be cached";
+
+        std::filesystem::remove_all(root);
+    };
+
+    // the three skips an index can produce, in one root with a sound definition beside them
+    "a skipped asset is reported and counted, and the sound one still loads"_test = [] {
+        const auto root = std::filesystem::temp_directory_path() / "gr4_qa_asset_skips";
+        std::filesystem::remove_all(root);
+        std::filesystem::create_directories(root);
+
+        const auto listAsset = [](std::ofstream& index, std::string_view file) { //
+            index << "  - file: " << file << "\n    created: \"2024-01-01-00:00:00\"\n    modified: \"2024-01-15-10:00:00\"\n";
+        };
+        {
+            std::ofstream index(root / "index.yaml");
+            index << "assets:\n";
+            listAsset(index, "sound.yaml");
+            listAsset(index, "absent.yaml"); // deliberately never written
+            listAsset(index, "malformed.yaml");
+            listAsset(index, "untyped.yaml");
+        }
+        {
+            std::ofstream sound(root / "sound.yaml");
+            sound << "definition_metadata:\n  block_type: SoundBlock\n";
+            std::ofstream malformed(root / "malformed.yaml");
+            malformed << ": this is not valid yaml: [unclosed\n  - malformed\n";
+            std::ofstream untyped(root / "untyped.yaml");
+            untyped << "definition_metadata:\n  plugin_name: UntypedPlugin\n";
+        }
+
+        auto        loader = makeLoader({root.string()});
+        const auto& defs   = loader.definitionForBlockName();
+        expect(eq(defs.size(), 1uz)) << "only the sound definition may register";
+        expect(defs.contains("SoundBlock")) << "the sound definition must still resolve";
+        expect(eq(loader.nSkippedAssets(), 3uz)) << "the unreadable, the malformed and the untyped asset must each count as a skip";
+
+        std::filesystem::remove_all(root);
+    };
+
     // ── remote tests (server started by CMake fixture) ────────────────────────
+
+#endif
 
     "remote happy path: two blocks loaded via http from root_a"_test = [] {
         if (kSkipRemote) {
@@ -248,15 +322,16 @@ const boost::ut::suite AssetsLoadingTests = [] {
             expect(std::filesystem::exists(cachePathFor(blockUri)));
         }
 
-        // Overwrite the cache file with a distinguishable block type, then set
-        // its mtime to "now" (well after the 2020-06-15 modified stamp in index.yaml)
-        // so that the cache is considered fresh on the next load.
-        const auto cachePath = cachePathFor(blockUri);
+        // Overwrite the cache file with a distinguishable block type, leaving the sidecar stamp at
+        // the value index.yaml carries, so the cached copy is the current version of that asset.
         {
-            std::ofstream f(cachePath);
+            std::ofstream f(cachePathFor(blockUri));
             f << "definition_metadata:\n  block_type: CachedDeltaBlock\n";
         }
-        std::filesystem::last_write_time(cachePath, std::filesystem::file_time_type::clock::now());
+        {
+            std::ofstream f(versionPathFor(blockUri));
+            f << kDeltaStamp;
+        }
 
         auto loader = makeLoader({kServerBase + "/root_cache"});
 
@@ -275,21 +350,16 @@ const boost::ut::suite AssetsLoadingTests = [] {
         clearCache();
         const std::string blockUri = kServerBase + "/root_cache/block_delta.yaml";
 
-        // Pre-seed cache with stale content.
+        // Pre-seed the cache with content stamped for a version index.yaml no longer names.
         std::filesystem::create_directories(kCacheDir);
-        const auto cachePath = cachePathFor(blockUri);
         {
-            std::ofstream f(cachePath);
-            f << "ndefinition_metadata:\n  block_type: StaleBlock\n";
+            std::ofstream f(cachePathFor(blockUri));
+            f << "definition_metadata:\n  block_type: StaleBlock\n";
         }
-
-        // Recommended portable version:
-        std::chrono::sys_days sys_tp = std::chrono::year{2019} / std::chrono::January / std::chrono::day{1};
-
-        // Convert sys_days → file_time_type without clock_cast
-        auto staleTime = std::chrono::file_clock::from_sys(sys_tp);
-
-        std::filesystem::last_write_time(cachePath, staleTime);
+        {
+            std::ofstream f(versionPathFor(blockUri));
+            f << "2019-01-01-00:00:00";
+        }
 
         auto loader = makeLoader({kServerBase + "/root_cache"});
 
@@ -299,8 +369,9 @@ const boost::ut::suite AssetsLoadingTests = [] {
         // Stale cache should have been ignored; remote content loaded.
         expect(loader.definitionForBlockName().contains(DeltaBlock));
         expect(!loader.definitionForBlockName().contains(StaleBlock));
-        // Cache should now be refreshed (mtime updated).
-        expect(std::filesystem::last_write_time(cachePath) > staleTime);
+        // Cache should now be refreshed: the sidecar carries the stamp index.yaml names.
+        const auto refreshed = gr::detail::readUriToString(versionPathFor(blockUri).string());
+        expect(refreshed.has_value() && *refreshed == kDeltaStamp);
     };
 };
 

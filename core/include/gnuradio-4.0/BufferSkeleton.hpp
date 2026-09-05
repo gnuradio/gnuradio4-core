@@ -1,9 +1,7 @@
 #ifndef GNURADIO_BUFFERSKELETON_HPP
 #define GNURADIO_BUFFERSKELETON_HPP
 
-#ifndef GNURADIO_BUFFER2_H
-#include "buffer.hpp" // TODO: why is this include guard outside of the buffer hpp needed?
-#endif
+#include "Buffer.hpp"
 
 #include <cstdlib> // for malloc
 #include <memory>  // for std::shared_ptr

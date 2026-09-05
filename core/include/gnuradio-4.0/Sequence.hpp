@@ -21,7 +21,7 @@ namespace gr {
 // consequently slow down execution
 #define forceinline inline __attribute__((always_inline))
 #endif
-static constexpr const std::size_t kInitialCursorValue = 0L;
+inline constexpr std::size_t kInitialCursorValue = 0L;
 
 /**
  * Concurrent sequence class used for tracking the progress of the ring buffer and event
@@ -84,6 +84,11 @@ inline std::size_t getMinimumSequence(const std::vector<std::shared_ptr<Sequence
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #endif
+
+// the only safe way to read a gating-sequence list that addSequences()/removeSequence() may be swapping
+inline std::shared_ptr<std::vector<std::shared_ptr<Sequence>>> loadSequences(const std::shared_ptr<std::vector<std::shared_ptr<Sequence>>>& sequences) noexcept { //
+    return std::atomic_load_explicit(&sequences, std::memory_order_acquire);
+}
 
 inline void addSequences(std::shared_ptr<std::vector<std::shared_ptr<Sequence>>>& sequences, const Sequence& cursor, const std::vector<std::shared_ptr<Sequence>>& sequencesToAdd) {
     std::size_t                                             cursorSequence;

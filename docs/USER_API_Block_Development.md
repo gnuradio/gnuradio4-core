@@ -212,6 +212,13 @@ the `snake_case` setting name and values are `pmt::Value`.
 
 Downstream examples: richly annotated hardware and oscillator blocks in `gnuradio4-blocks`.
 
+### Changing a setting while the graph runs
+
+`settings().set(params)` stores `params` against a timestamped settings context; a running block picks
+them up only when that context is activated, so on a live graph the call reports success and changes
+nothing. To retune a running block use `settings().setStaged(params)`, which the block applies at the
+top of its next `work()` call.
+
 ## Processing functions
 
 Implement exactly one: `processOne`, `processBulk`, or — for full control —
@@ -269,6 +276,13 @@ gr::work::Status processBulk(std::span<TInSpan>& ins, gr::OutputSpanLike auto& o
     return gr::work::Status::OK;
 }
 ```
+
+`publish(n)` and `consume(n)` may be smaller than the span the framework handed over — ending a
+chunk early is how a block stops at a retune point or a frame boundary, and the unused remainder
+of the output reservation is released back to the buffer. `n` larger than the span is a contract
+violation: it would hand the downstream block ring slots that were never written, so it is clamped
+to the span and reported on `stderr`. Output ports on a multi-producer buffer are the one exception
+and must publish the whole span, because the gap would stall every later publication.
 
 ### SIMD-aware `processOne`
 

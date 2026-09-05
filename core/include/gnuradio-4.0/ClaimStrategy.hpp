@@ -35,9 +35,14 @@ concept ClaimStrategyLike = requires(T /*const*/ t, const std::size_t sequence, 
 
 template<std::size_t SIZE = std::dynamic_extent, WaitStrategyLike TWaitStrategy = BusySpinWaitStrategy>
 class alignas(kCacheLine) SingleProducerStrategy {
-    const std::size_t   _size = SIZE;
-    mutable std::size_t _cachedReaderCount{0UZ};
-    mutable Sequence*   _cachedSingleReader{nullptr}; // fast path: direct pointer when ≤1 reader
+    const std::size_t _size = SIZE;
+
+    // producer-confined snapshot of the gating sequences: refreshed only when a reader attaches or detaches,
+    // so the hot path costs one relaxed load and keeps the direct-pointer fast path for a single reader
+    mutable std::size_t                                             _readerGeneration{0UZ};
+    mutable std::size_t                                             _snapshotGeneration{std::numeric_limits<std::size_t>::max()};
+    mutable std::shared_ptr<std::vector<std::shared_ptr<Sequence>>> _snapshotReadSequences;
+    mutable Sequence*                                               _cachedSingleReader{nullptr};
 
 public:
     Sequence                                                _publishCursor;                      // slots are published and ready to be read until _publishCursor
@@ -50,10 +55,7 @@ public:
     SingleProducerStrategy(const SingleProducerStrategy&&) = delete;
     void operator=(const SingleProducerStrategy&)          = delete;
 
-    void updateCachedReaderInfo() const noexcept {
-        _cachedReaderCount  = _readSequences->size();
-        _cachedSingleReader = (_cachedReaderCount == 1UZ) ? _readSequences->front().get() : nullptr;
-    }
+    void notifyReaderSetChanged() const noexcept { gr::atomic_ref(_readerGeneration).fetch_add(1UZ); }
 
     std::size_t next(const std::size_t nSlotsToClaim = 1) noexcept {
         assert((nSlotsToClaim > 0 && nSlotsToClaim <= _size) && "nSlotsToClaim must be > 0 and <= bufferSize");
@@ -79,7 +81,10 @@ public:
         return _reserveCursor;
     }
 
-    [[nodiscard]] forceinline std::size_t getRemainingCapacity() const noexcept { return _size - (_reserveCursor - getMinReaderCursor()); }
+    [[nodiscard]] forceinline std::size_t getRemainingCapacity() const noexcept {
+        const std::size_t nClaimed = _reserveCursor - getMinReaderCursor();
+        return nClaimed >= _size ? 0UZ : _size - nClaimed; // unsigned-safe: a reader cursor ahead of the reserve cursor also lands here
+    }
 
     void publish(std::size_t offset, std::size_t nSlotsToClaim) {
         const auto sequence = offset + nSlotsToClaim;
@@ -91,14 +96,25 @@ public:
     }
 
 private:
+    void refreshReaderSnapshot() const noexcept {
+        const std::size_t generation = gr::atomic_ref(_readerGeneration).load_acquire();
+        if (generation == _snapshotGeneration) [[likely]] {
+            return;
+        }
+        _snapshotReadSequences = detail::loadSequences(_readSequences); // owning snapshot: the cached pointer cannot dangle
+        _cachedSingleReader    = (_snapshotReadSequences->size() == 1UZ) ? _snapshotReadSequences->front().get() : nullptr;
+        _snapshotGeneration    = generation;
+    }
+
     [[nodiscard]] forceinline std::size_t getMinReaderCursor() const noexcept {
+        refreshReaderSnapshot();
         if (_cachedSingleReader) {
             return _cachedSingleReader->value(); // O(1): single atomic load, no shared_ptr indirection
         }
-        if (_cachedReaderCount == 0UZ) {
-            return kInitialCursorValue;
+        if (_snapshotReadSequences->empty()) {
+            return _reserveCursor; // no readers: nothing gates the writer, published samples are discarded
         }
-        return std::ranges::min(*_readSequences | std::views::transform([](const auto& cursor) { return cursor->value(); }));
+        return std::ranges::min(*_snapshotReadSequences | std::views::transform([](const auto& cursor) { return cursor->value(); }));
     }
 };
 
@@ -124,8 +140,6 @@ class alignas(kCacheLine) MultiProducerStrategy {
     const bool          _isPow2 = kIsSizePow2;
     const std::size_t   _mask   = SIZE - 1;
     mutable std::size_t _cachedMinReaderCursor{kInitialCursorValue};
-    mutable std::size_t _cachedReaderCount{0UZ};
-    mutable Sequence*   _cachedSingleReader{nullptr}; // fast path: direct pointer when ≤1 reader
 
     forceinline constexpr std::size_t calculateIndex(std::size_t seq) const noexcept {
         if constexpr (!kIsSizeDynamic) {
@@ -172,10 +186,8 @@ public:
     MultiProducerStrategy(const MultiProducerStrategy&&) = delete;
     void operator=(const MultiProducerStrategy&)         = delete;
 
-    void updateCachedReaderInfo() const noexcept {
-        _cachedReaderCount  = _readSequences->size();
-        _cachedSingleReader = (_cachedReaderCount == 1UZ) ? _readSequences->front().get() : nullptr;
-    }
+    // a reader attaches at the publish cursor, so republishing it is the conservative min for the fast path
+    void notifyReaderSetChanged() const noexcept { gr::atomic_ref(_cachedMinReaderCursor).store_relaxed(_publishCursor.value()); }
 
     [[nodiscard]] std::size_t next(std::size_t nSlotsToClaim = 1) noexcept {
         assert((nSlotsToClaim > 0 && nSlotsToClaim <= _size) && "nSlotsToClaim must be > 0 and <= bufferSize");
@@ -230,7 +242,8 @@ public:
     [[nodiscard]] forceinline std::size_t getRemainingCapacity() const noexcept {
         const std::size_t minReader = getMinReaderCursor();
         gr::atomic_ref(_cachedMinReaderCursor).store_relaxed(minReader); // keep cache warm for next()/tryNext()
-        return _size - (_reserveCursor.value() - minReader);
+        const std::size_t nClaimed = _reserveCursor.value() - minReader;
+        return nClaimed >= _size ? 0UZ : _size - nClaimed; // unsigned-safe: a reader cursor ahead of the reserve cursor also lands here
     }
 
     void publish(std::size_t offset, std::size_t nSlotsToClaim) {
@@ -262,14 +275,17 @@ public:
     }
 
 private:
+    // multiple producers rule out a producer-confined cache, so take an owning snapshot; the _cachedMinReaderCursor
+    // fast path in next()/tryNext() keeps this off the common path
     [[nodiscard]] forceinline std::size_t getMinReaderCursor() const noexcept {
-        if (_cachedSingleReader) {
-            return _cachedSingleReader->value();
+        const std::shared_ptr<std::vector<std::shared_ptr<Sequence>>> readSequences = detail::loadSequences(_readSequences);
+        if (readSequences->empty()) {
+            return _reserveCursor.value(); // no readers: nothing gates the writer, published samples are discarded
         }
-        if (_cachedReaderCount == 0UZ) {
-            return kInitialCursorValue;
+        if (readSequences->size() == 1UZ) {
+            return readSequences->front()->value();
         }
-        return std::ranges::min(*_readSequences | std::views::transform([](const auto& cursor) { return cursor->value(); }));
+        return std::ranges::min(*readSequences | std::views::transform([](const auto& cursor) { return cursor->value(); }));
     }
 };
 

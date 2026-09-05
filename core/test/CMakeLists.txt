@@ -10,6 +10,7 @@ function(add_app_test TEST_NAME)
   add_dependencies(
     ${TEST_NAME}
     GoodBasePlugin
+    GoodRegistryPlugin
     good_math_plugin
     good_conversion_plugin
     bad_plugin)
@@ -17,18 +18,35 @@ endfunction()
 
 set(_CORE_TESTS
     qa_buffer
+    qa_BufferEdgeCases
     qa_AtomicBitset
     qa_AtomicRef
     qa_Value
     qa_ValueHelper
+    qa_BlockDiagnostics
+    qa_BlockMessages
+    qa_BlockRegistration
     qa_ComputeDomain
     qa_DataSet
+    qa_DestructionSafety
     qa_DynamicPort
+    qa_Fusion
+    qa_GraphEdit
+    qa_grc
     qa_LifeCycle
     qa_MemoryAllocators
+    qa_MessagePlane
     qa_PmtCollections
     qa_Port
     qa_Profiler
+    qa_SchedulerDrain
+    qa_SchedulerExchange
+    qa_SchedulerLifecycle
+    qa_Settings
+    qa_SettingsBase
+    qa_SettingsConcurrency
+    qa_SettingsTable
+    qa_TagForwarding
     qa_Tensor
     qa_TensorMath
     qa_SVD
@@ -52,16 +70,49 @@ set(_STANDARD_BLOCK_INTEGRATION_TESTS
     qa_Messages
     qa_PerformanceMonitor)
 
+# loadGrc resolves a block id through the registry, so the round trip needs one
+if(NOT GR_ENABLE_BLOCK_REGISTRY)
+  list(REMOVE_ITEM _CORE_TESTS qa_grc)
+endif()
+
 message(
   STATUS
     "Standard-block integration tests removed from gnuradio4-core and should move to gnuradio4-blocks or cross-repo CI: ${_STANDARD_BLOCK_INTEGRATION_TESTS}"
 )
 
+if(NOT GR_ENABLE_BLOCK_REGISTRY)
+  list(REMOVE_ITEM _CORE_TESTS qa_BlockRegistration)
+endif()
+
 foreach(TEST_NAME IN LISTS _CORE_TESTS)
   add_ut_test(${TEST_NAME})
 endforeach()
 
+# only the cases that emplace a block by name need the registry, so those cases are compiled out rather than the whole
+# test being dropped
+if(NOT GR_ENABLE_BLOCK_REGISTRY)
+  target_compile_definitions(qa_GraphEdit PRIVATE GR_TEST_WITHOUT_BLOCK_REGISTRY)
+endif()
+
+# regression tests for control-plane wedges: a failure shows up as a hang, so cap them
+set(_CORE_DEADLOCK_TESTS
+    qa_DestructionSafety
+    qa_GraphEdit
+    qa_MessagePlane
+    qa_SchedulerDrain
+    qa_SchedulerExchange
+    qa_SchedulerLifecycle
+    qa_SettingsConcurrency)
+if(GR_ENABLE_BLOCK_REGISTRY)
+  list(APPEND _CORE_DEADLOCK_TESTS qa_grc)
+endif()
+set_tests_properties(${_CORE_DEADLOCK_TESTS} PROPERTIES TIMEOUT 120)
+
 add_ut_test(qa_SubGraphAssets)
+# only the case that instantiates an asset needs the registry; the rest run without one
+if(NOT GR_ENABLE_BLOCK_REGISTRY)
+  target_compile_definitions(qa_SubGraphAssets PRIVATE GR_TEST_WITHOUT_BLOCK_REGISTRY)
+endif()
 set(_QA_SUBGRAPH_HTTP_PORT 18765)
 target_compile_definitions(qa_SubGraphAssets PRIVATE HTTP_SERVER_PORT=${_QA_SUBGRAPH_HTTP_PORT})
 if(EMSCRIPTEN)
@@ -89,6 +140,8 @@ if(GR_ENABLE_BLOCK_REGISTRY AND INTERNAL_ENABLE_BLOCK_PLUGINS)
     good_math_plugin
     good_conversion_plugin
     bad_plugin)
+
+  add_app_test(qa_PluginRegistration)
 endif()
 
 if(GR_ENABLE_BLOCK_REGISTRY AND INTERNAL_ENABLE_BLOCK_PLUGINS)

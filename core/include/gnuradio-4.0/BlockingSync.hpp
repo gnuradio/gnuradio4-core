@@ -118,10 +118,17 @@ struct BlockingSync {
     using TimePoint = std::chrono::time_point<ClockSourceType>;
 
 private:
-    TimePoint _blockingSync_startTime{};
-    TimePoint _blockingSync_lastUpdateTime{};
-    bool      _blockingSync_timerRunning{false};
-    bool      _blockingSync_timerDone{true};
+    // owned jointly with the timer task, so the task can publish its exit and notify without touching
+    // storage that the block's destructor may already have released
+    struct TimerState {
+        std::atomic<bool> running{false};
+        std::atomic<bool> done{true};
+        std::atomic<bool> blockAlive{true};
+    };
+
+    TimePoint                   _blockingSync_startTime{};
+    TimePoint                   _blockingSync_lastUpdateTime{};
+    std::shared_ptr<TimerState> _blockingSync_timer{std::make_shared<TimerState>()};
 
     [[nodiscard]] constexpr Derived&       self() noexcept { return *static_cast<Derived*>(this); }
     [[nodiscard]] constexpr const Derived& self() const noexcept { return *static_cast<const Derived*>(this); }
@@ -260,26 +267,50 @@ public:
      */
     void blockingSyncStop() { stopTimer(); }
 
-    ~BlockingSync() { stopTimer(); }
+    /**
+     * @brief Stops the timer and waits for it to leave the block.
+     *
+     * A derived class that owns members the timer reads (name, state, progress) must call this from its
+     * own destructor: ~Derived() runs before ~BlockingSync(), so waiting only in ~BlockingSync() lets the
+     * timer touch already-destroyed members. ~BlockingSync() calls it as a backstop.
+     *
+     * The same destructor should also leave the lifecycle's active states (changeStateTo(REQUESTED_STOP)),
+     * because ~Block() invokes the derived stop() hook for a block that is still active -- by then the
+     * derived object, including this mixin, is gone.
+     */
+    void stopTimerAndJoin() {
+        const std::shared_ptr<TimerState> timer = _blockingSync_timer; // outlives this object
+        timer->blockAlive.store(false, std::memory_order_release);
+        timer->running.store(false, std::memory_order_release);
+        timer->done.wait(false);
+    }
+
+    ~BlockingSync() { stopTimerAndJoin(); }
 
 private:
     void startTimer() {
-        if (gr::atomic_ref(_blockingSync_timerRunning).exchange(true)) {
+        const std::shared_ptr<TimerState> timer = _blockingSync_timer;
+        if (timer->running.exchange(true)) {
             return;
         }
 
-        gr::atomic_ref(_blockingSync_timerDone).store_release(false);
-        thread_pool::Manager::defaultIoPool()->execute([this]() {
+        timer->done.store(false, std::memory_order_release);
+        auto timerTask = [this, timer]() {
+            if (!timer->blockAlive.load(std::memory_order_acquire)) {
+                timer->done.store(true, std::memory_order_release); // the block went away before the pool started the task
+                timer->done.notify_all();
+                return;
+            }
             thread_pool::thread::setThreadName(std::format("sync:{}", self().name.value));
 
             TimePoint nextWakeUp = ClockSourceType::now();
 
-            while (gr::atomic_ref(_blockingSync_timerRunning).load_acquire() && getSampleRate() > 0.f && lifecycle::isActive(self().state())) {
+            while (timer->running.load(std::memory_order_acquire) && getSampleRate() > 0.f && lifecycle::isActive(self().state())) {
                 const auto period = getChunkPeriod();
                 nextWakeUp += period;
                 std::this_thread::sleep_until(nextWakeUp);
 
-                if (!gr::atomic_ref(_blockingSync_timerRunning).load_acquire()) {
+                if (!timer->running.load(std::memory_order_acquire)) {
                     break; // stop requested — exit without touching self()
                 }
 
@@ -292,14 +323,23 @@ private:
                 self().progress->notify_all();
             }
 
-            gr::atomic_ref(_blockingSync_timerDone).store_release(true);
-            gr::atomic_ref(_blockingSync_timerDone).notify_all();
-        });
+            timer->done.store(true, std::memory_order_release);
+            timer->done.notify_all();
+        };
+
+        try {
+            thread_pool::Manager::defaultIoPool()->execute(std::move(timerTask));
+        } catch (...) { // a rejected task would leave stopTimer() waiting for a timer that never runs
+            timer->running.store(false, std::memory_order_release);
+            timer->done.store(true, std::memory_order_release);
+            timer->done.notify_all();
+        }
     }
 
     void stopTimer() {
-        gr::atomic_ref(_blockingSync_timerRunning).store_release(false);
-        gr::atomic_ref(_blockingSync_timerDone).wait(false);
+        const std::shared_ptr<TimerState> timer = _blockingSync_timer;
+        timer->running.store(false, std::memory_order_release);
+        timer->done.wait(false);
     }
 };
 

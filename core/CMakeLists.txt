@@ -4,51 +4,12 @@ add_library(
   src/ValueHelper.cpp
   src/Block.cpp
   src/BlockModel.cpp
+  src/Port.cpp
   src/Settings.cpp
   src/Graph.cpp
   src/PluginLoader.cpp
   src/PmtTypeHelpers.cpp)
 
-set(public_headers
-    include/gnuradio-4.0/annotated.hpp
-    include/gnuradio-4.0/AtomicBitset.hpp
-    include/gnuradio-4.0/Block.hpp
-    include/gnuradio-4.0/BlockMerging.hpp
-    include/gnuradio-4.0/BlockModel.hpp
-    include/gnuradio-4.0/BlockTraits.hpp
-    include/gnuradio-4.0/Buffer.hpp
-    include/gnuradio-4.0/BufferSkeleton.hpp
-    include/gnuradio-4.0/CircularBuffer.hpp
-    include/gnuradio-4.0/ClaimStrategy.hpp
-    include/gnuradio-4.0/BlockingSync.hpp
-    include/gnuradio-4.0/DataSet.hpp
-    include/gnuradio-4.0/Graph_yaml_importer.hpp
-    include/gnuradio-4.0/Graph.hpp
-    include/gnuradio-4.0/HistoryBuffer.hpp
-    include/gnuradio-4.0/LifeCycle.hpp
-    include/gnuradio-4.0/MemoryAllocators.hpp
-    include/gnuradio-4.0/Message.hpp
-    include/gnuradio-4.0/PluginLoader.hpp
-    include/gnuradio-4.0/PmtCollections.hpp
-    include/gnuradio-4.0/Port.hpp
-    include/gnuradio-4.0/PortTraits.hpp
-    include/gnuradio-4.0/Profiler.hpp
-    include/gnuradio-4.0/reader_writer_lock.hpp
-    include/gnuradio-4.0/Scheduler.hpp
-    include/gnuradio-4.0/Sequence.hpp
-    include/gnuradio-4.0/Settings.hpp
-    include/gnuradio-4.0/Tag.hpp
-    include/gnuradio-4.0/Tensor.hpp
-    include/gnuradio-4.0/TensorMath.hpp
-    include/gnuradio-4.0/TriggerMatcher.hpp
-    include/gnuradio-4.0/Value.hpp
-    include/gnuradio-4.0/ValueHelper.hpp
-    include/gnuradio-4.0/formatter/ValueFormatter.hpp
-    include/gnuradio-4.0/formatter/ValueHelperFormatter.hpp
-    include/gnuradio-4.0/WaitStrategy.hpp
-    include/gnuradio-4.0/YamlPmt.hpp)
-
-set_target_properties(gnuradio-core PROPERTIES PUBLIC_HEADER "${public_headers}")
 add_library(gnuradio4::gnuradio-core ALIAS gnuradio-core)
 target_include_directories(
   gnuradio-core
@@ -69,8 +30,6 @@ if(EMSCRIPTEN)
 else()
   add_library(gnuradio-blocklib-core SHARED src/BlockRegistry.cpp)
 endif()
-set(blocklib_public_headers include/gnuradio-4.0/BlockRegistry.hpp include/gnuradio-4.0/Plugin.hpp)
-set_target_properties(gnuradio-blocklib-core PROPERTIES PUBLIC_HEADER "${blocklib_public_headers}")
 add_library(gnuradio4::gnuradio-blocklib-core ALIAS gnuradio-blocklib-core)
 message(INFO "PATH include " $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/>)
 target_include_directories(gnuradio-blocklib-core PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/>
@@ -93,10 +52,10 @@ install(
   EXPORT gnuradio4Targets
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-  PUBLIC_HEADER DESTINATION include/gnuradio-4.0)
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
-# Just install the entire include directory
+# the whole include directory is the public surface, and it is installed as it is laid out: a PUBLIC_HEADER list would
+# flatten the subdirectories into a second copy beside the first
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 add_subdirectory(src)

@@ -2,7 +2,6 @@
 #define GNURADIO_PLUGIN_LOADER_HPP
 
 #include <algorithm>
-#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -13,10 +12,6 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
-
-#if defined(_LIBCPP_VERSION)
-#include <regex>
-#endif
 
 #include "BlockRegistry.hpp"
 
@@ -58,13 +53,15 @@ inline std::string joinUri(const std::string& base, const std::string& file) {
                                  : base + '/' + file;
 }
 
+inline bool isRemoteUri(std::string_view uri) noexcept { return uri.starts_with("http://") || uri.starts_with("https://"); }
+
 inline std::expected<std::string, ParseError> readUriToString(std::string_view uri) {
     const auto uriString = std::string(uri);
-    if (uriString.starts_with("http://") || uriString.starts_with("https://")) {
+    if (isRemoteUri(uriString)) {
         return std::unexpected(ParseError{.message = "HTTP(S) asset loading is not available in gnuradio4-core"});
     }
 
-    const auto path = uriString.starts_with("file://") ? uriString.substr(7) : uriString;
+    const auto    path = uriString.starts_with("file://") ? uriString.substr(7) : uriString;
     std::ifstream input(path, std::ios::binary);
     if (!input) {
         return std::unexpected(ParseError{.message = std::format("Failed to read URI {}", uriString)});
@@ -72,36 +69,6 @@ inline std::expected<std::string, ParseError> readUriToString(std::string_view u
     std::ostringstream content;
     content << input.rdbuf();
     return content.str();
-}
-
-inline std::expected<std::chrono::sys_seconds, ParseError> parseTimestamp(const std::string& ts) {
-    // clang/libc++ does not implement std::chrono::parse
-#if not defined(_LIBCPP_VERSION)
-    std::istringstream ss{ts};
-    if (std::chrono::sys_seconds tp{}; ss >> std::chrono::parse("%Y-%m-%d-%H:%M:%S", tp)) {
-        return tp;
-    }
-#else
-    static const std::regex pattern(R"(^(\d{4})-(\d{2})-(\d{2})-(\d{2}):(\d{2}):(\d{2})$)");
-
-    std::smatch match;
-    if (std::regex_match(ts, match, pattern)) {
-        int y  = std::stoi(match[1]);
-        int m  = std::stoi(match[2]);
-        int d  = std::stoi(match[3]);
-        int hh = std::stoi(match[4]);
-        int mm = std::stoi(match[5]);
-        int ss = std::stoi(match[6]);
-
-        std::chrono::year_month_day ymd{std::chrono::year{y}, std::chrono::month{static_cast<unsigned>(m)}, std::chrono::day{static_cast<unsigned>(d)}};
-
-        auto days = std::chrono::sys_days{ymd};
-        auto time = std::chrono::hours{hh} + std::chrono::minutes{mm} + std::chrono::seconds{ss};
-
-        return days + time;
-    }
-#endif
-    return std::unexpected(ParseError{.message = std::format("Invalid timestamp {}", ts)});
 }
 
 inline std::string uriToCacheFilename(std::string_view uri) {
@@ -132,16 +99,29 @@ struct YamlDefinitionsLoader {
 
     std::unordered_map<std::string, Definition> _definitionForBlockName;
 
+    /// assets an index named that did not register; each was reported as it was skipped
+    std::size_t _nSkippedAssets = 0UZ;
+
+    [[nodiscard]] std::size_t nSkippedAssets() const noexcept { return _nSkippedAssets; }
+
     explicit YamlDefinitionsLoader(std::span<const std::string> uris) { loadBlockDefinitions(uris); }
 
     void loadBlockDefinitions(std::span<const std::string> uris) {
-        const auto      cacheDir = std::filesystem::path(assetsCacheDir()) / "asset_cache";
-        std::error_code createEc;
-        std::filesystem::create_directories(cacheDir, createEc);
-        const bool cacheAvailable = !createEc && std::filesystem::is_directory(cacheDir);
-        if (!cacheAvailable) {
-            std::println("warning: plugin cache directory {} is not available; caching disabled", cacheDir.string());
-        }
+        const auto cacheDir = std::filesystem::path(assetsCacheDir()) / "asset_cache";
+        // the directory is made on first use, so a run that reaches no remote asset makes none and
+        // says nothing about a cache it never needed
+        std::optional<bool> cacheReady;
+        auto                cacheAvailable = [&] {
+            if (!cacheReady.has_value()) {
+                std::error_code createEc;
+                std::filesystem::create_directories(cacheDir, createEc);
+                cacheReady = !createEc && std::filesystem::is_directory(cacheDir);
+                if (!*cacheReady) {
+                    std::println("warning: plugin cache directory {} is not available; caching disabled", cacheDir.string());
+                }
+            }
+            return *cacheReady;
+        };
 
         auto getMapField = []<typename R>(const auto& map, const auto& key, const R& defaultValue) {
             auto it = map.find(key);
@@ -177,29 +157,47 @@ struct YamlDefinitionsLoader {
                 const auto blockUri = joinUri(uriBase, file);
 
                 std::expected<std::string, ParseError> blockContent;
-                if (cacheAvailable) {
-                    const auto modified     = getMapField(*assetMap, "modified", "undefined"s);
-                    const auto modifiedTime = parseTimestamp(modified);
-                    const auto cachePath    = cacheDir / uriToCacheFilename(blockUri);
-                    if (const bool cacheHit = modifiedTime && std::filesystem::exists(cachePath) && std::chrono::file_clock::to_sys(std::filesystem::last_write_time(cachePath)) >= *modifiedTime; cacheHit) {
+                // Only a remote asset is cached, and its copy is valid for exactly the `modified` stamp it was
+                // taken at: that stamp is written to a sidecar and compared as text, so the decision is between
+                // two versions of the same thing. A local asset is read straight from disk — copying a file that
+                // is already there buys nothing, and the copy is the only thing that can fall behind it.
+                if (isRemoteUri(blockUri) && cacheAvailable()) {
+                    const auto modified      = getMapField(*assetMap, "modified", "undefined"s);
+                    const auto cachePath     = cacheDir / uriToCacheFilename(blockUri);
+                    const auto versionPath   = std::filesystem::path(cachePath).replace_extension(".version");
+                    const auto cachedVersion = readUriToString(versionPath.string());
+                    if (cachedVersion && *cachedVersion == modified) {
                         blockContent = readUriToString(cachePath.string());
                     } else {
                         blockContent = readUriToString(blockUri);
                         if (blockContent) {
-                            if (std::ofstream f(cachePath); f) {
-                                f << *blockContent;
+                            // the stamp is written last, so an interrupted write leaves a miss rather than a
+                            // fresh stamp over stale content
+                            if (std::ofstream body(cachePath); body) {
+                                body << *blockContent;
+                                body.close();
+                                if (std::ofstream version(versionPath); version) {
+                                    version << modified;
+                                }
                             }
                         }
                     }
                 } else {
                     blockContent = readUriToString(blockUri);
                 }
+                // a skip is reported and counted where it happens: a definition that fails to
+                // register is otherwise indistinguishable from one nobody listed, and the first
+                // sign of it is a registry miss somewhere else entirely
                 if (!blockContent) {
+                    ++_nSkippedAssets;
+                    std::println("warning: block definition {} skipped: could not be read ({})", blockUri, blockContent.error().message);
                     continue;
                 }
 
                 auto blockMap = gr::pmt::yaml::deserialize(*blockContent);
                 if (!blockMap) {
+                    ++_nSkippedAssets;
+                    std::println("warning: block definition {} skipped: not valid YAML ({}, line {})", blockUri, blockMap.error().message, blockMap.error().line);
                     continue;
                 }
 
@@ -217,6 +215,8 @@ struct YamlDefinitionsLoader {
                 };
 
                 if (metadata.block_type.empty()) {
+                    ++_nSkippedAssets;
+                    std::println("warning: block definition {} skipped: definition_metadata carries no block_type", blockUri);
                     continue;
                 }
 
@@ -436,26 +436,9 @@ public:
             return *result;
         }
 
-#ifndef NDEBUG
-        std::print("Available blocks in the registry\n");
-        for (const auto& block : _registry->keys()) {
-            std::print("    {}\n", block);
-        }
-        std::print("]\n");
-
-        std::print("Available blocks from plugins [\n");
-        for (const auto& [blockName, _] : _pluginForBlockName) {
-            std::print("    {}\n", blockName);
-        }
-        std::print("]\n");
-
-        std::print("Available YAML definitions[\n");
-        for (const auto& [blockName, _] : _yamlRegistry._definitionForBlockName) {
-            std::print("    {}\n", blockName);
-        }
-        std::print("]\n");
-#endif
-        std::print("Error: Plugin not found for '{}', returning nullptr.\n", name);
+        // a miss is an ordinary probe result (block, scheduler and YAML lookups are tried in
+        // sequence): the null return is the signal, and the caller that treats it as terminal
+        // reports it together with what was requested
         return {};
     }
 
@@ -467,20 +450,7 @@ public:
         auto* plugin = pluginForSchedulerName(name);
 
         if (plugin == nullptr) {
-#ifndef NDEBUG
-            std::println("Could not find scheduler {}. Available schedulers in the registry", name);
-            for (const auto& scheduler : _schedulerRegistry->keys()) {
-                std::print("    {}\n", scheduler);
-            }
-            std::print("]\n");
-
-            std::print("Available schedulers from plugins [\n");
-            for (const auto& [schedulerName, _] : _pluginForSchedulerName) {
-                std::print("    {}\n", schedulerName);
-            }
-            std::print("]\n");
-#endif
-            std::print("Error: Scheduler plugin not found for '{}', returning nullptr.\n", name);
+            // a miss is an ordinary probe result, as for instantiate() above
             return {};
         }
 
@@ -507,6 +477,10 @@ public:
     bool isSchedulerAvailable(std::string_view scheduler) const { return _schedulerRegistry->contains(scheduler) || pluginForSchedulerName(scheduler) != nullptr; }
 
     const auto& definitionForBlockName() const { return _yamlRegistry._definitionForBlockName; }
+
+    /// how many assets the definition roots named that did not register: unreadable, not
+    /// deserializable, or carrying no block_type. Each was reported as it was skipped.
+    [[nodiscard]] std::size_t nSkippedAssets() const noexcept { return _yamlRegistry.nSkippedAssets(); }
 };
 #else
 // PluginLoader on WASM is just a wrapper on BlockRegistry to provide the
@@ -552,6 +526,9 @@ public:
     bool isSchedulerAvailable(std::string_view scheduler) const { return _schedulerRegistry->contains(scheduler); }
 
     const auto& definitionForBlockName() const { return _yamlRegistry._definitionForBlockName; }
+
+    /// see the non-WASM PluginLoader::nSkippedAssets
+    [[nodiscard]] std::size_t nSkippedAssets() const noexcept { return _yamlRegistry.nSkippedAssets(); }
 };
 #endif
 

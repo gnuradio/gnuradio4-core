@@ -8,7 +8,9 @@
 #include <gnuradio-4.0/meta/reflection.hpp>
 #include <gnuradio-4.0/meta/utils.hpp>
 
+#include <atomic>
 #include <expected>
+#include <print>
 #include <source_location>
 #include <string_view>
 
@@ -82,8 +84,14 @@ std::string commandName() noexcept {
     return std::string(gr::meta::enumName(command).value_or(""));
 }
 
-inline static const std::string defaultBlockProtocol  = "MDPW03";
+inline const std::string        defaultBlockProtocol  = "MDPW03";
 inline static const std::string defaultClientProtocol = "MDPC03";
+
+// messages dropped because the destination ring was full -- process-global diagnostic counter
+inline std::atomic<std::size_t>& droppedMessageCount() noexcept {
+    static std::atomic<std::size_t> nDropped{0UZ};
+    return nDropped;
+}
 
 } // namespace message
 
@@ -128,8 +136,16 @@ void sendMessage(auto& port, std::string_view serviceName, std::string_view endp
     } else {
         message.data = std::unexpected(userMessage);
     }
-    WriterSpanLike auto msgSpan = port.streamWriter().template reserve<SpanReleasePolicy::ProcessAll>(1UZ);
-    msgSpan[0]                  = std::move(message);
+    // never block here: the emitters calling this (emitMessage/notifyListeners/emitErrorMessage) are noexcept and
+    // run on worker threads, so a stalled or unread consumer would wedge the graph rather than lose a notification
+    WriterSpanLike auto msgSpan = port.streamWriter().template tryReserve<SpanReleasePolicy::ProcessAll>(1UZ);
+    if (msgSpan.empty()) {
+        if (message::droppedMessageCount().fetch_add(1UZ, std::memory_order_relaxed) == 0UZ) {
+            std::print(stderr, "gr::sendMessage: message port full, dropping '{}' from '{}' -- further drops are counted only\n", endpoint, serviceName);
+        }
+        return;
+    }
+    msgSpan[0] = std::move(message);
     msgSpan.publish(1UZ);
 }
 } // namespace detail
