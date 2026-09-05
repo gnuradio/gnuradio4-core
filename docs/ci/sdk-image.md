@@ -18,8 +18,10 @@ The image installs GNU Radio 4 core under:
 ```
 
 Downstream builds should set `CMAKE_PREFIX_PATH=/opt/gnuradio4`. The image
-contains the installed `gnuradio4` and `GnuRadioBlockLib` CMake packages plus
-the `gnuradio_4_0_parse_registrations` tool.
+contains the installed `gnuradio4` and `GnuRadioBlockLib` CMake packages, the
+latter carrying the `GrParseRegistrations.cmake` generator script. Nothing in the
+image has to be a host-native program, so the Emscripten profile needs no host
+compiler.
 
 For reproducible CI, pin the image to a full git SHA plus profile tag. The
 `main-<profile>` tags are moving convenience tags and should not be treated as

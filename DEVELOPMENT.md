@@ -106,8 +106,7 @@ source "$EMSDK_HOME/emsdk_env.sh"
 emcmake cmake -S . -B build-wasm \
   -DCMAKE_BUILD_TYPE=Release \
   -DENABLE_COVERAGE=OFF \
-  -DCMAKE_CROSSCOMPILING_EMULATOR="$SYSTEM_NODE" \
-  -DGNURADIO_PARSE_REGISTRATIONS_TOOL_CXX_COMPLILER=g++-14
+  -DCMAKE_CROSSCOMPILING_EMULATOR="$SYSTEM_NODE"
 cmake --build build-wasm --parallel
 ctest --test-dir build-wasm --output-on-failure
 ```
