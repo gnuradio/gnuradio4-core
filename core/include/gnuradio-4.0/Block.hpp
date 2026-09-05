@@ -190,10 +190,11 @@ class PortCache {
     // updated on settings/port-config change
     bool                                         _dirtyConfig = true;
     std::vector<port::BitMask, AllocatorBitMask> _types;
-    std::vector<std::size_t, AllocatorSize>      _minSamples;
-    std::vector<std::size_t, AllocatorSize>      _maxSamples;
 
     // updated every work(...) function invokation
+    bool                                    _dirtyConstraints = true;
+    std::vector<std::size_t, AllocatorSize> _minSamples;
+    std::vector<std::size_t, AllocatorSize> _maxSamples;
     bool                                    _dirtyAvailable = true;
     std::vector<std::size_t, AllocatorSize> _available;
 
@@ -239,11 +240,27 @@ protected:
     }
 
     void updateConfig() {
-        _dirtyAvailable = true;
+        _dirtyConstraints = true;
+        _dirtyAvailable   = true;
         getPortTypes(_self, _types);
         _available.resize(_types.size(), 0UZ);
         _minSamples.resize(_types.size(), 0UZ);
         _maxSamples.resize(_types.size(), gr::undefined_size);
+        _dirtyConfig = false;
+    }
+
+    // min_samples and max_samples are the block's own statement of what it needs to progress and are writable
+    // while it runs, so they are read here, once per work call, and not with the port layout: a requirement a
+    // block publishes from processBulk() governs the very next call. They carry their own flag so that reading
+    // them leaves the availability snapshot alone.
+    void updateConstraints() {
+        if (_dirtyConfig) {
+            updateConfig();
+        }
+        assert(!_dirtyConfig);
+        if (!_dirtyConstraints) {
+            return; // already updated
+        }
         getPortConstraints(_self, _minSamples, [](auto& port) {
             if constexpr (std::remove_cvref_t<decltype(port)>::isOptional()) {
                 return port.isConnected() ? port.min_samples : 0UZ;
@@ -254,14 +271,11 @@ protected:
         getPortConstraints(_self, _maxSamples, [](auto& port) { return port.max_samples; });
         _minSyncRequirement = detail::max_element_masked<PortSync::SYNCHRONOUS>(_minSamples, _types).value_or(0UZ);
         _maxSyncRequirement = detail::min_element_masked<PortSync::SYNCHRONOUS>(_maxSamples, _types).value_or(gr::undefined_size);
-        _dirtyConfig        = false;
+        _dirtyConstraints   = false;
     }
 
     void updateAvailable() {
-        if (_dirtyConfig) {
-            updateConfig();
-        }
-        assert(!_dirtyConfig);
+        updateConstraints();
         if (!_dirtyAvailable) {
             return; // already updated
         }
@@ -281,7 +295,10 @@ public:
     PortCache(Derived& self) : _self(self) {}
 
     void invalidateConfig() noexcept { _dirtyConfig = true; }
-    void invalidateStatistic() noexcept { _dirtyAvailable = true; }
+    void invalidateStatistic() noexcept {
+        _dirtyConstraints = true;
+        _dirtyAvailable   = true;
+    }
 
     std::span<const port::BitMask> types() {
         if (_dirtyConfig) {
@@ -292,17 +309,13 @@ public:
     }
 
     std::span<const std::size_t> minSamples() {
-        if (_dirtyConfig) {
-            updateConfig();
-        }
+        updateConstraints();
         assert(!_dirtyConfig);
         return std::span<const std::size_t>{_minSamples.data(), _minSamples.size()};
     }
 
     std::span<const std::size_t> maxSamples() {
-        if (_dirtyConfig) {
-            updateConfig();
-        }
+        updateConstraints();
         assert(!_dirtyConfig);
         return std::span<const std::size_t>{_maxSamples.data(), _maxSamples.size()};
     }
@@ -316,15 +329,11 @@ public:
     }
 
     std::size_t minSyncRequirement() {
-        if (_dirtyConfig) {
-            updateConfig();
-        }
+        updateConstraints();
         return _minSyncRequirement;
     }
     std::size_t maxSyncRequirement() {
-        if (_dirtyConfig) {
-            updateConfig();
-        }
+        updateConstraints();
         return _maxSyncRequirement;
     }
     std::size_t maxSyncAvailable() {
