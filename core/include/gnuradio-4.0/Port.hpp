@@ -421,6 +421,8 @@ struct PortDescriptor {
     static constexpr bool          kIsInput                   = portDirection == PortDirection::INPUT;
     static constexpr bool          kIsOutput                  = portDirection == PortDirection::OUTPUT;
     static constexpr bool          kIsArithmeticLikeValueType = gr::arithmetic_or_complex_like<T> || gr::UncertainValueLike<T>;
+    static constexpr bool          kIsSynch                   = !std::disjunction_v<std::is_same<Async, Attributes>...>;   // false -> asynchronous: does not gate scheduling
+    static constexpr bool          kIsOptional                = std::disjunction_v<std::is_same<Optional, Attributes>...>; // port may be left unconnected
 
     using Required = meta::typelist<Attributes...>::template find_or_default<is_required_samples, RequiredSamples<std::dynamic_extent, std::dynamic_extent>>;
 

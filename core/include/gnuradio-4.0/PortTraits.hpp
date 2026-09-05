@@ -58,6 +58,9 @@ template<gr::detail::PortDescription T>
 using is_output_port = std::bool_constant<T::kIsOutput>;
 
 template<gr::detail::PortDescription T>
+using is_synchronous = std::bool_constant<T::kIsSynch>;
+
+template<gr::detail::PortDescription T>
 using is_dynamic_port_collection = std::bool_constant<T::kIsDynamicCollection>;
 
 template<gr::detail::PortDescription T>
