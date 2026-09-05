@@ -15,6 +15,7 @@ using polymorphic_allocator = std::experimental::pmr::polymorphic_allocator<T>;
 #include <algorithm>
 #include <bit>
 #include <cassert> // to assert if compiled for debugging
+#include <cstring>
 #include <functional>
 #include <numeric>
 #include <ranges>
@@ -37,18 +38,18 @@ using polymorphic_allocator = std::experimental::pmr::polymorphic_allocator<T>;
 
 #ifdef __NR_memfd_create
 namespace gr {
-static constexpr bool has_posix_mmap_interface = true;
+inline constexpr bool has_posix_mmap_interface = true;
 }
 
 #define HAS_POSIX_MAP_INTERFACE
 #else
 namespace gr {
-static constexpr bool has_posix_mmap_interface = false;
+inline constexpr bool has_posix_mmap_interface = false;
 }
 #endif
 #else // #if defined __has_include -- required for portability
 namespace gr {
-static constexpr bool has_posix_mmap_interface = false;
+inline constexpr bool has_posix_mmap_interface = false;
 }
 #endif
 
@@ -308,9 +309,16 @@ private:
     template<typename U = T>
     class Writer;
 
+    struct RefusedReservation {};
+
     template<typename U = T, SpanReleasePolicy policy = SpanReleasePolicy::ProcessNone>
     class WriterSpan {
-        Writer<U>* _parent = nullptr;
+        Writer<U>*           _parent    = nullptr;
+        bool                 _isRefused = false;
+        mutable std::span<T> _noSlots{};
+
+        // the claim lives in the Writer and is shared by every span that holds it; a refused reservation holds none of it
+        [[nodiscard]] constexpr std::span<T>& view() const noexcept { return _isRefused ? _noSlots : _parent->_internalSpan; }
 
     public:
         using element_type     = T;
@@ -320,23 +328,22 @@ private:
         using pointer          = typename std::span<T>::reverse_iterator;
 
         explicit WriterSpan(Writer<U>* parent) noexcept : _parent(parent) { _parent->incInstanceCount(); };
+        explicit WriterSpan(Writer<U>* parent, RefusedReservation) noexcept : _parent(parent), _isRefused(true) { _parent->incInstanceCount(); };
         explicit constexpr WriterSpan(Writer<U>* parent, std::size_t index, std::size_t sequence, std::size_t nSlotsToClaim) noexcept : _parent(parent) {
             _parent->_index        = index;
             _parent->_offset       = sequence - nSlotsToClaim;
             _parent->_internalSpan = std::span<T>(&_parent->_buffer->_data.data()[index], nSlotsToClaim);
             _parent->incInstanceCount();
         }
-        WriterSpan(const WriterSpan& other) : _parent(other._parent) { _parent->incInstanceCount(); }
-        WriterSpan& operator=(const WriterSpan& other) {
-            if (this != &other) {
-                _parent = other._parent;
-                _parent->incInstanceCount();
-            }
-            return *this;
-        }
+        WriterSpan(const WriterSpan& other) : _parent(other._parent), _isRefused(other._isRefused) { _parent->incInstanceCount(); }
+        // no assignment: releasing the overwritten span's share of the claim is the destructor's job
+        WriterSpan& operator=(const WriterSpan&) = delete;
 
         ~WriterSpan() {
             _parent->decInstanceCount();
+            if (_isRefused) {
+                return;
+            }
             if (_parent->isLastInstance()) {
                 if (!_parent->isPublishRequested()) {
                     if constexpr (spanReleasePolicy() == SpanReleasePolicy::Terminate) {
@@ -405,25 +412,35 @@ private:
         [[nodiscard]] constexpr static bool              isMultiProducerStrategy() noexcept { return std::is_base_of_v<MultiProducerStrategy<SIZE, TWaitStrategy>, ClaimType>; }
         [[nodiscard]] constexpr std::size_t              instanceCount() const noexcept { return _parent->instanceCount(); }
 
-        [[nodiscard]] constexpr std::size_t      size() const noexcept { return _parent->_internalSpan.size(); };
+        [[nodiscard]] constexpr std::size_t      size() const noexcept { return view().size(); };
         [[nodiscard]] constexpr std::size_t      size_bytes() const noexcept { return size() * sizeof(T); };
-        [[nodiscard]] constexpr bool             empty() const noexcept { return _parent->_internalSpan.empty(); }
-        [[nodiscard]] constexpr iterator         cbegin() const noexcept { return _parent->_internalSpan.begin(); }
-        [[nodiscard]] constexpr iterator         begin() const noexcept { return _parent->_internalSpan.begin(); }
-        [[nodiscard]] constexpr iterator         cend() const noexcept { return _parent->_internalSpan.end(); }
-        [[nodiscard]] constexpr iterator         end() const noexcept { return _parent->_internalSpan.end(); }
-        [[nodiscard]] constexpr reverse_iterator rbegin() const noexcept { return _parent->_internalSpan.rbegin(); }
-        [[nodiscard]] constexpr reverse_iterator rend() const noexcept { return _parent->_internalSpan.rend(); }
-        [[nodiscard]] constexpr T*               data() const noexcept { return _parent->_internalSpan.data(); }
-        T&                                       operator[](std::size_t i) const noexcept { return _parent->_internalSpan[i]; }
-        T&                                       operator[](std::size_t i) noexcept { return _parent->_internalSpan[i]; }
-        explicit(false) operator std::span<T>&() const noexcept { return _parent->_internalSpan; }
-        explicit(false) operator std::span<T>&() noexcept { return _parent->_internalSpan; }
+        [[nodiscard]] constexpr bool             empty() const noexcept { return view().empty(); }
+        [[nodiscard]] constexpr iterator         cbegin() const noexcept { return view().begin(); }
+        [[nodiscard]] constexpr iterator         begin() const noexcept { return view().begin(); }
+        [[nodiscard]] constexpr iterator         cend() const noexcept { return view().end(); }
+        [[nodiscard]] constexpr iterator         end() const noexcept { return view().end(); }
+        [[nodiscard]] constexpr reverse_iterator rbegin() const noexcept { return view().rbegin(); }
+        [[nodiscard]] constexpr reverse_iterator rend() const noexcept { return view().rend(); }
+        [[nodiscard]] constexpr T*               data() const noexcept { return view().data(); }
+        T&                                       operator[](std::size_t i) const noexcept { return view()[i]; }
+        T&                                       operator[](std::size_t i) noexcept { return view()[i]; }
+        explicit(false) operator std::span<T>&() const noexcept { return view(); }
+        explicit(false) operator std::span<T>&() noexcept { return view(); }
 
+        // publishing fewer samples than reserved is allowed: the remainder is released back to the buffer.
+        // publishing more would move the publish cursor past the claim and hand readers slots that were never
+        // written, so an over-publish is clamped and reported.
         constexpr void publish(std::size_t nSamplesToPublish) noexcept {
-            auto&      requested        = _parent->_nRequestedSamplesToPublish;
-            const auto alreadyRequested = (requested == Writer<U>::kNotPublished) ? 0UZ : requested;
-            assert(nSamplesToPublish <= _parent->_internalSpan.size() - alreadyRequested && "n_produced must be <= than unpublished samples");
+            if (_isRefused) {
+                return;
+            }
+            auto&             requested        = _parent->_nRequestedSamplesToPublish;
+            const std::size_t alreadyRequested = (requested == Writer<U>::kNotPublished) ? 0UZ : requested;
+            const std::size_t unpublished      = _parent->_internalSpan.size() - alreadyRequested;
+            if (nSamplesToPublish > unpublished) [[unlikely]] {
+                std::print(stderr, "CircularBuffer::WriterSpan::publish({}) exceeds the {} unpublished samples of a {}-sample reservation - clamped\n", nSamplesToPublish, unpublished, _parent->_internalSpan.size());
+                nSamplesToPublish = unpublished;
+            }
             requested = alreadyRequested + nSamplesToPublish;
         }
     }; // class WriterSpan
@@ -486,11 +503,18 @@ private:
 
         [[nodiscard]] constexpr BufferType buffer() const noexcept { return CircularBuffer(_buffer); };
 
+        [[nodiscard]] std::size_t nReaders() const noexcept { return gr::atomic_ref(_buffer->_reader_count).load_acquire(); }
+        [[nodiscard]] std::size_t nWriters() const noexcept { return gr::atomic_ref(_buffer->_writer_count).load_acquire(); }
+
         [[nodiscard]] std::size_t bufferIndex() const noexcept { return _buffer->calculateIndex(_buffer->_claimStrategy._publishCursor.value()); }
 
         template<SpanReleasePolicy policy = SpanReleasePolicy::ProcessNone>
         [[nodiscard]] constexpr auto tryReserve(std::size_t nSamples) noexcept -> WriterSpan<U, policy> {
             checkIfCanReserveAndAbortIfNeeded();
+            if (_instanceCount > 0UZ) [[unlikely]] {
+                std::print(stderr, "CircularBuffer::Writer::tryReserve({}) nested inside a live {}-sample reservation - refused\n", nSamples, _internalSpan.size());
+                return WriterSpan<U, policy>(this, RefusedReservation{});
+            }
             _nRequestedSamplesToPublish = kNotPublished;
 
             if (nSamples == 0) {
@@ -509,6 +533,10 @@ private:
         template<SpanReleasePolicy policy = SpanReleasePolicy::ProcessNone>
         [[nodiscard]] constexpr auto reserve(std::size_t nSamples) noexcept -> WriterSpan<U, policy> {
             checkIfCanReserveAndAbortIfNeeded();
+            if (_instanceCount > 0UZ) [[unlikely]] {
+                std::print(stderr, "CircularBuffer::Writer::reserve({}) nested inside a live {}-sample reservation - refused\n", nSamples, _internalSpan.size());
+                return WriterSpan<U, policy>(this, RefusedReservation{});
+            }
             _nRequestedSamplesToPublish = kNotPublished;
 
             if (nSamples == 0) {
@@ -567,20 +595,12 @@ private:
         using reverse_iterator = typename std::span<const T>::reverse_iterator;
         using pointer          = typename std::span<const T>::reverse_iterator;
 
-        explicit ReaderSpan(const Reader<U>* parent) noexcept : _parent(parent) { _parent->incInstanceCount(); }
-
         explicit constexpr ReaderSpan(Reader<U>* parent, std::size_t index, std::size_t nRequested) noexcept : _parent(parent), _internalSpan({&_parent->_buffer->_data.data()[index], nRequested}) { _parent->incInstanceCount(); }
 
         ReaderSpan(const ReaderSpan& other) : _parent(other._parent), _internalSpan(other._internalSpan) { _parent->incInstanceCount(); }
 
-        ReaderSpan& operator=(const ReaderSpan& other) {
-            if (this != &other) {
-                _parent       = other._parent;
-                _internalSpan = other._internalSpan;
-                _parent->incInstanceCount();
-            }
-            return *this;
-        }
+        // no assignment: releasing the overwritten span's share of the acquisition is the destructor's job
+        ReaderSpan& operator=(const ReaderSpan&) = delete;
 
         ~ReaderSpan() {
             _parent->decInstanceCount();
@@ -639,10 +659,10 @@ private:
                 return false;
             }
             if constexpr (strict_check) {
-                if (nSamples > _parent->_nSamplesFirstGet) { // get() already validated availability for up to _nSamplesFirstGet samples
-                    if (nSamples > _parent->available()) {
-                        return false;
-                    }
+                const std::size_t nSamplesHandedOut = _parent->_nSamplesFirstGet == std::numeric_limits<std::size_t>::max() ? 0UZ : _parent->_nSamplesFirstGet;
+                if (nSamples > nSamplesHandedOut) {
+                    std::print(stderr, "CircularBuffer::ReaderSpan::consume({}) exceeds the {}-sample span handed out by get() - refused\n", nSamples, nSamplesHandedOut);
+                    return false;
                 }
             }
             _parent->_nRequestedSamplesToConsume = nSamples;
@@ -663,8 +683,9 @@ private:
                     return false;
                 }
             }
-            _parent->_readIndexCached += nSamples;
-            _parent->_readIndex->setValue(_parent->_readIndexCached); // store(release) — each Reader is the sole writer of its _readIndex
+            const std::size_t nextReadIndex = gr::atomic_ref(_parent->_readIndexCached).load_relaxed() + nSamples;
+            gr::atomic_ref(_parent->_readIndexCached).store_relaxed(nextReadIndex);
+            _parent->_readIndex->setValue(nextReadIndex); // store(release) — each Reader is the sole writer of its _readIndex
             if constexpr (producerType == ProducerType::Single) {
                 if (gr::atomic_ref(_parent->_buffer->_reader_count).load_acquire() > 2) {
 #if defined(__x86_64__) || defined(__i386__)
@@ -690,27 +711,29 @@ private:
         using BufferTypeLocal = std::shared_ptr<BufferImpl>;
 
         std::shared_ptr<Sequence> _readIndex = std::make_shared<Sequence>();
-        std::size_t               _readIndexCached;
-        BufferTypeLocal           _buffer; // controls buffer life-cycle, the rest are cache optimisations
-        std::size_t               _nSamplesFirstGet{std::numeric_limits<std::size_t>::max()};
-        mutable std::size_t       _instanceCount{0UZ}; // tracks live ReaderSpan copies (needed by invokeProcessBulk)
-        std::size_t               _nRequestedSamplesToConsume{std::numeric_limits<std::size_t>::max()};
-        std::size_t               _nSamplesConsumed{0UZ};
+        // read position of the sole consuming thread, but observers on other threads poll it through
+        // available()/position() -- atomic so those polls are defined rather than a data race
+        mutable std::size_t _readIndexCached;
+        BufferTypeLocal     _buffer; // controls buffer life-cycle, the rest are cache optimisations
+        std::size_t         _nSamplesFirstGet{std::numeric_limits<std::size_t>::max()};
+        mutable std::size_t _instanceCount{0UZ}; // tracks live ReaderSpan copies (needed by invokeProcessBulk)
+        std::size_t         _nRequestedSamplesToConsume{std::numeric_limits<std::size_t>::max()};
+        std::size_t         _nSamplesConsumed{0UZ};
 
         constexpr void                      incInstanceCount() const noexcept { _instanceCount++; }
         constexpr void                      decInstanceCount() const noexcept { _instanceCount--; }
         [[nodiscard]] constexpr bool        isLastInstance() const noexcept { return _instanceCount == 0; }
         [[nodiscard]] constexpr std::size_t instanceCount() const noexcept { return _instanceCount; }
 
-        std::size_t bufferIndex() const noexcept { return _buffer->calculateIndex(_readIndexCached); }
+        std::size_t bufferIndex() const noexcept { return _buffer->calculateIndex(gr::atomic_ref(_readIndexCached).load_relaxed()); }
 
     public:
         Reader() = delete;
         explicit Reader(std::shared_ptr<BufferImpl> buffer) noexcept : _buffer(buffer) {
             gr::detail::addSequences(_buffer->_claimStrategy._readSequences, _buffer->_claimStrategy._publishCursor, {_readIndex});
-            _buffer->_claimStrategy.updateCachedReaderInfo();
+            _buffer->_claimStrategy.notifyReaderSetChanged();
             gr::atomic_ref(_buffer->_reader_count).fetch_add(1UZ);
-            _readIndexCached = _readIndex->value();
+            gr::atomic_ref(_readIndexCached).store_relaxed(_readIndex->value());
         }
 
         Reader(Reader&& other) noexcept
@@ -738,12 +761,16 @@ private:
         ~Reader() {
             if (_buffer) {
                 gr::detail::removeSequence(_buffer->_claimStrategy._readSequences, _readIndex);
-                _buffer->_claimStrategy.updateCachedReaderInfo();
+                _buffer->_claimStrategy.notifyReaderSetChanged();
                 gr::atomic_ref(_buffer->_reader_count).fetch_sub(1UZ);
             }
         }
 
-        [[nodiscard]] constexpr BufferType  buffer() const noexcept { return CircularBuffer(_buffer); };
+        [[nodiscard]] constexpr BufferType buffer() const noexcept { return CircularBuffer(_buffer); };
+
+        [[nodiscard]] std::size_t nReaders() const noexcept { return gr::atomic_ref(_buffer->_reader_count).load_acquire(); }
+        [[nodiscard]] std::size_t nWriters() const noexcept { return gr::atomic_ref(_buffer->_writer_count).load_acquire(); }
+
         [[nodiscard]] constexpr std::size_t nSamplesConsumed() const noexcept { return _nSamplesConsumed; };
         [[nodiscard]] constexpr bool        isConsumeRequested() const noexcept { return _nRequestedSamplesToConsume != std::numeric_limits<std::size_t>::max(); }
         [[nodiscard]] constexpr std::size_t nRequestedSamplesToConsume() const noexcept { return _nRequestedSamplesToConsume; }
@@ -769,9 +796,9 @@ private:
             return ReaderSpan<U, policy>(this, bufferIndex(), nSamples);
         }
 
-        [[nodiscard]] constexpr std::size_t position() const noexcept { return _readIndexCached; }
+        [[nodiscard]] std::size_t position() const noexcept { return gr::atomic_ref(_readIndexCached).load_relaxed(); }
 
-        [[nodiscard]] constexpr std::size_t available() const noexcept { return _buffer->_claimStrategy._publishCursor.value() - _readIndexCached; }
+        [[nodiscard]] std::size_t available() const noexcept { return _buffer->_claimStrategy._publishCursor.value() - gr::atomic_ref(_readIndexCached).load_relaxed(); }
     }; // class Reader
 
     [[nodiscard]] constexpr static Allocator DefaultAllocator() {

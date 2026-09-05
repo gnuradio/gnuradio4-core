@@ -15,6 +15,7 @@ target_include_directories(minimal_blocklib_support INTERFACE ${CMAKE_CURRENT_SO
 gr_add_block_library(
   MinimalBlockLib
   MAKE_SHARED_LIBRARY
+  MAKE_STATIC_LIBRARY
   HEADERS
   ${CMAKE_CURRENT_SOURCE_DIR}/include/minimal_blocklib/Gain.hpp
   SOURCES
@@ -22,5 +23,11 @@ gr_add_block_library(
   LINK_LIBRARIES
   minimal_blocklib_support)
 
-add_executable(minimal_blocklib_consumer src/consumer.cpp)
-target_link_libraries(minimal_blocklib_consumer PRIVATE MinimalBlockLibShared gnuradio4::gnuradio-core)
+# both linkage forms run the same consumer: it instantiates the block directly, calls the generated initializer, and
+# then constructs a block through the registry, which is how the installed SDK is used
+foreach(_linkage Shared Static)
+  add_executable(minimal_blocklib_consumer_${_linkage} src/consumer.cpp)
+  target_link_libraries(minimal_blocklib_consumer_${_linkage} PRIVATE MinimalBlockLib${_linkage}
+                                                                      gnuradio4::gnuradio-core)
+  target_include_directories(minimal_blocklib_consumer_${_linkage} PRIVATE ${CMAKE_BINARY_DIR}/include)
+endforeach()

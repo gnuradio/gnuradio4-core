@@ -7,6 +7,21 @@ gr_add_block_plugin(
   HEADERS
   good_base_plugin.hpp)
 
+# the same, registering into an instance the plugin declares in a header of its own, which is how a plugin built outside
+# this tree names its registry
+gr_add_block_plugin(
+  GoodRegistry
+  NO_INSTALL
+  REGISTRY_HEADER
+  good_registry_instance.hpp
+  REGISTRY_INSTANCE
+  grPluginInstance
+  SOURCES
+  good_registry_plugin.cpp
+  HEADERS
+  good_registry_plugin.hpp)
+target_include_directories(GoodRegistry PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
 # Ordinary plugins
 function(add_non_blocklib_plugin PLUGIN_NAME)
   add_library(${PLUGIN_NAME} MODULE ${PLUGIN_NAME}.cpp)

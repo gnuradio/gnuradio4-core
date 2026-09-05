@@ -1,19 +1,14 @@
 #ifndef GNURADIO_NODE_NODE_TRAITS_HPP
 #define GNURADIO_NODE_NODE_TRAITS_HPP
 
+#include <gnuradio-4.0/meta/simd.hpp>
+
 #include <array>
 #include <gnuradio-4.0/meta/reflection.hpp>
 #include <gnuradio-4.0/meta/utils.hpp>
 
 #include "Port.hpp"
 #include "PortTraits.hpp"
-
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wshadow"
-#pragma GCC diagnostic ignored "-Wsign-conversion"
-#include <vir/simd.h>
-#include <vir/simdize.h>
-#pragma GCC diagnostic pop
 
 namespace gr::work {
 enum class Status;

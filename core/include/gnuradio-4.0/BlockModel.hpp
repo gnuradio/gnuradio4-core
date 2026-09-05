@@ -9,6 +9,7 @@
 #include <gnuradio-4.0/thread/thread_pool.hpp>
 
 #include <charconv>
+#include <concepts>
 #include <memory_resource>
 #include <mutex>
 
@@ -148,7 +149,7 @@ struct Edge {
     [[nodiscard]] property_map&       uiConstraints() noexcept { return *_uiConstraints; }
     [[nodiscard]] const property_map& uiConstraints() const { return *_uiConstraints; }
 
-    constexpr bool hasSameSourcePort(const Edge& other) const noexcept { return sourceBlock() == other.sourceBlock() && sourcePortDefinition().definition == other.sourcePortDefinition().definition; }
+    [[nodiscard]] bool hasSameSourcePort(const Edge& other) const;
 
     constexpr bool operator==(const Edge& other) const noexcept {
         return sourceBlock() == other.sourceBlock()                                                       //
@@ -234,8 +235,11 @@ protected:
     DynamicPortsLoader     _dynamicPortsLoader;
     DynamicPorts           _dynamicInputPorts;
     DynamicPorts           _dynamicOutputPorts;
+    std::string            _typeName;
 
     BlockModel() = default;
+
+    explicit BlockModel(std::string typeName) noexcept : _typeName(std::move(typeName)) {}
 
     [[nodiscard]] std::expected<gr::DynamicPort*, Error> dynamicPortFromName(DynamicPorts& what, std::string_view name, std::source_location location = std::source_location::current()) {
         initDynamicPorts();
@@ -455,9 +459,9 @@ public:
     [[nodiscard]] virtual std::string_view name() const = 0;
 
     /**
-     * @brief the type of the node as a string
+     * @brief the type of the node as a string, as the derived type named it on construction
      */
-    [[nodiscard]] virtual std::string_view typeName() const = 0;
+    [[nodiscard]] virtual std::string_view typeName() const;
 
     /**
      * @brief user-defined name
@@ -498,6 +502,23 @@ public:
     virtual void processScheduledMessages() = 0;
 
     [[nodiscard]] virtual UICategory uiCategory() const { return UICategory::None; }
+
+    /**
+     * @brief Descriptor allowing a synchronous 1:1 `processOne` block to be driven from a scratch buffer, or nullptr.
+     *
+     * Non-null only for a block that implements `processOne` (not `processBulk`), has exactly one stream input and one
+     * stream output port, and uses the default tag-propagation policy with neither `Stride<>` nor `Resampling<>`.
+     */
+    [[nodiscard]] virtual const block::FusedStage* fusedStage() const noexcept { return nullptr; }
+
+    /**
+     * @brief Descriptor of a synchronous single-port `processBulk` block a fused run may drive through `work()`, or nullptr.
+     *
+     * Non-null and `fusedStage() != nullptr` are mutually exclusive: a block implements `processOne` or `processBulk`.
+     * The resampling ratio is not part of the descriptor; the planner reads it from `resamplingRatio()` because it may
+     * change while the graph runs.
+     */
+    [[nodiscard]] virtual const block::BulkStage* bulkStage() const noexcept { return nullptr; }
 
     // port and sample information
     /**
@@ -555,13 +576,33 @@ public:
 
     [[nodiscard]] virtual void* raw() = 0;
 
-    // Common interface between managed and unmanaged graphs
-    [[nodiscard]] virtual gr::Graph*       graph()               = 0;
-    [[nodiscard]] virtual gr::property_map exportedInputPorts()  = 0;
-    [[nodiscard]] virtual gr::property_map exportedOutputPorts() = 0;
+    // Common interface between managed and unmanaged graphs. A block that owns no sub-graph
+    // exports nothing and has no graph to hand out, which is the answer for every block but a
+    // GraphWrapper -- so it is given here once rather than stamped into every wrapper.
+    [[nodiscard]] virtual gr::Graph*       graph();
+    [[nodiscard]] virtual gr::property_map exportedInputPorts();
+    [[nodiscard]] virtual gr::property_map exportedOutputPorts();
 
-    [[nodiscard]] virtual std::expected<void, Error> exportPort(bool exportFlag, std::string_view uniqueBlockName, PortDirection portDirection, std::string_view portName, std::string_view exportedName, std::source_location location = std::source_location::current()) = 0;
+    [[nodiscard]] virtual std::expected<void, Error> exportPort(bool exportFlag, std::string_view uniqueBlockName, PortDirection portDirection, std::string_view portName, std::string_view exportedName, std::source_location location = std::source_location::current());
 };
+
+// two edges may name one and the same output port by index, by name, or — across a subgraph
+// boundary — through the subgraph's exported alias of an interior port, so differing
+// PortDefinitions have to be resolved and compared by the port they reference: an exported
+// port is a distinct DynamicPort wrapping the same underlying port, which is what
+// DynamicPort's equality compares
+inline bool Edge::hasSameSourcePort(const Edge& other) const {
+    if (!_sourceBlock || !other._sourceBlock) {
+        return false;
+    }
+    if (_sourceBlock == other._sourceBlock && _sourcePortDefinition.definition == other._sourcePortDefinition.definition) {
+        return true;
+    }
+
+    const auto port      = _sourceBlock->dynamicOutputPort(_sourcePortDefinition);
+    const auto otherPort = other._sourceBlock->dynamicOutputPort(other._sourcePortDefinition);
+    return port.has_value() && otherPort.has_value() && *port.value() == *otherPort.value();
+}
 
 namespace serialization_fields {
 using namespace std::string_view_literals;
@@ -661,7 +702,6 @@ class BlockWrapper : public BlockModel {
 protected:
     static_assert(std::is_same_v<T, std::remove_reference_t<T>>);
     std::conditional_t<kOwning, T, T*> _block;
-    std::string                        _type_name = gr::meta::type_name<T>();
 
     void initMessagePorts() {
         msgIn  = std::addressof(blockRef().msgIn);
@@ -706,15 +746,15 @@ protected:
 public:
     explicit BlockWrapper(gr::property_map initParameter = {})
     requires(kOwning && std::is_constructible_v<T, property_map>)
-        : _block(std::move(initParameter)) {
+        : BlockModel(gr::meta::type_name<T>()), _block(std::move(initParameter)) {
         initMessagePorts();
         _dynamicPortsLoader.fn       = &BlockWrapper::blockWrapperDynamicPortsLoader;
         _dynamicPortsLoader.instance = this;
     }
 
     explicit BlockWrapper(T&& original)
-    requires kOwning
-        : _block(std::move(original)) {
+    requires(kOwning && std::move_constructible<T>)
+        : BlockModel(gr::meta::type_name<T>()), _block(std::move(original)) {
         initMessagePorts();
         _dynamicPortsLoader.fn       = &BlockWrapper::blockWrapperDynamicPortsLoader;
         _dynamicPortsLoader.instance = this;
@@ -722,7 +762,7 @@ public:
 
     explicit BlockWrapper(T& ref)
     requires(!kOwning)
-        : _block(std::addressof(ref)) {
+        : BlockModel(gr::meta::type_name<T>()), _block(std::addressof(ref)) {
         initMessagePorts();
         _dynamicPortsLoader.fn       = &BlockWrapper::blockWrapperDynamicPortsLoader;
         _dynamicPortsLoader.instance = this;
@@ -768,6 +808,9 @@ public:
     [[nodiscard]] block::Category blockCategory() const override { return T::blockCategory; }
 
     [[nodiscard]] UICategory uiCategory() const override { return T::DrawableControl::kCategory; }
+
+    [[nodiscard]] const block::FusedStage* fusedStage() const noexcept override { return block::fusedStageOf<T>(); }
+    [[nodiscard]] const block::BulkStage*  bulkStage() const noexcept override { return block::bulkStageOf<T>(); }
 
     [[nodiscard]] gr::Ratio  resamplingRatio() const noexcept override { return {static_cast<std::int32_t>(blockRef().input_chunk_size), static_cast<std::int32_t>(blockRef().output_chunk_size)}; }
     [[nodiscard]] gr::Size_t stride() const noexcept override { return blockRef().stride; }
@@ -829,7 +872,6 @@ public:
     [[nodiscard]] lifecycle::State           state() const noexcept override { return blockRef().state(); }
     [[nodiscard]] std::string_view           name() const override { return blockRef().name; }
     void                                     setName(std::string name) noexcept override { blockRef().name = std::move(name); }
-    [[nodiscard]] std::string_view           typeName() const override { return _type_name; }
     [[nodiscard]] property_map&              metaInformation() noexcept override { return blockRef().meta_information; } // TODO: to be removed (read-only)
     [[nodiscard]] const property_map&        metaInformation() const override { return blockRef().meta_information; }
     [[nodiscard]] property_map&              uiConstraints() noexcept override { return blockRef().ui_constraints; }
@@ -838,12 +880,6 @@ public:
     [[nodiscard]] SettingsBase&              settings() override { return blockRef().settings(); }
     [[nodiscard]] const SettingsBase&        settings() const override { return blockRef().settings(); }
     [[nodiscard]] void*                      raw() override { return std::addressof(blockRef()); }
-
-    // Common interface between managed and unmanaged graphs
-    [[nodiscard]] gr::Graph*                 graph() override { return nullptr; }
-    [[nodiscard]] gr::property_map           exportedInputPorts() override { return {}; }
-    [[nodiscard]] gr::property_map           exportedOutputPorts() override { return {}; }
-    [[nodiscard]] std::expected<void, Error> exportPort(bool, std::string_view, PortDirection, std::string_view, std::string_view, std::source_location = std::source_location::current()) override { return {}; }
 };
 
 namespace detail {

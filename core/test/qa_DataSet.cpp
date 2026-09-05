@@ -1,5 +1,7 @@
 #include <boost/ut.hpp>
 
+#include <cstdint>
+
 #include <gnuradio-4.0/DataSet.hpp>
 
 const boost::ut::suite<"DataSet<T>"> _dataSetAPI = [] {
@@ -87,6 +89,25 @@ const boost::ut::suite<"DataSet<T>"> _dataSetAPI = [] {
             expect(throws([&] { std::ignore = ds.signalValues(99); }));
             expect(throws([&] { std::ignore = ds.signalRange(99); }));
         };
+    };
+};
+
+// A DataSet timestamp is optional, and 0 is the sentinel for "unset". The sentinel was chosen over
+// std::optional to keep the type narrow. This is part of the contract rather than an implementation
+// detail: a consumer must be able to distinguish "no time recorded" from a recorded time, so no
+// other meaning may be assigned to 0.
+const boost::ut::suite<"DataSet timestamp sentinel"> _dataSetTimestamp = [] {
+    using namespace boost::ut;
+
+    "a default-constructed DataSet carries no timestamp"_test = [] {
+        const gr::DataSet<float> dataSet;
+        expect(eq(dataSet.timestamp, std::int64_t{0})) << "0 is the unset sentinel, so a fresh DataSet must hold it";
+    };
+
+    "a recorded timestamp is distinguishable from unset"_test = [] {
+        gr::DataSet<float> dataSet;
+        dataSet.timestamp = 1;
+        expect(neq(dataSet.timestamp, std::int64_t{0})) << "the smallest recordable time must not read as unset";
     };
 };
 

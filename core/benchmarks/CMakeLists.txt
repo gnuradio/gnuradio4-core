@@ -19,6 +19,7 @@ if(NOT EMSCRIPTEN)
   endfunction()
 
   add_gr_benchmark(bm_Buffer)
+  add_gr_benchmark(bm_ChainFusion)
   add_gr_benchmark(bm_HistoryBuffer)
   add_gr_benchmark(bm_Profiler)
   add_gr_benchmark(bm_tensor)
