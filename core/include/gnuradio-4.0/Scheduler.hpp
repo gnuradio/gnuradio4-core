@@ -10,6 +10,7 @@
 #include <thread>
 #include <utility>
 
+#include <gnuradio-4.0/FusedRun.hpp>
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/Graph_yaml_importer.hpp>
 #include <gnuradio-4.0/LifeCycle.hpp>
@@ -79,6 +80,10 @@ enum class ExecutionPolicy {
 
 using JobLists = std::vector<std::vector<std::shared_ptr<BlockModel>>>;
 
+// identifies the scheduler whose poolWorker() is running on this thread, so a handler invoked from
+// that worker can tell that waiting for the job count to reach zero would include itself
+inline thread_local const void* tActiveSchedulerWorker = nullptr;
+
 template<typename Derived, ExecutionPolicy execution = ExecutionPolicy::singleThreaded, profiling::ProfilerLike TProfiler = profiling::null::Profiler>
 struct SchedulerBase : Block<Derived> {
     friend class lifecycle::StateMachine<Derived>;
@@ -127,6 +132,7 @@ protected:
 
     bool                          _valid{true};
     std::size_t                   _nWatchdogsRunning{0};
+    std::size_t                   _workerGeneration{0UZ}; // a queued worker runs only while it matches this
     meta::indirect<gr::Graph>     _graph{};
     TProfiler                     _profiler{};
     ProfileHandle                 _profilerHandler{_profiler.forThisThread()};
@@ -135,8 +141,22 @@ protected:
     std::recursive_mutex          _executionOrderMutex; // only used when modifying and copying the graph->local job list
     std::shared_ptr<JobLists>     _executionOrder = std::make_shared<JobLists>();
 
+    std::vector<std::vector<fusion::RunPlan>> _fusionPlan; // guarded by _executionOrderMutex, indexed like _executionOrder
+
     std::mutex                               _zombieBlocksMutex;
     std::vector<std::shared_ptr<BlockModel>> _zombieBlocks;
+
+    struct PendingExchange {
+        meta::indirect<gr::Graph> graph;
+        profiling::Options        option;
+        bool                      restart{false};
+        std::size_t               stopGeneration{0UZ}; // a later stop request cancels the restart
+    };
+    std::mutex                     _pendingExchangeMutex;
+    std::optional<PendingExchange> _pendingExchange;
+    std::size_t                    _nDeferredExchanges{0UZ}; // claimed swaps still running outside the job count
+    std::size_t                    _nStopRequests{0UZ};
+    bool                           _pendingStopRequest{false}; // a requested stop that no run loop has consumed yet
 
     // for blocks that were added while scheduler was running. They need to be adopted by a thread
     std::mutex _adoptionBlocksMutex;
@@ -149,8 +169,9 @@ protected:
     bool                     _messagePortsConnected = false;
 
     std::atomic_flag _processingScheduledMessages;
-    bool             _workQuiescenceRequested{false};
-    std::size_t      _nWorkersInWork{0};
+    // separate cache lines: every worker reads the flag and updates the counter on each iteration
+    alignas(gr::kCacheLine) bool _workQuiescenceRequested{false};
+    alignas(gr::kCacheLine) std::size_t _nWorkersInWork{0};
 
     void rebuildProfiler(const profiling::Options& opt) {
         std::destroy_at(std::addressof(_profiler));
@@ -183,15 +204,19 @@ public:
     Annotated<std::string, "pool name", Doc<"default pool name">>                                                              poolName                        = std::string(gr::thread_pool::kDefaultCpuPoolId);
     Annotated<std::size_t, "max_work_items", Doc<"number of work items per work scheduling interval (controls latency)">>      max_work_items                  = std::numeric_limits<std::size_t>::max(); // TODO: check whether we can keep this std::size_t or more consistently to gr::Size_t
     Annotated<property_map, "sched_settings", Doc<"scheduler implementation specific settings">>                               sched_settings{};
+    Annotated<bool, "enable_fusion", Doc<"execute maximal runs of processOne and fixed-ratio processBulk blocks as one unit">> enable_fusion                = false;
+    Annotated<gr::Size_t, "fusion_chunk_samples", Doc<"samples per fused chunk, 0 = derive from the run's value sizes">>       fusion_chunk_samples         = 0U;
+    Annotated<gr::Size_t, "fusion_interior_edge_samples", Doc<"ring size of an edge between two fused stages, 0 = derive">>    fusion_interior_edge_samples = 0U;
 
-    GR_MAKE_REFLECTABLE(SchedulerBase, timeout_ms, watchdog_timeout, timeout_inactivity_count, process_stream_to_message_ratio, max_work_items, poolName, sched_settings);
+    GR_MAKE_REFLECTABLE(SchedulerBase, timeout_ms, watchdog_timeout, timeout_inactivity_count, process_stream_to_message_ratio, max_work_items, poolName, sched_settings, enable_fusion, fusion_chunk_samples, fusion_interior_edge_samples);
 
     constexpr static block::Category blockCategory = block::Category::ScheduledBlockGroup;
 
     [[nodiscard]] static constexpr auto executionPolicy() { return execution; }
 
+    // seq_cst: this store and the worker's _nWorkersInWork increment must not sink below the load that follows them
     void requestWorkQuiescence() {
-        gr::atomic_ref(_workQuiescenceRequested).store_release(true);
+        gr::atomic_ref(_workQuiescenceRequested).store_seq_cst(true);
         while (gr::atomic_ref(_nWorkersInWork).load_acquire() > 0) {
             std::this_thread::yield();
         }
@@ -246,7 +271,13 @@ public:
     }
 
     ~SchedulerBase() {
-        if (this->state() == lifecycle::RUNNING) {
+        gr::atomic_ref(_valid).store_release(false); // mark as invalid: also stops a deferred swap from restarting the scheduler
+        {                                            // a deferred graph swap must not restart a scheduler that is being destroyed
+            std::lock_guard guard(_pendingExchangeMutex);
+            _pendingExchange.reset();
+        }
+
+        if (lifecycle::isActive(this->state())) { // RUNNING, REQUESTED_PAUSE or PAUSED -- workers are parked, not gone
             if (auto e = this->changeStateTo(lifecycle::REQUESTED_STOP); !e) {
                 std::println(std::cerr, "Failed to stop execution at destruction of scheduler: {} ({})", e.error().message, e.error().srcLoc());
                 std::abort();
@@ -254,19 +285,45 @@ public:
         }
         waitDone();
 
-        gr::atomic_ref(_valid).store_release(false); // Mark as invalid
+        // a swap claimed before _valid was cleared runs outside the job count, so wait for it separately
+        for (std::size_t nDeferred = gr::atomic_ref(_nDeferredExchanges).load_acquire(); nDeferred != 0UZ; nDeferred = gr::atomic_ref(_nDeferredExchanges).load_acquire()) {
+            gr::atomic_ref(_nDeferredExchanges).wait(nDeferred);
+        }
 
         // the watchdog dereferences SchedulerBase, wait until it finishes
-        while (gr::atomic_ref(_nWatchdogsRunning).load_acquire() != 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        for (std::size_t nWatchdogs = gr::atomic_ref(_nWatchdogsRunning).load_acquire(); nWatchdogs != 0UZ; nWatchdogs = gr::atomic_ref(_nWatchdogsRunning).load_acquire()) {
+            gr::atomic_ref(_nWatchdogsRunning).wait(nWatchdogs);
         }
 
         _executionOrder.reset(); // force earlier crashes if this is accessed after destruction (e.g. from thread that was kept running)
     }
 
+    [[nodiscard]] bool isOnOwnWorkerThread() const noexcept { return tActiveSchedulerWorker == static_cast<const void*>(this); }
+
     [[nodiscard]] std::expected<meta::indirect<Graph>, Error> exchange(meta::indirect<Graph>&& newGraph, const profiling::Options& option = {}) {
         using enum lifecycle::State;
         const auto oldState = this->state();
+
+        if (isOnOwnWorkerThread()) {
+            // a message handler on a worker of this scheduler cannot wait for the job count to reach zero --
+            // its own increment is part of it. Request the stop, stash the graph, and let the last worker out swap.
+            // The stop is requested before the record is published so that the record carries its restart from the
+            // moment it is visible: a worker leaving in between would otherwise claim one that still reads as a
+            // plain swap, and the scheduler would never start again.
+            const bool restart = lifecycle::isActive(oldState);
+            if (restart) {
+                if (auto result = this->changeStateTo(REQUESTED_STOP); !result) {
+                    return std::unexpected(result.error());
+                }
+            }
+            {
+                std::lock_guard guard(_pendingExchangeMutex);
+                // the generation is this stop's own; a later one cancels the restart
+                _pendingExchange = PendingExchange{std::move(newGraph), option, restart, gr::atomic_ref(_nStopRequests).load_acquire()};
+            }
+            return meta::indirect<Graph>{};
+        }
+
         if (lifecycle::isActive(oldState)) { // need to stop running scheduler
             if (auto result = this->changeStateTo(REQUESTED_STOP); !result) {
                 return std::unexpected(result.error());
@@ -348,7 +405,12 @@ public:
         }
     }
 
-    void stateChanged(lifecycle::State newState) { this->notifyListeners(block::property::kLifeCycleState, {{"state", std::string(gr::meta::enumName(newState).value_or(""))}}); }
+    void stateChanged(lifecycle::State newState) {
+        if (newState == lifecycle::State::REQUESTED_STOP) { // set with the claim, before stop() collapses the state to STOPPED
+            gr::atomic_ref(_pendingStopRequest).store_release(true);
+        }
+        this->notifyListeners(block::property::kLifeCycleState, {{"state", std::string(gr::meta::enumName(newState).value_or(""))}});
+    }
 
     [[nodiscard]] std::span<std::shared_ptr<BlockModel>>       blocks() noexcept { return _graph->blocks(); }
     [[nodiscard]] std::span<const std::shared_ptr<BlockModel>> blocks() const noexcept { return _graph->blocks(); }
@@ -416,27 +478,48 @@ public:
             graph::forEachBlock<TransparentBlockGroup>(*_graph, [](auto& block) { block->processScheduledMessages(); });
         }
 
+        forwardMessagesFromChildren();
+    }
+
+    // drains _fromChildMessagePort on every path: the ring is shared by all blocks, so an unconsumed span
+    // both wedges the next emitter and latches the workers' message-poll gate permanently open
+    void forwardMessagesFromChildren() {
         ReaderSpanLike auto messagesFromChildren = _fromChildMessagePort.streamReader().get();
-        if (messagesFromChildren.size() == 0) {
+        const std::size_t   nFromChildren        = messagesFromChildren.size();
+        if (nFromChildren == 0UZ) {
             return;
         }
 
-        if (this->msgOut.buffer().streamBuffer.n_readers() == 0) {
+        if (this->msgOut.nReaders() == 0) {
             // nobody is listening on messages -> convert errors to exceptions
+            std::optional<std::string> ignoredError;
             for (const auto& msg : messagesFromChildren) {
                 if (!msg.data.has_value()) {
-                    throw gr::exception(std::format("scheduler {}: throwing ignored exception {:t}", this->name, msg.data.error()));
+                    ignoredError = std::format("scheduler {}: throwing ignored exception {:t}", this->name, msg.data.error());
+                    break;
                 }
+            }
+            if (!messagesFromChildren.consume(nFromChildren)) {
+                this->emitErrorMessage("process child return messages", "Failed to consume messages from child message port");
+            }
+            if (ignoredError.has_value()) {
+                throw gr::exception(*ignoredError);
             }
             return;
         }
 
-        {
-            WriterSpanLike auto msgSpan = this->msgOut.streamWriter().template reserve<SpanReleasePolicy::ProcessAll>(messagesFromChildren.size());
-            std::ranges::copy(messagesFromChildren, msgSpan.begin());
-            msgSpan.publish(messagesFromChildren.size());
-        } // to force publish
-        if (!messagesFromChildren.consume(messagesFromChildren.size())) {
+        // forward what fits, drop the rest: a subscriber that stops consuming must not wedge worker 0
+        auto&             msgWriter  = this->msgOut.streamWriter();
+        const std::size_t nToForward = std::min(nFromChildren, msgWriter.available());
+        if (nToForward > 0UZ) {
+            WriterSpanLike auto msgSpan = msgWriter.template tryReserve<SpanReleasePolicy::ProcessAll>(nToForward);
+            std::ranges::copy_n(messagesFromChildren.begin(), static_cast<std::ptrdiff_t>(msgSpan.size()), msgSpan.begin());
+            msgSpan.publish(msgSpan.size());
+        }
+        if (nToForward < nFromChildren) {
+            message::droppedMessageCount().fetch_add(nFromChildren - nToForward, std::memory_order_relaxed);
+        }
+        if (!messagesFromChildren.consume(nFromChildren)) {
             this->emitErrorMessage("process child return messages", "Failed to consume messages from child message port");
         }
     }
@@ -444,7 +527,31 @@ public:
     std::expected<void, Error> runAndWait() {
         using enum lifecycle::State;
         [[maybe_unused]] const auto pe = this->_profilerHandler->startCompleteEvent("scheduler_base.runAndWait");
+
+        // a stop requested before RUNNING is claimed has no run loop to observe it, and the reinitialization
+        // below erases the STOPPED it produced: honor the latch instead, and consume it on the way out
+        on_scope_exit consumeStopRequest = [this] { gr::atomic_ref(_pendingStopRequest).store_release(false); };
+
+        auto settleStopped = [this]() -> std::expected<void, Error> {
+            if (this->state() == RUNNING) {
+                if (auto e = this->changeStateTo(REQUESTED_STOP); !e) {
+                    this->emitErrorMessage("runAndWait() -> LifecycleState", e.error());
+                    return std::unexpected(e.error());
+                }
+            }
+            if (this->state() == REQUESTED_STOP) {
+                if (auto e = this->changeStateTo(STOPPED); !e) {
+                    this->emitErrorMessage("runAndWait() -> LifecycleState", e.error());
+                }
+            }
+            processScheduledMessages();
+            return {};
+        };
+
         processScheduledMessages(); // make sure initial subscriptions are processed
+        if (gr::atomic_ref(_pendingStopRequest).load_acquire()) {
+            return settleStopped();
+        }
         if (this->state() == STOPPED || this->state() == ERROR) {
             if (auto e = this->changeStateTo(INITIALISED); !e) {
                 this->emitErrorMessage("runAndWait() -> LifecycleState", e.error());
@@ -458,8 +565,11 @@ public:
             }
         }
         if (auto e = this->changeStateTo(RUNNING); !e) {
-            this->emitErrorMessage("runAndWait() -> LifecycleState", e.error());
-            return std::unexpected(e.error());
+            if (!lifecycle::isShuttingDown(this->state())) {
+                this->emitErrorMessage("runAndWait() -> LifecycleState", e.error());
+                return std::unexpected(e.error());
+            }
+            return settleStopped(); // a stop claimed the transition first
         }
 
         // N.B. the transition to lifecycle::State::RUNNING will for the ExecutionPolicy:
@@ -467,30 +577,19 @@ public:
         // * multiThreaded[Blocking] spawn two worker and block on 'waitDone()'
         waitDone();
         processScheduledMessages();
-
-        if (this->state() == RUNNING) {
-            if (auto e = this->changeStateTo(REQUESTED_STOP); !e) {
-                this->emitErrorMessage("runAndWait() -> LifecycleState", e.error());
-                return std::unexpected(e.error());
-            }
-        }
-        if (this->state() == REQUESTED_STOP) {
-            if (auto e = this->changeStateTo(STOPPED); !e) {
-                this->emitErrorMessage("runAndWait() -> LifecycleState", e.error());
-            }
-        }
-        processScheduledMessages();
-        return {};
+        return settleStopped();
     }
 
     void waitDone() {
         [[maybe_unused]] const auto pe = _profilerHandler->startCompleteEvent("scheduler_base.waitDone");
-        while (_nRunningJobs->value() > 0UZ) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms));
+        for (std::size_t nRunning = _nRunningJobs->value(); nRunning > 0UZ; nRunning = _nRunningJobs->value()) {
+            _nRunningJobs->wait(nRunning);
         }
     }
 
     [[nodiscard]] std::shared_ptr<JobLists> jobs() const noexcept { return _executionOrder; }
+
+    [[nodiscard]] const std::vector<std::vector<fusion::RunPlan>>& fusionPlan() const noexcept { return _fusionPlan; }
 
 protected:
     void disconnectAllEdges() {
@@ -529,6 +628,23 @@ protected:
         return result;
     }
 
+    // idle worker backoff: hot spin, then yield, then a sleep doubling up to kMaxIdleSleep
+    static constexpr std::size_t kIdleSpinIterations  = 100UZ;
+    static constexpr std::size_t kIdleYieldIterations = 8UZ;
+    static constexpr auto        kMaxIdleSleep        = std::chrono::microseconds(200);
+
+    static void applyIdleBackoff(std::size_t nIdleIterations) noexcept {
+        if (nIdleIterations <= kIdleSpinIterations) {
+            return;
+        }
+        if (nIdleIterations <= kIdleSpinIterations + kIdleYieldIterations) {
+            std::this_thread::yield();
+            return;
+        }
+        const std::size_t shift = std::min(nIdleIterations - (kIdleSpinIterations + kIdleYieldIterations), 8UZ);
+        std::this_thread::sleep_for(std::min(kMaxIdleSleep, std::chrono::microseconds(static_cast<std::chrono::microseconds::rep>(1UZ << shift))));
+    }
+
     work::Result traverseBlockListOnce(const std::vector<std::shared_ptr<BlockModel>>& blocks) const {
         const std::size_t requestedWorkAllBlocks = max_work_items;
         std::size_t       performedWorkAllBlocks = 0UZ;
@@ -549,6 +665,116 @@ protected:
         return {max_work_items, performedWorkAllBlocks, unfinishedBlocksExist ? work::Status::OK : work::Status::DONE};
     }
 
+    // graph::flatten copies its edges by value, so a planned edge is a copy and writing it would be a silent no-op
+    [[nodiscard]] Edge* findLiveEdge(const Edge& planned) {
+        for (Edge& edge : _graph->edges()) {
+            if (edge == planned) {
+                return std::addressof(edge);
+            }
+        }
+        Edge* found = nullptr;
+        graph::forEachBlock<TransparentBlockGroup>(*_graph, [&found, &planned](auto& block) {
+            if (found != nullptr || block->blockCategory() != TransparentBlockGroup) {
+                return;
+            }
+            for (Edge& edge : static_cast<GraphWrapper<gr::Graph>*>(block.get())->blockRef().edges()) {
+                if (edge == planned) {
+                    found = std::addressof(edge);
+                    return;
+                }
+            }
+        });
+        return found;
+    }
+
+    // between planFusion() and start()'s connectPendingEdges() every edge is waiting to be connected, so writing
+    // minBufferSize per interior edge suffices: calculateStreamBufferSize() reads it back out on connection
+    void writeInteriorEdgeSizes(bool restore) {
+        for (std::vector<fusion::RunPlan>& runs : _fusionPlan) {
+            for (fusion::RunPlan& run : runs) {
+                for (fusion::InteriorEdge& interior : run.interiorEdges) {
+                    if (restore && interior.previousMinBufferSize == undefined_size) {
+                        continue;
+                    }
+                    Edge* live = findLiveEdge(interior.edge);
+                    if (live == nullptr) {
+                        continue;
+                    }
+                    if (restore) {
+                        live->setMinBufferSize(interior.previousMinBufferSize);
+                        interior.previousMinBufferSize = undefined_size;
+                    } else {
+                        interior.previousMinBufferSize = live->minBufferSize();
+                        live->setMinBufferSize(interior.samples);
+                    }
+                }
+            }
+        }
+    }
+
+    // the plan is rebuilt from scratch here and dissolved by any graph edit
+    void planFusion() {
+        std::lock_guard lock(_executionOrderMutex);
+        writeInteriorEdgeSizes(true);
+        _fusionPlan.clear();
+        if (!enable_fusion) {
+            return;
+        }
+        _fusionPlan = fusion::planFusedRuns(gr::graph::flatten(*_graph), *_executionOrder, static_cast<std::size_t>(fusion_chunk_samples.value), static_cast<std::size_t>(fusion_interior_edge_samples.value));
+
+        for (std::size_t jobIndex = 0UZ; jobIndex < _fusionPlan.size(); ++jobIndex) {
+            const std::vector<fusion::RunPlan>& runs = _fusionPlan[jobIndex];
+            if (runs.empty()) {
+                continue;
+            }
+            std::unordered_map<const BlockModel*, std::size_t> runOfMember;
+            std::vector<std::shared_ptr<BlockModel>>           runEntries;
+            runEntries.reserve(runs.size());
+            for (const fusion::RunPlan& run : runs) {
+                for (const std::shared_ptr<BlockModel>& member : run.members) {
+                    runOfMember[member.get()] = runEntries.size();
+                }
+                runEntries.push_back(std::make_shared<fusion::FusedRun>(run, _graph->_progress));
+            }
+
+            std::vector<std::shared_ptr<BlockModel>> fusedJob;
+            std::vector<bool>                        placed(runEntries.size(), false);
+            for (const std::shared_ptr<BlockModel>& entry : _executionOrder->at(jobIndex)) {
+                const auto it = runOfMember.find(entry.get());
+                if (it == runOfMember.end()) {
+                    fusedJob.push_back(entry);
+                } else if (!placed[it->second]) {
+                    placed[it->second] = true;
+                    fusedJob.push_back(runEntries[it->second]);
+                }
+            }
+            _executionOrder->at(jobIndex) = std::move(fusedJob);
+        }
+        writeInteriorEdgeSizes(false);
+    }
+
+    // a fused run holds its members by shared_ptr, so a graph edit that touches one must not leave it in the job list
+    void dissolveFusedRuns() {
+        std::lock_guard lock(_executionOrderMutex);
+        if (_fusionPlan.empty()) {
+            return;
+        }
+        // a live graph cannot reallocate a ring, so the rings stay small until the next start()
+        writeInteriorEdgeSizes(true);
+        for (std::vector<std::shared_ptr<BlockModel>>& job : *_executionOrder) {
+            std::vector<std::shared_ptr<BlockModel>> dissolved;
+            for (const std::shared_ptr<BlockModel>& entry : job) {
+                if (auto* run = dynamic_cast<fusion::FusedRun*>(entry.get()); run != nullptr) {
+                    std::ranges::copy(run->members(), std::back_inserter(dissolved));
+                } else {
+                    dissolved.push_back(entry);
+                }
+            }
+            job = std::move(dissolved);
+        }
+        _fusionPlan.clear();
+    }
+
     void init() {
         [[maybe_unused]] const auto pe = _profilerHandler->startCompleteEvent("scheduler_base.init");
         base_t::processScheduledMessages(); // make sure initial subscriptions are processed
@@ -557,19 +783,42 @@ protected:
         if constexpr (requires(Derived& d) { d.customInit(); }) {
             static_cast<Derived*>(this)->customInit();
         }
+        planFusion();
     }
 
+    // re-entering INITIALISED must rebuild the same execution state that init() builds, because the graph
+    // may have been exchanged or edited since: a stale _executionOrder runs the previous graph's blocks
     void reset() {
         graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) { this->emitErrorMessageIfAny("reset() -> LifecycleState", block->changeStateTo(lifecycle::INITIALISED)); });
         disconnectAllEdges();
+        connectBlockMessagePorts();
 
         if constexpr (requires(Derived& d) { d.customReset(); }) {
             static_cast<Derived*>(this)->customReset();
+        } else if constexpr (requires(Derived& d) { d.customInit(); }) {
+            static_cast<Derived*>(this)->customInit();
         }
+        planFusion();
     }
 
     void start() {
         using enum gr::lifecycle::State;
+
+        // stop() only publishes STOPPED, so the previous run can leave workers that the pool
+        // counted but never started. Those workers are retired and then drained before this run
+        // begins.
+        //
+        // Retiring them first is required because a worker that starts after this point would run
+        // the previous job list, whose blocks are stopped. It would make no progress, would not
+        // reach a terminal state, and would hold _nRunningJobs above zero indefinitely.
+        //
+        // The drain must happen before _executionOrderMutex is acquired: a queued worker acquires
+        // that mutex to copy its job list before it can decrement _nRunningJobs, so waiting for it
+        // while holding the mutex deadlocks the restart. A recursive mutex does not help, because
+        // the two are different threads. Draining first also keeps the graph from being rewired and
+        // keeps children and the watchdog from starting while the previous run unwinds.
+        const std::size_t workerGeneration = gr::atomic_ref(_workerGeneration).fetch_add(1UZ) + 1UZ;
+        waitDone();
 
         disconnectAllEdges();
         if (auto result = connectPendingEdges(); !result) {
@@ -604,24 +853,68 @@ protected:
         // keep outside of the lambda, as ~SchedulerBase() might finish before watchdog even starts
         gr::atomic_ref(_nWatchdogsRunning).fetch_add(1UZ);
 
-        ioThreadPool->execute([this] { this->runWatchDog(watchdog_timeout.value, timeout_inactivity_count.value); });
+        try {
+            ioThreadPool->execute([this] { this->runWatchDog(watchdog_timeout.value, timeout_inactivity_count.value); });
+        } catch (...) { // a rejected task would strand the count and spin ~SchedulerBase() forever
+            gr::atomic_ref(_nWatchdogsRunning).fetch_sub(1UZ);
+            gr::atomic_ref(_nWatchdogsRunning).notify_all();
+            throw;
+        }
 
-        assert(_nRunningJobs->value() == 0UZ);
-        assert(!_executionOrder->empty());
+        assert(_executionOrder != nullptr && !_executionOrder->empty());
         if constexpr (executionPolicy() == ExecutionPolicy::singleThreaded || executionPolicy() == ExecutionPolicy::singleThreadedBlocking) {
+            _nRunningJobs->incrementAndGet();
+            _nRunningJobs->notify_all();
             static_cast<Derived*>(this)->poolWorker(0UZ, _executionOrder);
         } else { // run on processing thread pool
             [[maybe_unused]] const auto pe           = _profilerHandler->startCompleteEvent("scheduler_base.runOnPool");
             auto                        jobListsCopy = _executionOrder;
-            for (std::size_t runnerID = 0UZ; runnerID < _executionOrder->size(); runnerID++) {
-                _pool->execute([this, runnerID, jobListsCopy]() { static_cast<Derived*>(this)->poolWorker(runnerID, jobListsCopy); });
-            }
-            if (!_executionOrder->empty()) {
-                _nRunningJobs->wait(0UZ); // waits until at least one pool worker started
+            const std::size_t           nWorkers     = jobListsCopy->size();
+
+            // the whole generation is counted before any of it is queued, so waitDone() also covers the
+            // workers the pool has not started yet
+            std::ignore = _nRunningJobs->addAndGet(nWorkers);
+            _nRunningJobs->notify_all();
+            for (std::size_t runnerID = 0UZ; runnerID < nWorkers; runnerID++) {
+                try {
+                    _pool->execute([this, runnerID, jobListsCopy, workerGeneration]() {
+                        if (gr::atomic_ref(_workerGeneration).load_acquire() != workerGeneration) { // a restart occurred before the pool reached this task
+                            releaseWorkerCount(*_nRunningJobs);
+                            return;
+                        }
+                        static_cast<Derived*>(this)->poolWorker(runnerID, jobListsCopy);
+                    });
+                } catch (...) { // a rejected task never decrements, and the leaked count spins waitDone() forever
+                    std::ignore = _nRunningJobs->subAndGet(nWorkers - runnerID);
+                    _nRunningJobs->notify_all();
+                    throw;
+                }
             }
         }
         if constexpr (requires(Derived& d) { d.customStart(); }) {
             static_cast<Derived*>(this)->customStart();
+        }
+    }
+
+    // The single path by which a counted worker releases its count, whether it ran its job list or
+    // was retired before starting. The pending graph exchange is claimed before the count is
+    // released so that ~SchedulerBase()'s waitDone() cannot complete before the swap is applied.
+    void releaseWorkerCount(gr::Sequence& nRunningJobs) {
+        std::optional<PendingExchange> claimed;
+        {
+            std::lock_guard guard(_pendingExchangeMutex);
+            if (_pendingExchange.has_value()) {
+                claimed = std::move(_pendingExchange);
+                _pendingExchange.reset();
+                gr::atomic_ref(_nDeferredExchanges).fetch_add(1UZ);
+            }
+        }
+        std::ignore = nRunningJobs.subAndGet(1UZ);
+        nRunningJobs.notify_all();
+        if (claimed.has_value()) {
+            applyPendingExchange(std::move(*claimed));
+            gr::atomic_ref(_nDeferredExchanges).fetch_sub(1UZ);
+            gr::atomic_ref(_nDeferredExchanges).notify_all();
         }
     }
 
@@ -630,8 +923,12 @@ protected:
         std::shared_ptr<gr::Sequence> progress     = _graph->_progress; // life-time guaranteed
         std::shared_ptr<gr::Sequence> nRunningJobs = _nRunningJobs;
 
-        nRunningJobs->incrementAndGet();
-        nRunningJobs->notify_all();
+        on_scope_exit decrementRunningJobs = [this, &nRunningJobs] { releaseWorkerCount(*nRunningJobs); }; // start() counted this worker in before queueing it
+
+        // runs out before decrementRunningJobs, so applyPendingExchange() is not seen as on-worker
+        const void*   previousActiveScheduler = std::exchange(tActiveSchedulerWorker, static_cast<const void*>(this));
+        on_scope_exit restoreActiveScheduler  = [previousActiveScheduler] { tActiveSchedulerWorker = previousActiveScheduler; };
+
         gr::thread_pool::thread::setThreadName(std::format("pW{}-{}", runnerID, gr::meta::shorten_type_name(this->unique_name)));
 
         [[maybe_unused]] auto profiler_handler = _profiler.forThisThread();
@@ -647,6 +944,7 @@ protected:
 
         [[maybe_unused]] auto currentProgress    = this->_graph->progress().value();
         std::size_t           inactiveCycleCount = 0UZ;
+        std::size_t           idleIterations     = 0UZ;
         std::size_t           msgToCount         = 0UZ;
         auto                  activeState        = this->state();
         do {
@@ -659,9 +957,8 @@ protected:
             // Process messages either when the ratio gate opens, or immediately when any entry-point port has
             // pending traffic. This keeps the ratio's amortisation of empty-queue checks while giving arriving
             // messages single-iteration latency (important for multi-hop sub-scheduler message paths).
-            const bool hasMessagesToProcess = msgToCount == 0UZ                //
-                                              || this->msgIn.available() > 0UZ //
-                                              || _fromChildMessagePort.available() > 0UZ;
+            const bool hasPendingMessages   = this->msgIn.available() > 0UZ || _fromChildMessagePort.available() > 0UZ;
+            const bool hasMessagesToProcess = msgToCount == 0UZ || hasPendingMessages;
             if (hasMessagesToProcess) {
                 if (runnerID == 0UZ || nRunningJobs->value() == 0UZ) {
                     this->processScheduledMessages(); // execute the scheduler- and Graph-specific message handler only once globally
@@ -674,7 +971,11 @@ protected:
                 adoptBlocks(runnerID, localBlockList);
 
                 std::ranges::for_each(localBlockList, &BlockModel::processScheduledMessages);
-                activeState = this->state();
+                const auto previousState = activeState;
+                activeState              = this->state();
+                if (hasPendingMessages || activeState != previousState) {
+                    idleIterations = 0UZ;
+                }
                 msgToCount++;
             } else {
                 if (std::has_single_bit(process_stream_to_message_ratio.value)) {
@@ -688,7 +989,7 @@ protected:
                 if (gr::atomic_ref(_workQuiescenceRequested).load_acquire()) {
                     std::this_thread::yield();
                 } else {
-                    gr::atomic_ref(_nWorkersInWork).fetch_add(1UZ);
+                    std::ignore = gr::atomic_ref(_nWorkersInWork).fetch_add_seq_cst(1UZ);
                     if (gr::atomic_ref(_workQuiescenceRequested).load_acquire()) {
                         gr::atomic_ref(_nWorkersInWork).fetch_sub(1UZ);
                     } else {
@@ -700,13 +1001,17 @@ protected:
                             this->emitErrorMessageIfAny("LifecycleState (ERROR)", this->changeStateTo(ERROR));
                             break;
                         }
+                        idleIterations = result.performed_work > 0UZ ? 0UZ : idleIterations + 1UZ;
+                        applyIdleBackoff(idleIterations);
+                        if (idleIterations > kIdleSpinIterations) {
+                            msgToCount = 0UZ; // re-read lifecycle state every backoff period, bounding stop latency
+                        }
                     }
                 }
-            } else if (activeState == PAUSED) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms));
-                msgToCount = 0UZ;
-            } else { // other states
-                std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms));
+            } else {                                    // PAUSED or any other non-RUNNING state
+                if (lifecycle::isActive(activeState)) { // a terminal state ends the loop below, do not sleep it out
+                    sleepUntilStateChanges(activeState);
+                }
                 msgToCount = 0UZ;
             }
 
@@ -720,7 +1025,8 @@ protected:
                 }
 
                 currentProgress = progressAfter;
-                if (inactiveCycleCount > timeout_inactivity_count) {
+                // parking in a non-RUNNING state would hold the worker until the watchdog's next progress bump
+                if (activeState == RUNNING && inactiveCycleCount > timeout_inactivity_count) {
                     // allow a scheduler process to wait on progress before retrying (N.B. intended to save CPU/battery power)
                     // N.B. a watchdog will periodically update the progress to check for non-responsive blocks.
                     waitUntilChanged(*progress, currentProgress, timeout_ms);
@@ -728,12 +1034,48 @@ protected:
                 }
             }
         } while (lifecycle::isActive(activeState));
-        std::ignore = nRunningJobs->subAndGet(1UZ);
-        nRunningJobs->notify_all();
+    }
+
+    // performs a graph swap that exchange() had to defer because it was requested from a scheduler worker
+    void applyPendingExchange(PendingExchange pending) {
+        using enum lifecycle::State;
+
+        waitDone(); // the claiming worker has already released its own count
+        if (!gr::atomic_ref(_valid).load_acquire()) {
+            return; // destruction started: do not touch the graph
+        }
+
+        if (this->state() == REQUESTED_STOP) {
+            this->emitErrorMessageIfAny("applyPendingExchange() -> STOPPED", this->changeStateTo(STOPPED));
+        }
+        if (auto result = exchange(std::move(pending.graph), pending.option); !result) {
+            this->emitErrorMessage("applyPendingExchange()", result.error());
+            return;
+        }
+        if (pending.restart && gr::atomic_ref(_nStopRequests).load_acquire() == pending.stopGeneration) {
+            this->emitErrorMessageIfAny("applyPendingExchange() -> INITIALISED", this->changeStateTo(INITIALISED));
+            this->emitErrorMessageIfAny("applyPendingExchange() -> RUNNING", this->changeStateTo(RUNNING));
+        }
+    }
+
+    // chunked so a lifecycle change is picked up within a chunk instead of at the end of a full timeout_ms
+    // sleep; only reached when the scheduler is not RUNNING, so it does not touch the idle-worker CPU path
+    void sleepUntilStateChanges(lifecycle::State observedState) {
+        constexpr auto kChunk   = std::chrono::milliseconds(1);
+        const auto     deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms.value);
+        while (std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(kChunk);
+            if (this->state() != observedState) {
+                return;
+            }
+        }
     }
 
     void runWatchDog(std::size_t timeOut_ms, std::size_t timeOut_count) {
-        on_scope_exit _ = [this] { gr::atomic_ref(_nWatchdogsRunning).fetch_sub(1UZ); };
+        on_scope_exit _ = [this] {
+            gr::atomic_ref(_nWatchdogsRunning).fetch_sub(1UZ);
+            gr::atomic_ref(_nWatchdogsRunning).notify_all();
+        };
 
         auto thisName = gr::meta::shorten_type_name(this->unique_name);
         gr::thread_pool::thread::setThreadName(std::format("WatchDog-{}", thisName));
@@ -748,10 +1090,25 @@ protected:
             return; // abort watchdog: scheduler inactive or jobs already finished.
         }
 
+        // chunked so a cleared _valid is observed well before a full watchdog period
+        auto sleepWhileValid = [this](std::chrono::milliseconds total) {
+            const auto chunk    = std::max(total / 10, std::chrono::milliseconds(1));
+            const auto wakeUpAt = std::chrono::steady_clock::now() + total;
+            while (std::chrono::steady_clock::now() < wakeUpAt) {
+                if (!gr::atomic_ref(_valid).load_acquire()) {
+                    return false;
+                }
+                std::this_thread::sleep_for(chunk);
+            }
+            return gr::atomic_ref(_valid).load_acquire();
+        };
+
         std::size_t lastProgress = _graph->_progress->value();
         std::size_t nWarnings    = 0;
         do {
-            std::this_thread::sleep_for(std::chrono::milliseconds(timeOut_ms));
+            if (!sleepWhileValid(std::chrono::milliseconds(timeOut_ms))) {
+                return;
+            }
             // check and increase progress if there hasn't been none.
 
             std::size_t currentProgress = _graph->_progress->value();
@@ -770,8 +1127,17 @@ protected:
         } while (_nRunningJobs->value() > 0UZ);
     }
 
+    // a worker parked in waitUntilChanged(progress) only wakes on progress, so a lifecycle change must
+    // bump it -- otherwise the wait runs until the watchdog's next tick
+    void wakeProgressWaiters() {
+        _graph->_progress->incrementAndGet();
+        _graph->_progress->notify_all();
+    }
+
     void stop() {
         using enum lifecycle::State;
+        gr::atomic_ref(_nStopRequests).fetch_add(1UZ);
+        wakeProgressWaiters();
         graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) {
             if (block->blockCategory() == ScheduledBlockGroup) {
                 auto* schedulerModel = dynamic_cast<SchedulerModel*>(block.get());
@@ -788,7 +1154,9 @@ protected:
             }
         });
 
-        this->emitErrorMessageIfAny("stop() -> LifecycleState ->STOPPED", this->changeStateTo(STOPPED));
+        if (this->state() != ERROR) { // stop() also runs on the way into ERROR, which only reset() leaves
+            this->emitErrorMessageIfAny("stop() -> LifecycleState ->STOPPED", this->changeStateTo(STOPPED));
+        }
         if constexpr (requires(Derived& d) { d.customStop(); }) {
             static_cast<Derived*>(this)->customStop();
         }
@@ -796,6 +1164,7 @@ protected:
 
     void pause() {
         using enum lifecycle::State;
+        wakeProgressWaiters();
         graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) {
             this->emitErrorMessageIfAny("pause() -> LifecycleState", block->changeStateTo(REQUESTED_PAUSE));
             if (!block->isBlocking()) { // N.B. no other thread/constraint to consider before shutting down
@@ -810,6 +1179,7 @@ protected:
 
     void resume() {
         using enum lifecycle::State;
+        wakeProgressWaiters();
         {
             WorkQuiescenceGuard quiescence(this);
             auto                result = connectPendingEdges();
@@ -951,10 +1321,19 @@ protected:
         const bool   isYamlPath   = messageData.contains("yaml");
         property_map yamlSettings = isYamlPath ? std::exchange(blockProperties, {}) : property_map{};
 
-        auto& newBlock = targetGraph->emplaceBlock(blockType, blockProperties);
+        const std::shared_ptr<BlockModel>& newBlock = [&]() -> const std::shared_ptr<BlockModel>& {
+            WorkQuiescenceGuard quiescence(this); // _blocks is traversed by every worker and by forEachBlock
+            dissolveFusedRuns();
+            return targetGraph->emplaceBlock(blockType, blockProperties);
+        }();
 
         if (isYamlPath && !yamlSettings.empty()) {
             newBlock->settings().loadParametersFromPropertyMap(yamlSettings);
+            // loadParametersFromPropertyMap() only stores; without activating the context nothing is ever
+            // staged and the block keeps its constructor defaults (Graph_yaml_importer does this itself)
+            if (newBlock->settings().activateContext() == std::nullopt) {
+                this->emitErrorMessage("propertyCallbackEmplaceBlock", std::format("could not activate the loaded settings context of '{}'", newBlock->uniqueName()));
+            }
         }
 
         adoptBlock(newBlock);
@@ -987,10 +1366,14 @@ protected:
         }
 
         messageData["_targetGraph"] = targetGraph->unique_name.value();
-        if (auto removedBlock = targetGraph->removeBlockByName(uniqueName); removedBlock.has_value()) {
-            makeZombie(std::move(*removedBlock));
-        } else {
-            message.data = std::unexpected(removedBlock.error());
+        {
+            WorkQuiescenceGuard quiescence(this); // _blocks is traversed by every worker and by forEachBlock
+            dissolveFusedRuns();
+            if (auto removedBlock = targetGraph->removeBlockByName(uniqueName); removedBlock.has_value()) {
+                makeZombie(std::move(*removedBlock));
+            } else {
+                message.data = std::unexpected(removedBlock.error());
+            }
         }
 
         return {message};
@@ -1016,10 +1399,17 @@ protected:
             return message;
         }
 
+        // optional: restrict the removal to a single edge of a fan-out
+        const auto destinationBlock = messageData.contains(std::pmr::string(gr::serialization_fields::EDGE_DESTINATION_BLOCK)) ? messageData.at(std::pmr::string(gr::serialization_fields::EDGE_DESTINATION_BLOCK)).value_or(std::string_view{}) : std::string_view{};
+        const auto destinationPort  = messageData.contains(std::pmr::string(gr::serialization_fields::EDGE_DESTINATION_PORT)) ? messageData.at(std::pmr::string(gr::serialization_fields::EDGE_DESTINATION_PORT)).value_or(std::string_view{}) : std::string_view{};
+
         messageData["_targetGraph"] = targetGraph->unique_name.value();
         {
             WorkQuiescenceGuard quiescence(this);
-            if (auto result = targetGraph->removeEdgeBySourcePort(sourceBlock, sourcePort); !result.has_value()) {
+            dissolveFusedRuns();
+            if (auto result = targetGraph->removeEdgeBySourcePort(sourceBlock, sourcePort, destinationBlock, destinationPort); result.has_value()) {
+                messageData["nEdgesRemoved"] = static_cast<gr::Size_t>(*result);
+            } else {
                 message.data = std::unexpected(result.error());
             }
         }
@@ -1056,7 +1446,8 @@ protected:
         messageData["_targetGraph"] = targetGraph->unique_name.value();
         {
             WorkQuiescenceGuard quiescence(this);
-            const std::size_t   effectiveMinBufferSize = (*minBufferSize == gr::undefined_Size) ? gr::undefined_size : static_cast<std::size_t>(*minBufferSize);
+            dissolveFusedRuns();
+            const std::size_t effectiveMinBufferSize = (*minBufferSize == gr::undefined_Size) ? gr::undefined_size : static_cast<std::size_t>(*minBufferSize);
             if (auto result = targetGraph->emplaceEdge(sourceBlock, std::string(sourcePort), destinationBlock, std::string(destinationPort), effectiveMinBufferSize, *weight, edgeName); !result.has_value()) {
                 message.data = std::unexpected(result.error());
             }
@@ -1087,6 +1478,19 @@ protected:
 
         std::lock_guard guard(_zombieBlocksMutex);
 
+        // a zombie inside a fused run is not addressable as a job entry, so restore that run's members first
+        if (!_zombieBlocks.empty()) {
+            for (std::size_t i = 0UZ; i < localBlockList.size(); ++i) {
+                auto* run = dynamic_cast<fusion::FusedRun*>(localBlockList[i].get());
+                if (run == nullptr || std::ranges::none_of(run->members(), [this](const auto& member) { return std::ranges::find(_zombieBlocks, member) != _zombieBlocks.end(); })) {
+                    continue;
+                }
+                const fusion::RunMembers members = run->members();
+                localBlockList.erase(localBlockList.begin() + static_cast<std::ptrdiff_t>(i));
+                localBlockList.insert(localBlockList.begin() + static_cast<std::ptrdiff_t>(i), members.begin(), members.end());
+            }
+        }
+
         auto it = _zombieBlocks.begin();
 
         while (it != _zombieBlocks.end()) {
@@ -1110,9 +1514,8 @@ protected:
                 break;
             case REQUESTED_STOP: // block will be deleted later
                 break;
-            case REQUESTED_PAUSE: // block will be deleted later
-                // There's no transition from REQUESTED_PAUSE to REQUESTED_STOP
-                // Will be moved to REQUESTED_STOP as soon as it's possible
+            case REQUESTED_PAUSE: // zombie that never reached PAUSED -- stop it directly
+                this->emitErrorMessageIfAny("cleanupZombieBlocks", (*it)->changeStateTo(REQUESTED_STOP));
                 break;
             case PAUSED: // zombie was in REQUESTED_PAUSE and now finally in PAUSED. Can be stopped now.
                 // Will be deleted in a next zombie maintenance period
@@ -1167,7 +1570,7 @@ protected:
     */
     void makeZombie(std::shared_ptr<BlockModel> block) {
         using enum lifecycle::State;
-        if (block->state() == PAUSED || block->state() == RUNNING) {
+        if (lifecycle::isActive(block->state())) {
             this->emitErrorMessageIfAny("makeZombie", block->changeStateTo(REQUESTED_STOP));
         }
 
@@ -1334,7 +1737,11 @@ protected:
             return message;
         }
 
-        auto [oldBlock, newBlockRaw] = targetGraph->replaceBlock(uniqueName, type, properties);
+        auto [oldBlock, newBlockRaw] = [&] {
+            WorkQuiescenceGuard quiescence(this); // _blocks is traversed by every worker and by forEachBlock
+            dissolveFusedRuns();
+            return targetGraph->replaceBlock(uniqueName, type, properties);
+        }();
         makeZombie(std::move(oldBlock));
 
         std::optional<Message> result = gr::Message{};
@@ -1375,25 +1782,26 @@ struct Simple : SchedulerBase<Simple<execution, TProfiler>, execution, TProfiler
         this->_adoptionBlocks.resize(n_batches);
         this->_executionOrder->clear();
         this->_executionOrder->reserve(n_batches);
+        // contiguous slices keep chain neighbors on the same worker
+        const std::span<const std::shared_ptr<BlockModel>> allBlocks = flatGraph.blocks();
         for (std::size_t i = 0; i < n_batches; i++) {
-            // create job-set for thread
-            auto& job = this->_executionOrder->emplace_back(std::vector<std::shared_ptr<BlockModel>>());
-            job.reserve(nBlocks / n_batches + 1);
-            for (std::size_t j = i; j < nBlocks; j += n_batches) {
-                job.push_back(flatGraph.blocks()[j]);
-            }
+            const std::size_t first = i * nBlocks / n_batches;
+            const std::size_t last  = (i + 1UZ) * nBlocks / n_batches;
+            auto&             job   = this->_executionOrder->emplace_back(std::vector<std::shared_ptr<BlockModel>>());
+            job.assign(allBlocks.begin() + static_cast<std::ptrdiff_t>(first), allBlocks.begin() + static_cast<std::ptrdiff_t>(last));
         }
     }
 };
 
 namespace detail {
+// contiguous slices keep chain neighbors on the same worker
 inline JobLists batchBlocks(const std::vector<std::shared_ptr<BlockModel>>& blocks, std::size_t n_batches) {
-    JobLists result(n_batches);
+    JobLists          result(n_batches);
+    const std::size_t nBlocks = blocks.size();
     for (std::size_t batch = 0UZ; batch < n_batches; ++batch) {
-        result[batch].reserve(blocks.size() / n_batches + 1UZ);
-        for (std::size_t i = batch; i < blocks.size(); i += n_batches) {
-            result[batch].push_back(blocks[i]);
-        }
+        const std::size_t first = batch * nBlocks / n_batches;
+        const std::size_t last  = (batch + 1UZ) * nBlocks / n_batches;
+        result[batch].assign(blocks.begin() + static_cast<std::ptrdiff_t>(first), blocks.begin() + static_cast<std::ptrdiff_t>(last));
     }
     return result;
 }

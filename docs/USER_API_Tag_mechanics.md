@@ -17,6 +17,8 @@ of annotated signal data.
   offset.
 - **Forwarding policies**: default (forward), `BackwardTagPropagation`, or `NoTagPropagation`.
   Override `forwardTags()` for full custom control.
+- A **negative `relIndex`** is a tag deferred out of an earlier chunk and not yet forwarded — not a
+  tag seen twice. A custom `forwardTags()` reading more than `tags(1)` is the one case where it is.
 - Tags are **never merged** across different positions or sources. No implicit data loss.
 - **Contexts** (`context` + `time` keys) switch entire settings presets per sample — a pipeline can
   coherently shift between different operating modes.
@@ -81,6 +83,9 @@ work::Status processBulk(InputSpanLike auto& input, OutputSpanLike auto& output)
 Use `input.tags(n)` to limit to tags within the first `n` samples. For raw access (manual
 consumption): `input.rawTags` is the underlying `ReaderSpan<Tag>`.
 
+A negative `relIndex` is a tag that lies before the current span — it was left in the tag buffer by
+an earlier chunk and has not been forwarded yet. See "Deferred tags and negative relative indices".
+
 ### processOne
 
 processOne processes one sample per work call when a tag is present. Use the pre-computed merged tag:
@@ -134,6 +139,19 @@ When processOne publishes a tag, the dispatch loop breaks after the current samp
 call continues from the following sample. This ensures tags are positioned at the exact sample where
 `publishTag` was called.
 
+### Publishing while the framework holds the span
+
+Between the moment the framework reserves a work call's output spans and the moment it releases them,
+those spans own the port's tag reservation, and a port-level `publishTag` cannot take a second one:
+the attempt is refused, reported on `stderr` and the tag dropped, rather than retargeting the open
+reservation and handing the downstream block ring slots nobody wrote. Publish through the span —
+`outSpan.publishTag(map, offset)` in `processBulk` — not through the port, and not via
+`this->publishTag(map)`, which goes to the ports directly outside processOne dispatch. The framework
+follows the same rule for the settings tags it forwards on your behalf, including a setting a block
+stages from inside its own `processBulk` before calling `requestStop()`: those parameters are applied
+and forwarded on that same work call, through the span it is already holding, just before the
+end-of-stream tag.
+
 ---
 
 ## Automatic tag forwarding
@@ -184,6 +202,36 @@ Tags NOT at position 0 of their chunk are unconsumed and shift forward:
 
   output:   ▽     ▼  ▽                         tags forwarded at position 0 of their chunk
 ```
+
+### Deferred tags and negative relative indices
+
+A chunk cannot always be broken at a tag: `min_samples` on an input port and `input_chunk_size > 1`
+on a resampling block both put a floor under the chunk, and `ForwardTagPropagation` disables the
+break outright. Where the break is impossible the tag stays interior to the chunk and the framework
+leaves it in the tag buffer — an input span retires only the tags at `relIndex <= 0`, exactly the
+window the default forwarder reads with `tags(1)`. By the next chunk the stream position has passed
+that tag, so it appears again at a **negative** `relIndex`.
+
+A negative `relIndex` therefore means "deferred, not yet forwarded". The default forwarder clamps it
+to output offset 0 and publishes it there: the tag's first and only publication, late by the distance
+it was carried. Dropping negative-index tags instead would silently lose every tag
+that could not become a chunk boundary — for a decimator with `input_chunk_size = 4` and tags at
+input samples 0, 1, 2, 5, 6 and 9, five of the six arrive this way (`core/test/qa_TagForwarding.cpp`
+measures both shapes).
+
+```
+  input:    ▽  ▽  ▽                          tags at 0, 1, 2       input_chunk_size = 4
+            │  │  │
+  samples: ─┬──┬──┬──┬──┬──┬──┬──┬─
+            0  1  2  3  4  5  6  7
+
+  chunk 1:  ├───────────┤                    relIndex 0 forwarded, 1 and 2 stay in the buffer
+  chunk 2:              ├───────────┤        the same two now at relIndex -3 and -2,
+                                             both clamped to output offset 0
+```
+
+The carry is bounded by the stream: a tag deferred out of the last chunk has no next chunk to arrive
+in and goes down with the buffer.
 
 ### Forward tag propagation (`ForwardTagPropagation`)
 
@@ -275,6 +323,30 @@ struct MyBlock : gr::Block<MyBlock> {
 `forwardTags` is detected via `requires` at compile time — no registration needed. The CRTP policy
 tags only affect the default implementation; a user `forwardTags` replaces it entirely.
 
+The retiring window does not follow the override. An input span still retires only `tags(1)`, so an
+override that reads a wider window — `in.tags(processedIn)`, `in.tags()`, `in.rawTags` — sees every
+deferred tag twice: once at its true positive offset in the chunk it lies in, and again at a negative
+offset in the chunk after that. Such an override must skip `relIndex < 0` and handle each tag where
+it lies:
+
+```cpp
+for (const auto& [relIndex, tagMapRef] : in.tags(processedIn)) {
+    if (relIndex < 0) {
+        continue; // an earlier chunk already forwarded this one
+    }
+    // ... map the offset, publish
+}
+```
+
+### Rate-changing blocks
+
+The default forwarding puts a tag at the output offset matching its input offset, which is only right
+at a ratio of one. A block that changes the sample rate must therefore override `forwardTags()` and
+map the offset itself. `gr::blocks::filter::RationalResampler` is the reference pattern: it maps each
+input offset by `floor(i*L/M + 1/2)`, skips `relIndex < 0`, and holds a tag whose output sample this
+call does not produce rather than moving it to an offset that is not its own, publishing it in the
+call that does produce that sample.
+
 ---
 
 ## Multi-input deduplication
@@ -324,14 +396,43 @@ block's `settingsChanged(old, new)` callback fires before the next processing ca
   └──────────┘              └──────────┘
 ```
 
-The set of auto-forwarded keys is `settings().autoForwardParameters()` — by default the standard tag
-keys (`kDefaultTags`). Blocks can add custom keys:
+The set of auto-forwarded keys is `settings().autoForwardParameters()` — the standard tag keys
+(`kDefaultTags`), fixed when the block's settings are constructed. The accessor is read-only. It returns a `const` reference because `Block::forwardInputTags()` holds that
+reference for the whole forwarding loop of every work call and takes no lock; a set that changed
+while the graph was running would be a data race on the hot path.
+
+To carry a non-standard key downstream, publish the tag from the block itself (see "Publishing
+tags" above) instead of adding the key to the forwarding set:
 
 ```cpp
-void start() {
-    settings().autoForwardParameters().insert("my_custom_key");
+work::Status processBulk(InputSpanLike auto& input, OutputSpanLike auto& output) {
+    output.publishTag({{"my_custom_key", value}}, 0);
+    return work::Status::OK;
 }
 ```
+
+A pass-through block that must forward _every_ input tag, whatever its keys, declares
+`NoTagPropagation` and republishes the input tags at their own offsets:
+
+```cpp
+struct Delay : gr::Block<Delay, gr::NoTagPropagation> {
+    work::Status processBulk(InputSpanLike auto& input, OutputSpanLike auto& output) {
+        const auto n = std::min(input.size(), output.size());
+        for (const Tag& tag : input.rawTags) {
+            if (tag.index >= input.streamIndex && tag.index - input.streamIndex < n) {
+                output.publishTag(tag.map, tag.index - input.streamIndex);
+            }
+        }
+        std::ranges::copy(input.first(n), output.begin());
+        std::ignore = input.consume(n);
+        output.publish(n);
+        return work::Status::OK;
+    }
+};
+```
+
+To rewrite or filter keys per tag rather than republish them all, override `forwardTags()` (see
+"Custom tag forwarding" above).
 
 ### Init-time settings forwarding
 

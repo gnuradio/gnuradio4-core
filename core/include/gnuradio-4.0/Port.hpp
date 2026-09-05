@@ -232,7 +232,7 @@ Follows the ISO 80000-1:2022 Quantities and Units conventions:
                             maybeError = std::unexpected(Error{std::format("PortMetaInfo invalid-argument: incorrect type for key")});
                         }
                     } else {
-                        const auto converted = pmt::convert_safely<Type, true>(value);
+                        const auto converted = pmt::convert_numerically<Type>(value);
                         if (converted) {
                             std::ignore = member.validate_and_set(*converted);
                         } else {
@@ -424,6 +424,11 @@ concept InputSpanLike = std::ranges::contiguous_range<T> && ConstSpanLike<T> && 
  *   - Default Behavior:
  *     - For `Synch` ports, all samples are published by default.
  *     - For `Async` ports, no samples are published by default.
+ *   - Publishing fewer samples than the span holds is allowed: the remainder is released back to the buffer, so a
+ *     `processBulk` may end its chunk early — including on the call where `input_chunk_size`/`output_chunk_size`
+ *     changed, which resizes the *next* span, not the one in hand. Ports on a multi-producer buffer are the
+ *     exception and must publish the whole span, since the gap would stall every later publication.
+ *   - Publishing more than the span holds is a contract violation: it is clamped to the reservation and reported.
  * - Publishing Tags: Use `publishTag(tagData, tagOffset)` to publish tags. `tagOffset` is relative to the first sample.
  */
 template<typename T>
@@ -639,7 +644,11 @@ struct Port {
         [[nodiscard]] static constexpr std::ptrdiff_t relIndex(std::size_t abs, std::size_t base) noexcept { return abs >= base ? static_cast<std::ptrdiff_t>(abs - base) : -static_cast<std::ptrdiff_t>(base - abs); }
 
         auto getTagsInRange(std::size_t nSamples, TagReaderType& reader, std::size_t currentStreamOffset) {
-            const auto tags = reader.get(reader.available());
+            const std::size_t nAvailableTags = reader.available();
+            if (nAvailableTags == 0UZ) [[likely]] {
+                return reader.get(0UZ);
+            }
+            const auto tags = reader.get(nAvailableTags);
             const auto it   = std::ranges::find_if_not(tags, [nSamples, currentStreamOffset](const auto& tag) { return tag.index < currentStreamOffset + nSamples; });
             const auto n    = static_cast<std::size_t>(std::distance(tags.begin(), it));
             return reader.get(n);
@@ -689,11 +698,9 @@ struct Port {
                 return;
             }
 
+            // TODO(error handling): surface this to the scheduler as a port-status flag instead of stderr
             if (tagsPublished >= tags.size()) {
-                // TODO(error handling): Decide how to surface failures.
-                // Option A: throw an exception, but this function is marked noexcept—either remove noexcept or avoid throwing.
-                // Option B: return an error (or set a port-status flag) that the Scheduler can observe and handle accordingly.
-                // std::println("Tags buffer is full (published:{}, size:{}), can not process tag publishing, tagOffset:{}, tagData:{}", tagsPublished, tags.size(), tagOffset, tagData);
+                std::println(stderr, "gr::Port: tag buffer full (published: {}, size: {}), dropping tag at offset {}", tagsPublished, tags.size(), tagOffset);
                 return;
             }
             const auto index = streamIndex + tagOffset;
@@ -780,9 +787,9 @@ public:
 
     [[nodiscard]] constexpr bool isConnected() const noexcept {
         if constexpr (kIsInput) {
-            return _ioHandler.buffer().n_writers() > 0;
+            return nWriters() > 0;
         } else {
-            return _ioHandler.buffer().n_readers() > 0;
+            return nReaders() > 0;
         }
     }
 
@@ -799,6 +806,8 @@ public:
     [[nodiscard]] constexpr std::size_t nReaders() const noexcept {
         if constexpr (kIsInput) {
             return -1UZ;
+        } else if constexpr (requires { _ioHandler.nReaders(); }) {
+            return _ioHandler.nReaders();
         } else {
             return _ioHandler.buffer().n_readers();
         }
@@ -806,7 +815,11 @@ public:
 
     [[nodiscard]] constexpr std::size_t nWriters() const noexcept {
         if constexpr (kIsInput) {
-            return _ioHandler.buffer().n_writers();
+            if constexpr (requires { _ioHandler.nWriters(); }) {
+                return _ioHandler.nWriters();
+            } else {
+                return _ioHandler.buffer().n_writers();
+            }
         } else {
             return -1UZ;
         }

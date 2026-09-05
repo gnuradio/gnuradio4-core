@@ -363,6 +363,18 @@ template<class T, bool strictCheck = false>
     return result;
 }
 
+// as strict as convert_safely<T, true>, except that a numeric scalar reaching a numeric target is
+// converted across width and signedness with the range and precision checks of convert_safely<T, false>
+template<class T>
+[[nodiscard]] constexpr std::expected<T, std::string> convert_numerically(const pmt::Value& v) {
+    if constexpr (std::is_arithmetic_v<T> && !std::is_same_v<T, bool>) {
+        if (v.is_integral() || v.is_floating_point()) {
+            return convert_safely<T, false>(v);
+        }
+    }
+    return convert_safely<T, true>(v);
+}
+
 template<typename TMinimalNumericVariant, typename R = std::expected<TMinimalNumericVariant, std::string>>
 [[nodiscard]] constexpr R parseToMinimalNumeric(std::string_view numericString) {
     const std::string_view str = detail::trimAndCutComment(numericString);

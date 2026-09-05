@@ -18,6 +18,8 @@
 #include <tuple>
 #include <typeinfo>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #if __has_include(<stdfloat>) && !defined(__ADAPTIVECPP__)
 #include <stdfloat>
@@ -34,13 +36,6 @@ static_assert(std::numeric_limits<float32_t>::is_iec559 && sizeof(float32_t) * 8
 static_assert(std::numeric_limits<float64_t>::is_iec559 && sizeof(float64_t) * 8 == 64, "float64_t must be a 64-bit IEEE 754 double");
 } // namespace std
 #endif
-
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wshadow"
-#pragma GCC diagnostic ignored "-Wsign-conversion"
-#include <vir/simd.h>
-#include <vir/simdize.h>
-#pragma GCC diagnostic pop
 
 #ifndef DISABLE_SIMD
 #define DISABLE_SIMD 0
@@ -634,8 +629,8 @@ struct message_type {};
 template<class... T>
 constexpr bool always_false = false;
 
-constexpr std::size_t invalid_index              = std::numeric_limits<std::size_t>::max();
-constexpr std::size_t default_message_port_index = std::numeric_limits<std::size_t>::max() - 1UZ;
+inline constexpr std::size_t invalid_index              = std::numeric_limits<std::size_t>::max();
+inline constexpr std::size_t default_message_port_index = std::numeric_limits<std::size_t>::max() - 1UZ;
 
 /**
  * T is tuple-like if it implements std::tuple_size, std::tuple_element, and std::get.
@@ -671,23 +666,6 @@ concept array_type = is_std_array_type<std::remove_cv_t<T>>::value;
 
 template<typename T, typename V = void>
 concept array_or_vector_type = (vector_type<T> || array_type<T>) && (std::same_as<V, void> || std::same_as<typename T::value_type, V>);
-
-namespace stdx = vir::stdx;
-
-template<typename V, typename T = void>
-concept any_simd = stdx::is_simd_v<V> && (std::same_as<T, void> || std::same_as<T, typename V::value_type>);
-
-template<typename V, typename T>
-concept t_or_simd = std::same_as<V, T> || any_simd<V, T>;
-
-template<typename T, typename U = void>
-concept constexpr_value = vir::constexpr_value<T, U>;
-
-template<auto V>
-inline constexpr vir::constexpr_wrapper<V> cw{};
-
-template<typename T, int N = 0>
-using simdize = vir::simdize<T, N>;
 
 template<typename T>
 concept complex_like = std::is_same_v<T, std::complex<float>> || std::is_same_v<T, std::complex<double>>;

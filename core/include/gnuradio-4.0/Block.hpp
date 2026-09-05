@@ -7,6 +7,8 @@
 
 #include <format>
 
+#include <gnuradio-4.0/meta/simd.hpp>
+
 #include <gnuradio-4.0/meta/RangesHelper.hpp>
 #include <gnuradio-4.0/meta/formatter.hpp>
 #include <gnuradio-4.0/meta/immutable.hpp>
@@ -89,41 +91,34 @@ template<PortType portType, PortReflectable Self>
 }
 
 namespace detail {
-template<std::ranges::range Range, typename T = std::ranges::range_value_t<Range>>
-[[nodiscard]] constexpr std::optional<T> min_element(Range&& range) {
-    if (auto it = std::ranges::min_element(range); it != std::ranges::end(range)) {
-        return *it;
-    }
-    return std::nullopt;
-}
-
-template<auto... MatchPortEnums, std::ranges::range Range, typename T = std::ranges::range_value_t<Range>>
+template<auto... MatchPortEnums, std::ranges::sized_range Range, typename T = std::ranges::range_value_t<Range>>
+requires std::ranges::random_access_range<Range>
 [[nodiscard]] constexpr std::optional<T> min_element_masked(Range&& range, const std::span<const port::BitMask>& portMaskVec) {
-    auto filtered = std::ranges::views::zip(range, portMaskVec) | std::views::filter([](const auto& pair) {
-        const auto& mask = std::get<1>(pair);
-        return port::pattern<MatchPortEnums...>().matches(mask); // actual & pattern.mask == pattern.value
-    }) | std::views::transform([](const auto& pair) { return std::get<0>(pair); });
+    constexpr port::BitPattern kPattern = port::pattern<MatchPortEnums...>();
+    const std::size_t          nPorts   = std::min(std::ranges::size(range), portMaskVec.size());
 
-    return min_element(filtered);
-}
-
-template<std::ranges::range Range, typename T = std::ranges::range_value_t<Range>>
-std::optional<T> max_element(Range&& range) {
-    if (auto it = std::ranges::max_element(range); it != std::ranges::end(range)) {
-        return *it;
+    std::optional<T> result;
+    for (std::size_t i = 0UZ; i < nPorts; ++i) {
+        if (kPattern.matches(portMaskVec[i]) && (!result.has_value() || range[i] < *result)) {
+            result = range[i];
+        }
     }
-    return std::nullopt;
+    return result;
 }
 
-template<auto... MatchPortEnums, std::ranges::range Range, typename T = std::ranges::range_value_t<Range>>
+template<auto... MatchPortEnums, std::ranges::sized_range Range, typename T = std::ranges::range_value_t<Range>>
+requires std::ranges::random_access_range<Range>
 [[nodiscard]] constexpr std::optional<T> max_element_masked(Range&& range, const std::span<const port::BitMask>& portMaskVec) {
-    auto zipped   = std::ranges::views::zip(range, portMaskVec);
-    auto filtered = zipped | std::views::filter([](const auto& pair) {
-        const auto& mask = std::get<1>(pair);
-        return port::pattern<MatchPortEnums...>().matches(mask); // actual & pattern.mask == pattern.value
-    }) | std::views::transform([](const auto& pair) { return std::get<0>(pair); });
+    constexpr port::BitPattern kPattern = port::pattern<MatchPortEnums...>();
+    const std::size_t          nPorts   = std::min(std::ranges::size(range), portMaskVec.size());
 
-    return max_element(filtered);
+    std::optional<T> result;
+    for (std::size_t i = 0UZ; i < nPorts; ++i) {
+        if (kPattern.matches(portMaskVec[i]) && (!result.has_value() || range[i] > *result)) {
+            result = range[i];
+        }
+    }
+    return result;
 }
 
 template<typename T, std::size_t simd_width = stdx::simd_abi::max_fixed_size<T>>
@@ -155,10 +150,18 @@ template<typename T, std::size_t simd_width = stdx::simd_abi::max_fixed_size<T>>
     return false;
 }
 
-template<auto... MatchPortEnums, std::ranges::input_range RangeA, std::ranges::input_range RangeB, std::ranges::input_range MaskRange>
+template<auto... MatchPortEnums, std::ranges::sized_range RangeA, std::ranges::sized_range RangeB, std::ranges::sized_range MaskRange>
+requires(std::ranges::random_access_range<RangeA> && std::ranges::random_access_range<RangeB> && std::ranges::random_access_range<MaskRange>)
 [[nodiscard]] constexpr bool compareRangesMasked(RangeA&& a, RangeB&& b, MaskRange&& mask) {
-    auto zipped = std::ranges::views::zip(a, b, mask) | std::views::filter([](const auto& tup) { return port::pattern<MatchPortEnums...>().matches(std::get<2>(tup)); });
-    return std::ranges::any_of(zipped, [](const auto& tup) { return std::get<0UZ>(tup) >= std::get<1UZ>(tup); });
+    constexpr port::BitPattern kPattern = port::pattern<MatchPortEnums...>();
+    const std::size_t          nPorts   = std::min({std::ranges::size(a), std::ranges::size(b), std::ranges::size(mask)});
+
+    for (std::size_t i = 0UZ; i < nPorts; ++i) {
+        if (kPattern.matches(mask[i]) && a[i] >= b[i]) {
+            return true;
+        }
+    }
+    return false;
 }
 } // namespace detail
 
@@ -488,12 +491,12 @@ struct isBlockDependent {
 
 namespace block::property {
 // [[maybe_unused]]: names referenced only from Block.cpp (initStandardPropertyCallbacks) and user code — silences -Werror=unused-variable on TUs that include only the header.
-[[maybe_unused]] inline static const char* const kHeartbeat      = "Heartbeat";      ///< heartbeat property - the canary in the coal mine (supports block-specific subscribe/unsubscribe)
+[[maybe_unused]] inline const char* const        kHeartbeat      = "Heartbeat";      ///< heartbeat property - the canary in the coal mine (supports block-specific subscribe/unsubscribe)
 [[maybe_unused]] inline static const char* const kEcho           = "Echo";           ///< basic property that receives any matching message and sends a mirror with it's serviceName/unique_name
 [[maybe_unused]] inline static const char* const kLifeCycleState = "LifecycleState"; ///< basic property that sets the block's @see lifecycle::StateMachine
-[[maybe_unused]] inline static const char* const kSetting        = "Settings";       ///< asynchronous message-based setting handling,
+[[maybe_unused]] inline const char* const        kSetting        = "Settings";       ///< asynchronous message-based setting handling,
                                                                                      // N.B. 'Set' Settings are first staged before being applied within the work(...) function (real-time/non-real-time decoupling)
-[[maybe_unused]] inline static const char* const kStagedSetting = "StagedSettings";  ///< asynchronous message-based staging of settings
+[[maybe_unused]] inline const char* const kStagedSetting = "StagedSettings";         ///< asynchronous message-based staging of settings
 
 [[maybe_unused]] inline static const char* const kMetaInformation = "MetaInformation"; ///< asynchronous message-based retrieval of the static meta-information (i.e. Annotated<> interfaces, constraints, etc...)
 [[maybe_unused]] inline static const char* const kUiConstraints   = "UiConstraints";   ///< asynchronous message-based retrieval of user-defined UI constraints
@@ -501,8 +504,8 @@ namespace block::property {
 [[maybe_unused]] inline static const char* const kStoreDefaults    = "StoreDefaults";    ///< store present settings as default, for counterpart @see kResetDefaults
 [[maybe_unused]] inline static const char* const kResetDefaults    = "ResetDefaults";    ///< retrieve and reset to default setting, for counterpart @see kStoreDefaults
 [[maybe_unused]] inline static const char* const kActiveContext    = "ActiveContext";    ///< retrieve and set active context
-[[maybe_unused]] inline static const char* const kSettingsCtx      = "SettingsCtx";      ///< retrieve/creates/remove a new stored context
-[[maybe_unused]] inline static const char* const kSettingsContexts = "SettingsContexts"; ///< retrieve/creates/remove a new stored context
+[[maybe_unused]] inline const char* const        kSettingsCtx      = "SettingsCtx";      ///< retrieve/creates/remove a new stored context
+[[maybe_unused]] inline const char* const        kSettingsContexts = "SettingsContexts"; ///< retrieve/creates/remove a new stored context
 
 } // namespace block::property
 
@@ -531,6 +534,8 @@ struct BlockBase {
     std::string_view (*_cbName)(const void*)                                = nullptr;
     property_map& (*_cbMetaInformation)(void*)                              = nullptr;
     property_map& (*_cbUiConstraints)(void*)                                = nullptr;
+    const MsgPortInBuiltin& (*_cbMsgIn)(const void*)                        = nullptr;
+    MsgPortOutBuiltin& (*_cbMsgOut)(void*)                                  = nullptr;
 
     // Hook for GraphWrapper to handle subgraph export port messages on any block type
     using SubgraphExportHandler                  = std::optional<Message> (*)(void* context, Message);
@@ -551,6 +556,24 @@ struct BlockBase {
     std::string_view           cbName() const { return _cbName(_blockSelf); }
     property_map&              cbMetaInformation() { return _cbMetaInformation(_blockSelf); }
     property_map&              cbUiConstraints() { return _cbUiConstraints(_blockSelf); }
+    const MsgPortInBuiltin&    cbMsgIn() const { return _cbMsgIn(_blockSelf); }
+    MsgPortOutBuiltin&         cbMsgOut() { return _cbMsgOut(_blockSelf); }
+
+    /**
+     * Message plumbing, compiled once rather than stamped per block type.
+     *
+     * The bodies reach the block through its two built-in message ports and its two names, none of
+     * which vary with the block's type, so a block type contributed nothing to them but duplicated
+     * code -- the std::format calls, the exception handling and the message-reserve path included.
+     * They stay non-virtual and are reached by inheritance, so a block calls them exactly as before
+     * and a block supplying its own processMessages() still hides this one.
+     */
+    void emitMessage(std::string_view endpoint, property_map message, std::string_view clientRequestID = "") noexcept;
+    void notifyListeners(std::string_view endpoint, property_map message) noexcept;
+    void emitErrorMessage(std::string_view endpoint, std::string_view errorMsg, std::string_view clientRequestID = "", std::source_location location = std::source_location::current()) noexcept;
+    void emitErrorMessage(std::string_view endpoint, Error e, std::string_view clientRequestID = "") noexcept;
+    void emitErrorMessageIfAny(std::string_view endpoint, std::expected<void, Error> e, std::string_view clientRequestID = "") noexcept;
+    void processMessages(const MsgPortInBuiltin& port, std::span<const Message> messages);
 
     // 12 callback implementations (compiled once, not per block type)
     std::optional<Message> propertyCallbackHeartbeat(std::string_view propertyName, Message message);
@@ -575,7 +598,60 @@ enum class Category {
     TransparentBlockGroup, ///< Block with children blocks which do not have a dedicated scheduler
     ScheduledBlockGroup    ///< Block with children that have a dedicated scheduler
 };
-}
+
+struct FusedTag {
+    std::ptrdiff_t relIndex{};
+    property_map   map{};
+};
+
+using FusedTagList = std::vector<FusedTag>;
+
+struct FusedFront {
+    std::size_t  nSamples = 0UZ;
+    work::Status status   = work::Status::OK;
+    bool         fallback = false; ///< end-of-stream or a non-RUNNING member: the run must fall back to per-member work()
+};
+
+// the boundary spans live on the stack frame of the typed function that owns them, so the rest of the
+// run is invoked from inside that frame rather than the span being handed out
+using FusedInputBody  = std::size_t (*)(void* context, const void* input, const FusedTagList& inputTags, std::size_t nSamples);
+using FusedOutputBody = std::size_t (*)(void* context, void* output, std::size_t nSamples);
+
+/**
+ * @brief Type-erased view of one synchronous 1:1 `processOne` block, sufficient to drive it from a scratch buffer.
+ *
+ * Resolved once at plan time by `BlockModel::fusedStage()` and stored in the fused run's plan; the per-chunk cost
+ * is one indirect call per entry. A block that does not satisfy the fusion inclusion rules publishes no descriptor.
+ */
+struct FusedStage {
+    std::size_t valueSizeIn{};
+    std::size_t valueSizeOut{};
+    std::size_t valueAlignOut{};
+    bool        isPure{}; ///< const processOne: no mid-chunk tag or lifecycle interaction
+
+    std::size_t (*applyChunk)(void* block, const void* in, void* out, std::size_t nSamples);
+    bool (*takePendingTag)(void* block, property_map& tag);
+
+    FusedFront (*front)(void* block, std::size_t requestedWork);
+    std::size_t (*withInput)(void* block, std::size_t nSamples, FusedInputBody body, void* context);
+    std::size_t (*withOutput)(void* block, std::size_t nSamples, const FusedTagList& outputTags, FusedOutputBody body, void* context);
+    void (*beginChunk)(void* block, bool isFront, const FusedTagList& incoming, FusedTagList& outgoing);
+};
+
+/**
+ * @brief Type-erased view of one `processBulk` block that a fused run drives through its own `work()`, or nullptr.
+ *
+ * Non-null only for a block that implements `processBulk` (not `processOne`) with exactly one stream input and one
+ * stream output port. There is no per-chunk entry point because `BlockModel::work()` already is one; the value sizes
+ * are the one thing the run cannot read elsewhere, and they size the interior edge the member writes into.
+ */
+struct BulkStage {
+    std::size_t valueSizeIn{};
+    std::size_t valueSizeOut{};
+};
+
+inline constexpr std::size_t kFusedShutdownCheckStride = 256UZ; ///< a non-pure stage reads its lifecycle state once per sub-block, not once per sample
+} // namespace block
 
 /**
  * @brief The 'Block<Derived>' is a base class for blocks that perform specific signal processing operations. It stores
@@ -804,6 +880,9 @@ public:
     bool         _outputTagPending = false;
     property_map _pendingOutputTag{};
 
+    // workInternal() scratch, retained to reuse its buckets
+    property_map _pendingForwardParams{};
+
     // intermediate non-real-time<->real-time setting states
     CtxSettings<Derived> _settings;
 
@@ -818,6 +897,8 @@ protected: // BlockBase function-pointer plumbing — not part of the user API
     static std::string_view           cbNameImpl(const void* self) { return static_cast<const Block*>(self)->name; }
     static property_map&              cbMetaInformationImpl(void* self) { return static_cast<Block*>(self)->meta_information.value; }
     static property_map&              cbUiConstraintsImpl(void* self) { return static_cast<Block*>(self)->ui_constraints.value; }
+    static const MsgPortInBuiltin&    cbMsgInImpl(const void* self) { return static_cast<const Block*>(self)->msgIn; }
+    static MsgPortOutBuiltin&         cbMsgOutImpl(void* self) { return static_cast<Block*>(self)->msgOut; }
 
 public:
     template<typename TFunction, typename... Args>
@@ -856,6 +937,8 @@ public:
         _cbName            = &Block::cbNameImpl;
         _cbMetaInformation = &Block::cbMetaInformationImpl;
         _cbUiConstraints   = &Block::cbUiConstraintsImpl;
+        _cbMsgIn           = &Block::cbMsgInImpl;
+        _cbMsgOut          = &Block::cbMsgOutImpl;
 
         initStandardPropertyCallbacks();
 
@@ -1097,35 +1180,45 @@ public:
         }
     }
 
+    /// keep the auto-forward keys of an incoming tag, substituting this block's own current value for any key it owns
+    [[nodiscard]] property_map filterAndSubstituteTag(const property_map& src, std::optional<property_map>& cachedSettings) {
+        const auto&  autoForwardKeys = settings().autoForwardParameters();
+        const auto&  blockSettings   = CtxSettings<Derived>::allWritableMembers();
+        property_map dst;
+        for (const auto& [key, value] : src) {
+            auto shortKey = convert_string_domain(key);
+            if (!autoForwardKeys.contains(shortKey)) {
+                continue;
+            }
+            if (!cachedSettings) {
+                cachedSettings.emplace(settings().get());
+            }
+            if (auto it = cachedSettings->find(key); blockSettings.contains(shortKey) && it != cachedSettings->end()) {
+                dst.insert_or_assign(key, it->second);
+            } else {
+                dst.insert_or_assign(key, value);
+            }
+        }
+        return dst;
+    }
+
     /// default tag forwarding — called by workInternal unless the user provides forwardTags()
+    ///
+    /// The window read here is the window the input span retires: prepareStreams() builds it with
+    /// consumeOnlyFirstTag = !backwardTagPropagation, so the span drops exactly the tags at relIndex <= 0, which is
+    /// what tags(1) yields. A tag interior to a chunk that could not be broken at it — min_samples, or
+    /// input_chunk_size > 1 — stays in the buffer and returns in the next chunk at a negative relIndex, still
+    /// unforwarded, so clamping it to offset 0 publishes it for the first time rather than a second. A forwardTags()
+    /// override reading a wider window sees those tags twice and must skip relIndex < 0.
     template<typename TInputSpans, typename TOutputSpans>
     void forwardInputTags(TInputSpans& inputSpans, TOutputSpans& outputSpans, std::size_t processedIn) noexcept {
         if constexpr (noTagPropagation) {
             return;
         }
-        const auto&       autoForwardKeys = settings().autoForwardParameters();
-        const auto&       blockSettings   = CtxSettings<Derived>::allWritableMembers();
-        const std::size_t tagWindow       = backwardTagPropagation ? processedIn : 1UZ;
+        const std::size_t tagWindow = backwardTagPropagation ? processedIn : 1UZ;
 
         std::optional<property_map> cachedSettings;
-        auto                        filterAndSubstitute = [&](const property_map& src) {
-            property_map dst;
-            for (const auto& [key, value] : src) {
-                auto shortKey = convert_string_domain(key);
-                if (!autoForwardKeys.contains(shortKey)) {
-                    continue;
-                }
-                if (!cachedSettings) {
-                    cachedSettings.emplace(settings().get());
-                }
-                if (auto it = cachedSettings->find(key); blockSettings.contains(shortKey) && it != cachedSettings->end()) {
-                    dst.insert_or_assign(key, it->second);
-                } else {
-                    dst.insert_or_assign(key, value);
-                }
-            }
-            return dst;
-        };
+        auto                        filterAndSubstitute = [&](const property_map& src) { return filterAndSubstituteTag(src, cachedSettings); };
 
         auto publishFiltered = [&](std::ptrdiff_t relIndex, const property_map& tagMap) {
             auto forwarded = filterAndSubstitute(tagMap);
@@ -1223,7 +1316,9 @@ public:
         for_each_port_and_reader_span(
             [this, tagWindow]<PortLike TPort, ReaderSpanLike TReaderSpan>(TPort& port, TReaderSpan& span) {
                 for (const auto& [_, tagMapRef] : span.tags(tagWindow)) {
-                    emitErrorMessageIfAny("Block::applyInputTagsFromPorts", port.metaInfo.update(tagMapRef.get()));
+                    if (const auto res = port.metaInfo.update(tagMapRef.get()); !res.has_value()) {
+                        emitMessage("Block::applyInputTagsFromPorts - rejected tag", {{"error", res.error().message}});
+                    }
                 }
             },
             inputPorts<PortType::STREAM>(&self()), inputSpans);
@@ -1261,6 +1356,9 @@ public:
                 notifyListeners(block::property::kStagedSetting, appliedParametersMap);
             }
             notifyListeners(block::property::kSetting, settings().get());
+            if (!applyResult.failedParameters.empty()) {
+                emitMessage("applyChangedSettings() - rejected settings", applyResult.failedParameters);
+            }
         });
 
         // update input/output port caches
@@ -1362,8 +1460,12 @@ public:
 
     constexpr void processScheduledMessages() {
         using namespace std::chrono;
-        const std::uint64_t nanoseconds_count = static_cast<uint64_t>(duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count());
-        notifyListeners(block::property::kHeartbeat, pmt::Value::Map{{"heartbeat", nanoseconds_count}});
+        // notifyListeners() is a no-op without a kHeartbeat subscriber, which is the common case on every poll,
+        // so the payload map is built only where a subscription exists.
+        if (propertySubscriptions.contains(block::property::kHeartbeat)) {
+            const std::uint64_t nanoseconds_count = static_cast<uint64_t>(duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count());
+            notifyListeners(block::property::kHeartbeat, pmt::Value::Map{{"heartbeat", nanoseconds_count}});
+        }
 
         auto processPort = [this]<PortLike TPort>(TPort& inPort) {
             const auto available = inPort.streamReader().available();
@@ -1433,19 +1535,32 @@ public:
         } result;
 
         auto adjustForInputPort = [&result]<PortLike Port>(Port& port) {
-            if (port.isConnected()) {
-                if constexpr (std::remove_cvref_t<Port>::kIsSynch) {
-                    // get the tag after the one at position 0 that will be evaluated for this chunk.
-                    // nextTag limits the size of the chunk except if this would violate port constraints
-                    result.nextTag                    = std::min(result.nextTag, nSamplesUntilNextTag(port, 1).value_or(std::numeric_limits<std::size_t>::max()));
-                    result.nextEosTag                 = std::min(result.nextEosTag, samples_to_eos_tag(port).value_or(std::numeric_limits<std::size_t>::max()));
-                    const ReaderSpanLike auto tagData = port.tagReader().get();
-                    result.hasAnyTag                  = result.hasAnyTag || !tagData.empty();
-                    result.hasTag                     = result.hasTag || (!tagData.empty() && tagData[0].index == port.streamReader().position() && !tagData[0].map.empty());
-                } else { // async port
-                    if (samples_to_eos_tag(port).transform([&port](auto n) { return n <= port.min_samples; }).value_or(false)) {
-                        result.asyncEoS = true;
-                    }
+            if (!port.isConnected()) {
+                return;
+            }
+            ReaderSpanLike auto tagData = port.tagReader().get();
+            if (tagData.empty()) [[likely]] {
+                return;
+            }
+            std::ignore                    = tagData.consume(0UZ);
+            const std::size_t readPosition = port.streamReader().position();
+            const auto        eosTagIt     = std::ranges::find_if(tagData, [readPosition](const Tag& tag) { return detail::defaultEOSTagMatcher(tag, readPosition); });
+
+            if constexpr (std::remove_cvref_t<Port>::kIsSynch) {
+                // get the tag after the one at position 0 that will be evaluated for this chunk.
+                // nextTag limits the size of the chunk except if this would violate port constraints
+                const auto nextTagIt = std::ranges::find_if(tagData, [readPosition](const Tag& tag) { return detail::defaultTagMatcher(tag, readPosition + 1UZ); });
+                if (nextTagIt != tagData.end()) {
+                    result.nextTag = std::min(result.nextTag, nextTagIt->index - readPosition);
+                }
+                if (eosTagIt != tagData.end()) {
+                    result.nextEosTag = std::min(result.nextEosTag, eosTagIt->index - readPosition);
+                }
+                result.hasAnyTag = true;
+                result.hasTag    = result.hasTag || (tagData[0].index == readPosition && !tagData[0].map.empty());
+            } else { // async port
+                if (eosTagIt != tagData.end() && (eosTagIt->index - readPosition) <= port.min_samples) {
+                    result.asyncEoS = true;
                 }
             }
         };
@@ -1635,6 +1750,29 @@ public:
         return work::Status::OK;
     }
 
+    /// non-const processOne over one fused chunk: the pending tag stays in _pendingOutputTag for the run to place,
+    /// and the shutdown state is read once per sub-block rather than once per sample
+    std::size_t invokeProcessOneNonConstFused(auto& inputSpans, auto& outputSpans, std::size_t nSamplesToProcess) {
+        _inProcessOneDispatch = true;
+        std::size_t i         = 0UZ;
+        while (i < nSamplesToProcess) {
+            const std::size_t until = std::min(nSamplesToProcess, i + block::kFusedShutdownCheckStride);
+            for (; i < until; ++i) {
+                auto results = std::apply([this, i](auto&... inputs) { return this->invoke_processOne(inputs[i]...); }, inputSpans);
+                meta::tuple_for_each([i]<typename R>(auto& output_range, R&& result) { output_range[i] = std::forward<R>(result); }, outputSpans, results);
+                if (_outputTagPending) [[unlikely]] {
+                    _inProcessOneDispatch = false;
+                    return i + 1UZ;
+                }
+            }
+            if (lifecycle::isShuttingDown(this->state())) [[unlikely]] {
+                break;
+            }
+        }
+        _inProcessOneDispatch = false;
+        return i;
+    }
+
     auto invokeProcessOneNonConst(auto& inputSpans, auto& outputSpans, std::size_t nSamplesToProcess) {
         using enum work::Status;
 
@@ -1707,26 +1845,7 @@ public:
         }
     }
 
-    void emitMessage(std::string_view endpoint, property_map message, std::string_view clientRequestID = "") noexcept { sendMessage<message::Command::Notify>(msgOut, unique_name /* serviceName */, endpoint, std::move(message), clientRequestID); }
-
-    void notifyListeners(std::string_view endpoint, property_map message) noexcept {
-        const auto it = propertySubscriptions.find(std::string(endpoint));
-        if (it != propertySubscriptions.end()) {
-            for (const auto& clientID : it->second) {
-                emitMessage(endpoint, message, clientID);
-            }
-        }
-    }
-
-    void emitErrorMessage(std::string_view endpoint, std::string_view errorMsg, std::string_view clientRequestID = "", std::source_location location = std::source_location::current()) noexcept { emitErrorMessageIfAny(endpoint, std::unexpected(Error(errorMsg, location)), clientRequestID); }
-
-    void emitErrorMessage(std::string_view endpoint, Error e, std::string_view clientRequestID = "") noexcept { emitErrorMessageIfAny(endpoint, std::unexpected(e), clientRequestID); }
-
-    inline void emitErrorMessageIfAny(std::string_view endpoint, std::expected<void, Error> e, std::string_view clientRequestID = "") noexcept {
-        if (!e.has_value()) [[unlikely]] {
-            sendMessage<message::Command::Notify>(msgOut, unique_name /* serviceName */, endpoint, std::move(e.error()), clientRequestID);
-        }
-    }
+    // emitMessage, notifyListeners, emitErrorMessage and emitErrorMessageIfAny are inherited from BlockBase
 
     /**
      * Central function managing the dispatch of work to the block implementation provided work implementation
@@ -1830,6 +1949,9 @@ public:
         if (this->state() == lifecycle::State::REQUESTED_STOP) {
             emitErrorMessageIfAny("workInternal(): REQUESTED_STOP -> STOPPED", this->changeStateTo(lifecycle::State::STOPPED));
         }
+        if (this->state() == lifecycle::State::REQUESTED_PAUSE) {
+            emitErrorMessageIfAny("workInternal(): REQUESTED_PAUSE -> PAUSED", this->changeStateTo(lifecycle::State::PAUSED));
+        }
         if constexpr (TOutputTypes::size.value > 0UZ) {
             if (disconnect_on_done && hasNoDownStreamConnectedChildren()) {
                 this->requestStop();
@@ -1890,6 +2012,12 @@ public:
         }
     }
 
+    /// publish forwardParams at the head of the span, but never before a tag already placed in it: the span's order check forbids that
+    static void publishForwardParams(OutputSpanLike auto& outSpan, const property_map& forwardParams) {
+        const std::size_t lastIndex = outSpan.tagsPublished > 0UZ ? outSpan.tags[outSpan.tagsPublished - 1UZ].index : 0UZ;
+        outSpan.publishTag(forwardParams, lastIndex > outSpan.streamIndex ? lastIndex - outSpan.streamIndex : 0UZ);
+    }
+
     /// publish tags and samples, consume inputs, handle EOS
     template<typename TInputSpans, typename TOutputSpans>
     void finaliseIO(TInputSpans& inputSpans, TOutputSpans& outputSpans, work::Status& userReturnStatus, std::size_t& processedIn, std::size_t processedOut, std::size_t resampledIn) {
@@ -1900,9 +2028,10 @@ public:
             for_each_writer_span([](auto& outSpan) { outSpan.tagsPublished = 0; }, outputSpans);
         }
 
+        property_map forwardParams;
         if (lifecycle::isShuttingDown(this->state())) {
             emitErrorMessageIfAny("isShuttingDown -> STOPPED", this->changeStateTo(lifecycle::State::REQUESTED_STOP));
-            applyChangedSettings();
+            applyChangedSettings(true, &forwardParams);
             userReturnStatus = DONE;
             processedIn      = 0UZ;
         }
@@ -1926,7 +2055,11 @@ public:
 
         // if the block state changed to DONE, publish EOS tag on the next sample
         if (userReturnStatus == DONE) {
+            emitErrorMessageIfAny("finaliseIO(): DONE -> REQUESTED_STOP", this->changeStateTo(lifecycle::State::REQUESTED_STOP));
             this->setAndNotifyState(lifecycle::State::STOPPED);
+            if (!forwardParams.empty()) {
+                for_each_writer_span([&forwardParams](auto& outSpan) { publishForwardParams(outSpan, forwardParams); }, outputSpans);
+            }
             publishEoS(outputSpans);
         }
     }
@@ -1945,8 +2078,10 @@ public:
             inputStreamCache.invalidateStatistic();
             outputStreamCache.invalidateStatistic();
         };
-        property_map pendingForwardParams;
-        applyChangedSettings(true, &pendingForwardParams);
+        if (!_pendingForwardParams.empty()) {
+            _pendingForwardParams.clear();
+        }
+        applyChangedSettings(true, &_pendingForwardParams);
         SampleLimits limits = computeSampleLimits(requestedWork);
 
         if (limits.inputSkipBefore > 0) {
@@ -1975,8 +2110,8 @@ public:
         }
 
         if (limits.resampledIn == 0 && limits.resampledOut == 0 && !limits.hasAsyncIn && !limits.hasAsyncOut) {
-            if (!pendingForwardParams.empty()) {
-                std::ignore = settings().setStaged(pendingForwardParams); // re-stage for next work call
+            if (!_pendingForwardParams.empty()) {
+                std::ignore = settings().setStaged(_pendingForwardParams); // re-stage for next work call
             }
             return {requestedWork, 0UZ, limits.resampledStatus};
         }
@@ -1987,7 +2122,7 @@ public:
         auto inputSpans  = prepareStreams(inputPorts<PortType::STREAM>(&self()), processedIn);
         auto outputSpans = prepareStreams(outputPorts<PortType::STREAM>(&self()), processedOut);
 
-        applyChangedSettings(); // publishes any additional external settings changes via port fallback
+        applyChangedSettings(true, &_pendingForwardParams); // captures any further external settings change, published through the open spans below
         applyInputTagsAndSettings(inputSpans, processedIn, limits.hasAnyTag);
 
         if constexpr (requires { self().forwardTags(inputSpans, outputSpans, processedIn); }) {
@@ -1996,8 +2131,8 @@ public:
             forwardInputTags(inputSpans, outputSpans, processedIn);
         }
 
-        if (!pendingForwardParams.empty()) {
-            for_each_writer_span([&pendingForwardParams](auto& out) { out.publishTag(pendingForwardParams, 0); }, outputSpans);
+        if (!_pendingForwardParams.empty()) {
+            for_each_writer_span([this](auto& out) { publishForwardParams(out, _pendingForwardParams); }, outputSpans);
         }
 
         if constexpr (HasProcessOneFunction<Derived> && !HasProcessBulkFunction<Derived>) {
@@ -2031,7 +2166,9 @@ public:
         if constexpr (HasProcessOneFunction<Derived> && !HasProcessBulkFunction<Derived>) {
             _inputTagPresent  = false;
             _outputTagPending = false;
-            _pendingOutputTag.clear();
+            if (!_pendingOutputTag.empty()) {
+                _pendingOutputTag.clear();
+            }
             _inProcessOneDispatch = false;
         }
         work::sanitiseProcessStatus(userReturnStatus, processedIn, processedOut);
@@ -2041,6 +2178,7 @@ public:
         std::size_t    performedWork  = work::computePerformedWork(userReturnStatus, processedIn, processedOut, kIsSourceBlock);
         if (performedWork > 0UZ) {
             progress->incrementAndGet();
+            progress->notify_all();
         }
         return {requestedWork, performedWork, userReturnStatus};
     }
@@ -2061,50 +2199,7 @@ public:
         }
     }
 
-    void processMessages([[maybe_unused]] const MsgPortInBuiltin& port, std::span<const Message> messages) {
-        using enum gr::message::Command;
-        assert(std::addressof(port) == std::addressof(msgIn) && "got a message on wrong port");
-
-        for (const auto& message : messages) {
-            if (!message.serviceName.empty() && message.serviceName != unique_name && message.serviceName != name) {
-                // Skip if target does not match the block's (unique) name and is not empty.
-                continue;
-            }
-
-            auto it = propertyCallbacks.find(message.endpoint);
-            if (it == propertyCallbacks.end()) {
-                continue; // did not find matching property callback
-            }
-            BlockBase::PropertyCallback callback = it->second;
-
-            std::optional<Message> retMessage;
-            try {
-                retMessage = (this->*callback)(message.endpoint, message); // N.B. life-time: message is copied
-            } catch (const gr::exception& e) {
-                retMessage       = Message{message};
-                retMessage->data = std::unexpected(Error(e));
-            } catch (const std::exception& e) {
-                retMessage       = Message{message};
-                retMessage->data = std::unexpected(Error(e));
-            } catch (...) {
-                retMessage       = Message{message};
-                retMessage->data = std::unexpected(Error(std::format("unknown exception in Block {} property '{}'\n request message: {} ", unique_name, message.endpoint, message)));
-            }
-
-            if (!retMessage.has_value()) {
-                continue; // function does not produce any return message
-            }
-
-            retMessage->cmd             = Final; // N.B. could enable/allow for partial if we return multiple messages (e.g. using coroutines?)
-            retMessage->serviceName     = unique_name;
-            WriterSpanLike auto msgSpan = msgOut.streamWriter().template tryReserve<SpanReleasePolicy::ProcessAll>(1UZ);
-            if (msgSpan.empty()) {
-                throw gr::exception(std::format("{}::processMessages() can not reserve span for message\n", name));
-            } else {
-                msgSpan[0] = *retMessage;
-            }
-        } // - end - for (const auto &message : messages) { ..
-    }
+    // processMessages(const MsgPortInBuiltin&, std::span<const Message>) is inherited from BlockBase
 
 }; // template<typename Derived, typename... Arguments> class Block : ...
 
@@ -2419,6 +2514,220 @@ inline constexpr int registerBlock(TRegisterInstance& registerInstance) {
     ((addBlockType.template operator()<TBlockParameters>()), ...);
     return {};
 }
+
+namespace block {
+namespace detail {
+
+template<typename T>
+concept FusableStageBlock = HasProcessOneFunction<T> && !HasProcessBulkFunction<T>                                                            //
+                            && (T::blockCategory == block::Category::NormalBlock)                                                             //
+                            && (traits::block::stream_input_port_types<T>::size() == 1UZ)                                                     //
+                            && (traits::block::stream_output_port_types<T>::size() == 1UZ)                                                    //
+                            && !T::noTagPropagation && !T::forwardTagPropagation && !T::backwardTagPropagation && !T::mergeTagPropagation     //
+                            && !T::StrideControl::kEnabled && !T::ResamplingControl::kEnabled                                                 //
+                            && !requires(T& block) { block.forwardTags(std::declval<std::tuple<>&>(), std::declval<std::tuple<>&>(), 0UZ); }; //
+
+template<typename T>
+concept BulkStageBlock = HasProcessBulkFunction<T> && !HasProcessOneFunction<T>          //
+                         && (T::blockCategory == block::Category::NormalBlock)           //
+                         && (traits::block::stream_input_port_types<T>::size() == 1UZ)   //
+                         && (traits::block::stream_output_port_types<T>::size() == 1UZ); //
+
+template<typename T>
+using FusedValueTypeIn = typename traits::block::stream_input_port_types<T>::template at<0>;
+template<typename T>
+using FusedValueTypeOut = typename traits::block::stream_output_port_types<T>::template at<0>;
+
+template<FusableStageBlock T>
+std::size_t fusedApplyChunk(void* rawBlock, const void* in, void* out, std::size_t nSamples) {
+    T&   block       = *static_cast<T*>(rawBlock);
+    auto inputSpans  = std::tuple{std::span<const FusedValueTypeIn<T>>(static_cast<const FusedValueTypeIn<T>*>(in), nSamples)};
+    auto outputSpans = std::tuple{std::span<FusedValueTypeOut<T>>(static_cast<FusedValueTypeOut<T>*>(out), nSamples)};
+
+    std::size_t produced = nSamples;
+    if constexpr (HasConstProcessOneFunction<T>) {
+        if constexpr (traits::block::can_processOne_simd<T>) {
+            constexpr std::size_t kMaxWidth = stdx::simd_abi::max_fixed_size<double>;
+            constexpr auto        kWidth    = meta::cw<std::min(kMaxWidth, meta::simdize<typename traits::block::stream_input_port_types<T>::template apply<std::tuple>>::size() * std::size_t(4))>;
+            std::ignore                     = block.invokeProcessOneSimd(inputSpans, outputSpans, kWidth, nSamples);
+        } else {
+            std::ignore = block.invokeProcessOnePure(inputSpans, outputSpans, nSamples);
+        }
+    } else {
+        produced = block.invokeProcessOneNonConstFused(inputSpans, outputSpans, nSamples);
+    }
+    block._inputTagPresent = false;
+    return produced;
+}
+
+template<FusableStageBlock T>
+bool fusedTakePendingTag(void* rawBlock, property_map& tag) {
+    T& block = *static_cast<T*>(rawBlock);
+    if (!block._outputTagPending) {
+        return false;
+    }
+    tag = std::move(block._pendingOutputTag);
+    block._pendingOutputTag.clear();
+    block._outputTagPending = false;
+    return true;
+}
+
+template<FusableStageBlock T>
+FusedFront fusedFront(void* rawBlock, std::size_t requestedWork) {
+    T& block = *static_cast<T*>(rawBlock);
+    if (block.state() != lifecycle::State::RUNNING) {
+        return {0UZ, work::Status::OK, true};
+    }
+    block.inputStreamCache.invalidateStatistic();
+    block.outputStreamCache.invalidateStatistic();
+    if (!block._pendingForwardParams.empty()) {
+        block._pendingForwardParams.clear();
+    }
+    block.applyChangedSettings(true, &block._pendingForwardParams);
+
+    const auto limits  = block.computeSampleLimits(requestedWork);
+    const auto reStage = [&block] {
+        if (!block._pendingForwardParams.empty()) {
+            std::ignore = block.settings().setStaged(block._pendingForwardParams);
+            block._pendingForwardParams.clear();
+        }
+    };
+    if (limits.isEosPresent || limits.asyncEoS || lifecycle::isShuttingDown(block.state())) {
+        reStage();
+        return {0UZ, work::Status::OK, true};
+    }
+    if (limits.resampledIn == 0UZ) {
+        reStage();
+        return {0UZ, limits.resampledStatus, false};
+    }
+    return {limits.resampledIn, work::Status::OK, false};
+}
+
+template<FusableStageBlock T>
+std::size_t fusedWithInput(void* rawBlock, std::size_t nSamples, FusedInputBody body, void* context) {
+    T&   block  = *static_cast<T*>(rawBlock);
+    auto inSpan = inputPort<0, PortType::STREAM>(&block).template get<SpanReleasePolicy::ProcessAll, true>(nSamples);
+
+    FusedTagList inputTags;
+    for (const auto& [relIndex, tagMapRef] : inSpan.tags(1UZ)) {
+        inputTags.emplace_back(relIndex, tagMapRef.get());
+    }
+
+    const std::size_t produced = body(context, static_cast<const void*>(inSpan.data()), inputTags, nSamples);
+    std::ignore                = inSpan.consume(produced);
+    return produced;
+}
+
+template<FusableStageBlock T>
+std::size_t fusedWithOutput(void* rawBlock, std::size_t nSamples, const FusedTagList& outputTags, FusedOutputBody body, void* context) {
+    T&   block   = *static_cast<T*>(rawBlock);
+    auto outSpan = outputPort<0, PortType::STREAM>(&block).template tryReserve<SpanReleasePolicy::ProcessAll>(nSamples);
+    if (outSpan.size() < nSamples) {
+        outSpan.publish(0UZ);
+        return 0UZ;
+    }
+    for (const auto& tag : outputTags) {
+        outSpan.publishTag(tag.map, 0UZ);
+    }
+
+    const std::size_t produced = body(context, static_cast<void*>(outSpan.data()), nSamples);
+    if constexpr (!HasConstProcessOneFunction<T>) {
+        property_map pending;
+        if (fusedTakePendingTag<T>(rawBlock, pending) && produced > 0UZ) {
+            outSpan.publishTag(std::move(pending), produced - 1UZ);
+        }
+    }
+    if (produced == 0UZ) {
+        outSpan.tagsPublished = 0UZ;
+    }
+    outSpan.publish(produced);
+    return produced;
+}
+
+template<FusableStageBlock T>
+void fusedBeginChunk(void* rawBlock, bool isFront, const FusedTagList& incoming, FusedTagList& outgoing) {
+    T& block = *static_cast<T*>(rawBlock);
+    if (!isFront) { // the front member's forward parameters were captured by fusedFront()
+        if (!block._pendingForwardParams.empty()) {
+            block._pendingForwardParams.clear();
+        }
+        block.applyChangedSettings(true, &block._pendingForwardParams);
+    }
+
+    if (!incoming.empty()) {
+        for (const auto& tag : incoming) {
+            block.settings().autoUpdate(Tag{tag.relIndex < 0 ? 0UZ : static_cast<std::size_t>(tag.relIndex), tag.map});
+        }
+        auto& port = inputPort<0, PortType::STREAM>(&block);
+        for (const auto& tag : incoming) {
+            if (const auto result = port.metaInfo.update(tag.map); !result.has_value()) {
+                block.emitMessage("Block::applyInputTagsFromPorts - rejected tag", {{"error", result.error().message}});
+            }
+        }
+        block.applyChangedSettings(false);
+    }
+
+    outgoing.clear();
+    std::optional<property_map> cachedSettings;
+    for (const auto& tag : incoming) {
+        property_map forwarded = block.filterAndSubstituteTag(tag.map, cachedSettings);
+        if (!forwarded.empty()) {
+            outgoing.emplace_back(0, std::move(forwarded));
+        }
+    }
+    if (!block._pendingForwardParams.empty()) {
+        outgoing.emplace_back(0, block._pendingForwardParams);
+    }
+
+    property_map merged;
+    for (const auto& tag : incoming) {
+        if (tag.relIndex != 0) {
+            continue;
+        }
+        for (const auto& [key, value] : tag.map) {
+            merged.insert_or_assign(key, value);
+        }
+    }
+    if (!merged.empty()) {
+        block._mergedInputTag  = Tag{0UZ, std::move(merged)};
+        block._inputTagPresent = true;
+    }
+}
+
+} // namespace detail
+
+template<typename T>
+[[nodiscard]] const FusedStage* fusedStageOf() noexcept {
+    if constexpr (!detail::FusableStageBlock<T>) {
+        return nullptr;
+    } else {
+        static constexpr FusedStage kStage{
+            .valueSizeIn    = sizeof(detail::FusedValueTypeIn<T>),
+            .valueSizeOut   = sizeof(detail::FusedValueTypeOut<T>),
+            .valueAlignOut  = alignof(detail::FusedValueTypeOut<T>),
+            .isPure         = HasConstProcessOneFunction<T>,
+            .applyChunk     = &detail::fusedApplyChunk<T>,
+            .takePendingTag = &detail::fusedTakePendingTag<T>,
+            .front          = &detail::fusedFront<T>,
+            .withInput      = &detail::fusedWithInput<T>,
+            .withOutput     = &detail::fusedWithOutput<T>,
+            .beginChunk     = &detail::fusedBeginChunk<T>,
+        };
+        return &kStage;
+    }
+}
+
+template<typename T>
+[[nodiscard]] const BulkStage* bulkStageOf() noexcept {
+    if constexpr (!detail::BulkStageBlock<T>) {
+        return nullptr;
+    } else {
+        static constexpr BulkStage kStage{sizeof(detail::FusedValueTypeIn<T>), sizeof(detail::FusedValueTypeOut<T>)};
+        return &kStage;
+    }
+}
+
+} // namespace block
 
 template<typename Function, typename Tuple>
 inline constexpr void for_each_port(Function&& function, Tuple&& tuple) {

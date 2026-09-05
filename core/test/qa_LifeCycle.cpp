@@ -1,10 +1,13 @@
 #include <boost/ut.hpp>
 
+#include <atomic>
+#include <barrier>
 #include <format>
 #include <map>
 #include <stdexcept>
 #include <thread>
 #include <tuple>
+#include <vector>
 
 #ifdef __GNUC__
 #pragma GCC diagnostic push // ignore warning of external libraries that from this lib-context we do not have any control over
@@ -52,6 +55,15 @@ struct MockStateMachine : public lifecycle::StateMachine<MockStateMachine<storag
     void resume() { resumeCalled++; }
 
     void reset() { resetCalled++; }
+};
+
+struct RacingStateMachine : public lifecycle::StateMachine<RacingStateMachine> {
+    std::string      unique_name = "RacingStateMachine";
+    std::atomic<int> stopCalled{0};
+    std::atomic<int> pauseCalled{0};
+
+    void stop() { stopCalled.fetch_add(1, std::memory_order_relaxed); }
+    void pause() { pauseCalled.fetch_add(1, std::memory_order_relaxed); }
 };
 
 } // namespace gr::test
@@ -126,12 +138,114 @@ const boost::ut::suite StateMachineTest = [] {
         nominalTest.template operator()<gr::test::MockStateMachine<StorageType::NON_ATOMIC>>();
     };
 
+    "StateMachine REQUESTED_PAUSE is not terminal"_test = [] {
+        // a block that never reaches PAUSED (isBlocking() -> true) must still be stoppable and resumable
+        auto toRequestedPause = [](auto& machine) {
+            expect(machine.changeStateTo(State::INITIALISED).has_value());
+            expect(machine.changeStateTo(State::RUNNING).has_value());
+            expect(machine.changeStateTo(State::REQUESTED_PAUSE).has_value());
+        };
+
+        gr::test::MockStateMachine<StorageType::NON_ATOMIC> stoppable;
+        toRequestedPause(stoppable);
+        expect(stoppable.changeStateTo(State::REQUESTED_STOP).has_value()) << "a pause-requesting block must be stoppable";
+        expect(stoppable.state() == State::REQUESTED_STOP);
+        expect(eq(stoppable.stopCalled, 1)) << "stop() runs on the direct REQUESTED_PAUSE -> REQUESTED_STOP path";
+
+        gr::test::MockStateMachine<StorageType::NON_ATOMIC> resumable;
+        toRequestedPause(resumable);
+        expect(resumable.changeStateTo(State::RUNNING).has_value()) << "a pause-requesting block must be resumable";
+        expect(resumable.state() == State::RUNNING);
+        expect(eq(resumable.resumeCalled, 1)) << "resume() runs on the direct REQUESTED_PAUSE -> RUNNING path";
+    };
+
+    "StateMachine stop() runs on the ERROR path out of an active state"_test = [] {
+        auto toRunning = [](auto& machine) {
+            expect(machine.changeStateTo(State::INITIALISED).has_value());
+            expect(machine.changeStateTo(State::RUNNING).has_value());
+        };
+
+        gr::test::MockStateMachine<StorageType::NON_ATOMIC> failing;
+        toRunning(failing);
+        expect(failing.changeStateTo(State::ERROR).has_value());
+        expect(failing.state() == State::ERROR);
+        expect(eq(failing.stopCalled, 1)) << "stop() runs on the direct RUNNING -> ERROR path";
+
+        gr::test::MockStateMachine<StorageType::NON_ATOMIC> stoppedThenFailing;
+        toRunning(stoppedThenFailing);
+        expect(stoppedThenFailing.changeStateTo(State::REQUESTED_STOP).has_value());
+        expect(stoppedThenFailing.changeStateTo(State::ERROR).has_value());
+        expect(eq(stoppedThenFailing.stopCalled, 1)) << "an ERROR after a requested stop must not run stop() a second time";
+
+        gr::test::MockStateMachine<StorageType::NON_ATOMIC> neverActive;
+        expect(neverActive.changeStateTo(State::INITIALISED).has_value());
+        expect(neverActive.changeStateTo(State::ERROR).has_value());
+        expect(eq(neverActive.stopCalled, 0)) << "stop() must not run for a machine that never became active";
+    };
+
+    "StateMachine concurrent transitions are claimed, not overwritten"_test = [] {
+        constexpr std::size_t nThreads = 4UZ;
+        constexpr std::size_t nRounds  = 2000UZ;
+
+        gr::test::RacingStateMachine machine;
+        std::barrier                 roundStart(static_cast<std::ptrdiff_t>(nThreads + 1UZ));
+        std::barrier                 roundEnd(static_cast<std::ptrdiff_t>(nThreads + 1UZ));
+        std::atomic<bool>            finished{false};
+
+        std::atomic<State> target{State::REQUESTED_STOP};
+
+        std::vector<std::jthread> hammers;
+        for (std::size_t t = 0UZ; t < nThreads; ++t) {
+            hammers.emplace_back([&machine, &roundStart, &roundEnd, &finished, &target] {
+                while (true) {
+                    roundStart.arrive_and_wait();
+                    if (finished.load(std::memory_order_acquire)) {
+                        return;
+                    }
+                    std::ignore = machine.changeStateTo(target.load(std::memory_order_acquire));
+                    roundEnd.arrive_and_wait();
+                }
+            });
+        }
+
+        std::size_t nRoundsWithDuplicateClaim = 0UZ;
+        std::size_t nRoundsWithWrongState     = 0UZ;
+        for (std::size_t round = 0UZ; round < nRounds; ++round) {
+            const bool stopRound = (round % 2UZ == 0UZ);
+            expect(machine.changeStateTo(State::INITIALISED).has_value());
+            expect(machine.changeStateTo(State::RUNNING).has_value());
+            machine.stopCalled  = 0;
+            machine.pauseCalled = 0;
+            target.store(stopRound ? State::REQUESTED_STOP : State::REQUESTED_PAUSE, std::memory_order_release);
+
+            roundStart.arrive_and_wait();
+            roundEnd.arrive_and_wait();
+
+            // only one thread may leave RUNNING, so the hook of the contended transition must run exactly once
+            if (machine.stopCalled.load() + machine.pauseCalled.load() != 1) {
+                nRoundsWithDuplicateClaim++;
+            }
+            if (machine.state() != target.load()) {
+                nRoundsWithWrongState++;
+            }
+
+            expect(machine.changeStateTo(State::REQUESTED_STOP).has_value());
+            expect(machine.changeStateTo(State::STOPPED).has_value());
+        }
+
+        finished.store(true, std::memory_order_release);
+        roundStart.arrive_and_wait();
+
+        expect(eq(nRoundsWithDuplicateClaim, 0UZ)) << "rounds where more than one thread claimed the same transition";
+        expect(eq(nRoundsWithWrongState, 0UZ)) << "rounds where the published state does not match the claimed transition";
+    };
+
     "StateMachine all State transitions"_test = [] {
         std::map<State, std::vector<State>> allowedTransitions = {
             {State::IDLE, {State::INITIALISED, State::REQUESTED_STOP, State::STOPPED}},
             {State::INITIALISED, {State::RUNNING, State::REQUESTED_STOP, State::STOPPED}},
             {State::RUNNING, {State::REQUESTED_PAUSE, State::REQUESTED_STOP}},
-            {State::REQUESTED_PAUSE, {State::PAUSED}},
+            {State::REQUESTED_PAUSE, {State::PAUSED, State::RUNNING, State::REQUESTED_STOP}},
             {State::PAUSED, {State::RUNNING, State::REQUESTED_STOP}},
             {State::REQUESTED_STOP, {State::STOPPED}},
             {State::STOPPED, {State::INITIALISED}},

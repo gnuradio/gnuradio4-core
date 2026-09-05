@@ -148,7 +148,7 @@ struct Edge {
     [[nodiscard]] property_map&       uiConstraints() noexcept { return *_uiConstraints; }
     [[nodiscard]] const property_map& uiConstraints() const { return *_uiConstraints; }
 
-    constexpr bool hasSameSourcePort(const Edge& other) const noexcept { return sourceBlock() == other.sourceBlock() && sourcePortDefinition().definition == other.sourcePortDefinition().definition; }
+    [[nodiscard]] bool hasSameSourcePort(const Edge& other) const;
 
     constexpr bool operator==(const Edge& other) const noexcept {
         return sourceBlock() == other.sourceBlock()                                                       //
@@ -499,6 +499,23 @@ public:
 
     [[nodiscard]] virtual UICategory uiCategory() const { return UICategory::None; }
 
+    /**
+     * @brief Descriptor allowing a synchronous 1:1 `processOne` block to be driven from a scratch buffer, or nullptr.
+     *
+     * Non-null only for a block that implements `processOne` (not `processBulk`), has exactly one stream input and one
+     * stream output port, and uses the default tag-propagation policy with neither `Stride<>` nor `Resampling<>`.
+     */
+    [[nodiscard]] virtual const block::FusedStage* fusedStage() const noexcept { return nullptr; }
+
+    /**
+     * @brief Descriptor of a synchronous single-port `processBulk` block a fused run may drive through `work()`, or nullptr.
+     *
+     * Non-null and `fusedStage() != nullptr` are mutually exclusive: a block implements `processOne` or `processBulk`.
+     * The resampling ratio is not part of the descriptor; the planner reads it from `resamplingRatio()` because it may
+     * change while the graph runs.
+     */
+    [[nodiscard]] virtual const block::BulkStage* bulkStage() const noexcept { return nullptr; }
+
     // port and sample information
     /**
      * @brief returns the input_chunk_size to output_chunk_size ratio for the block
@@ -562,6 +579,21 @@ public:
 
     [[nodiscard]] virtual std::expected<void, Error> exportPort(bool exportFlag, std::string_view uniqueBlockName, PortDirection portDirection, std::string_view portName, std::string_view exportedName, std::source_location location = std::source_location::current()) = 0;
 };
+
+// two edges may name one and the same output port by index or by name, so differing
+// PortDefinitions have to be resolved to port objects before they can be told apart
+inline bool Edge::hasSameSourcePort(const Edge& other) const {
+    if (!_sourceBlock || _sourceBlock != other._sourceBlock) {
+        return false;
+    }
+    if (_sourcePortDefinition.definition == other._sourcePortDefinition.definition) {
+        return true;
+    }
+
+    const auto port      = _sourceBlock->dynamicOutputPort(_sourcePortDefinition);
+    const auto otherPort = other._sourceBlock->dynamicOutputPort(other._sourcePortDefinition);
+    return port.has_value() && otherPort.has_value() && port.value() == otherPort.value();
+}
 
 namespace serialization_fields {
 using namespace std::string_view_literals;
@@ -768,6 +800,9 @@ public:
     [[nodiscard]] block::Category blockCategory() const override { return T::blockCategory; }
 
     [[nodiscard]] UICategory uiCategory() const override { return T::DrawableControl::kCategory; }
+
+    [[nodiscard]] const block::FusedStage* fusedStage() const noexcept override { return block::fusedStageOf<T>(); }
+    [[nodiscard]] const block::BulkStage*  bulkStage() const noexcept override { return block::bulkStageOf<T>(); }
 
     [[nodiscard]] gr::Ratio  resamplingRatio() const noexcept override { return {static_cast<std::int32_t>(blockRef().input_chunk_size), static_cast<std::int32_t>(blockRef().output_chunk_size)}; }
     [[nodiscard]] gr::Size_t stride() const noexcept override { return blockRef().stride; }

@@ -12,6 +12,7 @@
 #include <gnuradio-4.0/AtomicRef.hpp>
 #include <gnuradio-4.0/BlockTraits.hpp>
 #include <gnuradio-4.0/PmtTypeHelpers.hpp>
+#include <gnuradio-4.0/SettingsCtx.hpp>
 #include <gnuradio-4.0/Tag.hpp>
 #include <gnuradio-4.0/ValueHelper.hpp>
 #include <gnuradio-4.0/annotated.hpp>
@@ -69,36 +70,14 @@ inline constexpr uint64_t convertTimePointToUint64Ns(const std::chrono::time_poi
     return static_cast<uint64_t>(ns);
 }
 
-static auto nullMatchPred = [](auto, auto, auto) { return std::nullopt; };
-
-inline std::strong_ordering comparePmt(const pmt::Value& lhs, const pmt::Value& rhs) {
-    // If the types are different, cast rhs to the type of lhs and compare
-    if (lhs.container_type() != rhs.container_type()) {
-        // TODO: throw if types are not the same?
-        return lhs.container_type() <=> rhs.container_type();
-    } else if (lhs.value_type() != rhs.value_type()) {
-        return lhs.value_type() <=> rhs.value_type();
-    } else {
-        if (lhs.holds<std::string_view>()) {
-            return lhs.value_or(std::string_view{}) <=> rhs.value_or(std::string_view{});
-        } else if (lhs.holds<int>()) {
-            return lhs.value_or(0) <=> rhs.value_or(0);
-        } else {
-            throw gr::exception("Invalid CtxSettings context type " + std::string(typeid(lhs).name()));
-        }
-    }
-}
-
-// pmt::Value comparison is needed to use it as a key of std::map
-struct PMTCompare {
-    bool operator()(const pmt::Value& lhs, const pmt::Value& rhs) const { return comparePmt(lhs, rhs) == std::strong_ordering::less; }
-};
+inline auto nullMatchPred = [](auto, auto, auto) { return std::nullopt; };
 
 } // namespace settings
 
 struct ApplyStagedParametersResult {
     property_map forwardParameters; // parameters that should be forwarded to dependent child blocks
     property_map appliedParameters;
+    property_map failedParameters; // staged values the block's setter rejected -- neither applied nor forwarded
 };
 
 namespace detail {
@@ -141,60 +120,6 @@ const auto& unwrap_decorated_reference(const T& value) {
     }
 };
 
-std::size_t computeHash(const pmt::Value& value);
-
-template<class T>
-constexpr std::size_t hash_combine(std::size_t seed, const T& v) noexcept {
-    std::hash<T> hasher;
-    seed ^= hasher(v) + 0x9e3779b9UZ + (seed << 6) + (seed >> 2);
-    return seed;
-}
-
-inline const auto computeValueHash = meta::overloaded([](const std::string_view& sv) { return std::hash<std::string_view>()(sv); }, //
-    []<typename T>(const gr::Tensor<T>& tensor) {
-        std::size_t seed = 9UZ;
-        for (const auto& v : tensor) {
-            seed = detail::hash_combine(seed, computeHash(pmt::Value(v)));
-        }
-        return seed;
-    }, //
-    [](const gr::property_map& map) {
-        std::size_t seed = 0UZ;
-        for (const auto& [k, v] : map) {
-            std::size_t kv_seed = std::hash<std::string_view>()(k);
-            seed                = detail::hash_combine(kv_seed, computeHash(v));
-            seed                = detail::hash_combine(seed, kv_seed);
-        }
-        return seed;
-    }, //
-    [](const std::monostate) {
-        // arbitrary constant seed
-        return 0x9e3779b9UZ;
-    }, //
-    []<typename VT>(const std::complex<VT>& v) {
-        std::hash<VT> hasher;
-        std::size_t   seed = hasher(v.real());
-        seed ^= hasher(v.imag()) + 0x9e3779b9UZ + (seed << 6) + (seed >> 2);
-        return seed;
-    }, //
-    []<typename T>(const T& v) {
-        if constexpr (gr::meta::complex_like<std::remove_cvref_t<T>>) {
-            using value_t           = typename T::value_type;
-            std::size_t        seed = std::hash<value_t>()(v.real());
-            std::hash<value_t> hasher;
-            seed ^= hasher(v.imag()) + 0x9e3779b9UZ + (seed << 6) + (seed >> 2);
-            return seed;
-        } else {
-            return std::hash<T>()(v);
-        }
-    });
-
-inline std::size_t computeHash(const pmt::Value& value) {
-    std::size_t result = 0UZ;
-    pmt::ValueVisitor([&result](const auto& v) { result = computeValueHash(v); }).visit(value);
-    return result;
-}
-
 template<typename TCollection>
 auto collectionToTensor(const TCollection& collection) {
     using TValue       = typename TCollection::value_type;
@@ -234,24 +159,6 @@ std::string enumToString(T&& enum_value) {
 }
 
 } // namespace detail
-
-struct SettingsCtx {
-    std::uint64_t time    = 0ULL;          // UTC-based time-stamp in ns, time from which the setting is valid, 0U is undefined time
-    pmt::Value    context = std::string(); // user-defined multiplexing context for which the setting is valid
-
-    bool operator==(const SettingsCtx&) const = default;
-
-    std::partial_ordering operator<=>(const SettingsCtx& other) const {
-        // First compare time
-        if (auto cmp = time <=> other.time; cmp != std::strong_ordering::equal) {
-            return cmp;
-        }
-        // Then compare context
-        return settings::comparePmt(context, other.context);
-    }
-
-    [[nodiscard]] std::size_t hash() const noexcept { return detail::hash_combine(std::hash<std::uint64_t>()(time), detail::computeHash(context)); }
-};
 
 /**
  * @brief a concept verifying whether a processing block optionally provides a `settingsChanged` callback to react to
@@ -390,6 +297,12 @@ inline bool autoUpdateImpl(std::string_view key, const pmt::Value& value, const 
             stagedParameters.insert_or_assign(keyPmr, value);
             return true;
         }
+        if constexpr (std::is_arithmetic_v<Type> && !std::is_same_v<Type, bool>) {
+            if (const auto converted = pmt::convert_numerically<Type>(value); converted) {
+                stagedParameters.insert_or_assign(keyPmr, detail::castToGrSizeIfNeeded(*converted));
+                return true;
+            }
+        }
     }
     return false;
 }
@@ -495,15 +408,26 @@ struct SettingsBase {
     /**
      * @brief returns the staged/not-yet-applied new parameters
      */
-    [[nodiscard]] virtual const property_map& stagedParameters() const = 0;
+    [[nodiscard]] virtual property_map stagedParameters() const = 0;
 
     [[nodiscard]] virtual std::set<std::string> autoUpdateParameters(SettingsCtx ctx = {}) noexcept = 0;
 
-    [[nodiscard]] virtual std::set<std::string>& autoForwardParameters() noexcept = 0;
+    // N.B. by reference: fixed once the block runs, and read on the per-work() tag-forwarding
+    // path where a set copy costs more than the whole work() call
+    [[nodiscard]] virtual const std::set<std::string>& autoForwardParameters() const noexcept = 0;
 
-    [[nodiscard]] virtual const property_map& defaultParameters() const noexcept = 0;
+    /**
+     * @brief add keys a block forwards to its children beyond the default tag set.
+     *
+     * The set is read unlocked on the per-work() path, so it is fixed for the duration of a
+     * run: add to it while the block is not running -- at construction, or while the graph is
+     * being built.
+     */
+    virtual void addAutoForwardParameters(std::set<std::string> parameterKeys) = 0;
 
-    [[nodiscard]] virtual const property_map& activeParameters() const noexcept = 0;
+    [[nodiscard]] virtual property_map defaultParameters() const noexcept = 0;
+
+    [[nodiscard]] virtual property_map activeParameters() const noexcept = 0;
 
     /**
      * @brief synchronise map-based with actual block field-based settings
@@ -567,9 +491,10 @@ public:
 
     [[nodiscard]] const SettingsCtx& activeContext() const noexcept override;
 
-    [[nodiscard]] std::set<std::string>& autoForwardParameters() noexcept override;
-    [[nodiscard]] const property_map&    defaultParameters() const noexcept override;
-    [[nodiscard]] const property_map&    activeParameters() const noexcept override;
+    [[nodiscard]] const std::set<std::string>& autoForwardParameters() const noexcept override;
+    void                                       addAutoForwardParameters(std::set<std::string> parameterKeys) override;
+    [[nodiscard]] property_map                 defaultParameters() const noexcept override;
+    [[nodiscard]] property_map                 activeParameters() const noexcept override;
 
     [[nodiscard]] property_map              get(std::span<const std::string> parameterKeys = {}) const noexcept override;
     [[nodiscard]] std::optional<pmt::Value> get(const std::string& parameterKey) const noexcept override;
@@ -582,7 +507,7 @@ public:
 
     [[nodiscard]] std::map<pmt::Value, std::vector<CtxSettingsPair>, settings::PMTCompare> getStoredAll() const noexcept override;
 
-    [[nodiscard]] const property_map& stagedParameters() const override;
+    [[nodiscard]] property_map stagedParameters() const override;
 
     [[nodiscard]] std::set<std::string> autoUpdateParameters(SettingsCtx ctx = {}) noexcept override;
 
@@ -596,6 +521,9 @@ public:
 
 protected:
     // --- Private helpers (defined in Settings.cpp) ---
+    // *Impl bodies run without taking _mutex, for callers that already hold it
+    [[nodiscard]] std::optional<SettingsCtx>           activateContextImpl(SettingsCtx ctx);
+    [[nodiscard]] bool                                 removeContextImpl(SettingsCtx ctx);
     [[nodiscard]] std::optional<pmt::Value>            findBestMatchCtx(const pmt::Value& contextToSearch) const;
     [[nodiscard]] std::optional<SettingsCtx>           findBestMatchSettingsCtx(const SettingsCtx& ctx) const;
     [[nodiscard]] std::optional<property_map>          getBestMatchStoredParameters(const SettingsCtx& ctx) const;
@@ -955,9 +883,13 @@ public:
     }
 
     [[nodiscard]] property_map set(const property_map& parameters, SettingsCtx ctx = {}) override {
+        std::lock_guard lg(_mutex);
+        return setImpl(parameters, ctx);
+    }
+
+    [[nodiscard]] property_map setImpl(const property_map& parameters, SettingsCtx ctx) {
         property_map ret;
         if constexpr (refl::reflectable<TBlock>) {
-            std::lock_guard lg(_mutex);
             if (ctx.time == 0ULL) {
                 ctx.time = settings::convertTimePointToUint64Ns(std::chrono::system_clock::now());
             }
@@ -1010,14 +942,19 @@ public:
     void storeDefaults() override { this->storeCurrentParameters(_defaultParameters); }
 
     NO_INLINE void resetDefaults() override {
+        std::lock_guard lg(_mutex);
+        resetDefaultsImpl();
+    }
+
+    NO_INLINE void resetDefaultsImpl() {
         // add default parameters to stored and apply the parameters
         auto ctx = SettingsCtx{settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), std::string()};
 #ifdef __EMSCRIPTEN__
         resolveDuplicateTimestamp(ctx);
 #endif
         addStoredParameters(_defaultParameters, ctx);
-        std::ignore = activateContext();
-        std::ignore = applyStagedParameters();
+        std::ignore = activateContextImpl({});
+        std::ignore = applyStagedParametersImpl();
 
         removeExpiredStoredParameters();
 
@@ -1034,7 +971,7 @@ public:
 
             SettingsCtx ctx;
             if (tagCtx != std::nullopt) {
-                const auto bestMatchSettingsCtx = activateContext(tagCtx.value());
+                const auto bestMatchSettingsCtx = activateContextImpl(tagCtx.value());
                 if (bestMatchSettingsCtx == std::nullopt) {
                     ctx = _activeCtx;
                 } else {
@@ -1074,30 +1011,42 @@ public:
     }
 
     [[nodiscard]] NO_INLINE ApplyStagedParametersResult applyStagedParameters() override {
+        std::unique_lock lock(_mutex);
+        return applyStagedParametersImpl(&lock);
+    }
+
+    // reentrantLock is null when a caller already holds _mutex and cannot have it released underneath it
+    [[nodiscard]] NO_INLINE ApplyStagedParametersResult applyStagedParametersImpl(std::unique_lock<std::mutex>* reentrantLock = nullptr) {
         ApplyStagedParametersResult result;
         if constexpr (refl::reflectable<TBlock>) {
-            std::lock_guard lg(_mutex);
-
             // prepare old settings if required
             property_map oldSettings;
             if constexpr (HasSettingsChangedCallback<TBlock>) {
                 storeCurrentParameters(oldSettings);
             }
 
+            // The batch is moved out of the shared map before anything below can release the
+            // lock. A setStaged() call that arrives during the settingsChanged() window then stages
+            // for the next apply instead of being cleared with this one, and a concurrent apply
+            // takes an empty map rather than repeating this batch.
+            const property_map batch = std::exchange(_stagedParameters, {});
+
             // check if reset of settings should be performed
-            if (_stagedParameters.contains(static_cast<std::pmr::string>(gr::tag::RESET_DEFAULTS))) {
-                resetDefaults();
+            if (batch.contains(static_cast<std::pmr::string>(gr::tag::RESET_DEFAULTS))) {
+                resetDefaultsImpl();
             }
 
             // Use static dispatch table for O(1) lookup instead of O(members) iteration (Optimization F)
             const auto&  appliers = stagedAppliers();
             property_map staged;
-            for (const auto& [key, stagedValue] : _stagedParameters) {
+            for (const auto& [key, stagedValue] : batch) {
                 auto it = appliers.find(key);
                 if (it != appliers.end()) {
                     constexpr bool hasCallback = HasSettingsChangedCallback<TBlock>;
-                    std::ignore                = it->second(_block, key, stagedValue, result.appliedParameters, staged, hasCallback);
-                    // Forward parameters check is independent of validation success (matches original behavior)
+                    if (!it->second(_block, key, stagedValue, result.appliedParameters, staged, hasCallback)) {
+                        result.failedParameters.insert_or_assign(key, stagedValue); // rejected: must not reach downstream blocks
+                        continue;
+                    }
                     if (_autoForwardParameters.contains(std::string(key))) {
                         result.forwardParameters.insert_or_assign(key, stagedValue);
                     }
@@ -1106,12 +1055,19 @@ public:
 
             updateActiveParametersImpl();
 
-            // invoke user-callback function if staged is not empty
+            // invoke user-callback function if staged is not empty; oldSettings, staged and result are local
+            // copies, so the callback may read or write settings() without _mutex being held across it
             if (!staged.empty()) {
+                if (reentrantLock != nullptr) {
+                    reentrantLock->unlock();
+                }
                 if constexpr (requires { _block->settingsChanged(/* old settings */ _activeParameters, /* new settings */ staged); }) {
                     _block->settingsChanged(/* old settings */ oldSettings, /* new settings */ staged);
                 } else if constexpr (requires { _block->settingsChanged(/* old settings */ _activeParameters, /* new settings */ staged, /* new forward settings */ result.forwardParameters); }) {
                     _block->settingsChanged(/* old settings */ oldSettings, /* new settings */ staged, /* new forward settings */ result.forwardParameters);
+                }
+                if (reentrantLock != nullptr) {
+                    reentrantLock->lock();
                 }
             }
 
@@ -1120,25 +1076,33 @@ public:
             // Update sample_rate if the block performs decimation or interpolation
             if constexpr (TBlock::ResamplingControl::kEnabled) {
                 if (result.forwardParameters.contains(gr::tag::SAMPLE_RATE.shortKey()) && (_block->input_chunk_size != 1ULL || _block->output_chunk_size != 1ULL)) {
-                    const float ratio         = static_cast<float>(_block->output_chunk_size) / static_cast<float>(_block->input_chunk_size);
-                    const float newSampleRate = ratio * (*_activeParameters.at(gr::tag::SAMPLE_RATE.shortKey()).template get_if<float>());
-                    result.forwardParameters.insert_or_assign(gr::tag::SAMPLE_RATE.shortKey(), newSampleRate);
-                    _activeParameters.insert_or_assign(gr::tag::SAMPLE_RATE.shortKey(), newSampleRate); // update for value substitution in forwardInputTags
+                    const auto activeIt = _activeParameters.find(gr::tag::SAMPLE_RATE.shortKey());
+                    // a sample_rate that is not a float (e.g. loaded as double from a GRC file) must not be dereferenced blindly
+                    const float* activeSampleRate = activeIt != _activeParameters.end() ? activeIt->second.template get_if<float>() : nullptr;
+                    if (activeSampleRate != nullptr) {
+                        const float ratio         = static_cast<float>(_block->output_chunk_size) / static_cast<float>(_block->input_chunk_size);
+                        const float newSampleRate = ratio * (*activeSampleRate);
+                        result.forwardParameters.insert_or_assign(gr::tag::SAMPLE_RATE.shortKey(), newSampleRate);
+                        _activeParameters.insert_or_assign(gr::tag::SAMPLE_RATE.shortKey(), newSampleRate); // update for value substitution in forwardInputTags
+                    }
                 }
             }
 
-            if (_stagedParameters.contains(static_cast<std::pmr::string>(gr::tag::STORE_DEFAULTS))) {
+            if (batch.contains(static_cast<std::pmr::string>(gr::tag::STORE_DEFAULTS))) {
                 storeDefaults();
             }
 
             if constexpr (HasSettingsResetCallback<TBlock>) {
-                if (_stagedParameters.contains(static_cast<std::pmr::string>(gr::tag::RESET_DEFAULTS))) {
+                if (batch.contains(static_cast<std::pmr::string>(gr::tag::RESET_DEFAULTS))) {
                     _block->reset();
                 }
             }
+        } else {
+            _stagedParameters.clear(); // a block with no reflectable members cannot apply these
         }
-        _stagedParameters.clear();
-        gr::atomic_ref(_changed).store_release(false);
+        // anything staged while the lock was released is work for the next apply, so the map
+        // reports unchanged only when it is empty
+        gr::atomic_ref(_changed).store_release(!_stagedParameters.empty());
         return result;
     }
 
@@ -1150,6 +1114,7 @@ public:
     }
 
     NO_INLINE void loadParametersFromPropertyMap(const property_map& parameters, SettingsCtx ctx = {}) override {
+        std::lock_guard lg(_mutex);
         // Use static dispatch table for O(1) membership check instead of O(members) iteration (Optimization F)
         const auto&  setters = parameterSetters();
         property_map newProperties;
@@ -1165,7 +1130,7 @@ public:
             }
         }
 
-        if (const property_map failed = set(newProperties, ctx); !failed.empty()) {
+        if (const property_map failed = setImpl(newProperties, ctx); !failed.empty()) {
             throw gr::exception(std::format("settings from property_map could not be loaded: {}", failed));
         }
     }

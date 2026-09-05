@@ -54,9 +54,9 @@ namespace gr::lifecycle {
  * │ │        └─────┬───────┘           │           │  ║
  * │ │              │ pause()           │           │  ║  isActive(lifecycle::State) ─> true
  * │ │              v                   │ resume()  │  ║
- * │ │    ┌─────────┴─────────┐   ┌─────┴─────┐     │  ║
- * │ │    │  REQUESTED_PAUSE  ├──>┤  PAUSED   │     │  ║
- * │ │    └──────────┬────────┘   └─────┬─────┘     │  ╙
+ * │ │    ┌─────────┴─────────┐   ┌─────┴─────┐     │  ║  N.B. REQUESTED_PAUSE also resumes
+ * │ │    │  REQUESTED_PAUSE  ├──>┤  PAUSED   │     │  ║  directly to RUNNING -- a block that
+ * │ │    └──────────┬────────┘   └─────┬─────┘     │  ╙  never reaches PAUSED is not stranded
  * │ │               │ stop()           │ stop()    │
  * │ │               v                  │           │
  * │ │     ┌─────────┴────────┐         │           │  ╓
@@ -108,7 +108,7 @@ constexpr bool isValidTransition(const State from, const State to) noexcept {
     case State::IDLE: return to == State::INITIALISED || to == State::REQUESTED_STOP || to == State::STOPPED;
     case State::INITIALISED: return to == State::RUNNING || to == State::REQUESTED_STOP || to == State::STOPPED;
     case State::RUNNING: return to == State::REQUESTED_PAUSE || to == State::REQUESTED_STOP;
-    case State::REQUESTED_PAUSE: return to == State::PAUSED;
+    case State::REQUESTED_PAUSE: return to == State::PAUSED || to == State::RUNNING || to == State::REQUESTED_STOP;
     case State::PAUSED: return to == State::RUNNING || to == State::REQUESTED_STOP;
     case State::REQUESTED_STOP: return to == State::STOPPED;
     case State::STOPPED: return to == State::INITIALISED;
@@ -126,7 +126,7 @@ enum class StorageType { ATOMIC, NON_ATOMIC };
  * If implemented in TDerived, the following specific lifecycle methods are called:
  * - `init()`   when transitioning from IDLE to INITIALISED
  * - `start()`  when transitioning from INITIALISED to RUNNING
- * - `stop()`   when transitioning from any `isActive(State)` to REQUESTED_STOP
+ * - `stop()`   when transitioning to REQUESTED_STOP, or from any `isActive(State)` to ERROR
  * - `pause()`  when transitioning from RUNNING to REQUESTED_PAUSE
  * - `resume()` when transitioning from PAUSED to RUNNING
  * - `reset()`  when transitioning from any state (typically ERROR or STOPPED) to INITIALISED.
@@ -154,6 +154,18 @@ protected:
         } else {
             _state = newState;
         }
+    }
+
+    // a transition that is already satisfied: reported as success without running any hook
+    [[nodiscard]] static constexpr bool isSatisfiedTransition(State from, State to) noexcept { //
+        return from == to || (from == State::STOPPED && to == State::REQUESTED_STOP) || (from == State::PAUSED && to == State::REQUESTED_PAUSE);
+    }
+
+    [[nodiscard]] Error invalidTransitionError(State from, State to, const std::source_location& location) {
+        return Error{std::format("Block '{}' invalid state transition in {} from {} -> to {}", //
+                         getBlockName(), gr::meta::type_name<TDerived>(),                      //
+                         gr::meta::enumName(from).value_or(""), gr::meta::enumName(to).value_or("")),
+            location};
     }
 
     std::string getBlockName() {
@@ -212,22 +224,34 @@ public:
     [[nodiscard]] std::expected<void, Error> changeStateTo(State newState, const std::source_location location = std::source_location::current()) {
         State oldState;
         if constexpr (storageType == StorageType::ATOMIC) {
+            // claim the transition with a CAS: a read-validate-write lets two threads both validate against the
+            // same observed state and both write, so the loser's transition is silently lost while its hooks still run
             oldState = gr::atomic_ref(_state).load_acquire();
+            while (!isSatisfiedTransition(oldState, newState)) {
+                if (!isValidTransition(oldState, newState)) {
+                    return std::unexpected(invalidTransitionError(oldState, newState, location));
+                }
+                if (gr::atomic_ref(_state).compare_exchange(oldState, newState)) { // re-validates from the fresh value on failure
+                    break;
+                }
+            }
+            if (isSatisfiedTransition(oldState, newState)) {
+                return {};
+            }
+            if constexpr (requires(TDerived d) { d.stateChanged(newState); }) {
+                static_cast<TDerived*>(this)->stateChanged(newState);
+            }
+            gr::atomic_ref(_state).notify_all();
         } else {
             oldState = _state;
+            if (isSatisfiedTransition(oldState, newState)) {
+                return {};
+            }
+            if (!isValidTransition(oldState, newState)) {
+                return std::unexpected(invalidTransitionError(oldState, newState, location));
+            }
+            setAndNotifyState(newState);
         }
-        if (oldState == newState || (oldState == STOPPED && newState == REQUESTED_STOP) || (oldState == PAUSED && newState == REQUESTED_PAUSE)) {
-            return {};
-        }
-
-        if (!isValidTransition(oldState, newState)) {
-            return std::unexpected(Error{std::format("Block '{}' invalid state transition in {} from {} -> to {}", //
-                                             getBlockName(), gr::meta::type_name<TDerived>(),                      //
-                                             gr::meta::enumName(state()).value_or(""), gr::meta::enumName(newState).value_or("")),
-                location});
-        }
-
-        setAndNotifyState(newState);
 
         if constexpr (std::is_same_v<TDerived, void>) {
             return {};
@@ -244,7 +268,7 @@ public:
                 }
             }
             if constexpr (requires(TDerived& d) { d.stop(); }) {
-                if (newState == State::REQUESTED_STOP) {
+                if (newState == State::REQUESTED_STOP || (newState == State::ERROR && isActive(oldState))) {
                     return invokeLifecycleMethod(&TDerived::stop, location);
                 }
             }

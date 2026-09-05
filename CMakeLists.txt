@@ -6,6 +6,12 @@ project(
   LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# No target in this tree declares a C++20 module, so dependency scanning would only add a preprocessor pass per
+# translation unit and a dynamic-dependency file per object. This records the tree's current state, not a policy: the
+# scan is what discovers module interfaces, so a target that declares a module cannot build while it is off. Delete this
+# line the day one does.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 set(GR4_PKG_VERSION
@@ -208,6 +214,12 @@ option(ENABLE_EXAMPLES "Enable Example Builds" ${GR_TOPLEVEL_PROJECT})
 option(ENABLE_TESTING "Enable Test Builds" ${GR_TOPLEVEL_PROJECT})
 option(MIT_ONLY "Exclude modules with non-MIT/Apache-compatible licences" OFF)
 option(GR_USE_FETCHCONTENT_DEPS "Allow CMake to download selected third-party dependencies with FetchContent" OFF)
+
+# Test executables check correctness, so a lower optimization level roughly halves their compile time and peak memory.
+# Benchmarks pin their own level. Empty keeps the build type's default.
+set(GR_QA_OPTIMIZATION_LEVEL
+    "-O1"
+    CACHE STRING "Optimization level for test executables in optimized build types (empty = build-type default)")
 
 if(NOT DEFINED GR_DATA_CACHE_DIR)
   set(GR_DATA_CACHE_DIR
@@ -720,8 +732,10 @@ if(TARGET gnuradio-plugin)
     DESTINATION "${GR_CMAKECONFIG_INSTALL_DIR}")
 endif()
 
-install(FILES "${CMAKE_CURRENT_BINARY_DIR}/gnuradio4Config.cmake"
-              "${CMAKE_CURRENT_BINARY_DIR}/gnuradio4ConfigVersion.cmake" DESTINATION "${GR_CMAKECONFIG_INSTALL_DIR}")
+install(
+  FILES "${CMAKE_CURRENT_BINARY_DIR}/gnuradio4Config.cmake" "${CMAKE_CURRENT_BINARY_DIR}/gnuradio4ConfigVersion.cmake"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GnuRadio4PrecompileHeaders.cmake"
+  DESTINATION "${GR_CMAKECONFIG_INSTALL_DIR}")
 
 # print effective options
 message(STATUS "================================================")

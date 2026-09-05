@@ -12,6 +12,7 @@
 #include <gnuradio-4.0/thread/thread_pool.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <map>
 #include <tuple>
 #include <variant>
@@ -103,6 +104,24 @@ namespace graph {
 inline static constexpr std::size_t  defaultMinBufferSize(bool isArithmeticLike) { return isArithmeticLike ? 65536UZ : 64UZ; }
 inline static constexpr std::int32_t defaultWeight   = 0;
 inline static const std::string      defaultEdgeName = "unnamed edge"; // Emscripten doesn't want constexpr strings
+
+inline constexpr double      kDefaultEdgeBufferSeconds = 0.05;
+inline constexpr std::size_t kMinEdgeBufferSize        = 1UZ << 15;
+inline constexpr std::size_t kMaxEdgeBufferSize        = 1UZ << 22;
+
+/**
+ * @brief Samples an edge carrying @p sampleRate should hold to buffer @p seconds of stream.
+ *
+ * defaultMinBufferSize()'s fixed 65536 samples is 27 ms at 2.4 MS/s and under 3 ms at 24 MS/s, so a
+ * ring long enough to ride out the scheduler's wake-up jitter at one rate is short at a higher one.
+ * Here the duration is fixed and the count follows the rate, rounded up to a power of two and clamped
+ * at both ends against single-chunk rings at very low rates and needless latency at very high ones.
+ */
+[[nodiscard]] inline constexpr std::size_t edgeBufferSizeFor(double sampleRate, double seconds = kDefaultEdgeBufferSeconds) noexcept {
+    const double      wanted = sampleRate > 0.0 && seconds > 0.0 ? sampleRate * seconds : 0.0;
+    const std::size_t count  = wanted >= static_cast<double>(kMaxEdgeBufferSize) ? kMaxEdgeBufferSize : static_cast<std::size_t>(wanted);
+    return std::bit_ceil(std::clamp(count, kMinEdgeBufferSize, kMaxEdgeBufferSize));
+}
 
 inline std::string format(GraphLike auto const& graph) {
     std::ostringstream os;
@@ -476,7 +495,9 @@ public:
         return {};
     }
 
-    std::expected<void, Error> removeEdgeBySourcePort(std::string_view sourceBlock, std::string_view sourcePort) {
+    // an empty destination removes every edge fanning out from the source port; the port's buffer is shared by
+    // all of them, so the ones that stay must be reconnected afterwards
+    std::expected<std::size_t, Error> removeEdgeBySourcePort(std::string_view sourceBlock, std::string_view sourcePort, std::string_view destinationBlock = {}, std::string_view destinationPort = {}) {
         auto sourceBlockIt = std::ranges::find_if(_blocks, [&sourceBlock](const auto& block) { return block->uniqueName() == sourceBlock; });
         if (sourceBlockIt == _blocks.end()) {
             return std::unexpected(Error(std::format("Block {} was not found in {}", sourceBlock, this->unique_name)));
@@ -488,11 +509,50 @@ public:
         }
         auto& sourcePortRef = *srcPortResult.value();
 
+        // resolve both sides to port objects: an edge may name its ports by index or by name
+        const auto resolvedOutput = [](const Edge& edge) {
+            auto port = edge.sourceBlock()->dynamicOutputPort(edge.sourcePortDefinition());
+            return port ? port.value() : nullptr;
+        };
+        const auto resolvedInput = [](const Edge& edge) {
+            auto port = edge.destinationBlock()->dynamicInputPort(edge.destinationPortDefinition());
+            return port ? port.value() : nullptr;
+        };
+        const auto sharesSourcePort = [&](const Edge& edge) { return resolvedOutput(edge) == std::addressof(sourcePortRef); };
+        const auto isRequestedEdge  = [&](const Edge& edge) {
+            if (!sharesSourcePort(edge)) {
+                return false;
+            }
+            if (destinationBlock.empty() || edge.destinationBlock()->uniqueName() != destinationBlock) {
+                return destinationBlock.empty();
+            }
+            if (destinationPort.empty()) {
+                return true;
+            }
+            auto requestedPort = edge.destinationBlock()->dynamicInputPort(destinationPort);
+            return requestedPort && requestedPort.value() == resolvedInput(edge);
+        };
+
+        if (std::ranges::none_of(_edges, isRequestedEdge)) {
+            return std::unexpected(Error(std::format("No edge from {}.{} in {}", sourceBlock, sourcePort, this->unique_name)));
+        }
+
         if (auto result = sourcePortRef.disconnect(); !result) {
             return std::unexpected(Error(std::format("Block {} sourcePortRef could not be disconnected {}: {}", sourceBlock, this->unique_name, result.error().message)));
         }
 
-        return {};
+        const auto [first, last] = std::ranges::remove_if(_edges, isRequestedEdge);
+        const auto nRemoved      = static_cast<std::size_t>(std::ranges::distance(first, last));
+        _edges.erase(first, last);
+
+        for (auto& edge : _edges) { // siblings lost their buffer with the port teardown
+            if (sharesSourcePort(edge)) {
+                edge._state = Edge::EdgeState::WaitingToBeConnected;
+            }
+        }
+        std::ignore = connectPendingEdges();
+
+        return nRemoved;
     }
 
     std::optional<Message> propertyCallbackGraphInspect([[maybe_unused]] std::string_view propertyName, Message message);
@@ -857,13 +917,14 @@ gr::Graph flatten(GraphLike auto const& root, std::source_location location = st
     return flattenedGraph;
 }
 
+// keyed on the resolved port, because one port named by index and by name is two PortDefinitions
 using AdjacencyList = std::unordered_map<std::shared_ptr<gr::BlockModel>, //
-    std::unordered_map<gr::PortDefinition, std::vector<const gr::Edge*>>>;
+    std::unordered_map<const gr::DynamicPort*, std::vector<const gr::Edge*>>>;
 
 AdjacencyList computeAdjacencyList(const GraphLike auto& root) {
     AdjacencyList result;
     for (const gr::Edge& edge : root.edges()) {
-        std::vector<const gr::Edge*>& srcMapPort = result[edge.sourceBlock()][edge.sourcePortDefinition()];
+        std::vector<const gr::Edge*>& srcMapPort = result[edge.sourceBlock()][edge.sourceBlock()->dynamicOutputPort(edge.sourcePortDefinition()).value_or(nullptr)];
         srcMapPort.push_back(std::addressof(edge));
     }
     return result;
@@ -966,7 +1027,7 @@ std::vector<gr::Graph> weaklyConnectedComponents(const GraphLike auto& graph) {
 
 inline std::span<const gr::Edge* const> outgoingEdges(const AdjacencyList& adj, const std::shared_ptr<gr::BlockModel>& block, const gr::PortDefinition& port) {
     if (auto it = adj.find(block); it != adj.end()) {
-        if (auto pit = it->second.find(port); pit != it->second.end()) {
+        if (auto pit = it->second.find(block->dynamicOutputPort(port).value_or(nullptr)); pit != it->second.end()) {
             return std::span(pit->second);
         }
     }
@@ -1164,7 +1225,7 @@ struct std::formatter<gr::graph::AdjacencyList> {
 
         for (const auto& [srcBlock, portMap] : adj) {
             for (const auto& [srcPort, edges] : portMap) {
-                out = std::format_to(out, "{}:{}\n", getName(srcBlock), srcPort);
+                out = std::format_to(out, "{}:{}\n", getName(srcBlock), srcPort == nullptr ? std::string_view{"<unresolved>"} : std::string_view{srcPort->metaInfo.name});
                 for (const gr::Edge* edge : edges) {
                     if (formatSpecifier == 'l') {
                         out = std::format_to(out, "    → {:l}\n", *edge);
