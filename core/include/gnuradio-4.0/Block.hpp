@@ -7,6 +7,8 @@
 
 #include <format>
 
+#include <gnuradio-4.0/meta/simd.hpp>
+
 #include <gnuradio-4.0/meta/RangesHelper.hpp>
 #include <gnuradio-4.0/meta/formatter.hpp>
 #include <gnuradio-4.0/meta/immutable.hpp>
@@ -488,12 +490,12 @@ struct isBlockDependent {
 
 namespace block::property {
 // [[maybe_unused]]: names referenced only from Block.cpp (initStandardPropertyCallbacks) and user code — silences -Werror=unused-variable on TUs that include only the header.
-[[maybe_unused]] inline static const char* const kHeartbeat      = "Heartbeat";      ///< heartbeat property - the canary in the coal mine (supports block-specific subscribe/unsubscribe)
+[[maybe_unused]] inline const char* const        kHeartbeat      = "Heartbeat";      ///< heartbeat property - the canary in the coal mine (supports block-specific subscribe/unsubscribe)
 [[maybe_unused]] inline static const char* const kEcho           = "Echo";           ///< basic property that receives any matching message and sends a mirror with it's serviceName/unique_name
 [[maybe_unused]] inline static const char* const kLifeCycleState = "LifecycleState"; ///< basic property that sets the block's @see lifecycle::StateMachine
-[[maybe_unused]] inline static const char* const kSetting        = "Settings";       ///< asynchronous message-based setting handling,
+[[maybe_unused]] inline const char* const        kSetting        = "Settings";       ///< asynchronous message-based setting handling,
                                                                                      // N.B. 'Set' Settings are first staged before being applied within the work(...) function (real-time/non-real-time decoupling)
-[[maybe_unused]] inline static const char* const kStagedSetting = "StagedSettings";  ///< asynchronous message-based staging of settings
+[[maybe_unused]] inline const char* const kStagedSetting = "StagedSettings";         ///< asynchronous message-based staging of settings
 
 [[maybe_unused]] inline static const char* const kMetaInformation = "MetaInformation"; ///< asynchronous message-based retrieval of the static meta-information (i.e. Annotated<> interfaces, constraints, etc...)
 [[maybe_unused]] inline static const char* const kUiConstraints   = "UiConstraints";   ///< asynchronous message-based retrieval of user-defined UI constraints
@@ -501,8 +503,8 @@ namespace block::property {
 [[maybe_unused]] inline static const char* const kStoreDefaults    = "StoreDefaults";    ///< store present settings as default, for counterpart @see kResetDefaults
 [[maybe_unused]] inline static const char* const kResetDefaults    = "ResetDefaults";    ///< retrieve and reset to default setting, for counterpart @see kStoreDefaults
 [[maybe_unused]] inline static const char* const kActiveContext    = "ActiveContext";    ///< retrieve and set active context
-[[maybe_unused]] inline static const char* const kSettingsCtx      = "SettingsCtx";      ///< retrieve/creates/remove a new stored context
-[[maybe_unused]] inline static const char* const kSettingsContexts = "SettingsContexts"; ///< retrieve/creates/remove a new stored context
+[[maybe_unused]] inline const char* const        kSettingsCtx      = "SettingsCtx";      ///< retrieve/creates/remove a new stored context
+[[maybe_unused]] inline const char* const        kSettingsContexts = "SettingsContexts"; ///< retrieve/creates/remove a new stored context
 
 } // namespace block::property
 
@@ -531,6 +533,8 @@ struct BlockBase {
     std::string_view (*_cbName)(const void*)                                = nullptr;
     property_map& (*_cbMetaInformation)(void*)                              = nullptr;
     property_map& (*_cbUiConstraints)(void*)                                = nullptr;
+    const MsgPortInBuiltin& (*_cbMsgIn)(const void*)                        = nullptr;
+    MsgPortOutBuiltin& (*_cbMsgOut)(void*)                                  = nullptr;
 
     // Hook for GraphWrapper to handle subgraph export port messages on any block type
     using SubgraphExportHandler                  = std::optional<Message> (*)(void* context, Message);
@@ -551,6 +555,24 @@ struct BlockBase {
     std::string_view           cbName() const { return _cbName(_blockSelf); }
     property_map&              cbMetaInformation() { return _cbMetaInformation(_blockSelf); }
     property_map&              cbUiConstraints() { return _cbUiConstraints(_blockSelf); }
+    const MsgPortInBuiltin&    cbMsgIn() const { return _cbMsgIn(_blockSelf); }
+    MsgPortOutBuiltin&         cbMsgOut() { return _cbMsgOut(_blockSelf); }
+
+    /**
+     * Message plumbing, compiled once rather than stamped per block type.
+     *
+     * The bodies reach the block through its two built-in message ports and its two names, none of
+     * which vary with the block's type, so a block type contributed nothing to them but duplicated
+     * code -- the std::format calls, the exception handling and the message-reserve path included.
+     * They stay non-virtual and are reached by inheritance, so a block calls them exactly as before
+     * and a block supplying its own processMessages() still hides this one.
+     */
+    void emitMessage(std::string_view endpoint, property_map message, std::string_view clientRequestID = "") noexcept;
+    void notifyListeners(std::string_view endpoint, property_map message) noexcept;
+    void emitErrorMessage(std::string_view endpoint, std::string_view errorMsg, std::string_view clientRequestID = "", std::source_location location = std::source_location::current()) noexcept;
+    void emitErrorMessage(std::string_view endpoint, Error e, std::string_view clientRequestID = "") noexcept;
+    void emitErrorMessageIfAny(std::string_view endpoint, std::expected<void, Error> e, std::string_view clientRequestID = "") noexcept;
+    void processMessages(const MsgPortInBuiltin& port, std::span<const Message> messages);
 
     // 12 callback implementations (compiled once, not per block type)
     std::optional<Message> propertyCallbackHeartbeat(std::string_view propertyName, Message message);
@@ -818,6 +840,8 @@ protected: // BlockBase function-pointer plumbing — not part of the user API
     static std::string_view           cbNameImpl(const void* self) { return static_cast<const Block*>(self)->name; }
     static property_map&              cbMetaInformationImpl(void* self) { return static_cast<Block*>(self)->meta_information.value; }
     static property_map&              cbUiConstraintsImpl(void* self) { return static_cast<Block*>(self)->ui_constraints.value; }
+    static const MsgPortInBuiltin&    cbMsgInImpl(const void* self) { return static_cast<const Block*>(self)->msgIn; }
+    static MsgPortOutBuiltin&         cbMsgOutImpl(void* self) { return static_cast<Block*>(self)->msgOut; }
 
 public:
     template<typename TFunction, typename... Args>
@@ -856,6 +880,8 @@ public:
         _cbName            = &Block::cbNameImpl;
         _cbMetaInformation = &Block::cbMetaInformationImpl;
         _cbUiConstraints   = &Block::cbUiConstraintsImpl;
+        _cbMsgIn           = &Block::cbMsgInImpl;
+        _cbMsgOut          = &Block::cbMsgOutImpl;
 
         initStandardPropertyCallbacks();
 
@@ -1707,26 +1733,7 @@ public:
         }
     }
 
-    void emitMessage(std::string_view endpoint, property_map message, std::string_view clientRequestID = "") noexcept { sendMessage<message::Command::Notify>(msgOut, unique_name /* serviceName */, endpoint, std::move(message), clientRequestID); }
-
-    void notifyListeners(std::string_view endpoint, property_map message) noexcept {
-        const auto it = propertySubscriptions.find(std::string(endpoint));
-        if (it != propertySubscriptions.end()) {
-            for (const auto& clientID : it->second) {
-                emitMessage(endpoint, message, clientID);
-            }
-        }
-    }
-
-    void emitErrorMessage(std::string_view endpoint, std::string_view errorMsg, std::string_view clientRequestID = "", std::source_location location = std::source_location::current()) noexcept { emitErrorMessageIfAny(endpoint, std::unexpected(Error(errorMsg, location)), clientRequestID); }
-
-    void emitErrorMessage(std::string_view endpoint, Error e, std::string_view clientRequestID = "") noexcept { emitErrorMessageIfAny(endpoint, std::unexpected(e), clientRequestID); }
-
-    inline void emitErrorMessageIfAny(std::string_view endpoint, std::expected<void, Error> e, std::string_view clientRequestID = "") noexcept {
-        if (!e.has_value()) [[unlikely]] {
-            sendMessage<message::Command::Notify>(msgOut, unique_name /* serviceName */, endpoint, std::move(e.error()), clientRequestID);
-        }
-    }
+    // emitMessage, notifyListeners, emitErrorMessage and emitErrorMessageIfAny are inherited from BlockBase
 
     /**
      * Central function managing the dispatch of work to the block implementation provided work implementation
@@ -2061,50 +2068,7 @@ public:
         }
     }
 
-    void processMessages([[maybe_unused]] const MsgPortInBuiltin& port, std::span<const Message> messages) {
-        using enum gr::message::Command;
-        assert(std::addressof(port) == std::addressof(msgIn) && "got a message on wrong port");
-
-        for (const auto& message : messages) {
-            if (!message.serviceName.empty() && message.serviceName != unique_name && message.serviceName != name) {
-                // Skip if target does not match the block's (unique) name and is not empty.
-                continue;
-            }
-
-            auto it = propertyCallbacks.find(message.endpoint);
-            if (it == propertyCallbacks.end()) {
-                continue; // did not find matching property callback
-            }
-            BlockBase::PropertyCallback callback = it->second;
-
-            std::optional<Message> retMessage;
-            try {
-                retMessage = (this->*callback)(message.endpoint, message); // N.B. life-time: message is copied
-            } catch (const gr::exception& e) {
-                retMessage       = Message{message};
-                retMessage->data = std::unexpected(Error(e));
-            } catch (const std::exception& e) {
-                retMessage       = Message{message};
-                retMessage->data = std::unexpected(Error(e));
-            } catch (...) {
-                retMessage       = Message{message};
-                retMessage->data = std::unexpected(Error(std::format("unknown exception in Block {} property '{}'\n request message: {} ", unique_name, message.endpoint, message)));
-            }
-
-            if (!retMessage.has_value()) {
-                continue; // function does not produce any return message
-            }
-
-            retMessage->cmd             = Final; // N.B. could enable/allow for partial if we return multiple messages (e.g. using coroutines?)
-            retMessage->serviceName     = unique_name;
-            WriterSpanLike auto msgSpan = msgOut.streamWriter().template tryReserve<SpanReleasePolicy::ProcessAll>(1UZ);
-            if (msgSpan.empty()) {
-                throw gr::exception(std::format("{}::processMessages() can not reserve span for message\n", name));
-            } else {
-                msgSpan[0] = *retMessage;
-            }
-        } // - end - for (const auto &message : messages) { ..
-    }
+    // processMessages(const MsgPortInBuiltin&, std::span<const Message>) is inherited from BlockBase
 
 }; // template<typename Derived, typename... Arguments> class Block : ...
 

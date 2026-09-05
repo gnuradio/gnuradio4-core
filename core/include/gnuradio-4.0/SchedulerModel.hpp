@@ -2,11 +2,20 @@
 #define GNURADIO_SCHEDULER_MODEL_HPP
 
 #include <gnuradio-4.0/BlockModel.hpp>
-#include <gnuradio-4.0/Graph.hpp>
 
 #include <thread>
 
 namespace gr {
+
+// Graph.hpp is not parsed here. SchedulerModel names gr::Graph only through a reference, and
+// SchedulerWrapper is a template whose base and body are instantiated at the point of use -- which
+// is a translation unit that builds a scheduler and therefore includes Graph.hpp already. Every
+// block header reaches this file through BlockRegistry.hpp for the GR_REGISTER_BLOCK marker, so the
+// graph machinery would otherwise be parsed by every translation unit that mentions a block.
+struct Graph;
+
+template<typename TSelf, typename TSubGraph>
+class GraphWrapper;
 
 class SchedulerModel {
 public:

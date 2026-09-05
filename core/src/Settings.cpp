@@ -2,6 +2,10 @@
 
 namespace gr {
 
+namespace settings {
+void throwInvalidContextType(const pmt::Value& value) { throw gr::exception("Invalid CtxSettings context type " + std::string(typeid(value).name())); }
+} // namespace settings
+
 // --- Simple accessors ---
 
 bool CtxSettingsBase::changed() const noexcept { return gr::atomic_ref(_changed).load_acquire(); }

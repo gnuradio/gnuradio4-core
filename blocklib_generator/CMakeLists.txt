@@ -4,17 +4,32 @@ project(MyProject LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 23)
 
 option(ENABLE_SPLIT "Enable splitting of generated files (pass --split to the parser)" OFF)
+option(GNURADIO_INSTALL_PARSE_REGISTRATIONS_TOOL "Install the block-registration parser tool" ON)
+
+# This program is run while CMake configures block libraries.  A cross build therefore needs a host-native compiler for
+# it, even though the generated block libraries use CMAKE_CXX_COMPILER.
+set(GNURADIO_PARSE_REGISTRATIONS_TOOL_CXX_COMPILER
+    ""
+    CACHE STRING "Host C++ compiler for the block-registration parser, a name found on PATH or a path")
 
 include(CMakePackageConfigHelpers)
 include(GNUInstallDirs)
 
-if(NOT GNURADIO_PARSE_REGISTRATIONS_TOOL_CXX_COMPLILER)
-  set(GNURADIO_PARSE_REGISTRATIONS_TOOL_CXX_COMPLILER ${CMAKE_CXX_COMPILER})
+# A cross build leaves the choice to the nested configure unless a host compiler is named explicitly; that configure
+# runs with the environment's CC and CXX cleared, since under a cross toolchain they name the target compiler.
+if(NOT GNURADIO_PARSE_REGISTRATIONS_TOOL_CXX_COMPILER AND NOT CMAKE_CROSSCOMPILING)
+  set(GNURADIO_PARSE_REGISTRATIONS_TOOL_CXX_COMPILER ${CMAKE_CXX_COMPILER})
 endif()
 
-message(
-  STATUS "Using ${GNURADIO_PARSE_REGISTRATIONS_TOOL_CXX_COMPLILER} to compile the gnuradio_4_0_parse_registrations tool"
-)
+set(PARSER_TOOL_COMPILER_ARGS "")
+if(GNURADIO_PARSE_REGISTRATIONS_TOOL_CXX_COMPILER)
+  set(PARSER_TOOL_COMPILER_ARGS -DCMAKE_CXX_COMPILER=${GNURADIO_PARSE_REGISTRATIONS_TOOL_CXX_COMPILER})
+  message(
+    STATUS
+      "Using ${GNURADIO_PARSE_REGISTRATIONS_TOOL_CXX_COMPILER} to compile the gnuradio_4_0_parse_registrations tool")
+else()
+  message(STATUS "Using the host's default C++ compiler to compile the gnuradio_4_0_parse_registrations tool")
+endif()
 
 # --------------------------------------------------------------------------
 # Manually configure and build the parser tool in a separate directory
@@ -23,8 +38,10 @@ set(TOOLS_BUILD_DIR "${PROJECT_BINARY_DIR}/tools_build")
 if(NOT EXISTS "${TOOLS_BUILD_DIR}/CMakeCache.txt")
   message(STATUS "Configuring parser tool in ${TOOLS_BUILD_DIR}...")
   execute_process(
-    COMMAND ${CMAKE_COMMAND} -S ${PROJECT_SOURCE_DIR}/tools -B ${TOOLS_BUILD_DIR} -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
-            -DCMAKE_CXX_COMPILER=${GNURADIO_PARSE_REGISTRATIONS_TOOL_CXX_COMPLILER}
+    COMMAND
+      ${CMAKE_COMMAND} -E env --unset=CC --unset=CXX ${CMAKE_COMMAND} -S ${PROJECT_SOURCE_DIR}/tools -B
+      ${TOOLS_BUILD_DIR} -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} ${PARSER_TOOL_COMPILER_ARGS}
+      -DGR4_USE_LIBCXX=${GR4_USE_LIBCXX}
     RESULT_VARIABLE config_result
     OUTPUT_VARIABLE config_output
     ERROR_VARIABLE config_error
@@ -80,4 +97,6 @@ install(
   DESTINATION "${GR_BLOCKLIB_CMAKECONFIG_INSTALL_DIR}"
   COMPONENT Devel)
 
-install(PROGRAMS ${PARSER_EXECUTABLE} DESTINATION ${CMAKE_INSTALL_BINDIR})
+if(GNURADIO_INSTALL_PARSE_REGISTRATIONS_TOOL)
+  install(PROGRAMS ${PARSER_EXECUTABLE} DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()

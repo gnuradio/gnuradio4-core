@@ -152,6 +152,7 @@ const boost::ut::suite AssetsLoadingTests = [] {
     // instantiate a YAML-defined composite block from an asset definition.
     // The definition embeds a SUBGRAPH with two chained multiply blocks whose
     // exported ports are named 'in' and 'out'.
+#ifndef GR_TEST_WITHOUT_BLOCK_REGISTRY // the asset's interior blocks are resolved by name through the registry
     "instantiate: YAML asset creates a composite block with exported ports"_test = [] {
         auto loader = makeLoaderWithPlugins({kAssetsDir + "/root_a"});
 
@@ -171,6 +172,8 @@ const boost::ut::suite AssetsLoadingTests = [] {
 #endif
 
     // ── remote tests (server started by CMake fixture) ────────────────────────
+
+#endif
 
     "remote happy path: two blocks loaded via http from root_a"_test = [] {
         if (kSkipRemote) {

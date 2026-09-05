@@ -140,7 +140,7 @@ inline void updateMaps(const pmt::Value::Map& src, pmt::Value::Map& dest) {
     }
 }
 
-constexpr fixed_string GR_TAG_PREFIX = "gr:";
+inline constexpr fixed_string GR_TAG_PREFIX = "gr:";
 
 template<fixed_string Key, typename PMT_TYPE, fixed_string Unit = "", fixed_string Description = "">
 class DefaultTag {

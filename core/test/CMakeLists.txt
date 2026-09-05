@@ -10,6 +10,7 @@ function(add_app_test TEST_NAME)
   add_dependencies(
     ${TEST_NAME}
     GoodBasePlugin
+    GoodRegistryPlugin
     good_math_plugin
     good_conversion_plugin
     bad_plugin)
@@ -21,6 +22,8 @@ set(_CORE_TESTS
     qa_AtomicRef
     qa_Value
     qa_ValueHelper
+    qa_BlockMessages
+    qa_BlockRegistration
     qa_ComputeDomain
     qa_DataSet
     qa_DynamicPort
@@ -57,11 +60,19 @@ message(
     "Standard-block integration tests removed from gnuradio4-core and should move to gnuradio4-blocks or cross-repo CI: ${_STANDARD_BLOCK_INTEGRATION_TESTS}"
 )
 
+if(NOT GR_ENABLE_BLOCK_REGISTRY)
+  list(REMOVE_ITEM _CORE_TESTS qa_BlockRegistration)
+endif()
+
 foreach(TEST_NAME IN LISTS _CORE_TESTS)
   add_ut_test(${TEST_NAME})
 endforeach()
 
 add_ut_test(qa_SubGraphAssets)
+# only the case that instantiates an asset needs the registry; the rest run without one
+if(NOT GR_ENABLE_BLOCK_REGISTRY)
+  target_compile_definitions(qa_SubGraphAssets PRIVATE GR_TEST_WITHOUT_BLOCK_REGISTRY)
+endif()
 set(_QA_SUBGRAPH_HTTP_PORT 18765)
 target_compile_definitions(qa_SubGraphAssets PRIVATE HTTP_SERVER_PORT=${_QA_SUBGRAPH_HTTP_PORT})
 if(EMSCRIPTEN)
@@ -89,6 +100,8 @@ if(GR_ENABLE_BLOCK_REGISTRY AND INTERNAL_ENABLE_BLOCK_PLUGINS)
     good_math_plugin
     good_conversion_plugin
     bad_plugin)
+
+  add_app_test(qa_PluginRegistration)
 endif()
 
 if(GR_ENABLE_BLOCK_REGISTRY AND INTERNAL_ENABLE_BLOCK_PLUGINS)
