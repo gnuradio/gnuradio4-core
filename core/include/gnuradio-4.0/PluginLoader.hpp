@@ -234,6 +234,27 @@ struct YamlDefinitionsLoader {
 
 std::expected<std::shared_ptr<gr::BlockModel>, gr::Error> instantiateBlockFromYamlDefinition(gr::PluginLoader& loader, const YamlDefinitionsLoader::Definition& def) noexcept;
 
+/**
+ * @brief Instantiates the one version a caller named, or says why it could not.
+ *
+ * A pin that cannot be honored is reported rather than rounded to a neighboring version, and the reason
+ * names the versions that are registered. A plugin or a YAML definition carries one revision,
+ * `block::kDefaultVersion`, so a pin to that reaches the ordinary path and a pin to anything else stops here.
+ */
+template<typename TLoader>
+std::expected<std::shared_ptr<gr::BlockModel>, gr::Error> instantiatePinnedOrError(TLoader& loader, const BlockRegistry& registry, std::string_view name, block::Version version, const property_map& params) {
+    if (auto result = registry.create(name, version, params)) {
+        return std::shared_ptr<gr::BlockModel>(std::move(result));
+    }
+    if (const std::vector<block::Version> known = registry.versions(name); !known.empty()) {
+        return std::unexpected(gr::Error(std::format("'{}' is registered, but not as version {}; registered versions: {}", name, version, gr::join(known, ", "))));
+    }
+    if (version != block::kDefaultVersion) {
+        return std::unexpected(gr::Error(std::format("'{}' is not in the block registry, so it has no version {}", name, version)));
+    }
+    return loader.instantiate(name, params);
+}
+
 } // namespace detail
 
 #ifdef INTERNAL_ENABLE_BLOCK_PLUGINS
@@ -514,6 +535,9 @@ public:
         return {};
     }
 
+    /// see gr::detail::instantiatePinnedOrError
+    std::expected<std::shared_ptr<gr::BlockModel>, gr::Error> instantiatePinnedOrError(std::string_view name, block::Version version, const property_map& params = property_map{}) { return detail::instantiatePinnedOrError(*this, *_registry, name, version, params); }
+
     std::shared_ptr<gr::SchedulerModel> instantiateScheduler(std::string_view name, const property_map& params = property_map{}) {
         if (auto result = _schedulerRegistry->create(name, params)) {
             return std::shared_ptr<gr::SchedulerModel>(result.release());
@@ -588,6 +612,9 @@ public:
 
         return nullptr;
     }
+
+    /// see the non-WASM PluginLoader::instantiatePinnedOrError
+    std::expected<std::shared_ptr<gr::BlockModel>, gr::Error> instantiatePinnedOrError(std::string_view name, block::Version version, const property_map& params = {}) { return detail::instantiatePinnedOrError(*this, *_registry, name, version, params); }
 
     std::shared_ptr<gr::SchedulerModel> instantiateScheduler(std::string_view name, const property_map& params = {}) {
         auto result = _schedulerRegistry->create(name, params);

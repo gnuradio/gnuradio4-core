@@ -145,11 +145,46 @@ struct RecordingSink : Block<RecordingSink> {
     }
 };
 
+/// the older revision of a block registered twice, so a file can pin one of the two
+struct GainV1 : Block<GainV1> {
+    static constexpr gr::block::Status  status{.deprecated = true};
+    static constexpr gr::block::Version version = 1U;
+
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(GainV1, in, out);
+
+    explicit GainV1(property_map init = {}) : Block<GainV1>(std::move(init)) {}
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
+};
+
+struct GainV2 : Block<GainV2> {
+    static constexpr gr::block::Version version = 2U;
+
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(GainV2, in, out);
+
+    explicit GainV2(property_map init = {}) : Block<GainV2>(std::move(init)) {}
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
+};
+
+/// two revisions of one alias, each also its own type-name key
+template<typename TBlock>
+inline bool insertGainVersion(BlockRegistry& registry) {
+    return registry.insert(gr::meta::type_name<TBlock>(), "qa::Gain", [](property_map params) -> std::unique_ptr<BlockModel> { return std::make_unique<BlockWrapper<TBlock>>(std::move(params)); }, block::versionOf<TBlock>(), block::statusOf<TBlock>());
+}
+
 inline void registerTestBlocks() {
     static const bool registered = [] {
         BlockRegistry& registry = globalBlockRegistry();
-        return registry.insert<RampSource>("=qa::RampSource") && registry.insert<Scale>("=qa::Scale") //
-               && registry.insert<SumInputs>("=qa::SumInputs") && registry.insert<RecordingSink>("=qa::RecordingSink");
+        return registry.insert<RampSource>("=qa::RampSource") && registry.insert<Scale>("=qa::Scale")                  //
+               && registry.insert<SumInputs>("=qa::SumInputs") && registry.insert<RecordingSink>("=qa::RecordingSink") //
+               && insertGainVersion<GainV1>(registry) && insertGainVersion<GainV2>(registry);
     }();
     expect(registered) << "the test blocks must reach the global registry";
 }
@@ -610,6 +645,67 @@ connections:
             }
             expect(refused) << what;
         }
+    };
+
+    "a block entry without a version key takes the newest registered version"_test = [] {
+        registerTestBlocks();
+        PluginLoader& loader = gr::globalPluginLoader();
+
+        const auto loaded = gr::loadGrc(loader, "blocks:\n  - id: qa::Gain\n    parameters:\n      name: gain\n");
+        expect(eq(loaded->blocks().size(), 1UZ));
+        const std::shared_ptr<BlockModel>& block = loaded->blocks().front();
+        expect(eq(block->version(), gr::block::Version{2U}));
+        expect(!block->pinnedVersion().has_value());
+        expect(!gr::saveGrc(loader, *loaded).contains("version:")) << "a graph that pinned nothing keeps taking the newest";
+    };
+
+    "a block entry that pins a version gets that version, and the save writes it back"_test = [] {
+        registerTestBlocks();
+        PluginLoader& loader = gr::globalPluginLoader();
+
+        const auto loaded = gr::loadGrc(loader, "blocks:\n  - id: qa::Gain\n    version: 1\n    parameters:\n      name: gain\n");
+        expect(eq(loaded->blocks().size(), 1UZ));
+        const std::shared_ptr<BlockModel>& block = loaded->blocks().front();
+        expect(eq(block->version(), gr::block::Version{1U}));
+        expect(block->pinnedVersion() == std::optional<gr::block::Version>{1U});
+        expect(block->status().deprecated) << "reported, and nothing refused it";
+        expect(block->metaInformation().at("Version").value_or(gr::Size_t{}) == gr::Size_t{1});
+
+        const std::string dump = gr::saveGrc(loader, *loaded);
+        expect(dump.contains("version: !!uint32 1")) << dump;
+        const auto reloaded = gr::loadGrc(loader, dump);
+        expect(eq(reloaded->blocks().size(), 1UZ));
+        expect(reloaded->blocks().front()->pinnedVersion() == std::optional<gr::block::Version>{1U});
+    };
+
+    "a pin to a version that was never registered names the versions that were"_test = [] {
+        registerTestBlocks();
+        PluginLoader& loader = gr::globalPluginLoader();
+
+        bool refused = false;
+        try {
+            const auto loaded = gr::loadGrc(loader, "blocks:\n  - id: qa::Gain\n    version: 9\n    parameters:\n      name: gain\n");
+            expect(false) << std::format("{} blocks loaded, a pin that cannot be honored must be refused", loaded->blocks().size());
+        } catch (const gr::exception& error) {
+            refused = true;
+            expect(error.message.contains("version 9")) << error.message;
+            expect(error.message.contains("1, 2")) << error.message << "the versions that are registered are named";
+        }
+        expect(refused);
+    };
+
+    "a version key that is not a version number is refused"_test = [] {
+        registerTestBlocks();
+        PluginLoader& loader = gr::globalPluginLoader();
+
+        bool refused = false;
+        try {
+            const auto loaded = gr::loadGrc(loader, "blocks:\n  - id: qa::Gain\n    version: not-a-number\n    parameters:\n      name: gain\n");
+            expect(false) << std::format("{} blocks loaded, a version that is not a number must be refused", loaded->blocks().size());
+        } catch (const gr::exception&) {
+            refused = true;
+        }
+        expect(refused);
     };
 
     "a blocks entry that is not a map is passed over"_test = [] {
