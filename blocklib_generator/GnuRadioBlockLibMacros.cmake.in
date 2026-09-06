@@ -181,8 +181,15 @@ function(gr_generate_block_instantiations LIB_NAME)
     set(GEN_CPP_LIST "${GEN_DIR}/integrator.cpp")
 
     # generation options are part of the staleness check: changing them must regenerate
+    # the generator script is the other input to a generated file, so its identity and timestamp join them
+    if(GR_BLOCKLIB_GENERATOR_USED STREQUAL "PYTHON")
+        file(TIMESTAMP "${GR_BLOCKLIB_PYTHON_GENERATOR}" GENERATOR_MODIFIED "%s")
+    else()
+        file(TIMESTAMP "${GR_BLOCKLIB_CMAKE_GENERATOR}" GENERATOR_MODIFIED "%s")
+    endif()
     set(GEN_OPTIONS_SIG
-        "${GR_BLOCKLIB_GENERATED_FORMAT}|${PARSER_SPLIT}|${EFFECTIVE_MAX_PER_TU}|${CBL_REGISTRY_HEADER}|${CBL_REGISTRY_INSTANCE}")
+        "${GR_BLOCKLIB_GENERATED_FORMAT}|${PARSER_SPLIT}|${EFFECTIVE_MAX_PER_TU}|${CBL_REGISTRY_HEADER}|${CBL_REGISTRY_INSTANCE}|${GR_BLOCKLIB_GENERATOR_USED}|${GENERATOR_MODIFIED}"
+    )
 
     foreach(HDR IN LISTS CBL_HEADERS)
         # unconditional: the source list below and the reconfigure trigger are needed for every
