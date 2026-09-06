@@ -124,7 +124,7 @@ jobs:
             -DENABLE_TESTING=OFF \
             -DENABLE_COVERAGE=OFF \
             -DCMAKE_CROSSCOMPILING_EMULATOR=${SYSTEM_NODE} \
-            -DGNURADIO_PARSE_REGISTRATIONS_TOOL_CXX_COMPLILER=g++-14
+            -DGNURADIO_PARSE_REGISTRATIONS_TOOL_CXX_COMPILER=g++-14
 
       - name: Build CPack packages
         shell: bash
