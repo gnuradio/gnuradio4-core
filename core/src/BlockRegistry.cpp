@@ -18,5 +18,5 @@ namespace gr {
 BlockRegistry&     globalBlockRegistry(std::source_location location) { return *grGlobalBlockRegistry(location); }
 SchedulerRegistry& globalSchedulerRegistry(std::source_location location) { return *grGlobalSchedulerRegistry(location); }
 
-bool insertBlockFactory(BlockRegistry& registry, const BlockRegistration& registration) { return registry.insert(registration.name, registration.alias, registration.factory); }
+bool insertBlockFactory(BlockRegistry& registry, const BlockRegistration& registration) { return registry.insert(registration.name, registration.alias, registration.factory, registration.version, registration.status); }
 } // namespace gr

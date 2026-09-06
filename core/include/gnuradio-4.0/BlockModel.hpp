@@ -237,6 +237,8 @@ protected:
     DynamicPorts           _dynamicOutputPorts;
     std::string            _typeName;
 
+    std::optional<block::Version> _pinnedVersion; ///< set by whoever created this instance for a version it named
+
     BlockModel() = default;
 
     explicit BlockModel(std::string typeName) noexcept : _typeName(std::move(typeName)) {}
@@ -502,6 +504,21 @@ public:
     virtual void processScheduledMessages() = 0;
 
     [[nodiscard]] virtual UICategory uiCategory() const { return UICategory::None; }
+
+    /**
+     * @brief The revision of the block type this instance is, and the qualities the type declares.
+     *
+     * Reported, never acted on. A type that declares neither is version `block::kDefaultVersion` with every flag
+     * false.
+     */
+    [[nodiscard]] virtual block::Version version() const noexcept { return block::kDefaultVersion; }
+
+    [[nodiscard]] virtual block::Status status() const noexcept { return {}; }
+
+    /// The version the caller asked for by name, when it pinned one; nothing when it took the newest.
+    [[nodiscard]] std::optional<block::Version> pinnedVersion() const noexcept { return _pinnedVersion; }
+
+    void setPinnedVersion(block::Version pinned) noexcept { _pinnedVersion = pinned; }
 
     /**
      * @brief Descriptor allowing a synchronous 1:1 `processOne` block to be driven from a scratch buffer, or nullptr.
@@ -808,6 +825,9 @@ public:
     [[nodiscard]] block::Category blockCategory() const override { return T::blockCategory; }
 
     [[nodiscard]] UICategory uiCategory() const override { return T::DrawableControl::kCategory; }
+
+    [[nodiscard]] block::Version version() const noexcept override { return block::versionOf<T>(); }
+    [[nodiscard]] block::Status  status() const noexcept override { return block::statusOf<T>(); }
 
     [[nodiscard]] const block::FusedStage* fusedStage() const noexcept override { return block::fusedStageOf<T>(); }
     [[nodiscard]] const block::BulkStage*  bulkStage() const noexcept override { return block::bulkStageOf<T>(); }
