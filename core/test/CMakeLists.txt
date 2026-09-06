@@ -42,6 +42,7 @@ set(_CORE_TESTS
     qa_SchedulerDrain
     qa_SchedulerExchange
     qa_SchedulerLifecycle
+    qa_SchedulerStartStop
     qa_Settings
     qa_SettingsBase
     qa_SettingsConcurrency
@@ -102,6 +103,7 @@ set(_CORE_DEADLOCK_TESTS
     qa_SchedulerDrain
     qa_SchedulerExchange
     qa_SchedulerLifecycle
+    qa_SchedulerStartStop
     qa_SettingsConcurrency)
 if(GR_ENABLE_BLOCK_REGISTRY)
   list(APPEND _CORE_DEADLOCK_TESTS qa_grc)

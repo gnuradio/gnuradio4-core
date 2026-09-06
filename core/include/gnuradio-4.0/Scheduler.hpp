@@ -153,6 +153,7 @@ protected:
     std::shared_ptr<gr::Sequence> _nRunningJobs = std::make_shared<gr::Sequence>();
     std::recursive_mutex          _executionOrderMutex; // only used when modifying and copying the graph->local job list
     std::shared_ptr<JobLists>     _executionOrder = std::make_shared<JobLists>();
+    std::mutex                    _childLifecycleMutex; // serializes start()'s and stop()'s sweeps of the children
 
     std::vector<std::vector<fusion::RunPlan>> _fusionPlan; // guarded by _executionOrderMutex, indexed like _executionOrder
 
@@ -893,27 +894,34 @@ protected:
         std::lock_guard lock(_executionOrderMutex);
 
         _firstChildStartError.reset();
-        graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) { //
-            if (block->blockCategory() == ScheduledBlockGroup) {
-                // We don't simply move to RUNNING, as schedulers block. This code path
-                // uses a separate thread.
-                auto* schedulerModel = dynamic_cast<SchedulerModel*>(block.get());
-                if (schedulerModel) {
-                    schedulerModel->start();
-                } else {
-                    throw gr::exception(std::format("ScheduledBlockGroup is not a SchedulerModel {}", block->uniqueName()));
-                }
-            } else {
-                // a child that refuses to start — a throwing start() hook lands here in the ERROR
-                // state — must fail the run itself, not only the message stream: the first such
-                // error is what runAndWait() returns
-                std::expected<void, Error> transitioned = block->changeStateTo(lifecycle::RUNNING);
-                if (!transitioned && !_firstChildStartError.has_value()) {
-                    _firstChildStartError = transitioned.error();
-                }
-                this->emitErrorMessageIfAny("LifecycleState -> RUNNING", std::move(transitioned));
+        // the sweep runs whole under this lock, released before the workers are dispatched: a worker requesting a stop takes it
+        {
+            std::lock_guard childLock(_childLifecycleMutex);
+            if (lifecycle::isShuttingDown(this->state())) {
+                return;
             }
-        });
+            graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) { //
+                if (block->blockCategory() == ScheduledBlockGroup) {
+                    // We don't simply move to RUNNING, as schedulers block. This code path
+                    // uses a separate thread.
+                    auto* schedulerModel = dynamic_cast<SchedulerModel*>(block.get());
+                    if (schedulerModel) {
+                        schedulerModel->start();
+                    } else {
+                        throw gr::exception(std::format("ScheduledBlockGroup is not a SchedulerModel {}", block->uniqueName()));
+                    }
+                } else {
+                    // a child that refuses to start — a throwing start() hook lands here in the ERROR
+                    // state — must fail the run itself, not only the message stream: the first such
+                    // error is what runAndWait() returns
+                    std::expected<void, Error> transitioned = block->changeStateTo(lifecycle::RUNNING);
+                    if (!transitioned && !_firstChildStartError.has_value()) {
+                        _firstChildStartError = transitioned.error();
+                    }
+                    this->emitErrorMessageIfAny("LifecycleState -> RUNNING", std::move(transitioned));
+                }
+            });
+        }
 
         if (_firstChildStartError.has_value()) {
             // a graph that could not start completely must not run degraded: a failed source never
@@ -1230,21 +1238,24 @@ protected:
         using enum lifecycle::State;
         gr::atomic_ref(_nStopRequests).fetch_add(1UZ);
         wakeProgressWaiters();
-        graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) {
-            if (block->blockCategory() == ScheduledBlockGroup) {
-                auto* schedulerModel = dynamic_cast<SchedulerModel*>(block.get());
-                if (schedulerModel) {
-                    schedulerModel->stop();
+        {
+            std::lock_guard childLock(_childLifecycleMutex); // serialized against start()'s sweep
+            graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) {
+                if (block->blockCategory() == ScheduledBlockGroup) {
+                    auto* schedulerModel = dynamic_cast<SchedulerModel*>(block.get());
+                    if (schedulerModel) {
+                        schedulerModel->stop();
+                    } else {
+                        throw gr::exception(std::format("ScheduledBlockGroup is not a SchedulerModel {}", block->uniqueName()));
+                    }
                 } else {
-                    throw gr::exception(std::format("ScheduledBlockGroup is not a SchedulerModel {}", block->uniqueName()));
+                    this->emitErrorMessageIfAny("forEachBlock -> stop() -> LifecycleState", block->changeStateTo(REQUESTED_STOP));
+                    if (!block->isBlocking()) { // N.B. no other thread/constraint to consider before shutting down
+                        this->emitErrorMessageIfAny("forEachBlock -> stop() -> LifecycleState", block->changeStateTo(STOPPED));
+                    }
                 }
-            } else {
-                this->emitErrorMessageIfAny("forEachBlock -> stop() -> LifecycleState", block->changeStateTo(REQUESTED_STOP));
-                if (!block->isBlocking()) { // N.B. no other thread/constraint to consider before shutting down
-                    this->emitErrorMessageIfAny("forEachBlock -> stop() -> LifecycleState", block->changeStateTo(STOPPED));
-                }
-            }
-        });
+            });
+        }
 
         if (this->state() != ERROR) { // stop() also runs on the way into ERROR, which only reset() leaves
             this->emitErrorMessageIfAny("stop() -> LifecycleState ->STOPPED", this->changeStateTo(STOPPED));
