@@ -472,6 +472,32 @@ inline std::string makePortableTypeName(std::string_view name) {
         return it->second;
     }
 
+    // The same types as `typeMapping`, spelled the way source text spells them: a registration alias or a compiler-rendered
+    // template argument writes "int16_t" or "short int" where the demangler prints "short". Every entry maps to the demangled
+    // spelling of the same type, so `typeMapping` still decides the portable name.
+    static const auto writtenMapping = std::array<std::pair<std::string, std::string>, 27>{{
+        {"int8_t"s, local_type_name<std::int8_t>()}, {"std::int8_t"s, local_type_name<std::int8_t>()},                        //
+        {"int16_t"s, local_type_name<std::int16_t>()}, {"std::int16_t"s, local_type_name<std::int16_t>()},                    //
+        {"int32_t"s, local_type_name<std::int32_t>()}, {"std::int32_t"s, local_type_name<std::int32_t>()},                    //
+        {"int64_t"s, local_type_name<std::int64_t>()}, {"std::int64_t"s, local_type_name<std::int64_t>()},                    //
+        {"uint8_t"s, local_type_name<std::uint8_t>()}, {"std::uint8_t"s, local_type_name<std::uint8_t>()},                    //
+        {"uint16_t"s, local_type_name<std::uint16_t>()}, {"std::uint16_t"s, local_type_name<std::uint16_t>()},                //
+        {"uint32_t"s, local_type_name<std::uint32_t>()}, {"std::uint32_t"s, local_type_name<std::uint32_t>()},                //
+        {"uint64_t"s, local_type_name<std::uint64_t>()}, {"std::uint64_t"s, local_type_name<std::uint64_t>()},                //
+        {"float32_t"s, local_type_name<std::float32_t>()}, {"std::float32_t"s, local_type_name<std::float32_t>()},            //
+        {"float64_t"s, local_type_name<std::float64_t>()}, {"std::float64_t"s, local_type_name<std::float64_t>()},            //
+        {"short int"s, local_type_name<short>()}, {"short unsigned int"s, local_type_name<unsigned short>()},                 //
+        {"long int"s, local_type_name<long>()}, {"long unsigned int"s, local_type_name<unsigned long>()},                     //
+        {"long long int"s, local_type_name<long long>()}, {"long long unsigned int"s, local_type_name<unsigned long long>()}, //
+        {"std::string"s, local_type_name<std::string>()},                                                                     //
+    }};
+
+    const auto writtenIt = std::ranges::find_if(writtenMapping, [&](const auto& pair) { return pair.first == name; });
+    if (writtenIt != writtenMapping.end()) {
+        const auto mappedIt = std::ranges::find_if(typeMapping, [&](const auto& pair) { return pair.first == writtenIt->second; });
+        return mappedIt != typeMapping.end() ? mappedIt->second : writtenIt->second;
+    }
+
     auto stripStdPrivates = [](std::string_view _name) -> std::string {
         // There's an issue in std::regex in libstdcpp which tries to construct
         // a vector of larger-than-possible size in some cases. Need to

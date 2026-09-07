@@ -3,6 +3,7 @@
 #include <gnuradio-4.0/Block.hpp>
 #include <gnuradio-4.0/BlockRegistry.hpp>
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -128,6 +129,27 @@ const boost::ut::suite<"block registration"> blockRegistrationTests = [] {
         expect(eq(key, std::string("qa_registration::Scale<float32, qa_registration::DefaultPolicy>")));
         expect(registry.contains("qa_registration::Scale<float32>")) << "the reflected alias";
         expect(registry.create("qa_registration::Scale<float32>", {}) != nullptr) << "the reflected alias";
+    };
+
+    "an integer parameter, whose alias is spelled the portable way"_test = [] {
+        qa_registration::expectRegistrationParity<qa_registration::Scale<std::int16_t>>("Scale<int16>");
+
+        gr::BlockRegistry registry;
+        expect(gr::insertBlockFactory(registry, gr::makeBlockRegistration<qa_registration::Scale<std::int16_t>>(&qa_registration::makeBlock<qa_registration::Scale<std::int16_t>>)));
+
+        // the compiler renders the reflected parameter as "short int"; the alias maps like the key
+        expect(eq(registry.keys().size(), 2UZ)) << "the key with its defaulted parameter, and the alias without";
+        expect(registry.contains("qa_registration::Scale<int16, qa_registration::DefaultPolicy>")) << "the key";
+        expect(registry.contains("qa_registration::Scale<int16>")) << "the reflected alias";
+        expect(!registry.contains("qa_registration::Scale<short int>")) << "the literal spelling";
+    };
+
+    "an overridden name, spelled the way a registration marker writes it"_test = [] {
+        gr::BlockRegistry registry;
+        expect(gr::insertBlockFactory(registry, gr::makeBlockRegistration<qa_registration::Scale<std::int16_t>, "qa::Scale<std::int16_t>">(&qa_registration::makeBlock<qa_registration::Scale<std::int16_t>>)));
+
+        expect(registry.contains("qa::Scale<int16>")) << "the overridden name, mapped";
+        expect(!registry.contains("qa::Scale<std::int16_t>")) << "the literal spelling";
     };
 };
 

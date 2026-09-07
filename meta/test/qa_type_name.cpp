@@ -47,6 +47,31 @@ const boost::ut::suite<"type name tests"> _type_name = [] {
         expect(eq(gr::meta::type_name<std::complex<std::float64_t>>(), "complex<float64>"s));
     };
 
+    "makePortableTypeName(sv) - a name taken from source text"_test = [] {
+        using gr::meta::detail::makePortableTypeName;
+
+        // what a registration marker writes
+        expect(eq(makePortableTypeName("int16_t"), "int16"s));
+        expect(eq(makePortableTypeName("std::int16_t"), "int16"s));
+        expect(eq(makePortableTypeName("int32_t"), "int32"s));
+        expect(eq(makePortableTypeName("uint8_t"), "uint8"s));
+        expect(eq(makePortableTypeName("std::uint8_t"), "uint8"s));
+        expect(eq(makePortableTypeName("std::string"), "string"s));
+
+        // what a compiler renders a template argument as
+        expect(eq(makePortableTypeName("short int"), "int16"s));
+        expect(eq(makePortableTypeName("short unsigned int"), "uint16"s));
+
+        // a parameter list, at any depth
+        expect(eq(makePortableTypeName("ns0::Foo<int16_t>"), "ns0::Foo<int16>"s));
+        expect(eq(makePortableTypeName("ns0::Notmetaected<short int, 5>"), "ns0::Notmetaected<int16, 5>"s));
+        expect(eq(makePortableTypeName("gr::DataSet<std::uint8_t>"), "gr::DataSet<uint8>"s));
+
+        // a name already spelled the portable way is left alone
+        expect(eq(makePortableTypeName("ns0::Foo<int16>"), "ns0::Foo<int16>"s));
+        expect(eq(makePortableTypeName("ns0::Foo<complex<float32>>"), "ns0::Foo<complex<float32>>"s));
+    };
+
     "gr::meta::type_name<T>()"_test = [] {
         expect(eq(gr::meta::type_name<Notmetaected<int, 5>>(), "ns0::Notmetaected<int32, 5>"s));
         expect(eq(gr::meta::type_name<Foo<int>>(), "ns0::Foo<int32>"s));
