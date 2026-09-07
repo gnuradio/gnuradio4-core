@@ -478,6 +478,72 @@ struct PassCounter : Block<PassCounter> {
     }
 };
 
+// One record per 16 input samples and a record edge of four, far smaller than one call could fill, so the
+// producer outruns a consumer that takes one record a visit.
+inline constexpr std::size_t kRecordHop     = 16UZ;
+inline constexpr std::size_t kRecordSamples = 8192UZ;
+inline constexpr std::size_t kRecordEdge    = 4UZ;
+inline constexpr std::size_t kRecordCount   = kRecordSamples / kRecordHop;
+
+/**
+ * @brief A spectral estimator's shape: one record per `kRecordHop` input samples on an asynchronous output port.
+ *
+ * Each call makes what the output span has room for and consumes only the input it turned into records, so a full
+ * record edge back-pressures the stream. The asynchronous output port keeps the block out of a fused run, which is
+ * the fact the record-edge case rests on.
+ */
+struct Recorder : Block<Recorder> {
+    PortIn<float>                  in;
+    PortOut<DataSet<float>, Async> out;
+
+    GR_MAKE_REFLECTABLE(Recorder, in, out);
+
+    std::size_t nRecorded  = 0UZ;
+    std::size_t maxOffered = 0UZ;
+    std::size_t maxRoom    = 0UZ;
+
+    work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
+        maxOffered = std::max(maxOffered, inSpan.size());
+        maxRoom    = std::max(maxRoom, outSpan.size());
+
+        const std::size_t possible = inSpan.size() / kRecordHop;
+        const std::size_t made     = std::min(possible, outSpan.size());
+        for (std::size_t i = 0UZ; i < made; ++i) {
+            DataSet<float> record;
+            record.signal_values = {static_cast<float>(nRecorded + i)};
+            outSpan[i]           = std::move(record);
+        }
+        outSpan.publish(made);
+        std::ignore = inSpan.consume(made * kRecordHop);
+        gr::atomic_ref(nRecorded).store_release(nRecorded + made);
+        if (made > 0UZ) {
+            return work::Status::OK;
+        }
+        return possible == 0UZ ? work::Status::INSUFFICIENT_INPUT_ITEMS : work::Status::INSUFFICIENT_OUTPUT_ITEMS;
+    }
+};
+
+/// the slow consumer of a record edge: one record a visit
+struct RecordSink : Block<RecordSink> {
+    PortIn<DataSet<float>> in;
+
+    GR_MAKE_REFLECTABLE(RecordSink, in);
+
+    std::vector<float> recordIds;
+    std::size_t        nReceived = 0UZ;
+
+    work::Status processBulk(InputSpanLike auto& inSpan) {
+        if (inSpan.size() == 0UZ) {
+            std::ignore = inSpan.consume(0UZ);
+            return work::Status::INSUFFICIENT_INPUT_ITEMS;
+        }
+        recordIds.push_back(inSpan[0].signal_values.empty() ? -1.0f : inSpan[0].signal_values.front());
+        std::ignore = inSpan.consume(1UZ);
+        gr::atomic_ref(nReceived).store_release(recordIds.size());
+        return work::Status::OK;
+    }
+};
+
 struct RunResult {
     std::vector<float>       samples;
     std::vector<TagRecord>   tags;
@@ -848,6 +914,55 @@ inline void sendSchedulerMessage(gr::MsgPortOut& port, std::string_view endpoint
     arm.samples    = sink.samples;
     arm.tapSamples = tap.samples;
     return arm;
+}
+
+/// the outcome of one arm of the record-edge run; `finished` is false when the wait timed out
+struct RecordArm {
+    std::vector<float>       recordIds;
+    std::vector<std::size_t> runSizes;
+    std::size_t              nMade      = 0UZ;
+    std::size_t              maxOffered = 0UZ;
+    std::size_t              maxRoom    = 0UZ;
+    bool                     finished   = false;
+};
+
+/**
+ * @brief Runs a record edge too small for what one call could fill, downstream of a fused run.
+ *
+ * Two 1:1 members that fuse, a producer with an asynchronous record output, a record edge of `kRecordEdge`, and a
+ * consumer that takes one record a visit. The producer's input edge holds `kRecordCount` records' worth of samples,
+ * so a call is offered far more input than the record edge can hold. A stalled chain never returns from
+ * `runAndWait()`, so `awaitCount` bounds the run and its timeout is what asks for the stop.
+ */
+[[nodiscard]] inline RecordArm runRecordChain(bool fusion) {
+    using namespace boost::ut;
+    const gr::EdgeParameters streamEdge{.minBufferSize = kRecordSamples};
+    const gr::EdgeParameters recordEdge{.minBufferSize = kRecordEdge};
+
+    gr::Graph flow;
+    auto&     source = flow.emplaceBlock<Source>(gr::property_map{{"name", std::string("src")}});
+    auto&     gain   = flow.emplaceBlock<Gain>(gr::property_map{{"name", std::string("gain")}});
+    auto&     quant  = flow.emplaceBlock<Quantize>(gr::property_map{{"name", std::string("quant")}});
+    auto&     rec    = flow.emplaceBlock<Recorder>(gr::property_map{{"name", std::string("rec")}});
+    auto&     snk    = flow.emplaceBlock<RecordSink>(gr::property_map{{"name", std::string("snk")}});
+    source.nTotal    = kRecordSamples;
+    expect(flow.connect<"out", "in">(source, gain, streamEdge).has_value());
+    expect(flow.connect<"out", "in">(gain, quant, streamEdge).has_value());
+    expect(flow.connect<"out", "in">(quant, rec, streamEdge).has_value());
+    expect(flow.connect<"out", "in">(rec, snk, recordEdge).has_value());
+
+    const gr::property_map                                                schedulerSettings{{"enable_fusion", fusion}};
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{schedulerSettings};
+    expect(scheduler.exchange(std::move(flow)).has_value());
+
+    std::thread runner([&scheduler] { std::ignore = scheduler.runAndWait(); });
+    const bool  finished = awaitCount(snk.nReceived, kRecordCount);
+    if (!finished) {
+        std::ignore = scheduler.changeStateTo(lifecycle::State::REQUESTED_STOP);
+    }
+    runner.join();
+
+    return RecordArm{snk.recordIds, collectRunSizes(scheduler.fusionPlan()), rec.nRecorded, rec.maxOffered, rec.maxRoom, finished};
 }
 
 } // namespace qa_fusion
@@ -1365,6 +1480,27 @@ const boost::ut::suite<"fusion"> _fusion = [] {
         expect(scheduler.runAndWait().has_value());
         expect(scheduler.fusionPlan().empty()) << "enable_fusion defaults to false";
         expect(eq(sink.samples.size(), 1024UZ));
+    };
+
+    "a record edge that fills behind a fused run drains rather than stopping the chain"_test = [] {
+        const RecordArm unfused = runRecordChain(false);
+        const RecordArm fused   = runRecordChain(true);
+
+        expect(unfused.finished) << "the unfused control did not deliver every record";
+        expect(fused.finished) << "the fused arm did not deliver every record";
+
+        expect(unfused.runSizes.empty());
+        expect(eq(fused.runSizes.size(), 1UZ)) << "the two 1:1 members fuse";
+        if (!fused.runSizes.empty()) {
+            expect(eq(fused.runSizes[0], 2UZ)) << "an asynchronous output port keeps the producer out of the run";
+        }
+
+        expect(eq(fused.maxRoom, kRecordEdge)) << "the record edge is the depth it was asked for";
+        expect(ge(fused.maxOffered / kRecordHop, 64UZ)) << "one call was never offered far more input than the edge can hold";
+        expect(eq(fused.nMade, kRecordCount));
+        expect(eq(fused.recordIds.size(), kRecordCount));
+        expect(eq(unfused.recordIds.size(), kRecordCount));
+        expect(fused.recordIds == unfused.recordIds) << "the record sequence differs";
     };
 };
 
