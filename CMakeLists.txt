@@ -18,11 +18,9 @@ set(GR4_PKG_VERSION
     "${PROJECT_VERSION}-git"
     CACHE STRING "Version string used in gnuradio4.pc")
 
-include(CMakePackageConfigHelpers)
-include(GNUInstallDirs)
-find_package(PkgConfig QUIET)
-
 set(CMAKE_POSITION_INDEPENDENT_CODE TRUE)
+
+# User facing GR Configuration Options
 
 # limit parallel compile/link jobs to prevent OOM with template-heavy TUs override with -DGR_BUILD_PARALLEL_LEVEL=<N>
 # (CI with more RAM can raise this)
@@ -42,127 +40,9 @@ if(CMAKE_CXX_COMPILER MATCHES "/em\\+\\+(-[a-zA-Z0-9.])?$") # if this hasn't bee
   set(EMSCRIPTEN ON)
 endif()
 
-# default explicit compiler and linker flag optimisation per build type
 if(NOT MSVC)
-  # optional:  -fno-inline-functions -fvar-tracking-assignments
-  set(CMAKE_CXX_FLAGS_DEBUG "-Og -g1 -gz -DDEBUG -fno-omit-frame-pointer -ffunction-sections -fdata-sections")
-  set(CMAKE_CXX_FLAGS_RELEASE "-O2 -g0 -DNDEBUG -ffunction-sections -fdata-sections")
-  set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g1 -gz -DNDEBUG -ffunction-sections -fdata-sections")
-  set(CMAKE_CXX_FLAGS_RELWITHASSERT "-O2 -DASSERT_ENABLED -ffunction-sections -fdata-sections")
-  # '-s': strip debug symbols, 'EMBEDDED is used to disable/minimise code features for embedded systems (e.g. code-size,
-  # console printouts, etc.)
-  set(CMAKE_CXX_FLAGS_MINSIZEREL "-Os -g0 -DNDEBUG -DEMBEDDED -ffunction-sections -fdata-sections")
-  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    set(CMAKE_CXX_FLAGS_MINSIZEREL "${CMAKE_CXX_FLAGS_MINSIZEREL} -s")
-  endif()
-
-  if(GR4_USE_THIN_ARCHIVES)
-    set(CMAKE_CXX_ARCHIVE_CREATE "<CMAKE_AR> crT <TARGET> <LINK_FLAGS> <OBJECTS>")
-    set(CMAKE_CXX_ARCHIVE_APPEND "<CMAKE_AR> rT <TARGET> <LINK_FLAGS> <OBJECTS>")
-  else()
-    set(CMAKE_CXX_ARCHIVE_CREATE "<CMAKE_AR> cr <TARGET> <LINK_FLAGS> <OBJECTS>")
-    set(CMAKE_CXX_ARCHIVE_APPEND "<CMAKE_AR> r <TARGET> <LINK_FLAGS> <OBJECTS>")
-  endif()
-
-  if(APPLE)
-    # macOS ld uses -dead_strip instead of --gc-sections; -ffunction-sections/-fdata-sections are still valid for Clang
-    set(_LD_GC_SECTIONS "-Wl,-dead_strip -ffunction-sections -fdata-sections")
-  else()
-    set(_LD_GC_SECTIONS "-Wl,--gc-sections -ffunction-sections -fdata-sections")
-  endif()
-
-  if(APPLE)
-    # macOS Mach-O two-level namespace duplicates singletons (e.g. globalBlockRegistry()) when a static library is
-    # linked into both the executable and shared plugins; -flat_namespace forces ELF-like single-level lookup ensuring
-    # one instance. -stack_size 8 MiB matches the Linux default — macOS ARM64 non-main threads default to 512 KiB.
-    string(APPEND _LD_GC_SECTIONS " -Wl,-flat_namespace")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-stack_size,0x800000")
-  endif()
-
-  # prefer mold > lld > system linker (Linux/non-Emscripten only) --icf=safe (Identical Code Folding) is disabled under
-  # sanitizers to avoid merging functions that sanitiser instrumentation needs to track separately
-  set(_USE_ICF TRUE)
-  if(ADDRESS_SANITIZER
-     OR UB_SANITIZER
-     OR THREAD_SANITIZER)
-    set(_USE_ICF FALSE)
-  endif()
-
   # user-facing override: USE_MOLD_LINKER=OFF forces fall-through to lld/default even if mold is installed.
   option(USE_MOLD_LINKER "Use mold as the linker when available (falls back to lld, then default)" ON)
-
-  if(NOT
-     CMAKE_SYSTEM_NAME
-     STREQUAL
-     "Emscripten"
-     AND NOT APPLE)
-    set(_mold_usable FALSE)
-    if(USE_MOLD_LINKER)
-      find_program(MOLD_BIN ld.mold)
-      if(MOLD_BIN)
-        # mold < 3.0 does not parse the AS_NEEDED() directive used by some modern libatomic stubs (observed with GCC
-        # 16's libatomic_asneeded.so; affects any compiler toolchain whose runtime ships an AS_NEEDED linker-script
-        # stub). Auto-fall-through to lld / default in that case.
-        execute_process(
-          COMMAND "${MOLD_BIN}" --version
-          OUTPUT_VARIABLE _mold_version_out
-          OUTPUT_STRIP_TRAILING_WHITESPACE)
-        if(_mold_version_out MATCHES "mold ([0-9]+)\\.([0-9]+)")
-          if(CMAKE_MATCH_1 VERSION_LESS 3)
-            message(
-              STATUS "Skipping mold ${CMAKE_MATCH_1}.${CMAKE_MATCH_2} (AS_NEEDED() support requires mold >= 3.0).")
-          else()
-            set(_mold_usable TRUE)
-          endif()
-        else()
-          # unknown format — assume usable, user can override via -DUSE_MOLD_LINKER=OFF
-          set(_mold_usable TRUE)
-        endif()
-      endif()
-    endif()
-
-    if(_mold_usable)
-      set(_LD_GC_SECTIONS "${_LD_GC_SECTIONS} -fuse-ld=mold")
-      if(_USE_ICF)
-        string(APPEND _LD_GC_SECTIONS " -Wl,--icf=safe")
-      endif()
-      message(STATUS "Using mold @ ${MOLD_BIN} as the linker.")
-    else()
-      find_program(LLD_BIN ld.lld)
-      if(LLD_BIN)
-        set(_LD_GC_SECTIONS "${_LD_GC_SECTIONS} -fuse-ld=lld")
-        if(_USE_ICF)
-          string(APPEND _LD_GC_SECTIONS " -Wl,--icf=safe")
-        endif()
-        message(STATUS "Using lld @ ${LLD_BIN} as the linker.")
-      else()
-        message(STATUS "Using default system linker (mold and lld unavailable).")
-      endif()
-    endif()
-  endif()
-  set(CMAKE_EXE_LINKER_FLAGS_DEBUG "${_LD_GC_SECTIONS}")
-  set(CMAKE_SHARED_LINKER_FLAGS_DEBUG "${_LD_GC_SECTIONS}")
-  set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${_LD_GC_SECTIONS}")
-  set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "${_LD_GC_SECTIONS}")
-  set(CMAKE_EXE_LINKER_FLAGS_MINSIZEREL "${_LD_GC_SECTIONS}")
-  set(CMAKE_SHARED_LINKER_FLAGS_MINSIZEREL "${_LD_GC_SECTIONS}")
-  if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    # we need to set -Wa,-mbig-obj or build fails with gcc
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wa,-mbig-obj")
-    # on windows gcc requires stdc++exp to link for <format> and <print> functions
-    set(CMAKE_CXX_STANDARD_LIBRARIES "${CMAKE_CXX_STANDARD_LIBRARIES} -lstdc++exp")
-  endif()
-elseif(MSVC)
-  set(CMAKE_CXX_FLAGS_DEBUG "/Od /Zi /Zf /DDEBUG")
-  set(CMAKE_CXX_FLAGS_RELEASE "/O2 /GL /DNDEBUG")
-  set(CMAKE_CXX_FLAGS_RELWITHASSERT "/O2 /GL /DASSERT_ENABLED")
-  set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "/O2 /GL /Zi /Zf /DNDEBUG")
-  set(CMAKE_CXX_FLAGS_MINSIZEREL "/O1 /Os /GL /DNDEBUG")
-
-  set(LINK_RELEASE "/LTCG /OPT:REF /OPT:ICF")
-  set(LINK_RELASSERT "${LINK_RELEASE}")
-  set(LINK_RELDEBINFO "${LINK_RELEASE}")
-  set(LINK_MINSIZE "${LINK_RELEASE} /DEBUG:NONE") # strip PDB
 endif()
 
 if(NOT CMAKE_BUILD_TYPE)
@@ -215,6 +95,9 @@ option(ENABLE_TESTING "Enable Test Builds" ${GR_TOPLEVEL_PROJECT})
 option(ENABLE_BENCH "Include benchmarking in builds" ${GR_TOPLEVEL_PROJECT})
 option(MIT_ONLY "Exclude modules with non-MIT/Apache-compatible licences" OFF)
 option(GR_USE_FETCHCONTENT_DEPS "Allow CMake to download selected third-party dependencies with FetchContent" OFF)
+option(GR_PACKAGING "Allow GNURadio Core to be packaged with CPack" OFF)
+# Keep third party header diagnostic warnings out of GR's builds
+option(DISABLE_EXTERNAL_DEPS_WARNINGS "Treat external dependency headers as SYSTEM includes" ON)
 
 # Test executables check correctness, so a lower optimization level roughly halves their compile time and peak memory.
 # Benchmarks pin their own level. Empty keeps the build type's default.
@@ -234,6 +117,8 @@ set(GR_MAX_WASM_THREAD_COUNT
 add_compile_definitions(GR_MAX_WASM_THREAD_COUNT=${GR_MAX_WASM_THREAD_COUNT}) # propagate to C++
 set(GR4_PKGCONFIG_EXTRA_LIBS "")
 
+# End user GR configuration
+
 if(ENABLE_TESTING
    AND (UNIX
         OR APPLE
@@ -244,23 +129,12 @@ if(ENABLE_TESTING
   message("Building Tests and benchmarks.")
 endif()
 
-# apply known LSAN suppressions to all tests
-if(ADDRESS_SANITIZER OR UB_SANITIZER)
-  set(ASAN_SUPPRESSION_FILE "${CMAKE_SOURCE_DIR}/cmake/asan_suppressions.supp")
-  if(EXISTS "${ASAN_SUPPRESSION_FILE}")
-    set(ENV_ASAN_OPTIONS "ASAN_OPTIONS=suppressions=${ASAN_SUPPRESSION_FILE}")
-    message(STATUS "LeakSanitizer suppression enabled: ${ASAN_SUPPRESSION_FILE}")
-  else()
-    message(WARNING "AddressSanitizer suppression file not found: ${ASAN_SUPPRESSION_FILE}")
-  endif()
-  set(LSAN_SUPPRESSION_FILE "${CMAKE_SOURCE_DIR}/cmake/lsan_suppressions.supp")
-  if(EXISTS "${LSAN_SUPPRESSION_FILE}")
-    set(ENV_LSAN_OPTIONS "LSAN_OPTIONS=suppressions=${LSAN_SUPPRESSION_FILE}")
-    message(STATUS "LeakSanitizer suppression enabled: ${LSAN_SUPPRESSION_FILE}")
-  else()
-    message(WARNING "LeakSanitizer suppression file not found: ${LSAN_SUPPRESSION_FILE}")
-  endif()
-  set_property(GLOBAL PROPERTY _GR_TEST_ENV "${ENV_ASAN_OPTIONS};${ENV_LSAN_OPTIONS}")
+include(GNUInstallDirs)
+include(cmake/SetupCompilerBehavior.cmake)
+include(cmake/CompilerWarnings.cmake)
+include(cmake/Utils.cmake)
+if(ENABLE_TESTING)
+  include(cmake/GnuRadioTestHelpers.cmake)
 endif()
 
 if(EMSCRIPTEN OR NOT GR_ENABLE_BLOCK_REGISTRY)
@@ -281,11 +155,6 @@ if(GR_USE_ADAPTIVE_CPP
     FATAL_ERROR
       "SYCL is incompatible with ADDRESS_SANITIZER=${ADDRESS_SANITIZER} or UB_SANITIZER=${UB_SANITIZER} or THREAD_SANITIZER=${THREAD_SANITIZER}."
   )
-endif()
-
-include(cmake/CompilerWarnings.cmake)
-if(ENABLE_TESTING)
-  include(cmake/GnuRadioTestHelpers.cmake)
 endif()
 
 # blocklib_generator is a build process dependency, add it before everything
@@ -315,220 +184,17 @@ message(
 )
 message(STATUS "Is plugin system enabled? ${INTERNAL_ENABLE_BLOCK_PLUGINS}")
 
-# clang-scan-deps in required by ccache
-if(CMAKE_CXX_COMPILER_ID MATCHES ".*Clang")
-  string(
-    REGEX MATCH
-          "^[0-9]+"
-          CLANG_MAJOR
-          "${CMAKE_CXX_COMPILER_VERSION}")
-  find_program(CLANG_SCAN_DEPS_EXEC NAMES clang-scan-deps-${CLANG_MAJOR} clang-scan-deps)
-  if(CLANG_SCAN_DEPS_EXEC)
-    set(CMAKE_CXX_COMPILER_CLANG_SCAN_DEPS
-        "${CLANG_SCAN_DEPS_EXEC}"
-        CACHE FILEPATH "" FORCE)
-  else()
-    message(WARNING "clang‑scan‑deps not found; module scanning will be disabled")
-    set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
-  endif()
-endif()
-
-# Use ccache if found and enabled
-find_program(CCACHE_PROGRAM ccache)
-if(CCACHE_PROGRAM AND USE_CCACHE)
-  message(STATUS "ccache found and will be used")
-  set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${CCACHE_PROGRAM}")
-else()
-  message(STATUS "ccache will not be used")
-endif()
-
-# Prefer forced colored compiler output if there's a chance we'd otherwise get none at all. Ninja and ccache "consume"
-# the compiler output, breaking the terminal detection of compilers. ccache tries to solve the problem, but can only do
-# so if it determines that it's calling GCC or Clang. It uses a very lightweight heuristic, which breaks easily.
-if((CMAKE_GENERATOR STREQUAL "Ninja" OR (CCACHE_PROGRAM AND USE_CCACHE)) AND NOT DEFINED CMAKE_COLOR_DIAGNOSTICS)
-  message(
-    STATUS
-      "Forcing compiler color output due to the use of Ninja and/or ccache. Use -DCMAKE_COLOR_DIAGNOSTICS=OFF to turn it off."
-  )
-  set(CMAKE_COLOR_DIAGNOSTICS ON)
-endif()
-
-# Keep third party header diagnostic warnings out of GR's builds
-option(DISABLE_EXTERNAL_DEPS_WARNINGS "Treat external dependency headers as SYSTEM includes" ON)
-set(CMAKE_EXT_DEP_WARNING_GUARD "")
-if(DISABLE_EXTERNAL_DEPS_WARNINGS)
-  set(CMAKE_EXT_DEP_WARNING_GUARD SYSTEM)
-endif()
-
-# Initialize a variable to hold all the compiler flags -> exported into global config.h(.in)
-if(CMAKE_BUILD_TYPE MATCHES Debug)
-  set(ALL_COMPILER_FLAGS "${CMAKE_CXX_FLAGS_DEBUG} ${CMAKE_CXX_FLAGS}")
-elseif(CMAKE_BUILD_TYPE MATCHES Release)
-  set(ALL_COMPILER_FLAGS "${CMAKE_CXX_FLAGS_RELEASE} ${CMAKE_CXX_FLAGS}")
-elseif(CMAKE_BUILD_TYPE MATCHES RelWithAssert)
-  set(ALL_COMPILER_FLAGS "${CMAKE_CXX_FLAGS_RELWITHASSERT} ${CMAKE_CXX_FLAGS}")
-elseif(CMAKE_BUILD_TYPE MATCHES RelWithDebInfo)
-  set(ALL_COMPILER_FLAGS "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} ${CMAKE_CXX_FLAGS}")
-elseif(CMAKE_BUILD_TYPE MATCHES MinSizeRel)
-  set(ALL_COMPILER_FLAGS "${CMAKE_CXX_FLAGS_MINSIZEREL} ${CMAKE_CXX_FLAGS}")
-endif()
-# Replace ; with space
-string(
-  REPLACE ";"
-          " "
-          ALL_COMPILER_FLAGS
-          "${ALL_COMPILER_FLAGS}")
-
-if(CMAKE_CXX_COMPILER_ID MATCHES ".*Clang")
-  if(NOT GR_USE_ADAPTIVE_CPP AND GR4_USE_LIBCXX)
-    message(STATUS "Using plain Clang – enabling libc++ (GR4_USE_LIBCXX=ON)")
-    add_compile_options(-stdlib=libc++ -Wno-unused-command-line-argument)
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -stdlib=libc++")
-    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -stdlib=libc++")
-  elseif(NOT GR_USE_ADAPTIVE_CPP)
-    message(STATUS "Using plain Clang – using default C++ standard library")
-  else()
-    message(STATUS "AdaptiveCpp detected – skipping libc++ settings")
-  endif()
-  if(TIMETRACE)
-    add_compile_options(-ftime-trace)
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -ftime-trace")
-    message(STATUS "Enable TIMETRACE: ${TIMETRACE}")
-  endif()
-endif()
-
-if(CMAKE_CXX_COMPILER_ID MATCHES "(Clang|GNU)")
-  if(ENABLE_TBB)
-    find_package(TBB REQUIRED)
-    target_link_libraries(gnuradio-options INTERFACE TBB::tbb)
-    string(APPEND GR4_PKGCONFIG_EXTRA_LIBS " -ltbb")
-  else()
-    target_compile_definitions(gnuradio-options INTERFACE _GLIBCXX_USE_TBB_PAR_BACKEND=0)
-  endif()
-endif()
-
-if(CMAKE_CXX_COMPILER_ID MATCHES "(Clang|GNU)")
-  if(ADDRESS_SANITIZER)
-    set(SANITIZER_FLAGS
-        -fsanitize=address
-        -fsanitize-address-use-after-scope
-        -fsanitize=leak
-        -fno-omit-frame-pointer
-        -fstack-protector-strong)
-  elseif(UB_SANITIZER)
-    set(SANITIZER_FLAGS
-        -fsanitize=undefined
-        -fsanitize-address-use-after-scope
-        -fsanitize=leak
-        -fno-omit-frame-pointer
-        -fstack-protector-strong)
-  elseif(THREAD_SANITIZER)
-    set(SANITIZER_FLAGS -fsanitize=thread -fsanitize=thread)
-  endif()
-
-  if(DEFINED SANITIZER_FLAGS)
-    add_compile_options(${SANITIZER_FLAGS} -fno-omit-frame-pointer -fstack-protector-strong)
-    if(NOT EMSCRIPTEN)
-      add_compile_options(${SANITIZER_FLAGS} -fstack-clash-protection)
-    endif()
-    add_link_options(${SANITIZER_FLAGS})
-    message(STATUS "Enabled sanitizer flags: ${SANITIZER_FLAGS}")
-  endif()
-endif()
-
-# Include What You Use tooling: https://github.com/include-what-you-use/include-what-you-use
-find_program(INCLUDE_WHAT_YOU_USE_TOOL_PATH NAMES include-what-you-use iwyu)
-if(INCLUDE_WHAT_YOU_USE_TOOL_PATH)
-  message(" using 'Include What You Use' path: (${INCLUDE_WHAT_YOU_USE_TOOL_PATH})")
-  set_property(GLOBAL PROPERTY CMAKE_CXX_INCLUDE_WHAT_YOU_USE ${INCLUDE_WHAT_YOU_USE_TOOL_PATH})
-endif()
-
 set_project_warnings(gnuradio-options)
 
 if(EMSCRIPTEN)
-  set(CMAKE_EXECUTABLE_SUFFIX ".js")
-  # Make sure consumers of gnuradio4::gnuradio-options don't accidentally build with conflicting arguments
-  target_compile_definitions(gnuradio-options INTERFACE GR_MAX_WASM_THREAD_COUNT=${GR_MAX_WASM_THREAD_COUNT})
-  target_compile_options(gnuradio-options INTERFACE -fexceptions -pthread)
-  target_link_options(
-    gnuradio-options
-    INTERFACE
-    "SHELL:-s ALLOW_MEMORY_GROWTH=1"
-    "SHELL:-s ASSERTIONS=1"
-    "SHELL:-s INITIAL_MEMORY=256MB"
-    "SHELL:-s STACK_SIZE=4194304"
-    # "SHELL:-s SAFE_HEAP=1" # additional for debug "SHELL:-s ASSERTIONS=2" # additional for debug "SHELL:-s
-    # STACK_OVERFLOW_CHECK=2" # additional for debug "SHELL:-g" # additional for debug "SHELL:-gsource-map" # additional
-    # for debug "SHELL:--profiling-funcs" # additional for debug "SHELL:--emit-symbol-map" # additional for debug
-    -fexceptions
-    -pthread
-    "SHELL:-s PTHREAD_POOL_SIZE=${GR_MAX_WASM_THREAD_COUNT}"
-    "SHELL:-s PTHREAD_POOL_SIZE_STRICT=2"
-    "SHELL:-s FETCH=1"
-    "SHELL:-s WASM=1" # output as web-assembly
-    "SHELL:-s EXPORTED_RUNTIME_METHODS=['ccall']"
-    "SHELL:-s ENVIRONMENT=web,worker,node")
+  SetupEmscriptenGnuRadioOptions()
 endif()
 
-# include header-only libraries that have been inlined to simplify builds w/o requiring access to the internet
 if(NOT (TARGET magic_enum))
-  add_library(magic_enum INTERFACE)
-  add_library(gnuradio4::magic_enum ALIAS magic_enum)
-  target_include_directories(
-    magic_enum ${CMAKE_EXT_DEP_WARNING_GUARD} INTERFACE $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/third_party/magic_enum/>
-                                                        $<INSTALL_INTERFACE:include>)
-
-  set(magic_enum_public_headers third_party/magic_enum/magic_enum.hpp third_party/magic_enum/magic_enum_utility.hpp)
-  set_target_properties(magic_enum PROPERTIES PUBLIC_HEADER "${magic_enum_public_headers}")
-  install(
-    TARGETS magic_enum
-    EXPORT gnuradio4Targets
-    PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+  SetupMagicEnumTarget()
 endif()
 
 include(cmake/GnuRadioDependencies.cmake)
-
-if(EMSCRIPTEN AND TARGET ut)
-  # Boost.UT upstream adds -fwasm-exceptions which conflicts with our -fexceptions (JS exceptions). JS-based exceptions
-  # are required for Asyncify compatibility. Remove and replace.
-  get_target_property(_ut_copts ut INTERFACE_COMPILE_OPTIONS)
-  get_target_property(_ut_lopts ut INTERFACE_LINK_OPTIONS)
-  if(_ut_copts)
-    list(REMOVE_ITEM _ut_copts -fwasm-exceptions)
-    list(APPEND _ut_copts -fexceptions)
-    set_target_properties(ut PROPERTIES INTERFACE_COMPILE_OPTIONS "${_ut_copts}")
-  endif()
-  if(_ut_lopts)
-    list(REMOVE_ITEM _ut_lopts -fwasm-exceptions)
-    list(APPEND _ut_lopts -fexceptions)
-    set_target_properties(ut PROPERTIES INTERFACE_LINK_OPTIONS "${_ut_lopts}")
-  endif()
-endif()
-
-# check for CPython and Numpy dependencies
-set(PYTHON_FORCE_INCLUDE OFF)
-if(PYTHON_FORCE_INCLUDE)
-  find_package(Python3 3.12 REQUIRED COMPONENTS Interpreter Development NumPy)
-else()
-  find_package(Python3 3.12 COMPONENTS Interpreter Development NumPy)
-endif()
-
-set(PYTHON_AVAILABLE OFF)
-if(Python3_FOUND AND NOT EMSCRIPTEN)
-  execute_process(
-    COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckNumPy.py"
-    RESULT_VARIABLE NUMPY_NOT_FOUND
-    OUTPUT_VARIABLE NUMPY_INCLUDE_DIR
-    OUTPUT_STRIP_TRAILING_WHITESPACE)
-
-  # If NumPy is found, set PYTHON_AVAILABLE to ON
-  if(NOT NUMPY_NOT_FOUND)
-    set(PYTHON_AVAILABLE ON)
-    message(STATUS "Using Python Include Dirs: ${Python3_INCLUDE_DIRS} and ${NUMPY_INCLUDE_DIR}")
-  else()
-    message(STATUS "Python and Numpy Include headers not found!!")
-  endif()
-endif()
 
 if(ENABLE_BENCH)
   add_subdirectory(bench) # custom ut addon for microbenchmarking
@@ -542,73 +208,7 @@ if(ENABLE_TESTING
         OR APPLE
         OR WIN32)
    AND ENABLE_COVERAGE)
-  message("Coverage reporting enabled")
-  include(cmake/CodeCoverage.cmake) # https://github.com/bilke/cmake-modules/blob/master/CodeCoverage.cmake #
-  # (License: BSL-1.0)
-  target_compile_options(
-    gnuradio-options
-    INTERFACE --coverage
-              -Og
-              -g1
-              -gz
-    # -gdwarf-2 -gstrict-dwarf -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
-  ) # fortify_source is not possible without optimization
-  target_link_libraries(gnuradio-options INTERFACE --coverage)
-  append_coverage_compiler_flags()
-  set(GCOVR_ADDITIONAL_ARGS "--merge-mode-functions=merge-use-line-min"
-                            "--gcov-ignore-parse-errors=negative_hits.warn_once_per_file")
-  set(GR4_CORE_COVERAGE_DEPENDENCIES
-      qa_buffer
-      qa_AtomicBitset
-      qa_AtomicRef
-      qa_Value
-      qa_ValueHelper
-      qa_ComputeDomain
-      qa_DataSet
-      qa_DynamicPort
-      qa_LifeCycle
-      qa_MemoryAllocators
-      qa_PmtCollections
-      qa_Port
-      qa_Profiler
-      qa_Tensor
-      qa_TensorMath
-      qa_SVD
-      qa_TriggerMatcher
-      qa_YamlPmt
-      qa_PortableTypeName
-      qa_thread_affinity
-      qa_thread_pool
-      qa_SubGraphAssets
-      qa_fixed_string
-      qa_reflection
-      qa_formatter
-      qa_traits
-      qa_type_name
-      qa_UncertainValue
-      qa_RangesHelper)
-  setup_target_for_coverage_gcovr_xml(
-    NAME
-    coverage
-    EXECUTABLE
-    ctest
-    EXECUTABLE_ARGS
-    "--output-on-failure"
-    DEPENDENCIES
-    ${GR4_CORE_COVERAGE_DEPENDENCIES}
-    EXCLUDE
-    "${CMAKE_BINARY_DIR}/*")
-  setup_target_for_coverage_gcovr_html(
-    NAME
-    coverage_html
-    EXECUTABLE
-    ctest
-    EXECUTABLE_ARGS
-    "--output-on-failure"
-    DEPENDENCIES
-    ${GR4_CORE_COVERAGE_DEPENDENCIES}
-    EXCLUDE
-    "${CMAKE_BINARY_DIR}/*")
+  SetupCoverageSupport()
 endif()
 
 # Configure and install the pkg-config file TODO: This should become more granular - .pc for each in-tree module
@@ -661,92 +261,8 @@ install(
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GnuRadio4PrecompileHeaders.cmake"
   DESTINATION "${GR_CMAKECONFIG_INSTALL_DIR}")
 
-# print effective options
-message(STATUS "================================================")
-message(STATUS "GR-4 build configuration")
-message(STATUS "------------------------------------------------")
-message(STATUS "GR_TOPLEVEL_PROJECT          : ${GR_TOPLEVEL_PROJECT}")
-message(STATUS "GR_ENABLE_BLOCK_REGISTRY     : ${GR_ENABLE_BLOCK_REGISTRY}")
-message(STATUS "INTERNAL_ENABLE_BLOCK_PLUGINS: ${INTERNAL_ENABLE_BLOCK_PLUGINS}")
-message(STATUS "USE_CCACHE                   : ${USE_CCACHE}")
-message(STATUS "WARNINGS_AS_ERRORS           : ${WARNINGS_AS_ERRORS}")
-message(STATUS "TIMETRACE                    : ${TIMETRACE}")
-message(STATUS "ADDRESS_SANITIZER            : ${ADDRESS_SANITIZER}")
-message(STATUS "UB_SANITIZER                 : ${UB_SANITIZER}")
-message(STATUS "THREAD_SANITIZER             : ${THREAD_SANITIZER}")
-message(STATUS "ENABLE_TBB                   : ${ENABLE_TBB}")
-message(STATUS "ENABLE_EXAMPLES              : ${ENABLE_EXAMPLES}")
-message(STATUS "ENABLE_TESTING               : ${ENABLE_TESTING}")
-message(STATUS "ENABLE_COVERAGE              : ${ENABLE_COVERAGE}")
-message(STATUS "GR_MAX_WASM_THREAD_COUNT     : ${GR_MAX_WASM_THREAD_COUNT}")
-message(STATUS "------------------------------------------------")
+ReportConfigurationState()
 
-string(TOUPPER "${CMAKE_BUILD_TYPE}" _BT)
-set(_config_cxx_flags "${CMAKE_CXX_FLAGS_${_BT}}")
-set(_config_link_flags "${CMAKE_EXE_LINKER_FLAGS_${_BT}}")
-set(_base_cxx_flags "${CMAKE_CXX_FLAGS}")
-set(_base_link_flags "${CMAKE_EXE_LINKER_FLAGS}")
-get_directory_property(_dir_compile_opts COMPILE_OPTIONS)
-get_directory_property(_dir_link_opts LINK_OPTIONS)
-get_target_property(_t_copts gnuradio-options INTERFACE_COMPILE_OPTIONS)
-get_target_property(_t_lopts gnuradio-options INTERFACE_LINK_OPTIONS)
-if(_t_lopts STREQUAL "_t_lopts-NOTFOUND")
-  unset(_t_lopts)
+if(GR_PACKAGING)
+  include(cmake/CPackConfig.cmake)
 endif()
-
-string(
-  JOIN
-  " "
-  _final_compile_opts
-  ${_base_cxx_flags}
-  ${_config_cxx_flags}
-  ${_dir_compile_opts}
-  ${_t_copts})
-string(
-  JOIN
-  " "
-  _final_link_opts
-  ${_base_link_flags}
-  ${_config_link_flags}
-  ${_dir_link_opts}
-  ${_t_lopts})
-
-message(STATUS "Effective compiler flags : ${_final_compile_opts}")
-message(STATUS "Effective linker flags   : ${_final_link_opts}")
-message(STATUS "------------------------------------------------")
-message(STATUS "Toolchain details")
-message(STATUS "------------------------------------------------")
-message(STATUS "C++ compiler ID          : ${CMAKE_CXX_COMPILER_ID}")
-message(STATUS "GR_USE_ADAPTIVE_CPP?     : ${GR_USE_ADAPTIVE_CPP}")
-message(STATUS "C++ compiler path        : ${CMAKE_CXX_COMPILER}")
-message(STATUS "C++ compiler version     : ${CMAKE_CXX_COMPILER_VERSION}")
-string(
-  REGEX MATCH
-        "-fuse-ld=([a-zA-Z0-9._-]+)"
-        _linker_backend
-        "${_final_link_opts}")
-if(_linker_backend MATCHES "-fuse-ld=([a-zA-Z0-9._-]+)")
-  set(_detected_linker "${CMAKE_CXX_COMPILER} with ${CMAKE_MATCH_1}")
-else()
-  set(_detected_linker "${CMAKE_LINKER} (default/provided linker)")
-endif()
-message(STATUS "Linker                   : ${_detected_linker}")
-
-if(CCACHE_PROGRAM)
-  execute_process(
-    COMMAND ${CCACHE_PROGRAM} --version
-    OUTPUT_VARIABLE CCACHE_VERSION
-    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-  string(
-    REGEX MATCH
-          "[^\n]*"
-          CCACHE_VERSION_LINE
-          "${CCACHE_VERSION}")
-  message(STATUS "ccache                   : ${CCACHE_VERSION_LINE}")
-else()
-  message(STATUS "ccache                   : not found or disabled")
-endif()
-
-message(STATUS "================================================")
-
-include(cmake/CPackConfig.cmake)

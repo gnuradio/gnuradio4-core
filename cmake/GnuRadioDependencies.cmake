@@ -5,6 +5,9 @@ if(EMSCRIPTEN OR GR_USE_FETCHCONTENT_DEPS)
   include(FetchContent)
 endif()
 
+include(CMakePackageConfigHelpers)
+find_package(PkgConfig QUIET)
+
 function(ObtainOrFindUT)
   if(FETCH)
     FetchContent_Declare(
@@ -33,6 +36,23 @@ function(ObtainOrFindUT)
     ON
     CACHE BOOL "Disable UT Module Support" FORCE)
   add_compile_definitions(BOOST_UT_DISABLE_MODULE)
+endfunction()
+
+function(SetupUtTargetForEmscripten)
+  # Boost.UT upstream adds -fwasm-exceptions which conflicts with our -fexceptions (JS exceptions). JS-based exceptions
+  # are required for Asyncify compatibility. Remove and replace.
+  get_target_property(_ut_copts ut INTERFACE_COMPILE_OPTIONS)
+  get_target_property(_ut_lopts ut INTERFACE_LINK_OPTIONS)
+  if(_ut_copts)
+    list(REMOVE_ITEM _ut_copts -fwasm-exceptions)
+    list(APPEND _ut_copts -fexceptions)
+    set_target_properties(ut PROPERTIES INTERFACE_COMPILE_OPTIONS "${_ut_copts}")
+  endif()
+  if(_ut_lopts)
+    list(REMOVE_ITEM _ut_lopts -fwasm-exceptions)
+    list(APPEND _ut_lopts -fexceptions)
+    set_target_properties(ut PROPERTIES INTERFACE_LINK_OPTIONS "${_ut_lopts}")
+  endif()
 endfunction()
 
 
@@ -140,3 +160,8 @@ if(GR_FETCH_MAKE_AVAILABLE_DEPS)
 endif()
 
 DefineVirTarget()
+if(EMSCRIPTEN AND TARGET ut)
+  SetupUtTargetForEmscripten()
+endif()
+
+CheckPythonAvailability()
