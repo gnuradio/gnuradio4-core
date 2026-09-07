@@ -683,11 +683,11 @@ GR_REGISTER_BLOCK(my::Gain, [T], [float, double])
 GR_REGISTER_BLOCK(my::Converter, ([T], [U]), [float, double], [int, long])
 
 // extra non-type template arguments (here: 3UZ)
-GR_REGISTER_BLOCK("gr::electrical::ThreePhasePower", gr::electrical::PowerMetrics,
+GR_REGISTER_BLOCK("my::ThreePhasePower", my::PowerMetrics,
                    ([T], 3UZ), [float, double])
 
 // custom name + policy template argument — [T] inside policy is also expanded
-GR_REGISTER_BLOCK("gr::blocks::math::AddConst", gr::blocks::math::MathOpImpl,
+GR_REGISTER_BLOCK("my::AddConst", my::MathOpImpl,
                    ([T], std::plus<[T]>), [float, double, std::complex<float>])
 ```
 
@@ -697,6 +697,14 @@ GR_REGISTER_BLOCK("gr::blocks::math::AddConst", gr::blocks::math::MathOpImpl,
 | `3UZ`, `std::plus<[T]>` | fixed non-type/type template arguments                       |
 | `[float, double]`       | type list for expansion of corresponding `[T]`               |
 | `"custom::name"`        | optional custom registered name (default: deduced from type) |
+
+Fixing a template argument in the registration is supported but is not how
+`gnuradio4-blocks` spells these blocks. Where a block is an alias for a more
+general template — `AddConst<T>` for `MathOpImpl<T, std::plus<T>>`,
+`ThreePhasePowerMetrics<T>` for `PowerMetrics<T, 3UZ>` — register the alias
+under its own name with a single `[T]`. The registered key is then the element
+type alone, `gr::blocks::math::AddConst<float32>`, rather than one that repeats
+the fixed argument.
 
 Downstream examples: common blocks, math blocks, power estimators, and
 hardware-backed blocks in `gnuradio4-blocks`.
