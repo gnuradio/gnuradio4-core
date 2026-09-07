@@ -693,7 +693,7 @@ private:
             } else {
                 maybe_value = std::unexpected("Unexpected type in stagedValue");
             }
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) || (defined(__APPLE__) && defined(__aarch64__))
         } else if constexpr (std::is_same_v<Type, std::size_t> && !std::is_same_v<std::size_t, gr::Size_t>) {
             auto ptr = checked_access_ptr{stagedValue.get_if<gr::Size_t>()};
             if (ptr != nullptr) {
