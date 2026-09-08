@@ -928,10 +928,16 @@ protected:
                         throw gr::exception(std::format("ScheduledBlockGroup is not a SchedulerModel {}", block->uniqueName()));
                     }
                 } else {
-                    // a child that refuses to start — a throwing start() hook lands here in the ERROR
-                    // state — must fail the run itself, not only the message stream: the first such
-                    // error is what runAndWait() returns
-                    std::expected<void, Error> transitioned = block->changeStateTo(lifecycle::RUNNING);
+                    // a child that never initialized or refuses to start — a throwing init or start() hook
+                    // leaves the block unable to run — must fail the run itself, not only the message
+                    // stream: the first such error is what runAndWait() returns
+                    std::optional<Error>       initFailure = block->initError();
+                    std::expected<void, Error> transitioned;
+                    if (initFailure.has_value()) {
+                        transitioned = std::unexpected(std::move(*initFailure));
+                    } else {
+                        transitioned = block->changeStateTo(lifecycle::RUNNING);
+                    }
                     if (!transitioned && !_firstChildStartError.has_value()) {
                         _firstChildStartError = transitioned.error();
                     }

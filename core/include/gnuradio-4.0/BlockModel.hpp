@@ -436,6 +436,10 @@ public:
      */
     virtual void init(std::shared_ptr<gr::Sequence> progress, std::string_view ioThreadPool) = 0;
 
+    // the error that kept init() from completing, if any: init() has no return value and a block's message
+    // port has no subscriber while the graph is built, so the user code it runs reaches no caller but this
+    [[nodiscard]] virtual std::optional<Error> initError() const { return {}; }
+
     /**
      * @brief returns scheduling hint that invoking the work(...) function may block on IO or system-calls
      */
@@ -777,6 +781,14 @@ public:
     void init(std::shared_ptr<gr::Sequence> progress, std::string_view ioThreadPool = gr::thread_pool::kDefaultIoPoolId) override {
         if constexpr (requires { blockRef().init(progress, ioThreadPool); }) {
             return blockRef().init(progress, ioThreadPool);
+        }
+    }
+
+    [[nodiscard]] std::optional<Error> initError() const override {
+        if constexpr (requires { blockRef()._initError; }) {
+            return blockRef()._initError;
+        } else {
+            return {};
         }
     }
 

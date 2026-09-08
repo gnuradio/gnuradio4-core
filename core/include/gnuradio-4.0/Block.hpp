@@ -560,6 +560,10 @@ struct BlockBase {
     const MsgPortInBuiltin& (*_cbMsgIn)(const void*)                        = nullptr;
     MsgPortOutBuiltin& (*_cbMsgOut)(void*)                                  = nullptr;
 
+    // the error that kept init() from completing, if any: init() has no return value and a block's message
+    // port has no subscriber while the graph is built, so the error waits here for the scheduler to read it
+    std::optional<Error> _initError;
+
     // Hook for GraphWrapper to handle subgraph export port messages on any block type
     using SubgraphExportHandler                  = std::optional<Message> (*)(void* context, Message);
     SubgraphExportHandler _subgraphExportHandler = nullptr;
@@ -1047,7 +1051,8 @@ public:
         settings().init();
 
         // apply initial settings — forward params pend until a work call has an output span
-        invokeUserProvidedFunction("init() - applyStagedParameters", [this] noexcept(false) {
+        _initError.reset();
+        try {
             auto applyResult = settings().applyStagedParameters();
             if (!applyResult.appliedParameters.empty()) {
                 notifyListeners(block::property::kSetting, settings().get());
@@ -1055,7 +1060,20 @@ public:
             if constexpr (!noTagPropagation) {
                 mergeForwardParams(_pendingForwardParams, std::move(applyResult.forwardParameters));
             }
-        });
+        } catch (const gr::exception& e) {
+            _initError = Error{std::format("Block '{}' init() throws: {}", std::string(unique_name), e.message), e.sourceLocation, e.errorTime};
+        } catch (const std::exception& e) {
+            _initError = Error{std::format("Block '{}' init() throws: {}", std::string(unique_name), e.what())};
+        } catch (...) {
+            _initError = Error{std::format("Block '{}' init() throws: {}", std::string(unique_name), "unknown unnamed error")};
+        }
+        if (_initError.has_value()) {
+            // a block that could not apply its settings is not initialized and has no caller to tell, so it
+            // keeps the error for the scheduler to report and enters the error state rather than claiming it
+            emitErrorMessage("init() - applyStagedParameters", *_initError);
+            emitErrorMessageIfAny("init(..) -> ERROR", this->changeStateTo(lifecycle::State::ERROR));
+            return;
+        }
         checkBlockArgumentContracts();
         if constexpr (gr::meta::kDebugBuild) {
             checkBlockParameterConsistency();
