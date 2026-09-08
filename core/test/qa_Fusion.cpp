@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <format>
 #include <limits>
+#include <memory>
 #include <ranges>
 #include <string>
 #include <thread>
@@ -965,6 +967,206 @@ struct RecordArm {
     return RecordArm{snk.recordIds, collectRunSizes(scheduler.fusionPlan()), rec.nRecorded, rec.maxOffered, rec.maxRoom, finished};
 }
 
+inline std::atomic<std::size_t> gOwningConstructed{0UZ};
+inline std::atomic<std::size_t> gOwningDestroyed{0UZ};
+
+// owns its payload, so its assignment operator reads the target: assigning to raw storage would dereference a
+// pointer whose lifetime never began
+struct OwningSample {
+    std::shared_ptr<float> value;
+
+    OwningSample() : value(std::make_shared<float>(0.0f)) { gOwningConstructed.fetch_add(1UZ, std::memory_order_relaxed); }
+    OwningSample(const OwningSample& other) : value(std::make_shared<float>(*other.value)) { gOwningConstructed.fetch_add(1UZ, std::memory_order_relaxed); }
+    ~OwningSample() { gOwningDestroyed.fetch_add(1UZ, std::memory_order_relaxed); }
+
+    OwningSample& operator=(const OwningSample& other) {
+        *value = *other.value;
+        return *this;
+    }
+};
+
+inline constexpr std::size_t kOwningSamples = 512UZ;
+
+struct OwningSource : Block<OwningSource> {
+    PortOut<OwningSample> out;
+
+    GR_MAKE_REFLECTABLE(OwningSource, out);
+
+    std::size_t _emitted = 0UZ;
+
+    work::Status processBulk(OutputSpanLike auto& outSpan) {
+        if (_emitted >= kOwningSamples) {
+            outSpan.publish(0UZ);
+            return work::Status::DONE;
+        }
+        const std::size_t n = std::min(outSpan.size(), kOwningSamples - _emitted);
+        for (std::size_t i = 0UZ; i < n; ++i) {
+            *outSpan[i].value = static_cast<float>(_emitted + i);
+        }
+        _emitted += n;
+        outSpan.publish(n);
+        return n == 0UZ ? work::Status::INSUFFICIENT_OUTPUT_ITEMS : work::Status::OK;
+    }
+};
+
+struct OwningScale : Block<OwningScale> {
+    PortIn<OwningSample>  in;
+    PortOut<OwningSample> out;
+
+    GR_MAKE_REFLECTABLE(OwningScale, in, out);
+
+    [[nodiscard]] OwningSample processOne(const OwningSample& sample) const {
+        OwningSample scaled;
+        *scaled.value = *sample.value * 2.0f;
+        return scaled;
+    }
+};
+
+struct OwningSink : Block<OwningSink> {
+    PortIn<OwningSample> in;
+
+    GR_MAKE_REFLECTABLE(OwningSink, in);
+
+    std::vector<float> values;
+
+    void processOne(const OwningSample& sample) { values.push_back(*sample.value); }
+};
+
+inline std::atomic<std::size_t> gMisalignedStageAddresses{0UZ};
+
+template<typename T>
+inline void countAlignment(const T& sample) {
+    if ((reinterpret_cast<std::uintptr_t>(std::addressof(sample)) % alignof(T)) != 0UZ) {
+        gMisalignedStageAddresses.fetch_add(1UZ, std::memory_order_relaxed);
+    }
+}
+
+inline constexpr std::size_t kStageAlignment       = 64UZ;
+inline constexpr std::size_t kAlignedSamples       = 512UZ;
+inline constexpr std::size_t kUnalignedStrideChunk = 3UZ;
+
+struct alignas(kStageAlignment) AlignedSample {
+    float value{};
+};
+
+// wider than the over-aligned sample and a multiple of no cache line, so this type sizes the scratch stride and a
+// stride of whole samples of it does not carry the alignment of the over-aligned one
+struct WideSample {
+    float                     value;
+    std::array<std::byte, 76> pad;
+
+    WideSample() : value(0.0f), pad{} {}
+};
+
+static_assert(sizeof(WideSample) > sizeof(AlignedSample), "the wide type must size the scratch stride");
+static_assert((kUnalignedStrideChunk * sizeof(WideSample)) % alignof(AlignedSample) != 0UZ, "a stride of whole wide samples must not be aligned on its own");
+
+struct AlignedSource : Block<AlignedSource> {
+    PortOut<AlignedSample> out;
+
+    GR_MAKE_REFLECTABLE(AlignedSource, out);
+
+    std::size_t _emitted = 0UZ;
+
+    work::Status processBulk(OutputSpanLike auto& outSpan) {
+        if (_emitted >= kAlignedSamples) {
+            outSpan.publish(0UZ);
+            return work::Status::DONE;
+        }
+        const std::size_t n = std::min(outSpan.size(), kAlignedSamples - _emitted);
+        for (std::size_t i = 0UZ; i < n; ++i) {
+            outSpan[i].value = static_cast<float>(_emitted + i);
+        }
+        _emitted += n;
+        outSpan.publish(n);
+        return n == 0UZ ? work::Status::INSUFFICIENT_OUTPUT_ITEMS : work::Status::OK;
+    }
+};
+
+struct AlignedToWide : Block<AlignedToWide> {
+    PortIn<AlignedSample> in;
+    PortOut<WideSample>   out;
+
+    GR_MAKE_REFLECTABLE(AlignedToWide, in, out);
+
+    [[nodiscard]] WideSample processOne(const AlignedSample& sample) const {
+        countAlignment(sample);
+        WideSample wide;
+        wide.value = sample.value;
+        return wide;
+    }
+};
+
+struct WideToAligned : Block<WideToAligned> {
+    PortIn<WideSample>     in;
+    PortOut<AlignedSample> out;
+
+    GR_MAKE_REFLECTABLE(WideToAligned, in, out);
+
+    [[nodiscard]] AlignedSample processOne(const WideSample& sample) const {
+        countAlignment(sample);
+        return AlignedSample{sample.value};
+    }
+};
+
+struct AlignedGain : Block<AlignedGain> {
+    PortIn<AlignedSample>  in;
+    PortOut<AlignedSample> out;
+
+    GR_MAKE_REFLECTABLE(AlignedGain, in, out);
+
+    [[nodiscard]] AlignedSample processOne(const AlignedSample& sample) const {
+        countAlignment(sample);
+        return AlignedSample{2.0f * sample.value};
+    }
+};
+
+struct AlignedSink : Block<AlignedSink> {
+    PortIn<AlignedSample> in;
+
+    GR_MAKE_REFLECTABLE(AlignedSink, in);
+
+    std::vector<float> values;
+
+    void processOne(const AlignedSample& sample) {
+        countAlignment(sample);
+        values.push_back(sample.value);
+    }
+};
+
+struct AlignedArm {
+    std::vector<float> values;
+    std::size_t        nMisaligned = 0UZ;
+    std::size_t        nRuns       = 0UZ;
+};
+
+// three composed members put the second ping-pong buffer in the middle of the segment, and the wide member sizes
+// the stride to a multiple of neither the aligned sample nor a cache line
+[[nodiscard]] inline AlignedArm runAlignedChain(bool fusion, std::size_t chunkSamples) {
+    using namespace boost::ut;
+
+    gr::Graph flow;
+    auto&     source = flow.emplaceBlock<AlignedSource>();
+    auto&     toWide = flow.emplaceBlock<AlignedToWide>();
+    auto&     toNarw = flow.emplaceBlock<WideToAligned>();
+    auto&     gain   = flow.emplaceBlock<AlignedGain>();
+    auto&     sink   = flow.emplaceBlock<AlignedSink>();
+    expect(flow.connect<"out", "in">(source, toWide).has_value());
+    expect(flow.connect<"out", "in">(toWide, toNarw).has_value());
+    expect(flow.connect<"out", "in">(toNarw, gain).has_value());
+    expect(flow.connect<"out", "in">(gain, sink).has_value());
+
+    AlignedSink* observed = std::addressof(sink);
+    gMisalignedStageAddresses.store(0UZ, std::memory_order_relaxed);
+
+    const gr::property_map                                                schedulerSettings{{"enable_fusion", fusion}, {"fusion_chunk_samples", static_cast<gr::Size_t>(chunkSamples)}};
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{schedulerSettings};
+    expect(scheduler.exchange(std::move(flow)).has_value());
+    expect(scheduler.runAndWait().has_value());
+
+    return AlignedArm{observed->values, gMisalignedStageAddresses.load(std::memory_order_relaxed), collectRunSizes(scheduler.fusionPlan()).size()};
+}
+
 } // namespace qa_fusion
 
 const boost::ut::suite<"fusion"> _fusion = [] {
@@ -1501,6 +1703,63 @@ const boost::ut::suite<"fusion"> _fusion = [] {
         expect(eq(fused.recordIds.size(), kRecordCount));
         expect(eq(unfused.recordIds.size(), kRecordCount));
         expect(fused.recordIds == unfused.recordIds) << "the record sequence differs";
+    };
+
+    "the classifier breaks a run at a sample type that owns memory"_test = [] {
+        const std::vector<std::size_t> runSizes = planOnly([](gr::Graph& flow) {
+            auto& source = flow.emplaceBlock<OwningSource>();
+            auto& scaleA = flow.emplaceBlock<OwningScale>();
+            auto& scaleB = flow.emplaceBlock<OwningScale>();
+            auto& sink   = flow.emplaceBlock<OwningSink>();
+            expect(flow.connect<"out", "in">(source, scaleA).has_value());
+            expect(flow.connect<"out", "in">(scaleA, scaleB).has_value());
+            expect(flow.connect<"out", "in">(scaleB, sink).has_value());
+        });
+        expect(runSizes.empty()) << "a sample the runner cannot create in byte scratch leaves no chain of two";
+    };
+
+    "a sample type that owns memory is delivered whole and freed"_test = [] {
+        const auto runOwningChain = [](bool fusion) {
+            gOwningConstructed.store(0UZ, std::memory_order_relaxed);
+            gOwningDestroyed.store(0UZ, std::memory_order_relaxed);
+
+            std::vector<float> values;
+            {
+                gr::Graph flow;
+                auto&     source = flow.emplaceBlock<OwningSource>();
+                auto&     scaleA = flow.emplaceBlock<OwningScale>();
+                auto&     scaleB = flow.emplaceBlock<OwningScale>();
+                auto&     sink   = flow.emplaceBlock<OwningSink>();
+                expect(flow.connect<"out", "in">(source, scaleA).has_value());
+                expect(flow.connect<"out", "in">(scaleA, scaleB).has_value());
+                expect(flow.connect<"out", "in">(scaleB, sink).has_value());
+
+                OwningSink* observed = std::addressof(sink);
+
+                gr::scheduler::Simple<singleThreaded> scheduler{gr::property_map{{"enable_fusion", fusion}}};
+                expect(scheduler.exchange(std::move(flow)).has_value());
+                expect(scheduler.runAndWait().has_value());
+                values = observed->values;
+            }
+            expect(eq(gOwningConstructed.load(std::memory_order_relaxed), gOwningDestroyed.load(std::memory_order_relaxed))) << "every sample that was created must be destroyed";
+            return values;
+        };
+
+        const std::vector<float> unfused = runOwningChain(false);
+        const std::vector<float> fused   = runOwningChain(true);
+        expect(eq(unfused.size(), kOwningSamples));
+        expect(fused == unfused) << "fusion changed the stream of an owning sample type";
+    };
+
+    "an over-aligned sample type is fused on addresses it can be created at"_test = [] {
+        const AlignedArm unfused = runAlignedChain(false, kUnalignedStrideChunk);
+        const AlignedArm fused   = runAlignedChain(true, kUnalignedStrideChunk);
+
+        expect(eq(fused.nRuns, 1UZ)) << "an over-aligned trivially copyable sample type is a fusable stage type";
+        expect(eq(unfused.nMisaligned, 0UZ)) << "the unfused path must hand out aligned addresses";
+        expect(eq(fused.nMisaligned, 0UZ)) << "a scratch address must carry the alignment of the type created at it";
+        expect(eq(unfused.values.size(), kAlignedSamples));
+        expect(fused.values == unfused.values) << "fusion changed the stream of an over-aligned sample type";
     };
 };
 

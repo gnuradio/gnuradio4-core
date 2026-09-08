@@ -2733,24 +2733,30 @@ namespace block {
 namespace detail {
 
 template<typename T>
-concept FusableStageBlock = HasProcessOneFunction<T> && !HasProcessBulkFunction<T>                                                            //
-                            && (T::blockCategory == block::Category::NormalBlock)                                                             //
-                            && (traits::block::stream_input_port_types<T>::size() == 1UZ)                                                     //
-                            && (traits::block::stream_output_port_types<T>::size() == 1UZ)                                                    //
-                            && !T::noTagPropagation && !T::forwardTagPropagation && !T::backwardTagPropagation && !T::mergeTagPropagation     //
-                            && !T::StrideControl::kEnabled && !T::ResamplingControl::kEnabled                                                 //
-                            && !requires(T& block) { block.forwardTags(std::declval<std::tuple<>&>(), std::declval<std::tuple<>&>(), 0UZ); }; //
-
-template<typename T>
-concept BulkStageBlock = HasProcessBulkFunction<T> && !HasProcessOneFunction<T>          //
-                         && (T::blockCategory == block::Category::NormalBlock)           //
-                         && (traits::block::stream_input_port_types<T>::size() == 1UZ)   //
-                         && (traits::block::stream_output_port_types<T>::size() == 1UZ); //
-
-template<typename T>
 using FusedValueTypeIn = typename traits::block::stream_input_port_types<T>::template at<0>;
 template<typename T>
 using FusedValueTypeOut = typename traits::block::stream_output_port_types<T>::template at<0>;
+
+// a fused run creates the intermediate samples of a composed segment in raw byte scratch and never destroys them, so
+// a stage value type must be one that a byte-wise copy creates and whose destruction has no effect
+template<typename T>
+concept TriviallyCopyableStageTypes = std::is_trivially_copyable_v<FusedValueTypeIn<T>> && std::is_trivially_copyable_v<FusedValueTypeOut<T>>;
+
+template<typename T>
+concept FusableStageBlock = HasProcessOneFunction<T> && !HasProcessBulkFunction<T>                                                           //
+                            && (T::blockCategory == block::Category::NormalBlock)                                                            //
+                            && (traits::block::stream_input_port_types<T>::size() == 1UZ)                                                    //
+                            && (traits::block::stream_output_port_types<T>::size() == 1UZ)                                                   //
+                            && !T::noTagPropagation && !T::forwardTagPropagation && !T::backwardTagPropagation && !T::mergeTagPropagation    //
+                            && !T::StrideControl::kEnabled && !T::ResamplingControl::kEnabled                                                //
+                            && !requires(T& block) { block.forwardTags(std::declval<std::tuple<>&>(), std::declval<std::tuple<>&>(), 0UZ); } //
+                            && TriviallyCopyableStageTypes<T>;
+
+template<typename T>
+concept BulkStageBlock = HasProcessBulkFunction<T> && !HasProcessOneFunction<T>        //
+                         && (T::blockCategory == block::Category::NormalBlock)         //
+                         && (traits::block::stream_input_port_types<T>::size() == 1UZ) //
+                         && (traits::block::stream_output_port_types<T>::size() == 1UZ) && TriviallyCopyableStageTypes<T>;
 
 template<FusableStageBlock T>
 std::size_t fusedApplyChunk(void* rawBlock, const void* in, void* out, std::size_t nSamples) {
