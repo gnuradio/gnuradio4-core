@@ -58,7 +58,11 @@ RUN set -eux; \
     fi \
     && cmake --build /build/minimal-blocklib --parallel 4 \
     && if [ "${SDK_TARGET}" = emscripten ]; then \
-      "${system_node}" /build/minimal-blocklib/minimal_blocklib_consumer.js; \
+      for consumer in minimal_blocklib_consumer_Shared minimal_blocklib_consumer_Static \
+                      minimal_blocklib_collision_Shared minimal_blocklib_collision_Static \
+                      minimal_blocklib_named_registry; do \
+        "${system_node}" "/build/minimal-blocklib/${consumer}.js"; \
+      done; \
     fi \
     && mkdir -p /opt/gnuradio4/share/gnuradio4-core-sdk \
     && if [ "${SDK_TARGET}" = emscripten ]; then emscripten_version="$(emcc -dumpversion)"; else emscripten_version=none; fi \
