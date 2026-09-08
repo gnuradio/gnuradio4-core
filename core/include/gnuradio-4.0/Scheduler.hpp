@@ -187,6 +187,7 @@ protected:
     // separate cache lines: every worker reads the flag and updates the counter on each iteration
     alignas(gr::kCacheLine) bool _workQuiescenceRequested{false};
     alignas(gr::kCacheLine) std::size_t _nWorkersInWork{0};
+    std::size_t _nWorkersStarted{0}; // workers of this run that reached poolWorker(), not workers the pool has queued
 
     // a watchdog only leaves on its own once the run's jobs are gone, which a restart inside its check
     // interval undoes, so every start retires the previous generation explicitly
@@ -253,6 +254,21 @@ public:
     }
 
     void releaseWorkQuiescence() { gr::atomic_ref(_workQuiescenceRequested).store_release(false); }
+
+    [[nodiscard]] bool workerStarted() noexcept { return gr::atomic_ref(_nWorkersStarted).load_acquire() > 0UZ; }
+
+    // a worker holds its pool thread for the run's lifetime, so a start into a pool whose threads are all held
+    // queues that worker behind them for as long as the holders live
+    [[nodiscard]] std::expected<void, Error> checkWorkerCapacity() const {
+        if constexpr (executionPolicy() == ExecutionPolicy::multiThreaded) {
+            const std::size_t nThreads = static_cast<std::size_t>(_pool->maxThreads());
+            const std::size_t nBusy    = std::min(_pool->numTasksRunning(), nThreads);
+            if (nBusy >= nThreads) {
+                return std::unexpected(Error(std::format("thread pool '{}' runs {} of its {} threads and has none free for a worker of '{}'", _pool->name(), nBusy, nThreads, this->unique_name)));
+            }
+        }
+        return {};
+    }
 
     void requestWorkQuiescenceAll() {
         requestWorkQuiescence();
@@ -880,6 +896,7 @@ protected:
         // keeps children and the watchdog from starting while the previous run unwinds.
         const std::size_t workerGeneration = gr::atomic_ref(_workerGeneration).fetch_add(1UZ) + 1UZ;
         waitDone();
+        gr::atomic_ref(_nWorkersStarted).store_release(0UZ);
 
         disconnectAllEdges();
         if (auto result = connectPendingEdges(); !result) {
@@ -1013,6 +1030,7 @@ protected:
 
     void poolWorker(const std::size_t runnerID, std::shared_ptr<std::vector<std::vector<std::shared_ptr<BlockModel>>>> jobList) {
         using enum lifecycle::State;
+        gr::atomic_ref(_nWorkersStarted).fetch_add(1UZ);
         std::shared_ptr<gr::Sequence> progress     = _graph->_progress; // life-time guaranteed
         std::shared_ptr<gr::Sequence> nRunningJobs = _nRunningJobs;
 
@@ -1296,8 +1314,8 @@ protected:
         }
     }
 
-    // a sub-scheduler's RUNNING transition runs its whole loop, so it starts through the threaded wrapper
-    // rather than on the thread that adopts it
+    // a sub-scheduler's RUNNING transition runs its whole loop, so it starts through the threaded wrapper rather than
+    // on the thread that adopts it, and only an executing worker shows that its pool had a thread for it
     void startAdoptedScheduler(const std::shared_ptr<BlockModel>& newBlock) {
         using enum lifecycle::State;
         auto* schedulerModel = dynamic_cast<SchedulerModel*>(newBlock.get());
@@ -1308,12 +1326,15 @@ protected:
         if (newBlock->state() == STOPPED) {
             this->emitErrorMessageIfAny("adoptBlock -> INITIALISED", newBlock->changeStateTo(INITIALISED));
         }
-        schedulerModel->start();
+        if (auto started = schedulerModel->startAdopted(); !started.has_value()) {
+            this->emitErrorMessageIfAny("adoptBlock", started);
+            return;
+        }
 
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(watchdog_timeout.value);
-        while (newBlock->state() == INITIALISED) {
+        while (!schedulerModel->workerStarted()) {
             if (std::chrono::steady_clock::now() >= deadline) {
-                this->emitErrorMessage("adoptBlock", std::format("adopted sub-scheduler '{}' did not reach RUNNING", newBlock->uniqueName()));
+                this->emitErrorMessage("adoptBlock", std::format("no worker of adopted sub-scheduler '{}' began executing", newBlock->uniqueName()));
                 return;
             }
             std::this_thread::yield();
