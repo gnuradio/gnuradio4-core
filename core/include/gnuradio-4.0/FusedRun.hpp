@@ -346,7 +346,9 @@ struct FusedRun : BlockModel {
             }
         }
 
-        _scratchStride = maxSegmentSize * maxValueSize;
+        // the second ping-pong buffer begins one stride into an allocation the allocator aligns to a cache line, so a
+        // stride that is a multiple of it carries that alignment to every value type aligned no wider
+        _scratchStride = ((maxSegmentSize * maxValueSize + gr::kCacheLine - 1UZ) / gr::kCacheLine) * gr::kCacheLine;
         _scratch.resize((_inPlaceScratch ? 1UZ : 2UZ) * _scratchStride);
 
         _name       = std::format("fused[{}..{}]", _members.front()->name(), _members.back()->name());
