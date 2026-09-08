@@ -39,6 +39,11 @@ add_non_blocklib_plugin(good_math_plugin)
 add_non_blocklib_plugin(good_conversion_plugin)
 add_non_blocklib_plugin(bad_plugin)
 
+# a plugin that registers two revisions of one alias; it goes in a directory of its own so that a loader over that
+# directory reports its versions and nothing else
+add_non_blocklib_plugin(versioned_plugin)
+set_target_properties(versioned_plugin PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${TESTS_BINARY_PATH}/versioned_plugin)
+
 # Shared objects that register blocks without being plugins: no gr_plugin_make, entries reaching the registry from
 # static initializers. Two go in one directory, because one alone does not show what unloading it does to a neighbor.
 function(add_block_library LIBRARY_NAME DIRECTORY_NAME)
