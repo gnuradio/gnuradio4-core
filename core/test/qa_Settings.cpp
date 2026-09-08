@@ -178,6 +178,44 @@ struct RateCountingBlock : Block<RateCountingBlock> {
     void settingsChanged(const property_map& /*oldSettings*/, const property_map& /*newSettings*/) { nSettingsChanged++; }
 };
 
+/// keeps both maps of every settings change, so what the callback was told can be read off the block
+struct ChangeRecordingBlock : Block<ChangeRecordingBlock> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    Annotated<float, "sample rate">         sample_rate = 1.0f;
+    Annotated<gr::Size_t, "FFT size">       fft_size    = 1024U;
+    Annotated<gr::Size_t, "averages">       n_averages  = 1U;
+    Annotated<gr::Size_t, "worker threads"> n_workers   = 1U;
+
+    GR_MAKE_REFLECTABLE(ChangeRecordingBlock, in, out, sample_rate, fft_size, n_averages, n_workers);
+
+    std::vector<property_map> oldSeen;
+    std::vector<property_map> newSeen;
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
+
+    void settingsChanged(const property_map& oldSettings, const property_map& newSettings) {
+        oldSeen.push_back(oldSettings);
+        newSeen.push_back(newSettings);
+    }
+};
+
+void applySettings(ChangeRecordingBlock& block, const property_map& parameters) {
+    std::ignore = block.settings().set(parameters);
+    std::ignore = block.settings().activateContext();
+    std::ignore = block.settings().applyStagedParameters();
+}
+
+[[nodiscard]] std::optional<gr::Size_t> sizeOf(const property_map& map, std::string_view key) {
+    const auto it = map.find(key);
+    if (it == map.end()) {
+        return std::nullopt;
+    }
+    const gr::Size_t* value = it->second.get_if<gr::Size_t>();
+    return value != nullptr ? std::optional<gr::Size_t>(*value) : std::nullopt;
+}
+
 struct RateStreamResult {
     std::size_t nSettingsChanged;
     float       finalRate;
@@ -312,6 +350,55 @@ const boost::ut::suite<"settings"> _settings = [] {
 
         expect(eq(retuned.nSettingsChanged, unchanged.nSettingsChanged + 1UZ)) << "the differing tag must cost exactly one further apply";
         expect(eq(retuned.finalRate, kRetunedRate)) << "the differing tag must reach the block's setting";
+    };
+
+    "a change names the key that moved and no key that was merely set before"_test = [] {
+        ChangeRecordingBlock block{property_map{{"fft_size", gr::Size_t(2048)}, {"n_averages", gr::Size_t(8)}, {"sample_rate", 48000.0f}}};
+        block.init(std::make_shared<gr::Sequence>());
+
+        expect(fatal(eq(block.newSeen.size(), 1UZ))) << "the three construction values are one change";
+        expect(eq(block.newSeen.front().size(), 3UZ)) << "each construction value moves its own key and no other";
+        block.oldSeen.clear();
+        block.newSeen.clear();
+
+        applySettings(block, {{"n_workers", gr::Size_t(4)}});
+
+        expect(fatal(eq(block.newSeen.size(), 1UZ))) << "the new value is one change";
+        const property_map& newSettings = block.newSeen.front();
+        expect(eq(newSettings.size(), 1UZ)) << "only the key whose value moved is named";
+        expect(eq(sizeOf(newSettings, "n_workers").value_or(0U), gr::Size_t(4))) << "the moved key is named with its new value";
+
+        const property_map& oldSettings = block.oldSeen.front();
+        expect(eq(sizeOf(oldSettings, "n_workers").value_or(0U), gr::Size_t(1))) << "the previous value of the moved key stays readable";
+        expect(eq(sizeOf(oldSettings, "fft_size").value_or(0U), gr::Size_t(2048))) << "the settings before the change stay complete";
+        expect(eq(block.fft_size.value, gr::Size_t(2048))) << "a key that is not named keeps its value";
+    };
+
+    "a setting re-applied at the value the block holds is no change"_test = [] {
+        ChangeRecordingBlock block{property_map{{"fft_size", gr::Size_t(2048)}}};
+        block.init(std::make_shared<gr::Sequence>());
+        block.oldSeen.clear();
+        block.newSeen.clear();
+
+        applySettings(block, {{"fft_size", gr::Size_t(2048)}});
+
+        expect(eq(block.newSeen.size(), 0UZ)) << "no value moved, so there is no change to report";
+        expect(eq(block.fft_size.value, gr::Size_t(2048))) << "the value stays applied";
+        expect(eq(sizeOf(block.settings().get(), "fft_size").value_or(0U), gr::Size_t(2048))) << "the settings still report the value";
+    };
+
+    "a change names only the moved key of a pair set together"_test = [] {
+        ChangeRecordingBlock block{property_map{{"fft_size", gr::Size_t(2048)}}};
+        block.init(std::make_shared<gr::Sequence>());
+        block.oldSeen.clear();
+        block.newSeen.clear();
+
+        applySettings(block, {{"fft_size", gr::Size_t(2048)}, {"n_averages", gr::Size_t(16)}});
+
+        expect(fatal(eq(block.newSeen.size(), 1UZ))) << "the moved key is one change";
+        const property_map& newSettings = block.newSeen.front();
+        expect(eq(newSettings.size(), 1UZ)) << "the key set at its current value is not named";
+        expect(eq(sizeOf(newSettings, "n_averages").value_or(0U), gr::Size_t(16))) << "the moved key is named";
     };
 };
 
