@@ -108,6 +108,24 @@ struct ThrowingStartSource : gr::Block<ThrowingStartSource> {
     }
 };
 
+// a source whose device is named by a setting it cannot resolve: settingsChanged() throws while the graph
+// is built, which is the user code Block::init() runs, and without a device the block ends the stream on
+// its first work call
+struct ThrowingInitSource : gr::Block<ThrowingInitSource> {
+    gr::PortOut<float> out;
+
+    gr::Annotated<std::string, "device name"> device_name = "";
+
+    GR_MAKE_REFLECTABLE(ThrowingInitSource, out, device_name);
+
+    void settingsChanged(const gr::property_map& /*oldSettings*/, const gr::property_map& /*newSettings*/) { throw gr::exception("the device is not registered"); }
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        outSpan.publish(0UZ);
+        return gr::work::Status::DONE;
+    }
+};
+
 // the start()/stop() hooks of a start-then-stop cycle, observed from the requesting thread
 inline std::atomic<int> gStartHooks{0};
 inline std::atomic<int> gStopHooks{0};
@@ -497,6 +515,53 @@ const boost::ut::suite<"block stop hook on terminal paths"> stopHookTests = [] {
         expect(scheduler.exchange(std::move(flow)).has_value());
         expect(!scheduler.runAndWait().has_value()) << "a delivered error message must not turn the failed run into a success";
         expect(eq(source._nEmitted, 0UZ));
+    };
+
+    "an init() that throws fails runAndWait"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::ThrowingInitSource>(gr::property_map{{"device_name", std::string("absent")}});
+        auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        expect(source.state() == ERROR) << "a block whose init() hook threw must not report itself initialized";
+
+        qa_sched::SerialScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        const std::expected<void, gr::Error> result = scheduler.runAndWait();
+        expect(!result.has_value()) << "a graph whose source never initialized must not report a successful run";
+        if (!result.has_value()) {
+            expect(result.error().message.find(std::string(source.unique_name)) != std::string::npos) << "the error must name the block that failed to initialize";
+            expect(result.error().message.find("the device is not registered") != std::string::npos) << "the error must carry what the init() hook threw";
+        }
+        expect(eq(sink._nReceived, 0UZ)) << "no sample moves through a block that never initialized";
+    };
+
+    "an init() that throws fails runAndWait with a message subscriber attached"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::ThrowingInitSource>(gr::property_map{{"device_name", std::string("absent")}});
+        auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        qa_sched::SerialScheduler scheduler;
+        gr::MsgPortIn             fromScheduler;
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(!scheduler.runAndWait().has_value()) << "a delivered error message must not turn the failed run into a success";
+        expect(eq(sink._nReceived, 0UZ));
+    };
+
+    "a repeated run of a graph that failed to initialize fails again"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::ThrowingInitSource>(gr::property_map{{"device_name", std::string("absent")}});
+        auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        qa_sched::SerialScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(!scheduler.runAndWait().has_value());
+        expect(!scheduler.runAndWait().has_value()) << "a second run must not clear a block's init failure";
+        expect(eq(sink._nReceived, 0UZ));
     };
 
     "an ordinary requestStop runs the stop hook once"_test = [] {
