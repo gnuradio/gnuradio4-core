@@ -730,6 +730,13 @@ ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::uniq
             }
         }
 
+        // a value the block already holds moves nothing: every key `newSettings` names is a key whose
+        // value in `oldSettings` differs, and a batch that moves none reports no change at all
+        std::erase_if(staged, [&oldSettings](const auto& entry) {
+            const auto previous = oldSettings.find(entry.first);
+            return previous != oldSettings.end() && previous->second == entry.second;
+        });
+
         updateActiveParametersImpl();
 
         // invoke user-callback function if staged is not empty; oldSettings, staged and result are local

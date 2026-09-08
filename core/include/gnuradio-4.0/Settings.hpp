@@ -171,6 +171,9 @@ std::string enumToString(T&& enum_value) {
  * 1. `settingsChanged(oldSettings, newSettings)`
  * 2. `settingsChanged(oldSettings, newSettings, forwardSettings)`
  *    - where `forwardSettings` is for influencing subsequent blocks. E.g., a decimating block might adjust the `sample_rate` for downstream blocks.
+ *
+ * `newSettings` names only the settings whose value moved, each under its new value; `oldSettings` holds all of the
+ * block's settings as they were before. A batch that moves no value does not call back.
  */
 template<typename BlockType>
 concept HasSettingsChangedCallback = requires(BlockType* block, const property_map& oldSettings, property_map& newSettings) {
