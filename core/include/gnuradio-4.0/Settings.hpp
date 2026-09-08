@@ -30,7 +30,7 @@ namespace gr {
 // lifecycle state without this header participating in that include cycle.
 namespace lifecycle {
 enum class State : char;
-[[nodiscard]] constexpr bool isActive(State state) noexcept;
+constexpr bool isActive(State state) noexcept;
 } // namespace lifecycle
 
 namespace settings {
