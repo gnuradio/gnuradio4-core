@@ -43,6 +43,12 @@ public:
     virtual void start() = 0;
     virtual void stop()  = 0;
 
+    // an adopted scheduler shares its parent's processing pool, so its start reports what keeps it from running
+    // instead of leaving a worker queued behind the threads the parent holds
+    virtual std::expected<void, Error> startAdopted() = 0;
+
+    [[nodiscard]] virtual bool workerStarted() = 0;
+
     virtual void requestWorkQuiescence() = 0;
     virtual void releaseWorkQuiescence() = 0;
 };
@@ -67,34 +73,11 @@ public:
 
     BlockModel* asBlockModel() final { return static_cast<BlockModel*>(this); }
 
-    void start() override {
-        auto& sched = this->blockRef();
+    void start() override { std::ignore = startOnOwnThread(false); }
 
-        if (_schedulerThread.joinable()) { // a previous run may have finished without a stop()
-            _schedulerThread.join();
-        }
+    std::expected<void, Error> startAdopted() override { return startOnOwnThread(true); }
 
-        if (sched.state() == gr::lifecycle::State::IDLE) {
-            std::ignore = sched.changeStateTo(gr::lifecycle::State::INITIALISED);
-        }
-
-        if (sched.state() != gr::lifecycle::State::INITIALISED) {
-            sched.emitErrorMessage("SchedulerWrapper::start()", std::format("sub-scheduler '{}' is {}, not INITIALISED -- not started", sched.unique_name, gr::meta::enumName(sched.state()).value_or("")));
-            return;
-        }
-
-        if (std::string_view(sched.poolName.value) == gr::thread_pool::kDefaultCpuPoolId) {
-            std::ignore = sched.settings().set({{"poolName", std::string(gr::thread_pool::kDefaultIoPoolId)}});
-            std::ignore = sched.settings().applyStagedParameters();
-        }
-
-        _schedulerThread = std::thread([&sched] {
-            // this will invoke scheduler's start(), which blocks
-            if (!sched.changeStateTo(gr::lifecycle::State::RUNNING)) {
-                std::ignore = sched.changeStateTo(gr::lifecycle::State::ERROR);
-            }
-        });
-    }
+    [[nodiscard]] bool workerStarted() override { return this->blockRef().workerStarted(); }
 
     void requestWorkQuiescence() override { this->blockRef().requestWorkQuiescence(); }
     void releaseWorkQuiescence() override { this->blockRef().releaseWorkQuiescence(); }
@@ -113,6 +96,43 @@ public:
     }
 
     std::thread _schedulerThread;
+
+private:
+    std::expected<void, Error> startOnOwnThread(bool requireWorkerCapacity) {
+        auto& sched = this->blockRef();
+
+        if (_schedulerThread.joinable()) { // a previous run may have finished without a stop()
+            _schedulerThread.join();
+        }
+
+        if (sched.state() == gr::lifecycle::State::IDLE) {
+            std::ignore = sched.changeStateTo(gr::lifecycle::State::INITIALISED);
+        }
+
+        if (sched.state() != gr::lifecycle::State::INITIALISED) {
+            sched.emitErrorMessage("SchedulerWrapper::start()", std::format("sub-scheduler '{}' is {}, not INITIALISED -- not started", sched.unique_name, gr::meta::enumName(sched.state()).value_or("")));
+            return std::unexpected(Error(std::format("sub-scheduler '{}' is {} and cannot be started", sched.unique_name, gr::meta::enumName(sched.state()).value_or(""))));
+        }
+
+        if (std::string_view(sched.poolName.value) == gr::thread_pool::kDefaultCpuPoolId) {
+            std::ignore = sched.settings().set({{"poolName", std::string(gr::thread_pool::kDefaultIoPoolId)}});
+            std::ignore = sched.settings().applyStagedParameters();
+        }
+
+        if (requireWorkerCapacity) {
+            if (auto capacity = sched.checkWorkerCapacity(); !capacity.has_value()) {
+                return capacity;
+            }
+        }
+
+        _schedulerThread = std::thread([&sched] {
+            // this will invoke scheduler's start(), which blocks
+            if (!sched.changeStateTo(gr::lifecycle::State::RUNNING)) {
+                std::ignore = sched.changeStateTo(gr::lifecycle::State::ERROR);
+            }
+        });
+        return {};
+    }
 };
 
 } // namespace gr
