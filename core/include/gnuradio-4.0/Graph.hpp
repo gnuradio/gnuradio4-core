@@ -441,6 +441,15 @@ public:
 
     [[maybe_unused]] std::shared_ptr<BlockModel> const& emplaceBlock(std::string_view type, property_map initialSettings);
 
+    /**
+     * The block a caller named, at the version it pinned, or the reason there is none.
+     *
+     * `std::nullopt` takes the newest registered version, as the throwing form above does. A pin that cannot
+     * be honored is reported and nothing is added, never rounded to a neighboring version. Every failure is
+     * returned rather than thrown, which is what a message handler needs.
+     */
+    [[nodiscard]] std::expected<std::shared_ptr<BlockModel>, Error> emplaceBlock(std::string_view type, std::optional<block::Version> pinnedVersion, property_map initialSettings);
+
     bool containsEdge(const Edge& edge) const {
         return std::ranges::any_of(_edges, [&](const Edge& e) { return e == edge; });
     }
@@ -478,6 +487,9 @@ public:
     }
 
     std::pair<std::shared_ptr<BlockModel>, std::shared_ptr<BlockModel>> replaceBlock(std::string_view uniqueName, std::string_view type, const property_map& properties);
+
+    /// as above, at the version the caller pinned; the pin and every other failure are reported rather than thrown
+    [[nodiscard]] std::expected<std::pair<std::shared_ptr<BlockModel>, std::shared_ptr<BlockModel>>, Error> replaceBlock(std::string_view uniqueName, std::string_view type, std::optional<block::Version> pinnedVersion, const property_map& properties);
 
     [[nodiscard]] std::expected<void, Error> emplaceEdge(std::string_view sourceBlock, std::string sourcePort, std::string_view destinationBlock, //
         std::string destinationPort, [[maybe_unused]] const std::size_t minBufferSize, [[maybe_unused]] const std::int32_t weight, std::string_view edgeName) {

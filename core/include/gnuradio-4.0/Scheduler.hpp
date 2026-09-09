@@ -1359,6 +1359,15 @@ protected:
         }
     }
 
+    /**
+     * Adds one block to the target graph and answers on kBlockEmplaced.
+     *
+     * The message either carries `yaml`, one serialized block definition, or names the block directly with
+     * `type` and an optional `properties` map. Either form may carry a `version`, the version of the block the
+     * sender pins; without it the newest registered version is taken, which is what a message written before
+     * versions existed says. A pin that cannot be honored is answered with the loader's reason and nothing is
+     * added, never rounded to a neighboring version.
+     */
     std::optional<Message> propertyCallbackEmplaceBlock([[maybe_unused]] std::string_view propertyName, Message message) {
         using enum lifecycle::State;
         assert(propertyName == scheduler::property::kEmplaceBlock);
@@ -1373,8 +1382,9 @@ protected:
             return message;
         }
 
-        std::string  blockType;
-        property_map blockProperties;
+        std::string                                         blockType;
+        property_map                                        blockProperties;
+        std::expected<std::optional<block::Version>, Error> pinnedVersion;
 
         if (auto yamlIt = messageData.find("yaml"); yamlIt != messageData.end()) {
             // YAML path: create block from a serialised block definition string
@@ -1428,6 +1438,9 @@ protected:
                 return {};
             }
 
+            // a serialized block writes the version it pins beside its id, as a block of a graph file does
+            pinnedVersion = detail::pinnedVersionOrError(*parsed, blockType);
+
             // Normal block from YAML: read parameters, stripping auto-generated system fields
             if (auto it = parsed->find("parameters"); it != parsed->end()) {
                 if (const auto* p = it->second.get_if<property_map>()) {
@@ -1436,12 +1449,13 @@ protected:
                 }
             }
         } else {
-            // Non-YAML path: read type and properties directly from the message
+            // Non-YAML path: read type, the pinned version and properties directly from the message
             blockType = std::string(messageData.at("type").value_or(std::string_view{}));
             if (blockType.empty()) {
                 message.data = std::unexpected(Error{std::format("No type specified for the message {}", message)});
                 return message;
             }
+            pinnedVersion = detail::pinnedVersionOrError(messageData, blockType);
             if (auto it = messageData.find("properties"); it != messageData.end()) {
                 if (const auto* result = it->second.get_if<property_map>()) {
                     blockProperties = *result;
@@ -1449,16 +1463,26 @@ protected:
             }
         }
 
+        if (!pinnedVersion.has_value()) {
+            message.data = std::unexpected(pinnedVersion.error());
+            return message;
+        }
+
         // For the YAML path, settings from the serialised block definition are applied
         // via loadParametersFromPropertyMap after emplacement
         const bool   isYamlPath   = messageData.contains("yaml");
         property_map yamlSettings = isYamlPath ? std::exchange(blockProperties, {}) : property_map{};
 
-        const std::shared_ptr<BlockModel>& newBlock = [&]() -> const std::shared_ptr<BlockModel>& {
+        const std::expected<std::shared_ptr<BlockModel>, Error> emplaced = [&] {
             WorkQuiescenceGuard quiescence(this); // _blocks is traversed by every worker and by forEachBlock
             dissolveFusedRuns();
-            return targetGraph->emplaceBlock(blockType, blockProperties);
+            return targetGraph->emplaceBlock(blockType, *pinnedVersion, blockProperties);
         }();
+        if (!emplaced.has_value()) {
+            message.data = std::unexpected(emplaced.error());
+            return message;
+        }
+        const std::shared_ptr<BlockModel>& newBlock = *emplaced;
 
         if (isYamlPath && !yamlSettings.empty()) {
             newBlock->settings().loadParametersFromPropertyMap(yamlSettings);
@@ -1846,6 +1870,14 @@ protected:
         return result;
     }
 
+    /**
+     * Puts a block of the target graph in the place of another, edges included, and answers on kBlockReplaced.
+     *
+     * The message names the block it replaces with `uniqueName` and the new one with `type`, an optional
+     * `properties` map and an optional `version`, the version the sender pins. The pin is honored as it is for
+     * an emplacement: without it the newest registered version is taken, and one that cannot be honored is
+     * answered with the loader's reason while the block that is there stays.
+     */
     std::optional<Message> propertyCallbackReplaceBlock([[maybe_unused]] std::string_view propertyName, Message message) {
         assert(propertyName == scheduler::property::kReplaceBlock);
         using namespace std::string_literals;
@@ -1869,6 +1901,12 @@ protected:
             }
         }();
 
+        const std::expected<std::optional<block::Version>, Error> pinnedVersion = detail::pinnedVersionOrError(messageData, type);
+        if (!pinnedVersion.has_value()) {
+            message.data = std::unexpected(pinnedVersion.error());
+            return message;
+        }
+
         auto* targetGraph = findTargetSubGraph(messageData);
 
         if (targetGraph == nullptr) {
@@ -1876,11 +1914,16 @@ protected:
             return message;
         }
 
-        auto [oldBlock, newBlockRaw] = [&] {
+        std::expected<std::pair<std::shared_ptr<BlockModel>, std::shared_ptr<BlockModel>>, Error> replacement = [&] {
             WorkQuiescenceGuard quiescence(this); // _blocks is traversed by every worker and by forEachBlock
             dissolveFusedRuns();
-            return targetGraph->replaceBlock(uniqueName, type, properties);
+            return targetGraph->replaceBlock(uniqueName, type, *pinnedVersion, properties);
         }();
+        if (!replacement.has_value()) {
+            message.data = std::unexpected(replacement.error());
+            return message;
+        }
+        auto [oldBlock, newBlockRaw] = std::move(*replacement);
         makeZombie(std::move(oldBlock));
 
         std::optional<Message> result = gr::Message{};

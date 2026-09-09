@@ -67,11 +67,15 @@ requires(sizeof...(propertySubNames) > 0)
  *
  * A block entry without the key takes the newest registered version. Any integral spelling the YAML reader
  * produced is accepted; anything else, or a value outside a version number's range, is reported as a defect.
+ *
+ * The map is whichever one carries the entry: a block of a graph file, or the data of a message that emplaces
+ * or replaces one at runtime. A message handler must not throw, so the defect is returned rather than thrown
+ * and the file loader is the one that turns it into an exception.
  */
-[[nodiscard]] inline std::optional<block::Version> pinnedVersionOf(const gr::property_map& grcBlock, std::string_view blockType) {
+[[nodiscard]] inline std::expected<std::optional<block::Version>, gr::Error> pinnedVersionOrError(const gr::property_map& grcBlock, std::string_view blockType) {
     const auto it = grcBlock.find("version");
     if (it == grcBlock.cend()) {
-        return std::nullopt;
+        return std::optional<block::Version>{};
     }
 
     std::optional<block::Version> pinned;
@@ -84,9 +88,17 @@ requires(sizeof...(propertySubNames) > 0)
     }).visit(it->second);
 
     if (!pinned.has_value()) {
-        throw gr::exception(std::format("Block of type '{}' pins a version that is not a version number", blockType));
+        return std::unexpected(gr::Error(std::format("Block of type '{}' pins a version that is not a version number", blockType)));
     }
     return pinned;
+}
+
+[[nodiscard]] inline std::optional<block::Version> pinnedVersionOf(const gr::property_map& grcBlock, std::string_view blockType) {
+    const std::expected<std::optional<block::Version>, gr::Error> pinned = pinnedVersionOrError(grcBlock, blockType);
+    if (!pinned.has_value()) {
+        throw gr::exception(pinned.error().message);
+    }
+    return *pinned;
 }
 
 template<typename T>
