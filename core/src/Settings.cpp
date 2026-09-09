@@ -227,6 +227,9 @@ std::optional<SettingsCtx> CtxSettingsBase::activateContextImpl(SettingsCtx ctx)
             auto& parameters = *_parameters;
             _stagedParameters.insert(parameters.begin(), parameters.end());
             _activeCtx = bestMatchSettingsCtx.value();
+            // moving to another context is an event of its own: the next apply reports it whether or not the
+            // context's parameters differ from the ones the block already holds
+            _contextActivated = true;
             setChanged(true);
         } else {
             return std::nullopt;
@@ -290,6 +293,7 @@ void CtxSettingsBase::assignFrom(const CtxSettingsBase& other) {
     _autoForwardParameters = other._autoForwardParameters;
     _matchPred             = other._matchPred;
     _activeCtx             = other._activeCtx;
+    _contextActivated      = other._contextActivated;
     _stagedParameters      = other._stagedParameters;
     _activeParameters      = other._activeParameters;
 }
@@ -304,6 +308,7 @@ void CtxSettingsBase::assignFrom(CtxSettingsBase&& other) noexcept {
     _autoForwardParameters = std::move(other._autoForwardParameters);
     _matchPred             = std::exchange(other._matchPred, settings::nullMatchPred);
     _activeCtx             = std::exchange(other._activeCtx, {});
+    _contextActivated      = std::exchange(other._contextActivated, false);
     _stagedParameters      = std::move(other._stagedParameters);
     _activeParameters      = std::move(other._activeParameters);
 }
@@ -696,6 +701,9 @@ ApplyStagedParametersResult CtxSettingsBase::applyStagedParameters() {
 ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::unique_lock<std::mutex>* reentrantLock) {
     const settings::BlockHooks& hooks = _descriptor->hooks;
 
+    // one apply consumes one activation, so an event is reported once and does not reach a later batch
+    const bool contextActivated = std::exchange(_contextActivated, false);
+
     ApplyStagedParametersResult result;
     if (hooks.reflectable) {
         // prepare old settings if required
@@ -736,6 +744,12 @@ ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::uniq
             const auto previous = oldSettings.find(entry.first);
             return previous != oldSettings.end() && previous->second == entry.second;
         });
+
+        // an activation is exempt from that rule: the newly active context is named after the erase, so a block
+        // sees the event even when the two contexts carry the same values
+        if (contextActivated && hasSettingsChangedCallback) {
+            staged.insert_or_assign(static_cast<std::pmr::string>(gr::tag::CONTEXT.shortKey()), _activeCtx.context);
+        }
 
         updateActiveParametersImpl();
 

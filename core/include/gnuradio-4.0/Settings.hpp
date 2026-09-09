@@ -173,7 +173,9 @@ std::string enumToString(T&& enum_value) {
  *    - where `forwardSettings` is for influencing subsequent blocks. E.g., a decimating block might adjust the `sample_rate` for downstream blocks.
  *
  * `newSettings` names only the settings whose value moved, each under its new value; `oldSettings` holds all of the
- * block's settings as they were before. A batch that moves no value does not call back.
+ * block's settings as they were before, and a batch that moves no value does not call back. Activating another
+ * context is an event rather than a value change: it always calls back and always names the newly active context
+ * under `gr::tag::CONTEXT`, whether or not any value moved with it.
  */
 template<typename BlockType>
 concept HasSettingsChangedCallback = requires(BlockType* block, const property_map& oldSettings, property_map& newSettings) {
@@ -811,6 +813,7 @@ protected:
     std::set<std::string>                                                            _autoForwardParameters{};
     MatchPredicate                                                                   _matchPred = settings::nullMatchPred;
     SettingsCtx                                                                      _activeCtx{};
+    bool                                                                             _contextActivated{false}; ///< set when `_activeCtx.context` moved, consumed by the next apply
     property_map                                                                     _stagedParameters{};
     property_map                                                                     _activeParameters{};
 

@@ -1,10 +1,12 @@
 #include <boost/ut.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <memory>
 #include <optional>
 #include <ranges>
+#include <string>
 #include <vector>
 
 #include <gnuradio-4.0/Block.hpp>
@@ -284,6 +286,15 @@ void applySettings(ChangeRecordingBlock& block, const property_map& parameters) 
     return value != nullptr ? std::optional<gr::Size_t>(*value) : std::nullopt;
 }
 
+[[nodiscard]] std::string contextOf(const property_map& map) {
+    const auto it = map.find(gr::tag::CONTEXT.shortKey());
+    if (it == map.end()) {
+        return {};
+    }
+    const auto text = it->second.value_or(std::string_view{});
+    return text.data() != nullptr ? std::string(text) : std::string{};
+}
+
 struct RateStreamResult {
     std::size_t nSettingsChanged;
     float       finalRate;
@@ -508,6 +519,48 @@ const boost::ut::suite<"settings"> _settings = [] {
         const property_map& newSettings = block.newSeen.front();
         expect(eq(newSettings.size(), 1UZ)) << "the key set at its current value is not named";
         expect(eq(sizeOf(newSettings, "n_averages").value_or(0U), gr::Size_t(16))) << "the moved key is named";
+    };
+
+    "activating another context is reported even when no value moves"_test = [] {
+        ChangeRecordingBlock block;
+        block.init(std::make_shared<gr::Sequence>());
+
+        // both contexts hold the same definition, so after the first activation neither can move a value
+        const auto         now = gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now());
+        const property_map definition{{"fft_size", gr::Size_t(4096)}, {"n_averages", gr::Size_t(8)}};
+        expect(block.settings().set(definition, gr::SettingsCtx{now, "A"}).empty());
+        expect(block.settings().set(definition, gr::SettingsCtx{now, "B"}).empty());
+        expect(block.settings().activateContext(gr::SettingsCtx{now, "A"}).has_value());
+        std::ignore = block.settings().applyStagedParameters();
+        block.oldSeen.clear();
+        block.newSeen.clear();
+
+        expect(block.settings().activateContext(gr::SettingsCtx{now, "B"}).has_value());
+        std::ignore = block.settings().applyStagedParameters();
+        expect(fatal(eq(block.newSeen.size(), 1UZ))) << "activating B is a change of its own";
+        expect(eq(block.newSeen.back().size(), 1UZ)) << "B carries the values the block holds, so no value key is named";
+        expect(eq(contextOf(block.newSeen.back()), std::string("B"))) << "the newly active context is named";
+
+        expect(block.settings().activateContext(gr::SettingsCtx{now, "A"}).has_value());
+        std::ignore = block.settings().applyStagedParameters();
+        expect(fatal(eq(block.newSeen.size(), 2UZ))) << "activating A again is a further change";
+        expect(eq(block.newSeen.back().size(), 1UZ)) << "returning to A moves no value either";
+        expect(eq(contextOf(block.newSeen.back()), std::string("A"))) << "the context that became active is named";
+        expect(eq(block.fft_size.value, gr::Size_t(4096))) << "the activated definition stays applied";
+    };
+
+    "re-staging an identical definition with no context reports nothing"_test = [] {
+        ChangeRecordingBlock block{property_map{{"fft_size", gr::Size_t(2048)}, {"n_averages", gr::Size_t(8)}}};
+        block.init(std::make_shared<gr::Sequence>());
+        block.oldSeen.clear();
+        block.newSeen.clear();
+
+        const property_map definition{{"fft_size", gr::Size_t(2048)}, {"n_averages", gr::Size_t(8)}};
+        applySettings(block, definition);
+        applySettings(block, definition);
+
+        expect(eq(block.newSeen.size(), 0UZ)) << "the active context does not move, so there is no event and no value to report";
+        expect(eq(block.fft_size.value, gr::Size_t(2048))) << "the definition stays applied";
     };
 };
 
