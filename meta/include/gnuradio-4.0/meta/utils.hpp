@@ -589,7 +589,7 @@ inline std::string shorten_qualified_name(std::string_view name) {
 
     const bool hasLeading   = name.starts_with("::"sv);
     const bool hasTrailing  = name.ends_with("::"sv);
-    const auto toStringView = [](auto&& r) { return std::string_view(&*r.begin(), static_cast<std::size_t>(std::ranges::distance(r))); };
+    const auto toStringView = [](auto&& r) { return std::string_view(r.begin(), r.end()); };
 
     std::vector<std::string_view> parts;
     for (auto&& token : name | std::views::split("::"sv)) {

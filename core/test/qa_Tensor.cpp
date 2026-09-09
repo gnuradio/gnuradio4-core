@@ -173,7 +173,7 @@ const boost::ut::suite<"Tensor<T> Basic Functionality"> _tensorBasic = [] {
     };
 
     "Type sizes"_test = [] {
-        static_assert(sizeof(Tensor<double>) == sizeof(std::pmr::vector<double>) + sizeof(Tensor<double, std::dynamic_extent>::dynamic_extents_store));
+        static_assert(sizeof(Tensor<double>) == sizeof(gr::pmr::vector<double, true>) + sizeof(Tensor<double, std::dynamic_extent>::dynamic_extents_store));
         static_assert(sizeof(Tensor<double, std::dynamic_extent>) == sizeof(gr::pmr::vector<double, true>) + sizeof(Tensor<double, std::dynamic_extent>::semi_static_extents_store));
         static_assert(sizeof(Tensor<double, 3UZ, 2UZ>) == 3UZ * 2UZ * sizeof(double));
     };
