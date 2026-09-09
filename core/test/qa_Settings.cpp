@@ -180,10 +180,12 @@ struct RateCountingBlock : Block<RateCountingBlock> {
     void settingsChanged(const property_map& /*oldSettings*/, const property_map& /*newSettings*/) { nSettingsChanged++; }
 };
 
-/// keeps both maps of every settings change, so what the callback was told can be read off the block
+/// keeps both maps of every settings change, so what the callback was told can be read off the block. Every member
+/// carries an initializer of its own: the block is an aggregate constructed from its base alone, and a member with
+/// no initializer is one clang reports as a missing field initializer at each such construction.
 struct ChangeRecordingBlock : Block<ChangeRecordingBlock> {
-    PortIn<float>  in;
-    PortOut<float> out;
+    PortIn<float>  in{};
+    PortOut<float> out{};
 
     Annotated<float, "sample rate">         sample_rate = 1.0f;
     Annotated<gr::Size_t, "FFT size">       fft_size    = 1024U;
@@ -192,8 +194,8 @@ struct ChangeRecordingBlock : Block<ChangeRecordingBlock> {
 
     GR_MAKE_REFLECTABLE(ChangeRecordingBlock, in, out, sample_rate, fft_size, n_averages, n_workers);
 
-    std::vector<property_map> oldSeen;
-    std::vector<property_map> newSeen;
+    std::vector<property_map> oldSeen{};
+    std::vector<property_map> newSeen{};
 
     [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
 
