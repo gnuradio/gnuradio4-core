@@ -320,7 +320,45 @@ struct AdoptingScheduler : TestScheduler {
     [[nodiscard]] std::size_t nWorkersStarted() { return gr::atomic_ref(this->_nWorkersStarted).load_acquire(); }
 };
 
-[[nodiscard]] std::shared_ptr<gr::SchedulerWrapper<TestScheduler>> makeSubScheduler(std::string_view poolName) {
+// a scheduler that supplies its own worker instead of the one the base provides: the smallest loop that runs a job
+// list, so that what it exercises is the dispatch every scheduler shares and not the base worker's body
+struct OwnWorkerScheduler : gr::scheduler::SchedulerBase<OwnWorkerScheduler, gr::scheduler::ExecutionPolicy::multiThreaded> {
+    using Base = gr::scheduler::SchedulerBase<OwnWorkerScheduler, gr::scheduler::ExecutionPolicy::multiThreaded>;
+    using Base::SchedulerBase;
+
+    void customInit() {
+        const gr::Graph flatGraph = gr::graph::flatten(*this->_graph);
+        const auto      blocks    = flatGraph.blocks();
+
+        std::lock_guard lock(this->_executionOrderMutex);
+        std::lock_guard guard(this->_adoptionBlocksMutex);
+        this->_adoptionBlocks.clear();
+        this->_adoptionBlocks.resize(1UZ);
+        this->_executionOrder->clear();
+        this->_executionOrder->emplace_back(blocks.begin(), blocks.end());
+    }
+
+    void poolWorker(std::size_t runnerID, std::shared_ptr<gr::scheduler::JobLists> jobList) {
+        std::shared_ptr<gr::Sequence> nRunningJobs = this->_nRunningJobs;
+        gr::on_scope_exit             release      = [this, &nRunningJobs] { this->releaseWorkerCount(*nRunningJobs); };
+
+        std::vector<std::shared_ptr<gr::BlockModel>> localBlockList;
+        {
+            std::lock_guard lock(this->_executionOrderMutex);
+            localBlockList = jobList->at(runnerID);
+        }
+
+        while (gr::lifecycle::isActive(this->state())) {
+            const gr::work::Result result = this->traverseBlockListOnce(localBlockList);
+            if (result.status == gr::work::Status::DONE || result.status == gr::work::Status::ERROR) {
+                return;
+            }
+        }
+    }
+};
+
+template<typename TScheduler>
+[[nodiscard]] std::shared_ptr<gr::SchedulerWrapper<TScheduler>> makeSubScheduler(std::string_view poolName) {
     using namespace boost::ut;
 
     gr::Graph innerFlow;
@@ -328,14 +366,14 @@ struct AdoptingScheduler : TestScheduler {
     auto&     innerSink   = innerFlow.emplaceBlock<SharedCountingSink>();
     expect(innerFlow.connect<"out", "in">(innerSource, innerSink).has_value());
 
-    auto inner = std::make_shared<gr::SchedulerWrapper<TestScheduler>>(gr::property_map{{"poolName", std::string(poolName)}});
+    auto inner = std::make_shared<gr::SchedulerWrapper<TScheduler>>(gr::property_map{{"poolName", std::string(poolName)}});
     inner->setGraph(std::move(innerFlow));
     return inner;
 }
 
 // an error message carries no property map, so a failed endpoint is told apart from a reply by its data alone
-[[nodiscard]] std::string awaitErrorMessage(gr::MsgPortIn& port, std::string_view endpoint) {
-    for (std::size_t i = 0UZ; i < 2000UZ; ++i) {
+[[nodiscard]] std::string awaitErrorMessage(gr::MsgPortIn& port, std::string_view endpoint, std::size_t nAttempts = 2000UZ) {
+    for (std::size_t i = 0UZ; i < nAttempts; ++i) {
         auto messages = port.streamReader().get();
         for (const gr::Message& message : messages) {
             if (message.endpoint == endpoint && !message.data.has_value()) {
@@ -856,7 +894,7 @@ const boost::ut::suite<"adopting a sub-scheduler"> subSchedulerAdoptionTests = [
         qa_sched::gSubSchedulerSamples.store(0UZ, std::memory_order_relaxed);
         auto pool = qa_sched::fixedPool(qa_sched::kAdoptionPoolName, 2U);
 
-        auto                                  inner      = qa_sched::makeSubScheduler(qa_sched::kAdoptionPoolName);
+        auto                                  inner      = qa_sched::makeSubScheduler<qa_sched::TestScheduler>(qa_sched::kAdoptionPoolName);
         const std::shared_ptr<gr::BlockModel> innerBlock = gr::SchedulerModel::asBlockModelPtr(inner);
 
         qa_sched::AdoptingScheduler outer({{"poolName", std::string(qa_sched::kAdoptionPoolName)}});
@@ -886,7 +924,7 @@ const boost::ut::suite<"adopting a sub-scheduler"> subSchedulerAdoptionTests = [
         qa_sched::gSubSchedulerSamples.store(0UZ, std::memory_order_relaxed);
         auto pool = qa_sched::fixedPool(qa_sched::kAdoptionPoolName, 3U);
 
-        auto                                  inner      = qa_sched::makeSubScheduler(qa_sched::kAdoptionPoolName);
+        auto                                  inner      = qa_sched::makeSubScheduler<qa_sched::TestScheduler>(qa_sched::kAdoptionPoolName);
         const std::shared_ptr<gr::BlockModel> innerBlock = gr::SchedulerModel::asBlockModelPtr(inner);
 
         qa_sched::AdoptingScheduler outer({{"poolName", std::string(qa_sched::kAdoptionPoolName)}});
@@ -900,6 +938,37 @@ const boost::ut::suite<"adopting a sub-scheduler"> subSchedulerAdoptionTests = [
 
         expect(innerBlock->state() == RUNNING) << "a sub-scheduler the pool can run must be running when adoptBlock returns";
         expect(inner->workerStarted()) << "adoptBlock returned before the sub-scheduler's worker began executing";
+        expect(qa_sched::awaitCondition([] { return qa_sched::gSubSchedulerSamples.load(std::memory_order_relaxed) > 0UZ; })) << "the adopted graph never moved a sample";
+
+        inner->stop();
+        outer.requestStop();
+        runner.join();
+    };
+
+    "a sub-scheduler that supplies its own worker is adopted"_test = [] {
+        qa_sched::gSubSchedulerSamples.store(0UZ, std::memory_order_relaxed);
+        auto pool = qa_sched::fixedPool(qa_sched::kAdoptionPoolName, 3U);
+
+        auto                                  inner      = qa_sched::makeSubScheduler<qa_sched::OwnWorkerScheduler>(qa_sched::kAdoptionPoolName);
+        const std::shared_ptr<gr::BlockModel> innerBlock = gr::SchedulerModel::asBlockModelPtr(inner);
+
+        qa_sched::AdoptingScheduler outer({{"poolName", std::string(qa_sched::kAdoptionPoolName)}});
+        expect(outer.exchange(qa_sched::makeEndlessGraph()).has_value());
+
+        gr::MsgPortIn fromOuter;
+        expect(outer.msgOut.connect(fromOuter).has_value());
+
+        std::thread runner([&outer] { std::ignore = outer.runAndWait(); });
+        expect(qa_sched::awaitState(outer, RUNNING)) << "the adopting scheduler did not reach RUNNING";
+        expect(qa_sched::awaitCondition([&outer] { return outer.nWorkersStarted() >= 2UZ; })) << "the adopting scheduler did not claim its own threads";
+
+        outer.adoptBlock(innerBlock);
+
+        // adoptBlock() reports before it returns, so one read of the port covers the whole adoption
+        const std::string reported = qa_sched::awaitErrorMessage(fromOuter, "adoptBlock", 1UZ);
+        expect(reported.empty()) << std::format("a sub-scheduler that runs must not be reported as failing: '{}'", reported);
+        expect(innerBlock->state() == RUNNING) << "a sub-scheduler with its own worker must be running when adoptBlock returns";
+        expect(inner->workerStarted()) << "a worker supplied by the scheduler itself is not reported as started";
         expect(qa_sched::awaitCondition([] { return qa_sched::gSubSchedulerSamples.load(std::memory_order_relaxed) > 0UZ; })) << "the adopted graph never moved a sample";
 
         inner->stop();
