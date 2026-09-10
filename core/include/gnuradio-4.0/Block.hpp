@@ -4,6 +4,7 @@
 #include <chrono>
 #include <limits>
 #include <map>
+#include <memory>
 #include <print>
 #include <source_location>
 
@@ -2786,11 +2787,19 @@ concept BulkStageBlock = HasProcessBulkFunction<T> && !HasProcessOneFunction<T> 
                          && (traits::block::stream_input_port_types<T>::size() == 1UZ) //
                          && (traits::block::stream_output_port_types<T>::size() == 1UZ) && TriviallyCopyableStageTypes<T>;
 
+// `out` is untyped storage that every stage type of a fused run is handed in turn, and this is where a stage's samples
+// become objects of its output type: writing through a pointer into that storage does not create them, so the array's
+// lifetime is started before the first sample is written.
 template<FusableStageBlock T>
 std::size_t fusedApplyChunk(void* rawBlock, const void* in, void* out, std::size_t nSamples) {
-    T&   block       = *static_cast<T*>(rawBlock);
+    T& block = *static_cast<T*>(rawBlock);
+#if __cpp_lib_start_lifetime_as >= 202207L
+    FusedValueTypeOut<T>* outSamples = std::start_lifetime_as_array<FusedValueTypeOut<T>>(out, nSamples);
+#else
+    FusedValueTypeOut<T>* outSamples = static_cast<FusedValueTypeOut<T>*>(out);
+#endif
     auto inputSpans  = std::tuple{std::span<const FusedValueTypeIn<T>>(static_cast<const FusedValueTypeIn<T>*>(in), nSamples)};
-    auto outputSpans = std::tuple{std::span<FusedValueTypeOut<T>>(static_cast<FusedValueTypeOut<T>*>(out), nSamples)};
+    auto outputSpans = std::tuple{std::span<FusedValueTypeOut<T>>(outSamples, nSamples)};
 
     std::size_t produced = nSamples;
     if constexpr (HasConstProcessOneFunction<T>) {
