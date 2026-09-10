@@ -234,6 +234,27 @@ struct YamlDefinitionsLoader {
 
 std::expected<std::shared_ptr<gr::BlockModel>, gr::Error> instantiateBlockFromYamlDefinition(gr::PluginLoader& loader, const YamlDefinitionsLoader::Definition& def) noexcept;
 
+/**
+ * @brief Instantiates the one version a caller named, or says why it could not.
+ *
+ * A pin that cannot be honored is reported rather than rounded to a neighboring version, and the reason
+ * names the versions that are registered wherever the loader can reach them, a plugin's own registry
+ * included. A YAML definition carries one revision, `block::kDefaultVersion`.
+ */
+template<typename TLoader>
+std::expected<std::shared_ptr<gr::BlockModel>, gr::Error> instantiatePinnedOrError(TLoader& loader, std::string_view name, block::Version version, const property_map& params) {
+    if (auto result = loader.instantiatePinned(name, version, params)) {
+        return result;
+    }
+    if (const std::vector<block::Version> known = loader.blockVersions(name); !known.empty()) {
+        return std::unexpected(gr::Error(std::format("'{}' is registered, but not as version {}; registered versions: {}", name, version, gr::join(known, ", "))));
+    }
+    if (version != block::kDefaultVersion) {
+        return std::unexpected(gr::Error(std::format("'{}' is not in the block registry, so it has no version {}", name, version)));
+    }
+    return loader.instantiate(name, params);
+}
+
 } // namespace detail
 
 #ifdef INTERNAL_ENABLE_BLOCK_PLUGINS
@@ -514,6 +535,33 @@ public:
         return {};
     }
 
+    /// every version of `name` a create can reach: the registry's, else those the plugin owning the name holds
+    [[nodiscard]] std::vector<block::Version> blockVersions(std::string_view name) const {
+        if (std::vector<block::Version> known = _registry->versions(name); !known.empty()) {
+            return known;
+        }
+        if (const gr_plugin_base* plugin = pluginForBlockName(name); plugin != nullptr) {
+            return plugin->blockVersions(name);
+        }
+        return {};
+    }
+
+    /// the one version named, from the registry or from the plugin owning the name; the instance records the pin
+    std::shared_ptr<gr::BlockModel> instantiatePinned(std::string_view name, block::Version version, const property_map& params = property_map{}) {
+        if (auto result = _registry->create(name, version, params)) {
+            return result;
+        }
+
+        if (auto* plugin = pluginForBlockName(name); plugin != nullptr) {
+            return plugin->createPinnedBlock(name, version, params);
+        }
+
+        return {};
+    }
+
+    /// see gr::detail::instantiatePinnedOrError
+    std::expected<std::shared_ptr<gr::BlockModel>, gr::Error> instantiatePinnedOrError(std::string_view name, block::Version version, const property_map& params = property_map{}) { return detail::instantiatePinnedOrError(*this, name, version, params); }
+
     std::shared_ptr<gr::SchedulerModel> instantiateScheduler(std::string_view name, const property_map& params = property_map{}) {
         if (auto result = _schedulerRegistry->create(name, params)) {
             return std::shared_ptr<gr::SchedulerModel>(result.release());
@@ -588,6 +636,15 @@ public:
 
         return nullptr;
     }
+
+    /// see the non-WASM PluginLoader::blockVersions
+    [[nodiscard]] std::vector<block::Version> blockVersions(std::string_view name) const { return _registry->versions(name); }
+
+    /// see the non-WASM PluginLoader::instantiatePinned
+    std::shared_ptr<gr::BlockModel> instantiatePinned(std::string_view name, block::Version version, const property_map& params = {}) { return _registry->create(name, version, params); }
+
+    /// see the non-WASM PluginLoader::instantiatePinnedOrError
+    std::expected<std::shared_ptr<gr::BlockModel>, gr::Error> instantiatePinnedOrError(std::string_view name, block::Version version, const property_map& params = {}) { return detail::instantiatePinnedOrError(*this, name, version, params); }
 
     std::shared_ptr<gr::SchedulerModel> instantiateScheduler(std::string_view name, const property_map& params = {}) {
         auto result = _schedulerRegistry->create(name, params);

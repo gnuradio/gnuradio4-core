@@ -15,7 +15,7 @@
 using namespace std::string_literals;
 using namespace std::string_view_literals;
 
-#define GR_PLUGIN_CURRENT_ABI_VERSION 1
+#define GR_PLUGIN_CURRENT_ABI_VERSION 2
 
 class GNURADIO_EXPORT gr_plugin_base {
 public:
@@ -30,6 +30,11 @@ public:
 
     virtual std::vector<std::string>            availableSchedulers() const                                           = 0;
     virtual std::unique_ptr<gr::SchedulerModel> createScheduler(std::string_view name, const gr::property_map& param) = 0;
+
+    // an entry appends here, so that abiVersion() keeps the slot a plugin built against an older ABI gave it, and
+    // carries a name of its own, so that an implementor overriding one of the two does not hide the other
+    virtual std::vector<gr::block::Version> blockVersions(std::string_view name) const                                                           = 0;
+    virtual std::unique_ptr<gr::BlockModel> createPinnedBlock(std::string_view name, gr::block::Version version, const gr::property_map& params) = 0;
 };
 
 namespace gr {
@@ -49,6 +54,9 @@ public:
 
     std::vector<std::string>            availableSchedulers() const override { return schedulerRegistry.keys(); }
     std::unique_ptr<gr::SchedulerModel> createScheduler(std::string_view name, const property_map& params) override { return schedulerRegistry.create(name, params); }
+
+    std::vector<block::Version>     blockVersions(std::string_view name) const override { return registry.versions(name); }
+    std::unique_ptr<gr::BlockModel> createPinnedBlock(std::string_view name, block::Version version, const property_map& params) override { return registry.create(name, version, params); }
 
     operator gr::BlockRegistry&() { return registry; }
     operator gr::SchedulerRegistry&() { return schedulerRegistry; }

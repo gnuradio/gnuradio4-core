@@ -2,6 +2,8 @@
 #define GNURADIO_BLOCK_HPP
 
 #include <chrono>
+#include <concepts>
+#include <cstdint>
 #include <limits>
 #include <map>
 #include <print>
@@ -622,6 +624,65 @@ enum class Category {
     ScheduledBlockGroup    ///< Block with children that have a dedicated scheduler
 };
 
+/**
+ * @brief What a block says about itself beyond what it does, as independent flags.
+ *
+ * A block declares it as `static constexpr gr::block::Status status{.deprecated = true};` and may set any
+ * combination. Nothing in the framework decides or warns on a flag; the registry and the document tools report it.
+ */
+struct Status {
+    bool deprecated   = false; ///< kept for existing graphs, superseded by something else
+    bool experimental = false; ///< the interface or the numerics may still change
+
+    [[nodiscard]] constexpr bool any() const noexcept { return deprecated || experimental; }
+
+    [[nodiscard]] constexpr bool operator==(const Status&) const noexcept = default;
+};
+
+/**
+ * @brief Which revision of a block a registration is.
+ *
+ * A block declares it as `static constexpr gr::block::Version version = 2U;`. A block that declares none is
+ * version 1, so a second revision is spelled `2U` and is newer by the ordinary comparison.
+ */
+using Version = std::uint32_t;
+
+inline constexpr Version kDefaultVersion = 1U;
+
+/// whether `TBlock` declares a version of its own
+template<typename TBlock>
+concept HasDeclaredVersion = requires {
+    { TBlock::version } -> std::convertible_to<Version>;
+};
+
+/// whether `TBlock` declares any status flag
+template<typename TBlock>
+concept HasDeclaredStatus = requires {
+    { TBlock::status } -> std::convertible_to<Status>;
+};
+
+template<typename TBlock>
+[[nodiscard]] constexpr Version versionOf() noexcept {
+    if constexpr (HasDeclaredVersion<TBlock>) {
+        return static_cast<Version>(TBlock::version);
+    } else {
+        return kDefaultVersion;
+    }
+}
+
+template<typename TBlock>
+[[nodiscard]] constexpr Status statusOf() noexcept {
+    if constexpr (HasDeclaredStatus<TBlock>) {
+        return TBlock::status;
+    } else {
+        return {};
+    }
+}
+
+/// the meta_information keys a declared version and a set status flag are reported under
+inline constexpr std::string_view kVersionMetaKey = "Version";
+inline constexpr std::string_view kStatusMetaKey  = "Status";
+
 struct FusedTag {
     std::ptrdiff_t relIndex{};
     property_map   map{};
@@ -865,6 +926,8 @@ public:
 #endif
 
     //
+    // A block that declares neither a version nor a status flag reports neither key, leaving its
+    // meta_information unchanged.
     static property_map initMetaInfo() {
         using namespace std::string_literals;
         property_map ret;
@@ -874,6 +937,22 @@ public:
             info.insert_or_assign("Toolkit", std::string(DrawableControl::kToolkit));
 
             ret.insert_or_assign("Drawable", info);
+        }
+        if constexpr (block::HasDeclaredVersion<Derived>) {
+            ret.insert_or_assign(std::pmr::string(block::kVersionMetaKey), static_cast<gr::Size_t>(block::versionOf<Derived>()));
+        }
+        if constexpr (block::HasDeclaredStatus<Derived>) {
+            constexpr block::Status status = block::statusOf<Derived>();
+            if constexpr (status.any()) {
+                property_map flags;
+                if constexpr (status.deprecated) {
+                    flags.insert_or_assign("deprecated", true);
+                }
+                if constexpr (status.experimental) {
+                    flags.insert_or_assign("experimental", true);
+                }
+                ret.insert_or_assign(std::pmr::string(block::kStatusMetaKey), std::move(flags));
+            }
         }
         return ret;
     }
