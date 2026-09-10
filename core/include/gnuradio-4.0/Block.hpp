@@ -2767,9 +2767,12 @@ template<typename T>
 using FusedValueTypeOut = typename traits::block::stream_output_port_types<T>::template at<0>;
 
 // a fused run creates the intermediate samples of a composed segment in raw byte scratch and never destroys them, so
-// a stage value type must be one that a byte-wise copy creates and whose destruction has no effect
+// a stage value type must be one that a byte-wise copy creates and whose destruction has no effect. That scratch is
+// allocated on a cache line and its stride is rounded to one, which is the whole alignment guarantee a stage gets, so
+// a value type aligned wider than gr::kCacheLine has no address in it to be created at.
 template<typename T>
-concept TriviallyCopyableStageTypes = std::is_trivially_copyable_v<FusedValueTypeIn<T>> && std::is_trivially_copyable_v<FusedValueTypeOut<T>>;
+concept TriviallyCopyableStageTypes = std::is_trivially_copyable_v<FusedValueTypeIn<T>> && std::is_trivially_copyable_v<FusedValueTypeOut<T>> //
+                                      && alignof(FusedValueTypeIn<T>) <= gr::kCacheLine && alignof(FusedValueTypeOut<T>) <= gr::kCacheLine;
 
 template<typename T>
 concept FusableStageBlock = HasProcessOneFunction<T> && !HasProcessBulkFunction<T>                                                           //

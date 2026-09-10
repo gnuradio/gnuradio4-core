@@ -1140,6 +1140,86 @@ struct AlignedArm {
     std::size_t        nRuns       = 0UZ;
 };
 
+// aligned wider than the scratch guarantees, so it is trivially copyable and still not a stage type
+struct alignas(2UZ * gr::kCacheLine) WidelyAlignedSample {
+    float value{};
+};
+
+static_assert(std::is_trivially_copyable_v<WidelyAlignedSample>, "the alignment must be the only thing keeping this type out of a run");
+
+struct WidelyAlignedSource : Block<WidelyAlignedSource> {
+    PortOut<WidelyAlignedSample> out;
+
+    GR_MAKE_REFLECTABLE(WidelyAlignedSource, out);
+
+    std::size_t _emitted = 0UZ;
+
+    work::Status processBulk(OutputSpanLike auto& outSpan) {
+        if (_emitted >= kAlignedSamples) {
+            outSpan.publish(0UZ);
+            return work::Status::DONE;
+        }
+        const std::size_t n = std::min(outSpan.size(), kAlignedSamples - _emitted);
+        for (std::size_t i = 0UZ; i < n; ++i) {
+            outSpan[i].value = static_cast<float>(_emitted + i);
+        }
+        _emitted += n;
+        outSpan.publish(n);
+        return n == 0UZ ? work::Status::INSUFFICIENT_OUTPUT_ITEMS : work::Status::OK;
+    }
+};
+
+struct WidelyAlignedGain : Block<WidelyAlignedGain> {
+    PortIn<WidelyAlignedSample>  in;
+    PortOut<WidelyAlignedSample> out;
+
+    GR_MAKE_REFLECTABLE(WidelyAlignedGain, in, out);
+
+    [[nodiscard]] WidelyAlignedSample processOne(const WidelyAlignedSample& sample) const {
+        countAlignment(sample);
+        return WidelyAlignedSample{2.0f * sample.value};
+    }
+};
+
+struct WidelyAlignedSink : Block<WidelyAlignedSink> {
+    PortIn<WidelyAlignedSample> in;
+
+    GR_MAKE_REFLECTABLE(WidelyAlignedSink, in);
+
+    std::vector<float> values;
+
+    void processOne(const WidelyAlignedSample& sample) {
+        countAlignment(sample);
+        values.push_back(sample.value);
+    }
+};
+
+static_assert(!block::detail::FusableStageBlock<WidelyAlignedGain>, "a sample type aligned wider than a cache line is not a fusable stage type");
+
+// two consecutive processOne members are a run wherever their sample type is one the scratch can carry
+[[nodiscard]] inline AlignedArm runWidelyAlignedChain(bool fusion) {
+    using namespace boost::ut;
+
+    gr::Graph flow;
+    auto&     source = flow.emplaceBlock<WidelyAlignedSource>();
+    auto&     gainA  = flow.emplaceBlock<WidelyAlignedGain>();
+    auto&     gainB  = flow.emplaceBlock<WidelyAlignedGain>();
+    auto&     sink   = flow.emplaceBlock<WidelyAlignedSink>();
+    expect(flow.connect<"out", "in">(source, gainA).has_value());
+    expect(flow.connect<"out", "in">(gainA, gainB).has_value());
+    expect(flow.connect<"out", "in">(gainB, sink).has_value());
+
+    WidelyAlignedSink* observed = std::addressof(sink);
+    gMisalignedStageAddresses.store(0UZ, std::memory_order_relaxed);
+
+    const gr::property_map                                                schedulerSettings{{"enable_fusion", fusion}};
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{schedulerSettings};
+    expect(scheduler.exchange(std::move(flow)).has_value());
+    expect(scheduler.runAndWait().has_value());
+
+    return AlignedArm{observed->values, gMisalignedStageAddresses.load(std::memory_order_relaxed), collectRunSizes(scheduler.fusionPlan()).size()};
+}
+
 // three composed members put the second ping-pong buffer in the middle of the segment, and the wide member sizes
 // the stride to a multiple of neither the aligned sample nor a cache line
 [[nodiscard]] inline AlignedArm runAlignedChain(bool fusion, std::size_t chunkSamples) {
@@ -1760,6 +1840,16 @@ const boost::ut::suite<"fusion"> _fusion = [] {
         expect(eq(fused.nMisaligned, 0UZ)) << "a scratch address must carry the alignment of the type created at it";
         expect(eq(unfused.values.size(), kAlignedSamples));
         expect(fused.values == unfused.values) << "fusion changed the stream of an over-aligned sample type";
+    };
+
+    "a sample type aligned wider than a cache line runs unfused"_test = [] {
+        const AlignedArm unfused = runWidelyAlignedChain(false);
+        const AlignedArm fused   = runWidelyAlignedChain(true);
+
+        expect(eq(fused.nRuns, 0UZ)) << "a sample type the scratch cannot align must leave no run";
+        expect(eq(fused.nMisaligned, 0UZ)) << "every sample must be read at an address its type can be created at";
+        expect(eq(unfused.values.size(), kAlignedSamples));
+        expect(fused.values == unfused.values) << "the stream of a sample type that is never fused differs";
     };
 };
 
