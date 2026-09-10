@@ -316,9 +316,13 @@ public:
             return;
         }
 
-        if (_instance->abiVersion() != GR_PLUGIN_CURRENT_ABI_VERSION) {
-            _status = "Wrong ABI version";
-            releaseInstance();
+        if (const std::uint8_t pluginAbiVersion = _instance->abiVersion(); pluginAbiVersion != GR_PLUGIN_CURRENT_ABI_VERSION) {
+            // A refused plugin is unmapped here rather than at the end of the load, so that it cannot be taken
+            // afterwards for one of the shared objects that register blocks without carrying a plugin interface,
+            // which the load keeps mapped.
+            _status = std::format("plugin ABI version {} does not match the host's plugin ABI version {}", pluginAbiVersion, GR_PLUGIN_CURRENT_ABI_VERSION);
+            std::println("warning: plugin {} not loaded: {}", plugin_file, _status);
+            release();
             return;
         }
     }

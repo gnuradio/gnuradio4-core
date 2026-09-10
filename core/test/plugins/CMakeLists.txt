@@ -55,6 +55,19 @@ add_block_library(block_library_second block_library)
 add_block_library(block_library_duplicate block_library_duplicate)
 add_block_library(block_library_duplicate_second block_library_duplicate)
 
+# One plugin at two plugin ABI versions, in a directory of their own: one at the version this core implements and one at
+# version 1. A single load of that directory reaches both outcomes of the loader's version check.
+function(add_abi_probe_plugin PLUGIN_NAME)
+  add_library(${PLUGIN_NAME} MODULE ${PLUGIN_NAME}.cpp)
+  target_compile_options(${PLUGIN_NAME} PRIVATE -Wall)
+  target_include_directories(${PLUGIN_NAME} PUBLIC ${CMAKE_BINARY_DIR}/include)
+  target_link_libraries(${PLUGIN_NAME} PUBLIC gnuradio-options gnuradio-core gnuradio-plugin)
+  set_target_properties(${PLUGIN_NAME} PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${TESTS_BINARY_PATH}/plugin_abi)
+endfunction()
+
+add_abi_probe_plugin(abi_probe_plugin)
+add_abi_probe_plugin(abi_probe_plugin_v1)
+
 # a name that reads as a shared object but is not one the scan opens; it is never dlopened, so an empty file suffices
 file(MAKE_DIRECTORY ${TESTS_BINARY_PATH}/block_library_skipped)
 file(TOUCH ${TESTS_BINARY_PATH}/block_library_skipped/libnotopened.so.1)
