@@ -186,8 +186,10 @@ public:
     MultiProducerStrategy(const MultiProducerStrategy&&) = delete;
     void operator=(const MultiProducerStrategy&)         = delete;
 
-    // a reader attaches at the publish cursor, so republishing it is the conservative min for the fast path
-    void notifyReaderSetChanged() const noexcept { gr::atomic_ref(_cachedMinReaderCursor).store_relaxed(_publishCursor.value()); }
+    // next()/tryNext() take _cachedMinReaderCursor as a lower bound on every reader's position and claim without
+    // recomputing while it holds, so a changed reader set leaves the minimum over the new set behind. Reader cursors
+    // only advance, which keeps that value a lower bound until the set changes again.
+    void notifyReaderSetChanged() const noexcept { gr::atomic_ref(_cachedMinReaderCursor).store_relaxed(getMinReaderCursor()); }
 
     [[nodiscard]] std::size_t next(std::size_t nSlotsToClaim = 1) noexcept {
         assert((nSlotsToClaim > 0 && nSlotsToClaim <= _size) && "nSlotsToClaim must be > 0 and <= bufferSize");
