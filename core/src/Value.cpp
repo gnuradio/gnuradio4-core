@@ -560,10 +560,15 @@ bool Value::operator==(const Value& other) const {
     case ContainerType::Map: return *static_cast<const Map*>(_storage.ptr) == *static_cast<const Map*>(other._storage.ptr);
 
     case ContainerType::Tensor:
-        // Tensor equality would require type dispatch and element-wise comparison
-        // For now, just compare pointers (identity check)
-        // TODO: Implement proper element-wise comparison via Tensor::operator==
-        return _storage.ptr == other._storage.ptr;
+        // the element type is equal on both sides here, so the shape and element check of Tensor::operator== decides
+        switch (value_type()) {
+#define X(T)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   \
+    case get_value_type<T>(): return *static_cast<const Tensor<T>*>(_storage.ptr) == *static_cast<const Tensor<T>*>(other._storage.ptr);
+            GR_PMT_VALUE_TENSOR_ELEMENT_TYPES
+#undef X
+
+        default: return false;
+        }
 
     default: return false;
     }
