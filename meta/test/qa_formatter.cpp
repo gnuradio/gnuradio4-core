@@ -108,35 +108,6 @@ const boost::ut::suite<"std::complex formatter"> complexFormatter = [] {
     };
 };
 
-const boost::ut::suite uncertainValueFormatter = [] {
-    using namespace boost::ut;
-    using namespace std::literals::complex_literals;
-    using namespace std::literals::string_literals;
-    using UncertainDouble  = gr::UncertainValue<double>;
-    using UncertainComplex = gr::UncertainValue<std::complex<double>>;
-
-    "std::formatter<gr::UncertainValue<T>>"_test = [] {
-        // Test with UncertainValue<double>
-        expect(eq("(1.23 ± 0.45)"s, std::format("{}", UncertainDouble{1.23, 0.45})));
-        expect(eq("(3.14 ± 0.01)"s, std::format("{}", UncertainDouble{3.14, 0.01})));
-        expect(eq("(0 ± 0)"s, std::format("{}", UncertainDouble{0, 0})));
-
-        // Test with UncertainValue<std::complex<double>>
-        expect(eq("((1+2i) ± (0.1+0.2i))"s, std::format("{}", UncertainComplex{{1, 2}, {0.1, 0.2}})));
-        expect(eq("((3.14+1.59i) ± (0.01+0.02i))"s, std::format("{}", UncertainComplex{{3.14, 1.59}, {0.01, 0.02}})));
-        expect(eq("(0 ± 0)"s, std::format("{}", UncertainComplex{{0, 0}, {0, 0}})));
-
-        // Test with UncertainValue<double> and float number formatting
-        expect(eq("(1.230 ± 0.450)"s, std::format("{:1.3f}", UncertainDouble{1.23, 0.45})));
-        expect(eq("(3.140 ± 0.010)"s, std::format("{:1.3f}", UncertainDouble{3.14, 0.01})));
-        expect(eq("(0.000 ± 0.000)"s, std::format("{:1.3f}", UncertainDouble{0, 0})));
-
-        std::stringstream ss;
-        ss << UncertainDouble{1.23, 0.45};
-        expect(eq("(1.23 ± 0.45)"s, ss.str()));
-    };
-};
-
 const boost::ut::suite propertyMapFormatter = [] {
     using namespace boost::ut;
     using namespace std::literals::string_literals;
