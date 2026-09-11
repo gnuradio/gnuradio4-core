@@ -279,6 +279,23 @@ void applySettings(ChangeRecordingBlock& block, const property_map& parameters) 
     std::ignore = block.settings().applyStagedParameters();
 }
 
+/// a block whose one setting is vector-valued: the settings map holds it as a tensor, so whether a repeat of it is a
+/// change is decided by tensor comparison. Every member carries an initializer of its own, as above.
+struct TapsRecordingBlock : Block<TapsRecordingBlock> {
+    PortIn<float>  in{};
+    PortOut<float> out{};
+
+    Annotated<std::vector<float>, "filter taps"> taps = std::vector<float>{1.0f};
+
+    GR_MAKE_REFLECTABLE(TapsRecordingBlock, in, out, taps);
+
+    std::size_t nSettingsChanged = 0UZ;
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
+
+    void settingsChanged(const property_map& /*oldSettings*/, const property_map& /*newSettings*/) { nSettingsChanged++; }
+};
+
 [[nodiscard]] std::optional<gr::Size_t> sizeOf(const property_map& map, std::string_view key) {
     const auto it = map.find(key);
     if (it == map.end()) {
@@ -507,6 +524,38 @@ const boost::ut::suite<"settings"> _settings = [] {
         expect(eq(block.newSeen.size(), 0UZ)) << "no value moved, so there is no change to report";
         expect(eq(block.fft_size.value, gr::Size_t(2048))) << "the value stays applied";
         expect(eq(sizeOf(block.settings().get(), "fft_size").value_or(0U), gr::Size_t(2048))) << "the settings still report the value";
+    };
+
+    "a vector setting re-applied at the value the block holds is no change"_test = [] {
+        TapsRecordingBlock block;
+        block.init(std::make_shared<gr::Sequence>());
+        const std::size_t        nChangesAtStart = block.nSettingsChanged;
+        const std::vector<float> taps{0.25f, 0.5f, 0.25f};
+
+        std::ignore = block.settings().set({{"taps", taps}});
+        std::ignore = block.settings().activateContext();
+        std::ignore = block.settings().applyStagedParameters();
+
+        expect(eq(block.nSettingsChanged, nChangesAtStart + 1UZ)) << "the new vector is one change";
+        expect(block.taps.value == taps) << "and it reaches the member";
+
+        std::ignore = block.settings().set({{"taps", taps}});
+        std::ignore = block.settings().activateContext();
+        std::ignore = block.settings().applyStagedParameters();
+
+        expect(eq(block.nSettingsChanged, nChangesAtStart + 1UZ)) << "the same vector costs no further change";
+        expect(block.taps.value == taps) << "and leaves the value applied";
+    };
+
+    "tags carrying equal vectors compare equal"_test = [] {
+        const std::vector<float> taps{0.25f, 0.5f, 0.25f};
+
+        const Tag first{0UZ, property_map{{"taps", taps}}};
+        const Tag second{0UZ, property_map{{"taps", taps}}};
+        const Tag third{0UZ, property_map{{"taps", std::vector<float>{0.25f, 0.5f}}}};
+
+        expect(first == second) << "equal payloads make equal tags";
+        expect(first != third) << "differing payloads make different tags";
     };
 
     "a change names only the moved key of a pair set together"_test = [] {

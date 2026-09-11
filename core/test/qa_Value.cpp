@@ -820,6 +820,31 @@ const boost::ut::suite<"Value - Comparison & Ordering"> _comparison_suite = [] {
             expect(map1["key3"].holds<int>());
         };
     };
+
+    "Tensor equality compares elements"_test = [] {
+        const std::vector<float> data{1.0f, 2.0f, 3.0f};
+
+        Value a{data};
+        Value b{data};
+
+        expect(a == b) << "equal contents compare equal";
+        expect(!(a != b));
+
+        Value copy = a;
+        expect(a == copy) << "a copy compares equal to its source";
+
+        expect(a != Value{std::vector<float>{1.0f, 2.0f, 4.0f}}) << "a differing element compares unequal";
+        expect(a != Value{std::vector<float>{1.0f, 2.0f}}) << "a differing shape compares unequal";
+        expect(a != Value{std::vector<double>{1.0, 2.0, 3.0}}) << "a differing element type compares unequal";
+    };
+
+    "Tensor of strings equality compares elements"_test = [] {
+        Value a{std::vector<std::string>{"alpha", "beta"}};
+        Value b{std::vector<std::string>{"alpha", "beta"}};
+
+        expect(a == b) << "equal contents compare equal";
+        expect(a != Value{std::vector<std::string>{"alpha", "gamma"}}) << "a differing element compares unequal";
+    };
 };
 
 const boost::ut::suite<"Value - PMR Memory Management"> _pmr_suite = [] {
