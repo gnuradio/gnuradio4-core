@@ -31,6 +31,12 @@ static_assert(string_like<decltype(stringLiteral)>);
 static_assert(string_like<decltype(fixed_string("abc"))>);
 static_assert(!string_like<int>);
 
+static_assert(gr::arithmetic_or_complex_like<float>);
+static_assert(gr::arithmetic_or_complex_like<std::complex<double>>);
+static_assert(gr::arithmetic_sample_like<float>);
+static_assert(gr::arithmetic_sample_like<std::complex<double>>);
+static_assert(!gr::arithmetic_sample_like<std::vector<float>>);
+
 class MyClass {
 public:
     void nonConstFunc() {}

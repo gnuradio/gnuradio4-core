@@ -179,7 +179,8 @@ A<gr::Size_t, "n_inputs", gr::Visible, gr::Limits<1U, 32U>> n_inputs = 0U;
 ### Supported types
 
 Scalars (`float`, `double`, `int`, ...), `std::string`, enums, `std::vector<T>`,
-`std::array<T, N>`, `gr::Tensor<T>`, `std::complex<T>`, `gr::UncertainValue<T>`.
+`std::array<T, N>`, `gr::Tensor<T>`, and `std::complex<T>`. The
+`gnuradio4-library` package additionally provides `gr::UncertainValue<T>`.
 
 ### When to use `std::vector<T>` vs. `std::array<T, N>` vs. `gr::Tensor<T>`
 
