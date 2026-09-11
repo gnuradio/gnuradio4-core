@@ -691,7 +691,6 @@ if(ENABLE_TESTING
       qa_formatter
       qa_traits
       qa_type_name
-      qa_UncertainValue
       qa_RangesHelper)
   setup_target_for_coverage_gcovr_xml(
     NAME

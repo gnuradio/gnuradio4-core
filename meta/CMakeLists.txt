@@ -14,8 +14,7 @@ set(meta_public_headers
     include/gnuradio-4.0/meta/reflection.hpp
     include/gnuradio-4.0/meta/simd.hpp
     include/gnuradio-4.0/meta/typelist.hpp
-    include/gnuradio-4.0/meta/utils.hpp
-    include/gnuradio-4.0/meta/UncertainValue.hpp)
+    include/gnuradio-4.0/meta/utils.hpp)
 
 # gr::kCacheLine is the alignment, and so the layout, of public types such as gr::Tag and gr::Sequence, so an override
 # is defined on the interface: a consumer has to be built with the same value as the library.

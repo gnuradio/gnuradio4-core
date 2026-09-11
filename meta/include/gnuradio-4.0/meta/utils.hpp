@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cctype>
 #include <complex>
+#include <concepts>
 #include <cstdint>
 #include <cxxabi.h>
 #include <format>
@@ -913,6 +914,20 @@ template<typename T>
 concept IsNoexceptMemberFunction = std::is_member_function_pointer_v<T> && detail::is_noexcept_member_function<T>::value;
 
 } // namespace meta
+
+/** A scalar arithmetic or supported complex number. */
+template<typename T>
+concept arithmetic_or_complex_like = std::is_arithmetic_v<std::remove_cvref_t<T>> || meta::complex_like<std::remove_cvref_t<T>>;
+
+/** Extension point for compact numeric wrappers that can use arithmetic stream-port handling. */
+template<typename T>
+struct is_arithmetic_sample : std::bool_constant<arithmetic_or_complex_like<T>> {};
+
+template<typename T>
+inline constexpr bool is_arithmetic_sample_v = is_arithmetic_sample<std::remove_cvref_t<T>>::value;
+
+template<typename T>
+concept arithmetic_sample_like = is_arithmetic_sample_v<T>;
 
 template<typename Fn>
 struct on_scope_exit {
