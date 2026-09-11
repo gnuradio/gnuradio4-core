@@ -156,7 +156,8 @@ class double_mapped_memory_resource : public std::pmr::memory_resource {
 #ifdef HAS_POSIX_MAP_INTERFACE
     void do_deallocate(void* p, std::size_t size, std::size_t alignment) override { // NOSONAR
 
-        if (munmap(p, size) == -1) {
+        const std::size_t mapped_size = 2 * size; // do_allocate_internal maps the requested size twice: the buffer and the mirror behind it
+        if (munmap(p, mapped_size) == -1) {
             throw std::system_error(errno, std::system_category(), std::format("double_mapped_memory_resource::do_deallocate(void*, {}, {}) - munmap(..) failed", size, alignment));
         }
     }
