@@ -128,6 +128,36 @@ struct Sink : Block<Sink> {
     }
 };
 
+/// Inspect EOS with the real work-path InputSpan alive, as tag-aware blocks do.
+struct InspectingForwarder : Block<InspectingForwarder> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(InspectingForwarder, in, out);
+
+    std::size_t            invocations  = 0UZ;
+    std::size_t            epilogueRuns = 0UZ;
+    std::vector<TagRecord> seen;
+
+    work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
+        ++invocations;
+        std::ignore = samples_to_eos_tag(in);
+        for (const auto& [relIndex, map] : inSpan.tags(1UZ)) {
+            seen.push_back({inSpan.streamIndex, map.get()});
+        }
+        std::ranges::copy(inSpan, outSpan.begin());
+        std::ignore = inSpan.consume(inSpan.size());
+        outSpan.publish(inSpan.size());
+        return work::Status::OK;
+    }
+
+    work::Status processEpilogue(InputSpanLike auto&, OutputSpanLike auto& outSpan) {
+        ++epilogueRuns;
+        outSpan.publish(0UZ);
+        return work::Status::OK;
+    }
+};
+
 /// default policy, but `input_chunk_size` > 1 forbids a chunk boundary at every tag
 struct Decimate : Block<Decimate, Resampling<kDecim, 1U, true>> {
     PortIn<float>  in;
@@ -370,6 +400,23 @@ const boost::ut::suite<"tag forwarding"> _tagForwarding = [] {
     using namespace qa_tag_forwarding;
 
     const std::vector<std::size_t> kInteriorTags{0UZ, 1UZ, 2UZ, 5UZ, 6UZ, 9UZ};
+
+    "tag inspection during work delivers each tag exactly once"_test = [] {
+        const std::vector<std::size_t> tagAt{0UZ, 1UZ, 7UZ, 8UZ, 9UZ, 63UZ};
+        runChain<InspectingForwarder>(
+            tagAt,
+            [&](InspectingForwarder& middle, Sink& sink) {
+                expect(gt(middle.invocations, 1UZ));
+                expect(eq(sink.samples.size(), kSamples));
+                expect(std::ranges::equal(sink.samples, std::views::iota(0UZ, kSamples) | std::views::transform([](auto i) { return static_cast<float>(i); })));
+                for (const auto at : tagAt) {
+                    expect(eq(countNamed(middle.seen, std::format("t{}", at)), 1UZ)) << "input tag observed once across work calls";
+                    expect(eq(countNamed(sink.tags, std::format("t{}", at)), 1UZ)) << "output tag delivered once";
+                }
+                expect(eq(middle.epilogueRuns, 1UZ)) << "EOS completes the work path once";
+            },
+            [](InspectingForwarder& middle) { middle.in.max_samples = kChunk; });
+    };
 
     "a decimator's interior tags arrive through a negative relative index"_test = [&] {
         runChain<Decimate>(kInteriorTags, [&](Decimate& middle, Sink& sink) {

@@ -923,6 +923,80 @@ const boost::ut::suite<"tag-distance helpers"> _tagdist = [] { // NOSONAR (N.B. 
         expect(!nSamplesUntilNextTag(in, 0UZ).has_value());
     };
 
+    "inspection preserves live InputSpan tag consumption"_test = [] {
+        // Include no progress, a boundary tag, explicit full consumption and default ProcessAll.
+        for (const std::size_t consumed : {0UZ, 2UZ, 6UZ}) {
+            for (const bool explicitConsume : {false, true}) {
+                if (!explicitConsume && consumed != 6UZ) {
+                    continue;
+                }
+                for (const bool inspectEOS : {false, true}) {
+                    PortIn<int> in;
+                    auto        writer    = in.buffer().streamBuffer.new_writer();
+                    auto        tagWriter = in.buffer().tagBuffer.new_writer();
+                    {
+                        auto data = writer.reserve<SpanReleasePolicy::ProcessAll>(6UZ);
+                        std::iota(data.begin(), data.end(), 0);
+                        auto tags = tagWriter.reserve<SpanReleasePolicy::ProcessAll>(4UZ);
+                        tags[0]   = {0UZ, {{"id", 0}}};
+                        tags[1]   = {1UZ, {{"id", 1}}};
+                        tags[2]   = {2UZ, {{"id", 2}}};
+                        tags[3]   = {4UZ, {{static_cast<std::pmr::string>(gr::tag::END_OF_STREAM), true}}};
+                    }
+                    {
+                        auto data = in.get<SpanReleasePolicy::ProcessAll>(6UZ);
+                        expect(eq(data.rawTags.size(), 4UZ));
+                        const auto distance = inspectEOS ? samples_to_eos_tag(in) : nSamplesUntilNextTag(in, 1UZ);
+                        expect(eq(distance.value_or(99UZ), inspectEOS ? 4UZ : 1UZ));
+                        if (explicitConsume) {
+                            expect(data.consume(consumed));
+                        }
+                    }
+                    expect(eq(in.streamReader().position(), consumed));
+                    const std::size_t remaining = consumed == 0UZ ? 4UZ : consumed == 2UZ ? 2UZ : 0UZ;
+                    expect(eq(in.tagReader().available(), remaining)) << "inspection must not retain consumed tags";
+                    {
+                        auto next = in.get<SpanReleasePolicy::ProcessAll>(6UZ - consumed);
+                        expect(eq(next.rawTags.size(), remaining)) << "consumed tags must not be delivered again";
+                        if (!next.rawTags.empty()) {
+                            expect(eq(next.rawTags.front().index, consumed));
+                        }
+                    }
+                    expect(eq(in.tagReader().available(), 0UZ));
+                }
+            }
+        }
+    };
+
+    "repeated inspection preserves boundary and EOS tags"_test = [] {
+        PortIn<int> in;
+        auto        writer    = in.buffer().streamBuffer.new_writer();
+        auto        tagWriter = in.buffer().tagBuffer.new_writer();
+        {
+            auto data = writer.reserve<SpanReleasePolicy::ProcessAll>(5UZ);
+            std::iota(data.begin(), data.end(), 0);
+            auto tags = tagWriter.reserve<SpanReleasePolicy::ProcessAll>(2UZ);
+            tags[0]   = {0UZ, {{"id", 0}}};
+            tags[1]   = {4UZ, {{static_cast<std::pmr::string>(gr::tag::END_OF_STREAM), true}}};
+        }
+        std::size_t delivered = 0UZ;
+        for (const auto n : {2UZ, 2UZ, 0UZ, 1UZ}) {
+            const auto position = in.streamReader().position();
+            auto       data     = in.get<SpanReleasePolicy::ProcessAll>(n);
+            delivered += data.rawTags.size();
+            for (int repeat = 0; repeat < 3; ++repeat) {
+                expect(eq(nSamplesUntilNextTag(in).value_or(99UZ), position == 0UZ ? 0UZ : 4UZ - position));
+                expect(eq(samples_to_eos_tag(in).value_or(99UZ), 4UZ - position));
+                expect(!nSamplesUntilNextTag(in, 5UZ).has_value());
+            }
+            expect(data.consume(n));
+        }
+        expect(eq(delivered, 2UZ));
+        expect(eq(in.streamReader().position(), 5UZ));
+        expect(eq(in.tagReader().available(), 0UZ));
+        expect(!samples_to_eos_tag(in).has_value());
+    };
+
     "custom predicate"_test = [] {
         PortIn<int> in;
         auto        writer    = in.buffer().streamBuffer.new_writer();
