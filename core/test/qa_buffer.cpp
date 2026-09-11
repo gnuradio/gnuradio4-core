@@ -1586,6 +1586,99 @@ const boost::ut::suite<"CursorCacheStaleness"> _cursorCacheTests = [] {
         expect(eq(writer.available(), cap)) << "full capacity not restored after drain";
     };
 
+    // the multi-producer claim keeps the reader minimum in a cache that available() recomputes, so neither test
+    // below may ask for the capacity between the change of the reader set and the claim it must gate
+    "multi producer - a reader added mid-stream must keep the lagging reader's samples"_test = [] {
+        using Buffer = CircularBuffer<int, std::dynamic_extent, ProducerType::Multi>;
+        Buffer buf(1024);
+        auto   writer     = buf.new_writer();
+        auto   readerSlow = buf.new_reader();
+        auto   readerFast = buf.new_reader();
+
+        const std::size_t cap  = buf.size();
+        const std::size_t nLag = 8UZ;
+
+        {
+            auto span = writer.tryReserve<SpanReleasePolicy::ProcessAll>(nLag);
+            expect(eq(span.size(), nLag)) << "the first claim must fit";
+            std::iota(span.begin(), span.end(), 0);
+            span.publish(span.size());
+        }
+        {
+            auto in = readerFast.get(nLag);
+            expect(in.consume(nLag));
+        }
+
+        auto readerNew = buf.new_reader(); // attaches at the publish cursor, nLag ahead of the lagging reader
+
+        bool overClaimed = false;
+        {
+            auto span   = writer.tryReserve<SpanReleasePolicy::ProcessAll>(cap - nLag + 1UZ);
+            overClaimed = !span.empty();
+            if (overClaimed) {
+                std::fill(span.begin(), span.end(), -1);
+                span.publish(span.size());
+            }
+        }
+        expect(!overClaimed) << "claimed into the lagging reader's unread samples";
+
+        {
+            auto span = writer.tryReserve<SpanReleasePolicy::ProcessAll>(cap - nLag);
+            expect(eq(span.size(), cap - nLag)) << "the slots the lagging reader does not hold must stay claimable";
+            std::fill(span.begin(), span.end(), -2);
+            span.publish(span.size());
+        }
+
+        auto in = readerSlow.get(nLag);
+        expect(eq(in.size(), nLag));
+        for (std::size_t i = 0UZ; i < in.size(); ++i) {
+            expect(eq(in[i], static_cast<int>(i))) << "unread sample " << i << " was overwritten";
+        }
+        expect(in.consume(in.size()));
+    };
+
+    "multi producer - a reader removed mid-stream must keep the lagging reader's samples"_test = [] {
+        using Buffer = CircularBuffer<int, std::dynamic_extent, ProducerType::Multi>;
+        Buffer buf(1024);
+        auto   writer     = buf.new_writer();
+        auto   readerSlow = buf.new_reader();
+
+        const std::size_t cap  = buf.size();
+        const std::size_t nLag = 8UZ;
+
+        {
+            auto readerTemp = buf.new_reader();
+            {
+                auto span = writer.tryReserve<SpanReleasePolicy::ProcessAll>(nLag);
+                expect(eq(span.size(), nLag)) << "the first claim must fit";
+                std::iota(span.begin(), span.end(), 0);
+                span.publish(span.size());
+            }
+            {
+                auto in = readerTemp.get(nLag);
+                expect(in.consume(nLag));
+            }
+        }
+
+        bool overClaimed = false;
+        {
+            auto span   = writer.tryReserve<SpanReleasePolicy::ProcessAll>(cap - nLag + 1UZ);
+            overClaimed = !span.empty();
+            if (overClaimed) {
+                std::fill(span.begin(), span.end(), -1);
+                span.publish(span.size());
+            }
+        }
+        expect(!overClaimed) << "claimed into the lagging reader's unread samples";
+
+        auto in = readerSlow.get(nLag);
+        expect(eq(in.size(), nLag));
+        for (std::size_t i = 0UZ; i < in.size(); ++i) {
+            expect(eq(in[i], static_cast<int>(i))) << "unread sample " << i << " was overwritten";
+        }
+        expect(in.consume(in.size()));
+    };
+
     "tryReserve with ProcessNone does not corrupt cache"_test = [&] {
         using Buffer = CircularBuffer<int, std::dynamic_extent, ProducerType::Single>;
         Buffer buf(1024);
