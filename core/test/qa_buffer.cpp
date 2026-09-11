@@ -1,8 +1,10 @@
 #include <algorithm>
 #include <array>
 #include <complex>
+#include <fstream>
 #include <numeric>
 #include <ranges>
+#include <string>
 #include <tuple>
 
 #include <boost/ut.hpp>
@@ -170,6 +172,34 @@ const boost::ut::suite DoubleMappedAllocatorTests = [] {
             // to note: can safely read beyond size for this special vector
             expect(eq(vec[size + i], vec[i])); // identical to mirrored copy
         }
+    };
+
+    // the mirror is a mapping of its own, and /proc/self/maps names every mapping after the memfd it was made from
+    "DoubleMappedAllocator - deallocation releases the mirror"_test = [] {
+        const auto countMappings = [] {
+            std::ifstream maps("/proc/self/maps");
+            std::size_t   nMappings = 0UZ;
+            for (std::string line; std::getline(maps, line);) {
+                nMappings += line.contains("double_mapped_memory_resource") ? 1UZ : 0UZ;
+            }
+            return nMappings;
+        };
+
+        if (!std::ifstream("/proc/self/maps").good()) {
+            return; // the mappings of a process are not observable without /proc
+        }
+
+        using Allocator           = std::pmr::polymorphic_allocator<int32_t>;
+        const std::size_t size    = static_cast<std::size_t>(getpagesize()) / sizeof(int32_t);
+        const std::size_t nBefore = countMappings();
+
+        for (std::size_t round = 0UZ; round < 8UZ; ++round) {
+            std::vector<int32_t, Allocator> vec(size, gr::double_mapped_memory_resource::allocator<int32_t>());
+            vec[0] = static_cast<std::int32_t>(round);
+            expect(eq(vec[size], vec[0])) << "the mirror must follow the first half";
+        }
+
+        expect(eq(countMappings(), nBefore)) << "each buffer must give back both halves of its mapping";
     };
 };
 #endif
