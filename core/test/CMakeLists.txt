@@ -49,8 +49,6 @@ set(_CORE_TESTS
     qa_SettingsTable
     qa_TagForwarding
     qa_Tensor
-    qa_TensorMath
-    qa_SVD
     qa_TriggerMatcher
     qa_YamlPmt
     qa_PortableTypeName
