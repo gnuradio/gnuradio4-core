@@ -187,7 +187,9 @@ protected:
     // separate cache lines: every worker reads the flag and updates the counter on each iteration
     alignas(gr::kCacheLine) bool _workQuiescenceRequested{false};
     alignas(gr::kCacheLine) std::size_t _nWorkersInWork{0};
-    std::size_t _nWorkersStarted{0}; // workers of this run that reached poolWorker(), not workers the pool has queued
+    // counted by the dispatch, immediately before the call into poolWorker(), so that a scheduler which supplies its
+    // own worker is counted as well; a worker the pool has only queued is not counted
+    std::size_t _nWorkersStarted{0};
 
     // a watchdog only leaves on its own once the run's jobs are gone, which a restart inside its check
     // interval undoes, so every start retires the previous generation explicitly
@@ -981,6 +983,7 @@ protected:
         if constexpr (executionPolicy() == ExecutionPolicy::singleThreaded || executionPolicy() == ExecutionPolicy::singleThreadedBlocking) {
             _nRunningJobs->incrementAndGet();
             _nRunningJobs->notify_all();
+            gr::atomic_ref(_nWorkersStarted).fetch_add(1UZ);
             static_cast<Derived*>(this)->poolWorker(0UZ, _executionOrder);
         } else { // run on processing thread pool
             [[maybe_unused]] const auto pe           = _profilerHandler->startCompleteEvent("scheduler_base.runOnPool");
@@ -998,6 +1001,7 @@ protected:
                             releaseWorkerCount(*_nRunningJobs);
                             return;
                         }
+                        gr::atomic_ref(_nWorkersStarted).fetch_add(1UZ);
                         static_cast<Derived*>(this)->poolWorker(runnerID, jobListsCopy);
                     });
                 } catch (...) { // a rejected task never decrements, and the leaked count spins waitDone() forever
@@ -1036,7 +1040,6 @@ protected:
 
     void poolWorker(const std::size_t runnerID, std::shared_ptr<std::vector<std::vector<std::shared_ptr<BlockModel>>>> jobList) {
         using enum lifecycle::State;
-        gr::atomic_ref(_nWorkersStarted).fetch_add(1UZ);
         std::shared_ptr<gr::Sequence> progress     = _graph->_progress; // life-time guaranteed
         std::shared_ptr<gr::Sequence> nRunningJobs = _nRunningJobs;
 
