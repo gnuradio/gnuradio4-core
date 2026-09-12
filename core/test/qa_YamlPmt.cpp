@@ -1256,4 +1256,98 @@ const boost::ut::suite<"round-trip precision"> _yamlPrecision = [] {
     };
 };
 
+const boost::ut::suite<"core schema scalar resolution"> _yamlScalarResolution = [] {
+    using namespace boost::ut;
+    using namespace std::string_literals;
+    using namespace std::string_view_literals;
+
+    "an untagged scalar is a number only when the whole scalar is one"_test = [] {
+        constexpr std::string_view src = R"yaml(
+code_rate: 2/3
+modulation: 8psk
+exponent_with_suffix: 1e3x
+digits_with_letters: 12abc
+point_then_letters: 3.x
+date: 2024-01-31
+version: 1.0.0
+integer: 2
+negative_integer: -7
+real: 2.5
+exponent: 1e3
+negative_exponent: -1.5e-3
+hexadecimal: 0xFF
+octal: 0o77
+binary: 0b1010
+infinity: .inf
+negative_infinity: -.inf
+not_a_number: .nan
+)yaml";
+
+        gr::property_map expected;
+        expected["code_rate"]            = "2/3"s;
+        expected["modulation"]           = "8psk"s;
+        expected["exponent_with_suffix"] = "1e3x"s;
+        expected["digits_with_letters"]  = "12abc"s;
+        expected["point_then_letters"]   = "3.x"s;
+        expected["date"]                 = "2024-01-31"s;
+        expected["version"]              = "1.0.0"s;
+        expected["integer"]              = static_cast<std::int64_t>(2);
+        expected["negative_integer"]     = static_cast<std::int64_t>(-7);
+        expected["real"]                 = 2.5;
+        expected["exponent"]             = 1e3;
+        expected["negative_exponent"]    = -1.5e-3;
+        expected["hexadecimal"]          = static_cast<std::int64_t>(255);
+        expected["octal"]                = static_cast<std::int64_t>(63);
+        expected["binary"]               = static_cast<std::int64_t>(10);
+        expected["infinity"]             = std::numeric_limits<double>::infinity();
+        expected["negative_infinity"]    = -std::numeric_limits<double>::infinity();
+        expected["not_a_number"]         = std::numeric_limits<double>::quiet_NaN();
+
+        testYAML(src, expected);
+    };
+
+    "a settings document keeps a fractional rate and a modulation name as text"_test = [] {
+        constexpr std::string_view src = R"yaml(
+settings:
+  puncture: 2/3
+  modulation: 8psk
+  sample_rate: 2.4e6
+  decimation: 4
+rates:
+  - 2/3
+  - 1/2
+)yaml";
+
+        gr::property_map settings;
+        settings["puncture"]    = "2/3"s;
+        settings["modulation"]  = "8psk"s;
+        settings["sample_rate"] = 2.4e6;
+        settings["decimation"]  = static_cast<std::int64_t>(4);
+
+        gr::property_map expected;
+        expected["settings"] = settings;
+        expected["rates"]    = Tensor<pmt::Value>{pmt::Value("2/3"), pmt::Value("1/2")};
+
+        testYAML(src, expected);
+    };
+
+    "strings that look like numbers survive a round trip"_test = [] {
+        gr::property_map map;
+        map["puncture"]   = "2/3"s;
+        map["modulation"] = "8psk"s;
+        map["digits"]     = "42"s;
+        map["real"]       = 2.5;
+
+        const std::string text = yaml::serialize(map);
+        const auto        back = yaml::deserialize(text);
+        expect(back.has_value()) << text;
+        expect(eq(diff(map, back.value_or(gr::property_map{})), false)) << text;
+    };
+
+    "a tagged floating-point value rejects trailing characters"_test = [] {
+        expect(fuzzy_eq(formatResult(yaml::deserialize("value: !!float64 2/3")), "Error in 1:18: Invalid floating-point-type value '2/3' (error: trailing characters)"sv));
+        expect(fuzzy_eq(formatResult(yaml::deserialize("value: !!float32 1e3x")), "Error in 1:18: Invalid floating-point-type value '1e3x' (error: trailing characters)"sv));
+    };
+};
+
 int main() { /* tests are statically executed */ }

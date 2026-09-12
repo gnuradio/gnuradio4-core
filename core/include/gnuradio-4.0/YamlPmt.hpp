@@ -575,11 +575,18 @@ std::expected<T, ValueParseError> parseAs(std::string_view sv) {
         }
         std::string tempParse(sv.data(), sv.size());
         try {
+            // a scalar is a number only when the whole scalar is one (YAML core schema), so '2/3' and '8psk' are strings, not 2 and 8
+            std::size_t convertedLength = 0UZ;
+            T           value{};
             if constexpr (std::is_same_v<T, float>) {
-                return std::stof(tempParse);
+                value = std::stof(tempParse, &convertedLength);
             } else {
-                return std::stod(tempParse);
+                value = std::stod(tempParse, &convertedLength);
             }
+            if (convertedLength != tempParse.size()) {
+                return std::unexpected(ValueParseError{0UZ, std::format("Invalid floating-point-type value '{}' (error: trailing characters)", tempParse)});
+            }
+            return value;
         } catch (std::invalid_argument& e) { // specifically: std::invalid_argument or std::out_of_range
             return std::unexpected(ValueParseError{0UZ, std::format("std::invalid_argument exception for expected floating-point value of '{}' - error: {}", tempParse, e.what())});
         } catch (std::out_of_range& e) { // specifically: std::invalid_argument or std::out_of_range
