@@ -2,9 +2,11 @@
 #define GNURADIO_BLOCK_HPP
 
 #include <chrono>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <memory>
+#include <new>
 #include <print>
 #include <source_location>
 
@@ -679,6 +681,56 @@ struct BulkStage {
 };
 
 inline constexpr std::size_t kFusedShutdownCheckStride = 256UZ; ///< a non-pure stage reads its lifecycle state once per sub-block, not once per sample
+
+/**
+ * @brief Whether this build starts the lifetime of a fused run's scratch objects with std::start_lifetime_as_array.
+ *
+ * The facility is C++23 and is absent from several of the standard libraries this code is compiled against; the
+ * implicit-creation fallback below stands there, and both paths are defined by the standard. A consumer and a test
+ * read the path from this constant, and the CMake configure prints the same fact as "Fused scratch lifetime".
+ */
+#if __cpp_lib_start_lifetime_as >= 202207L
+inline constexpr bool kFusedLifetimeViaStandardFacility = true;
+#else
+inline constexpr bool kFusedLifetimeViaStandardFacility = false;
+#endif
+
+/**
+ * @brief A type whose objects a byte-wise operation may create: an implicit-lifetime type in the terms of [class.prop].
+ *
+ * A class is one when it has a trivial, non-deleted destructor and at least one trivial eligible constructor, and every
+ * scalar type is one. std::is_implicit_lifetime states that directly and is C++23, so the two properties are spelled
+ * out here instead.
+ */
+template<typename T>
+concept ImplicitLifetimeType = std::is_trivially_destructible_v<T> && //
+                               (std::is_trivially_default_constructible_v<T> || std::is_trivially_copy_constructible_v<T> || std::is_trivially_move_constructible_v<T>);
+
+/**
+ * @brief Begin the lifetime of `T[nElements]` in untyped storage without the C++23 facility, and point at its first element.
+ *
+ * [cstring.syn]: std::memmove implicitly creates objects in its destination region before it copies, and [intro.object]
+ * makes the created set the one that gives the program defined behavior -- for a caller that goes on to index
+ * nElements values, the array. Copying the storage onto itself moves no byte, so the call is the lifetime start alone.
+ * `storage` must be aligned for T and large enough for nElements of them.
+ */
+template<ImplicitLifetimeType T>
+[[nodiscard]] inline T* beginArrayLifetimeByImplicitCreation(void* storage, std::size_t nElements) noexcept {
+    if (nElements == 0UZ) { // no array object to create, which is also what std::start_lifetime_as_array does here
+        return static_cast<T*>(storage);
+    }
+    return std::launder(static_cast<T*>(std::memmove(storage, storage, nElements * sizeof(T))));
+}
+
+/// the one place the availability of std::start_lifetime_as_array is read; kFusedLifetimeViaStandardFacility names the path taken
+template<ImplicitLifetimeType T>
+[[nodiscard]] inline T* beginArrayLifetime(void* storage, std::size_t nElements) noexcept {
+#if __cpp_lib_start_lifetime_as >= 202207L
+    return std::start_lifetime_as_array<T>(storage, nElements);
+#else
+    return beginArrayLifetimeByImplicitCreation<T>(storage, nElements);
+#endif
+}
 } // namespace block
 
 /**
@@ -2767,11 +2819,14 @@ template<typename T>
 using FusedValueTypeOut = typename traits::block::stream_output_port_types<T>::template at<0>;
 
 // a fused run creates the intermediate samples of a composed segment in raw byte scratch and never destroys them, so
-// a stage value type must be one that a byte-wise copy creates and whose destruction has no effect. That scratch is
-// allocated on a cache line and its stride is rounded to one, which is the whole alignment guarantee a stage gets, so
-// a value type aligned wider than gr::kCacheLine has no address in it to be created at.
+// a stage value type must be one that a byte-wise copy creates and whose destruction has no effect. That is the
+// implicit-lifetime requirement of beginArrayLifetime(), read here so a type that cannot be created that way is
+// refused where a stage is admitted rather than where the scratch is typed. That scratch is allocated on a cache line
+// and its stride is rounded to one, which is the whole alignment guarantee a stage gets, so a value type aligned wider
+// than gr::kCacheLine has no address in it to be created at.
 template<typename T>
 concept TriviallyCopyableStageTypes = std::is_trivially_copyable_v<FusedValueTypeIn<T>> && std::is_trivially_copyable_v<FusedValueTypeOut<T>> //
+                                      && ImplicitLifetimeType<FusedValueTypeIn<T>> && ImplicitLifetimeType<FusedValueTypeOut<T>>              //
                                       && alignof(FusedValueTypeIn<T>) <= gr::kCacheLine && alignof(FusedValueTypeOut<T>) <= gr::kCacheLine;
 
 template<typename T>
@@ -2792,15 +2847,13 @@ concept BulkStageBlock = HasProcessBulkFunction<T> && !HasProcessOneFunction<T> 
 
 // `out` is untyped storage that every stage type of a fused run is handed in turn, and this is where a stage's samples
 // become objects of its output type: writing through a pointer into that storage does not create them, so the array's
-// lifetime is started before the first sample is written.
+// lifetime is started before the first sample is written. The same bytes carry a different type at another stage of
+// the same chunk, and each start ends the lifetime of what the slot held.
 template<FusableStageBlock T>
 std::size_t fusedApplyChunk(void* rawBlock, const void* in, void* out, std::size_t nSamples) {
-    T& block = *static_cast<T*>(rawBlock);
-#if __cpp_lib_start_lifetime_as >= 202207L
-    FusedValueTypeOut<T>* outSamples = std::start_lifetime_as_array<FusedValueTypeOut<T>>(out, nSamples);
-#else
-    FusedValueTypeOut<T>* outSamples = static_cast<FusedValueTypeOut<T>*>(out);
-#endif
+    T&                    block      = *static_cast<T*>(rawBlock);
+    FusedValueTypeOut<T>* outSamples = beginArrayLifetime<FusedValueTypeOut<T>>(out, nSamples);
+
     auto inputSpans  = std::tuple{std::span<const FusedValueTypeIn<T>>(static_cast<const FusedValueTypeIn<T>*>(in), nSamples)};
     auto outputSpans = std::tuple{std::span<FusedValueTypeOut<T>>(outSamples, nSamples)};
 

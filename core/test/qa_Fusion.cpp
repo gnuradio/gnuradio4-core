@@ -4,14 +4,17 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <format>
 #include <limits>
 #include <memory>
+#include <print>
 #include <ranges>
 #include <string>
 #include <thread>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -1247,6 +1250,181 @@ static_assert(!block::detail::FusableStageBlock<WidelyAlignedGain>, "a sample ty
     return AlignedArm{observed->values, gMisalignedStageAddresses.load(std::memory_order_relaxed), collectRunSizes(scheduler.fusionPlan()).size()};
 }
 
+inline constexpr std::size_t kHeteroSamples  = 1024UZ;
+inline constexpr std::size_t kLifetimeValues = 64UZ;
+
+// five sample types for a chain of four pure members: a run alternates its two scratch slots by stage index, so the
+// slot that carries HeteroB out of the first member carries HeteroD out of the third. Distinct types and distinct
+// sizes in the same bytes, which is the reuse a typed cast alone would not account for.
+struct HeteroA {
+    float value{};
+};
+
+struct HeteroB {
+    double value{};
+};
+
+struct HeteroC {
+    std::int32_t value{};
+    std::int32_t doubled{};
+};
+
+struct HeteroD {
+    float value{};
+    float firstTail{};
+    float secondTail{};
+    float thirdTail{};
+};
+
+struct HeteroE {
+    std::int16_t value{};
+};
+
+// every sample type this test fuses, including the one whose default constructor is user-provided
+static_assert(gr::block::ImplicitLifetimeType<float>);
+static_assert(gr::block::ImplicitLifetimeType<AlignedSample>);
+static_assert(gr::block::ImplicitLifetimeType<WideSample>);
+static_assert(gr::block::ImplicitLifetimeType<HeteroA> && gr::block::ImplicitLifetimeType<HeteroB> && gr::block::ImplicitLifetimeType<HeteroC> && gr::block::ImplicitLifetimeType<HeteroD> && gr::block::ImplicitLifetimeType<HeteroE>);
+
+enum class LifetimeStart { dispatched, implicitCreation };
+
+// the fallback is exercised on every toolchain, not only where __cpp_lib_start_lifetime_as is absent
+template<typename T>
+[[nodiscard]] inline T* beginLifetime(LifetimeStart which, void* storage, std::size_t nElements) {
+    return which == LifetimeStart::dispatched ? gr::block::beginArrayLifetime<T>(storage, nElements) : gr::block::beginArrayLifetimeByImplicitCreation<T>(storage, nElements);
+}
+
+// one slot of byte scratch is given to one sample type and then to another, as a run's slot is between two stages
+inline void expectSlotCarriesBothTypes(LifetimeStart which, std::string_view path) {
+    using namespace boost::ut;
+
+    alignas(gr::kCacheLine) std::array<std::byte, kLifetimeValues * sizeof(HeteroD)> slot{};
+
+    HeteroB* asB = beginLifetime<HeteroB>(which, slot.data(), kLifetimeValues);
+    for (std::size_t i = 0UZ; i < kLifetimeValues; ++i) {
+        asB[i] = HeteroB{0.5 * static_cast<double>(i)};
+    }
+    std::size_t nWrong = 0UZ;
+    for (std::size_t i = 0UZ; i < kLifetimeValues; ++i) {
+        nWrong += asB[i].value == 0.5 * static_cast<double>(i) ? 0UZ : 1UZ;
+    }
+    expect(eq(nWrong, 0UZ)) << path << "the first sample type does not read back";
+
+    HeteroD* asD = beginLifetime<HeteroD>(which, slot.data(), kLifetimeValues);
+    for (std::size_t i = 0UZ; i < kLifetimeValues; ++i) {
+        asD[i] = HeteroD{static_cast<float>(i), 1.0f, 2.0f, 3.0f};
+    }
+    nWrong = 0UZ;
+    for (std::size_t i = 0UZ; i < kLifetimeValues; ++i) {
+        nWrong += asD[i].value == static_cast<float>(i) && asD[i].firstTail == 1.0f && asD[i].secondTail == 2.0f && asD[i].thirdTail == 3.0f ? 0UZ : 1UZ;
+    }
+    expect(eq(nWrong, 0UZ)) << path << "the second sample type does not read back from the same bytes";
+}
+
+struct HeteroSource : Block<HeteroSource> {
+    PortOut<HeteroA> out;
+
+    GR_MAKE_REFLECTABLE(HeteroSource, out);
+
+    std::size_t _emitted = 0UZ;
+
+    work::Status processBulk(OutputSpanLike auto& outSpan) {
+        if (_emitted >= kHeteroSamples) {
+            outSpan.publish(0UZ);
+            return work::Status::DONE;
+        }
+        const std::size_t n = std::min(outSpan.size(), kHeteroSamples - _emitted);
+        for (std::size_t i = 0UZ; i < n; ++i) {
+            outSpan[i].value = 2.0f * static_cast<float>(_emitted + i);
+        }
+        _emitted += n;
+        outSpan.publish(n);
+        return n == 0UZ ? work::Status::INSUFFICIENT_OUTPUT_ITEMS : work::Status::OK;
+    }
+};
+
+struct HeteroAToB : Block<HeteroAToB> {
+    PortIn<HeteroA>  in;
+    PortOut<HeteroB> out;
+
+    GR_MAKE_REFLECTABLE(HeteroAToB, in, out);
+
+    [[nodiscard]] HeteroB processOne(const HeteroA& sample) const { return HeteroB{0.5 * static_cast<double>(sample.value)}; }
+};
+
+struct HeteroBToC : Block<HeteroBToC> {
+    PortIn<HeteroB>  in;
+    PortOut<HeteroC> out;
+
+    GR_MAKE_REFLECTABLE(HeteroBToC, in, out);
+
+    [[nodiscard]] HeteroC processOne(const HeteroB& sample) const {
+        const std::int32_t value = static_cast<std::int32_t>(sample.value);
+        return HeteroC{value, 2 * value};
+    }
+};
+
+struct HeteroCToD : Block<HeteroCToD> {
+    PortIn<HeteroC>  in;
+    PortOut<HeteroD> out;
+
+    GR_MAKE_REFLECTABLE(HeteroCToD, in, out);
+
+    [[nodiscard]] HeteroD processOne(const HeteroC& sample) const { return HeteroD{static_cast<float>(sample.value + sample.doubled), 0.25f, 0.5f, 0.25f}; }
+};
+
+struct HeteroDToE : Block<HeteroDToE> {
+    PortIn<HeteroD>  in;
+    PortOut<HeteroE> out;
+
+    GR_MAKE_REFLECTABLE(HeteroDToE, in, out);
+
+    [[nodiscard]] HeteroE processOne(const HeteroD& sample) const { return HeteroE{static_cast<std::int16_t>(sample.value + sample.firstTail + sample.secondTail + sample.thirdTail)}; }
+};
+
+struct HeteroSink : Block<HeteroSink> {
+    PortIn<HeteroE> in;
+
+    GR_MAKE_REFLECTABLE(HeteroSink, in);
+
+    std::vector<std::int16_t> values;
+
+    void processOne(const HeteroE& sample) { values.push_back(sample.value); }
+};
+
+struct HeteroArm {
+    std::vector<std::int16_t> values;
+    std::size_t               nRuns    = 0UZ;
+    std::size_t               nMembers = 0UZ;
+};
+
+[[nodiscard]] inline HeteroArm runHeteroChain(bool fusion) {
+    using namespace boost::ut;
+
+    gr::Graph flow;
+    auto&     source = flow.emplaceBlock<HeteroSource>();
+    auto&     aToB   = flow.emplaceBlock<HeteroAToB>();
+    auto&     bToC   = flow.emplaceBlock<HeteroBToC>();
+    auto&     cToD   = flow.emplaceBlock<HeteroCToD>();
+    auto&     dToE   = flow.emplaceBlock<HeteroDToE>();
+    auto&     sink   = flow.emplaceBlock<HeteroSink>();
+    expect(flow.connect<"out", "in">(source, aToB).has_value());
+    expect(flow.connect<"out", "in">(aToB, bToC).has_value());
+    expect(flow.connect<"out", "in">(bToC, cToD).has_value());
+    expect(flow.connect<"out", "in">(cToD, dToE).has_value());
+    expect(flow.connect<"out", "in">(dToE, sink).has_value());
+
+    HeteroSink* observed = std::addressof(sink);
+
+    const gr::property_map                                                schedulerSettings{{"enable_fusion", fusion}};
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{schedulerSettings};
+    expect(scheduler.exchange(std::move(flow)).has_value());
+    expect(scheduler.runAndWait().has_value());
+
+    const std::vector<std::size_t> runSizes = collectRunSizes(scheduler.fusionPlan());
+    return HeteroArm{observed->values, runSizes.size(), runSizes.empty() ? 0UZ : runSizes.front()};
+}
+
 } // namespace qa_fusion
 
 const boost::ut::suite<"fusion"> _fusion = [] {
@@ -1850,6 +2028,31 @@ const boost::ut::suite<"fusion"> _fusion = [] {
         expect(eq(fused.nMisaligned, 0UZ)) << "every sample must be read at an address its type can be created at";
         expect(eq(unfused.values.size(), kAlignedSamples));
         expect(fused.values == unfused.values) << "the stream of a sample type that is never fused differs";
+    };
+
+    "a scratch slot carries a second sample type after the first"_test = [] {
+        std::println("qa_Fusion: the fused scratch starts its object lifetimes with {}", gr::block::kFusedLifetimeViaStandardFacility ? "std::start_lifetime_as_array" : "implicit object creation");
+
+        expectSlotCarriesBothTypes(LifetimeStart::implicitCreation, "implicit object creation");
+        expectSlotCarriesBothTypes(LifetimeStart::dispatched, gr::block::kFusedLifetimeViaStandardFacility ? "std::start_lifetime_as_array" : "implicit object creation, dispatched");
+    };
+
+    "a chain of four members of mixed sample types is fused and exact"_test = [] {
+        const HeteroArm unfused = runHeteroChain(false);
+        const HeteroArm fused   = runHeteroChain(true);
+
+        std::vector<std::int16_t> expected(kHeteroSamples);
+        for (std::size_t i = 0UZ; i < kHeteroSamples; ++i) {
+            expected[i] = static_cast<std::int16_t>(3UZ * i + 1UZ);
+        }
+
+        expect(eq(unfused.nRuns, 0UZ));
+        expect(eq(unfused.values.size(), kHeteroSamples));
+        expect(unfused.values == expected) << "the unfused chain does not deliver what the stages compute";
+
+        expect(eq(fused.nRuns, 1UZ)) << "four pure members of mixed sample types are one run";
+        expect(eq(fused.nMembers, 4UZ)) << "a run of four members is what hands one scratch slot a second output type";
+        expect(fused.values == unfused.values) << "fusion changed the stream of a chain of mixed sample types";
     };
 };
 

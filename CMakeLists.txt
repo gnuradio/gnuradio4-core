@@ -828,6 +828,27 @@ else()
 endif()
 message(STATUS "Linker                   : ${_detected_linker}")
 
+# which of the two defined paths gr::block::beginArrayLifetime() compiles for the scratch of a fused run. The header
+# reads __cpp_lib_start_lifetime_as itself; this asks the configured toolchain the same question so that the answer is
+# on record before anything is built. STATIC_LIBRARY keeps the probe to a compile, which every target supports.
+include(CheckCXXSourceCompiles)
+set(_gr_saved_try_compile_target_type "${CMAKE_TRY_COMPILE_TARGET_TYPE}")
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+check_cxx_source_compiles(
+  "#include <memory>
+   #if __cpp_lib_start_lifetime_as < 202207L
+   #error std::start_lifetime_as_array is unavailable
+   #endif
+   int probe() { return 0; }"
+  GR_HAVE_START_LIFETIME_AS)
+set(CMAKE_TRY_COMPILE_TARGET_TYPE "${_gr_saved_try_compile_target_type}")
+if(GR_HAVE_START_LIFETIME_AS)
+  set(_gr_fused_lifetime "std::start_lifetime_as_array")
+else()
+  set(_gr_fused_lifetime "implicit object creation ([cstring.syn], [intro.object])")
+endif()
+message(STATUS "Fused scratch lifetime   : ${_gr_fused_lifetime}")
+
 if(CCACHE_PROGRAM)
   execute_process(
     COMMAND ${CCACHE_PROGRAM} --version
