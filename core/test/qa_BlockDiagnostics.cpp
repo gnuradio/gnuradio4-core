@@ -120,6 +120,21 @@ struct DiscardingSink : Block<DiscardingSink> {
     }
 };
 
+struct CountingCopy : Block<CountingCopy> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(CountingCopy, in, out);
+
+    std::size_t nWorkCalls = 0UZ;
+
+    work::Status processBulk(std::span<const float> inSpan, std::span<float> outSpan) {
+        nWorkCalls++;
+        std::ranges::copy(inSpan, outSpan.begin());
+        return work::Status::OK;
+    }
+};
+
 /// the same defect behind an Async port, where no sync port constrains the processed count
 struct AsyncStuckSink : Block<AsyncStuckSink> {
     PortIn<float, Async> in;
@@ -157,6 +172,46 @@ struct AsyncDiscardingSink : Block<AsyncDiscardingSink> {
 const boost::ut::suite<"block diagnostics"> _blockDiagnostics = [] {
     using namespace boost::ut;
     using namespace qa_block_diagnostics;
+
+    "a refused output reservation never reaches processBulk"_test = [] {
+        PortOut<float> upstream;
+        PortIn<float>  downstream;
+        CountingCopy   block;
+
+        expect(upstream.connect(block.in).has_value());
+        expect(block.out.connect(downstream).has_value());
+        block.init(std::make_shared<gr::Sequence>());
+
+        {
+            auto input = upstream.reserve<SpanReleasePolicy::ProcessAll>(4UZ);
+            std::ranges::fill(input, 1.0f);
+        }
+
+        // Cache a positive availability snapshot, then fill the ring before work() reserves it.
+        // This deterministically models the availability/reservation race seen by the scheduler.
+        const std::size_t capacity = block.outputStreamCache.maxSyncAvailable();
+        {
+            auto occupied = block.out.reserve<SpanReleasePolicy::ProcessAll>(capacity);
+            std::ranges::fill(occupied, 2.0f);
+        }
+        const auto result = block.work(4UZ);
+
+        expect(result.status == work::Status::INSUFFICIENT_OUTPUT_ITEMS);
+        expect(eq(result.performed_work, 0UZ));
+        expect(eq(block.nWorkCalls, 0UZ)) << "user code is not called with a refused span";
+        expect(eq(block.in.streamReader().position(), 0UZ)) << "input is retained for the retry";
+
+        {
+            auto occupied = downstream.get<SpanReleasePolicy::ProcessAll>(capacity);
+            expect(eq(occupied.size(), capacity));
+        }
+
+        const auto retried = block.work(4UZ);
+        expect(retried.status == work::Status::OK);
+        expect(eq(block.nWorkCalls, 1UZ));
+        expect(eq(block.in.streamReader().position(), 4UZ));
+        expect(eq(downstream.streamReader().available(), 4UZ));
+    };
 
     "a block that returns OK without progress is named on stderr, once, while the graph keeps spinning"_test = [] {
         StderrCapture capture;

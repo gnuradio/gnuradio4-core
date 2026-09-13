@@ -1603,6 +1603,23 @@ public:
             ports);
     }
 
+    template<typename TInputSpans, typename TOutputSpans>
+    [[nodiscard]] static work::Status preparedStreamsStatus(const TInputSpans& inputSpans, const TOutputSpans& outputSpans, std::size_t expectedIn, std::size_t expectedOut) noexcept {
+        bool insufficientInput  = false;
+        bool insufficientOutput = false;
+
+        for_each_reader_span([expectedIn, &insufficientInput](const auto& in) { insufficientInput = insufficientInput || (in.isConnected && in.isSync && in.size() < expectedIn); }, inputSpans);
+        for_each_writer_span([expectedOut, &insufficientOutput](const auto& out) { insufficientOutput = insufficientOutput || (out.isConnected && out.isSync && out.size() < expectedOut); }, outputSpans);
+
+        if (insufficientOutput) {
+            return work::Status::INSUFFICIENT_OUTPUT_ITEMS;
+        }
+        if (insufficientInput) {
+            return work::Status::INSUFFICIENT_INPUT_ITEMS;
+        }
+        return work::Status::OK;
+    }
+
     /// publish a tag — in processOne dispatch: defers to dispatch loop for correct positioning; otherwise writes to ports directly
     template<PropertyMapType PropertyMap>
     inline constexpr void publishTag(PropertyMap&& tagData, std::size_t tagOffset = 0UZ) noexcept {
@@ -2471,6 +2488,15 @@ public:
 
         auto inputSpans  = prepareStreams(inputPorts<PortType::STREAM>(&self()), processedIn);
         auto outputSpans = prepareStreams(outputPorts<PortType::STREAM>(&self()), processedOut);
+
+        // Availability is only a snapshot, and capacity may change before non-blocking reservations
+        // are prepared. Never hand a block less storage than the sample counts computed above:
+        // release every prepared span without moving the stream and retry after back-pressure clears.
+        if (const work::Status status = preparedStreamsStatus(inputSpans, outputSpans, processedIn, processedOut); status != OK) {
+            publishSamples(0UZ, outputSpans);
+            consumeReaders(0UZ, inputSpans);
+            return {requestedWork, 0UZ, status};
+        }
 
         applyChangedSettings(true, &_pendingForwardParams); // captures any further external settings change, published through the open spans below
         applyInputTagsAndSettings(inputSpans, processedIn, limits.hasAnyTag);
