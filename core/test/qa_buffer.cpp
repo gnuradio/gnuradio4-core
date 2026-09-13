@@ -1679,6 +1679,43 @@ const boost::ut::suite<"CursorCacheStaleness"> _cursorCacheTests = [] {
         expect(in.consume(in.size()));
     };
 
+    // the refresh behind notifyReaderSetChanged() computes the minimum over the reader set and stores it as two
+    // steps, so two refreshes can store out of order. The last reader leaves while a reservation is unpublished, so
+    // its refresh computes the reserve cursor over the empty set; a new reader attaches at the lower publish cursor
+    // and its own refresh stores that; the first store then lands last and next()/tryNext() claim past the new
+    // reader. That losing store is the one this test leaves out, since the state below is what the interleaving
+    // leaves behind: a reader at the publish cursor and a cache carrying the empty set's minimum.
+    "multi producer - a minimum taken over the empty reader set must not gate a later reader"_test = [] {
+        using Strategy = gr::MultiProducerStrategy<std::dynamic_extent, gr::NoWaitStrategy>;
+
+        constexpr std::size_t cap          = 1024UZ;
+        constexpr std::size_t nPublished   = 8UZ;
+        constexpr std::size_t nOutstanding = 16UZ;
+
+        Strategy strategy(cap);
+        auto     readerLast = std::make_shared<gr::Sequence>();
+        gr::detail::addSequences(strategy._readSequences, strategy._publishCursor, {readerLast});
+        strategy.notifyReaderSetChanged();
+
+        expect(strategy.tryNext(nPublished).has_value()) << "the first claim must fit";
+        strategy.publish(0UZ, nPublished);
+        expect(eq(strategy._publishCursor.value(), nPublished)) << "the published samples must be visible";
+        expect(strategy.tryNext(nOutstanding).has_value()) << "the unpublished reservation must fit";
+
+        expect(gr::detail::removeSequence(strategy._readSequences, readerLast)) << "the last reader must leave";
+        strategy.notifyReaderSetChanged();
+
+        auto readerNew = std::make_shared<gr::Sequence>();
+        gr::detail::addSequences(strategy._readSequences, strategy._publishCursor, {readerNew});
+        expect(eq(readerNew->value(), nPublished)) << "a reader attaches at the publish cursor";
+
+        // the new reader holds the slots from the publish cursor on, so the reserve cursor may reach that plus cap
+        const std::size_t nToTheLimit = nPublished + cap - (nPublished + nOutstanding);
+        expect(strategy.tryNext(nToTheLimit).has_value()) << "the slots the new reader does not hold must stay claimable";
+        expect(eq(strategy._reserveCursor.value(), nPublished + cap)) << "the claim must reach the new reader's last free slot";
+        expect(!strategy.tryNext(1UZ).has_value()) << "claimed the slot the new reader has not read";
+    };
+
     "tryReserve with ProcessNone does not corrupt cache"_test = [&] {
         using Buffer = CircularBuffer<int, std::dynamic_extent, ProducerType::Single>;
         Buffer buf(1024);
