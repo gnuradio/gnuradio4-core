@@ -529,7 +529,10 @@ inline std::string makePortableTypeName(std::string_view name) {
     if (cursor == std::string_view::npos) {
         return stripStdPrivates(std::string{name});
     }
-    auto base = view.substr(0, cursor);
+    auto base = stripStdPrivates(view.substr(0, cursor));
+    if (base == "std::complex") {
+        base = "complex";
+    }
 
     view.remove_prefix(cursor + 1);
     if (!view.ends_with(">")) {

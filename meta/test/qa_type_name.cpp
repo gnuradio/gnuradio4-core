@@ -66,6 +66,10 @@ const boost::ut::suite<"type name tests"> _type_name = [] {
         expect(eq(makePortableTypeName("ns0::Foo<int16_t>"), "ns0::Foo<int16>"s));
         expect(eq(makePortableTypeName("ns0::Notmetaected<short int, 5>"), "ns0::Notmetaected<int16, 5>"s));
         expect(eq(makePortableTypeName("gr::DataSet<std::uint8_t>"), "gr::DataSet<uint8>"s));
+        expect(eq(makePortableTypeName("ns0::Foo<std::complex<float>>"), "ns0::Foo<complex<float32>>"s));
+        expect(eq(makePortableTypeName("ns0::Foo<std::__1::complex<float>>"), "ns0::Foo<complex<float32>>"s));
+        expect(eq(makePortableTypeName("std::__1::vector<std::__1::complex<float>>"), "std::vector<complex<float32>>"s));
+        expect(eq(makePortableTypeName("std::complex<float32>"), "complex<float32>"s));
 
         // a name already spelled the portable way is left alone
         expect(eq(makePortableTypeName("ns0::Foo<int16>"), "ns0::Foo<int16>"s));
