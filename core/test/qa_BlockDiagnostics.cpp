@@ -174,6 +174,8 @@ const boost::ut::suite<"block diagnostics"> _blockDiagnostics = [] {
     using namespace qa_block_diagnostics;
 
     "a refused output reservation never reaches processBulk"_test = [] {
+        StderrCapture capture;
+
         PortOut<float> upstream;
         PortIn<float>  downstream;
         CountingCopy   block;
@@ -187,8 +189,9 @@ const boost::ut::suite<"block diagnostics"> _blockDiagnostics = [] {
             std::ranges::fill(input, 1.0f);
         }
 
-        // Cache a positive availability snapshot, then fill the ring before work() reserves it.
-        // This deterministically models the availability/reservation race seen by the scheduler.
+        // Deliberately stale the block's private cache, then fill the ring before work() reserves it.
+        // This is fault injection for the dispatch boundary, not a scheduler-reachable interleaving
+        // for the single-producer stream ring.
         const std::size_t capacity = block.outputStreamCache.maxSyncAvailable();
         {
             auto occupied = block.out.reserve<SpanReleasePolicy::ProcessAll>(capacity);
@@ -200,6 +203,24 @@ const boost::ut::suite<"block diagnostics"> _blockDiagnostics = [] {
         expect(eq(result.performed_work, 0UZ));
         expect(eq(block.nWorkCalls, 0UZ)) << "user code is not called with a refused span";
         expect(eq(block.in.streamReader().position(), 0UZ)) << "input is retained for the retry";
+
+        const std::string reported = capture.text();
+        expect(reported.contains(std::string_view(block.unique_name))) << std::format("the refusal report must name the block, got: {}", reported);
+        expect(reported.contains("INSUFFICIENT_OUTPUT_ITEMS")) << std::format("the refusal report must name the returned status, got: {}", reported);
+
+        {
+            auto occupied = downstream.get<SpanReleasePolicy::ProcessAll>(capacity);
+            expect(eq(occupied.size(), capacity));
+        }
+
+        std::ignore = block.outputStreamCache.maxSyncAvailable();
+        {
+            auto occupied = block.out.reserve<SpanReleasePolicy::ProcessAll>(capacity);
+            std::ranges::fill(occupied, 2.0f);
+        }
+        const auto refusedAgain = block.work(4UZ);
+        expect(refusedAgain.status == work::Status::INSUFFICIENT_OUTPUT_ITEMS);
+        expect(eq(static_cast<std::size_t>(std::ranges::count(capture.text(), '\n')), 1UZ)) << std::format("one line is reported per affected block, got: {}", capture.text());
 
         {
             auto occupied = downstream.get<SpanReleasePolicy::ProcessAll>(capacity);
