@@ -519,12 +519,12 @@ public:
 
         const bool        isArithmeticLike       = sourcePortRef.isArithmeticLikeValueType();
         const std::size_t sanitizedMinBufferSize = minBufferSize == undefined_size ? graph::defaultMinBufferSize(isArithmeticLike) : minBufferSize;
-        Edge& edge              = _edges.emplace_back(*sourceBlockIt, sourcePort, *destinationBlockIt, destinationPort, sanitizedMinBufferSize, weight, std::string(edgeName));
-        edge._state             = Edge::EdgeState::Connected;
-        edge._actualBufferSize  = sourcePortRef.bufferSize();
-        edge._edgeType          = port::decodePortType(sourcePortRef.portMaskInfo());
-        edge._sourcePort        = std::addressof(sourcePortRef);
-        edge._destinationPort   = std::addressof(destinationPortRef);
+        Edge&             edge                   = _edges.emplace_back(*sourceBlockIt, sourcePort, *destinationBlockIt, destinationPort, sanitizedMinBufferSize, weight, std::string(edgeName));
+        edge._state                              = Edge::EdgeState::Connected;
+        edge._actualBufferSize                   = sourcePortRef.bufferSize();
+        edge._edgeType                           = port::decodePortType(sourcePortRef.portMaskInfo());
+        edge._sourcePort                         = std::addressof(sourcePortRef);
+        edge._destinationPort                    = std::addressof(destinationPortRef);
         return {};
     }
 

@@ -44,7 +44,7 @@ std::pair<std::shared_ptr<BlockModel>, std::shared_ptr<BlockModel>> Graph::repla
         }
     }
     const std::shared_ptr<BlockModel> replaced = *found;
-    auto newBlock = _pluginLoader->instantiate(type, properties);
+    auto                              newBlock = _pluginLoader->instantiate(type, properties);
     if (!newBlock) {
         throw gr::exception(std::format("Can not create block {}", type));
     }
@@ -56,11 +56,11 @@ std::pair<std::shared_ptr<BlockModel>, std::shared_ptr<BlockModel>> Graph::repla
 
     struct ReplacementEdge {
         std::size_t index;
-        Edge replacement;
+        Edge        replacement;
     };
-    std::vector<ReplacementEdge> changes;
+    std::vector<ReplacementEdge>                       changes;
     std::vector<std::pair<DynamicPort*, DynamicPort*>> bindings;
-    auto validateBinding = [&](DynamicPort* before, DynamicPort* after) {
+    auto                                               validateBinding = [&](DynamicPort* before, DynamicPort* after) {
         if (before->domain() != after->domain() || before->bufferSize() < after->min_samples) {
             throw gr::exception("Replacement port cannot use the existing buffer domain or capacity");
         }
@@ -85,18 +85,15 @@ std::pair<std::shared_ptr<BlockModel>, std::shared_ptr<BlockModel>> Graph::repla
         if (next._destinationBlock == replaced) {
             next._destinationBlock = newBlock;
         }
-        auto source = next._sourceBlock->dynamicOutputPort(next._sourcePortDefinition);
+        auto source      = next._sourceBlock->dynamicOutputPort(next._sourcePortDefinition);
         auto destination = next._destinationBlock->dynamicInputPort(next._destinationPortDefinition);
         if (!source || !destination) {
             throw gr::exception((!source ? source.error() : destination.error()).message);
         }
-        if ((*source)->typeName() != (*destination)->typeName() ||
-            port::decodePortType((*source)->portMaskInfo()) != port::decodePortType((*destination)->portMaskInfo()) ||
-            port::decodeDirection((*source)->portMaskInfo()) != PortDirection::OUTPUT ||
-            port::decodeDirection((*destination)->portMaskInfo()) != PortDirection::INPUT) {
+        if ((*source)->typeName() != (*destination)->typeName() || port::decodePortType((*source)->portMaskInfo()) != port::decodePortType((*destination)->portMaskInfo()) || port::decodeDirection((*source)->portMaskInfo()) != PortDirection::OUTPUT || port::decodeDirection((*destination)->portMaskInfo()) != PortDirection::INPUT) {
             throw gr::exception(std::format("Incompatible replacement ports for edge {}", edge));
         }
-        auto oldSource = edge._sourceBlock->dynamicOutputPort(edge._sourcePortDefinition);
+        auto oldSource      = edge._sourceBlock->dynamicOutputPort(edge._sourcePortDefinition);
         auto oldDestination = edge._destinationBlock->dynamicInputPort(edge._destinationPortDefinition);
         if (!oldSource || !oldDestination) {
             throw gr::exception((!oldSource ? oldSource.error() : oldDestination.error()).message);
@@ -111,13 +108,13 @@ std::pair<std::shared_ptr<BlockModel>, std::shared_ptr<BlockModel>> Graph::repla
         // Connectivity belongs to this edge, not to either port independently. A pending
         // edge can name an output and input that are each connected to different peers.
         // emplaceEdge() records Connected after its specific connect() succeeds.
-        const bool connected = edge.state() == Edge::EdgeState::Connected;
-        next._sourcePort = *source;
+        const bool connected  = edge.state() == Edge::EdgeState::Connected;
+        next._sourcePort      = *source;
         next._destinationPort = *destination;
-        next._state = connected ? Edge::EdgeState::Connected : Edge::EdgeState::WaitingToBeConnected;
+        next._state           = connected ? Edge::EdgeState::Connected : Edge::EdgeState::WaitingToBeConnected;
         if (connected) {
             next._actualBufferSize = (*oldSource)->bufferSize();
-            next._edgeType = port::decodePortType((*source)->portMaskInfo());
+            next._edgeType         = port::decodePortType((*source)->portMaskInfo());
         }
         changes.push_back({i, std::move(next)});
     }
@@ -130,19 +127,23 @@ std::pair<std::shared_ptr<BlockModel>, std::shared_ptr<BlockModel>> Graph::repla
     for (auto [before, after] : bindings) {
         exchanges.push_back(before->prepareBufferExchange(*after));
     }
-    for (auto& exchange : exchanges) { exchange(); }
+    for (auto& exchange : exchanges) {
+        exchange();
+    }
     try {
         if (auto result = resizeOptionalOutputs(newBlock); !result) {
             throw gr::exception(result.error().message);
         }
     } catch (...) {
         // No reader is recreated: reversing the exchange restores exact unread history.
-        for (auto& exchange : exchanges) { exchange(); }
+        for (auto& exchange : exchanges) {
+            exchange();
+        }
         throw;
     }
     for (auto& change : changes) {
         Edge& edge = _edges[change.index];
-        edge = std::move(change.replacement);
+        edge       = std::move(change.replacement);
         if (!edge._domainStr.empty()) {
             edge._domain = ComputeDomain::parse(edge._domainStr);
         }

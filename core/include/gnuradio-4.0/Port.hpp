@@ -3,13 +3,13 @@
 
 #include <algorithm>
 #include <any>
-#include <functional>
-#include <typeinfo>
 #include <chrono>
 #include <complex>
+#include <functional>
 #include <set>
 #include <span>
 #include <thread>
+#include <typeinfo>
 #include <variant>
 
 #include <gnuradio-4.0/PmtTypeHelpers.hpp>
@@ -1120,23 +1120,23 @@ public:
 private:
     friend class Graph;
     struct BufferState {
-        void* stream;
-        void* tags;
+        void*                 stream;
+        void*                 tags;
         const std::type_info* type;
         void (*exchange)(BufferState, BufferState) noexcept;
     };
     // A separate capability keeps the existing model vtable intact. Ports supplied by
     // older plugins (or custom ports without movable handlers) safely refuse replacement.
     struct BufferStateAccess {
-        virtual ~BufferStateAccess() = default;
+        virtual ~BufferStateAccess()               = default;
         virtual BufferState bufferState() noexcept = 0;
     };
     // Kept separate from BufferStateAccess so an older inline wrapper does not return
     // a differently laid-out BufferState. A replacement through such a wrapper is refused.
     struct BufferStateSafetyAccess {
-        virtual ~BufferStateSafetyAccess() = default;
+        virtual ~BufferStateSafetyAccess()                  = default;
         virtual bool reportsBufferExchangeSafety() noexcept = 0;
-        virtual bool hasOutstandingBufferSpans() noexcept  = 0;
+        virtual bool hasOutstandingBufferSpans() noexcept   = 0;
     };
     struct model { // intentionally class-private definition to limit interface exposure and enhance composition
         virtual ~model() = default;
@@ -1176,24 +1176,29 @@ private:
         std::conditional_t<owning, TPortType, TPortType&> _value;
 
         BufferState bufferState() noexcept override {
-            if constexpr (requires { _value._ioHandler; _value._tagIoHandler; }) {
+            if constexpr (requires {
+                              _value._ioHandler;
+                              _value._tagIoHandler;
+                          }) {
                 using Stream = std::remove_reference_t<decltype(_value._ioHandler)>;
-                using Tags = std::remove_reference_t<decltype(_value._tagIoHandler)>;
+                using Tags   = std::remove_reference_t<decltype(_value._tagIoHandler)>;
                 if constexpr (std::is_nothrow_swappable_v<Stream> && std::is_nothrow_swappable_v<Tags>) {
-                    return {&_value._ioHandler, &_value._tagIoHandler, &typeid(std::pair<Stream, Tags>),
-                        [](BufferState a, BufferState b) noexcept {
-                            std::swap(*static_cast<Stream*>(a.stream), *static_cast<Stream*>(b.stream));
-                            std::swap(*static_cast<Tags*>(a.tags), *static_cast<Tags*>(b.tags));
-                        }};
+                    return {&_value._ioHandler, &_value._tagIoHandler, &typeid(std::pair<Stream, Tags>), [](BufferState a, BufferState b) noexcept {
+                                std::swap(*static_cast<Stream*>(a.stream), *static_cast<Stream*>(b.stream));
+                                std::swap(*static_cast<Tags*>(a.tags), *static_cast<Tags*>(b.tags));
+                            }};
                 }
             }
             return {};
         }
 
         bool reportsBufferExchangeSafety() noexcept override {
-            if constexpr (requires { _value._ioHandler; _value._tagIoHandler; }) {
+            if constexpr (requires {
+                              _value._ioHandler;
+                              _value._tagIoHandler;
+                          }) {
                 using Stream = std::remove_reference_t<decltype(_value._ioHandler)>;
-                using Tags = std::remove_reference_t<decltype(_value._tagIoHandler)>;
+                using Tags   = std::remove_reference_t<decltype(_value._tagIoHandler)>;
                 if constexpr (requires(const Stream& stream, const Tags& tags) {
                                   { stream.hasOutstandingSpans() } noexcept -> std::convertible_to<bool>;
                                   { tags.hasOutstandingSpans() } noexcept -> std::convertible_to<bool>;
@@ -1205,9 +1210,12 @@ private:
         }
 
         bool hasOutstandingBufferSpans() noexcept override {
-            if constexpr (requires { _value._ioHandler; _value._tagIoHandler; }) {
+            if constexpr (requires {
+                              _value._ioHandler;
+                              _value._tagIoHandler;
+                          }) {
                 using Stream = std::remove_reference_t<decltype(_value._ioHandler)>;
-                using Tags = std::remove_reference_t<decltype(_value._tagIoHandler)>;
+                using Tags   = std::remove_reference_t<decltype(_value._tagIoHandler)>;
                 if constexpr (requires(const Stream& stream, const Tags& tags) {
                                   { stream.hasOutstandingSpans() } noexcept -> std::convertible_to<bool>;
                                   { tags.hasOutstandingSpans() } noexcept -> std::convertible_to<bool>;
@@ -1304,12 +1312,12 @@ private:
     // invoking it only exchanges existing handlers. Custom handlers opt in through the
     // separate safety capability and noexcept hasOutstandingSpans().
     std::function<void()> prepareBufferExchange(DynamicPort& other) {
-        auto* left = dynamic_cast<BufferStateAccess*>(_accessor.get());
-        auto* right = dynamic_cast<BufferStateAccess*>(other._accessor.get());
-        auto* leftSafety = dynamic_cast<BufferStateSafetyAccess*>(_accessor.get());
-        auto* rightSafety = dynamic_cast<BufferStateSafetyAccess*>(other._accessor.get());
-        const auto a = left ? left->bufferState() : BufferState{};
-        const auto b = right ? right->bufferState() : BufferState{};
+        auto*      left        = dynamic_cast<BufferStateAccess*>(_accessor.get());
+        auto*      right       = dynamic_cast<BufferStateAccess*>(other._accessor.get());
+        auto*      leftSafety  = dynamic_cast<BufferStateSafetyAccess*>(_accessor.get());
+        auto*      rightSafety = dynamic_cast<BufferStateSafetyAccess*>(other._accessor.get());
+        const auto a           = left ? left->bufferState() : BufferState{};
+        const auto b           = right ? right->bufferState() : BufferState{};
         if (!a.type || !b.type || !leftSafety || !rightSafety || !leftSafety->reportsBufferExchangeSafety() || !rightSafety->reportsBufferExchangeSafety() || *a.type != *b.type) {
             throw gr::exception("Replacement requires compatible transferable port buffers with span-state reporting");
         }

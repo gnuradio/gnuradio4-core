@@ -2,14 +2,14 @@
 
 #include <array>
 #include <bit>
-#include <memory_resource>
-#include <new>
-#include <vector>
 #include <chrono>
 #include <cstddef>
 #include <format>
+#include <memory_resource>
+#include <new>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <gnuradio-4.0/BlockRegistry.hpp>
 #include <gnuradio-4.0/Graph.hpp>
@@ -90,28 +90,26 @@ struct LoaderCanary : gr::Block<LoaderCanary> {
 
 template<typename T, std::size_t N = 2UZ>
 struct ReplacementPorts : gr::Block<ReplacementPorts<T, N>> {
-    std::array<gr::PortIn<T>, N> in;
+    std::array<gr::PortIn<T>, N>  in;
     std::array<gr::PortOut<T>, N> out;
     GR_MAKE_REFLECTABLE(ReplacementPorts, in, out);
     gr::work::Status processBulk(auto&, auto&) { return gr::work::Status::OK; }
 };
 
 struct FailingOptionalPort : gr::PortOut<float, gr::Optional> {
-    std::expected<void, gr::Error> resizeBuffer(std::size_t, std::pmr::memory_resource* = nullptr, std::pmr::memory_resource* = nullptr) {
-        return std::unexpected(gr::Error("injected optional-output allocation failure"));
-    }
+    std::expected<void, gr::Error> resizeBuffer(std::size_t, std::pmr::memory_resource* = nullptr, std::pmr::memory_resource* = nullptr) { return std::unexpected(gr::Error("injected optional-output allocation failure")); }
 };
 struct FailingReplacement : gr::Block<FailingReplacement> {
-    std::array<gr::PortIn<float>, 2> in;
+    std::array<gr::PortIn<float>, 2>  in;
     std::array<gr::PortOut<float>, 2> out;
-    FailingOptionalPort monitor;
+    FailingOptionalPort               monitor;
     GR_MAKE_REFLECTABLE(FailingReplacement, in, out, monitor);
     gr::work::Status processBulk(auto&, auto&, auto&) { return gr::work::Status::OK; }
 };
 
 struct ReplacementMonitor : gr::Block<ReplacementMonitor> {
-    gr::PortIn<float> in;
-    gr::PortOut<float> out;
+    gr::PortIn<float>                in;
+    gr::PortOut<float>               out;
     gr::PortOut<float, gr::Optional> monitor;
     GR_MAKE_REFLECTABLE(ReplacementMonitor, in, out, monitor);
     gr::work::Status processBulk(auto&, auto&, auto&) { return gr::work::Status::OK; }
@@ -129,9 +127,11 @@ struct ReorderedInputs : gr::Block<ReorderedInputs> {
 };
 
 struct FailingResource : std::pmr::memory_resource {
-    bool fail = false;
+    bool  fail = false;
     void* do_allocate(std::size_t bytes, std::size_t alignment) override {
-        if (fail) { throw std::bad_alloc(); }
+        if (fail) {
+            throw std::bad_alloc();
+        }
         return std::pmr::new_delete_resource()->allocate(bytes, alignment);
     }
     void do_deallocate(void* p, std::size_t bytes, std::size_t alignment) override { std::pmr::new_delete_resource()->deallocate(p, bytes, alignment); }
@@ -190,23 +190,23 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
     "replacement reconnects both sides and preserves fan-out after old block destruction"_test = [] {
         qa_edit::registerTestBlocks();
         gr::Graph flow;
-        auto& source = flow.emplaceBlock<qa_edit::Source>();
-        auto& middle = flow.emplaceBlock<qa_edit::Tunable>();
-        auto& sinkA = flow.emplaceBlock<qa_edit::Sink>();
-        auto& sinkB = flow.emplaceBlock<qa_edit::Sink>();
-        auto& bypass = flow.emplaceBlock<qa_edit::Sink>();
+        auto&     source = flow.emplaceBlock<qa_edit::Source>();
+        auto&     middle = flow.emplaceBlock<qa_edit::Tunable>();
+        auto&     sinkA  = flow.emplaceBlock<qa_edit::Sink>();
+        auto&     sinkB  = flow.emplaceBlock<qa_edit::Sink>();
+        auto&     bypass = flow.emplaceBlock<qa_edit::Sink>();
         expect(flow.connect<"out", "in">(source, middle).has_value());
         expect(flow.connect<"out", "in">(middle, sinkA).has_value());
         expect(flow.connect(middle, gr::PortDefinition("out"), sinkB, gr::PortDefinition("in")).has_value());
         expect(flow.connect<"out", "in">(source, bypass).has_value());
         expect(fatal(flow.connectPendingEdges()));
-        flow.edges()[1]._domainStr = "gpu:qa";
-        flow.edges()[1]._domain = gr::ComputeDomain::parse(flow.edges()[1]._domainStr);
-        auto* bypassSource = flow.edges()[3]._sourcePort;
-        auto* bypassDestination = flow.edges()[3]._destinationPort;
-        std::weak_ptr<gr::BlockModel> lifetime = flow.blocks()[1];
-        auto [oldBlock, replacement] = flow.replaceBlock(middle.unique_name, gr::meta::type_name<qa_edit::Tunable>(), {{"gain", 2.0f}});
-        auto& next = *static_cast<qa_edit::Tunable*>(replacement->raw());
+        flow.edges()[1]._domainStr                      = "gpu:qa";
+        flow.edges()[1]._domain                         = gr::ComputeDomain::parse(flow.edges()[1]._domainStr);
+        auto*                         bypassSource      = flow.edges()[3]._sourcePort;
+        auto*                         bypassDestination = flow.edges()[3]._destinationPort;
+        std::weak_ptr<gr::BlockModel> lifetime          = flow.blocks()[1];
+        auto [oldBlock, replacement]                    = flow.replaceBlock(middle.unique_name, gr::meta::type_name<qa_edit::Tunable>(), {{"gain", 2.0f}});
+        auto& next                                      = *static_cast<qa_edit::Tunable*>(replacement->raw());
         expect(!middle.in.isConnected()) << "the retired reader must not throttle the source";
         expect(!middle.out.isConnected()) << "consumers must leave the retired writer";
         replacement->initDynamicPorts();
@@ -218,8 +218,8 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(eq(flow.edges()[1]._domain.backend, std::string_view("qa")));
         bool valid = true;
         for (const auto& edge : flow.edges()) {
-            auto src = edge.sourceBlock()->dynamicOutputPort(edge.sourcePortDefinition());
-            auto dst = edge.destinationBlock()->dynamicInputPort(edge.destinationPortDefinition());
+            auto       src     = edge.sourceBlock()->dynamicOutputPort(edge.sourcePortDefinition());
+            auto       dst     = edge.destinationBlock()->dynamicInputPort(edge.destinationPortDefinition());
             const bool matches = src && dst && edge._sourcePort == *src && edge._destinationPort == *dst;
             expect(matches) << "edge caches must name live replacement ports";
             valid = valid && matches;
@@ -239,14 +239,14 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(eq(next.in.tagReader().nWriters(), 1UZ));
         {
             auto data = source.out.streamWriter().reserve(1UZ);
-            data[0] = 7.0f;
+            data[0]   = 7.0f;
             data.publish(1UZ);
         }
         expect(eq(next.in.streamReader().available(), 1UZ));
         expect(eq(bypass.in.streamReader().available(), 1UZ));
         {
             auto data = next.out.streamWriter().reserve(1UZ);
-            data[0] = 14.0f;
+            data[0]   = 14.0f;
             data.publish(1UZ);
         }
         for (auto* sink : {&sinkA, &sinkB}) {
@@ -260,7 +260,7 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
 
     "replacement resolves named and indexed collection ports and refuses incompatible ports"_test = [] {
         using Ports = qa_edit::ReplacementPorts<float>;
-        gr::BlockRegistry registry;
+        gr::BlockRegistry     registry;
         gr::SchedulerRegistry schedulers;
         std::ignore = registry.insert<Ports>();
         std::ignore = registry.insert<qa_edit::ReplacementPorts<float, 1UZ>>();
@@ -268,16 +268,16 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         std::ignore = registry.insert<qa_edit::Source>();
         gr::PluginLoader loader(registry, schedulers, {});
         for (const bool named : {false, true}) {
-            gr::Graph flow(loader);
-            auto& source = flow.emplaceBlock<qa_edit::Source>();
-            auto& middle = flow.emplaceBlock<Ports>();
-            auto& sink = flow.emplaceBlock<qa_edit::Sink>();
-            const gr::PortDefinition input = named ? gr::PortDefinition("in#1") : gr::PortDefinition(0UZ, 1UZ);
+            gr::Graph                flow(loader);
+            auto&                    source = flow.emplaceBlock<qa_edit::Source>();
+            auto&                    middle = flow.emplaceBlock<Ports>();
+            auto&                    sink   = flow.emplaceBlock<qa_edit::Sink>();
+            const gr::PortDefinition input  = named ? gr::PortDefinition("in#1") : gr::PortDefinition(0UZ, 1UZ);
             const gr::PortDefinition output = named ? gr::PortDefinition("out#1") : gr::PortDefinition(0UZ, 1UZ);
             expect(flow.connect(source, gr::PortDefinition("out"), middle, input).has_value());
             expect(flow.connect(middle, output, sink, gr::PortDefinition("in")).has_value());
             expect(fatal(flow.connectPendingEdges()));
-            auto original = flow.blocks()[1];
+            auto                        original = flow.blocks()[1];
             const std::vector<gr::Edge> edges(flow.edges().begin(), flow.edges().end());
             for (auto type : {gr::meta::type_name<qa_edit::ReplacementPorts<float, 1UZ>>(), gr::meta::type_name<qa_edit::ReplacementPorts<double>>(), gr::meta::type_name<qa_edit::Source>()}) {
                 expect(throws<gr::exception>([&] { std::ignore = flow.replaceBlock(original->uniqueName(), type, {}); })) << type;
@@ -288,9 +288,11 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
                 expect(eq(middle.out[1].nReaders(), 1UZ));
             }
             // On baseline the first invalid replacement already removed the original.
-            if (std::ranges::find(flow.blocks(), original) == flow.blocks().end()) { continue; }
+            if (std::ranges::find(flow.blocks(), original) == flow.blocks().end()) {
+                continue;
+            }
             auto [oldBlock, replacement] = flow.replaceBlock(original->uniqueName(), gr::meta::type_name<Ports>(), {});
-            auto& next = *static_cast<Ports*>(replacement->raw());
+            auto& next                   = *static_cast<Ports*>(replacement->raw());
             expect(eq(next.in[1].nWriters(), 1UZ));
             expect(eq(next.out[1].nReaders(), 1UZ));
             expect(!next.in[0].isConnected());
@@ -301,14 +303,14 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
     "replacement permits edge reader inspection after destruction"_test = [] {
         qa_edit::registerTestBlocks();
         gr::Graph flow;
-        auto& source = flow.emplaceBlock<qa_edit::Source>();
-        auto& middle = flow.emplaceBlock<qa_edit::Tunable>();
-        auto& sink = flow.emplaceBlock<qa_edit::Sink>();
+        auto&     source = flow.emplaceBlock<qa_edit::Source>();
+        auto&     middle = flow.emplaceBlock<qa_edit::Tunable>();
+        auto&     sink   = flow.emplaceBlock<qa_edit::Sink>();
         expect(flow.connect<"out", "in">(source, middle).has_value());
         expect(flow.connect<"out", "in">(middle, sink).has_value());
         expect(fatal(flow.connectPendingEdges()));
         std::weak_ptr<gr::BlockModel> lifetime = flow.blocks()[1];
-        auto [oldBlock, replacement] = flow.replaceBlock(middle.unique_name, gr::meta::type_name<qa_edit::Tunable>(), {});
+        auto [oldBlock, replacement]           = flow.replaceBlock(middle.unique_name, gr::meta::type_name<qa_edit::Tunable>(), {});
         replacement->initDynamicPorts();
         oldBlock.reset();
         expect(fatal(lifetime.expired()));
@@ -320,20 +322,20 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
     "replacement rejects a live input stream span before exchanging handlers"_test = [] {
         qa_edit::registerTestBlocks();
         gr::Graph flow;
-        auto& source = flow.emplaceBlock<qa_edit::Source>();
-        auto& middle = flow.emplaceBlock<qa_edit::Tunable>();
-        auto& sink = flow.emplaceBlock<qa_edit::Sink>();
+        auto&     source = flow.emplaceBlock<qa_edit::Source>();
+        auto&     middle = flow.emplaceBlock<qa_edit::Tunable>();
+        auto&     sink   = flow.emplaceBlock<qa_edit::Sink>();
         expect(flow.connect<"out", "in">(source, middle).has_value());
         expect(flow.connect<"out", "in">(middle, sink).has_value());
         expect(fatal(flow.connectPendingEdges()));
         {
             auto data = source.out.streamWriter().reserve(3UZ);
-            data[0] = 1.0f;
-            data[1] = 2.0f;
-            data[2] = 3.0f;
+            data[0]   = 1.0f;
+            data[1]   = 2.0f;
+            data[2]   = 3.0f;
             data.publish(3UZ);
         }
-        const auto original = flow.blocks()[1];
+        const auto                  original = flow.blocks()[1];
         const std::vector<gr::Edge> edges(flow.edges().begin(), flow.edges().end());
         {
             auto held = middle.in.streamReader().get();
@@ -348,7 +350,7 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(eq(middle.in.streamReader().position(), 2UZ));
         expect(eq(middle.in.streamReader().available(), 1UZ));
         auto [retired, replacement] = flow.replaceBlock(original->uniqueName(), gr::meta::type_name<qa_edit::Tunable>(), {});
-        auto& next = *static_cast<qa_edit::Tunable*>(replacement->raw());
+        auto& next                  = *static_cast<qa_edit::Tunable*>(replacement->raw());
         expect(eq(next.in.streamReader().position(), 2UZ));
         expect(eq(next.in.streamReader().available(), 1UZ));
     };
@@ -356,14 +358,14 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
     "replacement rejects a live tag span before exchanging handlers"_test = [] {
         qa_edit::registerTestBlocks();
         gr::Graph flow;
-        auto& source = flow.emplaceBlock<qa_edit::Source>();
-        auto& middle = flow.emplaceBlock<qa_edit::Tunable>();
-        auto& sink = flow.emplaceBlock<qa_edit::Sink>();
+        auto&     source = flow.emplaceBlock<qa_edit::Source>();
+        auto&     middle = flow.emplaceBlock<qa_edit::Tunable>();
+        auto&     sink   = flow.emplaceBlock<qa_edit::Sink>();
         expect(flow.connect<"out", "in">(source, middle).has_value());
         expect(flow.connect<"out", "in">(middle, sink).has_value());
         expect(fatal(flow.connectPendingEdges()));
         source.out.publishTag(gr::property_map{{"held", true}}, 0UZ);
-        const auto original = flow.blocks()[1];
+        const auto                  original = flow.blocks()[1];
         const std::vector<gr::Edge> edges(flow.edges().begin(), flow.edges().end());
         {
             auto held = middle.in.tagReader().get();
@@ -382,17 +384,17 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
     "replacement rejects a live output span before exchanging handlers"_test = [] {
         qa_edit::registerTestBlocks();
         gr::Graph flow;
-        auto& source = flow.emplaceBlock<qa_edit::Source>();
-        auto& middle = flow.emplaceBlock<qa_edit::Tunable>();
-        auto& sink = flow.emplaceBlock<qa_edit::Sink>();
+        auto&     source = flow.emplaceBlock<qa_edit::Source>();
+        auto&     middle = flow.emplaceBlock<qa_edit::Tunable>();
+        auto&     sink   = flow.emplaceBlock<qa_edit::Sink>();
         expect(flow.connect<"out", "in">(source, middle).has_value());
         expect(flow.connect<"out", "in">(middle, sink).has_value());
         expect(fatal(flow.connectPendingEdges()));
-        const auto original = flow.blocks()[1];
+        const auto                  original = flow.blocks()[1];
         const std::vector<gr::Edge> edges(flow.edges().begin(), flow.edges().end());
         {
             auto held = middle.out.template reserve<gr::SpanReleasePolicy::ProcessNone>(1UZ);
-            held[0] = 17.0f;
+            held[0]   = 17.0f;
             expect(throws<gr::exception>([&] { std::ignore = flow.replaceBlock(original->uniqueName(), gr::meta::type_name<qa_edit::Tunable>(), {}); }));
             expect(flow.blocks()[1] == original);
             expect(std::ranges::equal(flow.edges(), edges));
@@ -401,25 +403,25 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         }
         expect(eq(sink.in.streamReader().available(), 1UZ));
         auto [retired, replacement] = flow.replaceBlock(original->uniqueName(), gr::meta::type_name<qa_edit::Tunable>(), {});
-        auto data = sink.in.streamReader().get();
+        auto data                   = sink.in.streamReader().get();
         expect(eq(data[0], 17.0f));
     };
 
     "replacement preflights every affected endpoint for live spans"_test = [] {
         using Ports = qa_edit::ReplacementPorts<float>;
-        gr::BlockRegistry registry;
+        gr::BlockRegistry     registry;
         gr::SchedulerRegistry schedulers;
         std::ignore = registry.insert<Ports>();
         std::ignore = registry.insert<qa_edit::Source>();
         gr::PluginLoader loader(registry, schedulers, {});
-        gr::Graph flow(loader);
-        auto& sourceA = flow.emplaceBlock<qa_edit::Source>();
-        auto& sourceB = flow.emplaceBlock<qa_edit::Source>();
-        auto& middle = flow.emplaceBlock<Ports>();
+        gr::Graph        flow(loader);
+        auto&            sourceA = flow.emplaceBlock<qa_edit::Source>();
+        auto&            sourceB = flow.emplaceBlock<qa_edit::Source>();
+        auto&            middle  = flow.emplaceBlock<Ports>();
         expect(flow.connect(sourceA, gr::PortDefinition("out"), middle, gr::PortDefinition("in#0")).has_value());
         expect(flow.connect(sourceB, gr::PortDefinition("out"), middle, gr::PortDefinition("in#1")).has_value());
         expect(fatal(flow.connectPendingEdges()));
-        const auto original = flow.blocks()[2];
+        const auto                  original = flow.blocks()[2];
         const std::vector<gr::Edge> edges(flow.edges().begin(), flow.edges().end());
         {
             auto held = middle.in[1].streamReader().get();
@@ -436,26 +438,26 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
 
     "replacement rolls back a failed reconnection without removing the original"_test = [] {
         using Ports = qa_edit::ReplacementPorts<float>;
-        gr::BlockRegistry registry;
+        gr::BlockRegistry     registry;
         gr::SchedulerRegistry schedulers;
         std::ignore = registry.insert<Ports>();
         std::ignore = registry.insert<qa_edit::FailingReplacement>();
-        gr::PluginLoader loader(registry, schedulers, {});
+        gr::PluginLoader         loader(registry, schedulers, {});
         qa_edit::FailingResource resource;
-        gr::Graph flow(loader);
-        auto& source = flow.emplaceBlock<qa_edit::Source>();
-        auto& middle = flow.emplaceBlock<Ports>();
-        auto& sinkA = flow.emplaceBlock<qa_edit::Sink>();
-        auto& sinkB = flow.emplaceBlock<qa_edit::Sink>();
-        auto& sinkC = flow.emplaceBlock<qa_edit::Sink>();
+        gr::Graph                flow(loader);
+        auto&                    source = flow.emplaceBlock<qa_edit::Source>();
+        auto&                    middle = flow.emplaceBlock<Ports>();
+        auto&                    sinkA  = flow.emplaceBlock<qa_edit::Sink>();
+        auto&                    sinkB  = flow.emplaceBlock<qa_edit::Sink>();
+        auto&                    sinkC  = flow.emplaceBlock<qa_edit::Sink>();
         expect(flow.connect(source, gr::PortDefinition("out"), middle, gr::PortDefinition("in#1")).has_value());
         expect(flow.connect(middle, gr::PortDefinition("out#1"), sinkA, gr::PortDefinition("in")).has_value());
         expect(flow.connect(middle, gr::PortDefinition("out#0"), sinkB, gr::PortDefinition("in"), {.dataResource = &resource}).has_value());
         expect(flow.connect(middle, gr::PortDefinition("out#1"), sinkC, gr::PortDefinition("in")).has_value());
         expect(fatal(flow.connectPendingEdges()));
-        flow.edges()[1]._domainStr = "gpu:qa";
-        flow.edges()[1]._domain = gr::ComputeDomain::parse(flow.edges()[1]._domainStr);
-        const auto original = flow.blocks()[1];
+        flow.edges()[1]._domainStr           = "gpu:qa";
+        flow.edges()[1]._domain              = gr::ComputeDomain::parse(flow.edges()[1]._domainStr);
+        const auto                  original = flow.blocks()[1];
         const std::vector<gr::Edge> edges(flow.edges().begin(), flow.edges().end());
         {
             auto data = source.out.streamWriter().reserve(3UZ);
@@ -524,14 +526,14 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
     };
 
     "replacement refuses mixed definitions that collapse distinct inputs"_test = [] {
-        gr::BlockRegistry registry;
+        gr::BlockRegistry     registry;
         gr::SchedulerRegistry schedulers;
         std::ignore = registry.insert<qa_edit::ReorderedInputs>();
         gr::PluginLoader loader(registry, schedulers, {});
-        gr::Graph flow(loader);
-        auto& sourceA = flow.emplaceBlock<qa_edit::Source>();
-        auto& sourceB = flow.emplaceBlock<qa_edit::Source>();
-        auto& middle = flow.emplaceBlock<qa_edit::PairedInputs>();
+        gr::Graph        flow(loader);
+        auto&            sourceA = flow.emplaceBlock<qa_edit::Source>();
+        auto&            sourceB = flow.emplaceBlock<qa_edit::Source>();
+        auto&            middle  = flow.emplaceBlock<qa_edit::PairedInputs>();
         expect(flow.connect(sourceA, gr::PortDefinition("out"), middle, gr::PortDefinition(0UZ)).has_value());
         expect(flow.connect(sourceB, gr::PortDefinition("out"), middle, gr::PortDefinition("second")).has_value());
         expect(fatal(flow.connectPendingEdges()));
@@ -545,35 +547,40 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
     };
 
     "replacement sizes an optional output with its connected sibling"_test = [] {
-        gr::BlockRegistry registry;
+        gr::BlockRegistry     registry;
         gr::SchedulerRegistry schedulers;
         std::ignore = registry.insert<qa_edit::ReplacementMonitor>();
         gr::PluginLoader loader(registry, schedulers, {});
-        gr::Graph flow(loader);
-        auto& source = flow.emplaceBlock<qa_edit::Source>();
-        auto& middle = flow.emplaceBlock<qa_edit::Tunable>();
-        auto& sink = flow.emplaceBlock<qa_edit::Sink>();
+        gr::Graph        flow(loader);
+        auto&            source = flow.emplaceBlock<qa_edit::Source>();
+        auto&            middle = flow.emplaceBlock<qa_edit::Tunable>();
+        auto&            sink   = flow.emplaceBlock<qa_edit::Sink>();
         expect(flow.connect<"out", "in">(source, middle).has_value());
         expect(flow.connect<"out", "in">(middle, sink).has_value());
         expect(fatal(flow.connectPendingEdges()));
         auto [oldBlock, replacement] = flow.replaceBlock(middle.unique_name, gr::meta::type_name<qa_edit::ReplacementMonitor>(), {});
-        auto& next = *static_cast<qa_edit::ReplacementMonitor*>(replacement->raw());
+        auto& next                   = *static_cast<qa_edit::ReplacementMonitor*>(replacement->raw());
         expect(eq(next.monitor.bufferSize(), next.out.bufferSize()));
     };
 
     "replacement preserves pending edges"_test = [] {
         qa_edit::registerTestBlocks();
         gr::Graph flow;
-        auto& source = flow.emplaceBlock<qa_edit::Source>();
-        auto& middle = flow.emplaceBlock<qa_edit::Tunable>();
-        auto& sink = flow.emplaceBlock<qa_edit::Sink>();
+        auto&     source = flow.emplaceBlock<qa_edit::Source>();
+        auto&     middle = flow.emplaceBlock<qa_edit::Tunable>();
+        auto&     sink   = flow.emplaceBlock<qa_edit::Sink>();
         expect(flow.connect<"out", "in">(source, middle).has_value());
         expect(flow.connect<"out", "in">(middle, sink).has_value());
         auto [oldBlock, replacement] = flow.replaceBlock(middle.unique_name, gr::meta::type_name<qa_edit::Tunable>(), {});
         oldBlock.reset();
-        for (const auto& edge : flow.edges()) { expect(edge.state() == gr::Edge::EdgeState::WaitingToBeConnected); }
+        for (const auto& edge : flow.edges()) {
+            expect(edge.state() == gr::Edge::EdgeState::WaitingToBeConnected);
+        }
         expect(flow.connectPendingEdges());
-        for (const auto& edge : flow.edges()) { expect(eq(edge.nReaders(), 1UZ)); expect(eq(edge.nWriters(), 1UZ)); }
+        for (const auto& edge : flow.edges()) {
+            expect(eq(edge.nReaders(), 1UZ));
+            expect(eq(edge.nWriters(), 1UZ));
+        }
     };
 
     "replacement keeps a staged edge pending when its ports have unrelated connections"_test = [] {
@@ -691,9 +698,9 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
     "replacement refuses an owner of exported port aliases"_test = [] {
         qa_edit::registerTestBlocks();
         gr::GraphWrapper<gr::Graph> wrapper;
-        auto& flow = *wrapper.graph();
-        auto& middle = flow.emplaceBlock<qa_edit::Tunable>();
-        const auto original = flow.blocks()[0];
+        auto&                       flow     = *wrapper.graph();
+        auto&                       middle   = flow.emplaceBlock<qa_edit::Tunable>();
+        const auto                  original = flow.blocks()[0];
         expect(wrapper.exportPort(true, middle.unique_name, gr::PortDirection::OUTPUT, "out", "out").has_value());
         expect(throws<gr::exception>([&] { std::ignore = flow.replaceBlock(middle.unique_name, gr::meta::type_name<qa_edit::Tunable>(), {}); }));
         expect(flow.blocks()[0] == original);
@@ -765,7 +772,7 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
     };
 
     "connected replacement transfers handlers across a loaded plugin boundary"_test = [] {
-        gr::Graph flow;
+        gr::Graph   flow;
         const auto& source = flow.emplaceBlock("good::fixed_source<float32>", {});
         const auto& sink   = flow.emplaceBlock("good::cout_sink<float32>", {});
         expect(flow.connect(source, gr::PortDefinition("out"), sink, gr::PortDefinition("in")).has_value());

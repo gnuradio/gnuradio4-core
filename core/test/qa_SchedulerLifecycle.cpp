@@ -10,7 +10,9 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
+#include <gnuradio-4.0/BlockRegistry.hpp>
 #include <gnuradio-4.0/BlockingSync.hpp>
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/LifeCycle.hpp>
@@ -44,6 +46,61 @@ struct CountingSink : gr::Block<CountingSink> {
 
     void processOne(float) { _nReceived++; }
 };
+
+inline std::atomic<std::size_t> gRefusalWorkCalls{0UZ};
+inline std::atomic<std::size_t> gRefusalStartCalls{0UZ};
+inline std::atomic<std::size_t> gRefusalStopCalls{0UZ};
+inline std::atomic<std::size_t> gCandidateConstructions{0UZ};
+inline std::atomic<std::size_t> gCandidateSettingsChanges{0UZ};
+inline std::atomic<std::size_t> gCandidateStartCalls{0UZ};
+
+struct RefusalPassThrough : gr::Block<RefusalPassThrough> {
+    gr::PortIn<float>  in;
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(RefusalPassThrough, in, out);
+
+    void start() { gRefusalStartCalls.fetch_add(1UZ, std::memory_order_relaxed); }
+    void stop() { gRefusalStopCalls.fetch_add(1UZ, std::memory_order_relaxed); }
+
+    float processOne(float value) {
+        gRefusalWorkCalls.fetch_add(1UZ, std::memory_order_relaxed);
+        return value;
+    }
+};
+
+struct RefusedCandidate : gr::Block<RefusedCandidate> {
+    gr::PortIn<float>  in;
+    gr::PortOut<float> out;
+
+    gr::Annotated<float, "gain"> gain = 2.0f;
+
+    GR_MAKE_REFLECTABLE(RefusedCandidate, in, out, gain);
+
+    explicit RefusedCandidate(gr::property_map init = {}) : gr::Block<RefusedCandidate>(std::move(init)) { gCandidateConstructions.fetch_add(1UZ, std::memory_order_relaxed); }
+
+    void settingsChanged(const gr::property_map&, const gr::property_map&) { gCandidateSettingsChanges.fetch_add(1UZ, std::memory_order_relaxed); }
+    void start() { gCandidateStartCalls.fetch_add(1UZ, std::memory_order_relaxed); }
+
+    [[nodiscard]] float processOne(float value) const noexcept { return value * gain; }
+};
+
+void registerRefusedCandidate() {
+    static const bool registered = [] {
+        std::ignore = gr::globalBlockRegistry().insert<RefusedCandidate>();
+        return true;
+    }();
+    std::ignore = registered;
+}
+
+void resetReplacementCounters() {
+    gRefusalWorkCalls.store(0UZ, std::memory_order_relaxed);
+    gRefusalStartCalls.store(0UZ, std::memory_order_relaxed);
+    gRefusalStopCalls.store(0UZ, std::memory_order_relaxed);
+    gCandidateConstructions.store(0UZ, std::memory_order_relaxed);
+    gCandidateSettingsChanges.store(0UZ, std::memory_order_relaxed);
+    gCandidateStartCalls.store(0UZ, std::memory_order_relaxed);
+}
 
 constexpr std::size_t kSamplesBeforeTerminal = 32UZ;
 
@@ -348,6 +405,41 @@ struct AdoptingScheduler : TestScheduler {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     return {};
+}
+
+struct ReplacementResponse {
+    bool        refused  = false;
+    bool        replaced = false;
+    std::string errorMessage;
+};
+
+[[nodiscard]] ReplacementResponse awaitReplacementResponse(gr::MsgPortIn& port) {
+    ReplacementResponse result;
+    for (std::size_t i = 0UZ; i < 3000UZ; ++i) {
+        auto messages = port.streamReader().get();
+        for (const gr::Message& message : messages) {
+            result.replaced = result.replaced || message.endpoint == gr::scheduler::property::kBlockReplaced;
+            if (message.endpoint == gr::scheduler::property::kReplaceBlock && !message.data.has_value()) {
+                result.refused      = true;
+                result.errorMessage = message.data.error().message;
+            }
+        }
+        std::ignore = messages.consume(messages.size());
+        if (result.refused) {
+            return result;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return result;
+}
+
+void sendReplacementRequest(gr::MsgPortOut& port, const RefusalPassThrough& block) { gr::sendMessage<gr::message::Command::Set>(port, "", gr::scheduler::property::kReplaceBlock, {{"uniqueName", std::string(block.unique_name)}, {"type", gr::meta::type_name<RefusedCandidate>()}, {"properties", gr::property_map{{"gain", 3.0f}}}}); }
+
+void expectCandidateUntouched() {
+    using namespace boost::ut;
+    expect(eq(gCandidateConstructions.load(std::memory_order_relaxed), 0UZ));
+    expect(eq(gCandidateSettingsChanges.load(std::memory_order_relaxed), 0UZ));
+    expect(eq(gCandidateStartCalls.load(std::memory_order_relaxed), 0UZ));
 }
 
 struct WatchdogProbe : TestScheduler {
@@ -1091,6 +1183,163 @@ const boost::ut::suite<"a job list that finishes before the others"> upstreamRel
 
         expect(qa_sched::runAndWaitWithin(scheduler, qa_sched::kEventBound)) << "the paced source kept running after its only consumer finished";
         expect(ge(sink._nReceived, qa_sched::kSamplesBeforeTerminal));
+    };
+};
+
+const boost::ut::suite<"scheduler replacement release refusal"> schedulerReplacementRefusalTests = [] {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    "replacement is refused before inactive graph state or queued history can change"_test = [] {
+        qa_sched::registerRefusedCandidate();
+        qa_sched::resetReplacementCounters();
+
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::EndlessSource>();
+        auto&     old    = flow.emplaceBlock<qa_sched::RefusalPassThrough>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        expect(flow.connect<"out", "in">(source, old).has_value());
+        expect(flow.connect<"out", "in">(old, sink).has_value());
+        expect(fatal(flow.connectPendingEdges()));
+
+        {
+            auto samples = source.out.streamWriter().reserve(3UZ);
+            samples[0]   = 1.0f;
+            samples[1]   = 2.0f;
+            samples[2]   = 3.0f;
+            samples.publish(3UZ);
+        }
+        source.out.publishTag(gr::property_map{{"queued", true}}, 1UZ);
+        source.out.publishTag(gr::property_map{{static_cast<std::pmr::string>(gr::tag::END_OF_STREAM), true}}, 3UZ);
+        {
+            auto samples = old.out.streamWriter().reserve(2UZ);
+            samples[0]   = 7.0f;
+            samples[1]   = 8.0f;
+            samples.publish(2UZ);
+        }
+        old.out.publishTag(gr::property_map{{"pending", true}}, 0UZ);
+
+        qa_sched::SerialScheduler scheduler;
+        gr::MsgPortOut            toScheduler;
+        gr::MsgPortIn             fromScheduler;
+        expect(toScheduler.connect(scheduler.msgIn).has_value());
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        const auto                  originalBlock = scheduler.graph().blocks()[1];
+        const std::vector<gr::Edge> originalEdges(scheduler.graph().edges().begin(), scheduler.graph().edges().end());
+        const gr::lifecycle::State  schedulerState  = scheduler.state();
+        const gr::lifecycle::State  blockState      = old.state();
+        const std::size_t           inputPosition   = old.in.streamReader().position();
+        const std::size_t           inputAvailable  = old.in.streamReader().available();
+        const std::size_t           inputTags       = old.in.tagReader().available();
+        const std::size_t           outputPosition  = sink.in.streamReader().position();
+        const std::size_t           outputAvailable = sink.in.streamReader().available();
+        const std::size_t           outputTags      = sink.in.tagReader().available();
+
+        qa_sched::sendReplacementRequest(toScheduler, old);
+        scheduler.processScheduledMessages();
+        const auto response = qa_sched::awaitReplacementResponse(fromScheduler);
+
+        expect(response.refused);
+        expect(!response.replaced) << "the disabled endpoint must never emit BlockReplaced";
+        expect(response.errorMessage.find("disabled in this release") != std::string::npos);
+        qa_sched::expectCandidateUntouched();
+        expect(scheduler.state() == schedulerState);
+        expect(old.state() == blockState);
+        expect(scheduler.graph().blocks()[1] == originalBlock);
+        expect(std::ranges::equal(scheduler.graph().edges(), originalEdges));
+        expect(eq(old.in.streamReader().position(), inputPosition));
+        expect(eq(old.in.streamReader().available(), inputAvailable));
+        expect(eq(old.in.tagReader().available(), inputTags));
+        expect(eq(sink.in.streamReader().position(), outputPosition));
+        expect(eq(sink.in.streamReader().available(), outputAvailable));
+        expect(eq(sink.in.tagReader().available(), outputTags));
+
+        auto inputSamples = old.in.streamReader().get();
+        expect(fatal(eq(inputSamples.size(), 3UZ)));
+        expect(eq(inputSamples[0], 1.0f));
+        expect(eq(inputSamples[1], 2.0f));
+        expect(eq(inputSamples[2], 3.0f));
+        auto inputTagData = old.in.tagReader().get();
+        expect(fatal(eq(inputTagData.size(), 2UZ)));
+        expect(inputTagData[0].map.at("queued") == true);
+        expect(inputTagData[1].map.at(static_cast<std::pmr::string>(gr::tag::END_OF_STREAM)) == true);
+        auto outputSamples = sink.in.streamReader().get();
+        expect(fatal(eq(outputSamples.size(), 2UZ)));
+        expect(eq(outputSamples[0], 7.0f));
+        expect(eq(outputSamples[1], 8.0f));
+        auto outputTagData = sink.in.tagReader().get();
+        expect(fatal(eq(outputTagData.size(), 1UZ)));
+        expect(outputTagData[0].map.at("pending") == true);
+
+        expect(scheduler.changeStateTo(ERROR).has_value());
+        const auto errorBlockState = old.state();
+        qa_sched::sendReplacementRequest(toScheduler, old);
+        scheduler.processScheduledMessages();
+        const auto errorResponse = qa_sched::awaitReplacementResponse(fromScheduler);
+        expect(errorResponse.refused);
+        expect(!errorResponse.replaced);
+        expect(scheduler.state() == ERROR);
+        expect(old.state() == errorBlockState) << "the request must not transition A";
+        qa_sched::expectCandidateUntouched();
+    };
+
+    "a running graph continues and stops normally after replacement is refused"_test = [] {
+        qa_sched::registerRefusedCandidate();
+        qa_sched::resetReplacementCounters();
+
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::EndlessSource>();
+        auto&     old    = flow.emplaceBlock<qa_sched::RefusalPassThrough>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        expect(flow.connect<"out", "in">(source, old).has_value());
+        expect(flow.connect<"out", "in">(old, sink).has_value());
+
+        qa_sched::TestScheduler scheduler;
+        gr::MsgPortOut          toScheduler;
+        gr::MsgPortIn           fromScheduler;
+        expect(toScheduler.connect(scheduler.msgIn).has_value());
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        const auto                  originalBlock = scheduler.graph().blocks()[1];
+        const std::vector<gr::Edge> originalEdges(scheduler.graph().edges().begin(), scheduler.graph().edges().end());
+
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(qa_sched::awaitState(scheduler, RUNNING));
+        expect(qa_sched::awaitCondition([] { return qa_sched::gRefusalWorkCalls.load(std::memory_order_relaxed) > 0UZ; }));
+
+        const auto blockState = old.state();
+        qa_sched::sendReplacementRequest(toScheduler, old);
+        const auto response = qa_sched::awaitReplacementResponse(fromScheduler);
+        expect(response.refused);
+        expect(!response.replaced);
+        expect(response.errorMessage.find("disabled in this release") != std::string::npos);
+        qa_sched::expectCandidateUntouched();
+        expect(scheduler.state() == RUNNING);
+        expect(old.state() == blockState);
+        expect(scheduler.graph().blocks()[1] == originalBlock);
+        expect(std::ranges::equal(scheduler.graph().edges(), originalEdges));
+
+        const auto callsAfterRefusal = qa_sched::gRefusalWorkCalls.load(std::memory_order_relaxed);
+        expect(qa_sched::awaitCondition([callsAfterRefusal] { return qa_sched::gRefusalWorkCalls.load(std::memory_order_relaxed) > callsAfterRefusal; })) << "A must continue processing after the refusal";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_sched::awaitState(scheduler, STOPPED));
+        expect(eq(qa_sched::gRefusalStartCalls.load(std::memory_order_relaxed), 1UZ));
+        expect(eq(qa_sched::gRefusalStopCalls.load(std::memory_order_relaxed), 1UZ));
+
+        const auto stoppedBlockState = old.state();
+        qa_sched::sendReplacementRequest(toScheduler, old);
+        scheduler.processScheduledMessages();
+        const auto stoppedResponse = qa_sched::awaitReplacementResponse(fromScheduler);
+        expect(stoppedResponse.refused);
+        expect(!stoppedResponse.replaced);
+        expect(scheduler.state() == STOPPED);
+        expect(old.state() == stoppedBlockState);
+        expect(scheduler.graph().blocks()[1] == originalBlock);
+        qa_sched::expectCandidateUntouched();
     };
 };
 
