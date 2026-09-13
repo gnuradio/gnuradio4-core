@@ -13,8 +13,8 @@ if(UNIX)
 
   set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
   set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
-  # When installing to a non-standard prefix (e.g. /opt/gnuradio4), dpkg-shlibdeps
-  # cannot find the package's own private libraries. Point it to the install lib dir.
+  # When installing to a non-standard prefix (e.g. /opt/gnuradio4), dpkg-shlibdeps cannot find the package's own private
+  # libraries. Point it to the install lib dir.
   set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS_PRIVATE_DIRS "${CMAKE_INSTALL_PREFIX}/lib")
   if(CMAKE_BUILD_TYPE STREQUAL "Debug" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     set(CPACK_DEBIAN_DEBUGINFO_PACKAGE ON)

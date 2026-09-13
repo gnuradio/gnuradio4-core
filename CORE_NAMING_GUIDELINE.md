@@ -3,6 +3,7 @@
 In software development, the right naming conventions bridge the gap between human linguistic patterns and logical code structures, turning abstract concepts into meaningful expressions and algorithmic intent. By aligning our codebase with familiar linguistic constructs, we aim to foster clarity, maintainability, and a more intuitive understanding of our project. Embracing lean and clean code principles, this guideline aims at a concise yet expressive naming. While we strive for consistency, we emphasize the spirit of clarity and meaning over rigid adherence when faced with exceptions.
 
 This guideline is embedded into the larger [CORE_DEVELOPMENT_GUIDELINE.md](CORE_DEVELOPMENT_GUIDELINE.md) context of this project [README.md](README.md).
+
 <details> <summary>click here for the TL;DR summary</summary>
 
 ## Naming Conventions: Quick Summary (TL;DR)

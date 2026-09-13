@@ -2,7 +2,7 @@
 #
 # https://github.com/lefticus/cppbestpractices/blob/master/02-Use_the_Tools_Available.md
 
-function(set_project_warnings project_name)
+function(set_project_warnings target_name)
 
   set(MSVC_WARNINGS
       /W4 # Baseline reasonable warnings
@@ -58,8 +58,8 @@ function(set_project_warnings project_name)
   )
 
   if(WARNINGS_AS_ERRORS)
-    set(CLANG_WARNINGS ${CLANG_WARNINGS} -Werror) # avoid warnings since they are often indicative of immature API
-                                                  # and/or potential sources of bugs
+    # Avoid warnings since they are often indicative of immature APIs and/or potential sources of bugs.
+    set(CLANG_WARNINGS ${CLANG_WARNINGS} -Werror)
     set(MSVC_WARNINGS ${MSVC_WARNINGS} /WX)
     message(STATUS "Setting compiler warning as errors: ${WARNINGS_AS_ERRORS}")
   endif()
@@ -97,9 +97,6 @@ function(set_project_warnings project_name)
             " "
             PROJECT_WARNINGS_MOD
             "${PROJECT_WARNINGS}")
-  set(${output_var}
-      "${PROJECT_WARNINGS}"
-      PARENT_SCOPE)
   set(ALL_COMPILER_FLAGS
       "${ALL_COMPILER_FLAGS}${PROJECT_WARNINGS_MOD}"
       PARENT_SCOPE)
@@ -108,7 +105,7 @@ function(set_project_warnings project_name)
   # installed export, and the compiler-id expressions keep the configure-time selection above from leaking foreign flags
   # into TUs built with a different compiler
   target_compile_options(
-    ${project_name}
+    ${target_name}
     INTERFACE "$<BUILD_INTERFACE:$<$<CXX_COMPILER_ID:MSVC>:${MSVC_WARNINGS}>>"
               "$<BUILD_INTERFACE:$<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang,GNU>:${CLANG_WARNINGS}>>"
               "$<BUILD_INTERFACE:$<$<COMPILE_LANG_AND_ID:CXX,GNU>:${GCC_EXTRA_WARNINGS}>>")
