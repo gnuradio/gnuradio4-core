@@ -1,6 +1,7 @@
 #ifndef GNURADIO_CLAIMSTRATEGY_HPP
 #define GNURADIO_CLAIMSTRATEGY_HPP
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <concepts>
@@ -187,9 +188,8 @@ public:
     void operator=(const MultiProducerStrategy&)         = delete;
 
     // next()/tryNext() take _cachedMinReaderCursor as a lower bound on every reader's position and claim without
-    // recomputing while it holds, so a changed reader set leaves the minimum over the new set behind. Reader cursors
-    // only advance, which keeps that value a lower bound until the set changes again.
-    void notifyReaderSetChanged() const noexcept { gr::atomic_ref(_cachedMinReaderCursor).store_relaxed(getMinReaderCursor()); }
+    // recomputing while it holds, so a changed reader set leaves the minimum over the new set behind.
+    void notifyReaderSetChanged() const noexcept { refreshMinReaderCursor(); }
 
     [[nodiscard]] std::size_t next(std::size_t nSlotsToClaim = 1) noexcept {
         assert((nSlotsToClaim > 0 && nSlotsToClaim <= _size) && "nSlotsToClaim must be > 0 and <= bufferSize");
@@ -202,8 +202,7 @@ public:
             nextReserveCursor           = currentReserveCursor + nSlotsToClaim;
             const std::size_t cachedMin = gr::atomic_ref(_cachedMinReaderCursor).load_relaxed();
             if (nextReserveCursor - cachedMin > _size) {
-                const std::size_t freshMin = getMinReaderCursor();
-                gr::atomic_ref(_cachedMinReaderCursor).store_relaxed(freshMin);
+                const std::size_t freshMin = refreshMinReaderCursor();
                 if (nextReserveCursor - freshMin > _size) {
                     if constexpr (hasSignalAllWhenBlocking<TWaitStrategy>) {
                         _waitStrategy.signalAllWhenBlocking();
@@ -231,8 +230,7 @@ public:
             nextReserveCursor           = currentReserveCursor + nSlotsToClaim;
             const std::size_t cachedMin = gr::atomic_ref(_cachedMinReaderCursor).load_relaxed();
             if (nextReserveCursor - cachedMin > _size) {
-                const std::size_t freshMin = getMinReaderCursor();
-                gr::atomic_ref(_cachedMinReaderCursor).store_relaxed(freshMin);
+                const std::size_t freshMin = refreshMinReaderCursor();
                 if (nextReserveCursor - freshMin > _size) {
                     return std::nullopt;
                 }
@@ -242,9 +240,8 @@ public:
     }
 
     [[nodiscard]] forceinline std::size_t getRemainingCapacity() const noexcept {
-        const std::size_t minReader = getMinReaderCursor();
-        gr::atomic_ref(_cachedMinReaderCursor).store_relaxed(minReader); // keep cache warm for next()/tryNext()
-        const std::size_t nClaimed = _reserveCursor.value() - minReader;
+        const std::size_t minReader = refreshMinReaderCursor(); // also keeps the cache warm for next()/tryNext()
+        const std::size_t nClaimed  = _reserveCursor.value() - minReader;
         return nClaimed >= _size ? 0UZ : _size - nClaimed; // unsigned-safe: a reader cursor ahead of the reserve cursor also lands here
     }
 
@@ -277,6 +274,19 @@ public:
     }
 
 private:
+    // the cached bound must hold for every reader the claim meets later, not only for the set this minimum was taken
+    // over: refreshes on different threads store in any order, and one that runs while the set is empty computes the
+    // reserve cursor, which is above the publish cursor a reader attaching afterwards starts at. Reading the publish
+    // cursor before the reader set makes the stored value a lower bound for both, since reader cursors only advance
+    // and a later attach starts at a publish cursor no lower than the one read here. The returned minimum is left
+    // unbounded: with no readers nothing gates the writer.
+    forceinline std::size_t refreshMinReaderCursor() const noexcept {
+        const std::size_t publishCursor = _publishCursor.value();
+        const std::size_t minReader     = getMinReaderCursor();
+        gr::atomic_ref(_cachedMinReaderCursor).store_relaxed(std::min(minReader, publishCursor));
+        return minReader;
+    }
+
     // multiple producers rule out a producer-confined cache, so take an owning snapshot; the _cachedMinReaderCursor
     // fast path in next()/tryNext() keeps this off the common path
     [[nodiscard]] forceinline std::size_t getMinReaderCursor() const noexcept {
