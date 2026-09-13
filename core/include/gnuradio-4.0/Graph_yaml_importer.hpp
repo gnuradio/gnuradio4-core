@@ -2,9 +2,12 @@
 #define GNURADIO_GRAPH_YAML_IMPORTER_H
 
 #include <array>
+#include <limits>
 #include <map>
+#include <optional>
 #include <ranges>
 #include <set>
+#include <utility>
 
 #include <gnuradio-4.0/meta/indirect.hpp>
 
@@ -57,6 +60,45 @@ requires(sizeof...(propertySubNames) > 0)
     }
 
     return getProperty<T>(*value, propertySubNames...);
+}
+
+/**
+ * @brief The `version` a block entry pins, or nothing when it pins none.
+ *
+ * A block entry without the key takes the newest registered version. Any integral spelling the YAML reader
+ * produced is accepted; anything else, or a value outside a version number's range, is reported as a defect.
+ *
+ * The map is whichever one carries the entry: a block of a graph file, or the data of a message that emplaces
+ * or replaces one at runtime. A message handler must not throw, so the defect is returned rather than thrown
+ * and the file loader is the one that turns it into an exception.
+ */
+[[nodiscard]] inline std::expected<std::optional<block::Version>, gr::Error> pinnedVersionOrError(const gr::property_map& grcBlock, std::string_view blockType) {
+    const auto it = grcBlock.find("version");
+    if (it == grcBlock.cend()) {
+        return std::optional<block::Version>{};
+    }
+
+    std::optional<block::Version> pinned;
+    pmt::ValueVisitor([&pinned]<typename TValue>(const TValue& value) {
+        if constexpr (std::is_integral_v<TValue> && !std::is_same_v<TValue, bool>) {
+            if (std::cmp_greater_equal(value, 0) && std::cmp_less_equal(value, std::numeric_limits<block::Version>::max())) {
+                pinned = static_cast<block::Version>(value);
+            }
+        }
+    }).visit(it->second);
+
+    if (!pinned.has_value()) {
+        return std::unexpected(gr::Error(std::format("Block of type '{}' pins a version that is not a version number", blockType)));
+    }
+    return pinned;
+}
+
+[[nodiscard]] inline std::optional<block::Version> pinnedVersionOf(const gr::property_map& grcBlock, std::string_view blockType) {
+    const std::expected<std::optional<block::Version>, gr::Error> pinned = pinnedVersionOrError(grcBlock, blockType);
+    if (!pinned.has_value()) {
+        throw gr::exception(pinned.error().message);
+    }
+    return *pinned;
 }
 
 template<typename T>
@@ -236,7 +278,18 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
                 loadGraph(static_cast<GraphWrapper<gr::Graph>*>(subGraph.get()));
             }
         } else {
-            auto currentBlock = loader.instantiate(blockType);
+            // no `version` key means the newest registered version
+            const std::optional<block::Version> pinnedVersion = pinnedVersionOf(grcBlock, blockType);
+            std::shared_ptr<BlockModel>         currentBlock;
+            if (pinnedVersion.has_value()) {
+                const auto instantiated = loader.instantiatePinnedOrError(blockType, *pinnedVersion);
+                if (!instantiated.has_value()) {
+                    throw gr::exception(std::format("Unable to create block '{}' of type '{}': {}", blockName, blockType, instantiated.error().message));
+                }
+                currentBlock = *instantiated;
+            } else {
+                currentBlock = loader.instantiate(blockType);
+            }
             if (!currentBlock) {
                 throw gr::exception(std::format("Unable to create block of type '{}'", blockType));
             }
@@ -441,7 +494,7 @@ inline gr::meta::indirect<gr::Graph> loadGrc(PluginLoader& loader, std::string_v
 /// skimming a block sees what it is before how it is configured. Every map in the document is
 /// emitted with these keys first and the remainder lexicographically, which also makes the
 /// output deterministic (the underlying map's own iteration order is a hash artifact).
-inline constexpr std::array<std::string_view, 12> grcYamlKeyOrder{"id", "name", "unique_name", "block_category", "meta_information", "parameters", "ctx_parameters", "scheduler", "exported_ports", "blocks", "connections", "graph"};
+inline constexpr std::array<std::string_view, 13> grcYamlKeyOrder{"id", "version", "name", "unique_name", "block_category", "meta_information", "parameters", "ctx_parameters", "scheduler", "exported_ports", "blocks", "connections", "graph"};
 
 inline std::string saveGrc(PluginLoader& loader, const gr::Graph& rootGraph) { return pmt::yaml::serialize(detail::saveGraphToMap(loader, rootGraph), grcYamlKeyOrder); }
 

@@ -144,6 +144,7 @@ if(GR_ENABLE_BLOCK_REGISTRY AND INTERNAL_ENABLE_BLOCK_PLUGINS)
     bad_plugin)
 
   add_app_test(qa_PluginRegistration)
+  add_dependencies(qa_PluginRegistration versioned_plugin)
 
   add_app_test(qa_PluginBlockLibrary)
   add_dependencies(

@@ -24,6 +24,12 @@ property_map serializeBlockImpl(gr::PluginLoader& pluginLoader, const std::share
     result.emplace(serialization_fields::BLOCK_UNIQUE_NAME, std::string(block->uniqueName()));
     result.emplace(serialization_fields::BLOCK_CATEGORY, std::string(gr::meta::enumName(block->blockCategory()).value_or("")));
 
+    // Only a pinned instance writes the key back, so a graph that pinned nothing keeps taking the newest
+    // version when it is loaded again.
+    if (const std::optional<block::Version> pinned = block->pinnedVersion(); pinned.has_value()) {
+        result.emplace(serialization_fields::BLOCK_VERSION, static_cast<gr::Size_t>(*pinned));
+    }
+
     if (!block->metaInformation().empty()) {
         result.emplace(serialization_fields::BLOCK_META_INFORMATION, block->metaInformation());
     }
