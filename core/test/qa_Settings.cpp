@@ -352,6 +352,17 @@ const boost::ut::suite<"staged type refusals"> stagedRefusalTests = [] {
         expect(!gr::settings::extractStagedValue<gr::Size_t>(wrong, "input_chunk_size").has_value()) << "scalar mismatch reports";
         expect(!gr::settings::extractStagedValue<std::vector<float>>(wrong, "taps").has_value()) << "tensor mismatch reports";
     };
+
+    "a native size_t survives the staging representation on every platform"_test = [] {
+        constexpr std::size_t expected = 37UZ;
+        const pmt::Value      staged{gr::detail::castToGrSizeIfNeeded(expected)};
+        const auto            extracted = gr::settings::extractStagedValue<std::size_t>(staged, "num_filters");
+
+        expect(extracted.has_value()) << "the staging representation converts back to native size_t";
+        if (extracted.has_value()) {
+            expect(eq(*extracted, expected));
+        }
+    };
 };
 
 [[nodiscard]] Decimator makeDecimator() {

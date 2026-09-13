@@ -279,7 +279,7 @@ bool autoUpdateImpl(std::string_view key, const pmt::Value& value, const std::se
             stagedParameters.insert_or_assign(keyPmr, value);
             return true;
         }
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) || (defined(__APPLE__) && defined(__aarch64__))
     } else if constexpr (std::is_same_v<Type, std::size_t> && !std::is_same_v<std::size_t, gr::Size_t>) {
         if (value.holds<gr::Size_t>()) {
             stagedParameters.insert_or_assign(keyPmr, value);
@@ -347,7 +347,7 @@ template<typename Type>
         } else {
             maybeValue = std::unexpected("Unexpected type in stagedValue");
         }
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) || (defined(__APPLE__) && defined(__aarch64__))
     } else if constexpr (std::is_same_v<Type, std::size_t> && !std::is_same_v<std::size_t, gr::Size_t>) {
         auto ptr = checked_access_ptr<const gr::Size_t, false>{stagedValue.get_if<gr::Size_t>()};
         if (ptr != nullptr) {
