@@ -1,15 +1,15 @@
 {
-	"project": "Graph.hpp",
-	"target": "singleheader/Graph.hpp",
-	"sources": [
-		"./core/include/gnuradio-4.0/Graph.hpp"
-	],
-	"include_paths": [
-		"./core/include/",
-		"./meta/include/",
-		"./build/_deps/vir-simd-src/",
-		"./build/_deps/pmt-src/include/",
-		"./third_party/magic_enum/",
-		"./third_party/refl-cpp/"
-	]
+    "project": "Graph.hpp",
+    "target": "singleheader/Graph.hpp",
+    "sources": [
+        "./core/include/gnuradio-4.0/Graph.hpp"
+    ],
+    "include_paths": [
+        "./core/include/",
+        "./meta/include/",
+        "./build/_deps/vir-simd-src/",
+        "./build/_deps/pmt-src/include/",
+        "./third_party/magic_enum/",
+        "./third_party/refl-cpp/"
+    ]
 }

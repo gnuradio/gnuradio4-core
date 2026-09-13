@@ -243,7 +243,7 @@ checker to your e-mails ... they are free and easy to use ... just use them._
 8. **Structs vs Classes**: strongly prioritise functional programming where possible to mitigate performance bottlenecks
    and race conditions, especially in multi-threaded environments.
    - Favour public `structs` (aka. _aggregates_) over `classes` unless encapsulation of a non-public invariant or shared state (e.g. a HW resource) is required.
-   - Prefix member variables that have a predominantly 'private' use-case with an underscore (_).
+   - Prefix member variables that have a predominantly 'private' use-case with an underscore (\_).
    - structure members should be defined in the following order if possible:
      1. Meta-information about the structure/class (`static_assert`s that check compile-time properties of the type such as checking template parameters are valid in class templates);
      2. Member variables that define the private and public state.
@@ -346,7 +346,7 @@ column alignment.
     - Building upon that:
       - [CppCon](https://cppcon.org/)'s ['Back to Basic' Track](https://www.youtube.com/watch?v=Bt3zcJZIalk&list=PLHTh1InhhwT4TJaHBVWzvBOYhp27UO7mI&pp=iAQB) and [Slides](https://github.com/CppCon/CppCon2023).
       - YouTube Channels: [C++ Weekly](https://www.youtube.com/@cppweekly), [The Cherno](https://www.youtube.com/@TheCherno), [Casey Muratori's channel](https://www.youtube.com/@MollyRocket)
-        [//]: # ( * if you do not plan to make your code public you could stop here, otherwise you may continue.)
+        [//]: # ( \* if you do not plan to make your code public you could stop here, otherwise you may continue.)
 - **Application Class 1**: _Developing Out-Of-Tree (OOT) Modules, Blocks, or Schedulers for others:_
   - As above, plus:
     - Familiarise with the [C++ Core Guidelines](https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines) for safe syntax in modern C++.
@@ -389,6 +389,7 @@ It is based on a clear understanding of what brings value to the organisation an
 <a id="clean_code"></a>
 Code is clean if it can be understood easily – by everyone on the team. Clean code can be read and enhanced by a developer
 other than its original author. With understandability comes readability, changeability, extensibility and maintainability.
+
 <details>
   <summary>Click for more ...</summary>
 
@@ -402,7 +403,7 @@ other than its original author. With understandability comes readability, change
 ### Design rules
 
 1. Keep configurable data at high levels.
-2. ~~Prefer polymorphism to if/else or switch/case.~~ -> *N.B. [Inheritance Is The Base Class of Evil](https://www.youtube.com/watch?v=bIhUE5uUFOA) *
+2. ~~Prefer polymorphism to if/else or switch/case.~~ -> _N.B. [Inheritance Is The Base Class of Evil](https://www.youtube.com/watch?v=bIhUE5uUFOA) _
 3. ~~Separate multi-threading code.~~ -> _N.B. we follow a functional programming style that minimise hidden state for thread-safety and performance reason_
 4. Prevent over-configurability.
 5. Use dependency injection.
@@ -461,7 +462,7 @@ other than its original author. With understandability comes readability, change
 
 ### Objects and data structures
 
-1. ~~Hide internal structure.~~ -> _N.B. prefix internal/private variables with `_` and only 'hide' if RAII dictates or absolute necessary._
+1. ~~Hide internal structure.~~ -> _N.B. prefix internal/private variables with `_` and only 'hide' if RAII dictates or absolute necessary.\_
 2. Prefer data structures.
 3. Avoid hybrids structures (half object and half data).
 4. Should be small.
@@ -488,5 +489,4 @@ other than its original author. With understandability comes readability, change
 5. Needless Repetition.
 6. Opacity. The code is hard to understand.
 
-[//]:
-</details>
+[//]: /details
