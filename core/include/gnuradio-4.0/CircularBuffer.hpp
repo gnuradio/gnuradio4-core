@@ -551,6 +551,7 @@ private:
         [[nodiscard]] constexpr std::size_t                position() const noexcept { return _buffer->_claimStrategy._publishCursor.value(); }
         [[nodiscard]] constexpr std::size_t                available() const noexcept { return _buffer->_claimStrategy.getRemainingCapacity(); }
         [[nodiscard]] constexpr std::pmr::memory_resource* resource() const noexcept { return _buffer->_allocator.resource(); }
+        [[nodiscard]] constexpr bool                       hasOutstandingSpans() const noexcept { return _instanceCount != 0UZ; }
         [[nodiscard]] constexpr bool                       isPublishRequested() const noexcept { return _nRequestedSamplesToPublish != kNotPublished; }
         [[nodiscard]] constexpr std::size_t                nRequestedSamplesToPublish() const noexcept { return _nRequestedSamplesToPublish == kNotPublished ? 0UZ : _nRequestedSamplesToPublish; };
 
@@ -772,6 +773,7 @@ private:
         [[nodiscard]] std::size_t nWriters() const noexcept { return gr::atomic_ref(_buffer->_writer_count).load_acquire(); }
 
         [[nodiscard]] constexpr std::size_t nSamplesConsumed() const noexcept { return _nSamplesConsumed; };
+        [[nodiscard]] constexpr bool        hasOutstandingSpans() const noexcept { return _instanceCount != 0UZ; }
         [[nodiscard]] constexpr bool        isConsumeRequested() const noexcept { return _nRequestedSamplesToConsume != std::numeric_limits<std::size_t>::max(); }
         [[nodiscard]] constexpr std::size_t nRequestedSamplesToConsume() const noexcept { return _nRequestedSamplesToConsume; }
 
