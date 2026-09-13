@@ -477,6 +477,11 @@ public:
         return removedBlock;
     }
 
+    /// Replace a block after obtaining exclusive access to the graph and affected ports.
+    /// No scheduler, device, or user activity may touch those ports during the call. Runtime
+    /// preflight rejects already-outstanding spans, but cannot prevent another thread from
+    /// acquiring a span concurrently. The Scheduler ReplaceBlock message is unsupported in
+    /// every lifecycle state; observing STOPPED does not establish this exclusive-access contract.
     std::pair<std::shared_ptr<BlockModel>, std::shared_ptr<BlockModel>> replaceBlock(std::string_view uniqueName, std::string_view type, const property_map& properties);
 
     [[nodiscard]] std::expected<void, Error> emplaceEdge(std::string_view sourceBlock, std::string sourcePort, std::string_view destinationBlock, //
@@ -514,7 +519,12 @@ public:
 
         const bool        isArithmeticLike       = sourcePortRef.isArithmeticLikeValueType();
         const std::size_t sanitizedMinBufferSize = minBufferSize == undefined_size ? graph::defaultMinBufferSize(isArithmeticLike) : minBufferSize;
-        _edges.emplace_back(*sourceBlockIt, sourcePort, *destinationBlockIt, destinationPort, sanitizedMinBufferSize, weight, std::string(edgeName));
+        Edge& edge              = _edges.emplace_back(*sourceBlockIt, sourcePort, *destinationBlockIt, destinationPort, sanitizedMinBufferSize, weight, std::string(edgeName));
+        edge._state             = Edge::EdgeState::Connected;
+        edge._actualBufferSize  = sourcePortRef.bufferSize();
+        edge._edgeType          = port::decodePortType(sourcePortRef.portMaskInfo());
+        edge._sourcePort        = std::addressof(sourcePortRef);
+        edge._destinationPort   = std::addressof(destinationPortRef);
         return {};
     }
 
@@ -855,39 +865,42 @@ public:
             }
         }
 
-        // an unconnected optional synchronous output is still written by processBulk, whose
-        // item sizing may include it, yet only connected ports are resized to their edge
-        // size: left at the default capacity, a span request beyond that capacity returns an
-        // empty span in a release build with nothing signaled, silently throttling the block
-        // to zero — so it is sized with the block's largest connected output
         for (auto& block : _blocks) {
-            auto forEachOutputPort = [&block](auto&& fn) {
-                for (auto& portOrCollection : block->dynamicOutputPorts()) {
-                    if (auto* port = std::get_if<gr::DynamicPort>(&portOrCollection)) {
-                        fn(*port);
-                    } else {
-                        for (auto& collectionPort : std::get<BlockModel::NamedPortCollection>(portOrCollection).ports) {
-                            fn(collectionPort);
-                        }
-                    }
-                }
-            };
-            std::size_t maxConnectedSize = 0UZ;
-            forEachOutputPort([&maxConnectedSize](gr::DynamicPort& port) {
-                if (port.isConnected()) {
-                    maxConnectedSize = std::max(maxConnectedSize, port.bufferSize());
-                }
-            });
-            if (maxConnectedSize == 0UZ) {
-                continue;
-            }
-            forEachOutputPort([maxConnectedSize](gr::DynamicPort& port) {
-                if (!port.isConnected() && port.isSynchronous() && port.isOptional() && port.bufferSize() < maxConnectedSize) {
-                    std::ignore = port.resizeBuffer(maxConnectedSize);
-                }
-            });
+            std::ignore = resizeOptionalOutputs(block);
         }
         return allConnected;
+    }
+
+private:
+    // An optional synchronous output is still written by processBulk. Size it with the
+    // largest connected sibling so acquiring its span cannot throttle the block to zero.
+    static std::expected<void, Error> resizeOptionalOutputs(const std::shared_ptr<BlockModel>& block) {
+        auto forEachOutputPort = [&block](auto&& fn) {
+            for (auto& portOrCollection : block->dynamicOutputPorts()) {
+                if (auto* port = std::get_if<gr::DynamicPort>(&portOrCollection)) {
+                    fn(*port);
+                } else {
+                    for (auto& collectionPort : std::get<BlockModel::NamedPortCollection>(portOrCollection).ports) {
+                        fn(collectionPort);
+                    }
+                }
+            }
+        };
+        std::size_t maxConnectedSize = 0UZ;
+        forEachOutputPort([&maxConnectedSize](gr::DynamicPort& port) {
+            if (port.isConnected()) {
+                maxConnectedSize = std::max(maxConnectedSize, port.bufferSize());
+            }
+        });
+        std::expected<void, Error> result;
+        forEachOutputPort([maxConnectedSize, &result](gr::DynamicPort& port) {
+            if (!port.isConnected() && port.isSynchronous() && port.isOptional() && port.bufferSize() < maxConnectedSize) {
+                if (auto resized = port.resizeBuffer(maxConnectedSize); !resized) {
+                    result = std::unexpected(resized.error());
+                }
+            }
+        });
+        return result;
     }
 };
 
