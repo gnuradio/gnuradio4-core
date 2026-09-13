@@ -91,7 +91,15 @@ const boost::ut::suite<"block registration"> blockRegistrationTests = [] {
 
     "a template instantiation, whose alias carries the parameter spelling"_test = [] { qa_registration::expectRegistrationParity<qa_registration::Scale<float>>("Scale<float>"); };
 
-    "a defaulted template parameter, which the key spells out and the alias need not"_test = [] { qa_registration::expectRegistrationParity<qa_registration::Scale<std::complex<float>>>("Scale<complex<float32>>"); };
+    "a defaulted template parameter, which the key spells out and the alias need not"_test = [] {
+        qa_registration::expectRegistrationParity<qa_registration::Scale<std::complex<float>>>("Scale<complex<float32>>");
+
+        gr::BlockRegistry registry;
+        expect(gr::insertBlockFactory(registry, gr::makeBlockRegistration<qa_registration::Scale<std::complex<float>>>(&qa_registration::makeBlock<qa_registration::Scale<std::complex<float>>>)));
+        expect(registry.contains("qa_registration::Scale<complex<float32>, qa_registration::DefaultPolicy>")) << "the portable key";
+        expect(registry.contains("qa_registration::Scale<complex<float32>>")) << "the portable alias";
+        expect(!registry.contains("qa_registration::Scale<std::complex<float32>>")) << "no standard-library spelling";
+    };
 
     "an overridden name, which registers a second key"_test = [] {
         qa_registration::expectRegistrationParity<qa_registration::Sink, "qa::CustomSink">("Sink as qa::CustomSink");
