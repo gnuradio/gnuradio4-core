@@ -911,7 +911,8 @@ public:
     property_map _pendingForwardParams{};
 
     std::optional<std::chrono::steady_clock::time_point> _zeroProgressSince{};
-    bool                                                 _zeroProgressReported = false;
+    bool                                                 _zeroProgressReported          = false;
+    bool                                                 _preparedStreamFailureReported = false;
 
     /// everything a block draining an async input can be waiting on; two equal readings mean the next call sees
     /// exactly what this one saw
@@ -1483,6 +1484,47 @@ public:
                 }
             },
             ports);
+    }
+
+    template<typename TInputSpans, typename TOutputSpans>
+    [[nodiscard]] work::Status preparedStreamsStatus(const TInputSpans& inputSpans, const TOutputSpans& outputSpans, std::size_t expectedIn, std::size_t expectedOut) noexcept {
+        bool        insufficientInput  = false;
+        bool        insufficientOutput = false;
+        std::size_t smallestInput      = expectedIn;
+        std::size_t smallestOutput     = expectedOut;
+
+        for_each_reader_span(
+            [expectedIn, &insufficientInput, &smallestInput](const auto& in) {
+                if (in.isConnected && in.isSync && in.size() < expectedIn) {
+                    insufficientInput = true;
+                    smallestInput     = std::min(smallestInput, in.size());
+                }
+            },
+            inputSpans);
+        for_each_writer_span(
+            [expectedOut, &insufficientOutput, &smallestOutput](const auto& out) {
+                if (out.isConnected && out.isSync && out.size() < expectedOut) {
+                    insufficientOutput = true;
+                    smallestOutput     = std::min(smallestOutput, out.size());
+                }
+            },
+            outputSpans);
+
+        if (insufficientOutput) {
+            if (!_preparedStreamFailureReported) {
+                _preparedStreamFailureReported = true;
+                std::println(stderr, "gr::Block: '{}' could not prepare a full synchronous output span (requested: {}, prepared: {}) - returning INSUFFICIENT_OUTPUT_ITEMS without progress; further prepared-span failures on this block are suppressed", unique_name, expectedOut, smallestOutput);
+            }
+            return work::Status::INSUFFICIENT_OUTPUT_ITEMS;
+        }
+        if (insufficientInput) {
+            if (!_preparedStreamFailureReported) {
+                _preparedStreamFailureReported = true;
+                std::println(stderr, "gr::Block: '{}' could not prepare a full synchronous input span (requested: {}, prepared: {}) - returning INSUFFICIENT_INPUT_ITEMS without progress; further prepared-span failures on this block are suppressed", unique_name, expectedIn, smallestInput);
+            }
+            return work::Status::INSUFFICIENT_INPUT_ITEMS;
+        }
+        return work::Status::OK;
     }
 
     /// publish a tag — in processOne dispatch: defers to dispatch loop for correct positioning; otherwise writes to ports directly
@@ -2348,6 +2390,15 @@ public:
 
         auto inputSpans  = prepareStreams(inputPorts<PortType::STREAM>(&self()), processedIn);
         auto outputSpans = prepareStreams(outputPorts<PortType::STREAM>(&self()), processedOut);
+
+        // A failed non-blocking reservation must never reach user code. The ordinary stream path uses
+        // single-producer rings, so its fresh availability reading should agree with this reservation;
+        // retain this boundary check for any refusal and release every span without moving the stream.
+        if (const work::Status status = preparedStreamsStatus(inputSpans, outputSpans, processedIn, processedOut); status != OK) {
+            publishSamples(0UZ, outputSpans);
+            consumeReaders(0UZ, inputSpans);
+            return {requestedWork, 0UZ, status};
+        }
 
         applyChangedSettings(true, &_pendingForwardParams); // captures any further external settings change, published through the open spans below
         applyInputTagsAndSettings(inputSpans, processedIn, limits.hasAnyTag);

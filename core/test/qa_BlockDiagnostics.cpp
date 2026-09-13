@@ -120,6 +120,21 @@ struct DiscardingSink : Block<DiscardingSink> {
     }
 };
 
+struct CountingCopy : Block<CountingCopy> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(CountingCopy, in, out);
+
+    std::size_t nWorkCalls = 0UZ;
+
+    work::Status processBulk(std::span<const float> inSpan, std::span<float> outSpan) {
+        nWorkCalls++;
+        std::ranges::copy(inSpan, outSpan.begin());
+        return work::Status::OK;
+    }
+};
+
 /// the same defect behind an Async port, where no sync port constrains the processed count
 struct AsyncStuckSink : Block<AsyncStuckSink> {
     PortIn<float, Async> in;
@@ -157,6 +172,67 @@ struct AsyncDiscardingSink : Block<AsyncDiscardingSink> {
 const boost::ut::suite<"block diagnostics"> _blockDiagnostics = [] {
     using namespace boost::ut;
     using namespace qa_block_diagnostics;
+
+    "a refused output reservation never reaches processBulk"_test = [] {
+        StderrCapture capture;
+
+        PortOut<float> upstream;
+        PortIn<float>  downstream;
+        CountingCopy   block;
+
+        expect(upstream.connect(block.in).has_value());
+        expect(block.out.connect(downstream).has_value());
+        block.init(std::make_shared<gr::Sequence>());
+
+        {
+            auto input = upstream.reserve<SpanReleasePolicy::ProcessAll>(4UZ);
+            std::ranges::fill(input, 1.0f);
+        }
+
+        // Deliberately stale the block's private cache, then fill the ring before work() reserves it.
+        // This is fault injection for the dispatch boundary, not a scheduler-reachable interleaving
+        // for the single-producer stream ring.
+        const std::size_t capacity = block.outputStreamCache.maxSyncAvailable();
+        {
+            auto occupied = block.out.reserve<SpanReleasePolicy::ProcessAll>(capacity);
+            std::ranges::fill(occupied, 2.0f);
+        }
+        const auto result = block.work(4UZ);
+
+        expect(result.status == work::Status::INSUFFICIENT_OUTPUT_ITEMS);
+        expect(eq(result.performed_work, 0UZ));
+        expect(eq(block.nWorkCalls, 0UZ)) << "user code is not called with a refused span";
+        expect(eq(block.in.streamReader().position(), 0UZ)) << "input is retained for the retry";
+
+        const std::string reported = capture.text();
+        expect(reported.contains(std::string_view(block.unique_name))) << std::format("the refusal report must name the block, got: {}", reported);
+        expect(reported.contains("INSUFFICIENT_OUTPUT_ITEMS")) << std::format("the refusal report must name the returned status, got: {}", reported);
+
+        {
+            auto occupied = downstream.get<SpanReleasePolicy::ProcessAll>(capacity);
+            expect(eq(occupied.size(), capacity));
+        }
+
+        std::ignore = block.outputStreamCache.maxSyncAvailable();
+        {
+            auto occupied = block.out.reserve<SpanReleasePolicy::ProcessAll>(capacity);
+            std::ranges::fill(occupied, 2.0f);
+        }
+        const auto refusedAgain = block.work(4UZ);
+        expect(refusedAgain.status == work::Status::INSUFFICIENT_OUTPUT_ITEMS);
+        expect(eq(static_cast<std::size_t>(std::ranges::count(capture.text(), '\n')), 1UZ)) << std::format("one line is reported per affected block, got: {}", capture.text());
+
+        {
+            auto occupied = downstream.get<SpanReleasePolicy::ProcessAll>(capacity);
+            expect(eq(occupied.size(), capacity));
+        }
+
+        const auto retried = block.work(4UZ);
+        expect(retried.status == work::Status::OK);
+        expect(eq(block.nWorkCalls, 1UZ));
+        expect(eq(block.in.streamReader().position(), 4UZ));
+        expect(eq(downstream.streamReader().available(), 4UZ));
+    };
 
     "a block that returns OK without progress is named on stderr, once, while the graph keeps spinning"_test = [] {
         StderrCapture capture;
