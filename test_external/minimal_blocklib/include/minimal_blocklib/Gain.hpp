@@ -5,7 +5,7 @@
 
 namespace gr::minimal_blocklib {
 
-GR_REGISTER_BLOCK(gr::minimal_blocklib::Gain, [T], [float, double])
+GR_REGISTER_BLOCK(gr::minimal_blocklib::Gain, [T], [ float, double ])
 
 template<typename T>
 struct Gain : public gr::Block<Gain<T>> {

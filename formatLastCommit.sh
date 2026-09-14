@@ -1,4 +1,4 @@
-#/bin/bash
+#!/usr/bin/env bash
 
 #enforces .clang-format style guide prior to committing to the git repository
 
@@ -11,13 +11,16 @@ CLANG_VERSION="$(${CLANG_FORMAT} --version | sed '/^clang-format version /!d;s//
 
 compare_version () {
     echo " "
-    if [[ $1 == $2 ]]
+    if [[ $1 == "$2" ]]
     then
         CLANG_MIN_VERSION_MATCH="="
         return
     fi
     local IFS=.
-    local i ver1=($1) ver2=($2)
+    local i
+    local -a ver1 ver2
+    IFS=. read -r -a ver1 <<< "$1"
+    IFS=. read -r -a ver2 <<< "$2"
     # fill empty fields in ver1 with zeros
     for ((i=${#ver1[@]}; i<${#ver2[@]}; i++))
     do
@@ -45,18 +48,18 @@ compare_version () {
     return
 }
 
-compare_version ${CLANG_MIN_VERSION} ${CLANG_VERSION}
+compare_version "${CLANG_MIN_VERSION}" "${CLANG_VERSION}"
 git reset HEAD~1 --soft
 
-files=$((git diff --name-only --cached | grep -Ei "\.(c|cc|cpp|cxx|c\+\+|h|hh|hpp|hxx|h\+\+|java)$") || true)
+files=$( (git diff --name-only --cached | grep -Ei "\.(c|cc|cpp|cxx|c\+\+|h|hh|hpp|hxx|h\+\+|java)$") || true)
 if [ -n "${files}" ]; then
 
     if [ -n "${CLANG_FORMAT}" ] && [ "$CLANG_MIN_VERSION_MATCH" != "<" ]; then
-        spaced_files=$(echo "$files" | paste -s -d " " -)
-        echo "reformatting ${spaced_files}"
-        "${CLANG_FORMAT}" -style=file -i $spaced_files >/dev/null
+        mapfile -t files_to_format <<< "${files}"
+        echo "reformatting ${files_to_format[*]}"
+        "${CLANG_FORMAT}" -style=file -i "${files_to_format[@]}" >/dev/null
         git --no-pager diff
-        git add ${spaced_files}
+        git add "${files_to_format[@]}"
     fi
 fi
 git commit -C ORIG_HEAD
