@@ -308,8 +308,14 @@ struct MyBlock : gr::Block<MyBlock, gr::UnfilteredTagPropagation> { ... };
 The other four policies decide _where_ a forwarded tag lands. This one decides _which keys_ it still carries. Under
 every other policy the forwarder keeps only the reserved keys of `kDefaultTags` and drops the rest, so a protocol
 carrying its own key cannot cross a single stock block. Under `UnfilteredTagPropagation` every key of every forwarded
-tag survives. The offsets, the retired window, the multi-input dedup and the merge rule stay those of the default
-forwarder.
+tag survives. The multi-input dedup and the merge rule stay those of the default forwarder.
+
+Every tag of the consumed chunk leaves at the offset it arrived at, and the whole chunk is retired. An input
+`min_samples` or an `input_chunk_size` above one forbids a chunk boundary at a tag closer than that to the chunk's
+start; under the default policy such an interior tag is deferred and republished at the next chunk's first sample,
+and it still is there. Under this policy it is not: it leaves in its own chunk, at its own offset. What the block
+applies from that tag to its own settings is unchanged, and still takes effect from the chunk's first sample, so a
+setting an interior tag carries is in force a few samples before the forwarded tag that carries it.
 
 Value substitution works as it does elsewhere and reaches further: a key the block declares as a setting is forwarded
 with the block's own current value, whether or not that key is reserved. A key named after one of the settings `Block<>`
@@ -327,7 +333,9 @@ for its own purpose must not be rewritten with the block's name.
 
 The policy is refused at compile time for a block that declares `Resampling<>` or `Stride<>`, has an asynchronous
 stream port, declares another tag-propagation policy, or supplies its own `forwardTags()`. The predicate is
-`gr::block::kUnfilteredTagPropagationAdmissible<TBlock>`, and the assertion fires in every build configuration.
+`gr::block::kUnfilteredTagPropagationAdmissible<TBlock>`, and the assertion fires in every build configuration. The
+`forwardTags()` clause reads `Block<>::hasForwardTagsOverride()`, which probes the override with the span tuples the
+work path passes, so an override constrained to those types is refused rather than admitted and then called.
 
 What the guard cannot check is the obligation that matters, so the block author owns it: **a tag arriving at input
 offset `t` must belong at output offset `t`.** A block that shifts sample positions, an integer delay for instance, or

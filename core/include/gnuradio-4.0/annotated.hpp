@@ -105,9 +105,13 @@ struct MergeTagPropagation {};
  *
  * The default forwarder keeps only the keys in `gr::tag::kDefaultTags`. A block annotated with
  * `UnfilteredTagPropagation` keeps every key of every tag it forwards, substituting its own current value for a key
- * it declares as a setting. The offsets, the retired window, the multi-input dedup and the merge rule stay those of
- * the default forwarder: this policy governs which keys survive, and nothing else. A surviving key that names a
- * setting of a downstream block drives that setting, exactly as `sample_rate` does.
+ * it declares as a setting. A surviving key that names a setting of a downstream block drives that setting, exactly
+ * as `sample_rate` does. The multi-input dedup and the merge rule stay those of the default forwarder.
+ *
+ * Each tag leaves at the offset it arrived at, and the whole consumed chunk is retired, so an input `min_samples` or
+ * an `input_chunk_size` above one — which forbids a chunk boundary at every tag — does not defer an interior tag to
+ * the next chunk here as it does under the default policy. What the block itself applies from that tag, its settings,
+ * still takes effect from the chunk's first sample.
  *
  * Refused at compile time for a block that declares `Resampling<>`, declares `Stride<>`, has an asynchronous stream
  * port, declares another tag-propagation policy, or supplies its own `forwardTags()` — see Block.hpp.

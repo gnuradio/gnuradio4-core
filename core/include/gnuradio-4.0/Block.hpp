@@ -2,6 +2,7 @@
 #define GNURADIO_BLOCK_HPP
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cstring>
 #include <limits>
@@ -752,7 +753,7 @@ constexpr bool kUnfilteredTagPropagationAdmissible =                            
     && traits::block::stream_input_ports<TBlock>::template all_of<traits::port::is_synchronous>                                       //
     && traits::block::stream_output_ports<TBlock>::template all_of<traits::port::is_synchronous>                                      //
     && !TBlock::noTagPropagation && !TBlock::forwardTagPropagation && !TBlock::backwardTagPropagation && !TBlock::mergeTagPropagation //
-    && !requires(TBlock& block) { block.forwardTags(std::declval<std::tuple<>&>(), std::declval<std::tuple<>&>(), 0UZ); };
+    && !TBlock::hasForwardTagsOverride();
 } // namespace block
 
 /**
@@ -899,6 +900,11 @@ public:
     constexpr static bool backwardTagPropagation   = std::disjunction_v<std::is_same<BackwardTagPropagation, Arguments>...>;
     constexpr static bool mergeTagPropagation      = std::disjunction_v<std::is_same<MergeTagPropagation, Arguments>...>;
     constexpr static bool unfilteredTagPropagation = std::disjunction_v<std::is_same<UnfilteredTagPropagation, Arguments>...>;
+
+    /// the input span retires, and the default forwarder reads, every tag of the chunk rather than only the tags at
+    /// its first sample: BackwardTagPropagation needs it to place an interior tag on the chunk that consumed it,
+    /// UnfilteredTagPropagation to leave it at the offset it arrived at
+    constexpr static bool kWholeChunkTagWindow = backwardTagPropagation || unfilteredTagPropagation;
 
     constexpr static block::Category blockCategory = block::Category::NormalBlock;
 
@@ -1183,6 +1189,17 @@ public:
     template<fixed_string Name, typename Self>
     friend constexpr auto& outputPort(Self* self) noexcept;
 
+    /// whether the block supplies the forwardTags() that workInternal() calls in place of the default forwarder
+    ///
+    /// The probe passes the span tuples prepareStreams() builds from this block's own stream ports, which are the
+    /// types the work path and the epilogue path pass, so an override constrained to them answers the same here as
+    /// there. A probe on empty tuples answers "no override" for every such constrained override.
+    [[nodiscard]] static constexpr bool hasForwardTagsOverride() noexcept {
+        using TInputSpans  = decltype(prepareStreams(inputPorts<PortType::STREAM>(std::declval<Derived*>()), 0UZ));
+        using TOutputSpans = decltype(prepareStreams(outputPorts<PortType::STREAM>(std::declval<Derived*>()), 0UZ));
+        return requires(Derived& block, TInputSpans& inputSpans, TOutputSpans& outputSpans) { block.forwardTags(inputSpans, outputSpans, 0UZ); };
+    }
+
     /// contracts between a block's declared Arguments, its ports and its processing function; the body is
     /// static_asserts only, so the check costs nothing at run time and holds in every build configuration
     constexpr void checkBlockArgumentContracts() const noexcept {
@@ -1203,7 +1220,7 @@ public:
             static_assert(traits::block::stream_input_ports<Derived>::template all_of<traits::port::is_synchronous>, "UnfilteredTagPropagation is not available for a block with an asynchronous stream input port: the default forwarder never reads such a port, so nothing would be forwarded from it.");
             static_assert(traits::block::stream_output_ports<Derived>::template all_of<traits::port::is_synchronous>, "UnfilteredTagPropagation is not available for a block with an asynchronous stream output port: the forwarded offset is derived from the synchronous sample count and means nothing on a port that publishes its own.");
             static_assert(!noTagPropagation && !forwardTagPropagation && !backwardTagPropagation && !mergeTagPropagation, "UnfilteredTagPropagation cannot be combined with another tag-propagation policy: each of the other four either suppresses forwarding or moves the output offset the policy promises to preserve.");
-            static_assert(!requires(Derived& block) { block.forwardTags(std::declval<std::tuple<>&>(), std::declval<std::tuple<>&>(), 0UZ); }, "UnfilteredTagPropagation is not available for a block supplying forwardTags(): the override replaces the default forwarder entirely, so the policy would have no effect.");
+            static_assert(!hasForwardTagsOverride(), "UnfilteredTagPropagation is not available for a block supplying forwardTags(): the override replaces the default forwarder entirely, so the policy would have no effect.");
             static_assert(block::kUnfilteredTagPropagationAdmissible<Derived>, "UnfilteredTagPropagation admissibility and the assertions above must state the same conditions.");
         }
     }
@@ -1379,11 +1396,15 @@ public:
     /// default tag forwarding — called by workInternal unless the user provides forwardTags()
     ///
     /// The window read here is the window the input span retires: prepareStreams() builds it with
-    /// consumeOnlyFirstTag = !backwardTagPropagation, so the span drops exactly the tags at relIndex <= 0, which is
-    /// what tags(1) yields. A tag interior to a chunk that could not be broken at it — min_samples, or
-    /// input_chunk_size > 1 — stays in the buffer and returns in the next chunk at a negative relIndex, still
-    /// unforwarded, so clamping it to offset 0 publishes it for the first time rather than a second. A forwardTags()
-    /// override reading a wider window sees those tags twice and must skip relIndex < 0.
+    /// consumeOnlyFirstTag = !kWholeChunkTagWindow. Under the default policy the span drops exactly the tags at
+    /// relIndex <= 0, which is what tags(1) yields, and a tag interior to a chunk that could not be broken at it —
+    /// min_samples, or input_chunk_size > 1 — stays in the buffer and returns in the next chunk at a negative
+    /// relIndex, still unforwarded, so clamping it to offset 0 publishes it for the first time rather than a second.
+    /// Under BackwardTagPropagation and under UnfilteredTagPropagation the window is the whole consumed chunk: the
+    /// span retires every tag it holds, nothing is ever deferred, and no tag can return at a negative relIndex.
+    /// UnfilteredTagPropagation then publishes each at its own relIndex, which is what its offset promise means. A
+    /// forwardTags() override reading a wider window than its policy retires sees a deferred tag twice and must skip
+    /// relIndex < 0.
     template<typename TInputSpans, typename TOutputSpans>
     void forwardInputTags(TInputSpans& inputSpans, TOutputSpans& outputSpans, std::size_t processedIn, std::optional<std::size_t> tagWindowOverride = {}) noexcept {
         if constexpr (noTagPropagation) {
@@ -1391,7 +1412,7 @@ public:
         }
         // the override widens the window for the stream's final window, where no later chunk
         // exists to retire a deferred interior tag
-        const std::size_t tagWindow = tagWindowOverride.value_or(backwardTagPropagation ? processedIn : 1UZ);
+        const std::size_t tagWindow = tagWindowOverride.value_or(kWholeChunkTagWindow ? processedIn : 1UZ);
 
         std::optional<property_map> cachedSettings;
         auto                        filterAndSubstitute = [&](const property_map& src) { return filterAndSubstituteTag(src, cachedSettings); };
@@ -1399,6 +1420,9 @@ public:
         auto publishFiltered = [&](std::ptrdiff_t relIndex, const property_map& tagMap) {
             auto forwarded = filterAndSubstitute(tagMap);
             if (!forwarded.empty()) {
+                if constexpr (unfilteredTagPropagation) {
+                    assert(relIndex >= 0 && "a chunk that retires every tag it forwards cannot be handed one back");
+                }
                 const auto offset = backwardTagPropagation ? 0UZ : static_cast<std::size_t>(std::max(std::ptrdiff_t(0), relIndex));
                 for_each_writer_span([&forwarded, offset](auto& out) { out.publishTag(forwarded, offset); }, outputSpans);
             }
@@ -1476,7 +1500,9 @@ public:
     /// apply settings from per-port input tags and update PortMetaInfo — no merge, no intermediate storage
     template<typename TInputSpans>
     void applyInputTagsFromPorts(TInputSpans& inputSpans, std::size_t untilLocalIndex = 1UZ) noexcept {
-        const std::size_t tagWindow = backwardTagPropagation ? untilLocalIndex : 1UZ;
+        // the window matches the one the span retires, or a tag retired without being read here would never reach
+        // settings at all; an interior tag's settings take effect from the chunk's first sample, not from its own
+        const std::size_t tagWindow = kWholeChunkTagWindow ? untilLocalIndex : 1UZ;
 
         for_each_reader_span(
             [this, tagWindow](auto& in) {
@@ -1550,12 +1576,12 @@ public:
                     if constexpr (std::remove_cvref_t<Port>::kIsInput) {
                         if constexpr (std::remove_cvref_t<Port>::kIsSynch) {
                             if constexpr (std::remove_cvref_t<Port>::isOptional()) { // handle unconnected Optional ports: request 0 samples (like async)
-                                return std::forward<Port>(port).template get<ProcessAll, !backwardTagPropagation>(port.isConnected() ? nSyncSamples : 0UZ);
+                                return std::forward<Port>(port).template get<ProcessAll, !kWholeChunkTagWindow>(port.isConnected() ? nSyncSamples : 0UZ);
                             } else {
-                                return std::forward<Port>(port).template get<ProcessAll, !backwardTagPropagation>(nSyncSamples);
+                                return std::forward<Port>(port).template get<ProcessAll, !kWholeChunkTagWindow>(nSyncSamples);
                             }
                         } else {
-                            return std::forward<Port>(port).template get<ProcessNone, !backwardTagPropagation>(port.streamReader().available());
+                            return std::forward<Port>(port).template get<ProcessNone, !kWholeChunkTagWindow>(port.streamReader().available());
                         }
                     } else if constexpr (std::remove_cvref_t<Port>::kIsOutput) {
                         if constexpr (std::remove_cvref_t<Port>::kIsSynch) {
@@ -2853,8 +2879,8 @@ namespace block {
 namespace detail {
 
 // The tag-policy clause enumerates the four policies that move or suppress a forwarded tag. T::unfilteredTagPropagation
-// is deliberately not among them: it governs the surviving key set, not the tag window, the offsets or the merge rule,
-// and fusedBeginChunk() runs the same filterAndSubstituteTag().
+// is deliberately not among them: it leaves a tag where it arrived, and the fused path reads the same whole-chunk tag
+// window and carries the same relative index a composed member's own work path would.
 template<typename T>
 using FusedValueTypeIn = typename traits::block::stream_input_port_types<T>::template at<0>;
 template<typename T>
@@ -2956,10 +2982,12 @@ FusedFront fusedFront(void* rawBlock, std::size_t requestedWork) {
 template<FusableStageBlock T>
 std::size_t fusedWithInput(void* rawBlock, std::size_t nSamples, FusedInputBody body, void* context) {
     T&   block  = *static_cast<T*>(rawBlock);
-    auto inSpan = inputPort<0, PortType::STREAM>(&block).template get<SpanReleasePolicy::ProcessAll, true>(nSamples);
+    auto inSpan = inputPort<0, PortType::STREAM>(&block).template get<SpanReleasePolicy::ProcessAll, !T::kWholeChunkTagWindow>(nSamples);
 
+    // the window and the retirement are the front member's own, so a run reads a chunk's tags exactly as that
+    // member's work path would read them
     FusedTagList inputTags;
-    for (const auto& [relIndex, tagMapRef] : inSpan.tags(1UZ)) {
+    for (const auto& [relIndex, tagMapRef] : inSpan.tags(T::kWholeChunkTagWindow ? nSamples : 1UZ)) {
         inputTags.emplace_back(relIndex, tagMapRef.get());
     }
 
@@ -2976,15 +3004,19 @@ std::size_t fusedWithOutput(void* rawBlock, std::size_t nSamples, const FusedTag
         outSpan.publish(0UZ);
         return 0UZ;
     }
+    // a run carries the relative index a tag arrived at, which is 0 for every policy that breaks its chunk at a tag
     for (const auto& tag : outputTags) {
-        outSpan.publishTag(tag.map, 0UZ);
+        outSpan.publishTag(tag.map, static_cast<std::size_t>(std::max(std::ptrdiff_t(0), tag.relIndex)));
     }
 
     const std::size_t produced = body(context, static_cast<void*>(outSpan.data()), nSamples);
     if constexpr (!HasConstProcessOneFunction<T>) {
         property_map pending;
         if (fusedTakePendingTag<T>(rawBlock, pending) && produced > 0UZ) {
-            outSpan.publishTag(std::move(pending), produced - 1UZ);
+            // a non-const stage may stop short of the chunk; the span's order check forbids a tag before one already placed
+            const std::size_t lastIndex = outSpan.tagsPublished > 0UZ ? outSpan.tags[outSpan.tagsPublished - 1UZ].index : 0UZ;
+            const std::size_t lastAt    = lastIndex > outSpan.streamIndex ? lastIndex - outSpan.streamIndex : 0UZ;
+            outSpan.publishTag(std::move(pending), std::max(produced - 1UZ, lastAt));
         }
     }
     if (produced == 0UZ) {
@@ -3019,11 +3051,12 @@ void fusedBeginChunk(void* rawBlock, bool isFront, const FusedTagList& incoming,
     for (const auto& tag : incoming) {
         property_map forwarded = block.filterAndSubstituteTag(tag.map, cachedSettings);
         if (!forwarded.empty()) {
-            outgoing.emplace_back(0, std::move(forwarded));
+            outgoing.emplace_back(std::max(std::ptrdiff_t(0), tag.relIndex), std::move(forwarded));
         }
     }
     if (!block._pendingForwardParams.empty()) {
-        outgoing.emplace_back(0, block._pendingForwardParams);
+        // at the head of the chunk, but never before a tag already in the list: the output span's order check forbids that
+        outgoing.emplace_back(outgoing.empty() ? 0 : outgoing.back().relIndex, block._pendingForwardParams);
         block._pendingForwardParams.clear();
     }
 

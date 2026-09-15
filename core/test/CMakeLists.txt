@@ -99,7 +99,8 @@ endif()
 # Each of these must fail to compile, with the guard's own diagnostic: a predicate that is true proves nothing about
 # whether the static_assert reads it. The targets are excluded from the default build, and the nested build they drive
 # shares one binary directory, so they may not run concurrently.
-set(_COMPILE_FAIL_TESTS cf_UnfilteredTagPropagation_resampling cf_UnfilteredTagPropagation_async)
+set(_COMPILE_FAIL_TESTS cf_UnfilteredTagPropagation_resampling cf_UnfilteredTagPropagation_async
+                        cf_UnfilteredTagPropagation_forwardtags_constrained)
 foreach(TEST_NAME IN LISTS _COMPILE_FAIL_TESTS)
   add_executable(${TEST_NAME} EXCLUDE_FROM_ALL compile_fail/${TEST_NAME}.cpp)
   target_include_directories(${TEST_NAME} PRIVATE ${CMAKE_BINARY_DIR}/include ${CMAKE_CURRENT_BINARY_DIR})
