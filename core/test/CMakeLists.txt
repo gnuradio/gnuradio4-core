@@ -48,6 +48,7 @@ set(_CORE_TESTS
     qa_SettingsConcurrency
     qa_SettingsTable
     qa_TagForwarding
+    qa_UnfilteredTagPropagation
     qa_Tensor
     qa_TensorMath
     qa_SVD
@@ -94,6 +95,27 @@ endforeach()
 if(NOT GR_ENABLE_BLOCK_REGISTRY)
   target_compile_definitions(qa_GraphEdit PRIVATE GR_TEST_WITHOUT_BLOCK_REGISTRY)
 endif()
+
+# Each of these must fail to compile, with the guard's own diagnostic: a predicate that is true proves nothing about
+# whether the static_assert reads it. The targets are excluded from the default build, and the nested build they drive
+# shares one binary directory, so they may not run concurrently.
+set(_COMPILE_FAIL_TESTS cf_UnfilteredTagPropagation_resampling cf_UnfilteredTagPropagation_async
+                        cf_UnfilteredTagPropagation_forwardtags_constrained)
+foreach(TEST_NAME IN LISTS _COMPILE_FAIL_TESTS)
+  add_executable(${TEST_NAME} EXCLUDE_FROM_ALL compile_fail/${TEST_NAME}.cpp)
+  target_include_directories(${TEST_NAME} PRIVATE ${CMAKE_BINARY_DIR}/include ${CMAKE_CURRENT_BINARY_DIR})
+  target_link_libraries(${TEST_NAME} PRIVATE gnuradio-options gnuradio-core)
+  add_test(NAME ${TEST_NAME} COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target ${TEST_NAME} --config
+                                     $<CONFIG>)
+endforeach()
+set_tests_properties(
+  ${_COMPILE_FAIL_TESTS}
+  PROPERTIES PASS_REGULAR_EXPRESSION
+             "UnfilteredTagPropagation is not available"
+             RESOURCE_LOCK
+             gr_core_build_tree
+             TIMEOUT
+             300)
 
 # regression tests for control-plane wedges: a failure shows up as a hang, so cap them
 set(_CORE_DEADLOCK_TESTS
