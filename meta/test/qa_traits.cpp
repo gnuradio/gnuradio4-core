@@ -7,8 +7,8 @@ namespace gr::meta {
 static_assert(!tuple_like<int>);
 static_assert(!tuple_like<std::tuple<>>);
 static_assert(tuple_like<std::tuple<int>>);
-static_assert(tuple_like<std::tuple<int &>>);
-static_assert(tuple_like<std::tuple<const int &>>);
+static_assert(tuple_like<std::tuple<int&>>);
+static_assert(tuple_like<std::tuple<const int&>>);
 static_assert(tuple_like<std::tuple<const int>>);
 static_assert(!tuple_like<std::array<int, 0>>);
 static_assert(tuple_like<std::array<int, 2>>);
@@ -31,20 +31,22 @@ static_assert(string_like<decltype(stringLiteral)>);
 static_assert(string_like<decltype(fixed_string("abc"))>);
 static_assert(!string_like<int>);
 
+static_assert(gr::arithmetic_or_complex_like<float>);
+static_assert(gr::arithmetic_or_complex_like<std::complex<double>>);
+static_assert(gr::arithmetic_sample_like<float>);
+static_assert(gr::arithmetic_sample_like<std::complex<double>>);
+static_assert(!gr::arithmetic_sample_like<std::vector<float>>);
+
 class MyClass {
 public:
-    void
-    nonConstFunc() {}
+    void nonConstFunc() {}
 
-    void
-    constFunc() const {}
+    void constFunc() const {}
 
-    void
-    constFunc2(int) const {}
+    void constFunc2(int) const {}
 };
 
-void
-test() {
+void test() {
     // do nothing
 }
 
@@ -67,6 +69,4 @@ static_assert(!IsNoexceptMemberFunction<decltype(&Test::constFuncNotNoexcept)>);
 
 } // namespace gr::meta
 
-int
-main() { /* tests are statically executed */
-}
+int main() { /* tests are statically executed */ }

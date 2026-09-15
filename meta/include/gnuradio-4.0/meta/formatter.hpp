@@ -10,7 +10,6 @@
 #include <utility>
 #include <vector>
 
-#include <gnuradio-4.0/meta/UncertainValue.hpp>
 #include <gnuradio-4.0/meta/reflection.hpp>
 #include <gnuradio-4.0/meta/utils.hpp>
 
@@ -141,32 +140,6 @@ struct std::formatter<std::complex<T>, char> {
     }
 };
 #endif
-
-// simplified formatter for UncertainValue
-template<gr::arithmetic_or_complex_like T>
-struct std::formatter<gr::UncertainValue<T>> {
-    formatter<T> value_formatter;
-
-    constexpr auto parse(format_parse_context& ctx) { return value_formatter.parse(ctx); }
-
-    template<typename FormatContext>
-    auto format(const gr::UncertainValue<T>& uv, FormatContext& ctx) const {
-        auto out = ctx.out();
-        out      = std::format_to(out, "(");
-        out      = value_formatter.format(uv.value, ctx);
-        out      = std::format_to(out, " ± ");
-        out      = value_formatter.format(uv.uncertainty, ctx);
-        out      = std::format_to(out, ")");
-        return out;
-    }
-};
-
-namespace gr {
-template<gr::UncertainValueLike T>
-std::ostream& operator<<(std::ostream& os, const T& v) {
-    return os << std::format("{}", v);
-}
-} // namespace gr
 
 // DataSet - Range formatter
 
