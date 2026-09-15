@@ -6,19 +6,21 @@
 #include <ranges>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/Scheduler.hpp>
 
 /**
- * @brief `UnfilteredTagPropagation` carries every tag key across a block, and changes nothing else about forwarding.
+ * @brief `UnfilteredTagPropagation` carries every tag key across a block, and leaves every tag at the offset it arrived at.
  *
  * The default forwarder keeps only the reserved keys of `gr::tag::kDefaultTags`, so a protocol carrying its own key
  * cannot cross a single stock block. These tests pin what the policy governs — every key survives, a key the block
- * declares as a setting is substituted with the block's own current value, and a key named after one of the settings
- * `Block<>` declares for every block is not — and what it leaves alone: the offsets, the retired window and the
- * fused-versus-unfused equivalence. The compile-time guard is pinned twice: as a predicate here, and as two
+ * declares as a setting is substituted with the block's own current value, a key named after one of the settings
+ * `Block<>` declares for every block is not, and a tag interior to a chunk keeps its offset where an input minimum
+ * forbids a boundary at it — and what it leaves alone: the multi-input dedup, the merge rule and the
+ * fused-versus-unfused equivalence. The compile-time guard is pinned twice: as a predicate here, and as three
  * translation units under `compile_fail/` that must not build.
  *
  * The blocks are defined here: gnuradio4-core carries no standard block library, so a core test may not depend on one.
@@ -29,6 +31,9 @@ namespace qa_unfiltered_tag_propagation {
 using namespace gr;
 
 inline constexpr std::size_t kSamples = 2048UZ;
+
+/// an input minimum above one forbids a chunk boundary at a tag closer than that to the chunk's start
+inline constexpr std::size_t kInputMinimum = 4UZ;
 
 inline constexpr std::string_view kReservedKey = "trigger_name"; ///< reserved: survives the default key filter
 inline constexpr std::string_view kCustomKey   = "record_id";    ///< neither reserved nor any block's setting
@@ -138,6 +143,46 @@ struct UnfilteredBulkRelay : Block<UnfilteredBulkRelay, UnfilteredTagPropagation
     }
 };
 
+/// an identity block whose trailing samples, and the tags among them, arrive through processEpilogue
+struct UnfilteredTailRelay : Block<UnfilteredTailRelay, UnfilteredTagPropagation> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(UnfilteredTailRelay, in, out);
+
+    std::size_t epilogueRuns = 0UZ;
+
+    work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
+        const std::size_t n = std::min(inSpan.size(), outSpan.size());
+        std::ranges::copy(inSpan | std::views::take(n), outSpan.begin());
+        std::ignore = inSpan.consume(n);
+        outSpan.publish(n);
+        return work::Status::OK;
+    }
+
+    work::Status processEpilogue(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
+        ++epilogueRuns;
+        const std::size_t n = std::min(inSpan.size(), outSpan.size());
+        std::ranges::copy(inSpan | std::views::take(n), outSpan.begin());
+        outSpan.publish(n);
+        return work::Status::OK;
+    }
+};
+
+/// an override constrained to the span tuples the work path passes, which a probe on empty tuples does not see
+struct ConstrainedForwarder : Block<ConstrainedForwarder> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(ConstrainedForwarder, in, out);
+
+    template<typename TInputSpans, typename TOutputSpans>
+    requires(std::tuple_size_v<TInputSpans> > 0UZ)
+    void forwardTags(TInputSpans&, TOutputSpans&, std::size_t) {}
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
+};
+
 /// caps both of its settings, so the value it forwards for a key it owns differs from the value the tag carried
 struct UnfilteredCap : Block<UnfilteredCap, UnfilteredTagPropagation> {
     PortIn<float>  in;
@@ -244,6 +289,8 @@ struct OwnForwarder : Block<OwnForwarder> {
     return tags | std::views::filter([key](const TagRecord& record) { return record.map.contains(key); }) | std::ranges::to<std::vector>();
 }
 
+[[nodiscard]] std::vector<std::size_t> indicesCarrying(const std::vector<TagRecord>& tags, std::string_view key) { return carrying(tags, key) | std::views::transform(&TagRecord::index) | std::ranges::to<std::vector>(); }
+
 [[nodiscard]] property_map protocolTag(std::string_view recordId) {
     property_map map;
     gr::tag::put(map, kReservedKey, std::string("trigger"));
@@ -301,6 +348,56 @@ template<typename... TMiddle>
     return std::addressof(sink);
 }
 
+// source -> one middle -> sink, with the input window that decides whether a chunk can break at a tag
+template<typename TMiddle>
+[[nodiscard]] Sink* buildWindowed(gr::Graph& flow, const std::vector<TagRecord>& tags, std::size_t nTotal, std::size_t minSamples, std::size_t maxSamples) {
+    using namespace boost::ut;
+
+    auto& source      = flow.emplaceBlock<Source>(gr::property_map{{"name", std::string("src")}});
+    source.tagsToEmit = tags;
+    source.nTotal     = nTotal;
+
+    auto& middle          = flow.emplaceBlock<TMiddle>(gr::property_map{{"name", std::string("mid")}});
+    middle.in.min_samples = minSamples;
+    middle.in.max_samples = maxSamples;
+
+    auto& sink = flow.emplaceBlock<Sink>(gr::property_map{{"name", std::string("snk")}});
+    expect(flow.connect<"out", "in">(source, middle).has_value());
+    expect(flow.connect<"out", "in">(middle, sink).has_value());
+    return std::addressof(sink);
+}
+
+// three composed members; only the front decides the chunk of a fused run, so only its window matters
+[[nodiscard]] Sink* buildComposedWindowed(gr::Graph& flow, const std::vector<TagRecord>& tags, std::size_t minSamples) {
+    using namespace boost::ut;
+
+    auto& source      = flow.emplaceBlock<Source>(gr::property_map{{"name", std::string("src")}});
+    source.tagsToEmit = tags;
+
+    auto& first          = flow.emplaceBlock<UnfilteredRelay>(gr::property_map{{"name", std::string("m0")}});
+    auto& second         = flow.emplaceBlock<UnfilteredRelay>(gr::property_map{{"name", std::string("m1")}});
+    auto& third          = flow.emplaceBlock<UnfilteredRelay>(gr::property_map{{"name", std::string("m2")}});
+    first.in.min_samples = minSamples;
+
+    auto&      sink = flow.emplaceBlock<Sink>(gr::property_map{{"name", std::string("snk")}});
+    const auto link = [&flow](auto& from, auto& to) { expect(flow.connect<"out", "in">(from, to).has_value()); };
+    link(source, first);
+    link(first, second);
+    link(second, third);
+    link(third, sink);
+    return std::addressof(sink);
+}
+
+void expectTagIndices(std::string_view scenario, const std::vector<TagRecord>& tags, const std::vector<std::size_t>& expected) {
+    using namespace boost::ut;
+
+    const std::vector<std::size_t> actual = indicesCarrying(tags, kCustomKey);
+    expect(eq(actual.size(), expected.size())) << std::format("{}: {} tags carrying {}, expected {}", scenario, actual.size(), kCustomKey, expected.size());
+    for (std::size_t i = 0UZ; i < std::min(actual.size(), expected.size()); ++i) {
+        expect(eq(actual[i], expected[i])) << std::format("{}: tag {} arrived at output index {}, expected {}", scenario, i, actual[i], expected[i]);
+    }
+}
+
 inline constexpr std::array kChunkSizes = {1UZ, 61UZ, 4096UZ};
 
 template<typename TBuild>
@@ -347,6 +444,8 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
     static_assert(!gr::block::kUnfilteredTagPropagationAdmissible<PolicyRelay<gr::BackwardTagPropagation>>);
     static_assert(!gr::block::kUnfilteredTagPropagationAdmissible<PolicyRelay<gr::MergeTagPropagation>>);
     static_assert(!gr::block::kUnfilteredTagPropagationAdmissible<OwnForwarder>);
+    static_assert(!gr::block::kUnfilteredTagPropagationAdmissible<ConstrainedForwarder>); // the probe passes the work path's own span tuples
+    static_assert(gr::block::kUnfilteredTagPropagationAdmissible<UnfilteredTailRelay>);
 
     "the default policy drops a custom key at the first block"_test = [] {
         const std::vector<TagRecord> tags{TagRecord{0UZ, protocolTag("r0")}, TagRecord{700UZ, protocolTag("r1")}};
@@ -493,6 +592,50 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
 
         const RunResult fused = runOnce([&tags](gr::Graph& flow) { return buildSeries<UnfilteredRelay, UnfilteredBulkRelay, UnfilteredRelay>(flow, tags); }, true, 61UZ);
         expect(eq(carrying(fused.tags, kCustomKey).size(), tags.size())) << "the custom key crosses a composed-to-bulk and a bulk-to-composed boundary";
+    };
+
+    "an interior tag keeps its offset where an input minimum forbids a chunk boundary at it"_test = [] {
+        constexpr std::size_t        kTotal = 64UZ;
+        constexpr std::size_t        kAt    = 1UZ; // closer to the chunk start than the input minimum, so no boundary can fall on it
+        const std::vector<TagRecord> tags{TagRecord{kAt, protocolTag("r0")}};
+
+        const auto windowed = [&tags](std::size_t minSamples) { return [&tags, minSamples](gr::Graph& flow) { return buildWindowed<UnfilteredBulkRelay>(flow, tags, kTotal, minSamples, 7UZ); }; };
+
+        expectTagIndices("input minimum of one", runOnce(windowed(1UZ), false, 0UZ).tags, {kAt});
+        expectTagIndices(std::format("input minimum of {}", kInputMinimum), runOnce(windowed(kInputMinimum), false, 0UZ).tags, {kAt});
+    };
+
+    "a fused chain lands an interior tag where the unfused one does"_test = [] {
+        const std::vector<TagRecord>   tags{TagRecord{1UZ, protocolTag("r0")}, TagRecord{701UZ, protocolTag("r1")}, TagRecord{702UZ, protocolTag("r2")}};
+        const std::vector<std::size_t> expected{1UZ, 701UZ, 702UZ}; // the first and the third are interior, the second falls on a boundary
+        const auto                     build = [&tags](gr::Graph& flow) { return buildComposedWindowed(flow, tags, kInputMinimum); };
+
+        const RunResult reference = runOnce(build, false, 0UZ);
+        expectTagIndices("composed chain, unfused", reference.tags, expected);
+
+        for (const std::size_t chunk : kChunkSizes) {
+            const RunResult   fused = runOnce(build, true, chunk);
+            const std::string what  = std::format("composed chain, fused chunk={}", chunk);
+
+            expect(eq(fused.runSizes.size(), 1UZ)) << what;
+            if (!fused.runSizes.empty()) {
+                expect(eq(fused.runSizes[0], 3UZ)) << what;
+            }
+            expectTagIndices(what, fused.tags, expected);
+            const bool sameTags = carrying(fused.tags, kCustomKey) == carrying(reference.tags, kCustomKey);
+            expect(sameTags) << what << "tag for tag against the unfused chain";
+            if (chunk >= kInputMinimum) { // a run chunk below the front's input minimum leaves the stream's last samples, fewer than that minimum, unprocessed
+                expect(std::ranges::equal(fused.samples, reference.samples)) << std::format("{}: {} samples reached the sink, {} unfused", what, fused.samples.size(), reference.samples.size());
+            }
+        }
+    };
+
+    "a tag interior to the stream's last chunk still leaves, and the trailing window keeps its offsets"_test = [] {
+        constexpr std::size_t        kTotal = 10UZ; // seven samples, then a three-sample tail below the input minimum
+        const std::vector<TagRecord> tags{TagRecord{3UZ, protocolTag("r0")}, TagRecord{8UZ, protocolTag("r1")}};
+
+        const RunResult result = runOnce([&tags](gr::Graph& flow) { return buildWindowed<UnfilteredTailRelay>(flow, tags, kTotal, kInputMinimum, 7UZ); }, false, 0UZ);
+        expectTagIndices("stream tail", result.tags, {3UZ, 8UZ});
     };
 
     "tags denser than one chunk all keep their custom keys"_test = [] {
