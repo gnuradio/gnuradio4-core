@@ -2,6 +2,7 @@
 #define GNURADIO_FUSED_RUN_HPP
 
 #include <bit>
+#include <cassert>
 #include <numeric>
 #include <unordered_map>
 #include <unordered_set>
@@ -98,7 +99,14 @@ namespace detail {
             continue;
         }
         std::size_t n = 1UZ; // a non-pure processOne ends the segment: an early break would leave earlier members over-advanced
-        while (members[i + n - 1UZ]->fusedStage()->isPure && i + n < members.size() && members[i + n]->fusedStage() != nullptr) {
+        // the stage of members[i + n - 1], carried forward rather than taken from the member again
+        const block::FusedStage* last = fused;
+        while (last->isPure && i + n < members.size()) {
+            const block::FusedStage* next = members[i + n]->fusedStage();
+            if (next == nullptr) {
+                break;
+            }
+            last = next;
             ++n;
         }
         stages.push_back(Stage{i, n, true, gr::Ratio{1, 1}, 0UZ});
@@ -131,14 +139,24 @@ namespace detail {
     return true;
 }
 
+// A member of a plan carries one of the two stage records, because stageKindOf admits no other kind of block into
+// one. The two callers of these divide by what they return, so the value is never zero.
 [[nodiscard]] inline std::size_t valueSizeOut(const std::shared_ptr<BlockModel>& member) {
-    const block::FusedStage* fused = member->fusedStage();
-    return fused != nullptr ? fused->valueSizeOut : member->bulkStage()->valueSizeOut;
+    if (const block::FusedStage* fused = member->fusedStage(); fused != nullptr) {
+        return fused->valueSizeOut;
+    }
+    const block::BulkStage* bulk = member->bulkStage();
+    assert(bulk != nullptr);
+    return bulk != nullptr ? bulk->valueSizeOut : 1UZ;
 }
 
 [[nodiscard]] inline std::size_t valueSizeIn(const std::shared_ptr<BlockModel>& member) {
-    const block::FusedStage* fused = member->fusedStage();
-    return fused != nullptr ? fused->valueSizeIn : member->bulkStage()->valueSizeIn;
+    if (const block::FusedStage* fused = member->fusedStage(); fused != nullptr) {
+        return fused->valueSizeIn;
+    }
+    const block::BulkStage* bulk = member->bulkStage();
+    assert(bulk != nullptr);
+    return bulk != nullptr ? bulk->valueSizeIn : 1UZ;
 }
 
 } // namespace detail
@@ -149,8 +167,9 @@ namespace detail {
         std::size_t maxValueSize = 0UZ; // only a composed segment uses scratch, so only its members size it
         for (const Stage& stage : plan.stages) {
             for (std::size_t k = 0UZ; stage.isComposed && k < stage.nMembers; ++k) {
-                const block::FusedStage* fused = plan.members[stage.firstMember + k]->fusedStage();
-                maxValueSize                   = std::max({maxValueSize, fused->valueSizeIn, fused->valueSizeOut});
+                if (const block::FusedStage* fused = plan.members[stage.firstMember + k]->fusedStage(); fused != nullptr) {
+                    maxValueSize = std::max({maxValueSize, fused->valueSizeIn, fused->valueSizeOut});
+                }
             }
         }
         // the run's input window plus the two scratch buffers; the output window is written streaming
