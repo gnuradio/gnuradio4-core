@@ -1,0 +1,12 @@
+# The graph the runner test runs: a source and a sink from core's own test plugins, with nothing between them.
+# Neither block asks to stop, so a run of this graph ends on the --seconds bound or on a signal, which is what the
+# test needs of it.
+blocks:
+  - id: good::fixed_source<float32>
+    parameters:
+      name: source
+  - id: good::cout_sink<float32>
+    parameters:
+      name: sink
+connections:
+  - [source, out, sink, in]
