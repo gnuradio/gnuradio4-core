@@ -212,6 +212,7 @@ option(THREAD_SANITIZER "Enable thread sanitizer" OFF)
 option(ENABLE_TBB "Enable the TBB dependency for std::execution::par in gcc" OFF)
 option(ENABLE_EXAMPLES "Enable Example Builds" ${GR_TOPLEVEL_PROJECT})
 option(ENABLE_TESTING "Enable Test Builds" ${GR_TOPLEVEL_PROJECT})
+option(ENABLE_TOOLS "Enable the command-line tools" ON)
 option(MIT_ONLY "Exclude modules with non-MIT/Apache-compatible licences" OFF)
 option(GR_USE_FETCHCONTENT_DEPS "Allow CMake to download selected third-party dependencies with FetchContent" OFF)
 
@@ -643,6 +644,12 @@ add_subdirectory(bench) # custom ut addon for microbenchmarking
 add_subdirectory(core)
 add_subdirectory(meta)
 
+# after core, because the tool's test is built over core's own test plugins. It is a command-line program, which a
+# browser runtime has no way to invoke, so a WASM build leaves it out.
+if(ENABLE_TOOLS AND NOT EMSCRIPTEN)
+  add_subdirectory(tools)
+endif()
+
 if(ENABLE_TESTING
    AND (UNIX
         OR APPLE
@@ -773,6 +780,7 @@ message(STATUS "THREAD_SANITIZER             : ${THREAD_SANITIZER}")
 message(STATUS "ENABLE_TBB                   : ${ENABLE_TBB}")
 message(STATUS "ENABLE_EXAMPLES              : ${ENABLE_EXAMPLES}")
 message(STATUS "ENABLE_TESTING               : ${ENABLE_TESTING}")
+message(STATUS "ENABLE_TOOLS                 : ${ENABLE_TOOLS}")
 message(STATUS "ENABLE_COVERAGE              : ${ENABLE_COVERAGE}")
 message(STATUS "GR_MAX_WASM_THREAD_COUNT     : ${GR_MAX_WASM_THREAD_COUNT}")
 message(STATUS "------------------------------------------------")
