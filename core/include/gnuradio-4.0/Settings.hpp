@@ -897,6 +897,9 @@ protected:
     [[nodiscard]] std::optional<std::string>           contextInTag(const Tag& tag) const;
     [[nodiscard]] std::optional<std::uint64_t>         triggeredTimeInTag(const Tag& tag) const;
     [[nodiscard]] std::optional<SettingsCtx>           createSettingsCtxFromTag(const Tag& tag) const;
+
+private:
+    void resetDefaultsImpl(std::unique_lock<std::mutex>* reentrantLock);
 }; // class CtxSettingsBase
 
 /**

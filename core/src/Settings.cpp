@@ -626,11 +626,25 @@ property_map CtxSettingsBase::setStagedImpl(const property_map& parameters) {
 void CtxSettingsBase::storeDefaults() { storeCurrentParameters(_defaultParameters); }
 
 void CtxSettingsBase::resetDefaults() {
-    std::lock_guard lg(_mutex);
-    resetDefaultsImpl();
+    std::unique_lock lock(_mutex);
+    resetDefaultsImpl(&lock);
 }
 
 void CtxSettingsBase::resetDefaultsImpl() {
+    std::unique_lock lock(_mutex, std::adopt_lock);
+    try {
+        resetDefaultsImpl(&lock);
+    } catch (...) {
+        if (!lock.owns_lock()) {
+            lock.lock();
+        }
+        std::ignore = lock.release();
+        throw;
+    }
+    std::ignore = lock.release();
+}
+
+void CtxSettingsBase::resetDefaultsImpl(std::unique_lock<std::mutex>* reentrantLock) {
     // add default parameters to stored and apply the parameters
     auto ctx = SettingsCtx{settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), std::string()};
 #ifdef __EMSCRIPTEN__
@@ -638,12 +652,18 @@ void CtxSettingsBase::resetDefaultsImpl() {
 #endif
     addStoredParameters(_defaultParameters, ctx);
     std::ignore = activateContextImpl({});
-    std::ignore = applyStagedParametersImpl();
+    std::ignore = applyStagedParametersImpl(reentrantLock);
 
     removeExpiredStoredParameters();
 
     if (_descriptor->hooks.reset != nullptr) {
+        if (reentrantLock != nullptr) {
+            reentrantLock->unlock();
+        }
         _descriptor->hooks.reset(_block);
+        if (reentrantLock != nullptr) {
+            reentrantLock->lock();
+        }
     }
 }
 
@@ -721,7 +741,7 @@ ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::uniq
 
         // check if reset of settings should be performed
         if (batch.contains(static_cast<std::pmr::string>(gr::tag::RESET_DEFAULTS))) {
-            resetDefaultsImpl();
+            resetDefaultsImpl(reentrantLock);
         }
 
         property_map staged;
@@ -786,7 +806,13 @@ ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::uniq
         }
 
         if (hooks.reset != nullptr && batch.contains(static_cast<std::pmr::string>(gr::tag::RESET_DEFAULTS))) {
+            if (reentrantLock != nullptr) {
+                reentrantLock->unlock();
+            }
             hooks.reset(_block);
+            if (reentrantLock != nullptr) {
+                reentrantLock->lock();
+            }
         }
     } else {
         _stagedParameters.clear(); // a block with no reflectable members cannot apply these
