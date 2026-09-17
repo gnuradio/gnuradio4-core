@@ -31,6 +31,7 @@ if(TARGET grinfo)
       qa_GrInfo
       GoodBasePlugin
       good_math_plugin
+      good_conversion_plugin
       bad_plugin
       block_library
       block_library_second)
