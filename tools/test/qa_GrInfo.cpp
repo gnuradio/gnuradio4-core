@@ -1,6 +1,8 @@
 #include <boost/ut.hpp>
 
+#include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdio>
 #include <format>
 #include <string>
@@ -17,7 +19,8 @@
  * The tool's contract is its exit status and what it prints, and neither is visible from inside the process, so
  * every case here runs the built executable over core's own test plugins and test block libraries: the framework
  * report, the block listing, one block in detail, a name nothing is registered under, and a command line that
- * cannot be used.
+ * cannot be used. The shape of the report is part of that contract - no line wider than a terminal, one entry per
+ * block however many instantiations it has, and a JSON document that carries no null - so each is pinned here too.
  */
 namespace qa_grinfo {
 
@@ -97,6 +100,31 @@ struct Result {
     return opened && depth == 0UZ && !inString;
 }
 
+// the report is written for a terminal, so this is the number every one of its lines has to stay under
+constexpr std::size_t kWidth = 80UZ;
+
+[[nodiscard]] std::size_t widestLine(std::string_view text) {
+    std::size_t widest = 0UZ;
+    for (std::size_t start = 0UZ; start <= text.size();) {
+        const std::size_t end = std::min(text.find('\n', start), text.size());
+        widest                = std::max(widest, end - start);
+        start                 = end + 1UZ;
+    }
+    return widest;
+}
+
+[[nodiscard]] std::size_t occurrences(std::string_view text, std::string_view needle) {
+    std::size_t found = 0UZ;
+    for (std::size_t at = text.find(needle); at != std::string_view::npos; at = text.find(needle, at + needle.size())) {
+        ++found;
+    }
+    return found;
+}
+
+// what a reader sees of a path the report had to cut: the tool keeps a path's tail, which is what tells one
+// directory from another
+[[nodiscard]] std::string_view tailOf(std::string_view path, std::size_t count) { return path.size() <= count ? path : path.substr(path.size() - count); }
+
 #ifdef GR_TOOLS_CORE_TEST_PLUGINS
 // the two directories core's own tests build: one of plugins, one of shared objects that register blocks without
 // being plugins
@@ -151,23 +179,33 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
     "version names the directories searched and what they held"_test = [] {
         const Result version = run(overTestDirectories({"version"}));
         expect(eq(version.exitCode, 0)) << version.output;
-        expect(version.output.contains(GR_TOOLS_CORE_TEST_PLUGINS)) << "the directory it was given" << version.output;
-        expect(version.output.contains(GR_TOOLS_TEST_BLOCK_LIBRARY)) << "the directory it was given" << version.output;
-        expect(version.output.contains("block library")) << "a shared object that registers without being a plugin" << version.output;
+        expect(version.output.contains(tailOf(GR_TOOLS_CORE_TEST_PLUGINS, 30UZ))) << "the directory it was given" << version.output;
+        expect(version.output.contains(tailOf(GR_TOOLS_TEST_BLOCK_LIBRARY, 30UZ))) << "the directory it was given" << version.output;
+        expect(version.output.contains("block-library")) << "a shared object that registers without being a plugin" << version.output;
         expect(version.output.contains("block_library")) << "and the file it is" << version.output;
-        expect(version.output.contains("not loaded")) << "the plugin whose ABI version does not match" << version.output;
+        expect(version.output.contains("not-loaded")) << "the plugin whose ABI version does not match" << version.output;
         expect(version.output.contains("Good Math Plugin")) << "a plugin that did load" << version.output;
         expect(version.output.contains("block keys")) << version.output;
+    };
+
+    "a library is listed by its own name under the directory that held it"_test = [] {
+        const Result version = run(overTestDirectories({"version"}));
+        expect(eq(version.exitCode, 0)) << version.output;
+        expect(version.output.contains("\n    libblock_library.so")) << "the file by its name alone, indented under its directory" << version.output;
+        expect(eq(occurrences(version.output, GR_TOOLS_TEST_BLOCK_LIBRARY "/libblock_library.so"), 0UZ)) << "and not by a path repeated on every line" << version.output;
     };
 
     "version --json is one document carrying the shape a reader relies on"_test = [] {
         const Result version = run(overTestDirectories({"version", "--json"}));
         expect(eq(version.exitCode, 0)) << version.output;
         expect(isOneJsonDocument(version.output)) << version.output;
-        expect(version.output.contains("\"schema\": 1")) << version.output;
+        expect(version.output.contains("\"schema\": 2")) << version.output;
         for (const std::string_view key : {"\"framework\"", "\"directories\"", "\"libraries\"", "\"plugins\"", "\"schedulers\"", "\"totals\"", "\"blockKeys\""}) {
             expect(version.output.contains(key)) << key << version.output;
         }
+        expect(version.output.contains(GR_TOOLS_CORE_TEST_PLUGINS)) << "a path the text report cut is whole here" << version.output;
+        expect(version.output.contains("\"origin\": \"option\"")) << "the directory came from the command line" << version.output;
+        expect(version.output.contains("\"kind\": \"block-library\"")) << "the kinds are an enumeration" << version.output;
     };
 
     "blocks lists a block under the file that registered it and under its family"_test = [] {
@@ -185,7 +223,7 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         const Result blocks = run(overTestDirectories({"blocks", "--json"}));
         expect(eq(blocks.exitCode, 0)) << blocks.output;
         expect(isOneJsonDocument(blocks.output)) << blocks.output;
-        expect(blocks.output.contains("\"schema\": 1")) << blocks.output;
+        expect(blocks.output.contains("\"schema\": 2")) << blocks.output;
         for (const std::string_view key : {"\"libraries\"", "\"families\"", "\"instantiations\"", "\"LibraryDoubler\""}) {
             expect(blocks.output.contains(key)) << key << blocks.output;
         }
@@ -204,16 +242,66 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         expect(block.output.contains("doubles its input")) << "the description the block declares" << block.output;
     };
 
+    "the settings the framework declares on every block are behind an option"_test = [] {
+        const Result block = run(overTestDirectories({"block", "LibraryDoubler"}));
+        expect(eq(block.exitCode, 0)) << block.output;
+        expect(!block.output.contains("unique_name")) << "a framework setting is not in the block's own table" << block.output;
+        expect(block.output.contains("--all-settings")) << "and the report says where it is" << block.output;
+
+        const Result all = run(overTestDirectories({"block", "LibraryDoubler", "--all-settings"}));
+        expect(eq(all.exitCode, 0)) << all.output;
+        expect(all.output.contains("unique_name")) << all.output;
+        expect(all.output.contains("extra_gain")) << "the block's own settings are still there" << all.output;
+    };
+
+    "a block of several instantiations is one entry written in its type parameters"_test = [] {
+        const Result block = run(overTestDirectories({"block", "convert"}));
+        expect(eq(block.exitCode, 0)) << block.output;
+        expect(block.output.contains("good::convert<T1, T2>")) << "named by its parameters" << block.output;
+        expect(block.output.contains("<float64, float32>")) << "which are listed once" << block.output;
+        expect(block.output.contains("<float32, float64>")) << block.output;
+        expect(eq(occurrences(block.output, "direction"), 1UZ)) << "one port table for every instantiation" << block.output;
+        expect(block.output.contains("T1")) << "the input port carries the first parameter" << block.output;
+        expect(block.output.contains("T2")) << "and the output port the second" << block.output;
+    };
+
     "block --json carries the settings with their defaults typed"_test = [] {
         const Result block = run(overTestDirectories({"block", "LibraryDoubler", "--json"}));
         expect(eq(block.exitCode, 0)) << block.output;
         expect(isOneJsonDocument(block.output)) << block.output;
         expect(block.output.contains("\"command\": \"block\"")) << block.output;
+        expect(block.output.contains("\"query\": \"LibraryDoubler\"")) << block.output;
         expect(block.output.contains("\"name\": \"extra_gain\"")) << block.output;
         expect(block.output.contains("\"default\": 1")) << "a number is a number, not a string" << block.output;
         expect(block.output.contains("\"unit\": \"dB\"")) << block.output;
+        expect(block.output.contains("\"framework\": false")) << "a setting of the block's own" << block.output;
+        expect(!block.output.contains(": null")) << "a field the framework holds nothing in is left out" << block.output;
+    };
+
+    "block --json keys every instantiation in full, which the text report does not"_test = [] {
+        const Result block = run(overTestDirectories({"block", "convert", "--json"}));
+        expect(eq(block.exitCode, 0)) << block.output;
+        expect(isOneJsonDocument(block.output)) << block.output;
+        expect(block.output.contains("\"key\": \"good::convert<float64, float32>\"")) << block.output;
+        expect(block.output.contains("\"key\": \"good::convert<float32, float64>\"")) << block.output;
+        expect(block.output.contains("\"parameters\": [")) << "split into one entry per parameter" << block.output;
+        expect(eq(occurrences(block.output, "\"dataType\": \"float64\""), 2UZ)) << "the concrete type of each port of each key" << block.output;
+    };
+
+    "no line of any report is wider than a terminal"_test = [] {
+        for (const std::vector<std::string>& arguments : {std::vector<std::string>{"version"}, {"blocks"}, {"blocks", "--verbose"}, {"block", "convert"}, {"block", "LibraryDoubler", "--all-settings"}}) {
+            const Result report = run(overTestDirectories(arguments));
+            expect(eq(report.exitCode, 0)) << report.output;
+            expect(le(widestLine(report.output), kWidth)) << arguments.front() << report.output;
+        }
     };
 #endif
+
+    "--help is no wider than a terminal either"_test = [] {
+        const Result help = run({"--help"});
+        expect(eq(help.exitCode, 0)) << help.output;
+        expect(le(widestLine(help.output), kWidth)) << help.output;
+    };
 
     "a name nothing is registered under is refused"_test = [] {
         const Result missing = run({"block", "NoSuchBlockIsRegistered"});
