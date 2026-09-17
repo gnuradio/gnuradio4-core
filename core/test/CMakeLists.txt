@@ -158,6 +158,8 @@ endif()
 if(GR_ENABLE_BLOCK_REGISTRY AND INTERNAL_ENABLE_BLOCK_PLUGINS)
   add_subdirectory(plugins)
 
+  add_dependencies(qa_GraphEdit GoodBasePlugin)
+
   add_dependencies(
     qa_SubGraphAssets
     GoodBasePlugin

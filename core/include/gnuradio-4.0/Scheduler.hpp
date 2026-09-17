@@ -1878,49 +1878,8 @@ protected:
 
     std::optional<Message> propertyCallbackReplaceBlock([[maybe_unused]] std::string_view propertyName, Message message) {
         assert(propertyName == scheduler::property::kReplaceBlock);
-        using namespace std::string_literals;
-        const auto& messageData = message.data.value();
-        const auto  uniqueName  = messageData.at("uniqueName").value_or(std::string_view{});
-        const auto  type        = messageData.at("type").value_or(std::string_view{});
-        if (uniqueName.empty() || type.empty()) {
-            message.data = std::unexpected(Error{std::format("No uniqueName or type in the message {}", message)});
-            return message;
-        }
-        const property_map& properties = [&] {
-            if (auto it = messageData.find("properties"); it != messageData.end()) {
-                auto* result = it->second.get_if<property_map>();
-                if (result == nullptr) {
-                    return property_map{};
-                } else {
-                    return *result;
-                }
-            } else {
-                return property_map{};
-            }
-        }();
-
-        auto* targetGraph = findTargetSubGraph(messageData);
-
-        if (targetGraph == nullptr) {
-            message.data = std::unexpected(Error{std::format("No target graph for the message {}", message)});
-            return message;
-        }
-
-        auto [oldBlock, newBlockRaw] = [&] {
-            WorkQuiescenceGuard quiescence(this); // _blocks is traversed by every worker and by forEachBlock
-            dissolveFusedRuns();
-            return targetGraph->replaceBlock(uniqueName, type, properties);
-        }();
-        makeZombie(std::move(oldBlock));
-
-        std::optional<Message> result = gr::Message{};
-        result->endpoint              = scheduler::property::kBlockReplaced;
-        result->data                  = serializeBlock(gr::globalPluginLoader(), newBlockRaw, BlockSerializationFlags::All);
-
-        (*result->data)["_targetGraph"]            = targetGraph->unique_name.value();
-        (*result->data)["replacedBlockUniqueName"] = uniqueName;
-
-        return result;
+        message.data = std::unexpected(Error{"Scheduler block replacement is disabled in this release. Graph replacement is supported only outside scheduler execution with exclusive ownership and quiescent ports."});
+        return message;
     }
 };
 

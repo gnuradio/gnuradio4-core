@@ -34,31 +34,123 @@ std::pair<std::shared_ptr<BlockModel>, std::shared_ptr<BlockModel>> Graph::repla
     if (found == _blocks.end()) {
         throw gr::exception(std::format("Block {} was not found in {}", uniqueName, this->unique_name));
     }
-    // addBlock() may reallocate _blocks, so keep an index rather than the iterator
-    const auto                        oldIndex = static_cast<std::size_t>(std::ranges::distance(_blocks.begin(), found));
-    const std::shared_ptr<BlockModel> replaced = _blocks[oldIndex];
-
-    auto newBlock = _pluginLoader->instantiate(type, properties);
+    // Exported aliases live on the enclosing wrapper, outside this graph's edge list.
+    // Replacing their owner requires an explicit unexport first.
+    for (const auto key : {"exportedInputPorts", "exportedOutputPorts"}) {
+        if (auto it = meta_information.value.find(key); it != meta_information.value.end()) {
+            if (const auto* exports = it->second.get_if<property_map>(); exports && exports->contains(std::pmr::string(uniqueName))) {
+                throw gr::exception(std::format("Cannot replace block {} while its ports are exported", uniqueName));
+            }
+        }
+    }
+    const std::shared_ptr<BlockModel> replaced = *found;
+    auto                              newBlock = _pluginLoader->instantiate(type, properties);
     if (!newBlock) {
         throw gr::exception(std::format("Can not create block {}", type));
     }
+    // Initialise before looking up ports: settings can determine a collection's size.
+    newBlock->init(_progress, this->compute_domain);
+    if (auto error = newBlock->initError()) {
+        throw gr::exception(error->message);
+    }
 
-    addBlock(newBlock);
-
-    for (auto& edge : _edges) {
-        if (edge._sourceBlock == replaced) {
-            edge._sourceBlock = newBlock;
+    struct ReplacementEdge {
+        std::size_t index;
+        Edge        replacement;
+    };
+    std::vector<ReplacementEdge>                       changes;
+    std::vector<std::pair<DynamicPort*, DynamicPort*>> bindings;
+    auto                                               validateBinding = [&](DynamicPort* before, DynamicPort* after) {
+        if (before->domain() != after->domain() || before->bufferSize() < after->min_samples) {
+            throw gr::exception("Replacement port cannot use the existing buffer domain or capacity");
         }
-
+        for (const auto& [oldPort, newPort] : bindings) {
+            if ((oldPort == before) != (newPort == after)) {
+                throw gr::exception("Replacement port definitions do not preserve distinct endpoints");
+            }
+        }
+        if (std::ranges::find(bindings, std::pair{before, after}) == bindings.end()) {
+            bindings.emplace_back(before, after);
+        }
+    };
+    for (std::size_t i = 0UZ; i < _edges.size(); ++i) {
+        const Edge& edge = _edges[i];
+        if (edge._sourceBlock != replaced && edge._destinationBlock != replaced) {
+            continue;
+        }
+        Edge next = edge;
+        if (next._sourceBlock == replaced) {
+            next._sourceBlock = newBlock;
+        }
+        if (next._destinationBlock == replaced) {
+            next._destinationBlock = newBlock;
+        }
+        auto source      = next._sourceBlock->dynamicOutputPort(next._sourcePortDefinition);
+        auto destination = next._destinationBlock->dynamicInputPort(next._destinationPortDefinition);
+        if (!source || !destination) {
+            throw gr::exception((!source ? source.error() : destination.error()).message);
+        }
+        if ((*source)->typeName() != (*destination)->typeName() || port::decodePortType((*source)->portMaskInfo()) != port::decodePortType((*destination)->portMaskInfo()) || port::decodeDirection((*source)->portMaskInfo()) != PortDirection::OUTPUT || port::decodeDirection((*destination)->portMaskInfo()) != PortDirection::INPUT) {
+            throw gr::exception(std::format("Incompatible replacement ports for edge {}", edge));
+        }
+        auto oldSource      = edge._sourceBlock->dynamicOutputPort(edge._sourcePortDefinition);
+        auto oldDestination = edge._destinationBlock->dynamicInputPort(edge._destinationPortDefinition);
+        if (!oldSource || !oldDestination) {
+            throw gr::exception((!oldSource ? oldSource.error() : oldDestination.error()).message);
+        }
+        // Mixed name/index definitions must neither merge distinct ports nor split a fan-out.
+        if (edge._sourceBlock == replaced) {
+            validateBinding(*oldSource, *source);
+        }
         if (edge._destinationBlock == replaced) {
-            edge._destinationBlock = newBlock;
+            validateBinding(*oldDestination, *destination);
+        }
+        // Connectivity belongs to this edge, not to either port independently. A pending
+        // edge can name an output and input that are each connected to different peers.
+        // emplaceEdge() records Connected after its specific connect() succeeds.
+        const bool connected  = edge.state() == Edge::EdgeState::Connected;
+        next._sourcePort      = *source;
+        next._destinationPort = *destination;
+        next._state           = connected ? Edge::EdgeState::Connected : Edge::EdgeState::WaitingToBeConnected;
+        if (connected) {
+            next._actualBufferSize = (*oldSource)->bufferSize();
+            next._edgeType         = port::decodePortType((*source)->portMaskInfo());
+        }
+        changes.push_back({i, std::move(next)});
+    }
+
+    // Transfer the actual registrations, rings and sample/tag cursors. Reconnecting via
+    // new_reader() would attach at the publish cursor and discard pending data and EOS.
+    // In particular downstream fan-out readers must retain their independent positions.
+    std::vector<std::function<void()>> exchanges;
+    exchanges.reserve(bindings.size());
+    for (auto [before, after] : bindings) {
+        exchanges.push_back(before->prepareBufferExchange(*after));
+    }
+    for (auto& exchange : exchanges) {
+        exchange();
+    }
+    try {
+        if (auto result = resizeOptionalOutputs(newBlock); !result) {
+            throw gr::exception(result.error().message);
+        }
+    } catch (...) {
+        // No reader is recreated: reversing the exchange restores exact unread history.
+        for (auto& exchange : exchanges) {
+            exchange();
+        }
+        throw;
+    }
+    for (auto& change : changes) {
+        Edge& edge = _edges[change.index];
+        edge       = std::move(change.replacement);
+        if (!edge._domainStr.empty()) {
+            edge._domain = ComputeDomain::parse(edge._domainStr);
         }
     }
 
-    std::shared_ptr<BlockModel> oldBlock = replaced;
-    _blocks.erase(_blocks.begin() + static_cast<std::ptrdiff_t>(oldIndex));
-
-    return {std::move(oldBlock), newBlock};
+    *found = newBlock;
+    return {replaced, newBlock};
 }
 
 std::optional<Message> Graph::propertyCallbackRegistryBlockTypes([[maybe_unused]] std::string_view propertyName, Message message) {
