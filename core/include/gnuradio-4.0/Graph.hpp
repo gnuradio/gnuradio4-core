@@ -106,8 +106,9 @@ inline static constexpr std::int32_t defaultWeight   = 0;
 inline static const std::string      defaultEdgeName = "unnamed edge"; // Emscripten doesn't want constexpr strings
 
 inline constexpr double      kDefaultEdgeBufferSeconds = 0.05;
-inline constexpr std::size_t kMinEdgeBufferSize        = 1UZ << 15;
+inline constexpr std::size_t kMinEdgeBufferSize        = 1UZ << 12; // see edgeBufferSizeFor()
 inline constexpr std::size_t kMaxEdgeBufferSize        = 1UZ << 22;
+static_assert(kMinEdgeBufferSize == PortOut<float>::kDefaultBufferSize, "the edge-duration floor is the default size of a port's buffer");
 
 /**
  * @brief Samples an edge carrying @p sampleRate should hold to buffer @p seconds of stream.
@@ -115,7 +116,20 @@ inline constexpr std::size_t kMaxEdgeBufferSize        = 1UZ << 22;
  * defaultMinBufferSize()'s fixed 65536 samples is 27 ms at 2.4 MS/s and under 3 ms at 24 MS/s, so a
  * ring long enough to ride out the scheduler's wake-up jitter at one rate is short at a higher one.
  * Here the duration is fixed and the count follows the rate, rounded up to a power of two and clamped
- * at both ends against single-chunk rings at very low rates and needless latency at very high ones.
+ * at both ends.
+ *
+ * The floor matters when a block at either end of the edge declares a chunk size. A block that declares no chunk size
+ * needs one sample of room to make progress. For a block that declares a chunk, computeSampleLimits() caps the call at
+ * the room left in the output ring. computeResampling() then yields zero chunks while that room is under one
+ * output_chunk_size. The work call consumes and publishes nothing, and the scheduler spins. A ring of exactly one chunk
+ * runs but drains completely between calls. Two chunks is the smallest depth that lets one chunk be written while the
+ * other is read. kMinEdgeBufferSize holds two chunks of up to 2048 samples. It equals Port.hpp's kDefaultBufferSize. A
+ * rate-derived edge is never shallower than a port of the default size. A smaller floor saves little memory:
+ * CircularBuffer rounds a double-mapped ring up to a whole page of elements, 1024 float or 512 complex<float> on a
+ * 4 KiB page.
+ *
+ * A consumer that takes more than half the ring in one call, such as a transform over a whole window or a resampler
+ * with a long polyphase step, needs an edge size set by the caller. No rate implies that size.
  */
 [[nodiscard]] inline constexpr std::size_t edgeBufferSizeFor(double sampleRate, double seconds = kDefaultEdgeBufferSeconds) noexcept {
     const double      wanted = sampleRate > 0.0 && seconds > 0.0 ? sampleRate * seconds : 0.0;
