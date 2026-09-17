@@ -1900,6 +1900,11 @@ public:
         }
     }
 
+    // What a port that is not a collection contributes to the temporary tuple below. refToSpan() hands the
+    // callee the port's own span for those, so a span built here would only be constructed and destroyed
+    // again; the spans are copy-only, so each such copy is a full copy of the span and of its tag span.
+    struct NoSpanTemporary {};
+
     template<typename Fn, typename TIn, typename TOut>
     gr::work::Status invokeBulkDispatch(Fn&& fn, TIn& inputReaderTuple, TOut& outputReaderTuple) {
         auto tempInputSpanStorage = std::apply(
@@ -1908,7 +1913,7 @@ public:
                     if constexpr (gr::meta::array_or_vector_type<PortReader>) {
                         return std::span{a.data(), a.size()};
                     } else {
-                        return std::move(a);
+                        return NoSpanTemporary{};
                     }
                 }(args))...};
             },
@@ -1920,7 +1925,7 @@ public:
                     if constexpr (gr::meta::array_or_vector_type<std::remove_cvref_t<decltype(a)>>) {
                         return std::span{a.data(), a.size()};
                     } else {
-                        return std::move(a);
+                        return NoSpanTemporary{};
                     }
                 }(args))...};
             },
