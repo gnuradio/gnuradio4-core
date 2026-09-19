@@ -420,7 +420,7 @@ struct PortDescriptor {
     static constexpr PortType      kPortType                  = portType;
     static constexpr bool          kIsInput                   = portDirection == PortDirection::INPUT;
     static constexpr bool          kIsOutput                  = portDirection == PortDirection::OUTPUT;
-    static constexpr bool          kIsArithmeticLikeValueType = gr::arithmetic_or_complex_like<T> || gr::UncertainValueLike<T>;
+    static constexpr bool          kIsArithmeticLikeValueType = gr::arithmetic_sample_like<T>;
     static constexpr bool          kIsSynch                   = !std::disjunction_v<std::is_same<Async, Attributes>...>;   // false -> asynchronous: does not gate scheduling
     static constexpr bool          kIsOptional                = std::disjunction_v<std::is_same<Optional, Attributes>...>; // port may be left unconnected
 
@@ -502,7 +502,7 @@ struct Port {
     using BufferType        = AttributeTypeList::template find_or_default<is_stream_buffer_attribute, DefaultStreamBuffer<T>>::type;
     using TagBufferType     = AttributeTypeList::template find_or_default<is_tag_buffer_attribute, DefaultTagBuffer>::type;
 
-    static constexpr bool        kIsArithmeticLikeValueType = (gr::arithmetic_or_complex_like<T> || gr::UncertainValueLike<T>) && sizeof(T) <= 16UZ;
+    static constexpr bool        kIsArithmeticLikeValueType = gr::arithmetic_sample_like<T> && sizeof(T) <= 16UZ;
     static constexpr std::size_t kDefaultBufferSize         = 4096UZ; // TODO: limit initial max buffer size based on kIsArithmeticLikeValueType
 
     // constexpr members:
