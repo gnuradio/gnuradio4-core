@@ -1,3 +1,21 @@
+# graphdoc and the headers it shares with its test. It is an ordinary consumer of the installed headers: nothing here is
+# compiled into the libraries. Its document is read from the graph file, so it is built whether or not the registry is
+# on.
+add_library(gnuradio-doctools INTERFACE)
+add_library(gnuradio4::gnuradio-doctools ALIAS gnuradio-doctools)
+target_include_directories(gnuradio-doctools INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
+target_link_libraries(gnuradio-doctools INTERFACE gnuradio-options gnuradio-core gnuradio-blocklib-core)
+
+add_executable(graphdoc graphdoc_main.cpp)
+target_link_libraries(graphdoc PRIVATE gnuradio-doctools)
+if(TARGET gnuradio-plugin)
+  target_link_libraries(graphdoc PRIVATE gnuradio-plugin)
+endif()
+# where this installation puts its plugins, which the tool searches whatever the caller and the environment name
+target_compile_definitions(
+  graphdoc PRIVATE GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY="${CMAKE_INSTALL_FULL_LIBDIR}/gnuradio-4/plugins")
+install(TARGETS graphdoc RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
 # rungraph, an ordinary consumer of the installed headers: it is not compiled into the libraries. It builds its graph by
 # name, which needs the registry, so it follows it.
 if(GR_ENABLE_BLOCK_REGISTRY)

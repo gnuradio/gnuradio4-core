@@ -1,0 +1,64 @@
+definition_metadata:
+  block_type: qa::doc_fixture
+  plugin_name: Doc Tools Fixture
+  plugin_author: GNU Radio
+  plugin_license: MIT
+  plugin_version: "1"
+graph_version: 1
+blocks:
+  - id: qa::RampSource
+    unique_name: source_1
+    parameters:
+      name: source
+      n_samples: !!uint32 4096
+  - id: SUBGRAPH
+    name: front_end
+    graph:
+      blocks:
+        - id: qa::Scale
+          parameters:
+            name: pre_gain
+            gain: !!float32 2.0
+            label: front
+            enabled: true
+        - id: SUBGRAPH
+          parameters:
+            name: inner_chain
+          scheduler:
+            id: gr::scheduler::Simple
+            parameters:
+              name: inner_scheduler
+          graph:
+            blocks:
+              - id: qa::Scale
+                parameters:
+                  name: fine_gain
+                  gain: !!float32 0.5
+              - id: qa::SumInputs
+                parameters:
+                  name: combiner
+                  n_inputs: !!uint32 2
+            connections:
+              - [fine_gain, out, combiner, [0, 0]]
+            exported_ports:
+              - [fine_gain, INPUT, in, in]
+              - [combiner, OUTPUT, out, out]
+      connections:
+        - [pre_gain, out, inner_chain, in]
+      exported_ports:
+        - [pre_gain, INPUT, in, in]
+        - [inner_chain, OUTPUT, out, out]
+  - id: qa::RecordingSink
+    layout_hint: bottom-right
+    parameters:
+      name: sink
+    meta_information:
+      role: terminal
+    ctx_parameters:
+      - context: fast
+        time: !!uint64 0
+        parameters:
+          buffer_size: 512
+connections:
+  - [source_1, 0, front_end, 0]
+  - [front_end, 0, sink, 0, 4096]
