@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <expected>
 #include <format>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -313,6 +314,44 @@ inline Level readLevel(const property_map& map) {
 
     level.uninterpretedKeys = uninterpretedKeysOf(map, kKnownGraphKeys);
     return level;
+}
+
+/// Answers the type of the items an output port carries, given the block's registry key and the
+/// port as a connection spells it. An empty answer leaves the connection's type cell blank.
+using ConnectionTypeResolver = std::function<std::string(std::string_view blockType, std::string_view port)>;
+
+/**
+ * @brief Fills the item type of every connection of `level` and of every level below it.
+ *
+ * The type belongs to the source block's output port, so the lookup takes the source end: the
+ * block the level holds under that name, and its `id` as the registry key. A subgraph is passed
+ * over because SUBGRAPH is no key; its exported port is answered by the block behind it, which
+ * this level does not name.
+ */
+inline void resolveConnectionTypes(Level& level, const ConnectionTypeResolver& typeOf) {
+    if (!typeOf) {
+        return;
+    }
+    std::map<std::string, const Block*, std::less<>> blockForName;
+    for (const Block& block : level.blocks) {
+        if (!block.uniqueName.empty()) {
+            blockForName.emplace(block.uniqueName, &block);
+        }
+        if (!block.name.empty()) {
+            blockForName.emplace(block.name, &block);
+        }
+    }
+    for (Connection& connection : level.connections) {
+        const auto source = blockForName.find(connection.sourceBlock);
+        if (source != blockForName.end() && !source->second->isSubgraph()) {
+            connection.itemType = typeOf(source->second->type, connection.sourcePort);
+        }
+    }
+    for (Block& block : level.blocks) {
+        if (block.isSubgraph()) {
+            resolveConnectionTypes(*block.interior, typeOf);
+        }
+    }
 }
 
 /// how many subgraphs a level holds, counting every depth below it

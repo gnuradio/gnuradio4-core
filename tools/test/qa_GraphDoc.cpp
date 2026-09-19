@@ -9,7 +9,21 @@
 #include <string>
 #include <string_view>
 
+#include <gnuradio-4.0/config.hpp>
+
 #include "GraphDoc.hpp"
+
+#ifdef GR_ENABLE_BLOCK_REGISTRY
+#include <complex>
+#include <tuple>
+#include <vector>
+
+#include <gnuradio-4.0/Block.hpp>
+#include <gnuradio-4.0/BlockRegistry.hpp>
+#include <gnuradio-4.0/PluginLoader.hpp>
+
+#include "BlockLookup.hpp"
+#endif
 
 /**
  * The flowgraph document: what the reader must be able to find in it.
@@ -55,6 +69,27 @@ using namespace gr::tools;
     }
     return std::move(*level);
 }
+
+#ifdef GR_ENABLE_BLOCK_REGISTRY
+/// An output whose type is neither the input's nor anything the registry key spells, so a
+/// connection type that comes out right can only have been read from the block.
+struct Widener : gr::Block<Widener> {
+    gr::PortIn<float>                in;
+    gr::PortOut<std::complex<float>> out;
+
+    GR_MAKE_REFLECTABLE(Widener, in, out);
+
+    [[nodiscard]] constexpr std::complex<float> processOne(float value) const noexcept { return {value, 0.0f}; }
+};
+
+void registerTestBlocks() {
+    static const bool registered = [] {
+        std::ignore = gr::globalBlockRegistry().insert<Widener>();
+        return true;
+    }();
+    std::ignore = registered;
+}
+#endif
 
 /// every block name and type, and both ends of every connection, at every level of the fixture
 constexpr std::array<std::string_view, 7> kBlockNames{"source", "front_end", "sink", "pre_gain", "inner_chain", "fine_gain", "combiner"};
@@ -130,7 +165,41 @@ const boost::ut::suite<"GraphDoc"> graphDocTests = [] {
         expect(html.find("qa::Convert<br>&lt;float32, complex&lt;float32&gt;&gt;") != std::string::npos) << html;
     };
 
-    "the connection table carries a type column, which is blank where nothing answered for it"_test = [] {
+#ifdef GR_ENABLE_BLOCK_REGISTRY
+    "the connection table names the type the source block's output port carries"_test = [] {
+        registerTestBlocks();
+        const std::vector<std::string> noDirectories;
+        gr::PluginLoader               loader(gr::globalBlockRegistry(), gr::globalSchedulerRegistry(), noDirectories);
+        OutputPortTypes                outputPortTypes(loader);
+
+        const std::string key    = gr::meta::type_name<Widener>();
+        const std::string source = std::format("blocks:\n"
+                                               "  - id: {0}\n    parameters:\n      name: first\n"
+                                               "  - id: {0}\n    parameters:\n      name: second\n"
+                                               "  - id: qa::NoSuchBlockIsRegistered\n    parameters:\n      name: third\n"
+                                               "connections:\n"
+                                               "  - [first, out, second, in]\n"
+                                               "  - [first, 0, third, in]\n"
+                                               "  - [third, out, second, in]\n"
+                                               "  - [second, no_such_port, third, in]\n",
+            key);
+        auto              level  = graphdoc::read(source);
+        expect(fatal(level.has_value()));
+        graphdoc::resolveConnectionTypes(*level, [&outputPortTypes](std::string_view blockType, std::string_view port) { return outputPortTypes(blockType, port); });
+
+        expect(eq(level->connections[0].itemType, std::string("complex<float32>"))) << "the output port's type, not the input's and not the key's";
+        expect(eq(level->connections[1].itemType, std::string("complex<float32>"))) << "a port named by its position resolves as well";
+        expect(level->connections[2].itemType.empty()) << "a block no registry holds leaves the column blank";
+        expect(level->connections[3].itemType.empty()) << "a port the block does not declare leaves it blank too";
+
+        const std::string markdown = graphdoc::render(*level, Format::Markdown, "t");
+        expect(markdown.find("| From | Port | To | Port | Type | Minimum buffer |") != std::string::npos) << markdown;
+        expect(markdown.find("| first | out | second | in | complex<float32> |  |") != std::string::npos) << markdown;
+        expect(markdown.find("| third | out | second | in |  |  |") != std::string::npos) << markdown;
+    };
+#endif
+
+    "a document made without a resolver keeps the type column empty"_test = [] {
         const std::string markdown = graphdoc::render(readFixture(), Format::Markdown, "Nested graph fixture");
         expect(markdown.find("| From | Port | To | Port | Type | Minimum buffer |") != std::string::npos) << "the column is there";
         expect(markdown.find("| front_end | 0 | sink | 0 |  | 4096 |") != std::string::npos) << markdown;

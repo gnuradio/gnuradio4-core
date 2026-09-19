@@ -8,6 +8,12 @@ target_link_libraries(gnuradio-doctools INTERFACE gnuradio-options gnuradio-core
 
 add_executable(graphdoc graphdoc_main.cpp)
 target_link_libraries(graphdoc PRIVATE gnuradio-doctools)
+if(TARGET gnuradio-plugin)
+  target_link_libraries(graphdoc PRIVATE gnuradio-plugin)
+endif()
+# where this installation puts its plugins, which the tool searches whatever the caller and the environment name
+target_compile_definitions(
+  graphdoc PRIVATE GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY="${CMAKE_INSTALL_FULL_LIBDIR}/gnuradio-4/plugins")
 install(TARGETS graphdoc RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # rungraph, an ordinary consumer of the installed headers: it is not compiled into the libraries. It builds its graph by
