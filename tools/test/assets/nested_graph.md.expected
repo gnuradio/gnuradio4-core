@@ -1,0 +1,132 @@
+# Nested graph fixture
+
+## Summary
+
+- **Blocks at the top level**: 3
+- **Connections at the top level**: 2
+- **Subgraphs, all depths**: 2
+- **Schedulers**: gr::scheduler::Simple
+
+## Definition metadata
+
+| Key | Value |
+| --- | --- |
+| block_type | "qa::doc_fixture" |
+| plugin_author | "GNU Radio" |
+| plugin_license | "MIT" |
+| plugin_name | "Doc Tools Fixture" |
+| plugin_version | "1" |
+
+## Diagram
+
+```mermaid
+flowchart LR
+    gb0["source"]
+    gb1[["front_end"]]
+    gb2["sink"]
+    gb0 -- "0 to 0" --> gb1
+    gb1 -- "0 to 0" --> gb2
+```
+
+## Blocks
+
+| Name | Type | Parameters | Meta information |
+| --- | --- | --- | --- |
+| source<br>(source_1) | qa::RampSource | n_samples: 4096<br>name: "source" |  |
+| front_end | SUBGRAPH<br>(subgraph) |  |  |
+| sink | qa::RecordingSink | name: "sink"<br>[context fast @ 0] buffer_size: 512 | role: "terminal" |
+
+## Connections
+
+| From | Port | To | Port | Type | Minimum buffer |
+| --- | --- | --- | --- | --- | --- |
+| source_1 | 0 | front_end | 0 |  |  |
+| front_end | 0 | sink | 0 |  | 4096 |
+
+## Other keys
+
+| Key | Value |
+| --- | --- |
+| graph_version | 1 |
+
+## Other block keys
+
+| Block | Key | Value |
+| --- | --- | --- |
+| sink | layout_hint | "bottom-right" |
+
+<a id="subgraph-front-end"></a>
+
+## Subgraph: front_end
+
+- **Type**: SUBGRAPH
+- **Scheduler**: none, the parent schedules its blocks
+- **Blocks**: 2
+- **Connections**: 1
+
+### Exported ports
+
+| Exported as | Direction | Inner block | Inner port |
+| --- | --- | --- | --- |
+| in | INPUT | pre_gain | in |
+| out | OUTPUT | inner_chain | out |
+
+### Diagram
+
+```mermaid
+flowchart LR
+    gs1b0["pre_gain"]
+    gs1b1[["inner_chain"]]
+    gs1b0 -- "out to in" --> gs1b1
+```
+
+### Blocks
+
+| Name | Type | Parameters | Meta information |
+| --- | --- | --- | --- |
+| pre_gain | qa::Scale | enabled: true<br>gain: 2.000000<br>label: "front"<br>name: "pre_gain" |  |
+| inner_chain | SUBGRAPH<br>(subgraph, scheduler gr::scheduler::Simple) | name: "inner_chain" |  |
+
+### Connections
+
+| From | Port | To | Port | Type | Minimum buffer |
+| --- | --- | --- | --- | --- | --- |
+| pre_gain | out | inner_chain | in |  |  |
+
+<a id="subgraph-front-end-inner-chain"></a>
+
+### Subgraph: front_end / inner_chain
+
+- **Type**: SUBGRAPH
+- **Scheduler**: gr::scheduler::Simple
+- **Blocks**: 2
+- **Connections**: 1
+
+#### Exported ports
+
+| Exported as | Direction | Inner block | Inner port |
+| --- | --- | --- | --- |
+| in | INPUT | fine_gain | in |
+| out | OUTPUT | combiner | out |
+
+#### Diagram
+
+```mermaid
+flowchart LR
+    gs1s1b0["fine_gain"]
+    gs1s1b1["combiner"]
+    gs1s1b0 -- "out to 0.0" --> gs1s1b1
+```
+
+#### Blocks
+
+| Name | Type | Parameters | Meta information |
+| --- | --- | --- | --- |
+| fine_gain | qa::Scale | gain: 0.500000<br>name: "fine_gain" |  |
+| combiner | qa::SumInputs | n_inputs: 2<br>name: "combiner" |  |
+
+#### Connections
+
+| From | Port | To | Port | Type | Minimum buffer |
+| --- | --- | --- | --- | --- | --- |
+| fine_gain | out | combiner | 0.0 |  |  |
