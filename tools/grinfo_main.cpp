@@ -40,11 +40,16 @@
 #include <gnuradio-4.0/formatter/ValueFormatter.hpp>
 #include <gnuradio-4.0/meta/formatter.hpp>
 
+#include "BlockLookup.hpp"
+
 #ifdef INTERNAL_ENABLE_BLOCK_PLUGINS
 #include <dlfcn.h>
 #endif
 
 namespace {
+
+using gr::tools::Directory;
+using gr::tools::searchDirectories;
 
 constexpr std::string_view kProgram = "grinfo";
 
@@ -385,38 +390,6 @@ void printDescription(std::string_view description, std::string_view indent, boo
             return;
         }
     }
-}
-
-struct Directory {
-    std::string path;
-    std::string origin; // option, environment, or installation
-    bool        present = false;
-};
-
-// where the blocks are looked for, in the order the directories are searched
-[[nodiscard]] std::vector<Directory> searchDirectories(const std::vector<std::string>& fromCommandLine) {
-    std::vector<Directory> directories;
-    auto                   add = [&directories](std::string_view path, std::string_view origin) {
-        if (path.empty() || std::ranges::any_of(directories, [path](const Directory& held) { return held.path == path; })) {
-            return;
-        }
-        std::error_code ignored;
-        directories.push_back({.path = std::string(path), .origin = std::string(origin), .present = std::filesystem::is_directory(path, ignored)});
-    };
-    for (const std::string& directory : fromCommandLine) {
-        add(directory, "option");
-    }
-    if (const char* environment = std::getenv("GNURADIO4_PLUGIN_DIRECTORIES"); environment != nullptr) {
-        const std::string_view list(environment);
-        for (std::size_t start = 0UZ; start < list.size();) {
-            const std::size_t separator = list.find(':', start);
-            const std::size_t end       = separator == std::string_view::npos ? list.size() : separator;
-            add(list.substr(start, end - start), "environment");
-            start = end + 1UZ;
-        }
-    }
-    add(GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY, "installation");
-    return directories;
 }
 
 #ifdef INTERNAL_ENABLE_BLOCK_PLUGINS
@@ -1802,7 +1775,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    std::vector<Directory> directories = searchDirectories(options.pluginDirectories);
+    std::vector<Directory> directories = searchDirectories(options.pluginDirectories, GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY);
     bool                   searchable  = true;
     for (const Directory& directory : directories) {
         if (directory.origin == "option" && !directory.present) {
