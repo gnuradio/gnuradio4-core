@@ -65,7 +65,8 @@ A bare key of --set names a setting of the scheduler, and a key of the form <blo
 setting of the block --show matches by that name. The split is at the last dot before the '=', so
 a block name may hold a dot and a setting key never does. rungraph reads the value the way a graph
 file's parameter value is read, so a type tag applies: -s timeout_ms=50, -s
-'shift.frequency_shift=!!float32 -100000'. The last --set of a key wins.
+'shift.frequency_shift=!!float32 -100000'. One --set carries one setting, and a value that holds a
+second key is refused. The last --set of a key wins.
 
 SIGINT and SIGTERM stop the graph as a --seconds bound does.
 
@@ -267,17 +268,24 @@ struct StagedSettings {
     std::vector<std::pair<std::string, gr::property_map>> blocks;
 };
 
-// The settings the --set arguments stand for, or nothing when one of the values cannot be read.
+// The settings the --set arguments stand for, or nothing when one of the values cannot be read or stands for more
+// than the key it was given for.
 //
 // Each pair becomes a one-entry YAML document and the framework's own reader gives the value its type, so the text
 // after the '=' means here what the same text means as a parameter of a graph file: a bare `true` is a boolean, a bare
-// number an integer, and a tagged `!!float32 1.5` a float. A later setting of a key overwrites an earlier one.
+// number an integer, and a tagged `!!float32 1.5` a float. The document has to come back holding that one key alone:
+// text carrying a second line would otherwise reach the run as a setting the caller never wrote. A later setting of a
+// key overwrites an earlier one.
 [[nodiscard]] std::optional<StagedSettings> stagedSettingsOf(const std::vector<Setting>& settings) {
     StagedSettings staged;
     for (const Setting& setting : settings) {
         const auto parsed = gr::pmt::yaml::deserialize(std::format("{}: {}", setting.key, setting.value));
         if (!parsed.has_value()) {
             std::println(stderr, "{}: the value of --set {} could not be read: {}", kProgram, setting.key, parsed.error().message);
+            return std::nullopt;
+        }
+        if (parsed->size() != 1UZ || std::string_view(parsed->begin()->first) != setting.key) {
+            std::println(stderr, "{}: --set takes one value for one key, and the value of --set {} holds more than one key", kProgram, setting.key);
             return std::nullopt;
         }
         gr::property_map* target = std::addressof(staged.scheduler);

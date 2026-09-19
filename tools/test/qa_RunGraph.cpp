@@ -103,6 +103,19 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
         expect(withoutValue.output.contains("--set takes <key>=<value>")) << withoutValue.output;
     };
 
+    "a --set whose value holds a second key is refused"_test = [] {
+        const Result schedulerSetting = run({"--graph", "unread.yaml", "--set", "timeout_ms=10\nno_such_setting: 1"});
+        expect(eq(schedulerSetting.exitCode, 2)) << schedulerSetting.output;
+        expect(schedulerSetting.output.contains("the value of --set timeout_ms holds more than one key")) << schedulerSetting.output;
+        expect(!schedulerSetting.output.contains("no_such_setting")) << "the second key never reaches the scheduler" << schedulerSetting.output;
+        expect(!schedulerSetting.output.contains("unread.yaml")) << "the refusal comes before the graph is read" << schedulerSetting.output;
+
+        const Result blockSetting = run({"--graph", "unread.yaml", "--set", "src.count=1\nother: 2"});
+        expect(eq(blockSetting.exitCode, 2)) << blockSetting.output;
+        expect(blockSetting.output.contains("the value of --set count holds more than one key")) << blockSetting.output;
+        expect(!blockSetting.output.contains("unread.yaml")) << blockSetting.output;
+    };
+
     "a graph file that cannot be read ends the run before anything is loaded"_test = [] {
         const Result missing = run({"--graph", "/gnuradio4-graph-file-that-does-not-exist.yaml"});
         expect(eq(missing.exitCode, 1)) << missing.output;
