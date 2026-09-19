@@ -85,7 +85,7 @@ Merge types live in `<gnuradio-4.0/BlockMerging.hpp>` (explicit include required
 #include <gnuradio-4.0/BlockMerging.hpp>
 ```
 
-### `Merge` — linear chain fusion
+### `Merge` — two blocks in series
 
 Connects an output port of the left block to an input port of the right block:
 
