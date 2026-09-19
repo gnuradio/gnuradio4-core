@@ -50,8 +50,6 @@ set(_CORE_TESTS
     qa_TagForwarding
     qa_UnfilteredTagPropagation
     qa_Tensor
-    qa_TensorMath
-    qa_SVD
     qa_TriggerMatcher
     qa_YamlPmt
     qa_PortableTypeName

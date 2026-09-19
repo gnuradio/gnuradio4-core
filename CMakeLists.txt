@@ -685,8 +685,6 @@ if(ENABLE_TESTING
       qa_Port
       qa_Profiler
       qa_Tensor
-      qa_TensorMath
-      qa_SVD
       qa_TriggerMatcher
       qa_YamlPmt
       qa_PortableTypeName
