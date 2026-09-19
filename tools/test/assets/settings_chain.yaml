@@ -1,0 +1,19 @@
+# The graph the settings cases run: a source, two 1:1 blocks between it and the sink, and a sink. Neither end asks to
+# stop, so a run of this graph ends on the --seconds bound unless a setting on the source ends it first.
+blocks:
+  - id: good::fixed_source<float32>
+    parameters:
+      name: source
+  - id: good::identity<float32>
+    parameters:
+      name: first
+  - id: good::identity<float32>
+    parameters:
+      name: second
+  - id: good::cout_sink<float32>
+    parameters:
+      name: sink
+connections:
+  - [source, out, first, in]
+  - [first, out, second, in]
+  - [second, out, sink, in]
