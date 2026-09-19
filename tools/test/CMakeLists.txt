@@ -2,7 +2,12 @@ set(GR_TOOLS_TEST_ASSETS ${CMAKE_CURRENT_SOURCE_DIR}/assets)
 
 add_ut_test(qa_GraphDoc)
 target_link_libraries(qa_GraphDoc PRIVATE gnuradio-doctools)
-target_compile_definitions(qa_GraphDoc PRIVATE GR_TOOLS_TEST_ASSETS="${GR_TOOLS_TEST_ASSETS}")
+# A refusal is the status the command exits with and the line it prints, neither of which is visible from inside the
+# process, so the cases that cover one run the built program over a file they write in this directory.
+add_dependencies(qa_GraphDoc graphdoc)
+target_compile_definitions(
+  qa_GraphDoc PRIVATE GR_TOOLS_TEST_ASSETS="${GR_TOOLS_TEST_ASSETS}" GR_TOOLS_GRAPHDOC="$<TARGET_FILE:graphdoc>"
+                      GR_TOOLS_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}")
 
 # A reader reviews the whole document, so the pinned documents are compared as files rather than asserted piecewise: a
 # formatting change then shows up as a diff of the document itself. They carry the `.expected` extension because the

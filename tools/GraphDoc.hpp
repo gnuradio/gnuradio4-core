@@ -8,10 +8,10 @@
 #include <expected>
 #include <format>
 #include <functional>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <optional>
-#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -25,13 +25,6 @@
 #include "DocWriter.hpp"
 
 namespace gr::tools::graphdoc {
-
-/// The block-entry keys the reader interprets; anything else a file carries is listed as an
-/// uninterpreted key rather than dropped, so a document never hides part of its input.
-inline constexpr std::array<std::string_view, 9> kKnownBlockKeys{"id", "name", "unique_name", "block_category", "meta_information", "parameters", "ctx_parameters", "scheduler", "graph"};
-
-/// the same for a graph level
-inline constexpr std::array<std::string_view, 4> kKnownGraphKeys{"blocks", "connections", "exported_ports", "definition_metadata"};
 
 [[nodiscard]] inline const property_map* mapOf(const pmt::Value& value) noexcept { return value.get_if<property_map>(); }
 
@@ -49,6 +42,32 @@ inline constexpr std::array<std::string_view, 4> kKnownGraphKeys{"blocks", "conn
 [[nodiscard]] inline const pmt::Value* entryOf(const property_map& map, std::string_view key) noexcept {
     const auto it = map.find(key);
     return it == map.cend() ? nullptr : &it->second;
+}
+
+/**
+ * @brief The framework's own words for a field it cannot read.
+ *
+ * A file outside the dialect is refused with the text the importer gives for the same file, so that
+ * the two programs report one defect in one wording. The importer also dumps the map it was reading
+ * into this sentence; the dump is left out here, and the rest is the importer's.
+ */
+[[nodiscard]] inline std::string missingFieldMessage(std::string_view key) { return std::format("Missing field {} in YAML object", key); }
+
+[[nodiscard]] inline std::string wrongTypeMessage(std::string_view key, const pmt::Value& value, std::string_view wanted) { //
+    return std::format("Field {} in YAML object has an incorrect type {}:{} instead of {}", key, value.value_type(), value.container_type(), wanted);
+}
+
+/// the string a required field holds, or the importer's refusal of the field
+[[nodiscard]] inline std::expected<std::string, std::string> requiredString(const property_map& map, std::string_view key) {
+    const pmt::Value* value = entryOf(map, key);
+    if (value == nullptr) {
+        return std::unexpected(missingFieldMessage(key));
+    }
+    const std::optional<std::string> text = stringOf(*value);
+    if (!text.has_value()) {
+        return std::unexpected(wrongTypeMessage(key, *value, gr::meta::type_name<std::string>()));
+    }
+    return *text;
 }
 
 /**
@@ -97,24 +116,6 @@ inline constexpr std::array<std::string_view, 4> kKnownGraphKeys{"blocks", "conn
     return out;
 }
 
-/// how a connection spells one of its two ends: an index, a name, or an index and a sub-index
-[[nodiscard]] inline std::string portText(const pmt::Value& value) {
-    if (const Tensor<pmt::Value>* pair = listOf(value); pair != nullptr) {
-        std::string out;
-        for (std::size_t i = 0UZ; i < pair->size(); ++i) {
-            if (i != 0UZ) {
-                out += ".";
-            }
-            out += valueText((*pair)[i]);
-        }
-        return out;
-    }
-    if (const std::optional<std::string> name = stringOf(value); name.has_value()) {
-        return *name;
-    }
-    return valueText(value);
-}
-
 struct NamedText {
     std::string name;
     std::string value;
@@ -144,34 +145,54 @@ struct Level {
     std::vector<Connection>   connections;
     std::vector<ExportedPort> exportedPorts;
     std::vector<NamedText>    metadata;          ///< `definition_metadata`, sorted
-    std::vector<NamedText>    uninterpretedKeys; ///< keys outside kKnownGraphKeys
+    std::vector<NamedText>    uninterpretedKeys; ///< what the level carries and the tables above do not render
 };
 
 struct Block {
-    std::string            type; ///< the `id` field; "SUBGRAPH" for a nested graph
-    std::string            name;
-    std::string            uniqueName;
+    std::string            type;        ///< the `id` field; "SUBGRAPH" for a nested graph
+    std::string            name;        //
+    std::string            uniqueName;  //
+    std::string            category;    ///< the `block_category` field, empty where the entry carries none
     std::string            schedulerId; ///< empty unless the subgraph is scheduler-managed
     std::string            parameters;  ///< sorted `key: value` lines
     std::string            metaInformation;
-    std::vector<NamedText> contexts;          ///< one entry per `ctx_parameters` context
-    std::vector<NamedText> uninterpretedKeys; ///< keys outside kKnownBlockKeys
+    std::vector<NamedText> contexts;            ///< one entry per `ctx_parameters` context
+    std::vector<NamedText> schedulerParameters; ///< the parameters of the scheduler managing a subgraph
+    std::vector<NamedText> uninterpretedKeys;   ///< what the entry carries and the tables above do not render
 
     std::shared_ptr<Level> interior; ///< the nested graph of a SUBGRAPH entry
 
     [[nodiscard]] bool isSubgraph() const noexcept { return interior != nullptr; }
 };
 
-[[nodiscard]] inline std::vector<NamedText> uninterpretedKeysOf(const property_map& map, std::span<const std::string_view> known) {
+/**
+ * @brief The keys of one YAML map the reader has rendered into the document.
+ *
+ * Every other key reaches the document through a table of its own, whatever its name. The reader
+ * leaves a key it knows unread where the importer leaves it unread as well, and where the value has
+ * the wrong shape for the key. Such a key is listed beside a key no one knows. A document therefore
+ * holds everything its input holds.
+ */
+struct KeysRead {
+    std::vector<std::string_view> names;
+
+    void               add(std::string_view key) { names.push_back(key); }
+    [[nodiscard]] bool holds(std::string_view key) const { return std::ranges::find(names, key) != names.end(); }
+};
+
+[[nodiscard]] inline std::vector<NamedText> unreadKeysOf(const property_map& map, const KeysRead& read) {
     std::vector<NamedText> result;
     for (const auto& [key, value] : map) {
         const std::string_view view(key);
-        if (std::ranges::find(known, view) == known.end()) {
+        if (!read.holds(view)) {
             result.emplace_back(std::string(view), valueText(value));
         }
     }
-    std::ranges::sort(result, [](const NamedText& a, const NamedText& b) { return a.name < b.name; });
     return result;
+}
+
+inline void sortByName(std::vector<NamedText>& entries) {
+    std::ranges::sort(entries, [](const NamedText& a, const NamedText& b) { return a.name < b.name; });
 }
 
 [[nodiscard]] inline std::vector<NamedText> sortedEntriesOf(const property_map& map) {
@@ -184,124 +205,280 @@ struct Block {
     return result;
 }
 
-[[nodiscard]] Level readLevel(const property_map& map);
+/// The reader's result: a level, or the refusal of a file the importer would refuse as well. The
+/// tool prints the refusal on standard error and exits 1.
+using ReadResult = std::expected<Level, std::string>;
 
-[[nodiscard]] inline Block readBlock(const property_map& entry) {
-    Block block;
-    if (const pmt::Value* id = entryOf(entry, "id"); id != nullptr) {
-        block.type = stringOf(*id).value_or(valueText(*id));
+[[nodiscard]] ReadResult readLevel(const property_map& map);
+
+/// how a connection names one of its two blocks: a non-empty string, and nothing else
+[[nodiscard]] inline std::expected<std::string, std::string> connectionBlockText(const pmt::Value& value) {
+    const std::optional<std::string> name = stringOf(value);
+    if (!name.has_value() || name->empty()) {
+        return std::unexpected("Invalid blockField");
     }
+    return *name;
+}
+
+/// how a connection spells one of its two ports: a name, an index, or an index and a sub-index
+[[nodiscard]] inline std::expected<std::string, std::string> connectionPortText(const pmt::Value& value) {
+    if (const Tensor<pmt::Value>* fields = listOf(value); fields != nullptr) {
+        if (fields->size() != 2UZ) {
+            return std::unexpected(std::format("Port definition has invalid length ({} instead of 2)", fields->size()));
+        }
+        const std::int64_t* index    = (*fields)[0].get_if<std::int64_t>();
+        const std::int64_t* subIndex = (*fields)[1].get_if<std::int64_t>();
+        if (index == nullptr || subIndex == nullptr) {
+            return std::unexpected("Port definition missing values");
+        }
+        return std::format("{}.{}", *index, *subIndex);
+    }
+    if (const std::optional<std::string> name = stringOf(value); name.has_value()) {
+        return *name;
+    }
+    if (const std::int64_t* index = value.get_if<std::int64_t>(); index != nullptr) {
+        return std::format("{}", *index);
+    }
+    return std::unexpected("Port definition missing values");
+}
+
+/**
+ * @brief One block entry, read by the rules the importer applies to it.
+ *
+ * The entry's `id` decides which of its fields are read, as it does in the importer: a SUBGRAPH
+ * carries a graph and may name a scheduler; every other entry carries its name in its parameters
+ * and may carry contexts. A field the importer refuses is refused here in the importer's words. A
+ * field it passes over is listed in the document rather than read.
+ */
+[[nodiscard]] inline std::expected<Block, std::string> readBlock(const property_map& entry) {
+    Block                  block;
+    KeysRead               read;
+    std::vector<NamedText> unread; ///< what the entry holds below one of its own keys
+
+    const std::expected<std::string, std::string> id = requiredString(entry, "id");
+    if (!id.has_value()) {
+        return std::unexpected(id.error());
+    }
+    block.type = *id;
+    read.add("id");
+    const bool subgraph = block.type == "SUBGRAPH";
+
     if (const pmt::Value* uniqueName = entryOf(entry, "unique_name"); uniqueName != nullptr) {
-        block.uniqueName = stringOf(*uniqueName).value_or(std::string{});
-    }
-
-    const property_map* parameters = nullptr;
-    if (const pmt::Value* value = entryOf(entry, "parameters"); value != nullptr) {
-        parameters = mapOf(*value);
-    }
-    if (parameters != nullptr) {
-        block.parameters = mapLines(*parameters);
-        if (const pmt::Value* name = entryOf(*parameters, "name"); name != nullptr) {
-            block.name = stringOf(*name).value_or(std::string{});
+        if (const std::optional<std::string> text = stringOf(*uniqueName); text.has_value()) {
+            block.uniqueName = *text;
+            read.add("unique_name");
         }
     }
-    // a subgraph written before the parameters key carries its name at the top level
-    if (block.name.empty()) {
-        if (const pmt::Value* name = entryOf(entry, "name"); name != nullptr) {
-            block.name = stringOf(*name).value_or(std::string{});
+
+    const pmt::Value*   parameterValue = entryOf(entry, "parameters");
+    const property_map* parameters     = parameterValue == nullptr ? nullptr : mapOf(*parameterValue);
+    if (parameters != nullptr) {
+        block.parameters = mapLines(*parameters);
+        read.add("parameters");
+    }
+    if (subgraph) {
+        if (parameters != nullptr) {
+            if (const pmt::Value* name = entryOf(*parameters, "name"); name != nullptr) {
+                block.name = stringOf(*name).value_or(std::string{});
+            }
+        }
+        // a subgraph written before the parameters key carries its name at the top level
+        if (block.name.empty()) {
+            if (const pmt::Value* name = entryOf(entry, "name"); name != nullptr) {
+                if (const std::optional<std::string> text = stringOf(*name); text.has_value()) {
+                    block.name = *text;
+                    read.add("name");
+                }
+            }
+        }
+    } else {
+        if (parameterValue == nullptr) {
+            return std::unexpected(missingFieldMessage("parameters"));
+        }
+        if (parameters == nullptr) {
+            return std::unexpected(wrongTypeMessage("parameters", *parameterValue, "gr::property_map"));
+        }
+        const std::expected<std::string, std::string> name = requiredString(*parameters, "name");
+        if (!name.has_value()) {
+            return std::unexpected(name.error());
+        }
+        block.name = *name;
+    }
+
+    if (const pmt::Value* category = entryOf(entry, "block_category"); category != nullptr) {
+        if (const std::optional<std::string> text = stringOf(*category); text.has_value()) {
+            block.category = *text;
+            read.add("block_category");
         }
     }
 
     if (const pmt::Value* meta = entryOf(entry, "meta_information"); meta != nullptr) {
         if (const property_map* map = mapOf(*meta); map != nullptr) {
             block.metaInformation = mapLines(*map);
+            read.add("meta_information");
         }
     }
 
-    if (const pmt::Value* contexts = entryOf(entry, "ctx_parameters"); contexts != nullptr) {
-        if (const Tensor<pmt::Value>* list = listOf(*contexts); list != nullptr) {
-            for (const pmt::Value& contextValue : *list) {
-                const property_map* context = mapOf(contextValue);
-                if (context == nullptr) {
-                    continue;
-                }
-                std::string label;
-                if (const pmt::Value* name = entryOf(*context, gr::tag::CONTEXT.shortKey()); name != nullptr) {
-                    label = stringOf(*name).value_or(valueText(*name));
-                }
-                if (const pmt::Value* time = entryOf(*context, gr::tag::CONTEXT_TIME.shortKey()); time != nullptr) {
-                    label += std::format(" @ {}", valueText(*time));
-                }
-                std::string values;
-                if (const pmt::Value* parameterValue = entryOf(*context, "parameters"); parameterValue != nullptr) {
-                    if (const property_map* map = mapOf(*parameterValue); map != nullptr) {
-                        values = mapLines(*map);
-                    }
-                }
-                block.contexts.emplace_back(std::move(label), std::move(values));
+    if (const pmt::Value* contexts = entryOf(entry, "ctx_parameters"); contexts != nullptr && !subgraph) {
+        const Tensor<pmt::Value>* list = listOf(*contexts);
+        if (list == nullptr) {
+            return std::unexpected(std::format("Unable to create block '{}' of type '{}': ctx_parameters is not a list", block.name, block.type));
+        }
+        for (std::size_t at = 0UZ; at < list->size(); ++at) {
+            const property_map* context = mapOf((*list)[at]);
+            if (context == nullptr) {
+                return std::unexpected(std::format("Unable to create block '{}' of type '{}': a ctx_parameters entry is not a map", block.name, block.type));
+            }
+            const pmt::Value*                name              = entryOf(*context, gr::tag::CONTEXT.shortKey());
+            const pmt::Value*                time              = entryOf(*context, gr::tag::CONTEXT_TIME.shortKey());
+            const pmt::Value*                values            = entryOf(*context, "parameters");
+            const std::optional<std::string> label             = name == nullptr ? std::nullopt : stringOf(*name);
+            const std::uint64_t*             contextTime       = time == nullptr ? nullptr : time->get_if<std::uint64_t>();
+            const property_map*              contextParameters = values == nullptr ? nullptr : mapOf(*values);
+            if (!label.has_value() || contextTime == nullptr || contextParameters == nullptr) {
+                return std::unexpected(std::format("Unable to create block '{}' of type '{}': a ctx_parameters entry needs a context, a context_time and a parameters map", block.name, block.type));
+            }
+            block.contexts.emplace_back(std::format("{} @ {}", *label, *contextTime), mapLines(*contextParameters));
+
+            KeysRead contextRead;
+            contextRead.add(gr::tag::CONTEXT.shortKey());
+            contextRead.add(gr::tag::CONTEXT_TIME.shortKey());
+            contextRead.add("parameters");
+            for (NamedText& left : unreadKeysOf(*context, contextRead)) {
+                unread.emplace_back(std::format("ctx_parameters[{}].{}", at, left.name), std::move(left.value));
             }
         }
+        read.add("ctx_parameters");
     }
 
-    if (const pmt::Value* scheduler = entryOf(entry, "scheduler"); scheduler != nullptr) {
-        if (const property_map* map = mapOf(*scheduler); map != nullptr) {
-            if (const pmt::Value* id = entryOf(*map, "id"); id != nullptr) {
-                block.schedulerId = stringOf(*id).value_or(valueText(*id));
+    if (const pmt::Value* scheduler = entryOf(entry, "scheduler"); scheduler != nullptr && subgraph) {
+        const property_map* map = mapOf(*scheduler);
+        if (map == nullptr) {
+            return std::unexpected("scheduler is not a property_map");
+        }
+        const std::expected<std::string, std::string> schedulerId = requiredString(*map, "id");
+        if (!schedulerId.has_value()) {
+            return std::unexpected(schedulerId.error());
+        }
+        block.schedulerId = *schedulerId;
+
+        KeysRead schedulerRead;
+        schedulerRead.add("id");
+        if (const pmt::Value* values = entryOf(*map, "parameters"); values != nullptr) {
+            if (const property_map* entries = mapOf(*values); entries != nullptr) {
+                block.schedulerParameters = sortedEntriesOf(*entries);
+                schedulerRead.add("parameters");
             }
         }
-    }
-
-    if (const pmt::Value* graph = entryOf(entry, "graph"); graph != nullptr) {
-        if (const property_map* map = mapOf(*graph); map != nullptr) {
-            block.interior = std::make_shared<Level>(readLevel(*map));
+        for (NamedText& left : unreadKeysOf(*map, schedulerRead)) {
+            unread.emplace_back(std::format("scheduler.{}", left.name), std::move(left.value));
         }
+        read.add("scheduler");
     }
 
-    block.uninterpretedKeys = uninterpretedKeysOf(entry, kKnownBlockKeys);
+    if (subgraph) {
+        const pmt::Value* graph = entryOf(entry, "graph");
+        if (graph == nullptr) {
+            return std::unexpected(missingFieldMessage("graph"));
+        }
+        const property_map* map = mapOf(*graph);
+        if (map == nullptr) {
+            return std::unexpected(std::format("Unable to create block '{}' of type '{}': graph is not a map", block.name, block.type));
+        }
+        ReadResult interior = readLevel(*map);
+        if (!interior.has_value()) {
+            return std::unexpected(interior.error());
+        }
+        block.interior = std::make_shared<Level>(std::move(*interior));
+        read.add("graph");
+    }
+
+    block.uninterpretedKeys = unreadKeysOf(entry, read);
+    block.uninterpretedKeys.insert(block.uninterpretedKeys.end(), std::make_move_iterator(unread.begin()), std::make_move_iterator(unread.end()));
+    sortByName(block.uninterpretedKeys);
     return block;
 }
 
-inline Level readLevel(const property_map& map) {
-    Level level;
+inline ReadResult readLevel(const property_map& map) {
+    Level                  level;
+    KeysRead               read;
+    std::vector<NamedText> unread; ///< what the level holds below one of its own keys
 
     if (const pmt::Value* blocks = entryOf(map, "blocks"); blocks != nullptr) {
         if (const Tensor<pmt::Value>* list = listOf(*blocks); list != nullptr) {
-            for (const pmt::Value& entry : *list) {
-                if (const property_map* block = mapOf(entry); block != nullptr) {
-                    level.blocks.push_back(readBlock(*block));
+            read.add("blocks");
+            for (std::size_t at = 0UZ; at < list->size(); ++at) {
+                const property_map* entry = mapOf((*list)[at]);
+                if (entry == nullptr) {
+                    // the importer passes over an entry that is not a map, so the document carries it as text
+                    unread.emplace_back(std::format("blocks[{}]", at), valueText((*list)[at]));
+                    continue;
                 }
+                std::expected<Block, std::string> block = readBlock(*entry);
+                if (!block.has_value()) {
+                    return std::unexpected(block.error());
+                }
+                level.blocks.push_back(std::move(*block));
             }
         }
     }
 
     if (const pmt::Value* connections = entryOf(map, "connections"); connections != nullptr) {
         if (const Tensor<pmt::Value>* list = listOf(*connections); list != nullptr) {
-            for (const pmt::Value& entry : *list) {
-                const Tensor<pmt::Value>* fields = listOf(entry);
-                if (fields == nullptr || fields->size() < 4UZ) {
-                    continue;
+            read.add("connections");
+            for (std::size_t at = 0UZ; at < list->size(); ++at) {
+                const Tensor<pmt::Value>* fields = listOf((*list)[at]);
+                if (fields == nullptr) {
+                    return std::unexpected("Unable to parse connection (not a list)");
                 }
-                Connection connection{
-                    .sourceBlock      = portText((*fields)[0]),
-                    .sourcePort       = portText((*fields)[1]),
-                    .destinationBlock = portText((*fields)[2]),
-                    .destinationPort  = portText((*fields)[3]),
+                if (fields->size() < 4UZ) {
+                    return std::unexpected(std::format("Unable to parse connection ({} instead of >=4 elements)", fields->size()));
+                }
+                const std::expected<std::string, std::string> sourceBlock      = connectionBlockText((*fields)[0]);
+                const std::expected<std::string, std::string> sourcePort       = connectionPortText((*fields)[1]);
+                const std::expected<std::string, std::string> destinationBlock = connectionBlockText((*fields)[2]);
+                const std::expected<std::string, std::string> destinationPort  = connectionPortText((*fields)[3]);
+                for (const std::expected<std::string, std::string>& end : {sourceBlock, sourcePort, destinationBlock, destinationPort}) {
+                    if (!end.has_value()) {
+                        return std::unexpected(end.error());
+                    }
+                }
+                level.connections.push_back(Connection{
+                    .sourceBlock      = *sourceBlock,
+                    .sourcePort       = *sourcePort,
+                    .destinationBlock = *destinationBlock,
+                    .destinationPort  = *destinationPort,
                     .minBufferSize    = fields->size() > 4UZ ? valueText((*fields)[4]) : std::string{},
                     .itemType         = {},
-                };
-                level.connections.push_back(std::move(connection));
+                });
+                // the importer reads four elements and a buffer size; a further element belongs to the file and is listed
+                for (std::size_t field = 5UZ; field < fields->size(); ++field) {
+                    unread.emplace_back(std::format("connections[{}][{}]", at, field), valueText((*fields)[field]));
+                }
             }
         }
     }
 
     if (const pmt::Value* exported = entryOf(map, "exported_ports"); exported != nullptr) {
         if (const Tensor<pmt::Value>* list = listOf(*exported); list != nullptr) {
+            read.add("exported_ports");
             for (const pmt::Value& entry : *list) {
                 const Tensor<pmt::Value>* fields = listOf(entry);
-                if (fields == nullptr || fields->size() < 4UZ) {
-                    continue;
+                if (fields == nullptr) {
+                    return std::unexpected("Unable to parse exported port (not a list)");
                 }
-                level.exportedPorts.emplace_back(portText((*fields)[0]), portText((*fields)[1]), portText((*fields)[2]), portText((*fields)[3]));
+                if (fields->size() != 4UZ) {
+                    return std::unexpected(std::format("Unable to parse exported port ({} instead of 4 elements)", fields->size()));
+                }
+                std::array<std::string, 4UZ> text;
+                for (std::size_t field = 0UZ; field < text.size(); ++field) {
+                    const std::optional<std::string> value = stringOf((*fields)[field]);
+                    if (!value.has_value()) {
+                        return std::unexpected("Required fields for exported ports missing");
+                    }
+                    text[field] = *value;
+                }
+                level.exportedPorts.emplace_back(text[0], text[1], text[2], text[3]);
             }
         }
     }
@@ -309,10 +486,13 @@ inline Level readLevel(const property_map& map) {
     if (const pmt::Value* metadata = entryOf(map, "definition_metadata"); metadata != nullptr) {
         if (const property_map* entries = mapOf(*metadata); entries != nullptr) {
             level.metadata = sortedEntriesOf(*entries);
+            read.add("definition_metadata");
         }
     }
 
-    level.uninterpretedKeys = uninterpretedKeysOf(map, kKnownGraphKeys);
+    level.uninterpretedKeys = unreadKeysOf(map, read);
+    level.uninterpretedKeys.insert(level.uninterpretedKeys.end(), std::make_move_iterator(unread.begin()), std::make_move_iterator(unread.end()));
+    sortByName(level.uninterpretedKeys);
     return level;
 }
 
@@ -352,6 +532,35 @@ inline void resolveConnectionTypes(Level& level, const ConnectionTypeResolver& t
             resolveConnectionTypes(*block.interior, typeOf);
         }
     }
+}
+
+/// The kind a block is counted under: the category the entry states, SUBGRAPH for a nested graph,
+/// and the category a block has where the entry states none.
+[[nodiscard]] inline std::string blockKind(const Block& block) {
+    if (!block.category.empty()) {
+        return block.category;
+    }
+    return block.isSubgraph() ? std::string("SUBGRAPH") : std::string("NormalBlock");
+}
+
+/// The blocks of a level counted by kind, as `3 (2 NormalBlock, 1 SUBGRAPH)`. A summary names the
+/// kind of every block it counts, including the kind a block has when its entry states no category.
+[[nodiscard]] inline std::string blockCountText(const Level& level) {
+    std::map<std::string, std::size_t, std::less<>> perKind;
+    for (const Block& block : level.blocks) {
+        ++perKind[blockKind(block)];
+    }
+    if (perKind.empty()) {
+        return "0";
+    }
+    if (perKind.size() == 1UZ) {
+        return std::format("{} {}", level.blocks.size(), perKind.begin()->first);
+    }
+    std::string kinds;
+    for (const auto& [kind, count] : perKind) {
+        kinds += std::format("{}{} {}", kinds.empty() ? "" : ", ", count, kind);
+    }
+    return std::format("{} ({})", level.blocks.size(), kinds);
 }
 
 /// how many subgraphs a level holds, counting every depth below it
@@ -704,7 +913,9 @@ inline constexpr std::size_t kLabelCharacters = 28UZ;  ///< the widest label a n
 
     std::string kind;
     auto        add = [&kind](std::string_view text) { kind += kind.empty() ? std::string(text) : std::format(", {}", text); };
-    if (block.isSubgraph()) {
+    if (!block.category.empty() && block.category != "NormalBlock") {
+        add(block.category);
+    } else if (block.isSubgraph() && block.category.empty()) {
         add("subgraph");
     }
     if (!block.schedulerId.empty()) {
@@ -811,9 +1022,19 @@ inline void writeSubgraphs(DocWriter& writer, const Level& level, std::size_t de
             facts.push_back(writer.labeled("Unique name", block.uniqueName));
         }
         facts.push_back(writer.labeled("Scheduler", block.schedulerId.empty() ? "none, the parent schedules its blocks" : block.schedulerId));
-        facts.push_back(writer.labeled("Blocks", std::to_string(block.interior->blocks.size())));
+        facts.push_back(writer.labeled("Blocks", blockCountText(*block.interior)));
         facts.push_back(writer.labeled("Connections", std::to_string(block.interior->connections.size())));
         writer.rawBullets(facts);
+
+        if (!block.schedulerParameters.empty()) {
+            writer.heading(depth + 3UZ, "Scheduler parameters");
+            writeNamedTable(writer, "Key", "Value", block.schedulerParameters);
+        }
+
+        if (!block.interior->metadata.empty()) {
+            writer.heading(depth + 3UZ, "Definition metadata");
+            writeNamedTable(writer, "Key", "Value", block.interior->metadata);
+        }
 
         if (!block.interior->exportedPorts.empty()) {
             writer.heading(depth + 3UZ, "Exported ports");
@@ -842,7 +1063,7 @@ inline void writeSubgraphs(DocWriter& writer, const Level& level, std::size_t de
 
     writer.heading(2UZ, "Summary");
     std::vector<std::string> summary;
-    summary.push_back(writer.labeled("Blocks at the top level", std::to_string(level.blocks.size())));
+    summary.push_back(writer.labeled("Blocks at the top level", blockCountText(level)));
     summary.push_back(writer.labeled("Connections at the top level", std::to_string(level.connections.size())));
     summary.push_back(writer.labeled("Subgraphs, all depths", std::to_string(countSubgraphs(level))));
     if (!schedulers.empty()) {
@@ -877,7 +1098,7 @@ inline void writeSubgraphs(DocWriter& writer, const Level& level, std::size_t de
 }
 
 /// reads the YAML with the framework's own parser, so the dialect is exactly the importer's
-[[nodiscard]] inline std::expected<Level, std::string> read(std::string_view yaml) {
+[[nodiscard]] inline ReadResult read(std::string_view yaml) {
     const auto parsed = gr::pmt::yaml::deserialize(yaml);
     if (!parsed.has_value()) {
         return std::unexpected(std::format("line {}, column {}: {}", parsed.error().line, parsed.error().column, parsed.error().message));

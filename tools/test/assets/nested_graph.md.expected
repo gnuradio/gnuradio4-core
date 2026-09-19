@@ -2,7 +2,7 @@
 
 ## Summary
 
-- **Blocks at the top level**: 3
+- **Blocks at the top level**: 3 (2 NormalBlock, 1 SUBGRAPH)
 - **Connections at the top level**: 2
 - **Subgraphs, all depths**: 2
 - **Schedulers**: gr::scheduler::Simple
@@ -61,7 +61,7 @@ flowchart LR
 
 - **Type**: SUBGRAPH
 - **Scheduler**: none, the parent schedules its blocks
-- **Blocks**: 2
+- **Blocks**: 2 (1 NormalBlock, 1 SUBGRAPH)
 - **Connections**: 1
 
 ### Exported ports
@@ -99,8 +99,14 @@ flowchart LR
 
 - **Type**: SUBGRAPH
 - **Scheduler**: gr::scheduler::Simple
-- **Blocks**: 2
+- **Blocks**: 2 NormalBlock
 - **Connections**: 1
+
+#### Scheduler parameters
+
+| Key | Value |
+| --- | --- |
+| name | "inner_scheduler" |
 
 #### Exported ports
 

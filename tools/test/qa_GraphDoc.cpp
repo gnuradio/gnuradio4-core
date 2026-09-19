@@ -2,12 +2,18 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdio>
 #include <format>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
+
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 
 #include <gnuradio-4.0/config.hpp>
 
@@ -16,7 +22,6 @@
 #ifdef GR_ENABLE_BLOCK_REGISTRY
 #include <complex>
 #include <tuple>
-#include <vector>
 
 #include <gnuradio-4.0/Block.hpp>
 #include <gnuradio-4.0/BlockRegistry.hpp>
@@ -90,6 +95,127 @@ void registerTestBlocks() {
     std::ignore = registered;
 }
 #endif
+
+#ifdef _WIN32
+constexpr auto openPipe  = _popen;
+constexpr auto closePipe = _pclose;
+#else
+constexpr auto openPipe  = popen;
+constexpr auto closePipe = pclose;
+#endif
+
+struct Run {
+    int         exitCode = -1;
+    std::string output; // standard output and standard error together, in the order the run wrote them
+};
+
+/// Writes `yaml` to a file of the test's own and describes it with the built program. A refusal is
+/// the status the command exits with and the line it prints, and a test reads neither from inside
+/// this process.
+[[nodiscard]] Run describe(std::string_view fileName, std::string_view yaml) {
+    const std::string path = std::format("{}/{}", GR_TOOLS_TEST_SCRATCH, fileName);
+    {
+        std::ofstream file(path, std::ios::binary);
+        file << yaml;
+    }
+
+    Run               result;
+    const std::string command = std::format("\"{}\" --format md \"{}\" 2>&1", GR_TOOLS_GRAPHDOC, path);
+    std::FILE*        pipe    = openPipe(command.c_str(), "r");
+    if (pipe == nullptr) {
+        return result;
+    }
+    std::array<char, 4096UZ> buffer{};
+    while (std::fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr) {
+        result.output.append(buffer.data());
+    }
+    const int status = closePipe(pipe);
+#ifdef _WIN32
+    result.exitCode = status;
+#else
+    result.exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
+    return result;
+}
+
+struct Refusal {
+    std::string_view fileName;
+    std::string_view yaml;
+    std::string_view message; ///< what the importer says of the same file
+};
+
+/// One file per rule the importer enforces on a graph document's shape, each with the sentence the
+/// importer gives for it.
+constexpr std::array<Refusal, 21> kRefusals{{
+    {"no_id.yaml", "blocks:\n  - parameters:\n      name: source\n", "Missing field id in YAML object"},
+    {"id_not_a_string.yaml", "blocks:\n  - id: 42\n    parameters:\n      name: source\n", "Field id in YAML object has an incorrect type"},
+    {"no_parameters.yaml", "blocks:\n  - id: qa::Scale\n", "Missing field parameters in YAML object"},
+    {"parameters_not_a_map.yaml", "blocks:\n  - id: qa::Scale\n    parameters: 3\n", "Field parameters in YAML object has an incorrect type"},
+    {"no_name.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      gain: 2.0\n", "Missing field name in YAML object"},
+    {"subgraph_without_graph.yaml", "blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: inner\n", "Missing field graph in YAML object"},
+    {"graph_not_a_map.yaml", "blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: inner\n    graph: 7\n", "Unable to create block 'inner' of type 'SUBGRAPH': graph is not a map"},
+    {"scheduler_not_a_map.yaml", "blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: inner\n    scheduler: simple\n    graph:\n      blocks:\n        - id: qa::Scale\n          parameters:\n            name: gain\n", "scheduler is not a property_map"},
+    {"scheduler_without_id.yaml", "blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: inner\n    scheduler:\n      parameters:\n        thread_pool: workers\n    graph:\n      blocks:\n        - id: qa::Scale\n          parameters:\n            name: gain\n", "Missing field id in YAML object"},
+    {"exported_port_not_a_list.yaml", "blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: inner\n    graph:\n      blocks:\n        - id: qa::Scale\n          parameters:\n            name: gain\n      exported_ports:\n        - gain\n", "Unable to parse exported port (not a list)"},
+    {"exported_port_of_three.yaml", "blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: inner\n    graph:\n      blocks:\n        - id: qa::Scale\n          parameters:\n            name: gain\n      exported_ports:\n        - [gain, INPUT, in]\n", "Unable to parse exported port (3 instead of 4 elements)"},
+    {"exported_port_field.yaml", "blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: inner\n    graph:\n      blocks:\n        - id: qa::Scale\n          parameters:\n            name: gain\n      exported_ports:\n        - [gain, INPUT, in, 4]\n", "Required fields for exported ports missing"},
+    {"contexts_not_a_list.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\n    ctx_parameters: 5\n", "Unable to create block 'gain' of type 'qa::Scale': ctx_parameters is not a list"},
+    {"context_not_a_map.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\n    ctx_parameters:\n      - fast\n", "a ctx_parameters entry is not a map"},
+    {"context_without_time.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\n    ctx_parameters:\n      - context: fast\n        parameters:\n          buffer_size: 512\n", "a ctx_parameters entry needs a context, a context_time and a parameters map"},
+    {"connection_not_a_list.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\nconnections: [42]\n", "Unable to parse connection (not a list)"},
+    {"connection_of_three.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\nconnections:\n  - [gain, out, gain]\n", "Unable to parse connection (3 instead of >=4 elements)"},
+    {"connection_block_field.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\nconnections:\n  - [7, out, gain, in]\n", "Invalid blockField"},
+    {"port_pair_of_three.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\nconnections:\n  - [gain, [0, 0, 0], gain, in]\n", "Port definition has invalid length (3 instead of 2)"},
+    {"port_pair_not_indices.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\nconnections:\n  - [gain, [a, b], gain, in]\n", "Port definition missing values"},
+    {"port_not_a_definition.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\nconnections:\n  - [gain, 1.5, gain, in]\n", "Port definition missing values"},
+}};
+
+/// a graph carrying every key the reader knows, a key it does not, and keys nested under both
+constexpr std::string_view kEveryKey = R"(definition_metadata:
+  plugin_name: Keys fixture
+graph_version: 7
+blocks:
+  - id: qa::RampSource
+    unique_name: source_1
+    block_category: NormalBlock
+    parameters:
+      name: source
+      n_samples: !!uint32 64
+      nested:
+        depth: leaf_value
+    meta_information:
+      role: origin
+    ctx_parameters:
+      - context: fast
+        time: !!uint64 3
+        parameters:
+          buffer_size: 512
+        note: context_extra
+    layout_hint: top-left
+  - id: SUBGRAPH
+    block_category: ScheduledBlockGroup
+    parameters:
+      name: front_end
+    scheduler:
+      id: gr::scheduler::Simple
+      parameters:
+        thread_pool: workers
+      affinity: cpu_two
+    graph:
+      definition_metadata:
+        inner_note: nested_metadata
+      blocks:
+        - id: qa::Scale
+          parameters:
+            name: gain
+      exported_ports:
+        - [gain, INPUT, in, in]
+connections:
+  - [source_1, 0, front_end, in, 4096, extra_element]
+)";
+
+/// every scalar the file above carries, each of which the document has to hold
+constexpr std::array<std::string_view, 22> kEveryKeyScalars{"Keys fixture", "7", "source_1", "NormalBlock", "source", "64", "leaf_value", "origin", "fast", "3", "512", "context_extra", "top-left", "ScheduledBlockGroup", "front_end", "gr::scheduler::Simple", "workers", "cpu_two", "nested_metadata", "gain", "4096", "extra_element"};
 
 /// every block name and type, and both ends of every connection, at every level of the fixture
 constexpr std::array<std::string_view, 7> kBlockNames{"source", "front_end", "sink", "pre_gain", "inner_chain", "fine_gain", "combiner"};
@@ -384,6 +510,61 @@ const boost::ut::suite<"GraphDoc"> graphDocTests = [] {
         const std::size_t cycleAfter = cycle.find("<rect class=\"node\"", cycleFirst + 1UZ);
         expect(leftEdgeOf(cycle, cycleFirst) < leftEdgeOf(cycle, cycleAfter)) << "the edge that closes the cycle does not rank its destination";
         expect(eq(occurrences(cycle, "<path class=\"edge\""), 2UZ)) << "both connections are still drawn";
+    };
+
+    "a file outside the importer's dialect is refused in the importer's words"_test = [] {
+        for (const Refusal& refusal : kRefusals) {
+            const Run refused = describe(refusal.fileName, refusal.yaml);
+            expect(eq(refused.exitCode, 1)) << std::format("{} left the status at {}: {}", refusal.fileName, refused.exitCode, refused.output);
+            expect(refused.output.contains(refusal.message)) << std::format("{}: {}", refusal.fileName, refused.output);
+        }
+
+        // the same program describes a file within the dialect and exits 0, so the refusals above belong to their files
+        const Run described = describe("every_key.yaml", kEveryKey);
+        expect(eq(described.exitCode, 0)) << described.output;
+        expect(described.output.contains("# every_key.yaml")) << described.output;
+    };
+
+    "the summary counts the blocks of a level by kind"_test = [] {
+        const auto level = graphdoc::read(kEveryKey);
+        expect(fatal(level.has_value()));
+        const std::string markdown = graphdoc::render(*level, Format::Markdown, "t");
+        expect(markdown.find("**Blocks at the top level**: 2 (1 NormalBlock, 1 ScheduledBlockGroup)") != std::string::npos) << markdown;
+        expect(markdown.find("**Blocks**: 1 NormalBlock") != std::string::npos) << "a level of one kind names it without counting twice" << markdown;
+
+        const std::string fixture = graphdoc::render(readFixture(), Format::Markdown, "Nested graph fixture");
+        expect(fixture.find("**Blocks at the top level**: 3 (2 NormalBlock, 1 SUBGRAPH)") != std::string::npos) << "a block with no category is counted under the kind it has" << fixture;
+    };
+
+    "a scheduler's parameters, a nested metadata table, and every key left over have their own tables"_test = [] {
+        const auto level = graphdoc::read(kEveryKey);
+        expect(fatal(level.has_value()));
+        const std::string markdown = graphdoc::render(*level, Format::Markdown, "t");
+        expect(markdown.find("### Scheduler parameters") != std::string::npos) << markdown;
+        expect(markdown.find("| thread_pool | \"workers\" |") != std::string::npos) << "the parameters of the scheduler that manages a subgraph" << markdown;
+        expect(markdown.find("| inner_note | \"nested_metadata\" |") != std::string::npos) << "the definition metadata of a nested level" << markdown;
+        expect(markdown.find("| scheduler.affinity |") != std::string::npos) << "a key of the scheduler map nothing renders" << markdown;
+        expect(markdown.find("| ctx_parameters[0].note |") != std::string::npos) << "a key of a context entry nothing renders" << markdown;
+        expect(markdown.find("| connections[0][5] |") != std::string::npos) << "a connection element past the buffer size" << markdown;
+    };
+
+    "every scalar of a file with every known key reaches both documents"_test = [] {
+        const auto level = graphdoc::read(kEveryKey);
+        expect(fatal(level.has_value()));
+        for (const Format format : {Format::Markdown, Format::Html}) {
+            const std::string document = graphdoc::render(*level, format, "t");
+            for (const std::string_view scalar : kEveryKeyScalars) {
+                expect(document.find(scalar) != std::string::npos) << std::format("'{}' is missing from the document", scalar);
+            }
+        }
+    };
+
+    "a block entry the importer passes over is listed rather than dropped"_test = [] {
+        const auto level = graphdoc::read("blocks:\n  - 42\n  - id: qa::Scale\n    parameters:\n      name: gain\n");
+        expect(fatal(level.has_value())) << "the importer passes over an entry that is not a map, so the document is written";
+        expect(eq(level->blocks.size(), 1UZ));
+        const std::string markdown = graphdoc::render(*level, Format::Markdown, "t");
+        expect(markdown.find("| blocks[0] | 42 |") != std::string::npos) << markdown;
     };
 };
 
