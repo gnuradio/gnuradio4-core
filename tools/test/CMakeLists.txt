@@ -11,7 +11,8 @@ if(TARGET rungraph)
   set_tests_properties(qa_RunGraph PROPERTIES TIMEOUT 60)
   if(INTERNAL_ENABLE_BLOCK_PLUGINS)
     target_compile_definitions(qa_RunGraph PRIVATE GR_TOOLS_CORE_TEST_PLUGINS="${CMAKE_BINARY_DIR}/core/test/plugins")
-    add_dependencies(qa_RunGraph GoodBasePlugin)
+    # the fusion cases run a chain of good::identity, which GoodRegistryPlugin supplies
+    add_dependencies(qa_RunGraph GoodBasePlugin GoodRegistryPlugin)
   endif()
 endif()
 
