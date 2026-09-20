@@ -188,11 +188,11 @@ message(STATUS "Is plugin system enabled? ${INTERNAL_ENABLE_BLOCK_PLUGINS}")
 set_project_warnings(gnuradio-options)
 
 if(EMSCRIPTEN)
-  SetupEmscriptenGnuRadioOptions()
+  setupemscriptengnuradiooptions()
 endif()
 
 if(NOT (TARGET magic_enum))
-  SetupMagicEnumTarget()
+  setupmagicenumtarget()
 endif()
 
 include(cmake/GnuRadioDependencies.cmake)
@@ -215,7 +215,7 @@ if(ENABLE_TESTING
         OR APPLE
         OR WIN32)
    AND ENABLE_COVERAGE)
-  SetupCoverageSupport()
+  setupcoveragesupport()
 endif()
 
 # Configure and install the pkg-config file TODO: This should become more granular - .pc for each in-tree module
@@ -268,7 +268,7 @@ install(
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GnuRadio4PrecompileHeaders.cmake"
   DESTINATION "${GR_CMAKECONFIG_INSTALL_DIR}")
 
-ReportConfigurationState()
+reportconfigurationstate()
 
 if(GR_PACKAGING)
   include(cmake/CPackConfig.cmake)

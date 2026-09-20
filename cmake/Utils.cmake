@@ -28,7 +28,7 @@ macro(CheckPythonAvailability)
 endmacro()
 
 
-macro(SetupMagicEnumTarget)
+macro(setupmagicenumtarget)
     # include header-only libraries that have been inlined to simplify builds w/o requiring access to the internet
     add_library(magic_enum INTERFACE)
     add_library(gnuradio4::magic_enum ALIAS magic_enum)
@@ -45,7 +45,7 @@ macro(SetupMagicEnumTarget)
 endmacro()
 
 
-macro(SetupCoverageSupport)
+macro(setupcoveragesupport)
     message("Coverage reporting enabled")
     include(cmake/CodeCoverage.cmake) # https://github.com/bilke/cmake-modules/blob/master/CodeCoverage.cmake #
     # (License: BSL-1.0)
@@ -113,7 +113,7 @@ macro(SetupCoverageSupport)
 endmacro()
 
 
-function(SetupEmscriptenGnuRadioOptions)
+function(setupemscriptengnuradiooptions)
   # Make sure consumers of gnuradio4::gnuradio-options don't accidentally build with conflicting arguments
   target_compile_definitions(gnuradio-options INTERFACE GR_MAX_WASM_THREAD_COUNT=${GR_MAX_WASM_THREAD_COUNT})
   target_compile_options(gnuradio-options INTERFACE -fexceptions -pthread)
@@ -139,7 +139,7 @@ function(SetupEmscriptenGnuRadioOptions)
 endfunction()
 
 
-function(ReportConfigurationState)
+function(reportconfigurationstate)
     # print effective options
     message(STATUS "================================================")
     message(STATUS "GR-4 build configuration")
