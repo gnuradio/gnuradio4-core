@@ -120,6 +120,10 @@ set(GR4_PKGCONFIG_EXTRA_LIBS "")
 
 # End user GR configuration
 
+add_library(gnuradio-options INTERFACE)
+add_library(gnuradio4::gnuradio-options ALIAS gnuradio-options)
+install(TARGETS gnuradio-options EXPORT gnuradio4Targets)
+
 if(ENABLE_TESTING
    AND (UNIX
         OR APPLE
@@ -160,10 +164,6 @@ endif()
 
 # blocklib_generator is a build process dependency, add it before everything
 add_subdirectory(blocklib_generator)
-
-add_library(gnuradio-options INTERFACE)
-add_library(gnuradio4::gnuradio-options ALIAS gnuradio-options)
-install(TARGETS gnuradio-options EXPORT gnuradio4Targets)
 
 if(MSVC)
   target_compile_options(
