@@ -25,6 +25,7 @@
 
 #include <gnuradio-4.0/Block.hpp>
 #include <gnuradio-4.0/BlockRegistry.hpp>
+#include <gnuradio-4.0/Graph_yaml_importer.hpp>
 #include <gnuradio-4.0/PluginLoader.hpp>
 
 #include "BlockLookup.hpp"
@@ -94,6 +95,21 @@ void registerTestBlocks() {
     }();
     std::ignore = registered;
 }
+
+/// The importer's verdict on a document: true where `gr::loadGrc` builds a graph from it. A case
+/// compares this verdict with the tool's and leaves the two messages alone. The importer reports
+/// several document shapes with the message of a standard library container, and the tool names
+/// the field.
+[[nodiscard]] bool importerAccepts(std::string_view yaml) {
+    const std::vector<std::string> noDirectories;
+    gr::PluginLoader               loader(gr::globalBlockRegistry(), gr::globalSchedulerRegistry(), noDirectories);
+    try {
+        [[maybe_unused]] const auto graph = gr::loadGrc(loader, yaml);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
 #endif
 
 #ifdef _WIN32
@@ -141,11 +157,13 @@ struct Run {
 struct Refusal {
     std::string_view fileName;
     std::string_view yaml;
-    std::string_view message; ///< what the importer says of the same file
+    std::string_view message; ///< the sentence the tool gives for the file
 };
 
 /// One file per rule the importer enforces on a graph document's shape, each with the sentence the
-/// importer gives for it.
+/// tool gives for it. The importer refuses the same files. It reports several of these shapes with
+/// the message of a standard library container, and a case compares the two verdicts rather than
+/// the two messages.
 constexpr std::array<Refusal, 21> kRefusals{{
     {"no_id.yaml", "blocks:\n  - parameters:\n      name: source\n", "Missing field id in YAML object"},
     {"id_not_a_string.yaml", "blocks:\n  - id: 42\n    parameters:\n      name: source\n", "Field id in YAML object has an incorrect type"},
@@ -169,6 +187,12 @@ constexpr std::array<Refusal, 21> kRefusals{{
     {"port_pair_not_indices.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\nconnections:\n  - [gain, [a, b], gain, in]\n", "Port definition missing values"},
     {"port_not_a_definition.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\nconnections:\n  - [gain, 1.5, gain, in]\n", "Port definition missing values"},
 }};
+
+/// The same key in the two places a document may carry it: a document's top level, which the
+/// importer does not read, and the `graph` map of a SUBGRAPH entry, which it does. The entry has
+/// the wrong shape in both places.
+constexpr std::string_view kRootExportedPorts     = "exported_ports: [42]\n";
+constexpr std::string_view kSubgraphExportedPorts = "blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: inner\n    graph:\n      exported_ports: [42]\n";
 
 /// a graph carrying every key the reader knows, a key it does not, and keys nested under both
 constexpr std::string_view kEveryKey = R"(definition_metadata:
@@ -512,17 +536,42 @@ const boost::ut::suite<"GraphDoc"> graphDocTests = [] {
         expect(eq(occurrences(cycle, "<path class=\"edge\""), 2UZ)) << "both connections are still drawn";
     };
 
-    "a file outside the importer's dialect is refused in the importer's words"_test = [] {
+    "a file outside the importer's dialect is refused here as well"_test = [] {
         for (const Refusal& refusal : kRefusals) {
             const Run refused = describe(refusal.fileName, refusal.yaml);
             expect(eq(refused.exitCode, 1)) << std::format("{} left the status at {}: {}", refusal.fileName, refused.exitCode, refused.output);
             expect(refused.output.contains(refusal.message)) << std::format("{}: {}", refusal.fileName, refused.output);
+#ifdef GR_ENABLE_BLOCK_REGISTRY
+            expect(!importerAccepts(refusal.yaml)) << std::format("{}: the importer builds a graph from a file the tool refuses", refusal.fileName);
+#endif
         }
 
         // the same program describes a file within the dialect and exits 0, so the refusals above belong to their files
         const Run described = describe("every_key.yaml", kEveryKey);
         expect(eq(described.exitCode, 0)) << described.output;
         expect(described.output.contains("# every_key.yaml")) << described.output;
+    };
+
+    "exported_ports is read inside a subgraph and left uninterpreted at the top level"_test = [] {
+        const Run root = describe("root_exported_ports.yaml", kRootExportedPorts);
+        expect(eq(root.exitCode, 0)) << "the importer reads no exported_ports at a document's top level" << root.output;
+
+        const auto level = graphdoc::read(kRootExportedPorts);
+        expect(fatal(level.has_value()));
+        expect(level->exportedPorts.empty()) << "a top level exports no port";
+        const std::string markdown = graphdoc::render(*level, Format::Markdown, "t");
+        expect(markdown.find("| exported_ports |") != std::string::npos) << "the key belongs with the others the loader leaves alone" << markdown;
+        expect(markdown.find("Exported ports") == std::string::npos) << "and no exported-ports table stands at the top level" << markdown;
+
+        const Run nested = describe("subgraph_exported_ports.yaml", kSubgraphExportedPorts);
+        expect(eq(nested.exitCode, 1)) << nested.output;
+        expect(nested.output.contains("Unable to parse exported port (not a list)")) << nested.output;
+
+#ifdef GR_ENABLE_BLOCK_REGISTRY
+        // the two verdicts are the case: the same malformed entry passes at the top level and fails under a subgraph
+        expect(importerAccepts(kRootExportedPorts)) << "the importer builds a graph from the top-level file";
+        expect(!importerAccepts(kSubgraphExportedPorts)) << "and refuses the same entry inside a subgraph";
+#endif
     };
 
     "the summary counts the blocks of a level by kind"_test = [] {

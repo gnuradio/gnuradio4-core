@@ -36,7 +36,7 @@ parameters, connections, and SUBGRAPH entries with their nested graphs and
 exported ports, to any depth. Every graph level gets a diagram, a table of
 blocks and a table of connections, in that order, under a summary of the file.
 A key the importer does not read is listed rather than dropped, and a file the
-importer would refuse is refused here in the importer's own words.
+importer would refuse is refused here too, with a message of this program's own.
 
 The connection table names the type each connection carries. That one column
 comes from the blocks themselves: the tool constructs the source block of a

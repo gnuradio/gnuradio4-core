@@ -45,11 +45,11 @@ namespace gr::tools::graphdoc {
 }
 
 /**
- * @brief The framework's own words for a field it cannot read.
+ * @brief The refusal text for a field that is absent or of the wrong shape.
  *
- * A file outside the dialect is refused with the text the importer gives for the same file, so that
- * the two programs report one defect in one wording. The importer also dumps the map it was reading
- * into this sentence; the dump is left out here, and the rest is the importer's.
+ * The tool refuses every file the importer refuses. The wording is the tool's own and names the
+ * field and the shape it must have. The importer reports several of these defects with the message
+ * of a standard library container.
  */
 [[nodiscard]] inline std::string missingFieldMessage(std::string_view key) { return std::format("Missing field {} in YAML object", key); }
 
@@ -143,7 +143,7 @@ struct Block;
 struct Level {
     std::vector<Block>        blocks;
     std::vector<Connection>   connections;
-    std::vector<ExportedPort> exportedPorts;
+    std::vector<ExportedPort> exportedPorts;     ///< the ports a subgraph interior exports; empty at a document's top level
     std::vector<NamedText>    metadata;          ///< `definition_metadata`, sorted
     std::vector<NamedText>    uninterpretedKeys; ///< what the level carries and the tables above do not render
 };
@@ -209,7 +209,12 @@ inline void sortByName(std::vector<NamedText>& entries) {
 /// tool prints the refusal on standard error and exits 1.
 using ReadResult = std::expected<Level, std::string>;
 
-[[nodiscard]] ReadResult readLevel(const property_map& map);
+/// Where a level sits in a document: the top level, or the `graph` map of a SUBGRAPH entry. The
+/// importer reads `exported_ports` in the second and nowhere else. The reader takes the place as an
+/// argument and applies each rule where the importer applies it.
+enum class LevelKind { Root, Subgraph };
+
+[[nodiscard]] ReadResult readLevel(const property_map& map, LevelKind kind);
 
 /// how a connection names one of its two blocks: a non-empty string, and nothing else
 [[nodiscard]] inline std::expected<std::string, std::string> connectionBlockText(const pmt::Value& value) {
@@ -247,8 +252,8 @@ using ReadResult = std::expected<Level, std::string>;
  *
  * The entry's `id` decides which of its fields are read, as it does in the importer: a SUBGRAPH
  * carries a graph and may name a scheduler; every other entry carries its name in its parameters
- * and may carry contexts. A field the importer refuses is refused here in the importer's words. A
- * field it passes over is listed in the document rather than read.
+ * and may carry contexts. A field the importer refuses is refused here as well. A field it passes
+ * over is listed in the document rather than read.
  */
 [[nodiscard]] inline std::expected<Block, std::string> readBlock(const property_map& entry) {
     Block                  block;
@@ -385,7 +390,7 @@ using ReadResult = std::expected<Level, std::string>;
         if (map == nullptr) {
             return std::unexpected(std::format("Unable to create block '{}' of type '{}': graph is not a map", block.name, block.type));
         }
-        ReadResult interior = readLevel(*map);
+        ReadResult interior = readLevel(*map, LevelKind::Subgraph);
         if (!interior.has_value()) {
             return std::unexpected(interior.error());
         }
@@ -399,7 +404,7 @@ using ReadResult = std::expected<Level, std::string>;
     return block;
 }
 
-inline ReadResult readLevel(const property_map& map) {
+inline ReadResult readLevel(const property_map& map, LevelKind kind) {
     Level                  level;
     KeysRead               read;
     std::vector<NamedText> unread; ///< what the level holds below one of its own keys
@@ -459,7 +464,9 @@ inline ReadResult readLevel(const property_map& map) {
         }
     }
 
-    if (const pmt::Value* exported = entryOf(map, "exported_ports"); exported != nullptr) {
+    // The importer reads exported_ports in the graph map of a SUBGRAPH entry and nowhere else. The
+    // top level of a document carries the key uninterpreted, and the table of leftover keys holds it.
+    if (const pmt::Value* exported = kind == LevelKind::Subgraph ? entryOf(map, "exported_ports") : nullptr; exported != nullptr) {
         if (const Tensor<pmt::Value>* list = listOf(*exported); list != nullptr) {
             read.add("exported_ports");
             for (const pmt::Value& entry : *list) {
@@ -1080,17 +1087,6 @@ inline void writeSubgraphs(DocWriter& writer, const Level& level, std::size_t de
         writeNamedTable(writer, "Key", "Value", level.metadata);
     }
 
-    if (!level.exportedPorts.empty()) {
-        writer.heading(2UZ, "Exported ports");
-        std::vector<std::vector<std::string>> rows;
-        rows.reserve(level.exportedPorts.size());
-        for (const ExportedPort& port : level.exportedPorts) {
-            rows.push_back({port.exportedName, port.direction, port.block, port.internalName});
-        }
-        const std::array<std::string_view, 4> headers{"Exported as", "Direction", "Inner block", "Inner port"};
-        writer.table(headers, rows);
-    }
-
     writeLevelBody(writer, level, 0UZ, "g");
     writeSubgraphs(writer, level, 0UZ, "g", {});
 
@@ -1103,7 +1099,7 @@ inline void writeSubgraphs(DocWriter& writer, const Level& level, std::size_t de
     if (!parsed.has_value()) {
         return std::unexpected(std::format("line {}, column {}: {}", parsed.error().line, parsed.error().column, parsed.error().message));
     }
-    return readLevel(*parsed);
+    return readLevel(*parsed, LevelKind::Root);
 }
 
 } // namespace gr::tools::graphdoc
