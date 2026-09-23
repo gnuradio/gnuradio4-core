@@ -98,10 +98,12 @@ std::expected<T, std::string> parseStringToFloat(std::string_view trimmed) {
     using namespace std::string_literals;
 #if defined(__clang__)
     // Fallback to std::strtof / strtod for Clang versions prior to 20
+    // strtof and strtod read up to a terminator, which a std::string_view does not carry
+    const std::string terminated(trimmed);
     if constexpr (std::is_same_v<T, float>) {
         char* endPtr = nullptr;
-        float valF   = std::strtof(trimmed.data(), &endPtr);
-        if (endPtr == trimmed.data() + trimmed.size() && !std::isinf(valF)) {
+        float valF   = std::strtof(terminated.c_str(), &endPtr);
+        if (endPtr == terminated.c_str() + terminated.size() && !std::isinf(valF)) {
             return valF;
         }
         if (std::isinf(valF)) {
@@ -111,8 +113,8 @@ std::expected<T, std::string> parseStringToFloat(std::string_view trimmed) {
     } else {
         // double
         char*  endPtr = nullptr;
-        double valD   = std::strtod(trimmed.data(), &endPtr);
-        if (endPtr == trimmed.data() + trimmed.size() && !std::isinf(valD)) {
+        double valD   = std::strtod(terminated.c_str(), &endPtr);
+        if (endPtr == terminated.c_str() + terminated.size() && !std::isinf(valD)) {
             return static_cast<T>(valD);
         }
         if (std::isinf(valD)) {
@@ -291,8 +293,8 @@ template<class T, bool strictCheck = false, typename From>
             typeid(T).name(), std::real(srcValue), std::imag(srcValue), typeid(T).name()));
     }
 
-    // 6) source is string
-    else if constexpr (std::is_same_v<S, std::string>) {
+    // 6) source is text: a std::string, or the std::string_view a pmt::Value holding text is visited as
+    else if constexpr (std::is_same_v<S, std::string> || std::is_same_v<S, std::string_view>) {
         // 6a) string->enum
         if constexpr (std::is_enum_v<T>) {
             if (auto maybeEnum = gr::meta::parseEnum<T>(srcValue)) {
@@ -329,7 +331,7 @@ template<class T, bool strictCheck = false, typename From>
         }
         // 6d) string->bool
         else if constexpr (std::is_same_v<T, bool>) {
-            std::string s = srcValue;
+            std::string s(srcValue);
             std::ranges::transform(s, s.begin(), [](unsigned char c) { return std::tolower(c); });
             if (s == "true" || s == "1") {
                 return true;
@@ -337,6 +339,10 @@ template<class T, bool strictCheck = false, typename From>
                 return false;
             }
             return std::unexpected(std::format("cannot parse '{}' as bool", srcValue));
+        }
+        // 6e) string_view->string
+        else if constexpr (std::is_same_v<T, std::string>) {
+            return std::string(srcValue);
         }
         // fallback
         else {

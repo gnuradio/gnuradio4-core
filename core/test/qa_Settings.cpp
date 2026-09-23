@@ -1,16 +1,23 @@
 #include <boost/ut.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <complex>
 #include <cstddef>
+#include <cstdint>
+#include <expected>
+#include <format>
 #include <memory>
 #include <optional>
 #include <ranges>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <gnuradio-4.0/Block.hpp>
 #include <gnuradio-4.0/Graph.hpp>
+#include <gnuradio-4.0/PmtTypeHelpers.hpp>
 #include <gnuradio-4.0/Scheduler.hpp>
 #include <gnuradio-4.0/Sequence.hpp>
 #include <gnuradio-4.0/Settings.hpp>
@@ -365,6 +372,92 @@ const boost::ut::suite<"staged type refusals"> stagedRefusalTests = [] {
     };
 };
 
+enum class Waveform { sine, square, triangle };
+
+template<typename T>
+[[nodiscard]] std::expected<T, std::string> fromText(std::string_view text) {
+    return pmt::convert_safely<T>(pmt::Value{text});
+}
+
+template<typename T>
+void expectConvertsAsString(std::string_view text) {
+    using namespace boost::ut;
+    const std::expected<T, std::string> fromValue  = fromText<T>(text);
+    const std::expected<T, std::string> fromString = pmt::convert_safely<T>(std::string(text));
+    expect(fromValue == fromString) << std::format("'{}' to {}: '{}' from the Value, '{}' from the std::string", text, meta::type_name<T>(), fromValue.error_or("a value"), fromString.error_or("a value"));
+}
+
+/// the error set() raises for the parameters, empty when it accepts them all
+[[nodiscard]] std::string refusalOf(ChangeRecordingBlock& block, const property_map& parameters) {
+    try {
+        std::ignore = block.settings().set(parameters);
+    } catch (const gr::exception& e) {
+        return e.message;
+    }
+    return {};
+}
+
+const boost::ut::suite<"text held in a Value"> textValueTests = [] {
+    using namespace boost::ut;
+
+    "text converts to a signed and an unsigned integer"_test = [] {
+        const std::expected<std::int32_t, std::string> signedValue   = fromText<std::int32_t>("-42");
+        const std::expected<gr::Size_t, std::string>   unsignedValue = fromText<gr::Size_t>(" 4096 # FFT size");
+        expect(signedValue == std::int32_t{-42}) << signedValue.error_or("a different value");
+        expect(unsignedValue == gr::Size_t{4096}) << unsignedValue.error_or("a different value");
+    };
+
+    "text converts to float and double"_test = [] {
+        const std::expected<float, std::string>  floatValue  = fromText<float>("1.5");
+        const std::expected<double, std::string> doubleValue = fromText<double>("-0.1");
+        expect(floatValue == 1.5f) << floatValue.error_or("a different value");
+        expect(doubleValue == -0.1) << doubleValue.error_or("a different value");
+    };
+
+    "text converts to bool"_test = [] {
+        const std::expected<bool, std::string> trueValue  = fromText<bool>("True");
+        const std::expected<bool, std::string> falseValue = fromText<bool>("0");
+        expect(trueValue == true) << trueValue.error_or("a different value");
+        expect(falseValue == false) << falseValue.error_or("a different value");
+    };
+
+    "text converts to an enum"_test = [] {
+        const std::expected<Waveform, std::string> waveform = fromText<Waveform>("square");
+        expect(waveform == Waveform::square) << waveform.error_or("a different value");
+    };
+
+    "a Value holding text converts as the same std::string does"_test = [] {
+        constexpr std::array texts{"42", "-42", "1.5", " 7 # comment", "true", "0", "square", "", "fast", "1e40", "300", "-1"};
+        for (std::string_view text : texts) {
+            expectConvertsAsString<std::int8_t>(text);
+            expectConvertsAsString<std::uint8_t>(text);
+            expectConvertsAsString<std::int32_t>(text);
+            expectConvertsAsString<std::uint32_t>(text);
+            expectConvertsAsString<std::int64_t>(text);
+            expectConvertsAsString<std::uint64_t>(text);
+            expectConvertsAsString<float>(text);
+            expectConvertsAsString<double>(text);
+            expectConvertsAsString<bool>(text);
+            expectConvertsAsString<Waveform>(text);
+            expectConvertsAsString<std::string>(text);
+            expectConvertsAsString<std::complex<float>>(text);
+        }
+    };
+
+    "a std::string_view is parsed within its bounds"_test = [] {
+        const std::string_view                  prefix = std::string_view("1.25").substr(0UZ, 3UZ);
+        const std::expected<float, std::string> parsed = pmt::convert_safely<float>(prefix);
+        expect(parsed == 1.2f) << parsed.error_or("a different value");
+    };
+
+    "the strict and the numeric conversions still refuse text"_test = [] {
+        const pmt::Value text{std::string_view("1.5")};
+        expect(!pmt::convert_safely<float, true>(text).has_value());
+        expect(!pmt::convert_numerically<float>(text).has_value());
+        expect(!pmt::convert_numerically<std::int32_t>(text).has_value());
+    };
+};
+
 [[nodiscard]] Decimator makeDecimator() {
     Decimator block;
     block.init(std::make_shared<gr::Sequence>());
@@ -623,6 +716,31 @@ const boost::ut::suite<"settings"> _settings = [] {
 
         expect(eq(block.newSeen.size(), 0UZ)) << "the active context does not move, so there is no event and no value to report";
         expect(eq(block.fft_size.value, gr::Size_t(2048))) << "the definition stays applied";
+    };
+
+    "numeric settings given as text are parsed and applied"_test = [] {
+        ChangeRecordingBlock block;
+        block.init(std::make_shared<gr::Sequence>());
+
+        const std::string refusal = refusalOf(block, {{"sample_rate", std::string("48000.5")}, {"fft_size", std::string("4096")}});
+        expect(refusal.empty()) << refusal;
+        std::ignore = block.settings().activateContext();
+        std::ignore = block.settings().applyStagedParameters();
+
+        expect(eq(block.sample_rate.value, 48000.5f)) << "the float setting takes the parsed value";
+        expect(eq(block.fft_size.value, gr::Size_t(4096))) << "the unsigned setting takes the parsed value";
+    };
+
+    "a numeric setting given text that does not parse is refused by its key"_test = [] {
+        ChangeRecordingBlock block{property_map{{"fft_size", gr::Size_t(2048)}}};
+        block.init(std::make_shared<gr::Sequence>());
+
+        const std::string refusal = refusalOf(block, {{"fft_size", std::string("4096.5")}});
+        expect(refusal.contains("fft_size")) << refusal;
+        std::ignore = block.settings().activateContext();
+        std::ignore = block.settings().applyStagedParameters();
+
+        expect(eq(block.fft_size.value, gr::Size_t(2048))) << "the refused text does not reach the member";
     };
 };
 
