@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <format>
 #include <ranges>
 #include <string>
@@ -416,6 +417,36 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
 
         expect(eq(carrying(result.tags, kReservedKey).size(), tags.size())) << "a reserved key crosses a chain of default-policy blocks";
         expect(carrying(result.tags, kCustomKey).empty()) << "a key outside kDefaultTags must not survive the default key filter";
+    };
+
+    "the default policy carries the transmit burst keys through blocks that declare nothing about them"_test = [] {
+        constexpr std::size_t   kBurstFirst  = 100UZ;
+        constexpr std::size_t   kBurstLast   = 899UZ;
+        constexpr std::uint64_t kBurstTimeNs = 1'720'000'000'123'456'789ULL;
+
+        property_map burstStart;
+        gr::tag::put(burstStart, "tx_sob", true);
+        gr::tag::put(burstStart, "tx_time", kBurstTimeNs);
+        property_map burstEnd;
+        gr::tag::put(burstEnd, "tx_eob", true);
+        const std::vector<TagRecord> tags{TagRecord{kBurstFirst, burstStart}, TagRecord{kBurstLast, burstEnd}};
+        const RunResult              result = runOnce([&tags](gr::Graph& flow) { return buildSeries<Relay, Relay>(flow, tags); });
+
+        expect(indicesCarrying(result.tags, "tx_sob") == std::vector{kBurstFirst}) << "tx_sob stays on the burst's first sample";
+        expect(indicesCarrying(result.tags, "tx_time") == std::vector{kBurstFirst}) << "tx_time stays on the burst's first sample";
+        expect(indicesCarrying(result.tags, "tx_eob") == std::vector{kBurstLast}) << "tx_eob stays on the burst's last sample";
+
+        for (const TagRecord& record : result.tags) {
+            if (const pmt::Value* start = valueOf(record.map, "tx_sob"); start != nullptr) {
+                expect(start->holds<bool>() && *start->get_if<bool>()) << "tx_sob keeps its type and value";
+            }
+            if (const pmt::Value* time = valueOf(record.map, "tx_time"); time != nullptr) {
+                expect(time->holds<std::uint64_t>() && *time->get_if<std::uint64_t>() == kBurstTimeNs) << "tx_time keeps its type and value";
+            }
+            if (const pmt::Value* end = valueOf(record.map, "tx_eob"); end != nullptr) {
+                expect(end->holds<bool>() && *end->get_if<bool>()) << "tx_eob keeps its type and value";
+            }
+        }
     };
 
     "a custom key crosses a chain of unfiltered blocks with its value and offset intact"_test = [] {

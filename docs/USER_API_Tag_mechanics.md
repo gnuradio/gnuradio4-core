@@ -666,6 +666,18 @@ short key in code (`"sample_rate"`). Keys are aligned with the
 | `store_default` | `bool` | store current settings as new defaults                       |
 | `end_of_stream` | `bool` | signals end of data — downstream blocks transition to `DONE` |
 
+### Transmit bursts
+
+| Key       | Type       | Unit | Purpose                                                                  |
+| --------- | ---------- | ---- | ------------------------------------------------------------------------ |
+| `tx_sob`  | `bool`     |      | the tagged sample is the first of a transmit burst                       |
+| `tx_eob`  | `bool`     |      | the tagged sample is the last of a transmit burst                        |
+| `tx_time` | `uint64_t` | ns   | UTC time at which the tagged sample, a burst's first, leaves the antenna |
+
+A transmit sink reads these; a receive graph's `trigger_time` is never read as a transmit time. The names are GNU
+Radio 3's; `tx_time` is one count of nanoseconds, as `trigger_time` is, where GNU Radio 3 carried whole and
+fractional seconds.
+
 ---
 
 ## Performance notes
