@@ -2,9 +2,12 @@
 #define GNURADIO_SEQUENCE_HPP
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <ranges>
 #include <vector>
@@ -23,13 +26,22 @@ namespace gr {
 #endif
 inline constexpr std::size_t kInitialCursorValue = 0L;
 
+namespace detail {
+struct SequenceWaitSlot {
+    std::mutex              mutex;
+    std::condition_variable changed;
+};
+} // namespace detail
+
 /**
  * Concurrent sequence class used for tracking the progress of the ring buffer and event
  * processors. Support a number of concurrent operations including CAS and order writes.
  * Also avoids false sharing by adding padding cacheline-padding around the volatile field.
  */
 class alignas(kCacheLine) Sequence {
-    mutable std::size_t _fieldsValue{kInitialCursorValue};
+    mutable std::size_t               _fieldsValue{kInitialCursorValue};
+    mutable std::uint32_t             _nTimedWaiters{0U};
+    mutable detail::SequenceWaitSlot* _waitSlot{nullptr}; // created by the first waitUntil(), owned by this sequence
 
 public:
     Sequence(const Sequence&)       = delete;
@@ -38,6 +50,7 @@ public:
 
     Sequence() = default;
     explicit Sequence(std::size_t v) noexcept { gr::atomic_ref(_fieldsValue).store_release(v); }
+    ~Sequence() { delete _waitSlot; }
 
     [[nodiscard]] forceinline std::size_t value() const noexcept { return gr::atomic_ref(_fieldsValue).load_acquire(); }
     forceinline void                      setValue(const std::size_t value) noexcept { gr::atomic_ref(_fieldsValue).store_release(value); }
@@ -51,7 +64,65 @@ public:
     [[nodiscard]] forceinline std::size_t addAndGet(std::size_t increment) noexcept { return gr::atomic_ref(_fieldsValue).fetch_add(increment) + increment; }
     [[nodiscard]] forceinline std::size_t subAndGet(std::size_t decrement) noexcept { return gr::atomic_ref(_fieldsValue).fetch_sub(decrement) - decrement; }
     void                                  wait(std::size_t oldValue) const noexcept { gr::atomic_ref(_fieldsValue).wait(oldValue); }
-    void                                  notify_all() noexcept { gr::atomic_ref(_fieldsValue).notify_all(); }
+
+    // Blocks until the value leaves oldValue or the deadline passes, and returns whether it left. notify_all() after a
+    // read-modify-write of the value (incrementAndGet(), addAndGet(), subAndGet(), compareAndSet()) ends the wait at
+    // once; after setValue() the wait may last until the deadline.
+    bool waitUntil(std::size_t oldValue, std::chrono::steady_clock::time_point deadline) const {
+        if (value() != oldValue) {
+            return true;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        detail::SequenceWaitSlot& slot = waitSlot();
+        gr::atomic_ref(_nTimedWaiters).fetch_add(1U);
+        bool changed = false;
+        {
+            std::unique_lock lock(slot.mutex);
+            changed = slot.changed.wait_until(lock, deadline, [this, oldValue] { return hasLeft(oldValue); });
+        }
+        gr::atomic_ref(_nTimedWaiters).fetch_sub(1U);
+        return changed;
+    }
+
+    void notify_all() noexcept {
+        gr::atomic_ref(_fieldsValue).notify_all();
+        if (gr::atomic_ref(_nTimedWaiters).load_acquire() != 0U) [[unlikely]] {
+            notifyTimedWaiters();
+        }
+    }
+
+private:
+    // Tests the value with a compare-and-set of oldValue onto itself. As a read-modify-write it is ordered against the
+    // notifier's read-modify-write of the value: either the notifier's comes first and this one sees the new value, or
+    // this one comes first and the notifier sees this waiter in _nTimedWaiters.
+    [[nodiscard]] bool hasLeft(std::size_t oldValue) const noexcept {
+        std::size_t expected = oldValue;
+        return !gr::atomic_ref(_fieldsValue).compare_exchange(expected, oldValue);
+    }
+
+    [[nodiscard]] detail::SequenceWaitSlot& waitSlot() const {
+        detail::SequenceWaitSlot* slot = gr::atomic_ref(_waitSlot).load_acquire();
+        if (slot == nullptr) {
+            auto* created = new detail::SequenceWaitSlot();
+            if (gr::atomic_ref(_waitSlot).compare_exchange(slot, created)) {
+                slot = created;
+            } else {
+                delete created; // another waiter installed its slot first, and slot now holds it
+            }
+        }
+        return *slot;
+    }
+
+    void notifyTimedWaiters() noexcept {
+        detail::SequenceWaitSlot* slot = gr::atomic_ref(_waitSlot).load_acquire();
+        if (slot == nullptr) {
+            return;
+        }
+        { std::lock_guard lock(slot->mutex); } // a waiter between its check and its wait holds the mutex until it waits
+        slot->changed.notify_all();
+    }
 };
 
 namespace detail {
