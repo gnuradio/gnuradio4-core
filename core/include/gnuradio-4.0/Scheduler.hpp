@@ -168,7 +168,7 @@ protected:
     std::size_t                    _nDeferredExchanges{0UZ}; // claimed swaps still running outside the job count
     std::size_t                    _nStopRequests{0UZ};
     bool                           _pendingStopRequest{false}; // a requested stop that no run loop has consumed yet
-    std::optional<Error>           _firstChildStartError;      // written by start()'s child sweep before workers exist, returned by runAndWait()
+    std::optional<Error>           _startError;                // written by failStart(), cleared when a start begins
 
     // for blocks that were added while scheduler was running. They need to be adopted by a thread
     std::mutex _adoptionBlocksMutex;
@@ -252,6 +252,9 @@ public:
     void releaseWorkQuiescence() { gr::atomic_ref(_workQuiescenceRequested).store_release(false); }
 
     [[nodiscard]] bool workerStarted() noexcept { return gr::atomic_ref(_nWorkersStarted).load_acquire() > 0UZ; }
+
+    // why the latest start could not complete and left the scheduler in ERROR; the next start clears it
+    [[nodiscard]] std::optional<Error> startError() const { return _startError; }
 
     // a worker holds its pool thread for the run's lifetime, so a start into a pool whose threads are all held
     // queues that worker behind them for as long as the holders live
@@ -634,10 +637,8 @@ public:
         if (!settled) {
             return settled;
         }
-        if (_firstChildStartError.has_value()) {
-            std::expected<void, Error> failed = std::unexpected(*_firstChildStartError);
-            _firstChildStartError.reset();
-            return failed;
+        if (_startError.has_value()) {
+            return std::unexpected(*_startError);
         }
         if (this->state() == ERROR) {
             return std::unexpected(Error{"a block error ended the run: the scheduler finished in the ERROR state"});
@@ -759,6 +760,20 @@ protected:
         }
     }
 
+    // ends a start that cannot complete: the children that did start are wound back down, the reason is kept for
+    // startError() and runAndWait(), and the scheduler enters ERROR. Only a reset leaves ERROR. The caller returns
+    // without spawning a worker, and no run loop then exists to settle the state later
+    void failStart(Error reason) {
+        _startError = std::move(reason);
+        graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) {
+            if (block->state() == lifecycle::State::RUNNING) {
+                this->emitErrorMessageIfAny("LifecycleState -> REQUESTED_STOP", block->changeStateTo(lifecycle::REQUESTED_STOP));
+                this->emitErrorMessageIfAny("LifecycleState -> STOPPED", block->changeStateTo(lifecycle::STOPPED));
+            }
+        });
+        this->emitErrorMessageIfAny("failStart() -> LifecycleState -> ERROR", this->changeStateTo(lifecycle::State::ERROR));
+    }
+
     void start() {
         using enum gr::lifecycle::State;
 
@@ -778,6 +793,7 @@ protected:
         const std::size_t workerGeneration = gr::atomic_ref(_workerGeneration).fetch_add(1UZ) + 1UZ;
         waitDone();
         gr::atomic_ref(_nWorkersStarted).store_release(0UZ);
+        _startError.reset();
 
         disconnectAllEdges();
         if (auto result = connectPendingEdges(); !result) {
@@ -791,14 +807,14 @@ protected:
 
         std::lock_guard lock(_executionOrderMutex);
 
-        _firstChildStartError.reset();
+        std::optional<Error> firstChildError;
         // the sweep runs whole under this lock, released before the workers are dispatched: a worker requesting a stop takes it
         {
             std::lock_guard childLock(_childLifecycleMutex);
             if (lifecycle::isShuttingDown(this->state())) {
                 return;
             }
-            graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) { //
+            graph::forEachBlock<TransparentBlockGroup>(*_graph, [this, &firstChildError](auto& block) { //
                 if (block->blockCategory() == ScheduledBlockGroup) {
                     // We don't simply move to RUNNING, as schedulers block. This code path
                     // uses a separate thread.
@@ -819,25 +835,18 @@ protected:
                     } else {
                         transitioned = block->changeStateTo(lifecycle::RUNNING);
                     }
-                    if (!transitioned && !_firstChildStartError.has_value()) {
-                        _firstChildStartError = transitioned.error();
+                    if (!transitioned && !firstChildError.has_value()) {
+                        firstChildError = transitioned.error();
                     }
                     this->emitErrorMessageIfAny("LifecycleState -> RUNNING", std::move(transitioned));
                 }
             });
         }
 
-        if (_firstChildStartError.has_value()) {
+        if (firstChildError.has_value()) {
             // a graph that could not start completely must not run degraded: a failed source never
-            // publishes an end-of-stream, so the run would also never terminate on its own. The
-            // children that did start are wound back down, no worker or watchdog is spawned, and
-            // runAndWait() returns the captured error
-            graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) {
-                if (block->state() == lifecycle::State::RUNNING) {
-                    this->emitErrorMessageIfAny("LifecycleState -> REQUESTED_STOP", block->changeStateTo(lifecycle::REQUESTED_STOP));
-                    this->emitErrorMessageIfAny("LifecycleState -> STOPPED", block->changeStateTo(lifecycle::STOPPED));
-                }
-            });
+            // publishes an end-of-stream, so the run would also never terminate on its own
+            failStart(std::move(*firstChildError));
             return;
         }
 
