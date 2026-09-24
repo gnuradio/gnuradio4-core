@@ -3,6 +3,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <expected>
+#include <string>
+#include <string_view>
 
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/Message.hpp>
@@ -42,6 +45,30 @@ struct NullSink : gr::Block<NullSink> {
     std::size_t _nReceived = 0UZ;
 
     void processOne(float) { _nReceived++; }
+};
+
+constexpr std::string_view kDeviceLost = "the device disappeared";
+
+// reports the loss of its device on its first call and then ends the stream, with ERROR or with DONE
+struct DeviceLossSource : gr::Block<DeviceLossSource> {
+    gr::PortOut<float> out;
+
+    gr::Annotated<bool, "return ERROR after the report"> fail_after_report = true;
+
+    GR_MAKE_REFLECTABLE(DeviceLossSource, out, fail_after_report);
+
+    bool _reported = false;
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        if (!_reported) {
+            this->emitErrorMessage("processBulk", kDeviceLost);
+            _reported = true;
+            outSpan.publish(std::min(outSpan.size(), 1UZ));
+            return gr::work::Status::OK;
+        }
+        outSpan.publish(0UZ);
+        return fail_after_report ? gr::work::Status::ERROR : gr::work::Status::DONE;
+    }
 };
 
 // no ports: exists only to call processScheduledMessages() directly, outside a graph
@@ -119,6 +146,65 @@ const boost::ut::suite<"message plane back-pressure"> messagePlaneTests = [] {
         block.propertySubscriptions[std::string(block::property::kHeartbeat)].insert("test-client");
         block.processScheduledMessages();
         expect(eq(reader.streamReader().available(), 1UZ)) << "a registered subscriber must still receive exactly one heartbeat per poll";
+    };
+};
+
+const boost::ut::suite<"a block error that ends the run"> blockErrorRunTests = [] {
+    using namespace boost::ut;
+    using namespace gr;
+
+    "without a message subscriber the run's error names the block and carries its reason"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_msg::DeviceLossSource>();
+        auto&     sink   = flow.emplaceBlock<qa_msg::NullSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+        const std::string sourceName(source.unique_name);
+
+        gr::scheduler::Simple sched;
+        expect(sched.exchange(std::move(flow)).has_value());
+
+        const std::expected<void, Error> result = sched.runAndWait();
+        expect(!result.has_value()) << "a block error with no subscriber must fail the run";
+        if (!result.has_value()) {
+            expect(result.error().message.find(sourceName) != std::string::npos) << "the error must name the block that reported it: " << result.error().message;
+            expect(result.error().message.find(qa_msg::kDeviceLost) != std::string::npos) << "the error must carry the block's reason: " << result.error().message;
+        }
+    };
+
+    "with a message subscriber the run's error names the block and carries its reason"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_msg::DeviceLossSource>();
+        auto&     sink   = flow.emplaceBlock<qa_msg::NullSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+        const std::string sourceName(source.unique_name);
+
+        gr::scheduler::Simple sched;
+        MsgPortIn             subscriber;
+        expect(sched.msgOut.connect(subscriber).has_value());
+        expect(sched.exchange(std::move(flow)).has_value());
+
+        const std::expected<void, Error> result = sched.runAndWait();
+        expect(!result.has_value()) << "a block that ends its run with ERROR must fail the run";
+        if (!result.has_value()) {
+            expect(result.error().message.find(sourceName) != std::string::npos) << "the error must name the block that reported it: " << result.error().message;
+            expect(result.error().message.find(qa_msg::kDeviceLost) != std::string::npos) << "the error must carry the block's reason: " << result.error().message;
+        }
+        expect(gt(subscriber.streamReader().available(), 0UZ)) << "the subscriber must still receive the block's error message";
+    };
+
+    "with a message subscriber a report the block survives leaves the run successful"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_msg::DeviceLossSource>({{"fail_after_report", false}});
+        auto&     sink   = flow.emplaceBlock<qa_msg::NullSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        gr::scheduler::Simple sched;
+        MsgPortIn             subscriber;
+        expect(sched.msgOut.connect(subscriber).has_value());
+        expect(sched.exchange(std::move(flow)).has_value());
+
+        expect(sched.runAndWait().has_value()) << "a run that ends with DONE succeeds whatever its blocks reported";
+        expect(source._reported) << "the block must have sent its report";
     };
 };
 

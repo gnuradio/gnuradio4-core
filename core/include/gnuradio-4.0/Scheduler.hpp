@@ -180,6 +180,7 @@ protected:
     MsgPortInFromChildren    _fromChildMessagePort;
     std::vector<gr::Message> _pendingMessagesToChildren;
     bool                     _messagePortsConnected = false;
+    std::optional<Error>     _firstErrorFromChildren; // the first error a child sent since the latest start, named for the child; runAndWait() returns it for a run ending in ERROR
 
     std::atomic_flag _processingScheduledMessages;
     // separate cache lines: every worker reads the flag and updates the counter on each iteration
@@ -538,20 +539,22 @@ public:
             return;
         }
 
+        std::optional<Error> firstError;
+        if (const auto errorMessage = std::ranges::find_if(messagesFromChildren, [](const gr::Message& msg) { return !msg.data.has_value(); }); errorMessage != messagesFromChildren.end()) {
+            const Error& reason = errorMessage->data.error();
+            firstError          = Error{std::format("block '{}' reports an error on '{}': {}", errorMessage->serviceName, errorMessage->endpoint, reason.message), reason.sourceLocation, reason.errorTime};
+            if (!_firstErrorFromChildren.has_value()) {
+                _firstErrorFromChildren = firstError;
+            }
+        }
+
         if (this->msgOut.nReaders() == 0) {
             // nobody is listening on messages -> convert errors to exceptions
-            std::optional<std::string> ignoredError;
-            for (const auto& msg : messagesFromChildren) {
-                if (!msg.data.has_value()) {
-                    ignoredError = std::format("scheduler {}: throwing ignored exception {:t}", this->name, msg.data.error());
-                    break;
-                }
-            }
             if (!messagesFromChildren.consume(nFromChildren)) {
                 this->emitErrorMessage("process child return messages", "Failed to consume messages from child message port");
             }
-            if (ignoredError.has_value()) {
-                throw gr::exception(*ignoredError);
+            if (firstError.has_value()) {
+                throw gr::exception(firstError->message, firstError->sourceLocation);
             }
             return;
         }
@@ -642,7 +645,7 @@ public:
             return std::unexpected(*_startError);
         }
         if (this->state() == ERROR) {
-            return std::unexpected(Error{"a block error ended the run: the scheduler finished in the ERROR state"});
+            return std::unexpected(_firstErrorFromChildren.value_or(Error{"a block error ended the run: the scheduler finished in the ERROR state"}));
         }
         return {};
     }
@@ -811,6 +814,7 @@ protected:
                 this->emitErrorMessage("start()", result.error());
             }
         }
+        _firstErrorFromChildren.reset();
 
         std::lock_guard lock(_executionOrderMutex);
 
