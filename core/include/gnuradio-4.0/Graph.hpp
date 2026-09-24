@@ -575,20 +575,42 @@ public:
             return std::unexpected(Error(std::format("No edge from {}.{} in {}", sourceBlock, sourcePort, this->unique_name)));
         }
 
-        if (auto result = sourcePortRef.disconnect(); !result) {
-            return std::unexpected(Error(std::format("Block {} sourcePortRef could not be disconnected {}: {}", sourceBlock, this->unique_name, result.error().message)));
+        // A kept stream edge whose record is Connected and whose input is connected holds one of the port's readers.
+        // Message records do not count, because a message input keeps the record of every source wired into it and
+        // reads only the source connected last. A WaitingToBeConnected record with a connected input may read this port
+        // or another one. emplaceEdge() connects the two ports and leaves the record waiting. connect() records an edge
+        // into a taken stream input, and the input reads its old source until the next start. The port is torn down
+        // when a requested input is connected and the port has more readers than the kept edges hold. Otherwise only
+        // the matching records are erased, and the port's readers keep their buffer.
+        const auto inputConnected = [&](const Edge& edge) {
+            const auto* input = resolvedInput(edge);
+            return input != nullptr && input->isConnected();
+        };
+        const auto streamInput = [&](const Edge& edge) {
+            const auto* input = resolvedInput(edge);
+            return input != nullptr && port::decodePortType(input->portMaskInfo()) == PortType::STREAM;
+        };
+        const auto keptReader              = [&](const Edge& edge) { return sharesSourcePort(edge) && !isRequestedEdge(edge) && edge.state() == Edge::EdgeState::Connected && streamInput(edge) && inputConnected(edge); };
+        const bool requestedInputConnected = std::ranges::any_of(_edges, [&](const Edge& edge) { return isRequestedEdge(edge) && inputConnected(edge); });
+        const bool holdsReader             = requestedInputConnected && sourcePortRef.nReaders() > static_cast<std::size_t>(std::ranges::count_if(_edges, keptReader));
+        if (holdsReader) {
+            if (auto result = sourcePortRef.disconnect(); !result) {
+                return std::unexpected(Error(std::format("Block {} sourcePortRef could not be disconnected {}: {}", sourceBlock, this->unique_name, result.error().message)));
+            }
         }
 
         const auto [first, last] = std::ranges::remove_if(_edges, isRequestedEdge);
         const auto nRemoved      = static_cast<std::size_t>(std::ranges::distance(first, last));
         _edges.erase(first, last);
 
-        for (auto& edge : _edges) { // siblings lost their buffer with the port teardown
-            if (sharesSourcePort(edge)) {
-                edge._state = Edge::EdgeState::WaitingToBeConnected;
+        if (holdsReader) {
+            for (auto& edge : _edges) { // siblings lost their buffer with the port teardown
+                if (sharesSourcePort(edge)) {
+                    edge._state = Edge::EdgeState::WaitingToBeConnected;
+                }
             }
+            std::ignore = connectPendingEdges();
         }
-        std::ignore = connectPendingEdges();
 
         return nRemoved;
     }
