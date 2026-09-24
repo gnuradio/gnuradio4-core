@@ -137,6 +137,24 @@ struct PluggableSource : gr::Block<PluggableSource> {
     }
 };
 
+// a source whose device is slow to open: start() returns once gSlowStartReleased is set, and an open device delivers
+// an endless stream
+inline std::atomic<bool> gSlowStartEntered{false};
+inline std::atomic<bool> gSlowStartReleased{false};
+
+struct SlowStartSource : gr::Block<SlowStartSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(SlowStartSource, out);
+
+    void start() {
+        gSlowStartEntered.store(true, std::memory_order_release);
+        gSlowStartReleased.wait(false, std::memory_order_acquire);
+    }
+
+    [[nodiscard]] constexpr float processOne() const noexcept { return 1.0f; }
+};
+
 // a source whose device is named by a setting it cannot resolve: settingsChanged() throws while the graph
 // is built, which is the user code Block::init() runs, and without a device the block ends the stream on
 // its first work call
@@ -340,10 +358,20 @@ struct SharedCountingSink : gr::Block<SharedCountingSink> {
     void processOne(float) { gSubSchedulerSamples.fetch_add(1UZ, std::memory_order_relaxed); }
 };
 
-// adoptBlock is the scheduler's entry point for a block added to an already running graph
+// adoptBlock is the scheduler's entry point for a block added to an already running graph. A message handler calls it
+// on a worker inside processScheduledMessages(), which also forwards the children's messages to msgOut. The test calls
+// it from its own thread. The wrapper holds the same flag as processScheduledMessages(). A report of adoptBlock() and
+// a worker's forwarding then never use msgOut's single writer at once
 struct AdoptingScheduler : TestScheduler {
-    using TestScheduler::adoptBlock;
     using TestScheduler::TestScheduler;
+
+    void adoptBlock(const std::shared_ptr<gr::BlockModel>& newBlock) {
+        while (std::atomic_flag_test_and_set_explicit(&this->_processingScheduledMessages, std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        TestScheduler::adoptBlock(newBlock);
+        std::atomic_flag_clear_explicit(&this->_processingScheduledMessages, std::memory_order_release);
+    }
 
     [[nodiscard]] std::size_t nWorkersStarted() { return gr::atomic_ref(this->_nWorkersStarted).load_acquire(); }
 };
@@ -1118,6 +1146,99 @@ const boost::ut::suite<"adopting a sub-scheduler"> subSchedulerAdoptionTests = [
         expect(reported.empty()) << std::format("a sub-scheduler that runs must not be reported as failing: '{}'", reported);
         expect(innerBlock->state() == RUNNING) << "a sub-scheduler with its own worker must be running when adoptBlock returns";
         expect(inner->workerStarted()) << "a worker supplied by the scheduler itself is not reported as started";
+        expect(qa_sched::awaitCondition([] { return qa_sched::gSubSchedulerSamples.load(std::memory_order_relaxed) > 0UZ; })) << "the adopted graph never moved a sample";
+
+        inner->stop();
+        outer.requestStop();
+        runner.join();
+    };
+
+    // the adoption waits up to watchdog_timeout for a worker of the sub-scheduler; a start that failed has none to wait for.
+    // The report and the sub-scheduler's own start errors reach msgOut together, from the test's thread and a worker
+    "an adopted sub-scheduler whose start fails is reported with its reason before the timeout"_test = [] {
+        auto pool = qa_sched::fixedPool(qa_sched::kAdoptionPoolName, 3U);
+
+        gr::Graph innerFlow;
+        auto&     innerSource = innerFlow.emplaceBlock<qa_sched::ThrowingStartSource>();
+        auto&     innerSink   = innerFlow.emplaceBlock<qa_sched::CountingSink>();
+        expect(innerFlow.connect<"out", "in">(innerSource, innerSink).has_value());
+
+        auto inner = std::make_shared<gr::SchedulerWrapper<qa_sched::TestScheduler>>(gr::property_map{{"poolName", std::string(qa_sched::kAdoptionPoolName)}});
+        inner->setGraph(std::move(innerFlow));
+        const std::shared_ptr<gr::BlockModel> innerBlock = gr::SchedulerModel::asBlockModelPtr(inner);
+
+        const auto                  timeout = qa_sched::kRunBound;
+        qa_sched::AdoptingScheduler outer({{"poolName", std::string(qa_sched::kAdoptionPoolName)}, {"watchdog_timeout", static_cast<gr::Size_t>(timeout.count())}});
+        expect(outer.exchange(qa_sched::makeEndlessGraph()).has_value());
+
+        gr::MsgPortIn fromOuter;
+        expect(outer.msgOut.connect(fromOuter).has_value());
+
+        std::thread runner([&outer] { std::ignore = outer.runAndWait(); });
+        expect(qa_sched::awaitState(outer, RUNNING)) << "the adopting scheduler did not reach RUNNING";
+        expect(qa_sched::awaitCondition([&outer] { return outer.nWorkersStarted() >= 2UZ; })) << "the adopting scheduler did not claim its own threads";
+
+        const auto adoptionBegan = std::chrono::steady_clock::now();
+        outer.adoptBlock(innerBlock);
+        const auto adoptionTook = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - adoptionBegan);
+
+        expect(innerBlock->state() == ERROR) << "the sub-scheduler's start must have failed";
+        expect(adoptionTook < timeout) << std::format("adoptBlock waited {} ms for a sub-scheduler whose start failed, against a timeout of {} ms", adoptionTook.count(), timeout.count());
+
+        const std::string reported = qa_sched::awaitErrorMessage(fromOuter, "adoptBlock");
+        expect(reported.find(std::string(innerSource.unique_name)) != std::string::npos) << std::format("the report must name the block that failed to start: '{}'", reported);
+        expect(reported.find("the device refused to open") != std::string::npos) << std::format("the report must carry what the start() hook threw: '{}'", reported);
+        expect(eq(innerSource._nEmitted, 0UZ));
+
+        inner->stop();
+        outer.requestStop();
+        runner.join();
+    };
+
+    // a start still in progress has no worker yet and is not a failure: the adoption keeps waiting for the worker
+    "an adopted sub-scheduler whose start is slow is waited for and runs"_test = [] {
+        qa_sched::gSubSchedulerSamples.store(0UZ, std::memory_order_relaxed);
+        qa_sched::gSlowStartEntered.store(false, std::memory_order_release);
+        qa_sched::gSlowStartReleased.store(false, std::memory_order_release);
+        auto pool = qa_sched::fixedPool(qa_sched::kAdoptionPoolName, 3U);
+
+        gr::Graph innerFlow;
+        auto&     innerSource = innerFlow.emplaceBlock<qa_sched::SlowStartSource>();
+        auto&     innerSink   = innerFlow.emplaceBlock<qa_sched::SharedCountingSink>();
+        expect(innerFlow.connect<"out", "in">(innerSource, innerSink).has_value());
+
+        auto inner = std::make_shared<gr::SchedulerWrapper<qa_sched::TestScheduler>>(gr::property_map{{"poolName", std::string(qa_sched::kAdoptionPoolName)}});
+        inner->setGraph(std::move(innerFlow));
+        const std::shared_ptr<gr::BlockModel> innerBlock = gr::SchedulerModel::asBlockModelPtr(inner);
+
+        qa_sched::AdoptingScheduler outer({{"poolName", std::string(qa_sched::kAdoptionPoolName)}, {"watchdog_timeout", static_cast<gr::Size_t>(std::chrono::milliseconds(qa_sched::kEventBound).count())}});
+        expect(outer.exchange(qa_sched::makeEndlessGraph()).has_value());
+
+        gr::MsgPortIn fromOuter;
+        expect(outer.msgOut.connect(fromOuter).has_value());
+
+        std::thread runner([&outer] { std::ignore = outer.runAndWait(); });
+        expect(qa_sched::awaitState(outer, RUNNING)) << "the adopting scheduler did not reach RUNNING";
+        expect(qa_sched::awaitCondition([&outer] { return outer.nWorkersStarted() >= 2UZ; })) << "the adopting scheduler did not claim its own threads";
+
+        std::atomic<bool> returned{false};
+        std::thread       adopter([&outer, &innerBlock, &returned] {
+            outer.adoptBlock(innerBlock);
+            returned.store(true, std::memory_order_release);
+        });
+
+        expect(qa_sched::awaitCondition([] { return qa_sched::gSlowStartEntered.load(std::memory_order_acquire); })) << "the sub-scheduler's start never reached its source";
+        std::this_thread::sleep_for(qa_sched::kRunBound); // the start stays in progress for the timeout the failed-start case allows
+        const bool returnedDuringStart = returned.load(std::memory_order_acquire);
+        qa_sched::gSlowStartReleased.store(true, std::memory_order_release);
+        qa_sched::gSlowStartReleased.notify_all();
+        adopter.join();
+
+        expect(!returnedDuringStart) << "adoptBlock must wait for a sub-scheduler whose start is still in progress";
+        const std::string reported = qa_sched::awaitErrorMessage(fromOuter, "adoptBlock", 1UZ);
+        expect(reported.empty()) << std::format("a slow start must not be reported as failing: '{}'", reported);
+        expect(innerBlock->state() == RUNNING) << "a sub-scheduler whose start completed must be running when adoptBlock returns";
+        expect(inner->workerStarted()) << "adoptBlock returned before the sub-scheduler's worker began executing";
         expect(qa_sched::awaitCondition([] { return qa_sched::gSubSchedulerSamples.load(std::memory_order_relaxed) > 0UZ; })) << "the adopted graph never moved a sample";
 
         inner->stop();

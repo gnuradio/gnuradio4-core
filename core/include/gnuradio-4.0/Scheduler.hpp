@@ -1212,7 +1212,8 @@ protected:
     }
 
     // a sub-scheduler's RUNNING transition runs its whole loop, so it starts through the threaded wrapper rather than
-    // on the thread that adopts it, and only an executing worker shows that its pool had a thread for it
+    // on the thread that adopts it, and only an executing worker shows that its pool had a thread for it. A start that
+    // cannot complete ends the sub-scheduler in ERROR without a worker, and the report carries its startError().
     void startAdoptedScheduler(const std::shared_ptr<BlockModel>& newBlock) {
         using enum lifecycle::State;
         auto* schedulerModel = dynamic_cast<SchedulerModel*>(newBlock.get());
@@ -1230,6 +1231,12 @@ protected:
 
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(watchdog_timeout.value);
         while (!schedulerModel->workerStarted()) {
+            // a worker counts itself before its run can end in ERROR. ERROR with no worker counted is a failed start.
+            if (newBlock->state() == ERROR && !schedulerModel->workerStarted()) {
+                const std::optional<Error> reason = schedulerModel->startError();
+                this->emitErrorMessage("adoptBlock", std::format("adopted sub-scheduler '{}' could not start: {}", newBlock->uniqueName(), reason.has_value() ? reason->message : std::string("its start ended in ERROR")));
+                return;
+            }
             if (std::chrono::steady_clock::now() >= deadline) {
                 this->emitErrorMessage("adoptBlock", std::format("no worker of adopted sub-scheduler '{}' began executing", newBlock->uniqueName()));
                 return;
