@@ -358,6 +358,17 @@ struct SharedCountingSink : gr::Block<SharedCountingSink> {
     void processOne(float) { gSubSchedulerSamples.fetch_add(1UZ, std::memory_order_relaxed); }
 };
 
+// samples a graph has moved, read by the test while the run goes on
+inline std::atomic<std::size_t> gObservedSamples{0UZ};
+
+struct ObservedSink : gr::Block<ObservedSink> {
+    gr::PortIn<float> in;
+
+    GR_MAKE_REFLECTABLE(ObservedSink, in);
+
+    void processOne(float) { gObservedSamples.fetch_add(1UZ, std::memory_order_relaxed); }
+};
+
 // adoptBlock is the scheduler's entry point for a block added to an already running graph. A message handler calls it
 // on a worker inside processScheduledMessages(), which also forwards the children's messages to msgOut. The test calls
 // it from its own thread. The wrapper holds the same flag as processScheduledMessages(). A report of adoptBlock() and
@@ -493,6 +504,10 @@ template<typename TPredicate>
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     return true;
+}
+
+[[nodiscard]] bool awaitObservedSamplesAbove(std::size_t nSamples) {
+    return awaitCondition([nSamples] { return gObservedSamples.load(std::memory_order_relaxed) > nSamples; });
 }
 
 // runAndWait() on its own thread with a deadline, so a stop that fails to take fails the assertion
@@ -1021,6 +1036,159 @@ const boost::ut::suite<"job lists sized to the free pool threads"> jobListSizing
         } else {
             restarter.detach(); // joining a thread stuck on the mutex would hang the suite instead of failing it
         }
+    };
+};
+
+// a blocking block leaves REQUESTED_STOP in its own work() call. In these cases no worker makes that call after the
+// stop: the run's worker is still queued, no run has started since the reset, a pause has parked the workers, or a
+// running worker reads the stop before its next call
+const boost::ut::suite<"a blocking block reaches STOPPED when its scheduler stops"> blockingBlockStopTests = [] {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    "a blocking block whose worker never ran stops with the scheduler and runs after a restart"_test = [] {
+        // occupying every thread of a fixed-size pool keeps the run's worker queued across the stop
+        auto pool      = qa_sched::twoThreadPool();
+        auto occupierA = std::make_unique<qa_sched::PoolOccupier>(*pool);
+        auto occupierB = std::make_unique<qa_sched::PoolOccupier>(*pool);
+
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::BlockingSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::StoppingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        qa_sched::TestScheduler scheduler({{"poolName", std::string(qa_sched::kOccupiedPoolName)}});
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(!scheduler.workerStarted()) << "the run's worker must still be queued behind the occupied threads";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_sched::awaitState(scheduler, STOPPED)) << "the scheduler did not stop";
+        expect(source.state() == STOPPED) << "a blocking block whose worker never ran must stop with the scheduler";
+
+        occupierA.reset(); // the queued worker of the stopped run becomes runnable
+        occupierB.reset();
+        expect(qa_sched::awaitCondition([&scheduler] { return !scheduler.isProcessing(); })) << "the queued worker of the stopped run did not end";
+        expect(scheduler.workerStarted()) << "the queued worker of the stopped run must have run";
+        expect(source.state() == STOPPED) << "a worker of the stopped run must leave the blocking block stopped";
+        expect(eq(sink._nReceived, 0UZ)) << "a worker of the stopped run must not move a sample";
+
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(qa_sched::awaitCondition([&scheduler] { return !scheduler.isProcessing(); })) << "the restarted run did not end";
+        expect(ge(sink._nReceived, qa_sched::kSamplesBeforeTerminal)) << "the restart must run the blocking block";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_sched::awaitState(scheduler, STOPPED)) << "the restarted scheduler did not stop";
+    };
+
+    "a blocking block stopped after a reset stops with the scheduler and runs after a restart"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::BlockingSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::StoppingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        qa_sched::TestScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(qa_sched::awaitCondition([&scheduler] { return !scheduler.isProcessing(); })) << "the first run did not end";
+        expect(scheduler.workerStarted()) << "the first run's workers must have run";
+        expect(source.state() == STOPPED) << "the end of the stream must stop the source";
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_sched::awaitState(scheduler, STOPPED)) << "the first run did not stop";
+        const std::size_t nFirstRun = sink._nReceived;
+
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(source.state() == INITIALISED) << "the reset must reinitialize the source";
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_sched::awaitState(scheduler, STOPPED)) << "the scheduler did not stop after the reset";
+        expect(source.state() == STOPPED) << "a blocking block that no run has started since the reset must stop with the scheduler";
+
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(qa_sched::awaitCondition([&scheduler] { return !scheduler.isProcessing(); })) << "the restarted run did not end";
+        expect(gt(sink._nReceived, nFirstRun)) << "the restart must run the blocking block";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_sched::awaitState(scheduler, STOPPED)) << "the restarted scheduler did not stop";
+    };
+
+    "a blocking block of a paused run reaches STOPPED when the scheduler stops and runs after a restart"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::BlockingSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::ObservedSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+        qa_sched::gObservedSamples.store(0UZ, std::memory_order_relaxed);
+
+        qa_sched::TestScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(qa_sched::awaitObservedSamplesAbove(0UZ)) << "the run did not move a sample";
+        expect(scheduler.changeStateTo(REQUESTED_PAUSE).has_value());
+        expect(qa_sched::awaitState(scheduler, PAUSED)) << "the scheduler did not pause";
+        // a worker reads the pause some iterations late. Until the workers leave, quiescence holds each worker out of
+        // work(), as the pause does once read
+        scheduler.requestWorkQuiescence();
+        expect(scheduler.isProcessing()) << "the paused run's workers must be parked, not gone";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_sched::awaitState(scheduler, STOPPED)) << "the paused scheduler did not stop";
+        expect(qa_sched::awaitCondition([&scheduler] { return !scheduler.isProcessing(); })) << "the paused run's workers did not leave";
+        scheduler.releaseWorkQuiescence();
+        expect(source.state() == STOPPED) << "a blocking block of a paused run must reach STOPPED when the scheduler stops";
+
+        const std::size_t nFirstRun = qa_sched::gObservedSamples.load(std::memory_order_relaxed);
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(qa_sched::awaitObservedSamplesAbove(nFirstRun)) << "the restart must run the blocking block";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_sched::awaitState(scheduler, STOPPED)) << "the restarted scheduler did not stop";
+    };
+
+    // the stop lands between two work() calls at a point the test cannot choose. The case stops and restarts one
+    // running graph many times and ends at the first restart that moves no sample
+    "a blocking block of a running graph reaches STOPPED at every stop and runs after every restart"_test = [] {
+        constexpr std::size_t kCycles = 20UZ;
+
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::BlockingSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::ObservedSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+        qa_sched::gObservedSamples.store(0UZ, std::memory_order_relaxed);
+
+        qa_sched::TestScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        std::size_t nRuns                 = 0UZ;
+        std::size_t nStopsWithoutWorkers  = 0UZ;
+        std::size_t nStopsShortOfStopped  = 0UZ;
+        std::size_t nStopsThatDidNotDrain = 0UZ;
+        for (std::size_t cycle = 0UZ; cycle < kCycles; ++cycle) {
+            const std::size_t nBefore = qa_sched::gObservedSamples.load(std::memory_order_relaxed);
+            std::ignore               = scheduler.changeStateTo(INITIALISED);
+            std::ignore               = scheduler.changeStateTo(RUNNING);
+            if (!qa_sched::awaitObservedSamplesAbove(nBefore)) {
+                break;
+            }
+            nRuns++;
+            nStopsWithoutWorkers += scheduler.isProcessing() ? 0UZ : 1UZ;
+
+            std::ignore = scheduler.changeStateTo(REQUESTED_STOP);
+            if (!qa_sched::awaitState(scheduler, STOPPED) || !qa_sched::awaitCondition([&scheduler] { return !scheduler.isProcessing(); })) {
+                nStopsThatDidNotDrain++;
+                break;
+            }
+            nStopsShortOfStopped += source.state() == STOPPED ? 0UZ : 1UZ;
+        }
+
+        expect(eq(nStopsWithoutWorkers, 0UZ)) << "every stop must land on a run whose workers are inside their loop";
+        expect(eq(nStopsThatDidNotDrain, 0UZ)) << "a stop of the running graph did not end its workers";
+        expect(eq(nStopsShortOfStopped, 0UZ)) << "stops of a running graph that left the blocking block short of STOPPED";
+        expect(eq(nRuns, kCycles)) << "every restart after a stop of the running graph must run the blocking block";
     };
 };
 
