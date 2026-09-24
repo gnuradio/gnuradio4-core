@@ -1,5 +1,7 @@
 #include <boost/ut.hpp>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -7,9 +9,11 @@
 #include <format>
 #include <memory>
 #include <mutex>
+#include <print>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #include <gnuradio-4.0/BlockingSync.hpp>
 #include <gnuradio-4.0/Graph.hpp>
@@ -260,6 +264,49 @@ struct GatedSource : gr::Block<GatedSource> {
         return gr::work::Status::OK;
     }
 };
+
+// A thread outside the scheduler offers samples, advances the block's progress sequence and notifies
+// it, the way a capture source's receive thread does. The block's next call publishes what was offered.
+// Each call records the time it began, up to kMaxTimedCalls calls.
+inline constexpr std::size_t                                             kMaxTimedCalls = 1UZ << 14;
+inline std::atomic<std::size_t>                                          gOfferedSamples{0UZ};
+inline std::atomic<std::size_t>                                          gPublishedOffers{0UZ};
+inline std::atomic<std::size_t>                                          gOfferedSourceCalls{0UZ};
+inline std::array<std::chrono::steady_clock::time_point, kMaxTimedCalls> gOfferedSourceCallTimes{};
+
+struct OfferedSource : gr::Block<OfferedSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(OfferedSource, out);
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        const std::size_t call = gOfferedSourceCalls.load(std::memory_order_relaxed);
+        if (call < kMaxTimedCalls) {
+            gOfferedSourceCallTimes[call] = std::chrono::steady_clock::now();
+        }
+        const std::size_t nPublish = std::min(gOfferedSamples.exchange(0UZ, std::memory_order_acq_rel), outSpan.size());
+        gPublishedOffers.fetch_add(nPublish, std::memory_order_relaxed);
+        outSpan.publish(nPublish);
+        gOfferedSourceCalls.store(call + 1UZ, std::memory_order_release);
+        gOfferedSourceCalls.notify_all();
+        return gr::work::Status::OK;
+    }
+};
+
+// returns the call count once it exceeds nCalls
+inline std::size_t awaitOfferedSourceCallBeyond(std::size_t nCalls) {
+    std::size_t seen = gOfferedSourceCalls.load(std::memory_order_acquire);
+    while (seen <= nCalls) {
+        gOfferedSourceCalls.wait(seen, std::memory_order_acquire);
+        seen = gOfferedSourceCalls.load(std::memory_order_acquire);
+    }
+    return seen;
+}
+
+[[nodiscard]] inline double median(std::vector<double> values) {
+    std::ranges::sort(values);
+    return values.empty() ? 0.0 : values[values.size() / 2UZ];
+}
 
 struct EndlessSource : gr::Block<EndlessSource> {
     gr::PortOut<float> out;
@@ -1560,6 +1607,76 @@ const boost::ut::suite<"the zero-progress park"> zeroProgressParkTests = [] {
         });
         expect(completed) << "the parked worker never re-ran the source";
         expect(eq(sink._nReceived, qa_sched::kSamplesBeforeTerminal));
+    };
+
+    // With timeout_ms 1 a park that nothing ends early lasts one millisecond. The test alternates two
+    // trials in one run, each starting at a call that the worker follows with a park: a notify sent
+    // kSettle into the park, timed to the source's next call, and a park left alone, timed from call to
+    // call. A notify that ends the park brings the next call in a fraction of the undisturbed park.
+    "a producer's notify ends the park"_test = [] {
+        using Micros                       = std::chrono::duration<double, std::micro>;
+        constexpr std::size_t kTrials      = 25UZ;
+        constexpr std::size_t kMaxAttempts = 2000UZ;
+        constexpr auto        kSettle      = std::chrono::microseconds(100); // the worker reaches its park well inside this
+
+        qa_sched::gOfferedSamples.store(0UZ);
+        qa_sched::gPublishedOffers.store(0UZ);
+        qa_sched::gOfferedSourceCalls.store(0UZ);
+
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::OfferedSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        qa_sched::BlockingScheduler scheduler({{"timeout_ms", gr::Size_t(1)}, {"timeout_inactivity_count", gr::Size_t(0)}, {"watchdog_timeout", gr::Size_t(10'000)}});
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        std::vector<double> notifiedWakeUs;
+        std::vector<double> undisturbedParkUs;
+        std::size_t         nOffered = 0UZ;
+
+        const bool completed = qa_sched::runAndWaitWithin(scheduler, qa_sched::kEventBound, [&] {
+            bool notifyTurn = true;
+            for (std::size_t attempt = 0UZ; attempt < kMaxAttempts && (notifiedWakeUs.size() < kTrials || undisturbedParkUs.size() < kTrials); ++attempt) {
+                const std::size_t nCalls = qa_sched::awaitOfferedSourceCallBeyond(qa_sched::gOfferedSourceCalls.load(std::memory_order_acquire));
+                if (nCalls + 2UZ >= qa_sched::kMaxTimedCalls) {
+                    break;
+                }
+                std::this_thread::sleep_for(kSettle);
+                if (qa_sched::gOfferedSourceCalls.load(std::memory_order_acquire) != nCalls) {
+                    continue; // another pass followed that call within kSettle, and no park came between them
+                }
+                if (notifyTurn) {
+                    const auto notifiedAt = std::chrono::steady_clock::now();
+                    qa_sched::gOfferedSamples.fetch_add(1UZ, std::memory_order_acq_rel);
+                    ++nOffered;
+                    source.progress->incrementAndGet();
+                    source.progress->notify_all();
+                    std::ignore       = qa_sched::awaitOfferedSourceCallBeyond(nCalls);
+                    const auto wokeAt = qa_sched::gOfferedSourceCallTimes[nCalls];
+                    if (wokeAt < notifiedAt) {
+                        continue; // the park ended on its timeout before the notify
+                    }
+                    notifiedWakeUs.push_back(Micros(wokeAt - notifiedAt).count());
+                } else {
+                    std::ignore = qa_sched::awaitOfferedSourceCallBeyond(nCalls);
+                    undisturbedParkUs.push_back(Micros(qa_sched::gOfferedSourceCallTimes[nCalls] - qa_sched::gOfferedSourceCallTimes[nCalls - 1UZ]).count());
+                }
+                notifyTurn = !notifyTurn;
+            }
+            std::ignore = qa_sched::awaitCondition([&nOffered] { return qa_sched::gPublishedOffers.load(std::memory_order_relaxed) == nOffered; });
+            scheduler.requestStop();
+        });
+
+        const double notifiedMedianUs    = qa_sched::median(notifiedWakeUs);
+        const double undisturbedMedianUs = qa_sched::median(undisturbedParkUs);
+        std::println("notify to next call: median {:.0f} us over {} trials; undisturbed park: median {:.0f} us over {} trials", notifiedMedianUs, notifiedWakeUs.size(), undisturbedMedianUs, undisturbedParkUs.size());
+
+        expect(completed) << "the run did not end after its trials";
+        expect(ge(notifiedWakeUs.size(), kTrials)) << "too few notifies reached a parked worker";
+        expect(ge(undisturbedParkUs.size(), kTrials)) << "too few parks ran undisturbed";
+        expect(eq(qa_sched::gPublishedOffers.load(), nOffered)) << "an offered sample was not published";
+        expect(lt(notifiedMedianUs, undisturbedMedianUs / 2.0)) << std::format("the worker resumed {:.0f} us after a notify, and an undisturbed park lasted {:.0f} us", notifiedMedianUs, undisturbedMedianUs);
     };
 };
 

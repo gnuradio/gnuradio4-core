@@ -1,10 +1,12 @@
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <complex>
 #include <fstream>
 #include <numeric>
 #include <ranges>
 #include <string>
+#include <thread>
 #include <tuple>
 
 #include <boost/ut.hpp>
@@ -153,6 +155,38 @@ const boost::ut::suite SequenceTests = [] {
         expect(eq(ss.str().size(), 0UZ));
         expect(nothrow([&ss, &s3] { ss << std::format("{}", *s3); }));
         expect(not ss.str().empty());
+    };
+
+    "a timed wait returns on a moved value and at its deadline"_test = [] {
+        using namespace gr;
+        using Clock = std::chrono::steady_clock;
+
+        const Sequence moved(3);
+        expect(moved.waitUntil(2UZ, Clock::now() + std::chrono::seconds(2))) << "a value that already left oldValue";
+
+        const Sequence still(2);
+        const auto     deadline = Clock::now() + std::chrono::milliseconds(2);
+        expect(!still.waitUntil(2UZ, deadline));
+        expect(Clock::now() >= deadline) << "the wait ended before its deadline";
+    };
+
+    // the notifier starts 0 to 252 us after the waiter's thread: some trials notify before the waiter blocks, some after
+    "a notify after incrementAndGet ends a timed wait before its deadline"_test = [] {
+        using namespace gr;
+        using Clock = std::chrono::steady_clock;
+
+        for (std::size_t trial = 0UZ; trial < 64UZ; ++trial) {
+            Sequence    sequence(7);
+            const auto  deadline = Clock::now() + std::chrono::seconds(2);
+            bool        changed  = false;
+            std::thread waiter([&sequence, &changed, deadline] { changed = sequence.waitUntil(7UZ, deadline); });
+            std::this_thread::sleep_for(std::chrono::microseconds(trial * 4UZ));
+            sequence.incrementAndGet();
+            sequence.notify_all();
+            waiter.join();
+            expect(changed);
+            expect(Clock::now() < deadline) << "trial" << trial << "waited out its deadline";
+        }
     };
 };
 
