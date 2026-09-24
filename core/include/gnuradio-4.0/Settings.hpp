@@ -211,8 +211,33 @@ template<typename T>
             }
 
         } else if constexpr (meta::array_or_vector_type<T>) {
-            using TValue            = typename T::value_type;
-            using TTensorElem       = std::conditional_t<std::is_same_v<TValue, std::string> || std::is_same_v<TValue, std::pmr::string>, pmt::Value, TValue>;
+            using TValue      = typename T::value_type;
+            using TTensorElem = std::conditional_t<std::is_same_v<TValue, std::string> || std::is_same_v<TValue, std::pmr::string>, pmt::Value, TValue>;
+
+            // an untagged YAML list parses to a sequence of type-erased values, and each element of such
+            // a sequence converts by the rule of a scalar setting of the element type
+            if constexpr (!std::is_same_v<TTensorElem, pmt::Value>) {
+                if (const auto* elements = value.get_if<Tensor<pmt::Value>>(); elements != nullptr) {
+                    T converted;
+                    if constexpr (meta::array_type<T>) {
+                        if (elements->size() != std::tuple_size_v<T>) {
+                            return std::unexpected(std::format("tensor size {} does not match array size {}", elements->size(), std::tuple_size_v<T>));
+                        }
+                    } else {
+                        converted.resize(elements->size());
+                    }
+                    auto out = converted.begin();
+                    for (const pmt::Value& element : *elements) {
+                        const auto elementValue = pmt::convert_safely<TValue>(element);
+                        if (!elementValue) {
+                            return std::unexpected(std::format("element {} of key '{}' does not convert to {}: {}", element, key, std::string(meta::type_name<TValue>()), elementValue.error()));
+                        }
+                        *out++ = *elementValue;
+                    }
+                    return converted;
+                }
+            }
+
             const auto* tensorValue = value.get_if<Tensor<TTensorElem>>();
             if (!tensorValue) {
                 return std::unexpected(std::format("Value {} is not a tensor of {}", value, meta::type_name<TTensorElem>()));

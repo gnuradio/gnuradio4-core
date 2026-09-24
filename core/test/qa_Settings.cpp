@@ -360,6 +360,35 @@ const boost::ut::suite<"staged type refusals"> stagedRefusalTests = [] {
         expect(!gr::settings::extractStagedValue<std::vector<float>>(wrong, "taps").has_value()) << "tensor mismatch reports";
     };
 
+    // an untagged YAML list parses to a tensor of type-erased values, whatever its elements hold
+    "a type-erased value sequence converts element by element"_test = [] {
+        const auto toSequence = [](const std::vector<pmt::Value>& elements) { return pmt::Value(gr::Tensor<pmt::Value>(elements.begin(), elements.end())); };
+
+        const auto taps = gr::settings::convertParameter<std::vector<float>>("taps", toSequence({pmt::Value(0.5), pmt::Value(std::int64_t{2}), pmt::Value(0.25f)}));
+        expect(taps.has_value()) << (taps.has_value() ? std::string{} : taps.error());
+        if (taps.has_value()) {
+            expect(eq(taps->size(), 3UZ));
+            expect(eq((*taps)[0], 0.5f));
+            expect(eq((*taps)[1], 2.0f));
+            expect(eq((*taps)[2], 0.25f));
+        }
+
+        const auto weights = gr::settings::convertParameter<std::array<double, 2UZ>>("weights", toSequence({pmt::Value(std::int64_t{3}), pmt::Value(0.5f)}));
+        expect(weights.has_value()) << (weights.has_value() ? std::string{} : weights.error());
+        if (weights.has_value()) {
+            expect(eq((*weights)[0], 3.0));
+            expect(eq((*weights)[1], 0.5));
+        }
+        expect(!gr::settings::convertParameter<std::array<double, 3UZ>>("weights", toSequence({pmt::Value(3.0), pmt::Value(0.5)})).has_value()) << "a sequence whose length differs from the array's refuses";
+
+        const auto refused = gr::settings::convertParameter<std::vector<float>>("taps", toSequence({pmt::Value(0.5), pmt::Value(std::pmr::string("two"))}));
+        expect(!refused.has_value()) << "an element the scalar rule would refuse refuses the sequence";
+        if (!refused.has_value()) {
+            expect(refused.error().contains("taps")) << refused.error();
+            expect(refused.error().contains("two")) << refused.error();
+        }
+    };
+
     "a native size_t survives the staging representation on every platform"_test = [] {
         constexpr std::size_t expected = 37UZ;
         const pmt::Value      staged{gr::detail::castToGrSizeIfNeeded(expected)};

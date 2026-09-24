@@ -295,6 +295,58 @@ const boost::ut::suite<"GRC round trip"> grcTests = [] {
         expect(parameters.at("enabled") == pmt::Value(false)) << "a bool setting did not survive";
     };
 
+    // a list without a type tag reaches the block as a sequence of type-erased values
+    "an untagged list in a graph file sets a vector setting"_test = [] {
+        registerTestBlocks();
+        PluginLoader& loader = gr::globalPluginLoader();
+
+        const std::string document = R"yaml(blocks:
+  - id: qa::Scale
+    parameters:
+      name: scale
+      taps: [0.5, 2, 0.25]
+)yaml";
+
+        std::string        reported;
+        std::vector<float> applied;
+        try {
+            auto loaded = gr::loadGrc(loader, document);
+            expect(eq(loaded->blocks().size(), 1UZ));
+            applied = static_cast<Scale*>(loaded->blocks().front()->raw())->taps.value;
+        } catch (const gr::exception& e) {
+            reported = e.message;
+        }
+        expect(reported.empty()) << reported;
+        expect(eq(applied.size(), 3UZ)) << "the block holds the list";
+        if (applied.size() == 3UZ) {
+            expect(eq(applied[0], 0.5f));
+            expect(eq(applied[1], 2.0f));
+            expect(eq(applied[2], 0.25f));
+        }
+    };
+
+    "an untagged list element that does not convert refuses the graph file"_test = [] {
+        registerTestBlocks();
+        PluginLoader& loader = gr::globalPluginLoader();
+
+        const std::string document = R"yaml(blocks:
+  - id: qa::Scale
+    parameters:
+      name: scale
+      taps: [0.5, two]
+)yaml";
+
+        std::string reported;
+        try {
+            const auto loaded = gr::loadGrc(loader, document);
+            expect(false) << std::format("{} blocks loaded; a list element that does not convert must be refused", loaded->blocks().size());
+        } catch (const gr::exception& e) {
+            reported = e.message;
+        }
+        expect(reported.contains("taps")) << reported;
+        expect(reported.contains("two")) << reported;
+    };
+
     // the writer keyed edges by name; two blocks may share one, and the second then claimed both ends
     "two blocks sharing a name keep their own edges"_test = [] {
         registerTestBlocks();
