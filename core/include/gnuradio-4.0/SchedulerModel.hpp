@@ -49,6 +49,9 @@ public:
 
     [[nodiscard]] virtual bool workerStarted() = 0;
 
+    // why the latest start could not complete; the next start clears it
+    [[nodiscard]] virtual std::optional<Error> startError() const = 0;
+
     virtual void requestWorkQuiescence() = 0;
     virtual void releaseWorkQuiescence() = 0;
 };
@@ -78,6 +81,8 @@ public:
     std::expected<void, Error> startAdopted() override { return startOnOwnThread(true); }
 
     [[nodiscard]] bool workerStarted() override { return this->blockRef().workerStarted(); }
+
+    [[nodiscard]] std::optional<Error> startError() const override { return this->blockRef().startError(); }
 
     void requestWorkQuiescence() override { this->blockRef().requestWorkQuiescence(); }
     void releaseWorkQuiescence() override { this->blockRef().releaseWorkQuiescence(); }
