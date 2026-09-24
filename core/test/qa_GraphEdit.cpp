@@ -126,6 +126,25 @@ void registerTestBlocks() {
 
 void sendMessage(gr::MsgPortOut& port, std::string_view endpoint, gr::property_map data) { gr::sendMessage<gr::message::Command::Set>(port, "", endpoint, std::move(data)); }
 
+// the unique names of the graph's blocks in insertion order, comma separated
+[[nodiscard]] std::string blockNames(const gr::Graph& graph) {
+    std::string names;
+    for (const std::shared_ptr<gr::BlockModel>& block : graph.blocks()) {
+        names += std::format("{}{}", names.empty() ? "" : ", ", block->uniqueName());
+    }
+    return names;
+}
+
+// the message of the gr::exception that emplace throws, empty when it returns
+[[nodiscard]] std::string refusal(auto emplace) {
+    try {
+        emplace();
+    } catch (const gr::exception& e) {
+        return e.message;
+    }
+    return {};
+}
+
 } // namespace qa_edit
 
 const boost::ut::suite<"graph editing"> graphEditTests = [] {
@@ -196,7 +215,60 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         auto& toReplace = flow.emplaceBlock<qa_edit::Source>();
         expect(nothrow([&] { std::ignore = flow.replaceBlock(toReplace.unique_name, canaryType, {}); })) << "replaceBlock must consult the graph's own loader";
     };
+
+    "a block emplaced by name with a setting it does not declare stays out of the graph"_test = [] {
+        qa_edit::registerTestBlocks();
+        const std::string tunableType{gr::meta::type_name<qa_edit::Tunable>()};
+
+        gr::Graph flow;
+        std::ignore                     = flow.emplaceBlock<qa_edit::Source>();
+        const std::size_t nBlocksBefore = flow.blocks().size();
+        const std::string namesBefore   = qa_edit::blockNames(flow);
+
+        const std::string refused = qa_edit::refusal([&] { std::ignore = flow.emplaceBlock(tunableType, {{"gian", 2.0f}}); });
+        expect(refused.starts_with("settings could not be applied") && refused.contains("gian")) << "the refusal must reach the caller as thrown, got: " << refused;
+        expect(eq(flow.blocks().size(), nBlocksBefore)) << "the block stayed in the graph after throwing: " << refused;
+        expect(eq(qa_edit::blockNames(flow), namesBefore)) << "the graph holds other blocks after throwing: " << refused;
+
+        const std::shared_ptr<gr::BlockModel>& accepted = flow.emplaceBlock(tunableType, {{"gain", 2.0f}});
+        expect(eq(flow.blocks().size(), nBlocksBefore + 1UZ)) << "a block with settings it declares must join the graph";
+        const std::optional<gr::pmt::Value> gain = accepted->settings().get("gain");
+        expect(fatal(gain.has_value())) << "the accepted block reports no gain setting";
+        expect(eq(gain->value_or(0.0f), 2.0f)) << "the accepted block must apply its settings";
+    };
+
+    "a block emplaced by name with a value its setting refuses stays out of the graph"_test = [] {
+        qa_edit::registerTestBlocks();
+        const std::string tunableType{gr::meta::type_name<qa_edit::Tunable>()};
+
+        gr::Graph flow;
+        std::ignore                     = flow.emplaceBlock<qa_edit::Source>();
+        const std::size_t nBlocksBefore = flow.blocks().size();
+        const std::string namesBefore   = qa_edit::blockNames(flow);
+
+        const std::string refused = qa_edit::refusal([&] { std::ignore = flow.emplaceBlock(tunableType, {{"gain", std::string("loud")}}); });
+        expect(refused.contains("'gain'")) << "the refusal must reach the caller as thrown, got: " << refused;
+        expect(eq(flow.blocks().size(), nBlocksBefore)) << "the block stayed in the graph after throwing: " << refused;
+        expect(eq(qa_edit::blockNames(flow), namesBefore)) << "the graph holds other blocks after throwing: " << refused;
+    };
 #endif
+
+    "a typed emplacement with a setting the block does not declare leaves the graph as it was"_test = [] {
+        gr::Graph flow;
+        std::ignore                     = flow.emplaceBlock<qa_edit::Source>();
+        const std::size_t nBlocksBefore = flow.blocks().size();
+        const std::string namesBefore   = qa_edit::blockNames(flow);
+
+        const std::string refused = qa_edit::refusal([&] { std::ignore = flow.emplaceBlock<qa_edit::Tunable>({{"gian", 2.0f}}); });
+        expect(refused.starts_with("settings could not be applied") && refused.contains("gian")) << "the refusal must reach the caller as thrown, got: " << refused;
+        expect(eq(flow.blocks().size(), nBlocksBefore)) << "the block stayed in the graph after throwing: " << refused;
+        expect(eq(qa_edit::blockNames(flow), namesBefore)) << "the graph holds other blocks after throwing: " << refused;
+
+        auto& accepted = flow.emplaceBlock<qa_edit::Tunable>({{"gain", 2.0f}});
+        expect(eq(flow.blocks().size(), nBlocksBefore + 1UZ)) << "a block with settings it declares must join the graph";
+        expect(eq(accepted.gain.value, 2.0f)) << "the accepted block must apply its settings";
+        expect(accepted.state() == INITIALISED) << "the accepted block must be initialized";
+    };
 
     "an exported output with interior consumers feeds both sides of the boundary"_test = [] {
         gr::Graph flow;

@@ -420,22 +420,23 @@ public:
         }
     }
 
+    // addBlock() and emplaceBlock() initialize a block before it joins the graph: init() throws for a setting the
+    // block does not declare or a value it refuses, and the graph then holds the blocks it held before the call
     std::shared_ptr<BlockModel> const& addBlock(std::shared_ptr<BlockModel> block, bool initBlock = true) {
-        const std::shared_ptr<BlockModel>& newBlock = _blocks.emplace_back(block);
         if (initBlock) {
-            newBlock->init(_progress, this->compute_domain);
+            block->init(_progress, this->compute_domain);
         }
-        return newBlock;
+        return _blocks.emplace_back(std::move(block));
     }
 
     template<BlockLike TBlock>
     requires std::is_constructible_v<TBlock, property_map>
     TBlock& emplaceBlock(gr::property_map initialSettings = gr::property_map()) {
         static_assert(std::is_same_v<TBlock, std::remove_reference_t<TBlock>>);
-        BlockModel*                        raw         = new BlockWrapper<TBlock>(std::move(initialSettings));
-        const std::shared_ptr<BlockModel>& newBlock    = _blocks.emplace_back(std::shared_ptr<BlockModel>{raw});
-        TBlock*                            rawBlockRef = static_cast<TBlock*>(newBlock->raw());
+        std::shared_ptr<BlockModel> newBlock{new BlockWrapper<TBlock>(std::move(initialSettings))};
+        TBlock*                     rawBlockRef = static_cast<TBlock*>(newBlock->raw());
         rawBlockRef->init(_progress);
+        _blocks.emplace_back(std::move(newBlock));
         return *rawBlockRef;
     }
 
