@@ -347,6 +347,49 @@ struct RateStreamResult {
 
 [[nodiscard]] Decimator makeDecimator();
 
+const boost::ut::suite<"integer into floating-point settings"> exactIntegerTests = [] {
+    using namespace boost::ut;
+    using gr::pmt::convert_safely;
+
+    // an integer converts when the bits between its highest and lowest set bit fit the mantissa: trailing zero bits
+    // go into the exponent, so only a value that would round is refused
+    "an integer a float holds exactly converts, whatever its magnitude"_test = [] {
+        const auto rate = convert_safely<float>(std::int64_t{20'000'000}); // 78125 * 2^8, 17 significant bits
+        expect(rate.has_value()) << (rate.has_value() ? std::string{} : rate.error());
+        expect(eq(rate.value_or(0.0f), 20'000'000.0f));
+
+        const auto large = convert_safely<double>(std::int64_t{1} << 60);
+        expect(eq(large.value_or(0.0), 0x1p60)) << (large.has_value() ? std::string{} : large.error());
+
+        const auto lowest = convert_safely<double>(std::numeric_limits<std::int64_t>::min()); // -2^63
+        expect(eq(lowest.value_or(0.0), -0x1p63)) << (lowest.has_value() ? std::string{} : lowest.error());
+
+        expect(eq(convert_safely<float>(std::int64_t{0}).value_or(-1.0f), 0.0f));
+        expect(eq(convert_safely<float>(std::int64_t{-16'777'216}).value_or(0.0f), -16'777'216.0f)); // -2^24
+    };
+
+    "an integer that would round is refused, naming the bits it needs"_test = [] {
+        const auto odd = convert_safely<float>(std::int64_t{16'777'217}); // 2^24 + 1
+        expect(!odd.has_value());
+        expect(!odd.has_value() && odd.error().contains("25 significant bits")) << (odd.has_value() ? std::string{} : odd.error());
+
+        const auto wide = convert_safely<double>((std::int64_t{1} << 53) + 1);
+        expect(!wide.has_value());
+        expect(!wide.has_value() && wide.error().contains("54 significant bits")) << (wide.has_value() ? std::string{} : wide.error());
+
+        expect(!convert_safely<double>(std::numeric_limits<std::uint64_t>::max()).has_value());
+    };
+
+    "a float setting takes an integer it holds exactly"_test = [] {
+        qa_settings::RateCountingBlock block;
+        block.init(std::make_shared<gr::Sequence>());
+        expect(nothrow([&] { std::ignore = block.settings().set({{"sample_rate", std::int64_t{20'000'000}}}); }));
+        std::ignore = block.settings().activateContext();
+        std::ignore = block.settings().applyStagedParameters();
+        expect(eq(block.sample_rate.value, 20'000'000.0f));
+    };
+};
+
 const boost::ut::suite<"staged type refusals"> stagedRefusalTests = [] {
     using namespace boost::ut;
 
