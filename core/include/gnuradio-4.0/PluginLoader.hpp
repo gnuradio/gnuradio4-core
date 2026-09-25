@@ -291,7 +291,9 @@ public:
         _dl_handle = dlopen(plugin_file.c_str(), RTLD_LAZY | RTLD_LOCAL);
 #endif
         if (!_dl_handle) {
-            _status = "Failed to load the plugin file";
+            // the linker's reason: a missing library, a versioned name the installation lacks, an undefined symbol
+            const char* reason = dlerror();
+            _status            = reason == nullptr ? "Failed to load the plugin file" : std::format("Failed to load the plugin file: {}", reason);
             return;
         }
 

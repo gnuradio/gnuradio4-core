@@ -1,7 +1,9 @@
 #include <boost/ut.hpp>
 
 #include <algorithm>
+#include <filesystem>
 #include <format>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -98,6 +100,24 @@ const boost::ut::suite<"PluginBlockLibrary"> pluginBlockLibraryTests = [] {
         const auto failed = std::ranges::find_if(loader.failedPlugins(), [](const auto& entry) { return entry.first.contains("bad_plugin"); });
         expect(fatal(failed != loader.failedPlugins().end())) << "the plugin that cannot be instantiated is still a failure";
         expect(!failed->second.empty()) << "a failure carries its reason";
+    };
+
+    "a file the dynamic linker cannot map is reported with the linker's reason"_test = [] {
+        const std::filesystem::path directory = std::filesystem::path(TESTS_BINARY_PATH) / "unmappable_library";
+        std::filesystem::create_directories(directory);
+        const std::filesystem::path file = directory / "libempty.so";
+        { std::ofstream(file).flush(); } // an empty file: dlopen refuses it and dlerror() says why
+        expect(fatal(std::filesystem::exists(file)));
+
+        const std::vector<std::string> directories{directory.string()};
+        PluginLoader                   loader(gr::globalBlockRegistry(), gr::globalSchedulerRegistry(), directories);
+        std::filesystem::remove_all(directory);
+
+        const auto failed = std::ranges::find_if(loader.failedPlugins(), [](const auto& entry) { return entry.first.contains("libempty.so"); });
+        expect(fatal(failed != loader.failedPlugins().end())) << "a file dlopen refuses is a failed plugin";
+        constexpr std::string_view prefix = "Failed to load the plugin file: ";
+        expect(failed->second.starts_with(prefix)) << failed->second;
+        expect(gt(failed->second.size(), prefix.size())) << "the reason names what the linker refused";
     };
 
     "a name that reads as a shared object but is not opened is reported"_test = [] {
