@@ -63,9 +63,17 @@ struct Result {
 #ifdef GR_TOOLS_CORE_TEST_PLUGINS
 constexpr std::string_view kGraphFile{GR_TOOLS_TEST_ASSETS "/source_to_sink.yaml"};
 constexpr std::string_view kSettingsChainFile{GR_TOOLS_TEST_ASSETS "/settings_chain.yaml"};
+constexpr std::string_view kStartChainFile{GR_TOOLS_TEST_ASSETS "/start_chain.yaml"};
+constexpr std::string_view kUnnamedResourceFile{GR_TOOLS_TEST_ASSETS "/unnamed_resource_chain.yaml"};
 
 // the graph, the plugins that supply its blocks, and a bound short enough for a test
 [[nodiscard]] std::vector<std::string> boundedRun() { return {"--graph", std::string(kGraphFile), "--plugin-dir", GR_TOOLS_CORE_TEST_PLUGINS, "--seconds", "0.5"}; }
+
+// the same, over the chain whose two middle blocks open a resource when they start
+[[nodiscard]] std::vector<std::string> startChainRun() { return {"--graph", std::string(kStartChainFile), "--plugin-dir", GR_TOOLS_CORE_TEST_PLUGINS, "--seconds", "0.5"}; }
+
+// the same, over a chain whose middle block names no resource and fails to start
+[[nodiscard]] std::vector<std::string> unnamedResourceRun() { return {"--graph", std::string(kUnnamedResourceFile), "--plugin-dir", GR_TOOLS_CORE_TEST_PLUGINS, "--seconds", "0.5"}; }
 
 // the same, over the four-block chain the settings cases set a value on
 [[nodiscard]] std::vector<std::string> settingsChainRun() { return {"--graph", std::string(kSettingsChainFile), "--plugin-dir", GR_TOOLS_CORE_TEST_PLUGINS, "--seconds", "0.5"}; }
@@ -153,6 +161,56 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
         expect(set.output.contains("the graph ended on its own")) << "the bound the setting carries stopped the run" << set.output;
     };
 
+    "--set gives a block the value its start() reads"_test = [] {
+        std::vector<std::string> arguments = startChainRun();
+        arguments.insert(arguments.end(), {"--set", "first.resource=named-on-the-command-line", "--show", "first"});
+
+        const Result started = run(arguments);
+        expect(eq(started.exitCode, 0)) << started.output;
+        expect(started.output.contains(R"(first: resource_at_start = "named-on-the-command-line")")) << "start() read the value the command line set, not the graph file's" << started.output;
+        expect(started.output.contains("the graph was stopped before it ended")) << started.output;
+    };
+
+    "a block whose start fails holds every --set value, and --show reads each back"_test = [] {
+        std::vector<std::string> arguments = unnamedResourceRun();
+        arguments.insert(arguments.end(), {"--set", "first.sample_rate=2000", "--set", "first.gain=0.5", "--set", "source.event_count=1000", "--show", "first", "--show", "source"});
+
+        const Result failed = run(arguments);
+        expect(eq(failed.exitCode, 1)) << failed.output;
+        expect(failed.output.contains("no resource to open")) << "start() failed on the empty resource the graph file gives the block" << failed.output;
+        expect(failed.output.contains("first: sample_rate = 2000")) << failed.output;
+        expect(failed.output.contains("first: gain = 0.5")) << failed.output;
+        expect(failed.output.contains("source: event_count = 1000")) << "the value set on a second block is held as well" << failed.output;
+    };
+
+    // a --set value is read where the graph file's own value is read, so a value the block refuses is refused as the
+    // graph file's would be: a value outside the block's limits by the framework's own line, and a value its
+    // settingsChanged() throws on when the scheduler initializes the block, before start() runs
+    "a --set value the block refuses is refused as the graph file's value would be"_test = [] {
+        std::vector<std::string> outOfLimits = startChainRun();
+        outOfLimits.insert(outOfLimits.end(), {"--set", "first.gain=2", "--show", "first"});
+
+        const Result refusedByLimits = run(outOfLimits);
+        expect(refusedByLimits.output.contains("Failed to validate field 'gain' with value '2.000000'")) << refusedByLimits.output;
+        expect(!refusedByLimits.output.contains("first: gain = 2")) << "the block keeps a value inside its limits" << refusedByLimits.output;
+
+        std::vector<std::string> refusedBySettingsChanged = startChainRun();
+        refusedBySettingsChanged.insert(refusedBySettingsChanged.end(), {"--set", "first.sample_rate=-1"});
+
+        const Result refusedByBlock = run(refusedBySettingsChanged);
+        expect(refusedByBlock.output.contains("init() throws: sample_rate -1 is not positive")) << refusedByBlock.output;
+    };
+
+    "a --set value the block forwards reaches the block downstream in place of the graph file's"_test = [] {
+        std::vector<std::string> arguments = startChainRun();
+        arguments.insert(arguments.end(), {"--set", "first.sample_rate=2000", "--set", "source.event_count=1000", "--show", "second"});
+
+        const Result forwarded = run(arguments);
+        expect(eq(forwarded.exitCode, 0)) << forwarded.output;
+        expect(forwarded.output.contains("second: sample_rate = 2000")) << "the graph file gives the upstream block 1000" << forwarded.output;
+        expect(forwarded.output.contains("the graph ended on its own")) << "the run ended after every sample had passed the downstream block" << forwarded.output;
+    };
+
     "a block, or a block setting, the graph does not hold is refused"_test = [] {
         std::vector<std::string> unknownKey = settingsChainRun();
         unknownKey.emplace_back("-s");
@@ -160,7 +218,7 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
 
         const Result refusedKey = run(unknownKey);
         expect(eq(refusedKey.exitCode, 1)) << refusedKey.output;
-        expect(refusedKey.output.contains("the block source declares no setting named 'no_such_key'")) << refusedKey.output;
+        expect(refusedKey.output.contains("block 'source' of type 'good::fixed_source<float32>' declares no setting named 'no_such_key'; the nearest are")) << refusedKey.output;
 
         std::vector<std::string> unknownBlock = settingsChainRun();
         unknownBlock.emplace_back("-s");
@@ -168,7 +226,7 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
 
         const Result refusedBlock = run(unknownBlock);
         expect(eq(refusedBlock.exitCode, 1)) << refusedBlock.output;
-        expect(refusedBlock.output.contains("no block named no_such_block")) << refusedBlock.output;
+        expect(refusedBlock.output.contains("settings are given for block 'no_such_block', and the graph holds no block of that name")) << refusedBlock.output;
     };
 
     "a block name the graph does not hold is refused"_test = [] {

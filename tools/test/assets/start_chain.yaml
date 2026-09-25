@@ -1,0 +1,22 @@
+# The graph the start cases run: a source, two blocks that each open the resource they name when they start, and a
+# sink. `second` takes its sample rate from the stream `first` forwards.
+blocks:
+  - id: good::fixed_source<float32>
+    parameters:
+      name: source
+  - id: good::start_recorder<float32>
+    parameters:
+      name: first
+      resource: named-in-the-graph-file
+      sample_rate: !!float32 1000
+  - id: good::start_recorder<float32>
+    parameters:
+      name: second
+      resource: named-in-the-graph-file
+  - id: good::cout_sink<float32>
+    parameters:
+      name: sink
+connections:
+  - [source, out, first, in]
+  - [first, out, second, in]
+  - [second, out, sink, in]

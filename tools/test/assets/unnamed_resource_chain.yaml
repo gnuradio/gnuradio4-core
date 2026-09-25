@@ -1,0 +1,14 @@
+# A source, a block that fails to start because the graph file names no resource for it, and a sink.
+blocks:
+  - id: good::fixed_source<float32>
+    parameters:
+      name: source
+  - id: good::start_recorder<float32>
+    parameters:
+      name: first
+  - id: good::cout_sink<float32>
+    parameters:
+      name: sink
+connections:
+  - [source, out, first, in]
+  - [first, out, sink, in]

@@ -634,4 +634,135 @@ connections:
     };
 };
 
+/**
+ * `loadGrc` with a caller's settings: each block reads them where it reads the file's parameters, and a name or a
+ * key the graph cannot take is refused before any block is added.
+ */
+const boost::ut::suite<"GRC load with settings"> grcSettingsTests = [] {
+    using namespace boost::ut;
+    using namespace gr;
+    using namespace qa_grc;
+
+    static constexpr std::string_view kSummedRamps = R"yaml(blocks:
+  - id: qa::RampSource
+    parameters:
+      name: left
+      n_samples: 64
+  - id: qa::RampSource
+    parameters:
+      name: middle
+      n_samples: 64
+  - id: qa::RampSource
+    parameters:
+      name: right
+      n_samples: 64
+  - id: qa::SumInputs
+    parameters:
+      name: sum
+      n_inputs: 2
+  - id: qa::RecordingSink
+    parameters:
+      name: summed-sink
+connections:
+  - [left, out, sum, [0, 0]]
+  - [middle, out, sum, [0, 1]]
+  - [right, out, sum, [0, 2]]
+  - [sum, out, summed-sink, in]
+)yaml";
+
+    "a given n_inputs sizes the collection before the connections are made"_test = [] {
+        registerTestBlocks();
+        PluginLoader& loader = gr::globalPluginLoader();
+
+        auto loaded = gr::loadGrc(loader, kSummedRamps, gr::BlockSettings{{"sum", {{"n_inputs", gr::Size_t{3U}}}}});
+        expect(eq(loaded->edges().size(), 4UZ)) << "the third input exists when the file connects it";
+
+        gr::scheduler::Simple<> scheduler;
+        expect(scheduler.exchange(std::move(loaded)).has_value());
+        expect(scheduler.runAndWait().has_value());
+        const std::vector<float> samples = takeCollected("summed-sink");
+        expect(eq(samples.size(), 64UZ));
+        expect(eq(samples.back(), 3.0f * 63.0f)) << "all three ramps reach the sum";
+    };
+
+    // the edges are resolved when the scheduler takes the graph, so the file's own count shows at the run
+    "the file alone does not bring the third ramp to the sum"_test = [] {
+        registerTestBlocks();
+        PluginLoader& loader = gr::globalPluginLoader();
+
+        bool summedThree = false;
+        try {
+            auto                    loaded = gr::loadGrc(loader, kSummedRamps);
+            gr::scheduler::Simple<> scheduler;
+            if (scheduler.exchange(std::move(loaded)).has_value() && scheduler.runAndWait().has_value()) {
+                const std::vector<float> samples = takeCollected("summed-sink");
+                summedThree                      = !samples.empty() && samples.back() == 3.0f * 63.0f;
+            }
+        } catch (const gr::exception&) {
+        }
+        std::ignore = takeCollected("summed-sink");
+        expect(!summedThree) << "the file's own n_inputs of 2 leaves in#2 absent";
+    };
+
+    "a given value replaces the file's value and leaves the other keys"_test = [] {
+        registerTestBlocks();
+        PluginLoader& loader = gr::globalPluginLoader();
+
+        const auto             loaded   = gr::loadGrc(loader, R"yaml(blocks:
+  - id: qa::Scale
+    parameters:
+      name: scale
+      gain: 3.0
+      label: from-the-file
+)yaml",
+                          gr::BlockSettings{{"scale", {{"gain", 5.0f}}}});
+        const gr::property_map settings = loaded->blocks().front()->settings().get();
+        expect(settings.at("gain") == pmt::Value(5.0f));
+        expect(settings.at("label") == pmt::Value(std::string("from-the-file")));
+    };
+
+    "a name no block carries and a key a block does not declare are refused with the nearest names"_test = [] {
+        registerTestBlocks();
+        PluginLoader& loader = gr::globalPluginLoader();
+
+        auto reportOf = [&loader](const gr::BlockSettings& overrides) {
+            try {
+                std::ignore = gr::loadGrc(loader, kSummedRamps, overrides);
+            } catch (const gr::exception& e) {
+                return e.message;
+            }
+            return std::string{};
+        };
+
+        const std::string unknownBlock = reportOf({{"summ", {{"n_inputs", gr::Size_t{3U}}}}});
+        expect(unknownBlock.contains("block 'summ'")) << unknownBlock;
+        expect(unknownBlock.contains("'sum'")) << "the nearest name is offered" << unknownBlock;
+
+        const std::string unknownKey = reportOf({{"sum", {{"n_input", gr::Size_t{3U}}}}});
+        expect(unknownKey.contains("declares no setting named 'n_input'")) << unknownKey;
+        expect(unknownKey.contains("'n_inputs'")) << "the nearest key is offered" << unknownKey;
+    };
+
+    "a name two blocks share is refused"_test = [] {
+        registerTestBlocks();
+        PluginLoader& loader = gr::globalPluginLoader();
+
+        std::string reported;
+        try {
+            std::ignore = gr::loadGrc(loader, R"yaml(blocks:
+  - id: qa::Scale
+    parameters:
+      name: twin
+  - id: qa::Scale
+    parameters:
+      name: twin
+)yaml",
+                gr::BlockSettings{{"twin", {{"gain", 2.0f}}}});
+        } catch (const gr::exception& e) {
+            reported = e.message;
+        }
+        expect(reported.contains("unique_name")) << reported;
+    };
+};
+
 int main() { /* tests are run by the ut suite */ }

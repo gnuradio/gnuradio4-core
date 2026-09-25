@@ -262,10 +262,10 @@ void showSettings(gr::BlockModel& block) {
     std::fflush(stdout);
 }
 
-// the scheduler's settings and one map per block named, each in the order the command line gave them
+// the scheduler's settings, and the settings of each block named, which the graph file is read with
 struct StagedSettings {
-    gr::property_map                                      scheduler;
-    std::vector<std::pair<std::string, gr::property_map>> blocks;
+    gr::property_map  scheduler;
+    gr::BlockSettings blocks;
 };
 
 // The settings the --set arguments stand for, or nothing when one of the values cannot be read or stands for more
@@ -288,11 +288,7 @@ struct StagedSettings {
             std::println(stderr, "{}: --set takes one value for one key, and the value of --set {} holds more than one key", kProgram, setting.key);
             return std::nullopt;
         }
-        gr::property_map* target = std::addressof(staged.scheduler);
-        if (!setting.block.empty()) {
-            const auto found = std::ranges::find(staged.blocks, setting.block, &std::pair<std::string, gr::property_map>::first);
-            target           = found != staged.blocks.end() ? std::addressof(found->second) : std::addressof(staged.blocks.emplace_back(setting.block, gr::property_map{}).second);
-        }
+        gr::property_map* target = setting.block.empty() ? std::addressof(staged.scheduler) : std::addressof(staged.blocks[setting.block]);
         for (const auto& [parsedKey, parsedValue] : *parsed) {
             target->insert_or_assign(parsedKey, parsedValue);
         }
@@ -336,42 +332,6 @@ struct StagedSettings {
     return applySchedulerSettings(probe, settings);
 }
 
-// Applies each block's settings by the call the graph file's own parameters take, so a value set here is in force for
-// the first sample and is the value --show reports at the end. The block and the key are both looked up first: an
-// unknown key would otherwise be filed as meta information and the run would proceed as if nothing had been asked.
-[[nodiscard]] bool applyBlockSettings(gr::Graph& graph, const std::vector<std::pair<std::string, gr::property_map>>& blocks) {
-    for (const auto& [name, settings] : blocks) {
-        std::shared_ptr<gr::BlockModel> found;
-        gr::graph::forEachBlock<gr::block::Category::NormalBlock>(graph, [&found, &name](const std::shared_ptr<gr::BlockModel>& block) {
-            if (block->name() == name) {
-                found = block;
-            }
-        });
-        if (found == nullptr) {
-            std::println(stderr, "{}: --set names {}, and the graph holds no block named {}", kProgram, name, name);
-            return false;
-        }
-        const std::set<std::string>& declared = found->settings().writableMembers();
-        for (const auto& [key, value] : settings) {
-            if (!declared.contains(std::string(key.begin(), key.end()))) {
-                std::println(stderr, "{}: the block {} declares no setting named '{}'", kProgram, name, std::string_view(key.data(), key.size()));
-                return false;
-            }
-        }
-        try {
-            found->settings().loadParametersFromPropertyMap(settings);
-        } catch (const std::exception& error) {
-            std::println(stderr, "{}: the settings of block {} could not be applied: {}", kProgram, name, error.what());
-            return false;
-        }
-        if (found->settings().activateContext() == std::nullopt) {
-            std::println(stderr, "{}: the settings of block {} could not be activated", kProgram, name);
-            return false;
-        }
-    }
-    return true;
-}
-
 } // namespace
 
 int main(int argc, char** argv) {
@@ -413,17 +373,15 @@ int main(int argc, char** argv) {
         reportPlugins(loader, directories, keysBefore);
     }
 
+    // each block reads its --set values where it reads the graph file's own, so they are the values its start() sees;
     // the loader refuses a graph file for a key nothing supplies, a setting a block does not declare, a value of the
-    // wrong type or a port that is not there, and its message is printed as it arrives
+    // wrong type or a port that is not there, and a --set for a block the file does not hold, and its message is
+    // printed as it arrives
     std::optional<gr::meta::indirect<gr::Graph>> graph;
     try {
-        graph.emplace(gr::loadGrc(loader, *document));
+        graph.emplace(gr::loadGrc(loader, *document, staged->blocks));
     } catch (const std::exception& error) {
         std::println(stderr, "{}: {} did not load: {}", kProgram, options.graph, error.what());
-        return 1;
-    }
-
-    if (!applyBlockSettings(**graph, staged->blocks)) {
         return 1;
     }
 

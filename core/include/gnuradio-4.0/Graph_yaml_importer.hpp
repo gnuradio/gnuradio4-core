@@ -1,10 +1,12 @@
 #ifndef GNURADIO_GRAPH_YAML_IMPORTER_H
 #define GNURADIO_GRAPH_YAML_IMPORTER_H
 
+#include <algorithm>
 #include <array>
 #include <map>
 #include <ranges>
 #include <set>
+#include <vector>
 
 #include <gnuradio-4.0/meta/indirect.hpp>
 
@@ -15,6 +17,14 @@
 #include "PluginLoader.hpp"
 
 namespace gr {
+
+/**
+ * Settings a caller puts in force over a graph file's own: each key names a block at the file's top level, by its
+ * `unique_name` or its `name`, and its map replaces those keys of the block's `parameters`. The block reads the merged
+ * parameters where it reads the file's, so a value given here is the one its constructor, its `settingsChanged()` and
+ * its `start()` see, and a port count such as `n_inputs` sizes the ports before the connections are made.
+ */
+using BlockSettings = std::map<std::string, property_map, std::less<>>;
 
 namespace detail {
 
@@ -102,7 +112,100 @@ struct LoadedBlocks {
     }
 };
 
-inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGraph, gr::property_map yaml, std::source_location location = std::source_location::current()) {
+/// The number of single-character edits that turn one string into the other.
+inline std::size_t editDistance(std::string_view from, std::string_view to) {
+    std::vector<std::size_t> row(to.size() + 1UZ);
+    for (std::size_t j = 0UZ; j < row.size(); ++j) {
+        row[j] = j;
+    }
+    for (std::size_t i = 1UZ; i <= from.size(); ++i) {
+        std::size_t diagonal = row[0];
+        row[0]               = i;
+        for (std::size_t j = 1UZ; j <= to.size(); ++j) {
+            const std::size_t above = row[j];
+            row[j]                  = std::min({row[j] + 1UZ, row[j - 1UZ] + 1UZ, diagonal + (from[i - 1UZ] == to[j - 1UZ] ? 0UZ : 1UZ)});
+            diagonal                = above;
+        }
+    }
+    return row[to.size()];
+}
+
+/// Up to three of the candidates nearest to the name, nearest first, joined for a message.
+inline std::string closestNames(std::string_view name, const std::ranges::input_range auto& candidates) {
+    std::vector<std::pair<std::size_t, std::string_view>> ranked;
+    for (const auto& candidate : candidates) {
+        ranked.emplace_back(editDistance(name, candidate), candidate);
+    }
+    std::ranges::sort(ranked);
+    std::string joined;
+    for (const auto& [distance, candidate] : ranked | std::views::take(3)) {
+        joined += std::format("{}'{}'", joined.empty() ? "" : ", ", candidate);
+    }
+    return joined;
+}
+
+/// The tracking of a `BlockSettings` over one load: which entries a block took, and how many blocks took each.
+struct OverrideUse {
+    const BlockSettings&                                 overrides;
+    std::map<std::string_view, std::size_t, std::less<>> matchedByName{};
+    std::set<std::string_view, std::less<>>              matchedByUniqueName{};
+
+    /// The settings the block of this unique_name and name takes, or none.
+    [[nodiscard]] const property_map* take(std::string_view uniqueName, std::string_view name) {
+        if (!uniqueName.empty()) {
+            if (const auto it = overrides.find(uniqueName); it != overrides.cend()) {
+                matchedByUniqueName.emplace(it->first);
+                return std::addressof(it->second);
+            }
+        }
+        if (const auto it = overrides.find(name); it != overrides.cend()) {
+            ++matchedByName[it->first];
+            return std::addressof(it->second);
+        }
+        return nullptr;
+    }
+
+    /// Throws for an entry no block took, and for a name more than one block carries.
+    void checkAllTaken(const std::vector<std::string>& blockNames) const {
+        for (const auto& [key, settings] : overrides) {
+            if (matchedByUniqueName.contains(key)) {
+                continue;
+            }
+            const auto count = matchedByName.find(key);
+            if (count == matchedByName.cend()) {
+                throw gr::exception(std::format("settings are given for block '{}', and the graph holds no block of that name; the nearest are {}", key, closestNames(key, blockNames)));
+            }
+            if (count->second > 1UZ) {
+                throw gr::exception(std::format("settings are given for block '{}', which is the name of {} blocks; address one by its unique_name", key, count->second));
+            }
+        }
+    }
+};
+
+/// The file's parameters of one block with the caller's settings in place of the same keys.
+///
+/// A key the block does not declare is refused here: the settings map files an unknown key as meta information, and
+/// the run would then proceed as if the caller had asked for nothing.
+inline property_map mergedParameters(const BlockModel& block, std::string_view blockName, const property_map* fromFile, const property_map& overrides) {
+    const std::set<std::string>& declared = block.settings().writableMembers();
+    for (const auto& [key, value] : overrides) {
+        const std::string_view name(key.data(), key.size());
+        if (!declared.contains(std::string(name))) {
+            throw gr::exception(std::format("block '{}' of type '{}' declares no setting named '{}'; the nearest are {}", blockName, block.typeName(), name, closestNames(name, declared)));
+        }
+    }
+    property_map merged = fromFile != nullptr ? *fromFile : property_map{};
+    for (const auto& [key, value] : overrides) {
+        merged.insert_or_assign(key, value);
+    }
+    return merged;
+}
+
+inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGraph, gr::property_map yaml, OverrideUse* overrides, std::source_location location = std::source_location::current());
+
+inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGraph, gr::property_map yaml, std::source_location location = std::source_location::current()) { return loadGraphFromMap(loader, resultGraph, std::move(yaml), nullptr, location); }
+
+inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGraph, gr::property_map yaml, OverrideUse* overrides, std::source_location location) {
     LoadedBlocks createdBlocks;
 
     Tensor<pmt::Value> blks;
@@ -147,6 +250,10 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
                 createdBlock.metaInformation().try_emplace(key, value);
             }
         };
+
+        if (isSubgraph && overrides != nullptr && overrides->take(blockUniqueName, blockName) != nullptr) {
+            throw gr::exception(std::format("settings are given for '{}', which is a subgraph and holds no settings of its own", blockName));
+        }
 
         if (isSubgraph) {
             auto loadGraph = [&grcBlock, &loader, &location, &blockName, &blockType](auto graphWrapper) {
@@ -244,8 +351,11 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
             // This sets the previously read "name" field for the block
             currentBlock->setName(blockName);
 
-            const auto parametersPmt = grcBlock.at("parameters");
-            if (const auto parameters = checked_access_ptr{parametersPmt.get_if<property_map>()}; parameters != nullptr) {
+            const auto          parametersPmt = grcBlock.at("parameters");
+            const property_map* parameters    = parametersPmt.get_if<property_map>();
+            if (const property_map* given = overrides != nullptr ? overrides->take(blockUniqueName, blockName) : nullptr; given != nullptr) {
+                currentBlock->settings().loadParametersFromPropertyMap(mergedParameters(*currentBlock, blockName, parameters, *given));
+            } else if (parameters != nullptr) {
                 currentBlock->settings().loadParametersFromPropertyMap(*parameters);
             } else {
                 currentBlock->settings().loadParametersFromPropertyMap({});
@@ -434,6 +544,22 @@ inline gr::meta::indirect<gr::Graph> loadGrc(PluginLoader& loader, std::string_v
     }
 
     detail::loadGraphFromMap(loader, *resultGraph, *yaml, location);
+    return resultGraph;
+}
+
+/// `loadGrc` with the caller's settings merged over the file's parameters of the blocks they name (see
+/// `BlockSettings`); a name no top-level block carries, a name two blocks share and a key a block does not declare are
+/// refused.
+inline gr::meta::indirect<gr::Graph> loadGrc(PluginLoader& loader, std::string_view yamlSrc, const BlockSettings& overrides, std::source_location location = std::source_location::current()) {
+    gr::meta::indirect<gr::Graph> resultGraph{loader};
+    const auto                    yaml = pmt::yaml::deserialize(yamlSrc);
+    if (!yaml) {
+        throw gr::exception(std::format("Could not parse yaml: {}:{}\n{}", yaml.error().message, yaml.error().line, yamlSrc));
+    }
+
+    detail::OverrideUse        use{overrides};
+    const detail::LoadedBlocks loaded = detail::loadGraphFromMap(loader, *resultGraph, *yaml, std::addressof(use), location);
+    use.checkAllTaken(loaded.byName | std::views::keys | std::ranges::to<std::vector<std::string>>());
     return resultGraph;
 }
 
