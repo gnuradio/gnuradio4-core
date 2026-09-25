@@ -750,6 +750,12 @@ protected:
     // re-entering INITIALISED must rebuild the same execution state that init() builds, because the graph
     // may have been exchanged or edited since: a stale _executionOrder runs the previous graph's blocks
     void reset() {
+        // the previous run's workers leave before its blocks are reinitialized: one still traversing would call
+        // work() on a block whose edges this disconnects. stop() retired them, so the wait is bounded by one
+        // traversal. A reset requested by a message runs on a worker, which cannot wait for itself
+        if (!isOnOwnWorkerThread()) {
+            waitDone();
+        }
         graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) { this->emitErrorMessageIfAny("reset() -> LifecycleState", block->changeStateTo(lifecycle::INITIALISED)); });
         disconnectAllEdges();
         connectBlockMessagePorts();
@@ -778,13 +784,13 @@ protected:
     void start() {
         using enum gr::lifecycle::State;
 
-        // stop() only publishes STOPPED, so the previous run can leave workers that the pool
-        // counted but never started. Those workers are retired and then drained before this run
-        // begins.
-        //
-        // Retiring them first is required because a worker that starts after this point would run
-        // the previous job list, whose blocks are stopped. It would make no progress, would not
-        // reach a terminal state, and would hold _nRunningJobs above zero indefinitely.
+        // stop() publishes STOPPED and retires the run's workers by generation; it does not wait for
+        // them. A worker the pool counted but never started releases its count when the pool reaches
+        // it, and a worker in its loop leaves at its next check. This run begins only once every count
+        // of the previous run is released: a worker that started after this point would run the
+        // previous job list, whose blocks are stopped, make no progress, reach no terminal state, and
+        // hold _nRunningJobs above zero indefinitely. The generation advances here as well, for a run
+        // that ended other than through stop().
         //
         // The drain must happen before _executionOrderMutex is acquired: a queued worker acquires
         // that mutex to copy its job list before it can decrement _nRunningJobs, so waiting for it
@@ -873,7 +879,7 @@ protected:
             _nRunningJobs->incrementAndGet();
             _nRunningJobs->notify_all();
             gr::atomic_ref(_nWorkersStarted).fetch_add(1UZ);
-            static_cast<Derived*>(this)->poolWorker(0UZ, _executionOrder);
+            static_cast<Derived*>(this)->poolWorker(0UZ, _executionOrder, workerGeneration);
         } else { // run on processing thread pool
             [[maybe_unused]] const auto pe           = _profilerHandler->startCompleteEvent("scheduler_base.runOnPool");
             auto                        jobListsCopy = _executionOrder;
@@ -891,7 +897,7 @@ protected:
                             return;
                         }
                         gr::atomic_ref(_nWorkersStarted).fetch_add(1UZ);
-                        static_cast<Derived*>(this)->poolWorker(runnerID, jobListsCopy);
+                        static_cast<Derived*>(this)->poolWorker(runnerID, jobListsCopy, workerGeneration);
                     });
                 } catch (...) { // a rejected task never decrements, and the leaked count spins waitDone() forever
                     std::ignore = _nRunningJobs->subAndGet(nWorkers - runnerID);
@@ -927,7 +933,7 @@ protected:
         }
     }
 
-    void poolWorker(const std::size_t runnerID, std::shared_ptr<std::vector<std::vector<std::shared_ptr<BlockModel>>>> jobList) {
+    void poolWorker(const std::size_t runnerID, std::shared_ptr<std::vector<std::vector<std::shared_ptr<BlockModel>>>> jobList, const std::size_t generation) {
         using enum lifecycle::State;
         std::shared_ptr<gr::Sequence> progress     = _graph->_progress; // life-time guaranteed
         std::shared_ptr<gr::Sequence> nRunningJobs = _nRunningJobs;
@@ -996,6 +1002,9 @@ protected:
                 std::ranges::for_each(localBlockList, &BlockModel::processScheduledMessages);
                 const auto previousState = activeState;
                 activeState              = this->state();
+                if (gr::atomic_ref(_workerGeneration).load_acquire() != generation) {
+                    break; // the run was stopped: a worker that saw no state since must not work the next run's blocks
+                }
                 if (hasPendingMessages || activeState != previousState) {
                     idleIterations = 0UZ;
                 }
@@ -1056,7 +1065,7 @@ protected:
                     msgToCount = 0UZ;
                 }
             }
-        } while (lifecycle::isActive(activeState));
+        } while (lifecycle::isActive(activeState) && gr::atomic_ref(_workerGeneration).load_acquire() == generation);
     }
 
     // performs a graph swap that exchange() had to defer because it was requested from a scheduler worker
@@ -1178,6 +1187,10 @@ protected:
     void stop() {
         using enum lifecycle::State;
         gr::atomic_ref(_nStopRequests).fetch_add(1UZ);
+        // the run's workers are retired here, not only when they see the stop: one still queued releases its count
+        // instead of running, and one in its loop leaves at its next check even if it observes no state between
+        // this stop and the next start()'s RUNNING, as under load
+        gr::atomic_ref(_workerGeneration).fetch_add(1UZ);
         wakeProgressWaiters();
         {
             std::lock_guard childLock(_childLifecycleMutex); // serialized against start()'s sweep and the workers leaving poolWorker()

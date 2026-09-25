@@ -405,7 +405,7 @@ struct OwnWorkerScheduler : gr::scheduler::SchedulerBase<OwnWorkerScheduler, gr:
         this->_executionOrder->emplace_back(blocks.begin(), blocks.end());
     }
 
-    void poolWorker(std::size_t runnerID, std::shared_ptr<gr::scheduler::JobLists> jobList) {
+    void poolWorker(std::size_t runnerID, std::shared_ptr<gr::scheduler::JobLists> jobList, std::size_t generation) {
         std::shared_ptr<gr::Sequence> nRunningJobs = this->_nRunningJobs;
         gr::on_scope_exit             release      = [this, &nRunningJobs] { this->releaseWorkerCount(*nRunningJobs); };
 
@@ -415,7 +415,7 @@ struct OwnWorkerScheduler : gr::scheduler::SchedulerBase<OwnWorkerScheduler, gr:
             localBlockList = jobList->at(runnerID);
         }
 
-        while (gr::lifecycle::isActive(this->state())) {
+        while (gr::lifecycle::isActive(this->state()) && gr::atomic_ref(this->_workerGeneration).load_acquire() == generation) {
             const gr::work::Result result = this->traverseBlockListOnce(localBlockList);
             if (result.status == gr::work::Status::DONE || result.status == gr::work::Status::ERROR) {
                 return;
@@ -980,7 +980,7 @@ const boost::ut::suite<"job lists sized to the free pool threads"> jobListSizing
     // leave counted workers that never ran. start() drains those before acquiring
     // _executionOrderMutex, since a queued worker acquires the same mutex to copy its job list
     // before it can decrement. The drain terminates only because the workers are retired first: a
-    // task that reaches the pool after a restart releases its count instead of running. Occupying
+    // task that reaches the pool after the stop releases its count instead of running. Occupying
     // every thread of a fixed-size pool is what keeps a worker queued across the stop.
     "a restart completes while a worker of the previous generation is still queued"_test = [] {
         using enum gr::lifecycle::State;
@@ -1067,8 +1067,8 @@ const boost::ut::suite<"a blocking block reaches STOPPED when its scheduler stop
 
         occupierA.reset(); // the queued worker of the stopped run becomes runnable
         occupierB.reset();
-        expect(qa_sched::awaitCondition([&scheduler] { return !scheduler.isProcessing(); })) << "the queued worker of the stopped run did not end";
-        expect(scheduler.workerStarted()) << "the queued worker of the stopped run must have run";
+        expect(qa_sched::awaitCondition([&scheduler] { return !scheduler.isProcessing(); })) << "the queued worker of the stopped run was not retired";
+        expect(!scheduler.workerStarted()) << "a queued worker of the stopped run must be retired unstarted";
         expect(source.state() == STOPPED) << "a worker of the stopped run must leave the blocking block stopped";
         expect(eq(sink._nReceived, 0UZ)) << "a worker of the stopped run must not move a sample";
 
