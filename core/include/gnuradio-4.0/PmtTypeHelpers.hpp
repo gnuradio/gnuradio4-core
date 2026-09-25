@@ -191,17 +191,25 @@ template<class T, bool strictCheck = false, typename From>
             if constexpr (digitsS <= digitsT) {
                 return static_cast<T>(srcValue);
             } else {
-                using WideType     = std::conditional_t<(sizeof(S) < sizeof(long long)), long long, S>;
-                const auto wideVal = static_cast<WideType>(srcValue);
-                if (wideVal == std::numeric_limits<WideType>::min()) {
-                    return std::unexpected(std::format("cannot handle integer min()={} when checking bit width", wideVal));
+                // the value is exact when its bits from the highest set one to the lowest set one fit the mantissa;
+                // trailing zero bits go into the exponent, so 20000000 = 78125 * 2^8 needs 17 bits, not 25
+                using WideType         = std::conditional_t<(sizeof(S) < sizeof(long long)), long long, S>;
+                using UnsignedWide     = std::make_unsigned_t<WideType>;
+                const auto   wideVal   = static_cast<WideType>(srcValue);
+                UnsignedWide magnitude = static_cast<UnsignedWide>(wideVal);
+                if constexpr (std::is_signed_v<WideType>) {
+                    if (wideVal < 0) {
+                        magnitude = UnsignedWide{0} - magnitude; // also exact for min(), whose magnitude is a power of two
+                    }
                 }
-                const WideType magnitude = (wideVal < 0) ? -wideVal : wideVal;
-                const auto     bitWidth  = std::bit_width(static_cast<std::make_unsigned_t<WideType>>(magnitude));
-                if (bitWidth <= digitsT) {
+                if (magnitude == 0U) {
                     return static_cast<T>(srcValue);
                 }
-                return std::unexpected(std::format("integer bit_width({})={} > floating-point mantissa={}", srcValue, bitWidth, digitsT));
+                const auto significantBits = std::bit_width(static_cast<UnsignedWide>(magnitude >> std::countr_zero(magnitude)));
+                if (significantBits <= digitsT) {
+                    return static_cast<T>(srcValue);
+                }
+                return std::unexpected(std::format("integer {} has {} significant bits > floating-point mantissa={}", srcValue, significantBits, digitsT));
             }
         }
         // 3c) target is std::complex<T>
