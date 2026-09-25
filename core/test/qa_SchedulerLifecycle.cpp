@@ -989,10 +989,8 @@ const boost::ut::suite<"job lists sized to the free pool threads"> jobListSizing
         auto occupierA = std::make_unique<qa_sched::PoolOccupier>(*pool);
         auto occupierB = std::make_unique<qa_sched::PoolOccupier>(*pool);
 
-        // the first run's workers never execute, and a blocking block reaches STOPPED only through its own worker.
-        // Every block of this graph stops without one and can start again.
         qa_sched::TestScheduler scheduler({{"poolName", std::string(qa_sched::kOccupiedPoolName)}});
-        expect(scheduler.exchange(qa_sched::makeEndlessGraph()).has_value());
+        expect(scheduler.exchange(qa_sched::makeGraph()).has_value());
         expect(scheduler.changeStateTo(INITIALISED).has_value());
         expect(scheduler.changeStateTo(RUNNING).has_value()); // the generation is counted and queued behind the occupiers
         expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
