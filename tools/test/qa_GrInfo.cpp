@@ -18,8 +18,8 @@
  *
  * The tool's contract is its exit status and what it prints, and neither is visible from inside the process, so
  * every case here runs the built executable over core's own test plugins and test block libraries: the framework
- * report, the block listing, one block in detail, a name nothing is registered under, and a command line that
- * cannot be used. The shape of the report is part of that contract - no line wider than a terminal, one entry per
+ * report, the block listing, one block in detail, the scheduler listing, a name nothing is registered under, and a
+ * command line that cannot be used. The shape of the report is part of that contract - no line wider than a terminal, one entry per
  * block however many instantiations it has, and a JSON document that carries no null - so each is pinned here too.
  */
 namespace qa_grinfo {
@@ -173,6 +173,7 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         const Result help = run({"--help"});
         expect(eq(help.exitCode, 0)) << help.output;
         expect(help.output.contains("Usage: grinfo")) << help.output;
+        expect(help.output.contains("schedulers")) << "the command that lists the schedulers" << help.output;
     };
 
 #ifdef GR_TOOLS_CORE_TEST_PLUGINS
@@ -288,8 +289,53 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         expect(eq(occurrences(block.output, "\"dataType\": \"float64\""), 2UZ)) << "the concrete type of each port of each key" << block.output;
     };
 
+    "schedulers lists the program's own schedulers and a plugin's, each with its settings"_test = [] {
+        const Result schedulers = run(overTestDirectories({"schedulers"}));
+        expect(eq(schedulers.exitCode, 0)) << schedulers.output;
+        expect(schedulers.output.contains("gr::scheduler")) << "the family of core's schedulers" << schedulers.output;
+        expect(schedulers.output.contains("this-program")) << "the keys the program registers itself" << schedulers.output;
+        for (const std::string_view policy : {"<singleThreaded>", "<multiThreaded>", "<singleThreadedBlocking>"}) {
+            expect(schedulers.output.contains(policy)) << "one key per execution policy" << policy << schedulers.output;
+        }
+        expect(schedulers.output.contains("GoodMathScheduler")) << "the scheduler a plugin registers" << schedulers.output;
+        expect(schedulers.output.contains("good_math_plugin")) << "under the file that registered it" << schedulers.output;
+        expect(schedulers.output.contains("timeout_ms")) << "a scheduler's own setting" << schedulers.output;
+        expect(schedulers.output.contains("scheduler keys")) << schedulers.output;
+        expect(!schedulers.output.contains("unique_name")) << "the framework's settings stay behind --all-settings" << schedulers.output;
+        for (const std::string_view blockOnly : {"no stream ports", "ports", "alias of", "category"}) {
+            expect(!schedulers.output.contains(blockOnly)) << "a scheduler entry prints nothing only a block has:" << blockOnly << schedulers.output;
+        }
+    };
+
+    "schedulers --json is one document shaped by library, family and scheduler"_test = [] {
+        const Result schedulers = run(overTestDirectories({"schedulers", "--json"}));
+        expect(eq(schedulers.exitCode, 0)) << schedulers.output;
+        expect(isOneJsonDocument(schedulers.output)) << schedulers.output;
+        expect(schedulers.output.contains("\"command\": \"schedulers\"")) << schedulers.output;
+        for (const std::string_view key : {"\"libraries\"", "\"schedulerKeys\"", "\"families\"", "\"schedulers\"", "\"instantiations\"", "\"totals\""}) {
+            expect(schedulers.output.contains(key)) << key << schedulers.output;
+        }
+        expect(schedulers.output.contains("\"key\": \"gr::scheduler::Simple<singleThreaded>\"")) << schedulers.output;
+        expect(schedulers.output.contains("\"key\": \"gr::scheduler::Simple<multiThreaded>\"")) << schedulers.output;
+        expect(schedulers.output.contains("\"key\": \"good::GoodMathScheduler\"")) << schedulers.output;
+        expect(schedulers.output.contains("\"name\": \"timeout_ms\"")) << schedulers.output;
+        expect(schedulers.output.contains("\"unit\": \"ms\"")) << "the unit the annotation carries" << schedulers.output;
+        expect(!schedulers.output.contains(": null")) << schedulers.output;
+        for (const std::string_view blockOnly : {"\"ports\"", "\"blockCategory\"", "\"uiCategory\""}) {
+            expect(!schedulers.output.contains(blockOnly)) << "a scheduler entry carries nothing only a block has:" << blockOnly << schedulers.output;
+        }
+    };
+
+    "version names the registered schedulers and counts them"_test = [] {
+        const Result version = run(overTestDirectories({"version"}));
+        expect(eq(version.exitCode, 0)) << version.output;
+        expect(version.output.contains("gr::scheduler::Simple<singleThreaded>")) << version.output;
+        expect(version.output.contains("good::GoodMathScheduler")) << version.output;
+        expect(version.output.contains("scheduler keys")) << version.output;
+    };
+
     "no line of any report is wider than a terminal"_test = [] {
-        for (const std::vector<std::string>& arguments : {std::vector<std::string>{"version"}, {"blocks"}, {"blocks", "--verbose"}, {"block", "convert"}, {"block", "LibraryDoubler", "--all-settings"}}) {
+        for (const std::vector<std::string>& arguments : {std::vector<std::string>{"version"}, {"blocks"}, {"blocks", "--verbose"}, {"block", "convert"}, {"block", "LibraryDoubler", "--all-settings"}, {"schedulers"}, {"schedulers", "--all-settings"}}) {
             const Result report = run(overTestDirectories(arguments));
             expect(eq(report.exitCode, 0)) << report.output;
             expect(le(widestLine(report.output), kWidth)) << arguments.front() << report.output;
