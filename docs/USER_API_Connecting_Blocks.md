@@ -247,12 +247,12 @@ All connection methods accept an optional `EdgeParameters` struct:
 
 ```cpp
 struct EdgeParameters {
-    std::size_t                minBufferSize = undefined_size;                    // minimum stream buffer size
-    std::int32_t               weight        = 0;                                // scheduling weight/priority
-    std::string                name          = "unnamed edge";                   // human-readable edge label
-    std::pmr::memory_resource* dataResource  = std::pmr::get_default_resource(); // PMR allocator for stream buffer
-    std::pmr::memory_resource* tagResource   = std::pmr::get_default_resource(); // PMR allocator for tag buffer
-    ComputeDomain              domain        = ComputeDomain::host();            // compute domain (reserved)
+    std::size_t                minBufferSize = undefined_size;        // minimum stream buffer size
+    std::int32_t               weight        = 0;                     // scheduling weight/priority
+    std::string                name          = "unnamed edge";        // human-readable edge label
+    std::pmr::memory_resource* dataResource  = nullptr;               // PMR allocator for stream buffer (nullptr: none named)
+    std::pmr::memory_resource* tagResource   = nullptr;               // PMR allocator for tag buffer (nullptr: none named)
+    ComputeDomain              domain        = ComputeDomain::host(); // compute domain; a block's compute_domain applies while host
 };
 ```
 
@@ -267,7 +267,7 @@ the circular stream and tag buffers for an edge. This is important for:
   shared memory, CUDA managed memory, SYCL USM) to avoid explicit data transfers
 
 ```cpp
-// arena allocator — all sample buffers from a single 1 MB pool (tag buffers still use the default allocator)
+// arena allocator — all sample buffers from a single 1 MB pool (tag buffers keep the buffer's default, the heap)
 std::pmr::monotonic_buffer_resource arena(1 << 20);
 graph.connect<"out", "in">(source, sink, {
     .minBufferSize = 4096UZ,
@@ -290,9 +290,16 @@ graph.connect<"out", "in">(gpuSource, gpuSink, {
 });
 ```
 
-When left at the default (`std::pmr::get_default_resource()`), the framework uses
-its standard double-mapped circular buffer allocator on platforms with POSIX mmap
-support, falling back to the default PMR resource otherwise.
+A field left at `nullptr` names no resource, and the buffer takes its own default:
+the double-mapped circular buffer where the platform has the POSIX mmap interface
+and the sample type is trivially copyable, the heap otherwise. An unnamed tag
+resource takes the heap, because `Tag` is not trivially copyable. A field naming
+`std::pmr::get_default_resource()` takes the PMR heap and never the double-mapped
+buffer. A field naming any other resource takes that resource.
+
+A compute domain, named in `domain` or by a block's `compute_domain` setting in code
+or in a graph file, resolves through its registered provider and fills only the
+fields left at `nullptr`. A named field keeps its resource.
 
 ---
 

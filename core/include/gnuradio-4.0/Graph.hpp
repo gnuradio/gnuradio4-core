@@ -736,8 +736,8 @@ public:
             return edge._state;
         }
 
-        // auto-populate edge domain from block compute_domain if edge domain is still host (default) and no resource is named
-        if (edge._domain.kind == "host" && edge._dataResource == nullptr) {
+        // auto-populate edge domain from block compute_domain if edge domain is still host (default) and either resource is unnamed (nullptr)
+        if (edge._domain.kind == "host" && (edge._dataResource == nullptr || edge._tagResource == nullptr)) {
             auto tryResolveFromBlock = [&edge](const BlockModel& block) -> bool {
                 const auto& staged    = block.settings().stagedParameters();
                 auto        domainStr = std::string();
@@ -766,11 +766,15 @@ public:
                 tryResolveFromBlock(*edge._destinationBlock);
             }
         }
-        // resolve domain → PMR resources when no dataResource is named; one still unnamed after this gets the buffer's own default
-        if (edge._domain.kind != "host" && edge._dataResource == nullptr) {
+        // resolve domain → PMR resource into each resource still unnamed (nullptr); a named one, get_default_resource() included, keeps its value
+        if (edge._domain.kind != "host" && (edge._dataResource == nullptr || edge._tagResource == nullptr)) {
             if (auto* mr = ComputeRegistry::instance().tryResolve(edge._domain, edge._domain.user)) {
-                edge._dataResource = mr;
-                edge._tagResource  = mr;
+                if (edge._dataResource == nullptr) {
+                    edge._dataResource = mr;
+                }
+                if (edge._tagResource == nullptr) {
+                    edge._tagResource = mr;
+                }
             }
         }
 

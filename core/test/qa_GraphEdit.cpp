@@ -218,7 +218,7 @@ struct CountingResource : std::pmr::memory_resource {
 };
 
 // a compute-domain provider whose resource outlives every buffer bound to it
-std::pmr::memory_resource* graphFileResource(const gr::ComputeDomain&, void*) {
+std::pmr::memory_resource* domainResource(const gr::ComputeDomain&, void*) {
     static CountingResource resource;
     return &resource;
 }
@@ -411,8 +411,8 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
 #ifndef GR_TEST_WITHOUT_BLOCK_REGISTRY // a graph file resolves its block ids through the registry
     "an edge whose graph file names a memory resource keeps it"_test = [] {
         qa_edit::registerTestBlocks();
-        gr::ComputeRegistry::instance().register_provider("qa-edit-graph-file", &qa_edit::graphFileResource);
-        auto&             resource        = static_cast<qa_edit::CountingResource&>(*qa_edit::graphFileResource({}, nullptr));
+        gr::ComputeRegistry::instance().register_provider("qa-edit-graph-file", &qa_edit::domainResource);
+        auto&             resource        = static_cast<qa_edit::CountingResource&>(*qa_edit::domainResource({}, nullptr));
         const std::size_t nAllocationsOld = resource.nAllocations;
 
         const std::string graphFile = std::format("blocks:\n"
@@ -438,6 +438,57 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(gt(resource.nAllocations, nAllocationsOld)) << "the named resource must have served the buffer";
     };
 #endif
+
+    "an edge naming only its tag resource keeps it while the compute domain fills the data resource"_test = [] {
+        gr::ComputeRegistry::instance().register_provider("qa-edit-mixed", &qa_edit::domainResource);
+        auto&                     domainPool = static_cast<qa_edit::CountingResource&>(*qa_edit::domainResource({}, nullptr));
+        qa_edit::CountingResource tagPool;
+        gr::Graph                 flow;
+        auto&                     source = flow.emplaceBlock<qa_edit::Source>({{"compute_domain", std::string("gpu:qa-edit-mixed")}});
+        auto&                     sink   = flow.emplaceBlock<qa_edit::Sink>();
+        expect(flow.connect<"out", "in">(source, sink, gr::EdgeParameters{.tagResource = &tagPool}).has_value());
+        expect(flow.connectPendingEdges());
+
+        const gr::Edge& edge = flow.edges()[0];
+        expect(edge._tagResource == &tagPool) << "a tag resource the caller named must stay as named";
+        expect(source.out.tagResource() == &tagPool) << "the port's tag ring must come from the named resource";
+        expect(edge._dataResource == &domainPool) << "the compute domain must fill the data resource nobody named";
+        expect(source.out.dataResource() == &domainPool) << "the port's stream ring must come from the compute domain's resource";
+    };
+
+    "an edge naming only its data resource keeps it while the compute domain fills the tag resource"_test = [] {
+        gr::ComputeRegistry::instance().register_provider("qa-edit-mixed", &qa_edit::domainResource);
+        auto&                     domainPool = static_cast<qa_edit::CountingResource&>(*qa_edit::domainResource({}, nullptr));
+        qa_edit::CountingResource dataPool;
+        gr::Graph                 flow;
+        auto&                     source = flow.emplaceBlock<qa_edit::Source>({{"compute_domain", std::string("gpu:qa-edit-mixed")}});
+        auto&                     sink   = flow.emplaceBlock<qa_edit::Sink>();
+        expect(flow.connect<"out", "in">(source, sink, gr::EdgeParameters{.dataResource = &dataPool}).has_value());
+        expect(flow.connectPendingEdges());
+
+        const gr::Edge& edge = flow.edges()[0];
+        expect(edge._dataResource == &dataPool) << "a data resource the caller named must stay as named";
+        expect(source.out.dataResource() == &dataPool) << "the port's stream ring must come from the named resource";
+        expect(edge._tagResource == &domainPool) << "the compute domain must fill the tag resource nobody named";
+        expect(source.out.tagResource() == &domainPool) << "the port's tag ring must come from the compute domain's resource";
+    };
+
+    "an edge naming both resources keeps both under a compute domain"_test = [] {
+        gr::ComputeRegistry::instance().register_provider("qa-edit-mixed", &qa_edit::domainResource);
+        qa_edit::CountingResource dataPool;
+        qa_edit::CountingResource tagPool;
+        gr::Graph                 flow;
+        auto&                     source = flow.emplaceBlock<qa_edit::Source>({{"compute_domain", std::string("gpu:qa-edit-mixed")}});
+        auto&                     sink   = flow.emplaceBlock<qa_edit::Sink>();
+        expect(flow.connect<"out", "in">(source, sink, gr::EdgeParameters{.dataResource = &dataPool, .tagResource = &tagPool}).has_value());
+        expect(flow.connectPendingEdges());
+
+        const gr::Edge& edge = flow.edges()[0];
+        expect(edge._dataResource == &dataPool) << "a data resource the caller named must stay as named";
+        expect(edge._tagResource == &tagPool) << "a tag resource the caller named must stay as named";
+        expect(source.out.dataResource() == &dataPool) << "the port's stream ring must come from the named resource";
+        expect(source.out.tagResource() == &tagPool) << "the port's tag ring must come from the named resource";
+    };
 
     "a fan-out mixing typed and dynamic connects feeds every consumer"_test = [] {
         auto runMixedFanOut = [](bool typedFirst) {
