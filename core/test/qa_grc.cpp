@@ -12,6 +12,8 @@
 #include <format>
 #include <map>
 #include <mutex>
+#include <optional>
+#include <source_location>
 #include <string>
 #include <utility>
 #include <vector>
@@ -145,11 +147,34 @@ struct RecordingSink : Block<RecordingSink> {
     }
 };
 
+/// a block that reads a setting in its constructor, as a block sizing itself from its construction argument does
+struct ConstructionRecorder : Block<ConstructionRecorder> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    Annotated<float, "gain"> gain = 1.0f;
+
+    GR_MAKE_REFLECTABLE(ConstructionRecorder, in, out, gain);
+
+    std::optional<float> gainAtConstruction; // the gain in the constructor's argument, if it held one
+
+    explicit ConstructionRecorder(property_map init = {}) : Block<ConstructionRecorder>(init) {
+        if (const auto it = init.find("gain"); it != init.end()) {
+            if (const float* given = it->second.get_if<float>(); given != nullptr) {
+                gainAtConstruction = *given;
+            }
+        }
+    }
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
+};
+
 inline void registerTestBlocks() {
     static const bool registered = [] {
         BlockRegistry& registry = globalBlockRegistry();
-        return registry.insert<RampSource>("=qa::RampSource") && registry.insert<Scale>("=qa::Scale") //
-               && registry.insert<SumInputs>("=qa::SumInputs") && registry.insert<RecordingSink>("=qa::RecordingSink");
+        return registry.insert<RampSource>("=qa::RampSource") && registry.insert<Scale>("=qa::Scale")                  //
+               && registry.insert<SumInputs>("=qa::SumInputs") && registry.insert<RecordingSink>("=qa::RecordingSink") //
+               && registry.insert<ConstructionRecorder>("=qa::ConstructionRecorder");
     }();
     expect(registered) << "the test blocks must reach the global registry";
 }
@@ -762,6 +787,116 @@ connections:
             reported = e.message;
         }
         expect(reported.contains("unique_name")) << reported;
+    };
+
+    "a key that is one block's unique_name and another's name is refused, as are two keys for one block"_test = [] {
+        registerTestBlocks();
+        PluginLoader& loader = gr::globalPluginLoader();
+
+        auto reportOf = [&loader](std::string_view document, const gr::BlockSettings& overrides) {
+            try {
+                std::ignore = gr::loadGrc(loader, document, overrides);
+            } catch (const gr::exception& e) {
+                return e.message;
+            }
+            return std::string{};
+        };
+
+        const std::string collision = reportOf(R"yaml(blocks:
+  - id: qa::Scale
+    unique_name: target
+    parameters:
+      name: first
+  - id: qa::Scale
+    parameters:
+      name: target
+)yaml",
+            {{"target", {{"gain", 9.0f}}}});
+        expect(collision.contains("block 'target', and 2 blocks carry")) << collision;
+        expect(collision.contains("block 0 'first' of type 'qa::Scale' with unique_name 'target'")) << collision;
+        expect(collision.contains("block 1 'target' of type 'qa::Scale'")) << collision;
+
+        const std::string twice = reportOf(R"yaml(blocks:
+  - id: qa::Scale
+    unique_name: only
+    parameters:
+      name: scale
+)yaml",
+            {{"only", {{"gain", 2.0f}}}, {"scale", {{"gain", 3.0f}}}});
+        expect(twice.contains("settings are given twice for block 0 'scale'")) << twice;
+    };
+
+    "a key that is a block's unique_name reaches that block alone, beside another of the same name"_test = [] {
+        registerTestBlocks();
+        PluginLoader& loader = gr::globalPluginLoader();
+
+        const auto loaded = gr::loadGrc(loader, R"yaml(blocks:
+  - id: qa::Scale
+    unique_name: left-scale
+    parameters:
+      name: scale
+      gain: 3.0
+  - id: qa::Scale
+    parameters:
+      name: scale
+      gain: 3.0
+)yaml",
+            gr::BlockSettings{{"left-scale", {{"gain", 5.0f}}}});
+        expect(eq(loaded->blocks().size(), 2UZ));
+        if (loaded->blocks().size() == 2UZ) {
+            expect(eq(static_cast<Scale*>(loaded->blocks()[0]->raw())->gain.value, 5.0f)) << "the block of that unique_name takes the entry";
+            expect(eq(static_cast<Scale*>(loaded->blocks()[1]->raw())->gain.value, 3.0f)) << "the other block keeps the file's value";
+        }
+    };
+
+    "a block with an entry is constructed with the merged parameters"_test = [] {
+        registerTestBlocks();
+        PluginLoader& loader = gr::globalPluginLoader();
+
+        auto recorderOf = [](const std::shared_ptr<BlockModel>& block) -> ConstructionRecorder& { return *static_cast<ConstructionRecorder*>(block->raw()); };
+
+        const std::shared_ptr<BlockModel> direct = loader.instantiate("qa::ConstructionRecorder", {{"gain", 4.0f}});
+        expect(direct != nullptr);
+        if (direct != nullptr) {
+            expect(recorderOf(direct).gainAtConstruction == std::optional(4.0f)) << "the registry hands its argument to the constructor";
+        }
+
+        const auto loaded = gr::loadGrc(loader, R"yaml(blocks:
+  - id: qa::ConstructionRecorder
+    parameters:
+      name: given
+      gain: 3.0
+      unread: a key the block does not declare
+  - id: qa::ConstructionRecorder
+    parameters:
+      name: from-file
+      gain: 3.0
+)yaml",
+            gr::BlockSettings{{"given", {{"gain", 5.0f}}}});
+        expect(eq(loaded->blocks().size(), 2UZ));
+        if (loaded->blocks().size() == 2UZ) {
+            const std::shared_ptr<BlockModel>& given    = loaded->blocks()[0];
+            const std::shared_ptr<BlockModel>& fromFile = loaded->blocks()[1];
+            expect(recorderOf(given).gainAtConstruction == std::optional(5.0f)) << "the constructor reads the given value";
+            expect(eq(recorderOf(given).gain.value, 5.0f)) << "the settings hold the given value";
+            expect(given->metaInformation().contains("unread")) << "a key of the file the block does not declare stays meta information";
+            expect(!recorderOf(fromFile).gainAtConstruction.has_value()) << "a block without an entry is constructed as the file alone constructs it";
+            expect(eq(recorderOf(fromFile).gain.value, 3.0f));
+        }
+    };
+
+    "loadGrc takes an empty braced list for its settings"_test = [] {
+        static_assert(requires(PluginLoader& loader) { gr::loadGrc(loader, std::string_view{}, {}); });
+        static_assert(requires(PluginLoader& loader) { gr::loadGrc(loader, std::string_view{}, {}, std::source_location::current()); });
+
+        registerTestBlocks();
+        const auto loaded = gr::loadGrc(gr::globalPluginLoader(), R"yaml(blocks:
+  - id: qa::Scale
+    parameters:
+      name: scale
+)yaml",
+            {});
+        expect(eq(loaded->blocks().size(), 1UZ));
     };
 };
 
