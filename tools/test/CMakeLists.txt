@@ -55,8 +55,13 @@ if(TARGET rungraph)
   set_tests_properties(qa_RunGraph PROPERTIES TIMEOUT 60)
   if(INTERNAL_ENABLE_BLOCK_PLUGINS)
     target_compile_definitions(qa_RunGraph PRIVATE GR_TOOLS_CORE_TEST_PLUGINS="${CMAKE_BINARY_DIR}/core/test/plugins")
-    # the settings cases run chains of good::identity and good::start_recorder, which GoodRegistryPlugin supplies
-    add_dependencies(qa_RunGraph GoodBasePlugin GoodRegistryPlugin)
+    # the settings cases run chains of good::identity and good::start_recorder, which GoodRegistryPlugin supplies,
+    # and a plugin's scheduler, which good_math_plugin registers
+    add_dependencies(
+      qa_RunGraph
+      GoodBasePlugin
+      GoodRegistryPlugin
+      good_math_plugin)
   endif()
 endif()
 

@@ -36,6 +36,8 @@
 #include <gnuradio-4.0/YamlPmt.hpp>
 #include <gnuradio-4.0/formatter/ValueFormatter.hpp>
 
+#include "SchedulerRegistrations.hpp"
+
 namespace {
 
 constexpr std::string_view kProgram = "rungraph";
@@ -46,33 +48,45 @@ Usage: rungraph --graph <file> [options]
 
   --graph <file>     the graph to run, in the GRC YAML dialect; - reads it from standard input
   --plugin-dir <dir> a directory to load plugins and block libraries from; repeatable
+  --scheduler <key>  the registry key of the scheduler that runs the graph;
+                     gr::scheduler::Simple<singleThreaded> without it
   --seconds <s>      stop the graph after <s> seconds; without it the run ends when the graph does
   --show <name>      print the settings of the block named <name> when the run ends; repeatable
   --set, -s <key>=<value>
                      set one setting before the run; repeatable
-  --verbose          list what each plugin directory loaded and the keys it brought
+  --verbose          list what each plugin directory loaded, the keys it brought and the scheduler
   --help, -h         this text
 
 The blocks come from the directories named by --plugin-dir, from GNURADIO4_PLUGIN_DIRECTORIES,
 the colon-separated list the framework's own plugin loader reads, and from the plugin directory
 of this installation, which is always searched. A directory named twice is searched once.
 
+rungraph registers core's Simple scheduler under one key per execution policy:
+gr::scheduler::Simple<singleThreaded> runs every block on one thread,
+gr::scheduler::Simple<multiThreaded> spreads the blocks over the threads of the processing pool,
+and gr::scheduler::Simple<singleThreadedBlocking> runs on one thread and sleeps while no block
+makes progress. A plugin or a block library in the searched directories may register more, and
+grinfo schedulers lists them all. A key the registry does not hold is refused with the list of
+the keys it holds.
+
 A settings map holds what the last refresh put there, so the settings --show prints are read
 after the run has ended and the block has been asked to refresh them: a counter a block keeps
 as a readable member is then current as of the last sample it processed.
 
-A bare key of --set names a setting of the scheduler, and a key of the form <block>.<key> names a
-setting of the one top-level block whose unique_name or name is <block>; a <block> two blocks carry
-is refused. The split is at the last dot before the '=', so a block name may hold a dot and a
-setting key never does. rungraph reads the value the way a graph file's parameter value is read,
-so a type tag applies: -s timeout_ms=50, -s 'shift.frequency_shift=!!float32 -100000'. One --set
-carries one setting, and a value that holds a second key is refused. The last --set of a key wins.
+A bare key of --set names a setting of the scheduler --scheduler chose, and a key of the form
+<block>.<key> names a setting of the one top-level block whose unique_name or name is <block>;
+a <block> two blocks carry is refused. The split is at the last dot before the '=', so a block
+name may hold a dot and a setting key never does. rungraph reads the value the way a graph file's
+parameter value is read, so a type tag applies: -s timeout_ms=50,
+-s 'shift.frequency_shift=!!float32 -100000'. One --set carries one setting, and a value that
+holds a second key is refused. The last --set of a key wins.
 
 SIGINT and SIGTERM stop the graph as a --seconds bound does.
 
 Exit status is 0 when the run stopped cleanly, 1 when the graph could not be read, loaded or run
 and when a --set or --show names a block or a block setting the graph does not hold, and 2 when
-the command line could not be used, a scheduler setting the scheduler does not declare included.
+the command line could not be used, a scheduler the registry does not hold and a scheduler
+setting the scheduler does not declare included.
 )";
 
 std::atomic<bool> gStopRequested{false};
@@ -89,6 +103,7 @@ struct Setting {
 struct Options {
     std::string              graph; // the graph file, or "-" for standard input
     std::vector<std::string> pluginDirectories;
+    std::string              scheduler{gr::tools::kDefaultScheduler};
     std::vector<std::string> show;          // the blocks whose settings are printed when the run ends
     std::vector<Setting>     settings;      // in command-line order, so that the last of a key wins
     double                   seconds = 0.0; // 0 runs until the graph ends or a signal arrives
@@ -141,7 +156,7 @@ struct Options {
         }
         // the option is recognized before its value is asked for, so that an unknown option in the last position is
         // reported as unknown rather than as one missing a value
-        if (argument != "--graph" && argument != "--plugin-dir" && argument != "--show" && argument != "--seconds" && argument != "--set" && argument != "-s") {
+        if (argument != "--graph" && argument != "--plugin-dir" && argument != "--scheduler" && argument != "--show" && argument != "--seconds" && argument != "--set" && argument != "-s") {
             std::println(stderr, "{}: unknown option '{}'", kProgram, argument);
             return std::nullopt;
         }
@@ -155,6 +170,8 @@ struct Options {
             options.graph.assign(value);
         } else if (argument == "--plugin-dir") {
             options.pluginDirectories.emplace_back(value);
+        } else if (argument == "--scheduler") {
+            options.scheduler.assign(value);
         } else if (argument == "--show") {
             options.show.emplace_back(value);
         } else if (argument == "--set" || argument == "-s") {
@@ -300,7 +317,7 @@ struct StagedSettings {
 //
 // The name is checked against the settings the scheduler declares first: a key outside that set is filed as meta
 // information by the settings map itself, and the run would then proceed as if the caller had asked for nothing.
-[[nodiscard]] bool applySchedulerSettings(gr::scheduler::Simple<>& scheduler, const gr::property_map& settings) {
+[[nodiscard]] bool applySchedulerSettings(gr::BlockModel& scheduler, const gr::property_map& settings) {
     const std::set<std::string>& declared = scheduler.settings().writableMembers();
     for (const auto& [key, value] : settings) {
         if (!declared.contains(std::string(key.begin(), key.end()))) {
@@ -322,14 +339,36 @@ struct StagedSettings {
     return true;
 }
 
-// Whether a scheduler takes these settings, asked of one built for the question alone.
-//
-// The scheduler that runs the graph holds the graph's blocks and has to be destroyed before the libraries those blocks
-// come from are unloaded, so it is built after the plugin loader and cannot answer this. A setting the scheduler will
-// not take is a command line problem, and the answer is wanted before the graph file is read.
-[[nodiscard]] bool schedulerTakesSettings(const gr::property_map& settings) {
-    gr::scheduler::Simple<> probe;
-    return applySchedulerSettings(probe, settings);
+// The scheduler registered under `key`, or nothing when its factory throws or the registry holds no such key; the
+// latter is reported with the keys the registry holds.
+[[nodiscard]] std::shared_ptr<gr::SchedulerModel> schedulerOf(gr::PluginLoader& loader, std::string_view key) {
+    std::shared_ptr<gr::SchedulerModel> scheduler;
+    if (loader.isSchedulerAvailable(key)) {
+        try {
+            scheduler = loader.instantiateScheduler(key);
+        } catch (const std::exception& error) {
+            std::println(stderr, "{}: the scheduler {} could not be built: {}", kProgram, key, error.what());
+            return nullptr;
+        }
+    }
+    if (scheduler == nullptr) {
+        std::println(stderr, "{}: no scheduler is registered as {}; the registered schedulers are:", kProgram, key);
+        for (const std::string& registered : loader.availableSchedulers()) {
+            std::println(stderr, "{}:   {}", kProgram, registered);
+        }
+    }
+    return scheduler;
+}
+
+// the scheduler chosen and each setting --set gave it, read back from the scheduler
+void reportScheduler(const gr::BlockModel& scheduler, std::string_view key, const gr::property_map& settings) {
+    std::println(stderr, "{}: scheduler {}", kProgram, key);
+    const gr::property_map active = scheduler.settings().get();
+    for (const auto& [name, _] : settings) {
+        if (const auto found = active.find(name); found != active.end()) {
+            std::println(stderr, "{}: scheduler setting {} = {}", kProgram, std::string_view(name.data(), name.size()), found->second);
+        }
+    }
 }
 
 } // namespace
@@ -352,25 +391,41 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // the scheduler's settings are settled before the graph is read, so that one it will not take is reported as the
-    // command line problem it is rather than after a file has been loaded
     const std::optional<StagedSettings> staged = stagedSettingsOf(options.settings);
-    if (!staged.has_value() || !schedulerTakesSettings(staged->scheduler)) {
+    if (!staged.has_value()) {
         std::print(stderr, "{}", kUsage);
         return 2;
     }
 
-    const std::optional<std::string> document = readGraph(options.graph);
-    if (!document.has_value()) {
-        return 1;
-    }
-
+    // the program's own schedulers are registered before the loader runs, so that a library the loader opens can
+    // replace one under the same key
+    gr::tools::registerSchedulers(gr::globalSchedulerRegistry());
     const std::vector<std::string> directories = searchDirectories(options.pluginDirectories);
     std::vector<std::string>       keysBefore  = gr::globalBlockRegistry().keys();
     std::ranges::sort(keysBefore);
     gr::PluginLoader loader(gr::globalBlockRegistry(), gr::globalSchedulerRegistry(), directories);
     if (options.verbose) {
         reportPlugins(loader, directories, keysBefore);
+    }
+
+    // The scheduler is built after the loader, so that it and the blocks it holds are destroyed while the libraries
+    // they came from are still open. It is chosen and given its settings before the graph is read: a key the registry
+    // does not hold and a setting the scheduler will not take are command line problems.
+    const std::shared_ptr<gr::SchedulerModel> scheduler = schedulerOf(loader, options.scheduler);
+    if (scheduler == nullptr) {
+        return 2;
+    }
+    if (!applySchedulerSettings(*scheduler->asBlockModel(), staged->scheduler)) {
+        std::print(stderr, "{}", kUsage);
+        return 2;
+    }
+    if (options.verbose) {
+        reportScheduler(*scheduler->asBlockModel(), options.scheduler, staged->scheduler);
+    }
+
+    const std::optional<std::string> document = readGraph(options.graph);
+    if (!document.has_value()) {
+        return 1;
     }
 
     // Each block reads its --set values with the graph file's own. Its start() sees them. The loader refuses a graph
@@ -410,21 +465,12 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
 
-    // the scheduler is built after the loader, so that it and the blocks it holds are destroyed while the libraries
-    // they came from are still open
-    gr::scheduler::Simple<> scheduler;
-    if (!applySchedulerSettings(scheduler, staged->scheduler)) {
-        return 1;
-    }
-    if (!scheduler.exchange(std::move(**graph)).has_value()) {
-        std::println(stderr, "{}: the scheduler refused the graph", kProgram);
-        return 1;
-    }
+    scheduler->setGraph(std::move(**graph));
 
     std::atomic<bool> finished{false};
     std::atomic<bool> failed{false};
     std::thread       runner([&scheduler, &finished, &failed] {
-        if (const auto result = scheduler.runAndWait(); !result.has_value()) {
+        if (const auto result = scheduler->runAndWait(); !result.has_value()) {
             std::println(stderr, "{}: the graph stopped: {}", kProgram, result.error().message);
             failed.store(true, std::memory_order_relaxed);
         }
@@ -440,7 +486,8 @@ int main(int argc, char** argv) {
     }
     const bool endedItself = finished.load(std::memory_order_relaxed);
     if (!endedItself) {
-        scheduler.requestStop();
+        // a run that ended after the check refuses the transition, and the join below waits for it either way
+        std::ignore = scheduler->asBlockModel()->changeStateTo(gr::lifecycle::State::REQUESTED_STOP);
     }
     runner.join();
 
