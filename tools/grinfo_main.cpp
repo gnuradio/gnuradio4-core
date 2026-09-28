@@ -1,8 +1,9 @@
-// grinfo - report the framework, the directories it searches for blocks, and the blocks they bring.
+// grinfo - report the framework, the directories it searches for blocks, and the blocks and schedulers they bring.
 //
 // No block name is built in: the registry linked into this program, the libraries the plugin loader opens and a
 // default-constructed instance of each registered key are the only sources, so a framework that gains a block
-// reports it here without this program being rebuilt.
+// reports it here without this program being rebuilt. The schedulers the tools register themselves are the one
+// exception, and they are registered as rungraph registers them.
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE // dladdr, which names the file a block's type information was loaded from
@@ -41,6 +42,7 @@
 #include <gnuradio-4.0/meta/formatter.hpp>
 
 #include "BlockLookup.hpp"
+#include "SchedulerRegistrations.hpp"
 
 #ifdef INTERNAL_ENABLE_BLOCK_PLUGINS
 #include <dlfcn.h>
@@ -61,13 +63,14 @@ constexpr std::size_t kWidth = 80UZ;
 // so the report leaves them out of a block's own table unless they are asked for.
 constexpr std::array<std::string_view, 8> kFrameworkSettings{"compute_domain", "disconnect_on_done", "input_chunk_size", "name", "output_chunk_size", "stride", "ui_constraints", "unique_name"};
 
-constexpr std::string_view kUsage = R"(grinfo - report the GNU Radio 4 framework, its plugins and its blocks
+constexpr std::string_view kUsage = R"(grinfo - report the GNU Radio 4 framework, its plugins, blocks and schedulers
 
 Usage: grinfo [command] [options]
 
   version            the framework, the directories searched and what each held
   blocks             every registered block, by library and by family
   block <name>       one block in detail: its types, its ports and its settings
+  schedulers         every registered scheduler, by library, with its settings
 
   --plugin-dir <dir> a directory of plugins and block libraries; repeatable
   --json             the same content as a pretty-printed JSON document
@@ -75,23 +78,27 @@ Usage: grinfo [command] [options]
   --all-settings     also the settings the framework declares on every block
   --help, -h         this text
 
-Blocks come from the directories named by --plugin-dir, from the colon-separated
-list in GNURADIO4_PLUGIN_DIRECTORIES, and from the plugin directory of this
-installation, which is always searched. A directory named twice is searched
-once.
+Blocks and schedulers come from the directories named by --plugin-dir, from the
+colon-separated list in GNURADIO4_PLUGIN_DIRECTORIES, and from the plugin
+directory of this installation, which is always searched. A directory named
+twice is searched once.
 
 <name> is a registry key with its template parameters,
 gr::blocks::basic::Convert<int16, float32>, or a name without them,
 gr::blocks::basic::Convert or Convert, which selects every instantiation of it.
 
+grinfo registers the schedulers rungraph registers, core's Simple scheduler
+under one key per execution policy, so schedulers lists every key rungraph
+--scheduler takes from the same directories.
+
 A block is reported once however many instantiations it has: their type
 parameters are listed together, and a port or a setting is written in terms of
 those parameters wherever that is what tells the instantiations apart.
 
-What a block reports is read from a default-constructed instance of it. The file
-a key came from is the file the dynamic linker holds that instance's type
-information in, so a block linked into this program is told apart from one a
-library brought.
+What a block or a scheduler reports is read from an instance the registry
+creates with no parameters. The file a key came from is the file the dynamic
+linker holds that instance's type information in, so a block linked into this
+program is told apart from one a library brought.
 
 The JSON document carries "schema": 2 and one shape per command. A field the
 framework holds nothing in is left out rather than written as null; an array is
@@ -102,7 +109,7 @@ named by --plugin-dir cannot be searched, and 2 when the command line cannot be
 used.
 )";
 
-enum class Command : std::uint8_t { Version, Blocks, Block };
+enum class Command : std::uint8_t { Version, Blocks, Block, Schedulers };
 
 struct Options {
     Command                  command = Command::Version;
@@ -160,6 +167,8 @@ struct Options {
                 options.command = Command::Blocks;
             } else if (argument == "block") {
                 options.command = Command::Block;
+            } else if (argument == "schedulers") {
+                options.command = Command::Schedulers;
             } else {
                 std::println(stderr, "{}: unknown command '{}'", kProgram, argument);
                 return std::nullopt;
@@ -504,8 +513,11 @@ enum class KeyOrigin : std::uint8_t { ThisProgram, BlockLibrary, Plugin, LinkedL
     std::unreachable();
 }
 
+enum class Registry : std::uint8_t { Blocks, Schedulers };
+
 // one registered key, read from an instance of it
 struct Instantiation {
+    Registry                 registry = Registry::Blocks; // a scheduler has no ports and no block category
     std::string              key;
     std::string              family;
     std::string              name;
@@ -674,10 +686,11 @@ void collectSettings(const gr::BlockModel& block, std::vector<Setting>& into) {
  * defaults, and it needs neither a progress counter nor a thread pool, so the block is never started. Anything the
  * instance throws on the way is kept as that key's error and every other key is read as before.
  */
-[[nodiscard]] Instantiation readKey(Context& context, const std::string& key, bool detailed) {
+[[nodiscard]] Instantiation readKey(Context& context, const std::string& key, Registry registry, bool detailed) {
     const KeyParts parts = partsOf(key);
 
     Instantiation fact;
+    fact.registry   = registry;
     fact.key        = key;
     fact.family     = parts.family;
     fact.name       = parts.name;
@@ -685,7 +698,7 @@ void collectSettings(const gr::BlockModel& block, std::vector<Setting>& into) {
 
     std::shared_ptr<gr::BlockModel> instance;
     try {
-        instance = context.loader.instantiate(key, {});
+        instance = registry == Registry::Blocks ? context.loader.instantiate(key, {}) : gr::SchedulerModel::asBlockModelPtr(context.loader.instantiateScheduler(key, {}));
         if (instance == nullptr) {
             fact.error = "nothing of that name could be instantiated";
         }
@@ -703,11 +716,13 @@ void collectSettings(const gr::BlockModel& block, std::vector<Setting>& into) {
         return fact;
     }
 
-    fact.file          = fileOfType(*instance);
-    fact.origin        = originOfFile(context, fact.file);
-    fact.typeName      = std::string(instance->typeName());
-    fact.blockCategory = std::format("{}", instance->blockCategory());
-    fact.uiCategory    = std::format("{}", instance->uiCategory());
+    fact.file     = fileOfType(*instance);
+    fact.origin   = originOfFile(context, fact.file);
+    fact.typeName = std::string(instance->typeName());
+    if (registry == Registry::Blocks) {
+        fact.blockCategory = std::format("{}", instance->blockCategory());
+        fact.uiCategory    = std::format("{}", instance->uiCategory());
+    }
     if (!detailed) {
         return fact;
     }
@@ -723,8 +738,10 @@ void collectSettings(const gr::BlockModel& block, std::vector<Setting>& into) {
         fact.settingsError = "an exception that is not a std::exception";
     }
     fact.description = metaString(instance->metaInformation(), "description");
-    collectPorts(instance->dynamicInputPorts(), "input", fact.ports);
-    collectPorts(instance->dynamicOutputPorts(), "output", fact.ports);
+    if (registry == Registry::Blocks) {
+        collectPorts(instance->dynamicInputPorts(), "input", fact.ports);
+        collectPorts(instance->dynamicOutputPorts(), "output", fact.ports);
+    }
     collectSettings(*instance, fact.settings);
     return fact;
 }
@@ -1045,25 +1062,27 @@ void printPortsAndSettings(const NamedBlock& block, const TypeParameters& types,
         mergeCells(settings[i], settingCells[i], types);
     }
 
-    std::print("\n");
-    if (ports.empty()) {
-        std::println("{}no stream ports", indent);
-    } else {
-        constexpr std::array<Column, 9>       portColumns{Column{.header = "port"}, Column{.header = "direction"}, Column{.header = "type"}, Column{.header = "port type", .collapsible = true}, Column{.header = "domain", .collapsible = true}, Column{.header = "sync", .collapsible = true}, Column{.header = "optional", .collapsible = true}, Column{.header = "collection", .collapsible = true}, Column{.header = "samples", .collapsible = true}};
-        std::vector<std::vector<std::string>> rows;
-        for (const Merged& port : ports) {
-            const std::size_t        tab = port.name.find('\t');
-            std::vector<std::string> row{port.name.substr(tab + 1UZ), port.name.substr(0UZ, tab)};
-            for (const std::string& cell : port.cells) {
-                row.push_back(cell);
+    if (block.instantiations.front().registry == Registry::Blocks) {
+        std::print("\n");
+        if (ports.empty()) {
+            std::println("{}no stream ports", indent);
+        } else {
+            constexpr std::array<Column, 9>       portColumns{Column{.header = "port"}, Column{.header = "direction"}, Column{.header = "type"}, Column{.header = "port type", .collapsible = true}, Column{.header = "domain", .collapsible = true}, Column{.header = "sync", .collapsible = true}, Column{.header = "optional", .collapsible = true}, Column{.header = "collection", .collapsible = true}, Column{.header = "samples", .collapsible = true}};
+            std::vector<std::vector<std::string>> rows;
+            for (const Merged& port : ports) {
+                const std::size_t        tab = port.name.find('\t');
+                std::vector<std::string> row{port.name.substr(tab + 1UZ), port.name.substr(0UZ, tab)};
+                for (const std::string& cell : port.cells) {
+                    row.push_back(cell);
+                }
+                rows.push_back(std::move(row));
             }
-            rows.push_back(std::move(row));
+            std::vector<Column> kept;
+            std::string         constant;
+            splitConstantColumns(portColumns, rows, kept, constant);
+            printSection(indent, "ports", constant);
+            printTable(inner, kept, rows);
         }
-        std::vector<Column> kept;
-        std::string         constant;
-        splitConstantColumns(portColumns, rows, kept, constant);
-        printSection(indent, "ports", constant);
-        printTable(inner, kept, rows);
     }
 
     std::print("\n");
@@ -1139,12 +1158,14 @@ void printBlock(const NamedBlock& block, std::string_view indent, bool qualified
         printFacts(detail, facts, Break::BetweenTypes);
         return;
     }
-    facts.emplace_back("category", std::format("{}, UI {}", first.blockCategory, first.uiCategory));
-    // A key registered under a name of its own reports the type it is an alias of, and only then is the row worth
-    // a line: the type name of a key that is not an alias is the key itself.
-    const auto alias = std::ranges::find_if(block.instantiations, [](const Instantiation& fact) { return !fact.typeName.empty() && fact.typeName != fact.key; });
-    if (alias != block.instantiations.end()) {
-        facts.emplace_back("alias of", alias->typeName);
+    if (first.registry == Registry::Blocks) {
+        facts.emplace_back("category", std::format("{}, UI {}", first.blockCategory, first.uiCategory));
+        // A key registered under a name of its own reports the type it is an alias of, and only then is the row
+        // worth a line: the type name of a key that is not an alias is the key itself.
+        const auto alias = std::ranges::find_if(block.instantiations, [](const Instantiation& fact) { return !fact.typeName.empty() && fact.typeName != fact.key; });
+        if (alias != block.instantiations.end()) {
+            facts.emplace_back("alias of", alias->typeName);
+        }
     }
     if (!first.settingsError.empty()) {
         facts.emplace_back("settings error", first.settingsError);
@@ -1342,12 +1363,14 @@ void writeInstantiation(JsonWriter& json, const Instantiation& fact) {
     json.member("error", fact.error);
     json.member("settingsError", fact.settingsError);
     if (fact.detailed) {
-        json.key("ports");
-        json.beginArray();
-        for (const Port& port : fact.ports) {
-            writePort(json, port);
+        if (fact.registry == Registry::Blocks) {
+            json.key("ports");
+            json.beginArray();
+            for (const Port& port : fact.ports) {
+                writePort(json, port);
+            }
+            json.endArray();
         }
-        json.endArray();
         json.key("settings");
         json.beginArray();
         for (const Setting& setting : fact.settings) {
@@ -1613,49 +1636,37 @@ void printBlockLine(std::string_view indent, const NamedBlock& block, std::size_
     }
 }
 
-void reportBlocks(Context& context, const Options& options) {
-    std::vector<Instantiation> facts;
-    facts.reserve(context.keys.size());
-    for (const std::string& key : context.keys) {
-        facts.push_back(readKey(context, key, options.verbose));
-    }
-    const std::vector<Library> libraries = group(std::move(facts));
-
-    if (options.json) {
-        JsonWriter json;
+// one library object per file, each holding its families and they their blocks or their schedulers
+void writeLibraries(JsonWriter& json, const std::vector<Library>& libraries, Registry registry) {
+    json.key("libraries");
+    json.beginArray();
+    for (const Library& library : libraries) {
         json.beginObject();
-        json.count("schema", 2UZ);
-        json.member("command", "blocks");
-        json.key("libraries");
+        json.member("file", library.file);
+        json.member("origin", nameOf(library.origin));
+        json.count(registry == Registry::Blocks ? "blockKeys" : "schedulerKeys", library.keys);
+        json.key("families");
         json.beginArray();
-        for (const Library& library : libraries) {
+        for (const Family& family : library.families) {
             json.beginObject();
-            json.member("file", library.file);
-            json.member("origin", nameOf(library.origin));
-            json.count("blockKeys", library.keys);
-            json.key("families");
+            json.member("name", family.name);
+            json.key(registry == Registry::Blocks ? "blocks" : "schedulers");
             json.beginArray();
-            for (const Family& family : library.families) {
-                json.beginObject();
-                json.member("name", family.name);
-                json.key("blocks");
-                json.beginArray();
-                for (const NamedBlock& block : family.blocks) {
-                    writeBlock(json, block, false);
-                }
-                json.endArray();
-                json.endObject();
+            for (const NamedBlock& block : family.blocks) {
+                writeBlock(json, block, false);
             }
             json.endArray();
             json.endObject();
         }
         json.endArray();
-        writeTotals(json, context.totals);
         json.endObject();
-        std::println("{}", json.text);
-        return;
     }
+    json.endArray();
+}
 
+// the libraries under the directories that held them, each with its families and in each family one line per entry,
+// or each entry in detail
+void printLibraries(const std::vector<Library>& libraries, bool detailed, bool allSettings) {
     std::string lastDirectory;
     bool        firstDirectory = true;
     for (const Library& library : libraries) {
@@ -1674,10 +1685,10 @@ void reportBlocks(Context& context, const Options& options) {
         for (const Family& family : library.families) {
             std::print("\n");
             std::println("    {}", fit(family.name.empty() ? "(no namespace)" : family.name, kWidth - 4UZ));
-            if (options.verbose) {
+            if (detailed) {
                 for (const NamedBlock& block : family.blocks) {
                     std::print("\n");
-                    printBlock(block, "      ", false, false, options.allSettings);
+                    printBlock(block, "      ", false, false, allSettings);
                 }
                 continue;
             }
@@ -1691,6 +1702,29 @@ void reportBlocks(Context& context, const Options& options) {
             }
         }
     }
+}
+
+void reportBlocks(Context& context, const Options& options) {
+    std::vector<Instantiation> facts;
+    facts.reserve(context.keys.size());
+    for (const std::string& key : context.keys) {
+        facts.push_back(readKey(context, key, Registry::Blocks, options.verbose));
+    }
+    const std::vector<Library> libraries = group(std::move(facts));
+
+    if (options.json) {
+        JsonWriter json;
+        json.beginObject();
+        json.count("schema", 2UZ);
+        json.member("command", "blocks");
+        writeLibraries(json, libraries, Registry::Blocks);
+        writeTotals(json, context.totals);
+        json.endObject();
+        std::println("{}", json.text);
+        return;
+    }
+
+    printLibraries(libraries, options.verbose, options.allSettings);
 
     std::print("\n");
     std::println("totals");
@@ -1698,6 +1732,38 @@ void reportBlocks(Context& context, const Options& options) {
     const std::vector<std::vector<std::string>> totalRows{
         {"block keys", std::to_string(context.totals.blockKeys)},
         {"block families", std::to_string(context.totals.blockFamilies)},
+        {"libraries", std::to_string(libraries.size())},
+    };
+    printTable("  ", totalColumns, totalRows);
+}
+
+void reportSchedulers(Context& context, const Options& options) {
+    std::vector<Instantiation> facts;
+    facts.reserve(context.schedulers.size());
+    for (const std::string& key : context.schedulers) {
+        facts.push_back(readKey(context, key, Registry::Schedulers, true));
+    }
+    const std::vector<Library> libraries = group(std::move(facts));
+
+    if (options.json) {
+        JsonWriter json;
+        json.beginObject();
+        json.count("schema", 2UZ);
+        json.member("command", "schedulers");
+        writeLibraries(json, libraries, Registry::Schedulers);
+        writeTotals(json, context.totals);
+        json.endObject();
+        std::println("{}", json.text);
+        return;
+    }
+
+    printLibraries(libraries, true, options.allSettings);
+
+    std::print("\n");
+    std::println("totals");
+    constexpr std::array<Column, 2>             totalColumns{Column{.header = ""}, Column{.header = "", .align = Align::Right}};
+    const std::vector<std::vector<std::string>> totalRows{
+        {"scheduler keys", std::to_string(context.totals.schedulerKeys)},
         {"libraries", std::to_string(libraries.size())},
     };
     printTable("  ", totalColumns, totalRows);
@@ -1713,7 +1779,7 @@ void reportBlocks(Context& context, const Options& options) {
         if (key != wanted && parts.name != wanted && qualified != wanted) {
             continue;
         }
-        selected.push_back(readKey(context, key, true));
+        selected.push_back(readKey(context, key, Registry::Blocks, true));
     }
     if (selected.empty()) {
         std::println(stderr, "{}: no block named {} is registered", kProgram, wanted);
@@ -1792,6 +1858,7 @@ int main(int argc, char** argv) {
     for (const Directory& directory : directories) {
         paths.push_back(directory.path);
     }
+    gr::tools::registerSchedulers(gr::globalSchedulerRegistry());
     gr::PluginLoader loader(gr::globalBlockRegistry(), gr::globalSchedulerRegistry(), paths);
 
     Context context{.loader = loader, .directories = std::move(directories), .keys = {}, .schedulers = {}, .files = {}, .plugins = {}, .libraryFiles = {}, .program = thisProgramFile(), .totals = {}};
@@ -1843,6 +1910,7 @@ int main(int argc, char** argv) {
         return 0;
     case Command::Blocks: reportBlocks(context, options); return 0;
     case Command::Block: return reportBlock(context, options);
+    case Command::Schedulers: reportSchedulers(context, options); return 0;
     }
     return 0;
 }
