@@ -832,6 +832,7 @@ public:
     // implementation specific interface -- not part of public Buffer / production-code API
     [[nodiscard]] std::size_t n_writers() const { return gr::atomic_ref(_sharedBufferPtr->_writer_count).load_acquire(); }
     [[nodiscard]] std::size_t n_readers() const { return gr::atomic_ref(_sharedBufferPtr->_reader_count).load_acquire(); }
+    [[nodiscard]] bool        isMmapAllocated() const noexcept { return _sharedBufferPtr->_isMmapAllocated; }
     [[nodiscard]] const auto& claim_strategy() { return _sharedBufferPtr->_claimStrategy; }
     [[nodiscard]] const auto& wait_strategy() { return _sharedBufferPtr->_claimStrategy._wait_strategy; }
     [[nodiscard]] const auto& cursor_sequence() { return _sharedBufferPtr->_claimStrategy._publishCursor; }
