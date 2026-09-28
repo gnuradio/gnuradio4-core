@@ -16,8 +16,9 @@
  *
  * The tool's contract is its exit status and what it prints, and neither is visible from inside the process, so
  * every case here runs the built executable: a graph that would not end by itself, bounded by --seconds; the
- * settings --show prints when the run is over; a scheduler setting and a block setting taken and each refused; a
- * command line that cannot be used; and a graph file that cannot be read.
+ * settings --show prints when the run is over; a scheduler setting and a block setting taken and each refused; the
+ * scheduler chosen by its registry key, the program's own and a plugin's; a command line that cannot be used; and a
+ * graph file that cannot be read.
  */
 namespace qa_rungraph {
 
@@ -77,7 +78,18 @@ constexpr std::string_view kUnnamedResourceFile{GR_TOOLS_TEST_ASSETS "/unnamed_r
 
 // the same, over the four-block chain the settings cases set a value on
 [[nodiscard]] std::vector<std::string> settingsChainRun() { return {"--graph", std::string(kSettingsChainFile), "--plugin-dir", GR_TOOLS_CORE_TEST_PLUGINS, "--seconds", "0.5"}; }
+
+// the chain, bounded by a count on its source so that the run ends by itself, on the scheduler named by `key`
+[[nodiscard]] std::vector<std::string> chainToItsEnd(std::string_view key) {
+    std::vector<std::string>                arguments = settingsChainRun();
+    const std::array<std::string_view, 7UZ> added{"--scheduler", key, "--set", "source.event_count=1000", "--show", "source", "--verbose"};
+    arguments.insert(arguments.end(), added.begin(), added.end());
+    return arguments;
+}
 #endif
+
+// the schedulers rungraph registers itself, one per execution policy of core's Simple scheduler
+constexpr std::array<std::string_view, 3UZ> kOwnSchedulers{"gr::scheduler::Simple<singleThreaded>", "gr::scheduler::Simple<multiThreaded>", "gr::scheduler::Simple<singleThreadedBlocking>"};
 
 } // namespace qa_rungraph
 
@@ -122,6 +134,23 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
         expect(eq(blockSetting.exitCode, 2)) << blockSetting.output;
         expect(blockSetting.output.contains("the value of --set count holds more than one key")) << blockSetting.output;
         expect(!blockSetting.output.contains("unread.yaml")) << blockSetting.output;
+    };
+
+    "a scheduler key the registry does not hold is refused with the keys it holds"_test = [] {
+        const Result refused = run({"--graph", "unread.yaml", "--scheduler", "no::such::Scheduler"});
+        expect(eq(refused.exitCode, 2)) << refused.output;
+        expect(refused.output.contains("no scheduler is registered as no::such::Scheduler")) << refused.output;
+        for (const std::string_view key : kOwnSchedulers) {
+            expect(refused.output.contains(key)) << "the list names" << key << refused.output;
+        }
+        expect(!refused.output.contains("unread.yaml")) << "the command line is judged before the graph is read" << refused.output;
+    };
+
+    "a scheduler setting is judged against the scheduler --scheduler chose"_test = [] {
+        const Result refused = run({"--graph", "unread.yaml", "--scheduler", std::string(kOwnSchedulers[1]), "--set", "no_such_setting=1"});
+        expect(eq(refused.exitCode, 2)) << refused.output;
+        expect(refused.output.contains("the scheduler declares no setting named 'no_such_setting'")) << refused.output;
+        expect(!refused.output.contains("unread.yaml")) << refused.output;
     };
 
     "a graph file that cannot be read ends the run before anything is loaded"_test = [] {
@@ -227,6 +256,56 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
         const Result refusedBlock = run(unknownBlock);
         expect(eq(refusedBlock.exitCode, 1)) << refusedBlock.output;
         expect(refusedBlock.output.contains("settings are given for block 'no_such_block', and the graph holds no block of that name")) << refusedBlock.output;
+    };
+
+    "without --scheduler the graph runs on the single-threaded Simple scheduler"_test = [] {
+        std::vector<std::string> arguments = settingsChainRun();
+        arguments.emplace_back("--set");
+        arguments.emplace_back("source.event_count=1000");
+        arguments.emplace_back("--verbose");
+
+        const Result ran = run(arguments);
+        expect(eq(ran.exitCode, 0)) << ran.output;
+        expect(ran.output.contains(std::format("rungraph: scheduler {}\n", kOwnSchedulers[0]))) << ran.output;
+        expect(ran.output.contains("the graph ended on its own")) << ran.output;
+    };
+
+    "--scheduler runs the chain to its end on each of the program's own schedulers"_test = [] {
+        for (const std::string_view key : kOwnSchedulers) {
+            const Result ran = run(chainToItsEnd(key));
+            expect(eq(ran.exitCode, 0)) << key << ran.output;
+            expect(ran.output.contains(std::format("rungraph: scheduler {}\n", key))) << "the scheduler chosen is named" << ran.output;
+            expect(ran.output.contains("the graph ended on its own")) << key << ran.output;
+            expect(ran.output.contains("source: event_count = 1000")) << key << ran.output;
+        }
+    };
+
+    "a bare --set key reaches the scheduler --scheduler chose"_test = [] {
+        std::vector<std::string> arguments = chainToItsEnd(kOwnSchedulers[1]);
+        arguments.emplace_back("--set");
+        arguments.emplace_back("timeout_ms=37");
+
+        const Result ran = run(arguments);
+        expect(eq(ran.exitCode, 0)) << ran.output;
+        expect(ran.output.contains("rungraph: scheduler setting timeout_ms = 37")) << "read back from the chosen scheduler" << ran.output;
+        expect(ran.output.contains("the graph ended on its own")) << ran.output;
+    };
+
+    "a scheduler a plugin registers is chosen by its key and runs the chain to its end"_test = [] {
+        std::vector<std::string> arguments = chainToItsEnd("good::GoodMathScheduler");
+        arguments.emplace_back("--set");
+        arguments.emplace_back("timeout_ms=37");
+
+        const Result ran = run(arguments);
+        expect(eq(ran.exitCode, 0)) << ran.output;
+        expect(ran.output.contains("rungraph: scheduler good::GoodMathScheduler\n")) << ran.output;
+        expect(ran.output.contains("rungraph: scheduler setting timeout_ms = 37")) << ran.output;
+        expect(ran.output.contains("the graph ended on its own")) << ran.output;
+        expect(ran.output.contains("source: event_count = 1000")) << ran.output;
+
+        const Result refused = run({"--graph", "unread.yaml", "--plugin-dir", GR_TOOLS_CORE_TEST_PLUGINS, "--scheduler", "no::such::Scheduler"});
+        expect(eq(refused.exitCode, 2)) << refused.output;
+        expect(refused.output.contains("good::GoodMathScheduler")) << "the list of keys includes the plugin's" << refused.output;
     };
 
     "a block name the graph does not hold is refused"_test = [] {
