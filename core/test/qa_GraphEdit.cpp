@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <expected>
 #include <format>
+#include <memory_resource>
 #include <optional>
 #include <string>
 #include <thread>
@@ -15,7 +16,10 @@
 #include <unistd.h>
 
 #include <gnuradio-4.0/BlockRegistry.hpp>
+#include <gnuradio-4.0/CircularBuffer.hpp>
+#include <gnuradio-4.0/ComputeDomain.hpp>
 #include <gnuradio-4.0/Graph.hpp>
+#include <gnuradio-4.0/Graph_yaml_importer.hpp>
 #include <gnuradio-4.0/Message.hpp>
 #include <gnuradio-4.0/Scheduler.hpp>
 
@@ -202,6 +206,23 @@ void sendMessage(gr::MsgPortOut& port, std::string_view endpoint, gr::property_m
     return {};
 }
 
+struct CountingResource : std::pmr::memory_resource {
+    std::size_t nAllocations = 0UZ;
+
+    void* do_allocate(std::size_t bytes, std::size_t alignment) override {
+        ++nAllocations;
+        return std::pmr::new_delete_resource()->allocate(bytes, alignment);
+    }
+    void do_deallocate(void* pointer, std::size_t bytes, std::size_t alignment) override { std::pmr::new_delete_resource()->deallocate(pointer, bytes, alignment); }
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override { return this == &other; }
+};
+
+// a compute-domain provider whose resource outlives every buffer bound to it
+std::pmr::memory_resource* graphFileResource(const gr::ComputeDomain&, void*) {
+    static CountingResource resource;
+    return &resource;
+}
+
 } // namespace qa_edit
 
 const boost::ut::suite<"graph editing"> graphEditTests = [] {
@@ -357,6 +378,66 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(flow.connectPendingEdges());
         expect(eq(source.monitor.bufferSize(), source.out.bufferSize())) << "a span request past the default capacity returns empty with nothing signaled";
     };
+
+    "an edge naming no memory resource gets the buffer's own default"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_edit::Source>();
+        auto&     sink   = flow.emplaceBlock<qa_edit::Sink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+        expect(fatal(eq(flow.edges().size(), 1UZ)));
+        expect(flow.connectPendingEdges());
+
+        const gr::Edge& edge = flow.edges()[0];
+        expect(edge._dataResource == nullptr) << "an edge nobody gave a resource must leave the choice to the buffer";
+        expect(edge._tagResource == nullptr) << "an edge nobody gave a resource must leave the choice to the buffer";
+        expect(!source.out.buffer().tagBuffer.isMmapAllocated()) << "a tag is not trivially copyable, so its ring stays on the heap";
+        if constexpr (gr::has_posix_mmap_interface) {
+            expect(source.out.buffer().streamBuffer.isMmapAllocated()) << "a trivially copyable sample on a platform with mmap must get the double-mapped ring";
+        }
+    };
+
+    "an edge naming the default resource gets a heap buffer"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_edit::Source>();
+        auto&     sink   = flow.emplaceBlock<qa_edit::Sink>();
+        expect(flow.connect<"out", "in">(source, sink, gr::EdgeParameters{.dataResource = std::pmr::get_default_resource(), .tagResource = std::pmr::get_default_resource()}).has_value());
+        expect(flow.connectPendingEdges());
+
+        expect(flow.edges()[0]._dataResource == std::pmr::get_default_resource()) << "a named resource must stay as named";
+        expect(source.out.dataResource() == std::pmr::get_default_resource()) << "the port's buffer must come from the named resource";
+        expect(!source.out.buffer().streamBuffer.isMmapAllocated()) << "a named heap resource must not be replaced by the double-mapped ring";
+    };
+
+#ifndef GR_TEST_WITHOUT_BLOCK_REGISTRY // a graph file resolves its block ids through the registry
+    "an edge whose graph file names a memory resource keeps it"_test = [] {
+        qa_edit::registerTestBlocks();
+        gr::ComputeRegistry::instance().register_provider("qa-edit-graph-file", &qa_edit::graphFileResource);
+        auto&             resource        = static_cast<qa_edit::CountingResource&>(*qa_edit::graphFileResource({}, nullptr));
+        const std::size_t nAllocationsOld = resource.nAllocations;
+
+        const std::string graphFile = std::format("blocks:\n"
+                                                  "  - id: {}\n"
+                                                  "    parameters:\n"
+                                                  "      name: source\n"
+                                                  "      compute_domain: \"gpu:qa-edit-graph-file\"\n"
+                                                  "  - id: {}\n"
+                                                  "    parameters:\n"
+                                                  "      name: sink\n"
+                                                  "connections:\n"
+                                                  "  - [source, out, sink, in]\n",
+            gr::meta::type_name<qa_edit::Source>(), gr::meta::type_name<qa_edit::Sink>());
+        auto              flow      = gr::loadGrc(gr::globalPluginLoader(), graphFile);
+        expect(fatal(eq(flow->edges().size(), 1UZ)));
+        expect(flow->connectPendingEdges());
+
+        const gr::Edge& edge = flow->edges()[0];
+        expect(edge._dataResource == &resource) << "the resource the graph file's compute domain names must reach the edge";
+        expect(edge._tagResource == &resource) << "the resource the graph file's compute domain names must reach the edge";
+        auto& source = *static_cast<qa_edit::Source*>(edge._sourceBlock->raw());
+        expect(source.out.dataResource() == &resource) << "the port's buffer must come from the named resource";
+        expect(gt(resource.nAllocations, nAllocationsOld)) << "the named resource must have served the buffer";
+    };
+#endif
 
     "a fan-out mixing typed and dynamic connects feeds every consumer"_test = [] {
         auto runMixedFanOut = [](bool typedFirst) {

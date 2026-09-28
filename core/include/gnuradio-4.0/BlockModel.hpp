@@ -65,8 +65,8 @@ struct EdgeParameters {
     std::size_t                minBufferSize = undefined_size;
     std::int32_t               weight        = 0;
     std::string                name          = "unnamed edge";
-    std::pmr::memory_resource* dataResource  = std::pmr::get_default_resource();
-    std::pmr::memory_resource* tagResource   = std::pmr::get_default_resource();
+    std::pmr::memory_resource* dataResource  = nullptr; // nullptr: the buffer's default, double-mapped where the platform and the sample type allow it
+    std::pmr::memory_resource* tagResource   = nullptr; // nullptr: the heap; a double-mapped ring needs a trivially copyable type, and Tag is not
 
     ComputeDomain domain = ComputeDomain::host(); // resolution: explicit domain > block compute_domain > host; resolved in applyEdgeConnection()
 };
@@ -89,8 +89,8 @@ struct Edge {
     std::size_t                _minBufferSize;
     std::int32_t               _weight       = 0;
     std::string                _name         = "unnamed edge"; // custom edge name
-    std::pmr::memory_resource* _dataResource = std::pmr::get_default_resource();
-    std::pmr::memory_resource* _tagResource  = std::pmr::get_default_resource();
+    std::pmr::memory_resource* _dataResource = nullptr;        // nullptr until named by the caller or a domain resolution
+    std::pmr::memory_resource* _tagResource  = nullptr;
     ComputeDomain              _domain       = ComputeDomain::host();
     std::string                _domainStr; // owns the string that _domain.backend may point into
 
