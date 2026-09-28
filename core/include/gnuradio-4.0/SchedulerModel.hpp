@@ -47,6 +47,10 @@ public:
     // instead of leaving a worker queued behind the threads the parent holds
     virtual std::expected<void, Error> startAdopted() = 0;
 
+    // runs the graph and returns when the run ends by itself, on a requested stop or on an error; the error is the
+    // result
+    virtual std::expected<void, Error> runAndWait() = 0;
+
     [[nodiscard]] virtual bool workerStarted() = 0;
 
     // why the latest start could not complete. The next start clears it. A read is ordered once the scheduler reads
@@ -80,6 +84,8 @@ public:
     void start() override { std::ignore = startOnOwnThread(false); }
 
     std::expected<void, Error> startAdopted() override { return startOnOwnThread(true); }
+
+    std::expected<void, Error> runAndWait() override { return this->blockRef().runAndWait(); }
 
     [[nodiscard]] bool workerStarted() override { return this->blockRef().workerStarted(); }
 
