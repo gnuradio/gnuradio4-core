@@ -88,26 +88,45 @@ struct Widener : gr::Block<Widener> {
     [[nodiscard]] constexpr std::complex<float> processOne(float value) const noexcept { return {value, 0.0f}; }
 };
 
+/// The block the refusal files name as `qa::Scale`. With it registered, the importer reaches the
+/// rule each file breaks.
+struct Scale : gr::Block<Scale> {
+    gr::PortIn<float>  in;
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(Scale, in, out);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
+};
+
 void registerTestBlocks() {
     static const bool registered = [] {
         std::ignore = gr::globalBlockRegistry().insert<Widener>();
+        std::ignore = gr::globalBlockRegistry().insert<Scale>("=qa::Scale");
         return true;
     }();
     std::ignore = registered;
 }
 
-/// The importer's verdict on a document: true where `gr::loadGrc` builds a graph from it. A case
-/// compares this verdict with the tool's and leaves the two messages alone. The importer reports
-/// several document shapes with the message of a standard library container, and the tool names
-/// the field.
-[[nodiscard]] bool importerAccepts(std::string_view yaml) {
+/// What `gr::loadGrc` makes of a document: a graph, or the message it refuses the document with.
+struct ImporterVerdict {
+    bool        accepted  = false;
+    bool        absentKey = false; ///< refused by std::out_of_range from a lookup of a key the document lacks
+    std::string message;           ///< the message of a refusal the importer words itself
+};
+
+[[nodiscard]] ImporterVerdict importerVerdict(std::string_view yaml) {
     const std::vector<std::string> noDirectories;
     gr::PluginLoader               loader(gr::globalBlockRegistry(), gr::globalSchedulerRegistry(), noDirectories);
     try {
         [[maybe_unused]] const auto graph = gr::loadGrc(loader, yaml);
-        return true;
-    } catch (...) {
-        return false;
+        return {.accepted = true, .absentKey = false, .message = {}};
+    } catch (const gr::exception& refusal) {
+        return {.accepted = false, .absentKey = false, .message = refusal.message};
+    } catch (const std::out_of_range&) {
+        return {.accepted = false, .absentKey = true, .message = {}};
+    } catch (const std::exception& refusal) {
+        return {.accepted = false, .absentKey = false, .message = refusal.what()};
     }
 }
 #endif
@@ -157,36 +176,55 @@ struct Run {
 struct Refusal {
     std::string_view fileName;
     std::string_view yaml;
-    std::string_view message; ///< the sentence the tool gives for the file
+    std::string_view message;         ///< the sentence the tool gives for the file
+    std::string_view importerMessage; ///< what the importer's message holds; empty where it looks up the absent key
 };
 
-/// One file per rule the importer enforces on a graph document's shape, each with the sentence the
-/// tool gives for it. The importer refuses the same files. It reports several of these shapes with
-/// the message of a standard library container, and a case compares the two verdicts rather than
-/// the two messages.
-constexpr std::array<Refusal, 21> kRefusals{{
-    {"no_id.yaml", "blocks:\n  - parameters:\n      name: source\n", "Missing field id in YAML object"},
-    {"id_not_a_string.yaml", "blocks:\n  - id: 42\n    parameters:\n      name: source\n", "Field id in YAML object has an incorrect type"},
-    {"no_parameters.yaml", "blocks:\n  - id: qa::Scale\n", "Missing field parameters in YAML object"},
-    {"parameters_not_a_map.yaml", "blocks:\n  - id: qa::Scale\n    parameters: 3\n", "Field parameters in YAML object has an incorrect type"},
-    {"no_name.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      gain: 2.0\n", "Missing field name in YAML object"},
-    {"subgraph_without_graph.yaml", "blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: inner\n", "Missing field graph in YAML object"},
-    {"graph_not_a_map.yaml", "blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: inner\n    graph: 7\n", "Unable to create block 'inner' of type 'SUBGRAPH': graph is not a map"},
-    {"scheduler_not_a_map.yaml", "blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: inner\n    scheduler: simple\n    graph:\n      blocks:\n        - id: qa::Scale\n          parameters:\n            name: gain\n", "scheduler is not a property_map"},
-    {"scheduler_without_id.yaml", "blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: inner\n    scheduler:\n      parameters:\n        thread_pool: workers\n    graph:\n      blocks:\n        - id: qa::Scale\n          parameters:\n            name: gain\n", "Missing field id in YAML object"},
-    {"exported_port_not_a_list.yaml", "blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: inner\n    graph:\n      blocks:\n        - id: qa::Scale\n          parameters:\n            name: gain\n      exported_ports:\n        - gain\n", "Unable to parse exported port (not a list)"},
-    {"exported_port_of_three.yaml", "blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: inner\n    graph:\n      blocks:\n        - id: qa::Scale\n          parameters:\n            name: gain\n      exported_ports:\n        - [gain, INPUT, in]\n", "Unable to parse exported port (3 instead of 4 elements)"},
-    {"exported_port_field.yaml", "blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: inner\n    graph:\n      blocks:\n        - id: qa::Scale\n          parameters:\n            name: gain\n      exported_ports:\n        - [gain, INPUT, in, 4]\n", "Required fields for exported ports missing"},
-    {"contexts_not_a_list.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\n    ctx_parameters: 5\n", "Unable to create block 'gain' of type 'qa::Scale': ctx_parameters is not a list"},
-    {"context_not_a_map.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\n    ctx_parameters:\n      - fast\n", "a ctx_parameters entry is not a map"},
-    {"context_without_time.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\n    ctx_parameters:\n      - context: fast\n        parameters:\n          buffer_size: 512\n", "a ctx_parameters entry needs a context, a context_time and a parameters map"},
-    {"connection_not_a_list.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\nconnections: [42]\n", "Unable to parse connection (not a list)"},
-    {"connection_of_three.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\nconnections:\n  - [gain, out, gain]\n", "Unable to parse connection (3 instead of >=4 elements)"},
-    {"connection_block_field.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\nconnections:\n  - [7, out, gain, in]\n", "Invalid blockField"},
-    {"port_pair_of_three.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\nconnections:\n  - [gain, [0, 0, 0], gain, in]\n", "Port definition has invalid length (3 instead of 2)"},
-    {"port_pair_not_indices.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\nconnections:\n  - [gain, [a, b], gain, in]\n", "Port definition missing values"},
-    {"port_not_a_definition.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\nconnections:\n  - [gain, 1.5, gain, in]\n", "Port definition missing values"},
+/// One file per rule the importer enforces on a graph document's shape or on the block names it
+/// resolves, each with the sentence the tool gives for it and the text the importer refuses it with.
+/// The importer finds two absent keys by a lookup that throws std::out_of_range, with the message
+/// of a standard library container.
+constexpr std::array<Refusal, 25> kRefusals{{
+    {"no_id.yaml", "blocks:\n  - parameters:\n      name: source\n", "Missing field id in YAML object", "Missing field id in YAML object"},
+    {"id_not_a_string.yaml", "blocks:\n  - id: 42\n    parameters:\n      name: source\n", "Field id in YAML object has an incorrect type", "Field id in YAML object"},
+    {"no_parameters.yaml", "blocks:\n  - id: qa::Scale\n", "Missing field parameters in YAML object", "Missing field parameters in YAML object"},
+    {"parameters_not_a_map.yaml", "blocks:\n  - id: qa::Scale\n    parameters: 3\n", "Field parameters in YAML object has an incorrect type", "Field parameters in YAML object has an incorrect type"},
+    {"no_name.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      gain: 2.0\n", "Missing field name in YAML object", "Missing field name in YAML object"},
+    {"subgraph_without_graph.yaml", "blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: inner\n", "Missing field graph in YAML object", ""},
+    {"graph_not_a_map.yaml", "blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: inner\n    graph: 7\n", "Unable to create block 'inner' of type 'SUBGRAPH': graph is not a map", "graph is not a map"},
+    {"scheduler_not_a_map.yaml", "blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: inner\n    scheduler: simple\n    graph:\n      blocks:\n        - id: qa::Scale\n          parameters:\n            name: gain\n", "scheduler is not a property_map", "scheduler is not a property_map"},
+    {"scheduler_without_id.yaml", "blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: inner\n    scheduler:\n      parameters:\n        thread_pool: workers\n    graph:\n      blocks:\n        - id: qa::Scale\n          parameters:\n            name: gain\n", "Missing field id in YAML object", "Missing field id in YAML object"},
+    {"exported_port_not_a_list.yaml", "blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: inner\n    graph:\n      blocks:\n        - id: qa::Scale\n          parameters:\n            name: gain\n      exported_ports:\n        - gain\n", "Unable to parse exported port (not a list)", "Unable to parse exported port (not a list)"},
+    {"exported_port_of_three.yaml", "blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: inner\n    graph:\n      blocks:\n        - id: qa::Scale\n          parameters:\n            name: gain\n      exported_ports:\n        - [gain, INPUT, in]\n", "Unable to parse exported port (3 instead of 4 elements)", "Unable to parse exported port (3 instead of 4 elements)"},
+    {"exported_port_field.yaml", "blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: inner\n    graph:\n      blocks:\n        - id: qa::Scale\n          parameters:\n            name: gain\n      exported_ports:\n        - [gain, INPUT, in, 4]\n", "Required fields for exported ports missing", "Required fields for exported ports missing"},
+    {"exported_port_block.yaml", "blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: inner\n    graph:\n      blocks:\n        - id: qa::Scale\n          parameters:\n            name: gain\n      exported_ports:\n        - [nothere, INPUT, in, in]\n", "exported_ports[0] names block 'nothere': no block of its level carries that name", "Unknown block 'nothere'"},
+    {"contexts_not_a_list.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\n    ctx_parameters: 5\n", "Unable to create block 'gain' of type 'qa::Scale': ctx_parameters is not a list", "ctx_parameters is not a list"},
+    {"context_not_a_map.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\n    ctx_parameters:\n      - fast\n", "a ctx_parameters entry is not a map", "a ctx_parameters entry is not a map"},
+    {"context_without_time.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\n    ctx_parameters:\n      - context: fast\n        parameters:\n          buffer_size: 512\n", "a ctx_parameters entry needs a context, a context_time and a parameters map", ""},
+    {"connection_not_a_list.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\nconnections: [42]\n", "Unable to parse connection (not a list)", "Unable to parse connection (not a list)"},
+    {"connection_of_three.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\nconnections:\n  - [gain, out, gain]\n", "Unable to parse connection (3 instead of >=4 elements)", "Unable to parse connection (3 instead of >=4 elements)"},
+    {"connection_block_field.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\nconnections:\n  - [7, out, gain, in]\n", "Invalid blockField", "Invalid blockField"},
+    {"connection_block.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\nconnections:\n  - [gain, out, missing, in]\n", "connections[0] names block 'missing': no block of its level carries that name", "Unknown block 'missing'"},
+    {"shared_name.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: twin\n  - id: qa::Scale\n    parameters:\n      name: twin\nconnections:\n  - [twin, out, twin, in]\n", "connections[0] names block 'twin': more than one block carries that name", "'twin' is the name of more than one block"},
+    {"subgraph_empty_name.yaml", "blocks:\n  - id: SUBGRAPH\n    name: front\n    parameters:\n      name: \"\"\n    graph:\n      blocks:\n        - id: qa::Scale\n          parameters:\n            name: inside\n  - id: qa::Scale\n    parameters:\n      name: gain\nconnections:\n  - [gain, out, front, in]\n", "connections[0] names block 'front': no block of its level carries that name", "Unknown block 'front'"},
+    {"port_pair_of_three.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\nconnections:\n  - [gain, [0, 0, 0], gain, in]\n", "Port definition has invalid length (3 instead of 2)", "Port definition has invalid length (3 instead of 2)"},
+    {"port_pair_not_indices.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\nconnections:\n  - [gain, [a, b], gain, in]\n", "Port definition missing values", "Port definition missing values"},
+    {"port_not_a_definition.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\nconnections:\n  - [gain, 1.5, gain, in]\n", "Port definition missing values", "Port definition missing values"},
 }};
+
+/// A file that keeps every rule above. Its connections address two blocks of one name by their
+/// unique_name and a third block by its name, and its subgraph exports a port of its inner block by
+/// that block's name. The importer builds a graph from it, which shows that it creates `qa::Scale`.
+constexpr std::string_view kResolvedNames = "blocks:\n"
+                                            "  - id: qa::Scale\n    unique_name: twin_a\n    parameters:\n      name: twin\n"
+                                            "  - id: qa::Scale\n    unique_name: twin_b\n    parameters:\n      name: twin\n"
+                                            "  - id: qa::Scale\n    parameters:\n      name: gain\n"
+                                            "  - id: SUBGRAPH\n    parameters:\n      name: inner\n    graph:\n"
+                                            "      blocks:\n        - id: qa::Scale\n          parameters:\n            name: inside\n"
+                                            "      exported_ports:\n        - [inside, INPUT, in, in]\n"
+                                            "connections:\n"
+                                            "  - [twin_a, out, twin_b, in]\n"
+                                            "  - [twin_b, out, gain, in]\n";
 
 /// The same key in the two places a document may carry it: a document's top level, which the
 /// importer does not read, and the `graph` map of a SUBGRAPH entry, which it does. The entry has
@@ -506,13 +544,18 @@ const boost::ut::suite<"GraphDoc"> graphDocTests = [] {
     };
 
     "a connection to a block the level does not hold is still drawn"_test = [] {
-        const auto level = graphdoc::read("blocks:\n  - id: qa::Scale\n    parameters:\n      name: only\nconnections:\n  - [only, 0, missing, 0]\n");
-        expect(level.has_value());
-        const std::string diagram = graphdoc::diagramOf(*level, "g");
+        expect(!graphdoc::read("blocks:\n  - id: qa::Scale\n    parameters:\n      name: only\nconnections:\n  - [only, 0, missing, 0]\n").has_value()) << "the reader refuses such a file";
+
+        graphdoc::Level level;
+        level.blocks.emplace_back();
+        level.blocks.back().type = "qa::Scale";
+        level.blocks.back().name = "only";
+        level.connections.push_back(graphdoc::Connection{.sourceBlock = "only", .sourcePort = "0", .destinationBlock = "missing", .destinationPort = "0", .minBufferSize = {}, .itemType = {}});
+        const std::string diagram = graphdoc::diagramOf(level, "g");
         expect(diagram.find("(unresolved)") != std::string::npos) << "the missing end is drawn and marked";
         expect(diagram.find("classDef unresolved") != std::string::npos);
 
-        const std::string drawing = graphdoc::svgOf(*level, "g");
+        const std::string drawing = graphdoc::svgOf(level, "g");
         expect(eq(occurrences(drawing, "<rect class=\"node"), 2UZ)) << "the missing end is a node of the drawing too";
         expect(drawing.find("<rect class=\"node unresolved\"") != std::string::npos) << "and it is drawn dashed";
         expect(drawing.find(">(unresolved)<") != std::string::npos);
@@ -537,19 +580,43 @@ const boost::ut::suite<"GraphDoc"> graphDocTests = [] {
     };
 
     "a file outside the importer's dialect is refused here as well"_test = [] {
+#ifdef GR_ENABLE_BLOCK_REGISTRY
+        registerTestBlocks();
+        expect(fatal(importerVerdict(kResolvedNames).accepted)) << "the importer creates qa::Scale and resolves every name of the control file";
+#endif
         for (const Refusal& refusal : kRefusals) {
             const Run refused = describe(refusal.fileName, refusal.yaml);
             expect(eq(refused.exitCode, 1)) << std::format("{} left the status at {}: {}", refusal.fileName, refused.exitCode, refused.output);
             expect(refused.output.contains(refusal.message)) << std::format("{}: {}", refusal.fileName, refused.output);
 #ifdef GR_ENABLE_BLOCK_REGISTRY
-            expect(!importerAccepts(refusal.yaml)) << std::format("{}: the importer builds a graph from a file the tool refuses", refusal.fileName);
+            const ImporterVerdict verdict = importerVerdict(refusal.yaml);
+            expect(!verdict.accepted) << std::format("{}: the importer builds a graph from a file the tool refuses", refusal.fileName);
+            expect(!verdict.message.contains("Unable to create block of type")) << std::format("{}: the importer refuses the block type, not the rule: {}", refusal.fileName, verdict.message);
+            if (refusal.importerMessage.empty()) {
+                expect(verdict.absentKey) << std::format("{}: the importer refuses with '{}', not a lookup of the absent key", refusal.fileName, verdict.message);
+            } else {
+                expect(verdict.message.contains(refusal.importerMessage)) << std::format("{}: the importer refuses with '{}'", refusal.fileName, verdict.message);
+            }
 #endif
         }
 
-        // the same program describes a file within the dialect and exits 0, so the refusals above belong to their files
+        // a file within the dialect exits 0
         const Run described = describe("every_key.yaml", kEveryKey);
         expect(eq(described.exitCode, 0)) << described.output;
         expect(described.output.contains("# every_key.yaml")) << described.output;
+
+        const Run resolved = describe("resolved_names.yaml", kResolvedNames);
+        expect(eq(resolved.exitCode, 0)) << "a name two blocks share is no defect while a unique_name addresses each end" << resolved.output;
+    };
+
+    "a block type no registry holds leaves the file documentable"_test = [] {
+        constexpr std::string_view kUnknownType = "blocks:\n  - id: qa::NoSuchBlockIsRegistered\n    parameters:\n      name: lone\n";
+        const Run                  described    = describe("unknown_type.yaml", kUnknownType);
+        expect(eq(described.exitCode, 0)) << described.output;
+#ifdef GR_ENABLE_BLOCK_REGISTRY
+        const ImporterVerdict verdict = importerVerdict(kUnknownType);
+        expect(!verdict.accepted && verdict.message.contains("Unable to create block of type 'qa::NoSuchBlockIsRegistered'")) << "the importer refuses the type the tool does not check" << verdict.message;
+#endif
     };
 
     "exported_ports is read inside a subgraph and left uninterpreted at the top level"_test = [] {
@@ -568,9 +635,10 @@ const boost::ut::suite<"GraphDoc"> graphDocTests = [] {
         expect(nested.output.contains("Unable to parse exported port (not a list)")) << nested.output;
 
 #ifdef GR_ENABLE_BLOCK_REGISTRY
-        // the two verdicts are the case: the same malformed entry passes at the top level and fails under a subgraph
-        expect(importerAccepts(kRootExportedPorts)) << "the importer builds a graph from the top-level file";
-        expect(!importerAccepts(kSubgraphExportedPorts)) << "and refuses the same entry inside a subgraph";
+        // the same entry passes at the top level and fails under a subgraph
+        expect(importerVerdict(kRootExportedPorts).accepted) << "the importer builds a graph from the top-level file";
+        const ImporterVerdict nestedVerdict = importerVerdict(kSubgraphExportedPorts);
+        expect(!nestedVerdict.accepted && nestedVerdict.message.contains("Unable to parse exported port (not a list)")) << "and refuses the same entry inside a subgraph" << nestedVerdict.message;
 #endif
     };
 

@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -47,9 +48,10 @@ namespace gr::tools::graphdoc {
 /**
  * @brief The refusal text for a field that is absent or of the wrong shape.
  *
- * The tool refuses every file the importer refuses. The wording is the tool's own and names the
- * field and the shape it must have. The importer reports several of these defects with the message
- * of a standard library container.
+ * The tool refuses a file the importer refuses for its shape or for a block name it cannot resolve.
+ * Block types and ports need the block registry and are not checked. The wording is the tool's own
+ * and names the field and the shape it must have. The importer reports several of these defects
+ * with the message of a standard library container.
  */
 [[nodiscard]] inline std::string missingFieldMessage(std::string_view key) { return std::format("Missing field {} in YAML object", key); }
 
@@ -57,7 +59,7 @@ namespace gr::tools::graphdoc {
     return std::format("Field {} in YAML object has an incorrect type {}:{} instead of {}", key, value.value_type(), value.container_type(), wanted);
 }
 
-/// the string a required field holds, or the importer's refusal of the field
+/// the string a required field holds, or the refusal of the field
 [[nodiscard]] inline std::expected<std::string, std::string> requiredString(const property_map& map, std::string_view key) {
     const pmt::Value* value = entryOf(map, key);
     if (value == nullptr) {
@@ -166,12 +168,50 @@ struct Block {
 };
 
 /**
+ * @brief The blocks of one level by the names a connection or an exported port addresses them by.
+ *
+ * The rule is the importer's. A `unique_name` answers first, and of two blocks carrying the same
+ * one the later answers. A `name` answers next, unless more than one block carries it. An empty
+ * name addresses no block.
+ */
+class BlockNames {
+    std::map<std::string, std::size_t, std::less<>> _byUniqueName;
+    std::map<std::string, std::size_t, std::less<>> _byName;
+    std::set<std::string, std::less<>>              _sharedNames;
+
+public:
+    explicit BlockNames(const std::vector<Block>& blocks) {
+        for (std::size_t at = 0UZ; at < blocks.size(); ++at) {
+            if (!blocks[at].uniqueName.empty()) {
+                _byUniqueName.insert_or_assign(blocks[at].uniqueName, at);
+            }
+            if (!blocks[at].name.empty() && !_byName.try_emplace(blocks[at].name, at).second) {
+                _sharedNames.insert(blocks[at].name);
+            }
+        }
+    }
+
+    /// the position in the level of the block `key` addresses, or the reason it resolves to no block
+    [[nodiscard]] std::expected<std::size_t, std::string> find(std::string_view key) const {
+        if (const auto it = _byUniqueName.find(key); it != _byUniqueName.cend()) {
+            return it->second;
+        }
+        if (_sharedNames.contains(key)) {
+            return std::unexpected("more than one block carries that name; address the block by its unique_name");
+        }
+        if (const auto it = _byName.find(key); it != _byName.cend()) {
+            return it->second;
+        }
+        return std::unexpected("no block of its level carries that name");
+    }
+};
+
+/**
  * @brief The keys of one YAML map the reader has rendered into the document.
  *
- * Every other key reaches the document through a table of its own, whatever its name. The reader
- * leaves a key it knows unread where the importer leaves it unread as well, and where the value has
- * the wrong shape for the key. Such a key is listed beside a key no one knows. A document therefore
- * holds everything its input holds.
+ * A key is rendered in a table of its own where the reader reads it and its value has the shape
+ * that table needs. Every other key is listed with its value, whatever its name. A document
+ * therefore holds everything its input holds.
  */
 struct KeysRead {
     std::vector<std::string_view> names;
@@ -282,18 +322,16 @@ enum class LevelKind { Root, Subgraph };
         read.add("parameters");
     }
     if (subgraph) {
-        if (parameters != nullptr) {
-            if (const pmt::Value* name = entryOf(*parameters, "name"); name != nullptr) {
-                block.name = stringOf(*name).value_or(std::string{});
-            }
-        }
-        // a subgraph written before the parameters key carries its name at the top level
-        if (block.name.empty()) {
-            if (const pmt::Value* name = entryOf(entry, "name"); name != nullptr) {
-                if (const std::optional<std::string> text = stringOf(*name); text.has_value()) {
-                    block.name = *text;
-                    read.add("name");
-                }
+        // a string name in the parameters wins, an empty one included; a subgraph written before the
+        // parameters key carries its name at the top level
+        const pmt::Value*                named         = parameters == nullptr ? nullptr : entryOf(*parameters, "name");
+        const std::optional<std::string> parameterName = named == nullptr ? std::nullopt : stringOf(*named);
+        if (parameterName.has_value()) {
+            block.name = *parameterName;
+        } else if (const pmt::Value* name = entryOf(entry, "name"); name != nullptr) {
+            if (const std::optional<std::string> text = stringOf(*name); text.has_value()) {
+                block.name = *text;
+                read.add("name");
             }
         }
     } else {
@@ -428,6 +466,7 @@ inline ReadResult readLevel(const property_map& map, LevelKind kind) {
         }
     }
 
+    const BlockNames names(level.blocks);
     if (const pmt::Value* connections = entryOf(map, "connections"); connections != nullptr) {
         if (const Tensor<pmt::Value>* list = listOf(*connections); list != nullptr) {
             read.add("connections");
@@ -446,6 +485,11 @@ inline ReadResult readLevel(const property_map& map, LevelKind kind) {
                 for (const std::expected<std::string, std::string>& end : {sourceBlock, sourcePort, destinationBlock, destinationPort}) {
                     if (!end.has_value()) {
                         return std::unexpected(end.error());
+                    }
+                }
+                for (const std::string& block : {*sourceBlock, *destinationBlock}) {
+                    if (const std::expected<std::size_t, std::string> found = names.find(block); !found.has_value()) {
+                        return std::unexpected(std::format("connections[{}] names block '{}': {}", at, block, found.error()));
                     }
                 }
                 level.connections.push_back(Connection{
@@ -469,8 +513,8 @@ inline ReadResult readLevel(const property_map& map, LevelKind kind) {
     if (const pmt::Value* exported = kind == LevelKind::Subgraph ? entryOf(map, "exported_ports") : nullptr; exported != nullptr) {
         if (const Tensor<pmt::Value>* list = listOf(*exported); list != nullptr) {
             read.add("exported_ports");
-            for (const pmt::Value& entry : *list) {
-                const Tensor<pmt::Value>* fields = listOf(entry);
+            for (std::size_t at = 0UZ; at < list->size(); ++at) {
+                const Tensor<pmt::Value>* fields = listOf((*list)[at]);
                 if (fields == nullptr) {
                     return std::unexpected("Unable to parse exported port (not a list)");
                 }
@@ -484,6 +528,9 @@ inline ReadResult readLevel(const property_map& map, LevelKind kind) {
                         return std::unexpected("Required fields for exported ports missing");
                     }
                     text[field] = *value;
+                }
+                if (const std::expected<std::size_t, std::string> found = names.find(text[0]); !found.has_value()) {
+                    return std::unexpected(std::format("exported_ports[{}] names block '{}': {}", at, text[0], found.error()));
                 }
                 level.exportedPorts.emplace_back(text[0], text[1], text[2], text[3]);
             }
@@ -511,7 +558,7 @@ using ConnectionTypeResolver = std::function<std::string(std::string_view blockT
  * @brief Fills the item type of every connection of `level` and of every level below it.
  *
  * The type belongs to the source block's output port, so the lookup takes the source end: the
- * block the level holds under that name, and its `id` as the registry key. A subgraph is passed
+ * block the name addresses in the level, and its `id` as the registry key. A subgraph is passed
  * over because SUBGRAPH is no key; its exported port is answered by the block behind it, which
  * this level does not name.
  */
@@ -519,19 +566,11 @@ inline void resolveConnectionTypes(Level& level, const ConnectionTypeResolver& t
     if (!typeOf) {
         return;
     }
-    std::map<std::string, const Block*, std::less<>> blockForName;
-    for (const Block& block : level.blocks) {
-        if (!block.uniqueName.empty()) {
-            blockForName.emplace(block.uniqueName, &block);
-        }
-        if (!block.name.empty()) {
-            blockForName.emplace(block.name, &block);
-        }
-    }
+    const BlockNames names(level.blocks);
     for (Connection& connection : level.connections) {
-        const auto source = blockForName.find(connection.sourceBlock);
-        if (source != blockForName.end() && !source->second->isSubgraph()) {
-            connection.itemType = typeOf(source->second->type, connection.sourcePort);
+        const std::expected<std::size_t, std::string> source = names.find(connection.sourceBlock);
+        if (source.has_value() && !level.blocks[*source].isSubgraph()) {
+            connection.itemType = typeOf(level.blocks[*source].type, connection.sourcePort);
         }
     }
     for (Block& block : level.blocks) {
@@ -638,12 +677,13 @@ inline constexpr std::array<std::string_view, 12> kSimpleItemTypes{"int8", "int1
  * @brief A `flowchart LR` of one graph level, the form a Markdown reader draws a diagram from.
  *
  * Node identifiers are minted from the level prefix and the block position, so they are stable
- * across runs and unique across nesting depths. An endpoint no block of the level answers to is
- * still drawn, as a node marked unresolved: a connection the document silently omitted would be
- * worse than one whose end is visibly missing.
+ * across runs and unique across nesting depths. A block name resolves as the importer resolves it.
+ * The reader refuses a connection whose end resolves to no block. A level built in code may hold
+ * one, and the diagram draws that end as a node marked unresolved.
  */
 [[nodiscard]] inline std::string diagramOf(const Level& level, std::string_view prefix) {
-    std::map<std::string, std::string, std::less<>> idForName;
+    const BlockNames                                names(level.blocks);
+    std::map<std::string, std::string, std::less<>> unresolvedIds;
     std::string                                     nodes;
     std::string                                     edges;
 
@@ -654,23 +694,18 @@ inline constexpr std::array<std::string_view, 12> kSimpleItemTypes{"int8", "int1
         const std::string type  = nodeType(block.type);
         const std::string label = mermaidLabel(type.empty() ? name : std::format("{}\n{}", name, type));
         nodes += block.isSubgraph() ? std::format("    {}[[\"{}\"]]\n", id, label) : std::format("    {}[\"{}\"]\n", id, label);
-        if (!block.uniqueName.empty()) {
-            idForName.emplace(block.uniqueName, id);
-        }
-        if (!block.name.empty()) {
-            idForName.emplace(block.name, id);
-        }
     }
 
-    std::size_t unresolved = 0UZ;
-    auto        idOf       = [&](const std::string& blockName) {
-        const auto it = idForName.find(blockName);
-        if (it != idForName.end()) {
+    auto idOf = [&](const std::string& blockName) {
+        if (const std::expected<std::size_t, std::string> at = names.find(blockName); at.has_value()) {
+            return std::format("{}b{}", prefix, *at);
+        }
+        if (const auto it = unresolvedIds.find(blockName); it != unresolvedIds.end()) {
             return it->second;
         }
-        const std::string id = std::format("{}x{}", prefix, unresolved++);
+        const std::string id = std::format("{}x{}", prefix, unresolvedIds.size());
         nodes += std::format("    {}(\"{}\"):::unresolved\n", id, mermaidLabel(std::format("{}\n(unresolved)", blockName)));
-        idForName.emplace(blockName, id);
+        unresolvedIds.emplace(blockName, id);
         return id;
     };
 
@@ -683,7 +718,7 @@ inline constexpr std::array<std::string_view, 12> kSimpleItemTypes{"int8", "int1
     std::string diagram = "flowchart LR\n";
     diagram += nodes;
     diagram += edges;
-    if (unresolved != 0UZ) {
+    if (!unresolvedIds.empty()) {
         diagram += "    classDef unresolved stroke-dasharray: 4 3\n";
     }
     return diagram;
@@ -752,26 +787,23 @@ inline constexpr std::size_t kLabelCharacters = 28UZ;  ///< the widest label a n
         std::string toPort;
     };
 
-    std::vector<Node>                               nodes;
-    std::map<std::string, std::size_t, std::less<>> indexForName;
+    std::vector<Node> nodes;
     for (const Block& block : level.blocks) {
-        const std::size_t at = nodes.size();
         nodes.push_back({.name = block.name.empty() ? std::string("(unnamed)") : fitLabel(block.name, kLabelCharacters), .type = nodeType(block.type), .subgraph = block.isSubgraph()});
-        if (!block.uniqueName.empty()) {
-            indexForName.emplace(block.uniqueName, at);
-        }
-        if (!block.name.empty()) {
-            indexForName.emplace(block.name, at);
-        }
     }
 
-    auto indexOf = [&nodes, &indexForName](const std::string& blockName) -> std::size_t {
-        if (const auto held = indexForName.find(blockName); held != indexForName.end()) {
+    const BlockNames                                names(level.blocks);
+    std::map<std::string, std::size_t, std::less<>> unresolvedIndex;
+    auto                                            indexOf = [&nodes, &names, &unresolvedIndex](const std::string& blockName) -> std::size_t {
+        if (const std::expected<std::size_t, std::string> at = names.find(blockName); at.has_value()) {
+            return *at;
+        }
+        if (const auto held = unresolvedIndex.find(blockName); held != unresolvedIndex.end()) {
             return held->second;
         }
         const std::size_t at = nodes.size();
         nodes.push_back({.name = fitLabel(blockName, kLabelCharacters), .type = "(unresolved)", .unresolved = true});
-        indexForName.emplace(blockName, at);
+        unresolvedIndex.emplace(blockName, at);
         return at;
     };
 
