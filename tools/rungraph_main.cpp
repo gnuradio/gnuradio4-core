@@ -62,11 +62,11 @@ after the run has ended and the block has been asked to refresh them: a counter 
 as a readable member is then current as of the last sample it processed.
 
 A bare key of --set names a setting of the scheduler, and a key of the form <block>.<key> names a
-setting of the block --show matches by that name. The split is at the last dot before the '=', so
-a block name may hold a dot and a setting key never does. rungraph reads the value the way a graph
-file's parameter value is read, so a type tag applies: -s timeout_ms=50, -s
-'shift.frequency_shift=!!float32 -100000'. One --set carries one setting, and a value that holds a
-second key is refused. The last --set of a key wins.
+setting of the one top-level block whose unique_name or name is <block>; a <block> two blocks carry
+is refused. The split is at the last dot before the '=', so a block name may hold a dot and a
+setting key never does. rungraph reads the value the way a graph file's parameter value is read,
+so a type tag applies: -s timeout_ms=50, -s 'shift.frequency_shift=!!float32 -100000'. One --set
+carries one setting, and a value that holds a second key is refused. The last --set of a key wins.
 
 SIGINT and SIGTERM stop the graph as a --seconds bound does.
 

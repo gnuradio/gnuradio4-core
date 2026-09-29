@@ -158,10 +158,13 @@ struct ConstructionRecorder : Block<ConstructionRecorder> {
 
     std::optional<float> gainAtConstruction; // the gain in the constructor's argument, if it held one
 
+    // a graph file's untagged real number is a double, a caller's setting here a float
     explicit ConstructionRecorder(property_map init = {}) : Block<ConstructionRecorder>(init) {
         if (const auto it = init.find("gain"); it != init.end()) {
             if (const float* given = it->second.get_if<float>(); given != nullptr) {
                 gainAtConstruction = *given;
+            } else if (const double* fromFile = it->second.get_if<double>(); fromFile != nullptr) {
+                gainAtConstruction = static_cast<float>(*fromFile);
             }
         }
     }
@@ -661,7 +664,7 @@ connections:
 
 /**
  * `loadGrc` with a caller's settings: each block reads them where it reads the file's parameters, and a name or a
- * key the graph cannot take is refused before any block is added.
+ * key the graph cannot take is refused before the graph is returned.
  */
 const boost::ut::suite<"GRC load with settings"> grcSettingsTests = [] {
     using namespace boost::ut;
@@ -715,15 +718,12 @@ connections:
         registerTestBlocks();
         PluginLoader& loader = gr::globalPluginLoader();
 
-        bool summedThree = false;
-        try {
-            auto                    loaded = gr::loadGrc(loader, kSummedRamps);
-            gr::scheduler::Simple<> scheduler;
-            if (scheduler.exchange(std::move(loaded)).has_value() && scheduler.runAndWait().has_value()) {
-                const std::vector<float> samples = takeCollected("summed-sink");
-                summedThree                      = !samples.empty() && samples.back() == 3.0f * 63.0f;
-            }
-        } catch (const gr::exception&) {
+        auto                    loaded = gr::loadGrc(loader, kSummedRamps);
+        gr::scheduler::Simple<> scheduler;
+        bool                    summedThree = false;
+        if (scheduler.exchange(std::move(loaded)).has_value() && scheduler.runAndWait().has_value()) {
+            const std::vector<float> samples = takeCollected("summed-sink");
+            summedThree                      = !samples.empty() && samples.back() == 3.0f * 63.0f;
         }
         std::ignore = takeCollected("summed-sink");
         expect(!summedThree) << "the file's own n_inputs of 2 leaves in#2 absent";
@@ -786,7 +786,7 @@ connections:
         } catch (const gr::exception& e) {
             reported = e.message;
         }
-        expect(reported.contains("unique_name")) << reported;
+        expect(reported.contains("settings are given for block 'twin', and 2 blocks carry that unique_name or name")) << reported;
     };
 
     "a key that is one block's unique_name and another's name is refused, as are two keys for one block"_test = [] {
@@ -849,7 +849,7 @@ connections:
         }
     };
 
-    "a block with an entry is constructed with the merged parameters"_test = [] {
+    "every block is constructed with its parameters, merged where it has an entry"_test = [] {
         registerTestBlocks();
         PluginLoader& loader = gr::globalPluginLoader();
 
@@ -871,6 +871,7 @@ connections:
     parameters:
       name: from-file
       gain: 3.0
+      unread: a key the block does not declare
 )yaml",
             gr::BlockSettings{{"given", {{"gain", 5.0f}}}});
         expect(eq(loaded->blocks().size(), 2UZ));
@@ -880,13 +881,29 @@ connections:
             expect(recorderOf(given).gainAtConstruction == std::optional(5.0f)) << "the constructor reads the given value";
             expect(eq(recorderOf(given).gain.value, 5.0f)) << "the settings hold the given value";
             expect(given->metaInformation().contains("unread")) << "a key of the file the block does not declare stays meta information";
-            expect(!recorderOf(fromFile).gainAtConstruction.has_value()) << "a block without an entry is constructed as the file alone constructs it";
+            expect(recorderOf(fromFile).gainAtConstruction == std::optional(3.0f)) << "a block without an entry is constructed with the file's parameters";
             expect(eq(recorderOf(fromFile).gain.value, 3.0f));
+            expect(fromFile->metaInformation().contains("unread")) << "a key of the file the block does not declare stays meta information";
+        }
+
+        const auto alone = gr::loadGrc(loader, R"yaml(blocks:
+  - id: qa::ConstructionRecorder
+    parameters:
+      name: alone
+      gain: 3.0
+)yaml");
+        expect(eq(alone->blocks().size(), 1UZ));
+        if (alone->blocks().size() == 1UZ) {
+            expect(recorderOf(alone->blocks().front()).gainAtConstruction == std::optional(3.0f)) << "a load without settings constructs the block with the file's parameters";
         }
     };
 
-    "loadGrc takes an empty braced list for its settings"_test = [] {
+    // a location follows the settings: a call passing a location third does not compile
+    "loadGrc compiles with two arguments, with settings, and with settings and a location"_test = [] {
+        static_assert(requires(PluginLoader& loader) { gr::loadGrc(loader, std::string_view{}); });
+        static_assert(requires(PluginLoader& loader) { gr::loadGrc(loader, std::string_view{}, gr::BlockSettings{}); });
         static_assert(requires(PluginLoader& loader) { gr::loadGrc(loader, std::string_view{}, {}); });
+        static_assert(requires(PluginLoader& loader) { gr::loadGrc(loader, std::string_view{}, gr::BlockSettings{}, std::source_location::current()); });
         static_assert(requires(PluginLoader& loader) { gr::loadGrc(loader, std::string_view{}, {}, std::source_location::current()); });
 
         registerTestBlocks();

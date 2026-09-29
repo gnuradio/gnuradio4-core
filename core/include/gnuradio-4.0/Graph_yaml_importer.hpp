@@ -23,9 +23,9 @@ namespace gr {
  *
  * A key names the one block that carries it as its `unique_name` or its `name`; a key no block carries, a key two
  * blocks carry and a key for a subgraph are refused before any block is made. The entry's map replaces those keys of
- * the block's `parameters`. The block is constructed with the merged parameters and its settings load them where they
- * load the file's, so its constructor, its `settingsChanged()` and its `start()` see a given value, and a port count
- * such as `n_inputs` sizes the ports before the connections are made.
+ * the block's `parameters`. Every block is constructed with its parameters, merged where it has an entry, and its
+ * settings load the same map, so its constructor, its `settingsChanged()` and its `start()` see a given value, and a
+ * port count such as `n_inputs` sizes the ports before the connections are made.
  */
 using BlockSettings = std::map<std::string, property_map, std::less<>>;
 
@@ -242,11 +242,13 @@ inline void checkDeclared(const BlockModel& block, std::string_view blockName, c
     }
 }
 
-/// The file's parameters of one block with the caller's settings in place of the same keys.
-inline property_map mergedParameters(const property_map* fromFile, const property_map& overrides) {
+/// The file's parameters of one block with the caller's settings, if any, in place of the same keys.
+inline property_map mergedParameters(const property_map* fromFile, const property_map* overrides) {
     property_map merged = fromFile != nullptr ? *fromFile : property_map{};
-    for (const auto& [key, value] : overrides) {
-        merged.insert_or_assign(key, value);
+    if (overrides != nullptr) {
+        for (const auto& [key, value] : *overrides) {
+            merged.insert_or_assign(key, value);
+        }
     }
     return merged;
 }
@@ -383,29 +385,23 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
             const auto          parametersPmt = grcBlock.at("parameters");
             const property_map* parameters    = parametersPmt.get_if<property_map>();
             const property_map* given         = settingsByPosition[position];
-            const property_map  merged        = given != nullptr ? mergedParameters(parameters, *given) : property_map{};
+            const property_map  merged        = mergedParameters(parameters, given);
 
             auto currentBlock = loader.instantiate(blockType, merged);
             if (!currentBlock) {
                 throw gr::exception(std::format("Unable to create block of type '{}'", blockType));
             }
+            // the settings take the map once, below; the constructor's copy would be applied again by Settings::init(),
+            // which refuses a key of the file the block does not declare
+            currentBlock->settings().setInitBlockParameters({});
             if (given != nullptr) {
-                // the settings take the merged map once, below, as they take the file's; the constructor's copy would
-                // be applied again by Settings::init(), which refuses a key of the file the block does not declare
-                currentBlock->settings().setInitBlockParameters({});
                 checkDeclared(*currentBlock, blockName, *given);
             }
 
             // This sets the previously read "name" field for the block
             currentBlock->setName(blockName);
 
-            if (given != nullptr) {
-                currentBlock->settings().loadParametersFromPropertyMap(merged);
-            } else if (parameters != nullptr) {
-                currentBlock->settings().loadParametersFromPropertyMap(*parameters);
-            } else {
-                currentBlock->settings().loadParametersFromPropertyMap({});
-            }
+            currentBlock->settings().loadParametersFromPropertyMap(merged);
 
             if (auto it = grcBlock.find("ctx_parameters"); it != grcBlock.end()) {
                 // as with the graph field above, the null tests below are reachable only because the
