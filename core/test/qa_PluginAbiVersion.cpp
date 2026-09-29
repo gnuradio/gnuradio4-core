@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <format>
 #include <memory>
 #include <optional>
+#include <print>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -131,7 +133,11 @@ const boost::ut::suite<"PluginAbiVersion"> pluginAbiVersionTests = [] {
         expect(kept.file.ends_with("/libscheduler_library.so")) << kept.file;
         expect(eq(kept.nSchedulerRegistrations, 1UZ));
         expect(that % isMapped(kept.file)) << "the probe sees a library the loader keeps";
-        expect(that % !isMapped(refused->first)) << "a refused library is closed";
+        expect(that % !std::ranges::contains(loader.blockLibraries(), refused->first, &PluginLoader::BlockLibrary::file)) << "a refused library is not kept";
+        expect(that % loader.plugins().empty()) << "the loader holds no handle to a library that is not a plugin, the refused one included";
+
+        // glibc marks a shared object NODELETE when a load binds one of its STB_GNU_UNIQUE symbols, and dlclose then leaves it mapped
+        std::println(stderr, "the refused library {} is {} after the loader closed its handle; a runtime may keep a closed library mapped, as glibc does when a load bound one of its STB_GNU_UNIQUE symbols", refused->first, isMapped(refused->first) ? "still mapped" : "unmapped");
 
         expect(that % loader.isSchedulerAvailable(kCurrentSchedulerKey)) << "a library of this ABI version offers its scheduler";
         expect(that % std::ranges::contains(loader.availableSchedulers(), std::string(kCurrentSchedulerKey)));
