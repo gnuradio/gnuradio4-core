@@ -63,7 +63,7 @@ echo 1 | sudo tee /sys/block/zram0/reset
 - **`GR_ENABLE_BLOCK_REGISTRY`** (default: ON): enables a runtime registry of blocks.
   Turning this off gives fully static builds.
 - **`EMBEDDED`** (default: OFF): reduces code size and runtime features for constrained systems.
-  Also implicitly enabled by `-DCMAKE_BUILD_TYPE=MinSizeRel`.
+  Also enabled by `-DCMAKE_BUILD_TYPE=MinSizeRel` with the project's `MinSizeRel` flags.
 - **`WARNINGS_AS_ERRORS`** (default: ON): treats all compiler warnings as errors (`-Werror`).
 - **`TIMETRACE`** (default: OFF): activates Clang’s `-ftime-trace` for per-file compilation timing.
 - **`GR_BLOCKLIB_MAX_REGISTRATIONS_PER_TU`** (default: 16): balanced chunking of generated
@@ -79,6 +79,24 @@ echo 1 | sudo tee /sys/block/zram0/reset
 - **`ADDRESS_SANITIZER`** (default: OFF): enables AddressSanitizer (can’t be combined with the other sanitizer options).
 - **`UB_SANITIZER`** (default: OFF): enables 'Undefined Behavior' checks.
 - **`THREAD_SANITIZER`** (default: OFF): enables threading checks (N.B. strong impact on performance).
+
+### Per-Build-Type Flags
+
+A value the caller or a toolchain file sets for `CMAKE_CXX_FLAGS_<CONFIG>`, `CMAKE_EXE_LINKER_FLAGS_<CONFIG>` or
+`CMAKE_SHARED_LINKER_FLAGS_<CONFIG>` replaces the project's default for that build type, and `CXXFLAGS`, `LDFLAGS`
+and `CMAKE_CXX_FLAGS` apply to every build type.
+With GCC and Clang the project's compiler defaults (`cmake/FlagsOverride.cmake`) are `-O2 -DASSERT_ENABLED` for
+`RelWithAssert` (the default build type), `-O2 -g0 -DNDEBUG` for `Release`, `-O2 -g1 -gz -DNDEBUG` for
+`RelWithDebInfo`, `-Og -g1 -gz -DDEBUG -fno-omit-frame-pointer` for `Debug` and `-Os -g0 -DNDEBUG -DEMBEDDED` for
+`MinSizeRel` (with `-s` under GCC), each with `-ffunction-sections -fdata-sections`.
+`Debug`, `Release` and `MinSizeRel` link executables and shared libraries with `-Wl,--gc-sections`
+(`-Wl,-dead_strip` on macOS), the linker choice (mold or lld where found, with `-Wl,--icf=safe` unless a sanitizer
+is on) and `-Wl,-flat_namespace` on macOS.
+A per-build-type linker value from the caller replaces the section flags and keeps the linker choice.
+Built as a subproject, the tree takes the enclosing project's compiler flags for `Debug`, `Release`,
+`RelWithDebInfo` and `MinSizeRel`, CMake's own defaults included: the project's linker defaults apply there, and its
+compiler defaults do not.
+For `RelWithAssert` the tree uses its own compiler flags where the enclosing project gives none.
 
 ### Example Combined Command
 
