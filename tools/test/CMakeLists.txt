@@ -54,14 +54,18 @@ if(TARGET rungraph)
   add_dependencies(qa_RunGraph rungraph)
   set_tests_properties(qa_RunGraph PROPERTIES TIMEOUT 60)
   if(INTERNAL_ENABLE_BLOCK_PLUGINS)
-    target_compile_definitions(qa_RunGraph PRIVATE GR_TOOLS_CORE_TEST_PLUGINS="${CMAKE_BINARY_DIR}/core/test/plugins")
-    # the settings cases run chains of good::identity and good::start_recorder, which GoodRegistryPlugin supplies,
-    # and a plugin's scheduler, which good_math_plugin registers
+    target_compile_definitions(
+      qa_RunGraph PRIVATE GR_TOOLS_CORE_TEST_PLUGINS="${CMAKE_BINARY_DIR}/core/test/plugins"
+                          GR_TOOLS_TEST_SCHEDULER_LIBRARY="${CMAKE_BINARY_DIR}/core/test/scheduler_library")
+    # the settings cases need GoodRegistryPlugin (good::identity and good::start_recorder), good_math_plugin
+    # (a plugin's scheduler) and scheduler_library (a scheduler from a shared object that is not a plugin)
     add_dependencies(
       qa_RunGraph
       GoodBasePlugin
       GoodRegistryPlugin
-      good_math_plugin)
+      good_math_plugin
+      scheduler_library
+      scheduler_library_v1)
   endif()
 endif()
 
@@ -75,8 +79,10 @@ if(TARGET grinfo)
   set_tests_properties(qa_GrInfo PROPERTIES TIMEOUT 60)
   if(INTERNAL_ENABLE_BLOCK_PLUGINS)
     target_compile_definitions(
-      qa_GrInfo PRIVATE GR_TOOLS_CORE_TEST_PLUGINS="${CMAKE_BINARY_DIR}/core/test/plugins"
-                        GR_TOOLS_TEST_BLOCK_LIBRARY="${CMAKE_BINARY_DIR}/core/test/block_library")
+      qa_GrInfo
+      PRIVATE GR_TOOLS_CORE_TEST_PLUGINS="${CMAKE_BINARY_DIR}/core/test/plugins"
+              GR_TOOLS_TEST_BLOCK_LIBRARY="${CMAKE_BINARY_DIR}/core/test/block_library"
+              GR_TOOLS_TEST_SCHEDULER_LIBRARY="${CMAKE_BINARY_DIR}/core/test/scheduler_library")
     add_dependencies(
       qa_GrInfo
       GoodBasePlugin
@@ -84,6 +90,8 @@ if(TARGET grinfo)
       good_conversion_plugin
       bad_plugin
       block_library
-      block_library_second)
+      block_library_second
+      scheduler_library
+      scheduler_library_v1)
   endif()
 endif()

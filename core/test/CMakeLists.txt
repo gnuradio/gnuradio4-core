@@ -173,7 +173,12 @@ if(GR_ENABLE_BLOCK_REGISTRY AND INTERNAL_ENABLE_BLOCK_PLUGINS)
     block_library_duplicate_second)
 
   add_app_test(qa_PluginAbiVersion)
-  add_dependencies(qa_PluginAbiVersion abi_probe_plugin abi_probe_plugin_v1)
+  add_dependencies(
+    qa_PluginAbiVersion
+    abi_probe_plugin
+    abi_probe_plugin_v1
+    scheduler_library
+    scheduler_library_v1)
 endif()
 
 if(GR_ENABLE_BLOCK_REGISTRY AND INTERNAL_ENABLE_BLOCK_PLUGINS)

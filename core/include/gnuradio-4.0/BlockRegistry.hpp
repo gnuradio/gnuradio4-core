@@ -3,7 +3,10 @@
 
 #include <gnuradio-4.0/meta/simd.hpp>
 
+#include <cstdint>
+#include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -37,6 +40,13 @@
  * GR_REGISTER_BLOCK("blockN.hpp", gr::basic::BlockN, ([T],[U],3UZ,SomeAlgo<[T]>), [ short, int], [double])
  */
 #define GR_REGISTER_BLOCK(...) /* Marker macro for parse_registrations */
+
+// The version of the plugin interface, raised by every change to the layout of a type that crosses the plugin
+// boundary: `gr_plugin_base` itself, and the `BlockModel` and `SchedulerModel` interfaces whose objects a plugin or a
+// registry factory hands back. A plugin records the version it was compiled against, and so does every registry
+// entry. A host loads only a plugin whose version equals its own and keeps a shared object's schedulers only at that
+// version, because a virtual call through a mismatched interface reaches the wrong function.
+#define GR_PLUGIN_CURRENT_ABI_VERSION 4
 
 namespace gr {
 
@@ -87,34 +97,55 @@ class GeneralRegistry {
         decltype(this_t::factoryProto)* createFunction = nullptr;
     };
 
-    std::map<std::string, TTypeHandler, std::less<>> _blockTypeHandlers;
-    std::size_t                                      _generation = 0UZ;
+    // a version belongs to the factory it was recorded with, so an entry a later insertion replaced without recording
+    // one reads as unversioned
+    struct RecordedAbiVersion {
+        decltype(this_t::factoryProto)* createFunction = nullptr;
+        std::uint8_t                    abiVersion     = 0;
+    };
+
+    // `_blockTypeHandlers` and `_generation` keep the layout of a registry that records no version: a shared object
+    // built against one inserts into them through its own inline copy of `insert()`, and never into `_abiVersions`
+    std::map<std::string, TTypeHandler, std::less<>>       _blockTypeHandlers;
+    std::size_t                                            _generation = 0UZ;
+    std::map<std::string, RecordedAbiVersion, std::less<>> _abiVersions;
 
 public:
+    /// every entry of a registry, as `takeEntries()` moves them out and `restoreEntries()` puts them back
+    struct Entries {
+        std::map<std::string, TTypeHandler, std::less<>>       handlers;
+        std::map<std::string, RecordedAbiVersion, std::less<>> abiVersions;
+    };
+
     GeneralRegistry()                               = default;
     GeneralRegistry(const this_t& other)            = delete;
     GeneralRegistry& operator=(const this_t& other) = delete;
 
-    GeneralRegistry(this_t&& other) noexcept : _blockTypeHandlers(std::exchange(other._blockTypeHandlers, {})) {}
+    GeneralRegistry(this_t&& other) noexcept : _blockTypeHandlers(std::exchange(other._blockTypeHandlers, {})), _abiVersions(std::exchange(other._abiVersions, {})) {}
     GeneralRegistry& operator=(this_t&& other) noexcept {
         auto tmp = std::move(other);
         std::swap(_blockTypeHandlers, tmp._blockTypeHandlers);
+        std::swap(_abiVersions, tmp._abiVersions);
         return *this;
     }
     ~GeneralRegistry() = default;
 
 #ifdef GR_ENABLE_BLOCK_REGISTRY
-    /// Adds an entry a generated definition unit already produced: nothing here names the block type.
-    bool insert(std::string_view name, std::string_view alias, decltype(this_t::factoryProto)* factory) {
+    /// Adds an entry a generated definition unit already produced: nothing here names the block type. The entry
+    /// records `abiVersion`, whose default argument is evaluated where the call is written: the version recorded is the
+    /// `GR_PLUGIN_CURRENT_ABI_VERSION` of the translation unit that registers, whichever copy of this function runs.
+    bool insert(std::string_view name, std::string_view alias, decltype(this_t::factoryProto)* factory, std::uint8_t abiVersion = GR_PLUGIN_CURRENT_ABI_VERSION) {
         auto handler = TTypeHandler{.alias = std::string(alias), .createFunction = factory};
 
         auto resName = _blockTypeHandlers.insert_or_assign(std::string(name), handler);
+        _abiVersions.insert_or_assign(std::string(name), RecordedAbiVersion{.createFunction = factory, .abiVersion = abiVersion});
         ++_generation;
 
         bool aliasInserted = false;
         if (!alias.empty()) {
             handler.alias.clear();
             auto resAlias = _blockTypeHandlers.insert_or_assign(std::string(alias), handler);
+            _abiVersions.insert_or_assign(std::string(alias), RecordedAbiVersion{.createFunction = factory, .abiVersion = abiVersion});
             aliasInserted = resAlias.second;
             ++_generation;
         }
@@ -124,15 +155,15 @@ public:
 
     template<BlockLike TBlock>
     requires std::is_constructible_v<TBlock, property_map>
-    bool insert(std::string_view alias = "", std::string_view aliasParameters = "") {
-        return insert(gr::meta::type_name<TBlock>(), makeRegistryAlias(alias, aliasParameters), defaultFactory<TBlock>);
+    bool insert(std::string_view alias = "", std::string_view aliasParameters = "", std::uint8_t abiVersion = GR_PLUGIN_CURRENT_ABI_VERSION) {
+        return insert(gr::meta::type_name<TBlock>(), makeRegistryAlias(alias, aliasParameters), defaultFactory<TBlock>, abiVersion);
     }
 #else
-    bool insert([[maybe_unused]] std::string_view name, [[maybe_unused]] std::string_view alias, [[maybe_unused]] decltype(this_t::factoryProto)* factory) { return false; }
+    bool insert([[maybe_unused]] std::string_view name, [[maybe_unused]] std::string_view alias, [[maybe_unused]] decltype(this_t::factoryProto)* factory, [[maybe_unused]] std::uint8_t abiVersion = GR_PLUGIN_CURRENT_ABI_VERSION) { return false; }
 
     template<BlockLike TBlock>
     requires std::is_constructible_v<TBlock, property_map>
-    bool insert([[maybe_unused]] std::string_view alias = "", [[maybe_unused]] std::string_view aliasParameters = "") {
+    bool insert([[maybe_unused]] std::string_view alias = "", [[maybe_unused]] std::string_view aliasParameters = "", [[maybe_unused]] std::uint8_t abiVersion = GR_PLUGIN_CURRENT_ABI_VERSION) {
         return false;
         // disables plugin system in favour of faster compile-times and when runtime or Python wrapping APIs are not requrired
         // e.g. for compile-time only flow-graphs or for CI runners
@@ -157,6 +188,36 @@ public:
 
     [[nodiscard]] bool contains(std::string_view blockName) const { return _blockTypeHandlers.contains(blockName); }
 
+    /// the plugin ABI version the entry under `key` was registered at; empty for a key the registry does not hold and
+    /// for an entry whose registration recorded none, as code built against a registry without versions registers
+    [[nodiscard]] std::optional<std::uint8_t> abiVersion(std::string_view key) const {
+        const auto handler  = _blockTypeHandlers.find(key);
+        const auto recorded = _abiVersions.find(key);
+        if (handler == _blockTypeHandlers.end() || recorded == _abiVersions.end() || recorded->second.createFunction != handler->second.createFunction) {
+            return std::nullopt;
+        }
+        return recorded->second.abiVersion;
+    }
+
+    /// Moves every entry out and leaves the generation as it is, so that the registry holds only what is registered
+    /// afterwards until `restoreEntries()` puts the taken entries back.
+    [[nodiscard]] Entries takeEntries() { return {.handlers = std::exchange(_blockTypeHandlers, {}), .abiVersions = std::exchange(_abiVersions, {})}; }
+
+    /// Puts back the entries `takeEntries()` returned. With `keepRegistered`, an entry registered since then stays and
+    /// replaces a taken one under the same key; without it, every such entry is dropped.
+    void restoreEntries(Entries taken, bool keepRegistered) {
+        if (keepRegistered) {
+            for (auto& [key, handler] : _blockTypeHandlers) {
+                taken.handlers.insert_or_assign(key, std::move(handler));
+            }
+            for (const auto& [key, recorded] : _abiVersions) {
+                taken.abiVersions.insert_or_assign(key, recorded);
+            }
+        }
+        _blockTypeHandlers = std::move(taken.handlers);
+        _abiVersions       = std::move(taken.abiVersions);
+    }
+
     std::string typeName(const std::shared_ptr<BlockModel>& block) {
         auto name = block->typeName();
         auto it   = _blockTypeHandlers.find(name);
@@ -172,6 +233,7 @@ public:
         }
 
         _blockTypeHandlers.insert(anotherRegistry._blockTypeHandlers.cbegin(), anotherRegistry._blockTypeHandlers.cend());
+        _abiVersions.insert(anotherRegistry._abiVersions.cbegin(), anotherRegistry._abiVersions.cend());
     }
 };
 

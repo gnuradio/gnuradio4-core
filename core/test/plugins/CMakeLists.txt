@@ -68,6 +68,19 @@ endfunction()
 add_abi_probe_plugin(abi_probe_plugin)
 add_abi_probe_plugin(abi_probe_plugin_v1)
 
+# One shared object that registers a scheduler without being a plugin, built at the plugin ABI version this core
+# implements and at version 1, in a directory of their own. A load of that directory keeps the first and refuses the
+# second.
+function(add_scheduler_library LIBRARY_NAME)
+  add_library(${LIBRARY_NAME} MODULE scheduler_library.cpp)
+  target_link_libraries(${LIBRARY_NAME} PRIVATE gnuradio-options gnuradio-core gnuradio-blocklib-core)
+  set_target_properties(${LIBRARY_NAME} PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${TESTS_BINARY_PATH}/scheduler_library)
+endfunction()
+
+add_scheduler_library(scheduler_library)
+add_scheduler_library(scheduler_library_v1)
+target_compile_definitions(scheduler_library_v1 PRIVATE SCHEDULER_LIBRARY_ABI_VERSION=1)
+
 # a name that reads as a shared object but is not one the scan opens; it is never dlopened, so an empty file suffices
 file(MAKE_DIRECTORY ${TESTS_BINARY_PATH}/block_library_skipped)
 file(TOUCH ${TESTS_BINARY_PATH}/block_library_skipped/libnotopened.so.1)
