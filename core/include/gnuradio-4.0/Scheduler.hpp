@@ -4,9 +4,11 @@
 #include <algorithm>
 #include <bit>
 #include <chrono>
+#include <map>
 #include <mutex>
 #include <queue>
 #include <set>
+#include <string>
 
 #include <thread>
 #include <utility>
@@ -155,11 +157,14 @@ protected:
     // fixed-sized vector indexed by runnerId. Cheaper than a map.
     std::vector<std::vector<std::shared_ptr<BlockModel>>> _adoptionBlocks;
 
-    MsgPortOutForChildren    _toChildMessagePort;
-    MsgPortInFromChildren    _fromChildMessagePort;
-    std::vector<gr::Message> _pendingMessagesToChildren;
-    bool                     _messagePortsConnected = false;
-    std::optional<Error>     _firstErrorFromChildren; // the first error a child sent since the latest start, named for the child; runAndWait() returns it for a run ending in ERROR
+    MsgPortOutForChildren                     _toChildMessagePort;
+    MsgPortInFromChildren                     _fromChildMessagePort;
+    std::vector<gr::Message>                  _pendingMessagesToChildren;
+    bool                                      _messagePortsConnected = false;
+    std::optional<Error>                      _firstErrorFromChildren; // the first error a child sent since the latest start, named for the child
+    std::map<std::string, Error, std::less<>> _latestErrorByChild;     // each child's latest error since the latest start, keyed by its unique name
+    std::mutex                                _runEndingBlockMutex;
+    std::optional<std::string>                _runEndingBlock; // the first block whose work() returned ERROR since the latest start
 
     std::atomic_flag _processingScheduledMessages;
     // separate cache lines: every worker reads the flag and updates the counter on each iteration
@@ -234,7 +239,9 @@ public:
 
     [[nodiscard]] bool workerStarted() noexcept { return gr::atomic_ref(_nWorkersStarted).load_acquire() > 0UZ; }
 
-    // why the latest start could not complete and left the scheduler in ERROR; the next start clears it
+    // why the latest start could not complete and left the scheduler in ERROR; the next start clears it. The thread that
+    // runs the start writes it before it publishes ERROR. Read it once the state reads ERROR or while no start is in
+    // progress: a read during a start races with that write
     [[nodiscard]] std::optional<Error> startError() const { return _startError; }
 
     // a worker holds its pool thread for the run's lifetime, so a start into a pool whose threads are all held
@@ -519,12 +526,19 @@ public:
         }
 
         std::optional<Error> firstError;
-        if (const auto errorMessage = std::ranges::find_if(messagesFromChildren, [](const gr::Message& msg) { return !msg.data.has_value(); }); errorMessage != messagesFromChildren.end()) {
-            const Error& reason = errorMessage->data.error();
-            firstError          = Error{std::format("block '{}' reports an error on '{}': {}", errorMessage->serviceName, errorMessage->endpoint, reason.message), reason.sourceLocation, reason.errorTime};
-            if (!_firstErrorFromChildren.has_value()) {
-                _firstErrorFromChildren = firstError;
+        for (const gr::Message& message : messagesFromChildren) {
+            if (message.data.has_value()) {
+                continue;
             }
+            const Error& reason = message.data.error();
+            Error        named{std::format("block '{}' reports an error on '{}': {}", message.serviceName, message.endpoint, reason.message), reason.sourceLocation, reason.errorTime};
+            if (!firstError.has_value()) {
+                firstError = named;
+            }
+            if (!_firstErrorFromChildren.has_value()) {
+                _firstErrorFromChildren = named;
+            }
+            _latestErrorByChild.insert_or_assign(message.serviceName, std::move(named));
         }
 
         if (this->msgOut.nReaders() == 0) {
@@ -624,7 +638,7 @@ public:
             return std::unexpected(*_startError);
         }
         if (this->state() == ERROR) {
-            return std::unexpected(_firstErrorFromChildren.value_or(Error{"a block error ended the run: the scheduler finished in the ERROR state"}));
+            return std::unexpected(runEndingError());
         }
         return {};
     }
@@ -639,6 +653,24 @@ public:
     [[nodiscard]] std::shared_ptr<JobLists> jobs() const noexcept { return _executionOrder; }
 
 protected:
+    // the error of a run that ended in ERROR. It names the first block whose work() returned ERROR and carries that
+    // block's latest reported error, or the name alone when the block reported none. A run that no block's ERROR ended
+    // returns the first error any child reported
+    [[nodiscard]] Error runEndingError() {
+        std::optional<std::string> endingBlock;
+        {
+            std::lock_guard guard(_runEndingBlockMutex);
+            endingBlock = _runEndingBlock;
+        }
+        if (endingBlock.has_value()) {
+            if (const auto reported = _latestErrorByChild.find(*endingBlock); reported != _latestErrorByChild.end()) {
+                return reported->second;
+            }
+            return Error{std::format("block '{}' ended the run: its work() returned ERROR", *endingBlock)};
+        }
+        return _firstErrorFromChildren.value_or(Error{"a block error ended the run: the scheduler finished in the ERROR state"});
+    }
+
     void disconnectAllEdges() {
         _graph->disconnectAllEdges();
         graph::forEachBlock<TransparentBlockGroup>(*_graph, [](auto& block) {
@@ -692,7 +724,8 @@ protected:
         std::this_thread::sleep_for(std::min(kMaxIdleSleep, std::chrono::microseconds(static_cast<std::chrono::microseconds::rep>(1UZ << shift))));
     }
 
-    work::Result traverseBlockListOnce(const std::vector<std::shared_ptr<BlockModel>>& blocks) const {
+    // a block whose work() returns ERROR ends the traversal, and the first such block since the start names the run's error
+    work::Result traverseBlockListOnce(const std::vector<std::shared_ptr<BlockModel>>& blocks) {
         const std::size_t requestedWorkAllBlocks = max_work_items;
         std::size_t       performedWorkAllBlocks = 0UZ;
         bool              unfinishedBlocksExist  = false; // i.e. at least one block returned OK, INSUFFICIENT_INPUT_ITEMS, or INSUFFICIENT_OUTPU_ITEMS
@@ -701,6 +734,10 @@ protected:
             performedWorkAllBlocks += performed_work;
 
             if (status == work::Status::ERROR) {
+                std::lock_guard guard(_runEndingBlockMutex);
+                if (!_runEndingBlock.has_value()) {
+                    _runEndingBlock = std::string(currentBlock->uniqueName());
+                }
                 return {requested_work, performedWorkAllBlocks, work::Status::ERROR};
             }
             // A block group performs no work of its own: Block::work() reports OK for every non-NormalBlock
@@ -738,6 +775,7 @@ protected:
         if (!isOnOwnWorkerThread()) {
             waitDone();
         }
+        gr::atomic_ref(_nWorkersStarted).store_release(0UZ); // workerStarted() reports the next start's workers, not the last run's
         graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) { this->emitErrorMessageIfAny("reset() -> LifecycleState", block->changeStateTo(lifecycle::INITIALISED)); });
         disconnectAllEdges();
         connectBlockMessagePorts();
@@ -794,23 +832,30 @@ protected:
             }
         }
         _firstErrorFromChildren.reset();
+        _latestErrorByChild.clear();
+        {
+            std::lock_guard guard(_runEndingBlockMutex);
+            _runEndingBlock.reset();
+        }
 
         std::lock_guard lock(_executionOrderMutex);
 
-        std::optional<Error> firstChildError;
+        std::optional<Error>                     firstChildError;
+        std::vector<std::shared_ptr<BlockModel>> startedSubSchedulers;
         // the sweep runs whole under this lock, released before the workers are dispatched: a worker requesting a stop takes it
         {
             std::lock_guard childLock(_childLifecycleMutex);
             if (lifecycle::isShuttingDown(this->state())) {
                 return;
             }
-            graph::forEachBlock<TransparentBlockGroup>(*_graph, [this, &firstChildError](auto& block) { //
+            graph::forEachBlock<TransparentBlockGroup>(*_graph, [this, &firstChildError, &startedSubSchedulers](auto& block) { //
                 if (block->blockCategory() == ScheduledBlockGroup) {
                     // We don't simply move to RUNNING, as schedulers block. This code path
                     // uses a separate thread.
                     auto* schedulerModel = dynamic_cast<SchedulerModel*>(block.get());
                     if (schedulerModel) {
                         schedulerModel->start();
+                        startedSubSchedulers.push_back(block);
                     } else {
                         throw gr::exception(std::format("ScheduledBlockGroup is not a SchedulerModel {}", block->uniqueName()));
                     }
@@ -831,6 +876,16 @@ protected:
                     this->emitErrorMessageIfAny("LifecycleState -> RUNNING", std::move(transitioned));
                 }
             });
+        }
+
+        // a sub-scheduler starts on its own thread and can fail after its start() returned. Its outcome is awaited here,
+        // outside the sweep's lock, as an adoption awaits it
+        for (const std::shared_ptr<BlockModel>& subScheduler : startedSubSchedulers) {
+            auto* schedulerModel = dynamic_cast<SchedulerModel*>(subScheduler.get());
+            if (awaitSubSchedulerStart(*subScheduler, *schedulerModel) == SubSchedulerStart::failed && !firstChildError.has_value()) {
+                firstChildError = Error{std::format("sub-scheduler '{}' could not start: {}", subScheduler->uniqueName(), subSchedulerStartFailure(*schedulerModel))};
+                this->emitErrorMessage("start()", *firstChildError);
+            }
         }
 
         if (firstChildError.has_value()) {
@@ -862,7 +917,7 @@ protected:
             _nRunningJobs->incrementAndGet();
             _nRunningJobs->notify_all();
             gr::atomic_ref(_nWorkersStarted).fetch_add(1UZ);
-            static_cast<Derived*>(this)->poolWorker(0UZ, _executionOrder, workerGeneration);
+            dispatchWorker(0UZ, _executionOrder, workerGeneration);
         } else { // run on processing thread pool
             [[maybe_unused]] const auto pe           = _profilerHandler->startCompleteEvent("scheduler_base.runOnPool");
             auto                        jobListsCopy = _executionOrder;
@@ -880,7 +935,7 @@ protected:
                             return;
                         }
                         gr::atomic_ref(_nWorkersStarted).fetch_add(1UZ);
-                        static_cast<Derived*>(this)->poolWorker(runnerID, jobListsCopy, workerGeneration);
+                        dispatchWorker(runnerID, jobListsCopy, workerGeneration);
                     });
                 } catch (...) { // a rejected task never decrements, and the leaked count spins waitDone() forever
                     std::ignore = _nRunningJobs->subAndGet(nWorkers - runnerID);
@@ -891,6 +946,16 @@ protected:
         }
         if constexpr (requires(Derived& d) { d.customStart(); }) {
             static_cast<Derived*>(this)->customStart();
+        }
+    }
+
+    // a scheduler's own poolWorker() takes the run's generation as a third parameter or omits it. A worker without the
+    // generation ends only when it observes an inactive state
+    void dispatchWorker(std::size_t runnerID, std::shared_ptr<JobLists> jobList, std::size_t generation) {
+        if constexpr (requires(Derived& d, std::shared_ptr<JobLists> list) { d.poolWorker(0UZ, list, 0UZ); }) {
+            static_cast<Derived*>(this)->poolWorker(runnerID, std::move(jobList), generation);
+        } else {
+            static_cast<Derived*>(this)->poolWorker(runnerID, std::move(jobList));
         }
     }
 
@@ -1236,6 +1301,36 @@ protected:
         }
     }
 
+    enum class SubSchedulerStart { workerRunning, failed, stopped, noWorkerInTime };
+
+    // waits at most watchdog_timeout for a sub-scheduler's start to settle. A worker counts itself before its run can end
+    // in ERROR, so ERROR with no worker counted is a failed start. A stop that claims the start leaves no worker and no
+    // ERROR
+    [[nodiscard]] SubSchedulerStart awaitSubSchedulerStart(const BlockModel& block, SchedulerModel& schedulerModel) const {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(watchdog_timeout.value);
+        while (true) {
+            const lifecycle::State state = block.state();
+            if (schedulerModel.workerStarted()) {
+                return SubSchedulerStart::workerRunning;
+            }
+            if (state == lifecycle::State::ERROR) {
+                return SubSchedulerStart::failed;
+            }
+            if (lifecycle::isShuttingDown(state)) {
+                return SubSchedulerStart::stopped;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return SubSchedulerStart::noWorkerInTime;
+            }
+            std::this_thread::yield();
+        }
+    }
+
+    [[nodiscard]] static std::string subSchedulerStartFailure(const SchedulerModel& schedulerModel) {
+        const std::optional<Error> reason = schedulerModel.startError();
+        return reason.has_value() ? reason->message : std::string("its start ended in ERROR");
+    }
+
     // a sub-scheduler's RUNNING transition runs its whole loop, so it starts through the threaded wrapper rather than
     // on the thread that adopts it, and only an executing worker shows that its pool had a thread for it. A start that
     // cannot complete ends the sub-scheduler in ERROR without a worker, and the report carries its startError().
@@ -1254,19 +1349,11 @@ protected:
             return;
         }
 
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(watchdog_timeout.value);
-        while (!schedulerModel->workerStarted()) {
-            // a worker counts itself before its run can end in ERROR. ERROR with no worker counted is a failed start.
-            if (newBlock->state() == ERROR && !schedulerModel->workerStarted()) {
-                const std::optional<Error> reason = schedulerModel->startError();
-                this->emitErrorMessage("adoptBlock", std::format("adopted sub-scheduler '{}' could not start: {}", newBlock->uniqueName(), reason.has_value() ? reason->message : std::string("its start ended in ERROR")));
-                return;
-            }
-            if (std::chrono::steady_clock::now() >= deadline) {
-                this->emitErrorMessage("adoptBlock", std::format("no worker of adopted sub-scheduler '{}' began executing", newBlock->uniqueName()));
-                return;
-            }
-            std::this_thread::yield();
+        switch (awaitSubSchedulerStart(*newBlock, *schedulerModel)) {
+        case SubSchedulerStart::failed: this->emitErrorMessage("adoptBlock", std::format("adopted sub-scheduler '{}' could not start: {}", newBlock->uniqueName(), subSchedulerStartFailure(*schedulerModel))); break;
+        case SubSchedulerStart::noWorkerInTime: this->emitErrorMessage("adoptBlock", std::format("no worker of adopted sub-scheduler '{}' began executing", newBlock->uniqueName())); break;
+        case SubSchedulerStart::workerRunning:
+        case SubSchedulerStart::stopped: break;
         }
     }
 

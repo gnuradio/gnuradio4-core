@@ -49,7 +49,7 @@ public:
 
     [[nodiscard]] virtual bool workerStarted() = 0;
 
-    // why the latest start could not complete; the next start clears it
+    // why the latest start could not complete; the next start clears it. A read is ordered once the scheduler reads ERROR
     [[nodiscard]] virtual std::optional<Error> startError() const = 0;
 
     virtual void requestWorkQuiescence() = 0;
