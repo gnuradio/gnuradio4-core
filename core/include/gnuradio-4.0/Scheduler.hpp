@@ -1595,6 +1595,8 @@ protected:
         return message;
     }
 
+    // the EdgeEmplaced reply lists the edges the new one displaced under "displacedEdges", keyed by index as in a
+    // GraphInspect reply
     std::optional<Message> propertyCallbackEmplaceEdge([[maybe_unused]] std::string_view propertyName, Message message) {
         assert(propertyName == scheduler::property::kEmplaceEdge);
         using namespace std::string_literals;
@@ -1628,7 +1630,13 @@ protected:
         {
             WorkQuiescenceGuard quiescence(this);
             const std::size_t   effectiveMinBufferSize = (*minBufferSize == gr::undefined_Size) ? gr::undefined_size : static_cast<std::size_t>(*minBufferSize);
-            if (auto result = targetGraph->emplaceEdge(sourceBlock, std::string(sourcePort), destinationBlock, std::string(destinationPort), effectiveMinBufferSize, *weight, edgeName); !result.has_value()) {
+            if (auto result = targetGraph->emplaceEdge(sourceBlock, std::string(sourcePort), destinationBlock, std::string(destinationPort), effectiveMinBufferSize, *weight, edgeName); result.has_value()) {
+                property_map displacedEdges;
+                for (std::size_t index = 0UZ; index < result->size(); ++index) {
+                    displacedEdges[convert_string_domain(std::to_string(index))] = serializeEdge((*result)[index]);
+                }
+                messageData["displacedEdges"] = std::move(displacedEdges);
+            } else {
                 message.data = std::unexpected(result.error());
             }
         }

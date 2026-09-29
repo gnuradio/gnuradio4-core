@@ -49,12 +49,15 @@ type mismatches produce runtime errors.
 ```cpp
 graph.connect(source, "out", sink, "in")                                          // block references
     .and_then([&] { return graph.connect(source, "out#0", sink, "in#2"); })       // port collections
-    .and_then([&] { return graph.connect(source, "out", sink, "in",
+    .and_then([&] { return graph.connect(source, "out", monitor, "in",
                                          {.minBufferSize = 4096UZ}); });          // with edge parameters
 
 // with shared_ptr<BlockModel> (from plugin registry)
 graph.connect(srcModel, PortDefinition("out"), sinkModel, PortDefinition("in"));
 ```
+
+An output may feed several inputs, and a stream input takes one source: a second edge into a stream input replaces
+the first, and the graph prints both edges.
 
 ---
 

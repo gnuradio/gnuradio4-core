@@ -446,6 +446,7 @@ public:
         return std::ranges::any_of(_edges, [&](const Edge& e) { return e == edge; });
     }
 
+    // appends the edge as given, without the one-source check that connect() and emplaceEdge() run for stream inputs
     template<typename T>
     requires std::same_as<std::remove_cvref_t<T>, Edge>
     [[nodiscard]] std::expected<std::reference_wrapper<Edge>, Error> addEdge(T&& edge, std::source_location location = std::source_location::current()) {
@@ -457,18 +458,6 @@ public:
 
     [[maybe_unused]] bool removeEdge(const Edge& edge) {
         return std::erase_if(_edges, [&edge](const Edge& e) { return e == edge; });
-    }
-
-    // a stream input reads only the ring it was connected to last; an earlier edge into it would be saved and inspected
-    // with no data behind it, and is removed and reported instead
-    void removeEdgesDisplacedBy(const Edge& newEdge) {
-        std::erase_if(_edges, [this, &newEdge](const Edge& edge) {
-            if (!edge.hasSameStreamInput(newEdge)) {
-                return false;
-            }
-            std::println(stderr, "{}: edge {:l} replaces edge {:l}: a stream input takes one source", this->unique_name, newEdge, edge);
-            return true;
-        });
     }
 
     std::optional<Message> propertyCallbackInspectBlock([[maybe_unused]] std::string_view propertyName, Message message);
@@ -492,7 +481,8 @@ public:
 
     std::pair<std::shared_ptr<BlockModel>, std::shared_ptr<BlockModel>> replaceBlock(std::string_view uniqueName, std::string_view type, const property_map& properties);
 
-    [[nodiscard]] std::expected<void, Error> emplaceEdge(std::string_view sourceBlock, std::string sourcePort, std::string_view destinationBlock, //
+    // returns the edges the new one displaced from its stream input
+    [[nodiscard]] std::expected<std::vector<Edge>, Error> emplaceEdge(std::string_view sourceBlock, std::string sourcePort, std::string_view destinationBlock, //
         std::string destinationPort, [[maybe_unused]] const std::size_t minBufferSize, [[maybe_unused]] const std::int32_t weight, std::string_view edgeName) {
         auto sourceBlockIt = std::ranges::find_if(_blocks, [&sourceBlock](const auto& block) { return block->uniqueName() == sourceBlock; });
         if (sourceBlockIt == _blocks.end()) {
@@ -528,9 +518,9 @@ public:
         const bool        isArithmeticLike       = sourcePortRef.isArithmeticLikeValueType();
         const std::size_t sanitizedMinBufferSize = minBufferSize == undefined_size ? graph::defaultMinBufferSize(isArithmeticLike) : minBufferSize;
         Edge              newEdge(*sourceBlockIt, sourcePort, *destinationBlockIt, destinationPort, sanitizedMinBufferSize, weight, std::string(edgeName));
-        removeEdgesDisplacedBy(newEdge);
+        std::vector<Edge> displaced = removeEdgesDisplacedBy(newEdge);
         _edges.push_back(std::move(newEdge));
-        return {};
+        return displaced;
     }
 
     // an empty destination removes every edge fanning out from the source port; the port's buffer is shared by
@@ -609,7 +599,7 @@ public:
         Edge newEdge(sourceBlock, std::move(sourcePort),  //
             destinationBlock, std::move(destinationPort), //
             std::move(parameters));
-        removeEdgesDisplacedBy(newEdge);
+        std::ignore = removeEdgesDisplacedBy(newEdge);
         _edges.push_back(std::move(newEdge));
 
         return {};
@@ -722,7 +712,7 @@ public:
         Edge newEdge(sourceBlockModel.value(), sourcePortDefinition->definition,  //
             destinationBlockModel.value(), destinationPortDefinition->definition, //
             std::move(parameters));
-        removeEdgesDisplacedBy(newEdge);
+        std::ignore = removeEdgesDisplacedBy(newEdge);
         _edges.push_back(std::move(newEdge));
 
         return {};
@@ -907,6 +897,22 @@ public:
             });
         }
         return allConnected;
+    }
+
+private:
+    // an earlier edge into the same stream input is removed and reported: the input reads only the ring it was
+    // connected to last
+    [[nodiscard]] std::vector<Edge> removeEdgesDisplacedBy(const Edge& newEdge) {
+        std::vector<Edge> displaced;
+        std::erase_if(_edges, [&newEdge, &displaced](const Edge& edge) {
+            if (!edge.hasSameStreamInput(newEdge)) {
+                return false;
+            }
+            std::println("edge {} replaces edge {}: a stream input takes one source", newEdge, edge);
+            displaced.push_back(edge);
+            return true;
+        });
+        return displaced;
     }
 };
 
