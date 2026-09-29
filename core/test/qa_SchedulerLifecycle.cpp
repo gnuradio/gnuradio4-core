@@ -471,6 +471,46 @@ struct OwnWorkerScheduler : gr::scheduler::SchedulerBase<OwnWorkerScheduler, gr:
     }
 };
 
+inline std::atomic<std::size_t> gTwoArgumentWorkers{0UZ};
+
+// a scheduler whose own worker takes the job list alone, without the run's generation: it runs until the scheduler
+// leaves an active state
+struct TwoArgumentWorkerScheduler : gr::scheduler::SchedulerBase<TwoArgumentWorkerScheduler, gr::scheduler::ExecutionPolicy::multiThreaded> {
+    using Base = gr::scheduler::SchedulerBase<TwoArgumentWorkerScheduler, gr::scheduler::ExecutionPolicy::multiThreaded>;
+    using Base::SchedulerBase;
+
+    void customInit() {
+        const gr::Graph flatGraph = gr::graph::flatten(*this->_graph);
+        const auto      blocks    = flatGraph.blocks();
+
+        std::lock_guard lock(this->_executionOrderMutex);
+        std::lock_guard guard(this->_adoptionBlocksMutex);
+        this->_adoptionBlocks.clear();
+        this->_adoptionBlocks.resize(1UZ);
+        this->_executionOrder->clear();
+        this->_executionOrder->emplace_back(blocks.begin(), blocks.end());
+    }
+
+    void poolWorker(std::size_t runnerID, std::shared_ptr<gr::scheduler::JobLists> jobList) {
+        gTwoArgumentWorkers.fetch_add(1UZ, std::memory_order_relaxed);
+        std::shared_ptr<gr::Sequence> nRunningJobs = this->_nRunningJobs;
+        gr::on_scope_exit             release      = [this, &nRunningJobs] { this->releaseWorkerCount(*nRunningJobs); };
+
+        std::vector<std::shared_ptr<gr::BlockModel>> localBlockList;
+        {
+            std::lock_guard lock(this->_executionOrderMutex);
+            localBlockList = jobList->at(runnerID);
+        }
+
+        while (gr::lifecycle::isActive(this->state())) {
+            const gr::work::Result result = this->traverseBlockListOnce(localBlockList);
+            if (result.status == gr::work::Status::DONE || result.status == gr::work::Status::ERROR) {
+                return;
+            }
+        }
+    }
+};
+
 template<typename TScheduler>
 [[nodiscard]] std::shared_ptr<gr::SchedulerWrapper<TScheduler>> makeSubScheduler(std::string_view poolName) {
     using namespace boost::ut;
@@ -822,6 +862,41 @@ const boost::ut::suite<"a start that cannot complete"> failedStartTests = [] {
         inner->stop();
     };
 
+    "a sub-scheduler whose start fails inside its parent's start ends the parent in ERROR with the reason"_test = [] {
+        gr::Graph innerFlow;
+        auto&     innerSource = innerFlow.emplaceBlock<qa_sched::ThrowingStartSource>();
+        auto&     innerSink   = innerFlow.emplaceBlock<qa_sched::CountingSink>();
+        expect(innerFlow.connect<"out", "in">(innerSource, innerSink).has_value());
+
+        auto inner = std::make_shared<gr::SchedulerWrapper<qa_sched::TestScheduler>>();
+        inner->setGraph(std::move(innerFlow));
+
+        gr::Graph                             flow       = qa_sched::makeEndlessGraph();
+        const std::shared_ptr<gr::BlockModel> innerBlock = flow.addBlock(gr::SchedulerModel::asBlockModelPtr(inner));
+        const std::string                     innerName(innerBlock->uniqueName());
+
+        qa_sched::TestScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        std::ignore = scheduler.changeStateTo(RUNNING); // the start's outcome is read from the state
+
+        expect(qa_sched::awaitCondition([&scheduler] { return !gr::lifecycle::isActive(scheduler.state()); }, qa_sched::kRunBound)) << "a parent whose sub-scheduler could not start still reads active";
+        expect(scheduler.state() == ERROR) << "a sub-scheduler's failed start must end its parent in ERROR";
+        expect(innerBlock->state() == ERROR) << "the sub-scheduler's own start must have failed";
+
+        const std::optional<gr::Error> reason = scheduler.startError();
+        expect(reason.has_value()) << "the parent must keep the reason its start could not complete";
+        if (reason.has_value()) {
+            expect(reason->message.find(innerName) != std::string::npos) << "the reason must name the sub-scheduler: " << reason->message;
+            expect(reason->message.find(std::string(innerSource.unique_name)) != std::string::npos) << "the reason must name the block that failed to start: " << reason->message;
+            expect(reason->message.find("the device refused to open") != std::string::npos) << "the reason must carry what the start() hook threw: " << reason->message;
+        }
+        expect(eq(innerSource._nEmitted, 0UZ));
+        if (gr::lifecycle::isActive(scheduler.state())) {
+            scheduler.requestStop();
+        }
+    };
+
     "runAndWait returns the reason a start could not complete and leaves the scheduler in ERROR"_test = [] {
         gr::Graph flow;
         auto&     source = flow.emplaceBlock<qa_sched::ThrowingStartSource>();
@@ -886,6 +961,29 @@ const boost::ut::suite<"a start that cannot complete"> failedStartTests = [] {
 
         expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
         expect(qa_sched::awaitState(scheduler, STOPPED)) << "the second run did not stop";
+    };
+};
+
+const boost::ut::suite<"a scheduler that supplies its own worker"> ownWorkerTests = [] {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    "a scheduler whose own worker takes no generation runs a graph to its end"_test = [] {
+        qa_sched::gTwoArgumentWorkers.store(0UZ, std::memory_order_relaxed);
+
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::DoneSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        qa_sched::TwoArgumentWorkerScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(scheduler.runAndWait().has_value()) << "a run that ends with DONE succeeds";
+
+        expect(gt(qa_sched::gTwoArgumentWorkers.load(std::memory_order_relaxed), 0UZ)) << "the dispatch must reach the scheduler's own two-argument worker";
+        expect(ge(source._nEmitted, qa_sched::kSamplesBeforeTerminal)) << "the source must have run to its end";
+        expect(eq(sink._nReceived, source._nEmitted)) << "the whole stream must pass through the scheduler's own worker";
+        expect(scheduler.state() == STOPPED);
     };
 };
 

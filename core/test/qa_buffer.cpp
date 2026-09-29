@@ -170,7 +170,8 @@ const boost::ut::suite SequenceTests = [] {
         expect(Clock::now() >= deadline) << "the wait ended before its deadline";
     };
 
-    // the notifier starts 0 to 252 us after the waiter's thread: some trials notify before the waiter blocks, some after
+    // the notify follows the waiter's thread by a delay that grows from 0 to 252 us across the trials, to spread it on
+    // both sides of the moment the waiter blocks. No trial checks which side its notify fell on
     "a notify after incrementAndGet ends a timed wait before its deadline"_test = [] {
         using namespace gr;
         using Clock = std::chrono::steady_clock;

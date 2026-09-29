@@ -71,6 +71,30 @@ struct DeviceLossSource : gr::Block<DeviceLossSource> {
     }
 };
 
+constexpr std::string_view kSensorFault = "the sensor stopped answering";
+
+// returns ERROR once another block has sent its report, and first reports kSensorFault itself when report_first is set
+struct ErrorAfterReportSource : gr::Block<ErrorAfterReportSource> {
+    gr::PortOut<float> out;
+
+    gr::Annotated<bool, "report a fault before the ERROR"> report_first = false;
+
+    GR_MAKE_REFLECTABLE(ErrorAfterReportSource, out, report_first);
+
+    const bool* _awaitedReport = nullptr;
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        outSpan.publish(0UZ);
+        if (_awaitedReport == nullptr || !*_awaitedReport) {
+            return gr::work::Status::OK;
+        }
+        if (report_first) {
+            this->emitErrorMessage("processBulk", kSensorFault);
+        }
+        return gr::work::Status::ERROR;
+    }
+};
+
 // no ports: exists only to call processScheduledMessages() directly, outside a graph
 struct SilentBlock : gr::Block<SilentBlock> {
     GR_MAKE_REFLECTABLE(SilentBlock);
@@ -205,6 +229,39 @@ const boost::ut::suite<"a block error that ends the run"> blockErrorRunTests = [
 
         expect(sched.runAndWait().has_value()) << "a run that ends with DONE succeeds whatever its blocks reported";
         expect(source._reported) << "the block must have sent its report";
+    };
+
+    // one scheduler thread traverses the blocks in turn, and the failing source waits for the other block's report, so
+    // the survivable report is the first error the scheduler receives
+    "the run's error names the block whose ERROR ended the run, not an earlier report of another block"_test = [] {
+        for (const bool reportFirst : {false, true}) {
+            gr::Graph flow;
+            auto&     reporter     = flow.emplaceBlock<qa_msg::DeviceLossSource>({{"fail_after_report", false}});
+            auto&     reporterSink = flow.emplaceBlock<qa_msg::NullSink>();
+            auto&     failing      = flow.emplaceBlock<qa_msg::ErrorAfterReportSource>({{"report_first", reportFirst}});
+            auto&     failingSink  = flow.emplaceBlock<qa_msg::NullSink>();
+            expect(flow.connect<"out", "in">(reporter, reporterSink).has_value());
+            expect(flow.connect<"out", "in">(failing, failingSink).has_value());
+            failing._awaitedReport = &reporter._reported;
+            const std::string reporterName(reporter.unique_name);
+            const std::string failingName(failing.unique_name);
+
+            gr::scheduler::Simple sched;
+            MsgPortIn             subscriber;
+            expect(sched.msgOut.connect(subscriber).has_value());
+            expect(sched.exchange(std::move(flow)).has_value());
+
+            const std::expected<void, Error> result = sched.runAndWait();
+            expect(reporter._reported) << "the surviving block must have sent its report";
+            expect(!result.has_value()) << "a block that ends its run with ERROR must fail the run";
+            if (!result.has_value()) {
+                const std::string& message = result.error().message;
+                expect(message.find(failingName) != std::string::npos) << "the error must name the block whose ERROR ended the run: " << message;
+                expect(message.find(reporterName) == std::string::npos) << "the error must not name the block that survived its report: " << message;
+                expect(message.find(qa_msg::kDeviceLost) == std::string::npos) << "the error must not carry the survived report: " << message;
+                expect(eq(message.find(qa_msg::kSensorFault) != std::string::npos, reportFirst)) << "the error carries the failing block's own report exactly when it sent one: " << message;
+            }
+        }
     };
 };
 
