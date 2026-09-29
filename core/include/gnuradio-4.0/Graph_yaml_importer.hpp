@@ -158,9 +158,8 @@ struct BlockIdentity {
 
 inline BlockIdentity readBlockIdentity(const property_map& grcBlock) {
     // the type decides which fields are required, so it is read first
-    BlockIdentity identity{.type = getOrThrow(getProperty<std::string>(grcBlock, "id"sv))};
-    identity.uniqueName = getProperty<std::string>(grcBlock, "unique_name"sv).value_or(std::string{});
-    auto fromParameters = getProperty<std::string>(grcBlock, "parameters"sv, "name"sv);
+    BlockIdentity identity{.type = getOrThrow(getProperty<std::string>(grcBlock, "id"sv)), .uniqueName = getProperty<std::string>(grcBlock, "unique_name"sv).value_or(std::string{}), .name = {}};
+    auto          fromParameters = getProperty<std::string>(grcBlock, "parameters"sv, "name"sv);
     if (fromParameters.has_value() || !identity.isSubgraph()) {
         identity.name = getOrThrow(std::move(fromParameters));
     } else {
