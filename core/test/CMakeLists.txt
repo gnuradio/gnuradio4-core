@@ -177,8 +177,10 @@ if(GR_ENABLE_BLOCK_REGISTRY AND INTERNAL_ENABLE_BLOCK_PLUGINS)
     qa_PluginAbiVersion
     abi_probe_plugin
     abi_probe_plugin_v1
+    abi_probe_plugin_foreign_scheduler
     scheduler_library
-    scheduler_library_v1)
+    scheduler_library_v1
+    scheduler_library_unversioned)
 endif()
 
 if(GR_ENABLE_BLOCK_REGISTRY AND INTERNAL_ENABLE_BLOCK_PLUGINS)

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -369,7 +370,8 @@ public:
      * It carries no `gr_plugin_make`; its entries reach the registries from static initializers, and it is kept
      * mapped for the lifetime of the process because those entries point into its code. A shared object that
      * registered a scheduler at a plugin ABI version other than the host's, or at none, is refused instead: its
-     * entries are dropped, it is closed, and it is reported among the failed plugins.
+     * entries are dropped, it is closed, and it is reported among the failed plugins. A plugin whose load registered
+     * such a scheduler is refused the same way.
      */
     struct BlockLibrary {
         std::string file;
@@ -510,6 +512,13 @@ public:
                 SetAsideRegistrations registrations(reachableRegistries(_registry, gr::globalBlockRegistry()), reachableRegistries(_schedulerRegistry, gr::globalSchedulerRegistry()));
 
                 if (PluginHandler handler(fileString); handler) {
+                    if (std::optional<std::string> mismatch = registrations.schedulerAbiMismatch(); mismatch.has_value()) {
+                        registrations.restore(false);
+                        std::println(stderr, "warning: plugin {} not loaded: {}", fileString, *mismatch);
+                        _failedPlugins[fileString] = std::move(*mismatch);
+                        continue;
+                    }
+
                     for (std::string_view blockName : handler->availableBlocks()) {
                         _pluginForBlockName.emplace(std::string(blockName), handler.operator->());
                     }
@@ -529,7 +538,7 @@ public:
                     if (handler.isLoaded() && (blockRegistrations != 0UZ || schedulerRegistrations != 0UZ)) {
                         if (std::optional<std::string> mismatch = registrations.schedulerAbiMismatch(); mismatch.has_value()) {
                             registrations.restore(false);
-                            std::println("warning: library {} not loaded: {}", fileString, *mismatch);
+                            std::println(stderr, "warning: library {} not loaded: {}", fileString, *mismatch);
                             _failedPlugins[fileString] = std::move(*mismatch);
                         } else {
                             registrations.restore(true);

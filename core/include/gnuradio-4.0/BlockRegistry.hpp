@@ -43,9 +43,11 @@
 
 // The version of the plugin interface, raised by every change to the layout of a type that crosses the plugin
 // boundary: `gr_plugin_base` itself, and the `BlockModel` and `SchedulerModel` interfaces whose objects a plugin or a
-// registry factory hands back. A plugin records the version it was compiled against, and so does every registry
-// entry. A host loads only a plugin whose version equals its own and keeps a shared object's schedulers only at that
-// version, because a virtual call through a mismatched interface reaches the wrong function.
+// registry factory hands back. A plugin records the version it was compiled against. A registry entry records the
+// version of the code that calls `insert()`, so a block entry added through `insertBlockFactory()` records the
+// version of core. A host loads only a plugin whose version equals its own. Of the entries a shared object registers,
+// the host reads the versions of the schedulers and keeps those only at its own version, because a virtual call
+// through a mismatched interface reaches the wrong function.
 #define GR_PLUGIN_CURRENT_ABI_VERSION 4
 
 namespace gr {
@@ -105,7 +107,10 @@ class GeneralRegistry {
     };
 
     // `_blockTypeHandlers` and `_generation` keep the layout of a registry that records no version: a shared object
-    // built against one inserts into them through its own inline copy of `insert()`, and never into `_abiVersions`
+    // built against one inserts into them through its own inline copy of `insert()`, and never into `_abiVersions`.
+    // The reverse does not hold: during its static initialization, a shared object built against this layout writes
+    // `_abiVersions` past the end of an older registry object, and a host built against that layout cannot load it
+    // safely.
     std::map<std::string, TTypeHandler, std::less<>>       _blockTypeHandlers;
     std::size_t                                            _generation = 0UZ;
     std::map<std::string, RecordedAbiVersion, std::less<>> _abiVersions;

@@ -85,8 +85,8 @@ SIGINT and SIGTERM stop the graph as a --seconds bound does.
 
 Exit status is 0 when the run stopped cleanly, 1 when the graph could not be read, loaded or run
 and when a --set or --show names a block or a block setting the graph does not hold, and 2 when
-the command line could not be used, a scheduler the registry does not hold and a scheduler
-setting the scheduler does not declare included.
+the command line could not be used, a scheduler the registry does not hold or cannot build and
+a scheduler setting the scheduler does not declare included.
 )";
 
 std::atomic<bool> gStopRequested{false};
