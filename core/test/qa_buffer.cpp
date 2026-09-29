@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <complex>
 #include <fstream>
@@ -1406,6 +1407,81 @@ const boost::ut::suite<"MultiProducerStrategy"> _multiProducerStrategy1 = [] {
         for (auto& t : threads) {
             t.join();
         }
+    };
+
+    // Two producers claim adjacent single slots and publish them at the same moment, round after round. After both
+    // publish() calls return, the publish cursor must cover both slots and the consumer must count both. The rounds
+    // run for a fixed duration because the interleaving under test occurs at a rate that depends on the machine.
+    "MultiProducerStrategy - two producers publishing adjacent slots never leave the cursor behind"_test = [] {
+        using Strategy = gr::MultiProducerStrategy<std::dynamic_extent, gr::NoWaitStrategy>;
+        using Clock    = std::chrono::steady_clock;
+
+        constexpr std::size_t kProducers = 2UZ;
+        constexpr std::size_t cap        = 16UZ;
+        constexpr auto        kDuration  = std::chrono::milliseconds(500);
+
+        Strategy strategy(cap);
+        auto     reader = std::make_shared<gr::Sequence>();
+        gr::detail::addSequences(strategy._readSequences, strategy._publishCursor, {reader});
+        strategy.notifyReaderSetChanged();
+
+        std::atomic<std::size_t> nRoundsStarted{0UZ};
+        std::atomic<std::size_t> nClaimed{0UZ};
+        std::atomic<std::size_t> nPublished{0UZ};
+        std::atomic<bool>        stopRequested{false};
+
+        auto producer = [&] {
+            std::size_t nRoundsDone = 0UZ;
+            while (true) {
+                std::size_t round = nRoundsStarted.load(std::memory_order_acquire);
+                while (round == nRoundsDone) {
+                    if (stopRequested.load(std::memory_order_acquire)) {
+                        return;
+                    }
+                    round = nRoundsStarted.load(std::memory_order_acquire);
+                }
+                nRoundsDone                  = round;
+                const std::size_t claimedEnd = strategy.next(1UZ);
+                nClaimed.fetch_add(1UZ, std::memory_order_acq_rel);
+                while (nClaimed.load(std::memory_order_acquire) < kProducers * round) {
+                    // both claims complete before either publish starts
+                }
+                strategy.publish(claimedEnd - 1UZ, 1UZ);
+                nPublished.fetch_add(1UZ, std::memory_order_acq_rel);
+            }
+        };
+
+        std::vector<std::thread> producers;
+        for (std::size_t i = 0UZ; i < kProducers; ++i) {
+            producers.emplace_back(producer);
+        }
+
+        std::size_t nRounds   = 0UZ;
+        std::size_t nConsumed = 0UZ;
+        std::size_t nStalls   = 0UZ;
+        const auto  deadline  = Clock::now() + kDuration;
+        while (Clock::now() < deadline) {
+            ++nRounds;
+            nRoundsStarted.store(nRounds, std::memory_order_release);
+            while (nPublished.load(std::memory_order_acquire) < kProducers * nRounds) {
+                // the consumer waits for both publish() calls of this round to return
+            }
+            const std::size_t publishCursor = strategy._publishCursor.value();
+            if (publishCursor != kProducers * nRounds) {
+                ++nStalls;
+            }
+            nConsumed += publishCursor - reader->value();
+            reader->setValue(publishCursor);
+        }
+        stopRequested.store(true, std::memory_order_release);
+        for (auto& thread : producers) {
+            thread.join();
+        }
+
+        expect(gt(nRounds, 0UZ));
+        expect(eq(nStalls, 0UZ)) << std::format("the publish cursor stayed behind a published slot in {} of {} rounds", nStalls, nRounds);
+        expect(eq(nConsumed, kProducers * nRounds)) << "the consumer must count every published slot";
+        expect(eq(strategy._reserveCursor.value(), kProducers * nRounds)) << "each producer claims one slot per round";
     };
 };
 

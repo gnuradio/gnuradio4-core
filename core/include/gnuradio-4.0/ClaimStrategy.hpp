@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <concepts>
 #include <cstdint>
@@ -200,7 +201,7 @@ public:
         do {
             currentReserveCursor        = _reserveCursor.value();
             nextReserveCursor           = currentReserveCursor + nSlotsToClaim;
-            const std::size_t cachedMin = gr::atomic_ref(_cachedMinReaderCursor).load_relaxed();
+            const std::size_t cachedMin = gr::atomic_ref(_cachedMinReaderCursor).load_acquire();
             if (nextReserveCursor - cachedMin > _size) {
                 const std::size_t freshMin = refreshMinReaderCursor();
                 if (nextReserveCursor - freshMin > _size) {
@@ -228,7 +229,7 @@ public:
         do {
             currentReserveCursor        = _reserveCursor.value();
             nextReserveCursor           = currentReserveCursor + nSlotsToClaim;
-            const std::size_t cachedMin = gr::atomic_ref(_cachedMinReaderCursor).load_relaxed();
+            const std::size_t cachedMin = gr::atomic_ref(_cachedMinReaderCursor).load_acquire();
             if (nextReserveCursor - cachedMin > _size) {
                 const std::size_t freshMin = refreshMinReaderCursor();
                 if (nextReserveCursor - freshMin > _size) {
@@ -253,6 +254,13 @@ public:
         for (std::size_t seq = offset; seq < offset + nSlotsToClaim; ++seq) {
             gr::atomic_ref(_availableBuffer[calculateIndex(seq)]).store_release(seq);
         }
+
+        // Two producers publishing adjacent slots n and n + 1 each store their own slot and then scan from the publish
+        // cursor. Without a full fence each scan can load the other producer's slot before that store is visible: the
+        // producer of n stops the cursor at n + 1, and the producer of n + 1 finds slot n unpublished and returns. With
+        // the fence, the producer whose fence comes second in the single total order sees both slots and moves the
+        // cursor past them.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
 
         std::size_t currentPublishCursor;
         std::size_t nextPublishCursor;
@@ -279,11 +287,12 @@ private:
     // reserve cursor, which is above the publish cursor a reader attaching afterwards starts at. Reading the publish
     // cursor before the reader set makes the stored value a lower bound for both, since reader cursors only advance
     // and a later attach starts at a publish cursor no lower than the one read here. The returned minimum is left
-    // unbounded: with no readers nothing gates the writer.
+    // unbounded: with no readers nothing gates the writer. The release store and the acquire loads of the cached value
+    // order a claim against it after the reads that moved the reader cursors it was taken from.
     forceinline std::size_t refreshMinReaderCursor() const noexcept {
         const std::size_t publishCursor = _publishCursor.value();
         const std::size_t minReader     = getMinReaderCursor();
-        gr::atomic_ref(_cachedMinReaderCursor).store_relaxed(std::min(minReader, publishCursor));
+        gr::atomic_ref(_cachedMinReaderCursor).store_release(std::min(minReader, publishCursor));
         return minReader;
     }
 
