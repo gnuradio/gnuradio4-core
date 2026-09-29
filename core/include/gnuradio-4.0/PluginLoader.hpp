@@ -367,7 +367,9 @@ public:
      * @brief A shared object that is not a plugin but registered blocks or schedulers when it loaded.
      *
      * It carries no `gr_plugin_make`; its entries reach the registries from static initializers, and it is kept
-     * mapped for the lifetime of the process because those entries point into its code.
+     * mapped for the lifetime of the process because those entries point into its code. A shared object that
+     * registered a scheduler at a plugin ABI version other than the host's, or at none, is refused instead: its
+     * entries are dropped, it is closed, and it is reported among the failed plugins.
      */
     struct BlockLibrary {
         std::string file;
@@ -397,17 +399,84 @@ private:
         return detail::optionalMapAt<gr_plugin_base*>(_pluginForSchedulerName, name, nullptr);
     }
 
-    /// How many registrations the registries a load can reach have taken. A library registers into the process-wide
-    /// registries rather than the pair this loader was handed, so both are counted when they differ. A registration
-    /// that replaces a key an earlier library registered leaves the entry count where it was.
-    [[nodiscard]] std::pair<std::size_t, std::size_t> registryGenerations() const {
-        std::size_t blockGeneration     = _registry->generation();
-        std::size_t schedulerGeneration = _schedulerRegistry->generation();
-        if (BlockRegistry& global = gr::globalBlockRegistry(); &global != _registry) {
-            blockGeneration += global.generation();
+    /**
+     * @brief Sets the entries of the registries a load can reach aside while one file loads, and puts them back after.
+     *
+     * The registries then hold exactly what the file registered, a replaced key included, whichever copy of the
+     * registry code inserted it. `restore(false)` drops those entries, which a file closed after its load requires,
+     * because they point into its code.
+     */
+    class SetAsideRegistrations {
+        std::vector<std::pair<BlockRegistry*, BlockRegistry::Entries>>         _blocks;
+        std::vector<std::pair<SchedulerRegistry*, SchedulerRegistry::Entries>> _schedulers;
+        bool                                                                   _restored = false;
+
+    public:
+        SetAsideRegistrations(const std::vector<BlockRegistry*>& blockRegistries, const std::vector<SchedulerRegistry*>& schedulerRegistries) {
+            for (BlockRegistry* registry : blockRegistries) {
+                _blocks.emplace_back(registry, registry->takeEntries());
+            }
+            for (SchedulerRegistry* registry : schedulerRegistries) {
+                _schedulers.emplace_back(registry, registry->takeEntries());
+            }
         }
-        if (SchedulerRegistry& global = gr::globalSchedulerRegistry(); &global != _schedulerRegistry) {
-            schedulerGeneration += global.generation();
+
+        SetAsideRegistrations(const SetAsideRegistrations&)            = delete;
+        SetAsideRegistrations& operator=(const SetAsideRegistrations&) = delete;
+        SetAsideRegistrations(SetAsideRegistrations&&)                 = delete;
+        SetAsideRegistrations& operator=(SetAsideRegistrations&&)      = delete;
+
+        ~SetAsideRegistrations() { restore(false); }
+
+        /// the reason to refuse the file: a scheduler it registered at a plugin ABI version other than the host's, or at none
+        [[nodiscard]] std::optional<std::string> schedulerAbiMismatch() const {
+            for (const auto& [registry, taken] : _schedulers) {
+                for (const std::string& key : registry->keys()) {
+                    const std::optional<std::uint8_t> abiVersion = registry->abiVersion(key);
+                    if (!abiVersion.has_value()) {
+                        return std::format("scheduler {} carries no plugin ABI version; the host's plugin ABI version is {}", key, GR_PLUGIN_CURRENT_ABI_VERSION);
+                    }
+                    if (*abiVersion != GR_PLUGIN_CURRENT_ABI_VERSION) {
+                        return std::format("scheduler {} has plugin ABI version {}, which does not match the host's plugin ABI version {}", key, *abiVersion, GR_PLUGIN_CURRENT_ABI_VERSION);
+                    }
+                }
+            }
+            return std::nullopt;
+        }
+
+        void restore(bool keepRegistered) {
+            if (std::exchange(_restored, true)) {
+                return;
+            }
+            for (auto& [registry, taken] : _blocks) {
+                registry->restoreEntries(std::move(taken), keepRegistered);
+            }
+            for (auto& [registry, taken] : _schedulers) {
+                registry->restoreEntries(std::move(taken), keepRegistered);
+            }
+        }
+    };
+
+    /// The registries a load can reach. A library registers into the process-wide registries rather than the pair
+    /// this loader was handed, so both are reached when they differ.
+    template<typename TRegistry>
+    [[nodiscard]] static std::vector<TRegistry*> reachableRegistries(TRegistry* handed, TRegistry& global) {
+        if (&global == handed) {
+            return {handed};
+        }
+        return {handed, &global};
+    }
+
+    /// How many registrations the registries a load can reach have taken. A registration that replaces a key an
+    /// earlier library registered leaves the entry count where it was.
+    [[nodiscard]] std::pair<std::size_t, std::size_t> registryGenerations() const {
+        std::size_t blockGeneration = 0UZ;
+        for (const BlockRegistry* registry : reachableRegistries(_registry, gr::globalBlockRegistry())) {
+            blockGeneration += registry->generation();
+        }
+        std::size_t schedulerGeneration = 0UZ;
+        for (const SchedulerRegistry* registry : reachableRegistries(_schedulerRegistry, gr::globalSchedulerRegistry())) {
+            schedulerGeneration += registry->generation();
         }
         return {blockGeneration, schedulerGeneration};
     }
@@ -438,6 +507,7 @@ public:
                 _loadedPluginFiles.insert(fileString);
 
                 const auto [blockGenerationBefore, schedulerGenerationBefore] = registryGenerations();
+                SetAsideRegistrations registrations(reachableRegistries(_registry, gr::globalBlockRegistry()), reachableRegistries(_schedulerRegistry, gr::globalSchedulerRegistry()));
 
                 if (PluginHandler handler(fileString); handler) {
                     for (std::string_view blockName : handler->availableBlocks()) {
@@ -448,6 +518,7 @@ public:
                         _pluginForSchedulerName.emplace(std::string(schedulerName), handler.operator->());
                     }
 
+                    registrations.restore(true);
                     _pluginHandlers.push_back(std::move(handler));
 
                 } else {
@@ -456,8 +527,15 @@ public:
                     const std::size_t schedulerRegistrations                    = schedulerGenerationAfter - schedulerGenerationBefore;
 
                     if (handler.isLoaded() && (blockRegistrations != 0UZ || schedulerRegistrations != 0UZ)) {
-                        handler.keepMapped();
-                        _blockLibraries.push_back({.file = fileString, .nBlockRegistrations = blockRegistrations, .nSchedulerRegistrations = schedulerRegistrations});
+                        if (std::optional<std::string> mismatch = registrations.schedulerAbiMismatch(); mismatch.has_value()) {
+                            registrations.restore(false);
+                            std::println("warning: library {} not loaded: {}", fileString, *mismatch);
+                            _failedPlugins[fileString] = std::move(*mismatch);
+                        } else {
+                            registrations.restore(true);
+                            handler.keepMapped();
+                            _blockLibraries.push_back({.file = fileString, .nBlockRegistrations = blockRegistrations, .nSchedulerRegistrations = schedulerRegistrations});
+                        }
                     } else {
                         _failedPlugins[fileString] = handler.status();
                     }

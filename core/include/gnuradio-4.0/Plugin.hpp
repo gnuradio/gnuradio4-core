@@ -15,12 +15,6 @@
 using namespace std::string_literals;
 using namespace std::string_view_literals;
 
-// The version of the plugin interface, raised by every change to the layout of a type that crosses the plugin
-// boundary: `gr_plugin_base` itself, and the `BlockModel` and `SchedulerModel` interfaces whose objects a plugin
-// hands back. A plugin records the version it was compiled against and a host loads only a plugin whose version
-// equals its own, because a virtual call through a mismatched interface reaches the wrong function.
-#define GR_PLUGIN_CURRENT_ABI_VERSION 4
-
 class GNURADIO_EXPORT gr_plugin_base {
 public:
     gr_plugin_metadata metadata;

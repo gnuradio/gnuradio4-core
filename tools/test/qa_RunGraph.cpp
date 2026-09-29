@@ -17,8 +17,8 @@
  * The tool's contract is its exit status and what it prints, and neither is visible from inside the process, so
  * every case here runs the built executable: a graph that would not end by itself, bounded by --seconds; the
  * settings --show prints when the run is over; a scheduler setting and a block setting taken and each refused; the
- * scheduler chosen by its registry key, the program's own and a plugin's; a command line that cannot be used; and a
- * graph file that cannot be read.
+ * scheduler chosen by its registry key, the program's own, a plugin's and a shared object's, and a shared object's
+ * refused at an earlier plugin ABI version; a command line that cannot be used; and a graph file that cannot be read.
  */
 namespace qa_rungraph {
 
@@ -306,6 +306,24 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
         const Result refused = run({"--graph", "unread.yaml", "--plugin-dir", GR_TOOLS_CORE_TEST_PLUGINS, "--scheduler", "no::such::Scheduler"});
         expect(eq(refused.exitCode, 2)) << refused.output;
         expect(refused.output.contains("good::GoodMathScheduler")) << "the list of keys includes the plugin's" << refused.output;
+    };
+
+    "a shared object's scheduler of this ABI version runs the chain to its end, one of an earlier version is refused"_test = [] {
+        std::vector<std::string> arguments = chainToItsEnd("test::library_scheduler");
+        arguments.emplace_back("--plugin-dir");
+        arguments.emplace_back(GR_TOOLS_TEST_SCHEDULER_LIBRARY);
+
+        const Result ran = run(arguments);
+        expect(eq(ran.exitCode, 0)) << ran.output;
+        expect(ran.output.contains("rungraph: scheduler test::library_scheduler\n")) << ran.output;
+        expect(ran.output.contains("the graph ended on its own")) << ran.output;
+        expect(ran.output.contains("source: event_count = 1000")) << ran.output;
+        expect(ran.output.contains("libscheduler_library_v1.so did not load: scheduler test::library_scheduler_v1 has plugin ABI version 1, which does not match the host's plugin ABI version")) << "the refusal is reported as a failed plugin is" << ran.output;
+
+        const Result refused = run({"--graph", "unread.yaml", "--plugin-dir", GR_TOOLS_TEST_SCHEDULER_LIBRARY, "--scheduler", "test::library_scheduler_v1"});
+        expect(eq(refused.exitCode, 2)) << refused.output;
+        expect(refused.output.contains("no scheduler is registered as test::library_scheduler_v1")) << refused.output;
+        expect(refused.output.contains("rungraph:   test::library_scheduler\n")) << "the list of keys includes the kept library's" << refused.output;
     };
 
     "a block name the graph does not hold is refused"_test = [] {
