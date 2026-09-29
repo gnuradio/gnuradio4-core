@@ -592,8 +592,9 @@ inline bool Edge::hasSameSourcePort(const Edge& other) const {
     return port.has_value() && otherPort.has_value() && *port.value() == *otherPort.value();
 }
 
-// two edges into one block may name one input by index and by name, so both definitions are resolved; a message input
-// takes several edges and never counts as shared
+// true when both edges end at one stream input of one block; the input may be named by index in one edge and by name
+// in the other, so both definitions are resolved. Edges in two graphs are not compared: an edge into a subgraph's
+// exported input and an edge into the interior port it wraps both stay listed
 inline bool Edge::hasSameStreamInput(const Edge& other) const {
     if (!_destinationBlock || _destinationBlock != other._destinationBlock) {
         return false;

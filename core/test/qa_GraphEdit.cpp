@@ -5,9 +5,12 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
+#include <expected>
 #include <format>
+#include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <unistd.h>
 
@@ -100,30 +103,30 @@ void registerTestBlocks() {
     std::ignore = registered;
 }
 
-// stderr redirected into an anonymous file while this lives, so a case can read what the graph reported
-struct StderrCapture {
+// stdout redirected into an anonymous file while this lives, so a case can read what the graph reported
+struct StdoutCapture {
     std::FILE* _file    = std::tmpfile();
     int        _savedFd = -1;
 
-    StderrCapture() {
-        std::fflush(stderr);
-        _savedFd = ::dup(STDERR_FILENO);
-        ::dup2(::fileno(_file), STDERR_FILENO);
+    StdoutCapture() {
+        std::fflush(stdout);
+        _savedFd = ::dup(STDOUT_FILENO);
+        ::dup2(::fileno(_file), STDOUT_FILENO);
     }
 
-    StderrCapture(const StderrCapture&)            = delete;
-    StderrCapture& operator=(const StderrCapture&) = delete;
+    StdoutCapture(const StdoutCapture&)            = delete;
+    StdoutCapture& operator=(const StdoutCapture&) = delete;
 
-    ~StderrCapture() {
-        std::fflush(stderr);
-        ::dup2(_savedFd, STDERR_FILENO);
+    ~StdoutCapture() {
+        std::fflush(stdout);
+        ::dup2(_savedFd, STDOUT_FILENO);
         ::close(_savedFd);
         std::fclose(_file);
     }
 
-    // pread leaves the offset alone, which stderr shares through dup2
+    // pread leaves the offset alone, which stdout shares through dup2
     [[nodiscard]] std::string text() const {
-        std::fflush(stderr);
+        std::fflush(stdout);
         std::string           captured;
         std::array<char, 512> chunk{};
         for (ssize_t nRead = ::pread(::fileno(_file), chunk.data(), chunk.size(), 0); nRead > 0; nRead = ::pread(::fileno(_file), chunk.data(), chunk.size(), static_cast<off_t>(captured.size()))) {
@@ -133,8 +136,8 @@ struct StderrCapture {
     }
 };
 
-// an edge as the graph reports it: a unique name is never followed by '/' inside a longer one
-[[nodiscard]] std::string portOf(std::string_view uniqueName, std::string_view port) { return std::format("{}/{}", uniqueName, port); }
+// formats a port as the edge formatter prints it; the '/' keeps one block name from matching inside a longer one
+[[nodiscard]] std::string portOf(std::string_view blockName, std::string_view port) { return std::format("{}/{}", blockName, port); }
 
 [[nodiscard]] bool awaitReply(gr::MsgPortIn& port, std::string_view endpoint) {
     for (std::size_t i = 0UZ; i < 3000UZ; ++i) {
@@ -148,6 +151,20 @@ struct StderrCapture {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     return false;
+}
+
+[[nodiscard]] std::optional<gr::property_map> awaitReplyData(gr::MsgPortIn& port, std::string_view endpoint) {
+    for (std::size_t i = 0UZ; i < 3000UZ; ++i) {
+        auto messages = port.streamReader().get();
+        for (const gr::Message& message : messages) {
+            if (message.endpoint == endpoint && message.data.has_value()) {
+                return message.data.value();
+            }
+        }
+        std::ignore = messages.consume(messages.size());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return std::nullopt;
 }
 
 [[nodiscard]] std::string awaitError(gr::MsgPortIn& port, std::string_view endpoint) {
@@ -490,22 +507,24 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         using namespace gr::serialization_fields;
 
         gr::Graph flow;
-        auto&     first  = flow.emplaceBlock<qa_edit::Source>();
-        auto&     second = flow.emplaceBlock<qa_edit::Source>();
+        auto&     first  = flow.emplaceBlock<qa_edit::Source>({{"name", std::string("first")}});
+        auto&     second = flow.emplaceBlock<qa_edit::Source>({{"name", std::string("second")}});
         auto&     sink   = flow.emplaceBlock<qa_edit::Sink>();
         expect(flow.connect<"out", "in">(first, sink).has_value());
 
+        bool        connected = false;
         std::string reported;
         {
-            qa_edit::StderrCapture capture;
+            qa_edit::StdoutCapture capture;
             // the typed connect names the input by index and this one names it by name
-            expect(flow.connect(second, gr::PortDefinition("out"), sink, gr::PortDefinition("in")).has_value());
-            reported = capture.text();
+            connected = flow.connect(second, gr::PortDefinition("out"), sink, gr::PortDefinition("in")).has_value();
+            reported  = capture.text();
         }
+        expect(connected);
 
         expect(fatal(eq(flow.edges().size(), 1UZ))) << "the displaced edge stayed listed";
         expect(eq(flow.edges()[0].sourceBlock()->uniqueName(), std::string_view(second.unique_name))) << "the earlier edge was kept instead of the later one";
-        expect(reported.contains(qa_edit::portOf(first.unique_name, "0")) && reported.contains(qa_edit::portOf(second.unique_name, "out"))) << "the replacement must name both edges, reported: " << reported;
+        expect(reported.contains(qa_edit::portOf("first", "0")) && reported.contains(qa_edit::portOf("second", "out"))) << "the replacement must name both edges, reported: " << reported;
 
         expect(flow.connectPendingEdges());
         expect(flow.edges()[0].state() == gr::Edge::EdgeState::Connected);
@@ -527,8 +546,8 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
 
         qa_edit::TestScheduler scheduler;
         gr::Graph              flow;
-        auto&                  first  = flow.emplaceBlock<qa_edit::Source>();
-        auto&                  second = flow.emplaceBlock<qa_edit::Source>();
+        auto&                  first  = flow.emplaceBlock<qa_edit::Source>({{"name", std::string("first")}});
+        auto&                  second = flow.emplaceBlock<qa_edit::Source>({{"name", std::string("second")}});
         auto&                  sink   = flow.emplaceBlock<qa_edit::Sink>();
         expect(flow.connect<"out", "in">(first, sink).has_value());
         expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
@@ -541,22 +560,32 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(scheduler.changeStateTo(INITIALISED).has_value());
         expect(scheduler.changeStateTo(RUNNING).has_value());
 
-        std::string reported;
+        std::optional<gr::property_map> reply;
+        std::string                     reported;
         {
-            qa_edit::StderrCapture capture;
+            qa_edit::StdoutCapture capture;
             qa_edit::sendMessage(toScheduler, gr::scheduler::property::kEmplaceEdge,
                 {{std::pmr::string(EDGE_SOURCE_BLOCK), std::string(second.unique_name)}, {std::pmr::string(EDGE_SOURCE_PORT), std::string("out")},           //
                     {std::pmr::string(EDGE_DESTINATION_BLOCK), std::string(sink.unique_name)}, {std::pmr::string(EDGE_DESTINATION_PORT), std::string("in")}, //
                     {std::pmr::string(EDGE_MIN_BUFFER_SIZE), gr::undefined_Size}, {std::pmr::string(EDGE_WEIGHT), std::int32_t{0}},                          //
                     {std::pmr::string(EDGE_NAME), std::string("replacement")}});
-            expect(qa_edit::awaitReply(fromScheduler, gr::scheduler::property::kEdgeEmplaced)) << "the edge was never emplaced";
+            reply    = qa_edit::awaitReplyData(fromScheduler, gr::scheduler::property::kEdgeEmplaced);
             reported = capture.text();
         }
+        expect(fatal(reply.has_value())) << "the edge was never emplaced";
 
         const std::span<const gr::Edge> edges = scheduler.graph().edges();
         expect(fatal(eq(edges.size(), 1UZ))) << "the displaced edge stayed listed";
         expect(eq(edges[0].sourceBlock()->uniqueName(), std::string_view(second.unique_name))) << "the earlier edge was kept instead of the emplaced one";
-        expect(reported.contains(qa_edit::portOf(first.unique_name, "0")) && reported.contains(qa_edit::portOf(second.unique_name, "out"))) << "the replacement must name both edges, reported: " << reported;
+        expect(reported.contains(qa_edit::portOf("first", "0")) && reported.contains(qa_edit::portOf("second", "out"))) << "the replacement must name both edges, reported: " << reported;
+
+        const auto* displaced = reply->contains(std::pmr::string("displacedEdges")) ? reply->at(std::pmr::string("displacedEdges")).get_if<gr::property_map>() : nullptr;
+        expect(fatal(displaced != nullptr)) << "the reply does not list the displaced edges";
+        expect(fatal(eq(displaced->size(), 1UZ))) << "the reply lists a different number of displaced edges";
+        const auto* displacedEdge = displaced->begin()->second.get_if<gr::property_map>();
+        expect(fatal(displacedEdge != nullptr));
+        expect(eq(displacedEdge->at(std::pmr::string(EDGE_SOURCE_BLOCK)).value_or(std::string_view{}), std::string_view(first.unique_name))) << "the reply names another edge as displaced";
+        expect(eq(displacedEdge->at(std::pmr::string(EDGE_DESTINATION_BLOCK)).value_or(std::string_view{}), std::string_view(sink.unique_name)));
         expect(eq(first.out.nReaders(), 0UZ)) << "the displaced source still feeds the input";
         expect(eq(second.out.nReaders(), 1UZ)) << "the emplaced source does not feed the input";
 
@@ -570,8 +599,8 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
     // the functions the RemoveEdge and EmplaceEdge handlers call, in the order a rewire takes
     "an input freed by removing its edge takes a new edge without a replacement"_test = [] {
         gr::Graph flow;
-        auto&     first  = flow.emplaceBlock<qa_edit::Source>();
-        auto&     second = flow.emplaceBlock<qa_edit::Source>();
+        auto&     first  = flow.emplaceBlock<qa_edit::Source>({{"name", std::string("first")}});
+        auto&     second = flow.emplaceBlock<qa_edit::Source>({{"name", std::string("second")}});
         auto&     sink   = flow.emplaceBlock<qa_edit::Sink>();
         expect(flow.connect<"out", "in">(first, sink).has_value());
         expect(flow.connectPendingEdges());
@@ -579,17 +608,19 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         const auto removed = flow.removeEdgeBySourcePort(first.unique_name, "out", sink.unique_name, "in");
         expect(fatal(removed.has_value())) << "the edge could not be removed: " << (removed.has_value() ? std::string{} : removed.error().message);
 
-        std::string reported;
+        std::expected<std::vector<gr::Edge>, gr::Error> emplaced;
+        std::string                                     reported;
         {
-            qa_edit::StderrCapture capture;
-            const auto             emplaced = flow.emplaceEdge(second.unique_name, "out", sink.unique_name, "in", gr::undefined_size, 0, "rewired");
-            expect(emplaced.has_value()) << "the edge could not be emplaced: " << (emplaced.has_value() ? std::string{} : emplaced.error().message);
+            qa_edit::StdoutCapture capture;
+            emplaced = flow.emplaceEdge(second.unique_name, "out", sink.unique_name, "in", gr::undefined_size, 0, "rewired");
             reported = capture.text();
         }
+        expect(fatal(emplaced.has_value())) << "the edge could not be emplaced: " << (emplaced.has_value() ? std::string{} : emplaced.error().message);
+        expect(emplaced->empty()) << "a free input returned a displaced edge";
 
         expect(fatal(eq(flow.edges().size(), 1UZ))) << "the rewire left a different number of edges";
         expect(eq(flow.edges()[0].sourceBlock()->uniqueName(), std::string_view(second.unique_name))) << "the rewired edge is not the one listed";
-        expect(!reported.contains(qa_edit::portOf(second.unique_name, "out"))) << "a free input reported a replacement: " << reported;
+        expect(!reported.contains(qa_edit::portOf("second", "out"))) << "a free input reported a replacement: " << reported;
         expect(eq(first.out.nReaders(), 0UZ)) << "the removed source still feeds the input";
         expect(eq(second.out.nReaders(), 1UZ)) << "the rewired source does not feed the input";
     };
