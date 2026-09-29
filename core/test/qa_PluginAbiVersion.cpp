@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <print>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -23,10 +24,11 @@
 #include "build_configure.hpp"
 
 /**
- * A plugin records the plugin ABI version it was compiled against and a host implements exactly one of them. The
- * two plugins in the directory below differ in nothing else, so one load of that directory shows what each of
- * them gets, and shows it before anything asks either of them for a block. The same holds for the two shared
- * objects that register a scheduler without being plugins: their registrations record the version.
+ * A plugin records the plugin ABI version it was compiled against and a host implements exactly one of them. Two of
+ * the plugins in the directory below differ in nothing else, so one load of that directory shows what each of them
+ * gets, and shows it before anything asks either of them for a block. The third is at the host's version and
+ * registers a scheduler at another one when it loads. The same holds for the three shared objects that register a
+ * scheduler without being plugins: their registrations record the version, or none.
  */
 namespace qa_plugin_abi_version {
 
@@ -35,8 +37,10 @@ using namespace gr;
 constexpr std::string_view kCurrentKey = "test::abi_probe";
 constexpr std::string_view kEarlierKey = "test::abi_probe_v1";
 
-constexpr std::string_view kCurrentSchedulerKey = "test::library_scheduler";
-constexpr std::string_view kEarlierSchedulerKey = "test::library_scheduler_v1";
+constexpr std::string_view kCurrentSchedulerKey     = "test::library_scheduler";
+constexpr std::string_view kEarlierSchedulerKey     = "test::library_scheduler_v1";
+constexpr std::string_view kUnversionedSchedulerKey = "test::library_scheduler_unversioned";
+constexpr std::string_view kForeignSchedulerKey     = "test::plugin_foreign_scheduler";
 
 constexpr std::uint8_t kEarlierAbiVersion = 1;
 
@@ -45,6 +49,14 @@ constexpr gr::Size_t kTerminalCount = 1000U;
 [[nodiscard]] std::string abiPluginDirectory() { return std::string(TESTS_BINARY_PATH) + "/plugin_abi"; }
 
 [[nodiscard]] std::string schedulerLibraryDirectory() { return std::string(TESTS_BINARY_PATH) + "/scheduler_library"; }
+
+// the reason the loader gives for a file whose load registered a scheduler at an earlier version
+[[nodiscard]] std::string earlierSchedulerReason(std::string_view key) { return std::format("scheduler {} has plugin ABI version {}, which does not match the host's plugin ABI version {}", key, kEarlierAbiVersion, GR_PLUGIN_CURRENT_ABI_VERSION); }
+
+// two factories of distinct bodies, so that no folding of identical functions gives them one address
+[[nodiscard]] std::unique_ptr<SchedulerModel> makeNoScheduler(property_map /*parameters*/) { return nullptr; }
+
+[[nodiscard]] std::unique_ptr<SchedulerModel> makeThrowingScheduler(property_map /*parameters*/) { throw std::logic_error("the factory of a replaced entry is never called"); }
 
 // whether the process holds the shared object at `file` mapped; the probe takes a reference only when it does
 [[nodiscard]] bool isMapped(const std::string& file) {
@@ -91,7 +103,7 @@ const boost::ut::suite<"PluginAbiVersion"> pluginAbiVersionTests = [] {
     using namespace boost::ut;
     using namespace qa_plugin_abi_version;
 
-    "a plugin of an earlier ABI version is refused and contributes nothing, one of this version loads"_test = [] {
+    "a plugin of an earlier ABI version or registering a scheduler of one is refused, one of this version loads"_test = [] {
         BlockRegistry                  registry;
         SchedulerRegistry              schedulerRegistry;
         const std::vector<std::string> directories{abiPluginDirectory()};
@@ -107,6 +119,12 @@ const boost::ut::suite<"PluginAbiVersion"> pluginAbiVersionTests = [] {
         expect(that % !gr::globalBlockRegistry().contains(kEarlierKey));
         expect(that % loader.blockLibraries().empty()) << "a refused plugin is not taken up again as a shared object of blocks";
 
+        const auto foreign = std::ranges::find_if(loader.failedPlugins(), [](const auto& entry) { return entry.first.contains("abi_probe_plugin_foreign_scheduler"); });
+        expect(fatal(foreign != loader.failedPlugins().end())) << "a plugin whose load registered a scheduler of an earlier ABI version has to be reported as a failure";
+        expect(eq(foreign->second, earlierSchedulerReason(kForeignSchedulerKey))) << "the reason names the scheduler and both versions";
+        expect(that % !loader.isSchedulerAvailable(kForeignSchedulerKey));
+        expect(that % !gr::globalSchedulerRegistry().contains(kForeignSchedulerKey)) << "the scheduler it registered is dropped with it";
+
         expect(fatal(eq(loader.plugins().size(), 1UZ))) << "only the plugin of this ABI version is held";
         expect(that % loader.isBlockAvailable(kCurrentKey)) << "a plugin of this ABI version offers its blocks";
 
@@ -115,13 +133,19 @@ const boost::ut::suite<"PluginAbiVersion"> pluginAbiVersionTests = [] {
         expect(eq(std::string(block->typeName()), std::string("gr::testing::AbiProbe")));
     };
 
-    "a shared object whose scheduler records an earlier ABI version is refused and closed, one of this version runs"_test = [] {
+    "a shared object whose scheduler records an earlier ABI version or none is refused and closed, one of this version runs"_test = [] {
         const std::vector<std::string> directories{schedulerLibraryDirectory()};
         PluginLoader                   loader(gr::globalBlockRegistry(), gr::globalSchedulerRegistry(), directories);
 
         const auto refused = std::ranges::find_if(loader.failedPlugins(), [](const auto& entry) { return entry.first.contains("scheduler_library_v1"); });
         expect(fatal(refused != loader.failedPlugins().end())) << "the library of the earlier ABI version has to be reported as a failure";
-        expect(eq(refused->second, std::format("scheduler {} has plugin ABI version {}, which does not match the host's plugin ABI version {}", kEarlierSchedulerKey, kEarlierAbiVersion, GR_PLUGIN_CURRENT_ABI_VERSION))) << "the reason names the scheduler and both versions";
+        expect(eq(refused->second, earlierSchedulerReason(kEarlierSchedulerKey))) << "the reason names the scheduler and both versions";
+
+        const auto unversioned = std::ranges::find_if(loader.failedPlugins(), [](const auto& entry) { return entry.first.contains("scheduler_library_unversioned"); });
+        expect(fatal(unversioned != loader.failedPlugins().end())) << "the library whose scheduler records no version has to be reported as a failure";
+        expect(eq(unversioned->second, std::format("scheduler {} carries no plugin ABI version; the host's plugin ABI version is {}", kUnversionedSchedulerKey, GR_PLUGIN_CURRENT_ABI_VERSION))) << "the reason names the scheduler and the host's version";
+        expect(that % !loader.isSchedulerAvailable(kUnversionedSchedulerKey));
+        expect(that % !gr::globalSchedulerRegistry().contains(kUnversionedSchedulerKey)) << "its entry is dropped with it";
 
         expect(that % !loader.isSchedulerAvailable(kEarlierSchedulerKey)) << "a refused library offers no scheduler";
         expect(that % !std::ranges::contains(loader.availableSchedulers(), std::string(kEarlierSchedulerKey)));
@@ -134,6 +158,7 @@ const boost::ut::suite<"PluginAbiVersion"> pluginAbiVersionTests = [] {
         expect(eq(kept.nSchedulerRegistrations, 1UZ));
         expect(that % isMapped(kept.file)) << "the probe sees a library the loader keeps";
         expect(that % !std::ranges::contains(loader.blockLibraries(), refused->first, &PluginLoader::BlockLibrary::file)) << "a refused library is not kept";
+        expect(that % !std::ranges::contains(loader.blockLibraries(), unversioned->first, &PluginLoader::BlockLibrary::file)) << "a refused library is not kept";
         expect(that % loader.plugins().empty()) << "the loader holds no handle to a library that is not a plugin, the refused one included";
 
         // glibc marks a shared object NODELETE when a load binds one of its STB_GNU_UNIQUE symbols, and dlclose then leaves it mapped
@@ -156,6 +181,22 @@ const boost::ut::suite<"PluginAbiVersion"> pluginAbiVersionTests = [] {
         expect(result.has_value()) << (result.has_value() ? std::string() : result.error().message);
         expect(eq(source._nProduced, kTerminalCount));
         expect(eq(sink._nReceived, kTerminalCount)) << "the run reached its terminal count";
+    };
+
+    "an entry whose factory a registration without a version replaced carries no version"_test = [] {
+        constexpr std::string_view kKey = "test::replaced_scheduler";
+        SchedulerRegistry          registry;
+        registry.insert(kKey, "", makeNoScheduler);
+        expect(registry.abiVersion(kKey) == std::optional<std::uint8_t>{GR_PLUGIN_CURRENT_ABI_VERSION}) << "the first registration recorded this version";
+
+        // what a registry without versions does on a second registration of the key: the factory changes, the version stays
+        SchedulerRegistry::Entries entries                    = registry.takeEntries();
+        entries.handlers.at(std::string(kKey)).createFunction = makeThrowingScheduler;
+        registry.restoreEntries(std::move(entries), false);
+
+        expect(that % registry.contains(kKey));
+        expect(registry.abiVersion(kKey) == std::nullopt) << "the recorded version belongs to the replaced factory";
+        expect(registry.abiVersion("test::no_such_scheduler") == std::nullopt);
     };
 };
 

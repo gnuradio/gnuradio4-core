@@ -18,9 +18,10 @@
  *
  * The tool's contract is its exit status and what it prints, and neither is visible from inside the process, so
  * every case here runs the built executable over core's own test plugins and test block libraries: the framework
- * report, the block listing, one block in detail, the scheduler listing, a scheduler library refused at an earlier
- * plugin ABI version, a name nothing is registered under, and a command line that cannot be used. The shape of the report is part of that contract - no line wider than a terminal, one entry per
- * block however many instantiations it has, and a JSON document that carries no null - so each is pinned here too.
+ * report, the block listing, one block in detail, the scheduler listing, scheduler libraries refused at an earlier
+ * plugin ABI version or at none, a name nothing is registered under, and a command line that cannot be used. The
+ * shape of the report is part of that contract - no line wider than a terminal, one entry per block however many
+ * instantiations it has, and a JSON document on standard output that carries no null - so each is pinned here too.
  */
 namespace qa_grinfo {
 
@@ -34,16 +35,22 @@ constexpr auto closePipe = pclose;
 
 struct Result {
     int         exitCode = -1;
-    std::string output; // standard output and standard error together, in the order the run wrote them
+    std::string output; // what the run wrote to the collected streams, in the order it wrote it
 };
 
-// runs the tool with `arguments` and collects what it wrote and the status it exited with
-[[nodiscard]] Result run(const std::vector<std::string>& arguments) {
+enum class Streams { both, standardOutput };
+
+// runs the tool with `arguments` and collects what it wrote to `streams` and the status it exited with
+[[nodiscard]] Result run(const std::vector<std::string>& arguments, Streams streams = Streams::both) {
     std::string command = std::format("\"{}\"", GR_TOOLS_GRINFO);
     for (const std::string& argument : arguments) {
         command += std::format(" \"{}\"", argument);
     }
-    command += " 2>&1";
+#ifdef _WIN32
+    command += streams == Streams::both ? " 2>&1" : " 2>NUL";
+#else
+    command += streams == Streams::both ? " 2>&1" : " 2>/dev/null";
+#endif
 
     Result     result;
     std::FILE* pipe = openPipe(command.c_str(), "r");
@@ -63,13 +70,18 @@ struct Result {
     return result;
 }
 
-// one JSON document: every bracket closed in order outside a string, and nothing left open at the end
+// one JSON document and nothing else: it opens the text, every bracket closes in order outside a string, and only
+// white space follows its end
 [[nodiscard]] bool isOneJsonDocument(std::string_view text) {
     std::size_t depth    = 0UZ;
     bool        inString = false;
     bool        escaped  = false;
     bool        opened   = false;
     for (const char character : text) {
+        const bool outside = depth == 0UZ && !inString;
+        if (outside && character != ' ' && character != '\n' && character != '\r' && character != '\t' && (opened || (character != '{' && character != '['))) {
+            return false;
+        }
         if (inString) {
             if (escaped) {
                 escaped = false;
@@ -137,8 +149,8 @@ constexpr std::size_t kWidth = 80UZ;
     return all;
 }
 
-// the directory of the two shared objects that register a scheduler without being plugins, one at this plugin ABI
-// version and one at an earlier version
+// the directory of the three shared objects that register a scheduler without being plugins: one at this plugin ABI
+// version, one at an earlier version and one without a version
 [[nodiscard]] std::vector<std::string> overSchedulerLibraries(const std::vector<std::string>& arguments) {
     std::vector<std::string> all(arguments);
     all.emplace_back("--plugin-dir");
@@ -185,6 +197,14 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         expect(help.output.contains("schedulers")) << "the command that lists the schedulers" << help.output;
     };
 
+    "the JSON check takes one document with nothing before or after it"_test = [] {
+        expect(isOneJsonDocument("{\"a\": [1, \"}\"]}\n"));
+        expect(!isOneJsonDocument("warning: a line\n{\"a\": 1}\n")) << "a line ahead of the document";
+        expect(!isOneJsonDocument("{\"a\": 1}\n{\"b\": 2}\n")) << "a second document";
+        expect(!isOneJsonDocument("{\"a\": 1}\ntrailing\n")) << "a line after the document";
+        expect(!isOneJsonDocument("{\"a\": 1")) << "a document left open";
+    };
+
 #ifdef GR_TOOLS_CORE_TEST_PLUGINS
     "version names the directories searched and what they held"_test = [] {
         const Result version = run(overTestDirectories({"version"}));
@@ -206,7 +226,7 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
     };
 
     "version --json is one document carrying the shape a reader relies on"_test = [] {
-        const Result version = run(overTestDirectories({"version", "--json"}));
+        const Result version = run(overTestDirectories({"version", "--json"}), Streams::standardOutput);
         expect(eq(version.exitCode, 0)) << version.output;
         expect(isOneJsonDocument(version.output)) << version.output;
         expect(version.output.contains("\"schema\": 2")) << version.output;
@@ -230,7 +250,7 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
     };
 
     "blocks --json is one document shaped by library, family and block"_test = [] {
-        const Result blocks = run(overTestDirectories({"blocks", "--json"}));
+        const Result blocks = run(overTestDirectories({"blocks", "--json"}), Streams::standardOutput);
         expect(eq(blocks.exitCode, 0)) << blocks.output;
         expect(isOneJsonDocument(blocks.output)) << blocks.output;
         expect(blocks.output.contains("\"schema\": 2")) << blocks.output;
@@ -276,7 +296,7 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
     };
 
     "block --json carries the settings with their defaults typed"_test = [] {
-        const Result block = run(overTestDirectories({"block", "LibraryDoubler", "--json"}));
+        const Result block = run(overTestDirectories({"block", "LibraryDoubler", "--json"}), Streams::standardOutput);
         expect(eq(block.exitCode, 0)) << block.output;
         expect(isOneJsonDocument(block.output)) << block.output;
         expect(block.output.contains("\"command\": \"block\"")) << block.output;
@@ -289,7 +309,7 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
     };
 
     "block --json keys every instantiation in full, which the text report does not"_test = [] {
-        const Result block = run(overTestDirectories({"block", "convert", "--json"}));
+        const Result block = run(overTestDirectories({"block", "convert", "--json"}), Streams::standardOutput);
         expect(eq(block.exitCode, 0)) << block.output;
         expect(isOneJsonDocument(block.output)) << block.output;
         expect(block.output.contains("\"key\": \"good::convert<float64, float32>\"")) << block.output;
@@ -317,7 +337,7 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
     };
 
     "schedulers --json is one document shaped by library, family and scheduler"_test = [] {
-        const Result schedulers = run(overTestDirectories({"schedulers", "--json"}));
+        const Result schedulers = run(overTestDirectories({"schedulers", "--json"}), Streams::standardOutput);
         expect(eq(schedulers.exitCode, 0)) << schedulers.output;
         expect(isOneJsonDocument(schedulers.output)) << schedulers.output;
         expect(schedulers.output.contains("\"command\": \"schedulers\"")) << schedulers.output;
@@ -343,19 +363,21 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         expect(version.output.contains("scheduler keys")) << version.output;
     };
 
-    "schedulers lists a shared object's scheduler of this ABI version and not one of an earlier version"_test = [] {
+    "schedulers lists a shared object's scheduler of this ABI version and not one of an earlier version or none"_test = [] {
         const Result schedulers = run(overSchedulerLibraries({"schedulers"}));
         expect(eq(schedulers.exitCode, 0)) << schedulers.output;
         expect(schedulers.output.contains("libscheduler_library.so (block-library, 1 keys)")) << "the kept library and its scheduler" << schedulers.output;
         expect(schedulers.output.contains("\n      library_scheduler\n")) << "the scheduler under its family" << schedulers.output;
         expect(!schedulers.output.contains("libscheduler_library_v1.so (")) << "the refused library heads no listing" << schedulers.output;
+        expect(!schedulers.output.contains("libscheduler_library_unversioned.so (")) << "the refused library heads no listing" << schedulers.output;
         expect(eq(occurrences(schedulers.output, "library_scheduler_v1"), 1UZ)) << "its key appears in the loader's warning alone" << schedulers.output;
 
-        const Result version = run(overSchedulerLibraries({"version", "--json"}));
+        const Result version = run(overSchedulerLibraries({"version", "--json"}), Streams::standardOutput);
         expect(eq(version.exitCode, 0)) << version.output;
         expect(isOneJsonDocument(version.output)) << version.output;
         expect(version.output.contains("\"kind\": \"not-loaded\"")) << "the refused library is a file that did not load" << version.output;
         expect(version.output.contains("\"reason\": \"scheduler test::library_scheduler_v1 has plugin ABI version 1, which does not match the host's plugin ABI version")) << "with the reason the loader gave" << version.output;
+        expect(version.output.contains("\"reason\": \"scheduler test::library_scheduler_unversioned carries no plugin ABI version")) << "with the reason the loader gave" << version.output;
         expect(version.output.contains("\"test::library_scheduler\"")) << "the kept library's scheduler is registered" << version.output;
     };
 

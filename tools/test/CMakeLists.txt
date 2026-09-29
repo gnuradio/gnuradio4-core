@@ -65,7 +65,8 @@ if(TARGET rungraph)
       GoodRegistryPlugin
       good_math_plugin
       scheduler_library
-      scheduler_library_v1)
+      scheduler_library_v1
+      scheduler_library_unversioned)
   endif()
 endif()
 
@@ -92,6 +93,7 @@ if(TARGET grinfo)
       block_library
       block_library_second
       scheduler_library
-      scheduler_library_v1)
+      scheduler_library_v1
+      scheduler_library_unversioned)
   endif()
 endif()

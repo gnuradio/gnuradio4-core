@@ -56,7 +56,8 @@ add_block_library(block_library_duplicate block_library_duplicate)
 add_block_library(block_library_duplicate_second block_library_duplicate)
 
 # One plugin at two plugin ABI versions, in a directory of their own: one at the version this core implements and one at
-# version 1. A single load of that directory reaches both outcomes of the loader's version check.
+# version 1. A third plugin is at the version this core implements and registers a scheduler at version 1 when it loads.
+# A single load of that directory reaches every outcome of the loader's version checks for plugins.
 function(add_abi_probe_plugin PLUGIN_NAME)
   add_library(${PLUGIN_NAME} MODULE ${PLUGIN_NAME}.cpp)
   target_compile_options(${PLUGIN_NAME} PRIVATE -Wall)
@@ -67,10 +68,11 @@ endfunction()
 
 add_abi_probe_plugin(abi_probe_plugin)
 add_abi_probe_plugin(abi_probe_plugin_v1)
+add_abi_probe_plugin(abi_probe_plugin_foreign_scheduler)
 
 # One shared object that registers a scheduler without being a plugin, built at the plugin ABI version this core
-# implements and at version 1, in a directory of their own. A load of that directory keeps the first and refuses the
-# second.
+# implements, at version 1 and without a version, in a directory of their own. A load of that directory keeps the first
+# and refuses the other two.
 function(add_scheduler_library LIBRARY_NAME)
   add_library(${LIBRARY_NAME} MODULE scheduler_library.cpp)
   target_link_libraries(${LIBRARY_NAME} PRIVATE gnuradio-options gnuradio-core gnuradio-blocklib-core)
@@ -80,6 +82,8 @@ endfunction()
 add_scheduler_library(scheduler_library)
 add_scheduler_library(scheduler_library_v1)
 target_compile_definitions(scheduler_library_v1 PRIVATE SCHEDULER_LIBRARY_ABI_VERSION=1)
+add_scheduler_library(scheduler_library_unversioned)
+target_compile_definitions(scheduler_library_unversioned PRIVATE SCHEDULER_LIBRARY_UNVERSIONED)
 
 # a name that reads as a shared object but is not one the scan opens; it is never dlopened, so an empty file suffices
 file(MAKE_DIRECTORY ${TESTS_BINARY_PATH}/block_library_skipped)

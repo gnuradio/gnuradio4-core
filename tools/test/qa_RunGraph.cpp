@@ -308,7 +308,7 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
         expect(refused.output.contains("good::GoodMathScheduler")) << "the list of keys includes the plugin's" << refused.output;
     };
 
-    "a shared object's scheduler of this ABI version runs the chain to its end, one of an earlier version is refused"_test = [] {
+    "a shared object's scheduler of this ABI version runs the chain to its end, one of an earlier version or none is refused"_test = [] {
         std::vector<std::string> arguments = chainToItsEnd("test::library_scheduler");
         arguments.emplace_back("--plugin-dir");
         arguments.emplace_back(GR_TOOLS_TEST_SCHEDULER_LIBRARY);
@@ -319,6 +319,7 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
         expect(ran.output.contains("the graph ended on its own")) << ran.output;
         expect(ran.output.contains("source: event_count = 1000")) << ran.output;
         expect(ran.output.contains("libscheduler_library_v1.so did not load: scheduler test::library_scheduler_v1 has plugin ABI version 1, which does not match the host's plugin ABI version")) << "the refusal is reported as a failed plugin is" << ran.output;
+        expect(ran.output.contains("libscheduler_library_unversioned.so did not load: scheduler test::library_scheduler_unversioned carries no plugin ABI version")) << "the refusal is reported as a failed plugin is" << ran.output;
 
         const Result refused = run({"--graph", "unread.yaml", "--plugin-dir", GR_TOOLS_TEST_SCHEDULER_LIBRARY, "--scheduler", "test::library_scheduler_v1"});
         expect(eq(refused.exitCode, 2)) << refused.output;
