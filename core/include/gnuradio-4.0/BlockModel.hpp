@@ -150,6 +150,7 @@ struct Edge {
     [[nodiscard]] const property_map& uiConstraints() const { return *_uiConstraints; }
 
     [[nodiscard]] bool hasSameSourcePort(const Edge& other) const;
+    [[nodiscard]] bool hasSameStreamInput(const Edge& other) const;
 
     constexpr bool operator==(const Edge& other) const noexcept {
         return sourceBlock() == other.sourceBlock()                                                       //
@@ -589,6 +590,17 @@ inline bool Edge::hasSameSourcePort(const Edge& other) const {
     const auto port      = _sourceBlock->dynamicOutputPort(_sourcePortDefinition);
     const auto otherPort = other._sourceBlock->dynamicOutputPort(other._sourcePortDefinition);
     return port.has_value() && otherPort.has_value() && *port.value() == *otherPort.value();
+}
+
+// two edges into one block may name one input by index and by name, so both definitions are resolved; a message input
+// takes several edges and never counts as shared
+inline bool Edge::hasSameStreamInput(const Edge& other) const {
+    if (!_destinationBlock || _destinationBlock != other._destinationBlock) {
+        return false;
+    }
+    const auto input      = _destinationBlock->dynamicInputPort(_destinationPortDefinition);
+    const auto otherInput = _destinationBlock->dynamicInputPort(other._destinationPortDefinition);
+    return input.has_value() && otherInput.has_value() && input.value() == otherInput.value() && port::decodePortType(input.value()->portMaskInfo()) == PortType::STREAM;
 }
 
 namespace serialization_fields {
