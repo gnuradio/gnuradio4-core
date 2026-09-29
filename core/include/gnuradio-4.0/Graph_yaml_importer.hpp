@@ -344,6 +344,13 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
         auto src = parseBlockPort(connection[0], connection[1]);
         auto dst = parseBlockPort(connection[2], connection[3]);
 
+        // a file states a whole graph: two connections into one stream input are an error in the file
+        const Edge                  requested(src.block, src.port_definition, dst.block, dst.port_definition, EdgeParameters{});
+        const std::span<const Edge> loadedEdges = resultGraph.edges();
+        if (const auto taken = std::ranges::find_if(loadedEdges, [&requested](const Edge& edge) { return edge.hasSameStreamInput(requested); }); taken != loadedEdges.end()) {
+            throw gr::exception(std::format("stream input {}/{} is the destination of two connections, from {}/{} and from {}/{}", dst.block->name(), dst.port_definition, taken->sourceBlock()->name(), taken->sourcePortDefinition(), src.block->name(), src.port_definition));
+        }
+
         if (connection.size() == 4) {
             if (auto r = resultGraph.connect(src.block, src.port_definition, dst.block, dst.port_definition, EdgeParameters{.minBufferSize = undefined_size, .weight = graph::defaultWeight, .name = graph::defaultEdgeName}, location); !r) {
                 throw gr::exception(std::format("connection failed: {}", r.error().message));

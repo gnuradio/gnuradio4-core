@@ -632,6 +632,62 @@ connections:
             expect(read.error().message.contains("count")) << read.error().message;
         }
     };
+
+    // the two connections name the one input by name and by index
+    "a graph file with two connections into one stream input is refused"_test = [] {
+        registerTestBlocks();
+        PluginLoader& loader = gr::globalPluginLoader();
+
+        const std::string document = R"yaml(blocks:
+  - id: qa::RampSource
+    parameters:
+      name: first
+  - id: qa::RampSource
+    parameters:
+      name: second
+  - id: qa::RecordingSink
+    parameters:
+      name: joined
+connections:
+  - [first, out, joined, in]
+  - [second, out, joined, 0]
+)yaml";
+
+        std::string reported;
+        try {
+            const auto loaded = gr::loadGrc(loader, document);
+            expect(false) << std::format("{} edges loaded; a stream input with two sources must be refused", loaded->edges().size());
+        } catch (const gr::exception& e) {
+            reported = e.message;
+        }
+        expect(reported.contains("joined/")) << reported;
+        expect(reported.contains("first/out")) << reported;
+        expect(reported.contains("second/out")) << reported;
+    };
+
+    "a saved graph carries only the edge that replaced another"_test = [] {
+        registerTestBlocks();
+        PluginLoader& loader = gr::globalPluginLoader();
+
+        gr::Graph flow;
+        auto&     first  = flow.emplaceBlock<RampSource>({{"name", std::string("first")}, {"n_samples", 64U}});
+        auto&     second = flow.emplaceBlock<RampSource>({{"name", std::string("second")}, {"n_samples", 64U}});
+        auto&     sink   = flow.emplaceBlock<RecordingSink>({{"name", std::string("replaced-edge-sink")}});
+        expect(flow.connect<"out", "in">(first, sink).has_value());
+        expect(flow.connect<"out", "in">(second, sink).has_value());
+
+        const auto saved = pmt::yaml::deserialize(gr::saveGrc(loader, flow));
+        expect(fatal(saved.has_value())) << "a dump this writer produced must parse";
+        const auto* connections = saved->at("connections").get_if<Tensor<pmt::Value>>();
+        expect(fatal(connections != nullptr)) << "the saved graph has no connections list";
+        expect(fatal(eq(connections->size(), 1UZ))) << "the saved graph keeps the displaced edge";
+        const auto* connection = (*connections)[0].get_if<Tensor<pmt::Value>>();
+        expect(fatal(connection != nullptr && connection->size() >= 4UZ));
+        expect(eq((*connection)[0].value_or(std::string_view{}), std::string_view(second.unique_name))) << "the saved edge is not the one that replaced the other";
+
+        const auto loaded = gr::loadGrc(loader, gr::saveGrc(loader, flow));
+        expect(eq(loaded->edges().size(), 1UZ));
+    };
 };
 
 int main() { /* tests are run by the ut suite */ }

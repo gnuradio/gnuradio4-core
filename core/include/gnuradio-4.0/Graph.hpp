@@ -458,6 +458,18 @@ public:
         return std::erase_if(_edges, [&edge](const Edge& e) { return e == edge; });
     }
 
+    // a stream input reads only the ring it was connected to last; an earlier edge into it would be saved and inspected
+    // with no data behind it, and is removed and reported instead
+    void removeEdgesDisplacedBy(const Edge& newEdge) {
+        std::erase_if(_edges, [this, &newEdge](const Edge& edge) {
+            if (!edge.hasSameStreamInput(newEdge)) {
+                return false;
+            }
+            std::println(stderr, "{}: edge {:l} replaces edge {:l}: a stream input takes one source", this->unique_name, newEdge, edge);
+            return true;
+        });
+    }
+
     std::optional<Message> propertyCallbackInspectBlock([[maybe_unused]] std::string_view propertyName, Message message);
 
     std::expected<std::shared_ptr<BlockModel>, Error> removeBlockByName(std::string_view uniqueName) {
@@ -514,7 +526,9 @@ public:
 
         const bool        isArithmeticLike       = sourcePortRef.isArithmeticLikeValueType();
         const std::size_t sanitizedMinBufferSize = minBufferSize == undefined_size ? graph::defaultMinBufferSize(isArithmeticLike) : minBufferSize;
-        _edges.emplace_back(*sourceBlockIt, sourcePort, *destinationBlockIt, destinationPort, sanitizedMinBufferSize, weight, std::string(edgeName));
+        Edge              newEdge(*sourceBlockIt, sourcePort, *destinationBlockIt, destinationPort, sanitizedMinBufferSize, weight, std::string(edgeName));
+        removeEdgesDisplacedBy(newEdge);
+        _edges.push_back(std::move(newEdge));
         return {};
     }
 
@@ -591,9 +605,11 @@ public:
         const bool isArithmeticLike = srcPortResult ? srcPortResult.value()->isArithmeticLikeValueType() : true;
         parameters.minBufferSize    = parameters.minBufferSize == undefined_size ? graph::defaultMinBufferSize(isArithmeticLike) : parameters.minBufferSize;
 
-        _edges.emplace_back(sourceBlock, std::move(sourcePort), //
-            destinationBlock, std::move(destinationPort),       //
+        Edge newEdge(sourceBlock, std::move(sourcePort),  //
+            destinationBlock, std::move(destinationPort), //
             std::move(parameters));
+        removeEdgesDisplacedBy(newEdge);
+        _edges.push_back(std::move(newEdge));
 
         return {};
     }
@@ -702,9 +718,11 @@ public:
         const std::size_t sanitizedMinBufferSize = parameters.minBufferSize == undefined_size ? graph::defaultMinBufferSize(isArithmeticLike) : parameters.minBufferSize;
 
         parameters.minBufferSize = sanitizedMinBufferSize;
-        _edges.emplace_back(sourceBlockModel.value(), sourcePortDefinition->definition, //
-            destinationBlockModel.value(), destinationPortDefinition->definition,       //
+        Edge newEdge(sourceBlockModel.value(), sourcePortDefinition->definition,  //
+            destinationBlockModel.value(), destinationPortDefinition->definition, //
             std::move(parameters));
+        removeEdgesDisplacedBy(newEdge);
+        _edges.push_back(std::move(newEdge));
 
         return {};
     }
