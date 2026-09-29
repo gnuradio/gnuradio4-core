@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 3.27)
 
+# project() creates the cache entries for the built-in build types and the build type named at that point from the _INIT
+# values in cmake/FlagsOverride.cmake. A value the caller gives on the command line, in an initial cache or in a preset
+# is already in the cache and stays in effect.
+set(CMAKE_USER_MAKE_RULES_OVERRIDE "${CMAKE_CURRENT_SOURCE_DIR}/cmake/FlagsOverride.cmake")
+
 project(
   gnuradio
   VERSION 4.0.0
@@ -42,20 +47,8 @@ if(CMAKE_CXX_COMPILER MATCHES "/em\\+\\+(-[a-zA-Z0-9.])?$") # if this hasn't bee
   set(EMSCRIPTEN ON)
 endif()
 
-# default explicit compiler and linker flag optimisation per build type
+# linker choice and per-build-type linker flags
 if(NOT MSVC)
-  # optional:  -fno-inline-functions -fvar-tracking-assignments
-  set(CMAKE_CXX_FLAGS_DEBUG "-Og -g1 -gz -DDEBUG -fno-omit-frame-pointer -ffunction-sections -fdata-sections")
-  set(CMAKE_CXX_FLAGS_RELEASE "-O2 -g0 -DNDEBUG -ffunction-sections -fdata-sections")
-  set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g1 -gz -DNDEBUG -ffunction-sections -fdata-sections")
-  set(CMAKE_CXX_FLAGS_RELWITHASSERT "-O2 -DASSERT_ENABLED -ffunction-sections -fdata-sections")
-  # '-s': strip debug symbols, 'EMBEDDED is used to disable/minimise code features for embedded systems (e.g. code-size,
-  # console printouts, etc.)
-  set(CMAKE_CXX_FLAGS_MINSIZEREL "-Os -g0 -DNDEBUG -DEMBEDDED -ffunction-sections -fdata-sections")
-  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    set(CMAKE_CXX_FLAGS_MINSIZEREL "${CMAKE_CXX_FLAGS_MINSIZEREL} -s")
-  endif()
-
   if(GR4_USE_THIN_ARCHIVES)
     set(CMAKE_CXX_ARCHIVE_CREATE "<CMAKE_AR> crT <TARGET> <LINK_FLAGS> <OBJECTS>")
     set(CMAKE_CXX_ARCHIVE_APPEND "<CMAKE_AR> rT <TARGET> <LINK_FLAGS> <OBJECTS>")
@@ -71,11 +64,12 @@ if(NOT MSVC)
     set(_LD_GC_SECTIONS "-Wl,--gc-sections -ffunction-sections -fdata-sections")
   endif()
 
+  set(_LD_REQUIRED "")
   if(APPLE)
     # macOS Mach-O two-level namespace duplicates singletons (e.g. globalBlockRegistry()) when a static library is
     # linked into both the executable and shared plugins; -flat_namespace forces ELF-like single-level lookup ensuring
     # one instance. -stack_size 8 MiB matches the Linux default — macOS ARM64 non-main threads default to 512 KiB.
-    string(APPEND _LD_GC_SECTIONS " -Wl,-flat_namespace")
+    list(APPEND _LD_REQUIRED -Wl,-flat_namespace)
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-stack_size,0x800000")
   endif()
 
@@ -122,17 +116,17 @@ if(NOT MSVC)
     endif()
 
     if(_mold_usable)
-      set(_LD_GC_SECTIONS "${_LD_GC_SECTIONS} -fuse-ld=mold")
+      list(APPEND _LD_REQUIRED -fuse-ld=mold)
       if(_USE_ICF)
-        string(APPEND _LD_GC_SECTIONS " -Wl,--icf=safe")
+        list(APPEND _LD_REQUIRED -Wl,--icf=safe)
       endif()
       message(STATUS "Using mold @ ${MOLD_BIN} as the linker.")
     else()
       find_program(LLD_BIN ld.lld)
       if(LLD_BIN)
-        set(_LD_GC_SECTIONS "${_LD_GC_SECTIONS} -fuse-ld=lld")
+        list(APPEND _LD_REQUIRED -fuse-ld=lld)
         if(_USE_ICF)
-          string(APPEND _LD_GC_SECTIONS " -Wl,--icf=safe")
+          list(APPEND _LD_REQUIRED -Wl,--icf=safe)
         endif()
         message(STATUS "Using lld @ ${LLD_BIN} as the linker.")
       else()
@@ -140,12 +134,21 @@ if(NOT MSVC)
       endif()
     endif()
   endif()
-  set(CMAKE_EXE_LINKER_FLAGS_DEBUG "${_LD_GC_SECTIONS}")
-  set(CMAKE_SHARED_LINKER_FLAGS_DEBUG "${_LD_GC_SECTIONS}")
-  set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${_LD_GC_SECTIONS}")
-  set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "${_LD_GC_SECTIONS}")
-  set(CMAKE_EXE_LINKER_FLAGS_MINSIZEREL "${_LD_GC_SECTIONS}")
-  set(CMAKE_SHARED_LINKER_FLAGS_MINSIZEREL "${_LD_GC_SECTIONS}")
+  # -flat_namespace and the linker choice apply to the executables and shared libraries of the build types that take the
+  # section flags below, whatever per-build-type linker flags the caller sets.
+  set(_LD_REQUIRED_WHEN
+      "$<AND:$<CONFIG:Debug,Release,MinSizeRel>,$<NOT:$<STREQUAL:$<TARGET_PROPERTY:TYPE>,MODULE_LIBRARY>>>")
+  foreach(_option IN LISTS _LD_REQUIRED)
+    add_link_options("$<${_LD_REQUIRED_WHEN}:${_option}>")
+  endforeach()
+  # CMake leaves these linker flags empty. A value the caller sets replaces the section flags alone.
+  foreach(_config DEBUG RELEASE MINSIZEREL)
+    foreach(_linkType EXE SHARED)
+      if(NOT CMAKE_${_linkType}_LINKER_FLAGS_${_config})
+        set(CMAKE_${_linkType}_LINKER_FLAGS_${_config} "${_LD_GC_SECTIONS}")
+      endif()
+    endforeach()
+  endforeach()
   if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     # we need to set -Wa,-mbig-obj or build fails with gcc
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wa,-mbig-obj")
@@ -153,12 +156,6 @@ if(NOT MSVC)
     set(CMAKE_CXX_STANDARD_LIBRARIES "${CMAKE_CXX_STANDARD_LIBRARIES} -lstdc++exp")
   endif()
 elseif(MSVC)
-  set(CMAKE_CXX_FLAGS_DEBUG "/Od /Zi /Zf /DDEBUG")
-  set(CMAKE_CXX_FLAGS_RELEASE "/O2 /GL /DNDEBUG")
-  set(CMAKE_CXX_FLAGS_RELWITHASSERT "/O2 /GL /DASSERT_ENABLED")
-  set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "/O2 /GL /Zi /Zf /DNDEBUG")
-  set(CMAKE_CXX_FLAGS_MINSIZEREL "/O1 /Os /GL /DNDEBUG")
-
   set(LINK_RELEASE "/LTCG /OPT:REF /OPT:ICF")
   set(LINK_RELASSERT "${LINK_RELEASE}")
   set(LINK_RELDEBINFO "${LINK_RELEASE}")
@@ -169,6 +166,13 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE
       "RelWithAssert"
       CACHE STRING "Default build type" FORCE)
+endif()
+# project() gives RelWithAssert its flags only when that build type is named at that point. An enclosing project that
+# names it creates the entry empty, and a subproject never reads cmake/FlagsOverride.cmake. This directory and those
+# below use the project's flags when the value is empty.
+if(NOT CMAKE_CXX_FLAGS_RELWITHASSERT)
+  include(cmake/FlagsOverride.cmake)
+  set(CMAKE_CXX_FLAGS_RELWITHASSERT "${CMAKE_CXX_FLAGS_RELWITHASSERT_INIT}")
 endif()
 set_property(
   CACHE CMAKE_BUILD_TYPE
