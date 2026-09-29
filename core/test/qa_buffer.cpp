@@ -1410,15 +1410,14 @@ const boost::ut::suite<"MultiProducerStrategy"> _multiProducerStrategy1 = [] {
     };
 
     // Two producers claim adjacent single slots and publish them at the same moment, round after round. After both
-    // publish() calls return, the publish cursor must cover both slots and the consumer must count both. The rounds
-    // run for a fixed duration because the interleaving under test occurs at a rate that depends on the machine.
+    // publish() calls return, the publish cursor must cover both slots and the consumer must count both. The
+    // interleaving under test occurs in a small share of rounds, so the case runs many of them.
     "MultiProducerStrategy - two producers publishing adjacent slots never leave the cursor behind"_test = [] {
         using Strategy = gr::MultiProducerStrategy<std::dynamic_extent, gr::NoWaitStrategy>;
-        using Clock    = std::chrono::steady_clock;
 
         constexpr std::size_t kProducers = 2UZ;
         constexpr std::size_t cap        = 16UZ;
-        constexpr auto        kDuration  = std::chrono::milliseconds(500);
+        constexpr std::size_t kRounds    = 100'000UZ;
 
         Strategy strategy(cap);
         auto     reader = std::make_shared<gr::Sequence>();
@@ -1438,6 +1437,7 @@ const boost::ut::suite<"MultiProducerStrategy"> _multiProducerStrategy1 = [] {
                     if (stopRequested.load(std::memory_order_acquire)) {
                         return;
                     }
+                    std::this_thread::yield();
                     round = nRoundsStarted.load(std::memory_order_acquire);
                 }
                 nRoundsDone                  = round;
@@ -1456,18 +1456,15 @@ const boost::ut::suite<"MultiProducerStrategy"> _multiProducerStrategy1 = [] {
             producers.emplace_back(producer);
         }
 
-        std::size_t nRounds   = 0UZ;
         std::size_t nConsumed = 0UZ;
         std::size_t nStalls   = 0UZ;
-        const auto  deadline  = Clock::now() + kDuration;
-        while (Clock::now() < deadline) {
-            ++nRounds;
-            nRoundsStarted.store(nRounds, std::memory_order_release);
-            while (nPublished.load(std::memory_order_acquire) < kProducers * nRounds) {
-                // the consumer waits for both publish() calls of this round to return
+        for (std::size_t round = 1UZ; round <= kRounds; ++round) {
+            nRoundsStarted.store(round, std::memory_order_release);
+            while (nPublished.load(std::memory_order_acquire) < kProducers * round) {
+                std::this_thread::yield(); // the consumer waits for both publish() calls of this round to return
             }
             const std::size_t publishCursor = strategy._publishCursor.value();
-            if (publishCursor != kProducers * nRounds) {
+            if (publishCursor != kProducers * round) {
                 ++nStalls;
             }
             nConsumed += publishCursor - reader->value();
@@ -1478,10 +1475,9 @@ const boost::ut::suite<"MultiProducerStrategy"> _multiProducerStrategy1 = [] {
             thread.join();
         }
 
-        expect(gt(nRounds, 0UZ));
-        expect(eq(nStalls, 0UZ)) << std::format("the publish cursor stayed behind a published slot in {} of {} rounds", nStalls, nRounds);
-        expect(eq(nConsumed, kProducers * nRounds)) << "the consumer must count every published slot";
-        expect(eq(strategy._reserveCursor.value(), kProducers * nRounds)) << "each producer claims one slot per round";
+        expect(eq(nStalls, 0UZ)) << std::format("the publish cursor stayed behind a published slot in {} of {} rounds", nStalls, kRounds);
+        expect(eq(nConsumed, kProducers * kRounds)) << "the consumer must count every published slot";
+        expect(eq(strategy._reserveCursor.value(), kProducers * kRounds)) << "each producer claims one slot per round";
     };
 };
 
