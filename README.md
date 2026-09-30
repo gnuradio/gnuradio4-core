@@ -85,6 +85,10 @@ echo 1 | sudo tee /sys/block/zram0/reset
 A value the caller or a toolchain file sets for `CMAKE_CXX_FLAGS_<CONFIG>`, `CMAKE_EXE_LINKER_FLAGS_<CONFIG>` or
 `CMAKE_SHARED_LINKER_FLAGS_<CONFIG>` replaces the project's default for that build type, and `CXXFLAGS`, `LDFLAGS`
 and `CMAKE_CXX_FLAGS` apply to every build type.
+A rules file the caller names in `CMAKE_USER_MAKE_RULES_OVERRIDE` runs before the project's defaults apply, and
+the `_INIT` values it changes stay in effect.
+A toolchain file that sets `CMAKE_USER_MAKE_RULES_OVERRIDE` replaces the project's rules file, and the built-in
+build types then take CMake's defaults.
 With GCC and Clang the project's compiler defaults (`cmake/FlagsOverride.cmake`) are `-O2 -DASSERT_ENABLED` for
 `RelWithAssert` (the top-level default build type), `-O2 -g0 -DNDEBUG` for `Release`, `-O2 -g1 -gz -DNDEBUG` for
 `RelWithDebInfo`, `-Og -g1 -gz -DDEBUG -fno-omit-frame-pointer` for `Debug` and `-Os -g0 -DNDEBUG -DEMBEDDED` for
@@ -94,8 +98,9 @@ With GCC and Clang the project's compiler defaults (`cmake/FlagsOverride.cmake`)
 is on) and `-Wl,-flat_namespace` on macOS.
 A per-build-type linker value from the caller replaces the section flags and keeps the linker choice.
 Built as a subproject, the tree uses the enclosing project's build type.
-It takes the enclosing project's compiler flags for `Debug`, `Release`, `RelWithDebInfo` and `MinSizeRel`, CMake's
-own defaults included: the project's linker defaults apply there, and its compiler defaults do not.
+Added after the enclosing project enables C++, the tree takes the enclosing project's compiler flags for `Debug`,
+`Release`, `RelWithDebInfo` and `MinSizeRel`, CMake's own defaults included: the project's linker defaults apply
+there, and its compiler defaults do not.
 For `RelWithAssert` the tree uses its own compiler flags where the enclosing project gives none.
 An empty build type gives the tree no per-build-type compiler or linker flags: no optimization, no section flags
 and no linker choice.
