@@ -103,21 +103,25 @@ struct MergeTagPropagation {};
 /**
  * @brief Require that the block forwards every key of every tag, at the offset the tag arrived at.
  *
- * The default forwarder keeps every key on a block that passes `gr::block::kUnfilteredTagPropagationAdmissible`: one
- * that declares neither `Resampling<>` nor `Stride<>`, has only synchronous stream ports, declares no tag-propagation
- * policy other than this one, and supplies no `forwardTags()` of its own. Such a block needs no annotation. A block
- * annotated with `UnfilteredTagPropagation` must pass the predicate, and fails to compile where it does not. Every
- * other block keeps only its auto-forward keys: those in `gr::tag::kDefaultTags` and any added through
- * `settings().addAutoForwardParameters()`.
+ * The default forwarder keeps every key on a block that passes `gr::block::kUnfilteredTagPropagationAdmissible`. The
+ * predicate holds for a block that
+ * - declares neither `Resampling<>` nor `Stride<>`
+ * - has only synchronous stream ports
+ * - declares no tag-propagation policy other than this one
+ * - supplies no `forwardTags()` of its own
+ *
+ * Such a block needs no annotation. A block annotated with `UnfilteredTagPropagation` must pass the predicate, and
+ * fails to compile where it does not. Every other block keeps only its auto-forward keys. Those are the keys in
+ * `gr::tag::kDefaultTags` and any added through `settings().addAutoForwardParameters()`.
  *
  * The forwarder substitutes the block's own current value for a key the block declares as a setting. A surviving key
  * that names a setting of a downstream block drives that setting, exactly as `sample_rate` does. The multi-input dedup
  * and the merge rule stay those of the key-filtered forwarder.
  *
  * Each tag leaves at the offset it arrived at, and the whole consumed chunk is retired. An input `min_samples` above
- * one forbids a chunk boundary at a tag near the chunk's start, and a key-filtered block defers such an interior tag
- * to the next chunk; a block forwarding every key does not. What the block itself applies from that tag, its settings,
- * still takes effect from the chunk's first sample.
+ * one can leave a tag inside a chunk. A key-filtered block defers that tag to the next chunk. A block forwarding every
+ * key publishes it at its own offset. What the block itself applies from that tag, its settings, still takes effect
+ * from the chunk's first sample.
  *
  * The remaining obligation is the author's, because no compile-time fact expresses it: a tag arriving at input
  * offset `t` must belong at output offset `t`. A block that shifts sample positions, an integer delay for instance,
@@ -134,9 +138,8 @@ struct UnfilteredTagPropagation {};
  * setting, and it defers a tag interior to a chunk to the next chunk's first sample. The build refuses the annotation
  * beside `UnfilteredTagPropagation` or `NoTagPropagation`.
  *
- * A block may fail `gr::block::kUnfilteredTagPropagationAdmissible` for another reason: `Resampling<>`, `Stride<>`, an
- * asynchronous stream port, `ForwardTagPropagation`, `BackwardTagPropagation`, `MergeTagPropagation` or a
- * `forwardTags()` override. The annotation changes nothing on such a block. A block template whose variants differ in
+ * The annotation changes nothing on a block that fails `gr::block::kUnfilteredTagPropagationAdmissible` for another
+ * reason, such as `Resampling<>`, `Stride<>` or a `forwardTags()` override. A block template whose variants differ in
  * these respects may declare it on every variant.
  */
 struct FilteredTagPropagation {};

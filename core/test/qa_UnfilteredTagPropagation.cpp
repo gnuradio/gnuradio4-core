@@ -15,16 +15,19 @@
 #include <gnuradio-4.0/Scheduler.hpp>
 
 /**
- * @brief A block passing `kUnfilteredTagPropagationAdmissible` carries every tag key across itself, and leaves every tag
- * at the offset it arrived at.
+ * @brief A block passing `kUnfilteredTagPropagationAdmissible` forwards every tag key at the tag's own offset.
  *
  * Such a block forwards every key whether it declares `UnfilteredTagPropagation` or no policy at all. A block declaring
- * `FilteredTagPropagation`, and every block the predicate refuses, keeps only the auto-forward keys. These tests pin what
- * forwarding every key governs — every key survives, a key the block declares as a setting is substituted with the
- * block's own current value, a key named after one of the settings `Block<>` declares for every block is not, and a tag
- * interior to a chunk keeps its offset where an input minimum forbids a boundary at it — and what it leaves alone: the
- * multi-input dedup, the merge rule, and the key-filtered forwarding of a block the predicate refuses. The compile-time
- * guards are pinned twice: as a predicate here, and as six translation units under `compile_fail/` that must not build.
+ * `FilteredTagPropagation`, and every block the predicate refuses, keeps only the auto-forward keys. The tests check
+ * that:
+ * - every key survives
+ * - a key the block declares as a setting carries the block's own current value
+ * - a key named after a setting `Block<>` declares for every block keeps the upstream value
+ * - a tag inside a chunk keeps its offset where an input minimum forbids a boundary at it
+ *
+ * They also check the multi-input dedup, the merge rule, and the key-filtered forwarding of a block the predicate
+ * refuses. The compile-time guards are checked twice. This file checks the predicate, and six translation units under
+ * `compile_fail/` must fail to build.
  *
  * The blocks are defined here: gnuradio4-core carries no standard block library, so a core test may not depend on one.
  */
@@ -112,7 +115,7 @@ struct Sink : Block<Sink> {
     }
 };
 
-/// declares no policy and passes the predicate: every key of every tag leaves this block
+/// declares no policy and passes the predicate, and every key of every tag leaves this block
 struct Relay : Block<Relay> {
     PortIn<float>  in;
     PortOut<float> out;
@@ -196,7 +199,7 @@ struct AsyncOutputRelay : Block<AsyncOutputRelay> {
     }
 };
 
-/// its own forwardTags() republishes whole every tag at relIndex <= 0, and relies on the input span retiring no other
+/// its own forwardTags() republishes every tag at relIndex <= 0 whole. It relies on the input span retiring only those.
 struct FirstTagForwarder : Block<FirstTagForwarder> {
     PortIn<float>  in;
     PortOut<float> out;

@@ -633,15 +633,16 @@ enum class Category {
 inline constexpr std::array<std::string_view, 8UZ> kFrameworkOwnedSettings{"input_chunk_size", "output_chunk_size", "stride", "disconnect_on_done", "compute_domain", "unique_name", "name", "ui_constraints"};
 
 /**
- * @brief Whether the default forwarder keeps every tag key for `TBlock`, and whether `UnfilteredTagPropagation` may be
- * declared for it.
+ * @brief Whether `TBlock` forwards every tag key and may declare `UnfilteredTagPropagation`.
  *
- * Forwarding every key promises that a tag arriving at input offset `t` leaves at output offset `t`. Declared
- * resampling and declared stride both break that; the default forwarder never reads an asynchronous input port, and an
- * asynchronous output port publishes a sample count the forwarded offset does not derive from; each of the other five
- * tag-propagation policies moves, suppresses or key-filters the forwarded tag; and a `forwardTags()` override replaces
- * the default forwarder outright. The predicate cannot express the block's own obligation to preserve sample
- * positions.
+ * Forwarding every key promises that a tag arriving at input offset `t` leaves at output offset `t`. The predicate is
+ * false for a block with any of:
+ * - `Resampling<>` or `Stride<>`
+ * - an asynchronous stream port
+ * - a tag-propagation policy other than `UnfilteredTagPropagation`
+ * - a `forwardTags()` override
+ *
+ * The predicate cannot check that the block keeps sample positions.
  */
 template<typename TBlock>
 constexpr bool kUnfilteredTagPropagationAdmissible =                                                                                  //
@@ -798,10 +799,10 @@ public:
     constexpr static bool unfilteredTagPropagation = std::disjunction_v<std::is_same<UnfilteredTagPropagation, Arguments>...>;
     constexpr static bool filteredTagPropagation   = std::disjunction_v<std::is_same<FilteredTagPropagation, Arguments>...>;
 
-    /// the default forwarder keeps every key of every tag: a block passing block::kUnfilteredTagPropagationAdmissible,
-    /// as every block declaring UnfilteredTagPropagation must. The predicate reads Derived's ports and its
-    /// forwardTags(). Derived is complete only inside a function body, and the predicate is evaluated there, never in
-    /// the class body.
+    /// whether the default forwarder keeps every key of every tag. It does on a block passing
+    /// block::kUnfilteredTagPropagationAdmissible, which every block declaring UnfilteredTagPropagation must pass. The
+    /// predicate reads Derived's ports and its forwardTags(). Derived is complete only inside a function body. The
+    /// predicate is therefore evaluated there, not in the class body.
     [[nodiscard]] static consteval bool forwardsEveryKey() noexcept { return block::kUnfilteredTagPropagationAdmissible<Derived>; }
 
     /// the input span retires, and the default forwarder reads, every tag of the chunk rather than only the tags at
@@ -1099,8 +1100,8 @@ public:
     /// the epilogue path pass the same types, and an override constrained to them answers the same here as there. A
     /// probe on empty tuples answers "no override" for every such constrained override. The input span type carries
     /// the tag window it retires, and that window depends on this answer. The probe tries the spans of both windows.
-    /// An override with a deduced return type whose body reads the window escapes the probe;
-    /// checkBlockArgumentContracts() refuses it on a block forwarding every key.
+    /// The probe misses an override with a deduced return type whose body reads the window.
+    /// checkBlockArgumentContracts() refuses such an override on a block forwarding every key.
     [[nodiscard]] static constexpr bool hasForwardTagsOverride() noexcept { return acceptsForwardTagsSpans<true>() || acceptsForwardTagsSpans<false>(); }
 
 private:
@@ -1315,16 +1316,14 @@ public:
 
     /// default tag forwarding — called by workInternal unless the user provides forwardTags()
     ///
-    /// The window read here is the window the input span retires: prepareStreams() builds it with
-    /// consumeOnlyFirstTag = !hasWholeChunkTagWindow(). On a key-filtered block the span drops exactly the tags at
-    /// relIndex <= 0, which is what tags(1) yields, and a tag interior to a chunk that could not be broken at it —
-    /// min_samples, or input_chunk_size > 1 — stays in the buffer and returns in the next chunk at a negative
-    /// relIndex, still unforwarded, so clamping it to offset 0 publishes it for the first time rather than a second.
-    /// Under BackwardTagPropagation and on a block forwarding every key the window is the whole consumed chunk: the
-    /// span retires every tag it holds, nothing is ever deferred, and no tag can return at a negative relIndex.
-    /// A block forwarding every key then publishes each at its own relIndex, as its offset promise requires. A
-    /// forwardTags() override reading a wider window than its policy retires sees a deferred tag twice and must skip
-    /// relIndex < 0.
+    /// This function reads the window the input span retires. prepareStreams() builds that window with
+    /// consumeOnlyFirstTag = !hasWholeChunkTagWindow(). On a key-filtered block the span retires the tags at
+    /// relIndex <= 0, the tags that tags(1) returns. An input min_samples, or an input_chunk_size above one, can keep a
+    /// chunk from breaking at a tag. That tag stays in the buffer and returns in the next chunk at a negative relIndex.
+    /// It has not been forwarded yet. Clamping it to offset 0 publishes it once. Under BackwardTagPropagation, and
+    /// on a block forwarding every key, the span retires every tag of the consumed chunk. A block forwarding every key
+    /// publishes each tag at its own relIndex. A forwardTags() override reading a wider window than its policy retires
+    /// sees a deferred tag twice and must skip relIndex < 0.
     template<typename TInputSpans, typename TOutputSpans>
     void forwardInputTags(TInputSpans& inputSpans, TOutputSpans& outputSpans, std::size_t processedIn, std::optional<std::size_t> tagWindowOverride = {}) noexcept {
         if constexpr (noTagPropagation) {

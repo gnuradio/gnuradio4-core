@@ -130,8 +130,8 @@ consteval bool memberForwardsEveryKey() {
     }
 }
 
-/// a composed block forwards every key only where each member block does, and keeps the auto-forward keys otherwise;
-/// an optional member left out as void does not count
+/// a composed block forwards every key only where each member block does, and keeps the auto-forward keys otherwise.
+/// An optional member left out as void does not count.
 template<typename TComposed, typename... TMembers>
 using MergedBlockBase = std::conditional_t<(memberForwardsEveryKey<TMembers>() && ...), Block<TComposed>, Block<TComposed, FilteredTagPropagation>>;
 
