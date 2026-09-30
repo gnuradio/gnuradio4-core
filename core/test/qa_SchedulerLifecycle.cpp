@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <format>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <print>
@@ -412,6 +413,25 @@ struct ObservedSink : gr::Block<ObservedSink> {
     gr::PortIn<float> in;
 
     GR_MAKE_REFLECTABLE(ObservedSink, in);
+
+    void processOne(float) { gObservedSamples.fetch_add(1UZ, std::memory_order_relaxed); }
+};
+
+// runs a test-supplied action in its stop() hook, on the thread that requested the stop
+struct StopActionSink : gr::Block<StopActionSink> {
+    gr::PortIn<float> in;
+
+    GR_MAKE_REFLECTABLE(StopActionSink, in);
+
+    std::function<void()> _onStop;
+    int                   _nStopCalls = 0;
+
+    void stop() {
+        if (_onStop) {
+            _onStop();
+        }
+        _nStopCalls++;
+    }
 
     void processOne(float) { gObservedSamples.fetch_add(1UZ, std::memory_order_relaxed); }
 };
@@ -1334,6 +1354,50 @@ const boost::ut::suite<"a blocking block reaches STOPPED when its scheduler stop
         expect(eq(nStopsThatDidNotDrain, 0UZ)) << "a stop of the running graph did not end its workers";
         expect(eq(nStopsShortOfStopped, 0UZ)) << "stops of a running graph that left the blocking block short of STOPPED";
         expect(eq(nRuns, kCycles)) << "every restart after a stop of the running graph must run the blocking block";
+    };
+
+    // the stop runs on the test's thread while the workers are inside their loop. The sink's stop hook waits, with a
+    // deadline, for the job count that waitDone() waits for, and then calls waitDone(). The stop reaches the source
+    // before the sink. The last worker to leave or the stop itself settles the blocking source before the wait ends
+    "a stop hook on the caller's thread that waits for the workers returns, and the graph runs again after a restart"_test = [] {
+        constexpr int kRuns = 2;
+
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::BlockingSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::StopActionSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+        qa_sched::gObservedSamples.store(0UZ, std::memory_order_relaxed);
+
+        qa_sched::TestScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        int nHooksTimedOut          = 0;
+        int nHooksWithSourceStopped = 0;
+        sink._onStop                = [&scheduler, &source, &nHooksTimedOut, &nHooksWithSourceStopped] {
+            if (!qa_sched::awaitCondition([&scheduler] { return !scheduler.isProcessing(); })) {
+                nHooksTimedOut++; // a timed-out hook returns, and the stop continues
+                return;
+            }
+            scheduler.waitDone();
+            nHooksWithSourceStopped += source.state() == STOPPED ? 1 : 0;
+        };
+
+        for (int run = 0; run < kRuns && nHooksTimedOut == 0; ++run) {
+            const std::size_t nBefore = qa_sched::gObservedSamples.load(std::memory_order_relaxed);
+            expect(scheduler.changeStateTo(INITIALISED).has_value());
+            expect(scheduler.changeStateTo(RUNNING).has_value());
+            expect(qa_sched::awaitObservedSamplesAbove(nBefore)) << "the run did not move a sample";
+            expect(scheduler.isProcessing()) << "the stop must land on a run whose workers are inside their loop";
+
+            expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+            expect(qa_sched::awaitState(scheduler, STOPPED)) << "the scheduler did not stop";
+            expect(qa_sched::awaitCondition([&scheduler] { return !scheduler.isProcessing(); })) << "the stopped run's workers did not leave";
+            expect(source.state() == STOPPED) << "the blocking source must reach STOPPED when the scheduler stops";
+        }
+
+        expect(eq(nHooksTimedOut, 0)) << "the workers did not leave while a stop hook on the caller's thread waited for them";
+        expect(eq(sink._nStopCalls, kRuns)) << "every stop must run the sink's stop hook once";
+        expect(eq(nHooksWithSourceStopped, kRuns)) << "the blocking source must be STOPPED when waitDone() returns in the hook";
     };
 };
 

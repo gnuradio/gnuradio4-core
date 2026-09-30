@@ -133,7 +133,8 @@ protected:
     std::shared_ptr<gr::Sequence> _nRunningJobs = std::make_shared<gr::Sequence>();
     std::recursive_mutex          _executionOrderMutex; // only used when modifying and copying the graph->local job list
     std::shared_ptr<JobLists>     _executionOrder = std::make_shared<JobLists>();
-    std::mutex                    _childLifecycleMutex; // serializes start()'s and stop()'s sweeps of the children, guards _nWorkersInLoop
+    std::mutex                    _childLifecycleMutex; // serializes start()'s and stop()'s sweeps; a worker never takes it to count itself
+    std::mutex                    _workersInLoopMutex;  // guards _nWorkersInLoop; no block's stop() hook runs under it
     std::size_t                   _nWorkersInLoop{0UZ}; // workers inside poolWorker(); only these workers call a block's work()
 
     std::mutex                               _zombieBlocksMutex;
@@ -992,15 +993,17 @@ protected:
         const void*   previousActiveScheduler = std::exchange(tActiveSchedulerWorker, static_cast<const void*>(this));
         on_scope_exit restoreActiveScheduler  = [previousActiveScheduler] { tActiveSchedulerWorker = previousActiveScheduler; };
 
-        // counted under the lock that stop() holds. A worker that enters after stop() read zero sees the scheduler
-        // shutting down and calls no work(). leaveLoop runs before decrementRunningJobs. Every blocking block is
-        // therefore settled when waitDone() returns.
+        // counted under the lock that stop() takes to read the count. A worker that enters after stop() read zero sees
+        // the scheduler shutting down and calls no work(). leaveLoop runs before decrementRunningJobs. Every blocking
+        // block already in REQUESTED_STOP is therefore settled when waitDone() returns. No block's stop() hook runs
+        // under this lock. A block's stop() hook that runs outside the scheduler's workers may therefore wait for them
+        // to leave.
         {
-            std::lock_guard childLock(_childLifecycleMutex);
+            std::lock_guard workersLock(_workersInLoopMutex);
             ++_nWorkersInLoop;
         }
         on_scope_exit leaveLoop = [this] {
-            std::lock_guard childLock(_childLifecycleMutex);
+            std::lock_guard workersLock(_workersInLoopMutex);
             if (--_nWorkersInLoop == 0UZ) {
                 settleStoppedBlockingBlocks();
             }
@@ -1222,8 +1225,8 @@ protected:
     }
 
     // a blocking block leaves REQUESTED_STOP in its own next work() call. With no worker inside poolWorker(), no such
-    // call follows, and the scheduler moves the block to STOPPED itself. Called under _childLifecycleMutex with
-    // _nWorkersInLoop at zero, by stop() or by the last worker leaving poolWorker()
+    // call follows, and the scheduler moves the block to STOPPED itself. That transition runs no stop() hook. Called
+    // under _workersInLoopMutex with _nWorkersInLoop at zero, by stop() or by the last worker leaving poolWorker()
     void settleStoppedBlockingBlocks() {
         graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) {
             if (block->blockCategory() != ScheduledBlockGroup && block->isBlocking() && block->state() == lifecycle::State::REQUESTED_STOP) {
@@ -1240,7 +1243,7 @@ protected:
         gr::atomic_ref(_workerGeneration).fetch_add(1UZ);
         wakeProgressWaiters();
         {
-            std::lock_guard childLock(_childLifecycleMutex); // serialized against start()'s sweep and the workers leaving poolWorker()
+            std::lock_guard childLock(_childLifecycleMutex); // serialized against start()'s sweep
             graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) {
                 if (block->blockCategory() == ScheduledBlockGroup) {
                     auto* schedulerModel = dynamic_cast<SchedulerModel*>(block.get());
@@ -1253,9 +1256,15 @@ protected:
                     this->emitErrorMessageIfAny("forEachBlock -> stop() -> LifecycleState", block->changeStateTo(REQUESTED_STOP));
                     if (!block->isBlocking()) { // N.B. no other thread/constraint to consider before shutting down
                         this->emitErrorMessageIfAny("forEachBlock -> stop() -> LifecycleState", block->changeStateTo(STOPPED));
+                    } else { // a blocking block that the sweep reaches after the last worker left is settled here
+                        std::lock_guard workersLock(_workersInLoopMutex);
+                        if (_nWorkersInLoop == 0UZ && block->state() == REQUESTED_STOP) {
+                            this->emitErrorMessageIfAny("forEachBlock -> stop() -> LifecycleState", block->changeStateTo(STOPPED));
+                        }
                     }
                 }
             });
+            std::lock_guard workersLock(_workersInLoopMutex);
             if (_nWorkersInLoop == 0UZ) { // otherwise the last worker to leave poolWorker() settles the blocking blocks
                 settleStoppedBlockingBlocks();
             }
