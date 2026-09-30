@@ -11,11 +11,15 @@ of annotated signal data.
 ## TL;DR
 
 - **processBulk**: read tags via `input.tags()` on the InputSpan. Publish via
-  `outSpan.publishTag(map, offset)`. The framework auto-forwards standard tag keys.
+  `outSpan.publishTag(map, offset)`. The framework forwards every tag key across a block that
+  declares no resampling, no stride, no tag-propagation policy and no `forwardTags()` override, on
+  synchronous ports, and the standard keys alone elsewhere. The block's author keeps the offsets
+  true: a tag arriving at input offset `t` belongs at output offset `t`.
 - **processOne**: check `inputTagsPresent()`, read via `mergedInputTag()` (returns `const Tag&`, once
   per work call). Publish via `this->publishTag(map)` — the framework places it at the correct sample
   offset.
 - **Forwarding policies**: default (forward), `BackwardTagPropagation`, or `NoTagPropagation`.
+  `FilteredTagPropagation` keeps the standard keys alone on a block that would forward every key.
   Override `forwardTags()` for full custom control.
 - A **negative `relIndex`** is a tag deferred out of an earlier chunk and not yet forwarded — not a
   tag seen twice. A custom `forwardTags()` reading more than `tags(1)` is the one case where it is.
@@ -59,7 +63,9 @@ at sample 0):
 ```
 
 Standard tag keys are defined in `gr::tag::` (`SAMPLE_RATE`, `SIGNAL_NAME`, ...). Any string key is
-valid — standard keys get automatic forwarding and settings synchronisation.
+valid. Standard keys cross every forwarding block and update downstream settings. Any other key
+crosses a block that declares no resampling, no stride, no tag-propagation policy and no
+`forwardTags()` override, on synchronous ports (see "Which keys a forwarded tag carries" below).
 
 ---
 
@@ -157,8 +163,8 @@ end-of-stream tag.
 ## Automatic tag forwarding
 
 The framework forwards tags from input to output automatically. The built-in policies below are
-selected via CRTP arguments; the first four choose where a forwarded tag lands, the fifth chooses
-which keys it carries. For full custom control, override `forwardTags()` (see below).
+selected via CRTP arguments; the first four choose where a forwarded tag lands, the last two which
+keys it carries. For full custom control, override `forwardTags()` (see below).
 
 ### Default (forward tag forwarding)
 
@@ -166,9 +172,11 @@ which keys it carries. For full custom control, override `forwardTags()` (see be
 struct MyBlock : gr::Block<MyBlock> { ... };
 ```
 
-The default policy breaks chunks at tag boundaries and forwards only the tag at position 0 of each
-chunk. Tags at later positions within the chunk are NOT consumed — they carry over to the next chunk
-where they appear at position 0 (shifted forward). Standard tag keys are forwarded with value
+The default policy breaks chunks at tag boundaries. On a key-filtered block it forwards only the tag
+at position 0 of each chunk. Tags at later positions within the chunk are NOT consumed — they carry
+over to the next chunk where they appear at position 0 (shifted forward). A block forwarding every
+key retires the whole chunk and forwards each tag at its own position. "Which keys a forwarded tag
+carries" below names the blocks of each kind. Each forwarded key is forwarded with value
 substitution (the block's current value replaces the tag value if modified).
 
 ```
@@ -208,10 +216,12 @@ Tags NOT at position 0 of their chunk are unconsumed and shift forward:
 
 A chunk cannot always be broken at a tag: `min_samples` on an input port and `input_chunk_size > 1`
 on a resampling block both put a floor under the chunk, and `ForwardTagPropagation` disables the
-break outright. Where the break is impossible the tag stays interior to the chunk and the framework
+break outright. The tag then stays interior to the chunk. On a key-filtered block the framework
 leaves it in the tag buffer — an input span retires only the tags at `relIndex <= 0`, exactly the
 window the default forwarder reads with `tags(1)`. By the next chunk the stream position has passed
-that tag, so it appears again at a **negative** `relIndex`.
+that tag, so it appears again at a **negative** `relIndex`. A block forwarding every key retires the
+whole chunk instead and publishes an interior tag at its own offset. No tag returns to it at a
+negative `relIndex`.
 
 A negative `relIndex` therefore means "deferred, not yet forwarded". The default forwarder clamps it
 to output offset 0 and publishes it there: the tag's first and only publication, late by the distance
@@ -299,52 +309,81 @@ struct MyBlock : gr::Block<MyBlock, gr::NoTagPropagation> { ... };
 The framework does not forward any tags. The block handles tag propagation entirely in `processBulk`
 or via a custom `forwardTags()` override.
 
-### Unfiltered tag propagation (`UnfilteredTagPropagation`)
+### Which keys a forwarded tag carries (`UnfilteredTagPropagation`, `FilteredTagPropagation`)
 
 ```cpp
-struct MyBlock : gr::Block<MyBlock, gr::UnfilteredTagPropagation> { ... };
+struct Plain : gr::Block<Plain> { ... };                                 // every key where admissible
+struct Checked : gr::Block<Checked, gr::UnfilteredTagPropagation> { ... }; // every key, or no build
+struct OptOut : gr::Block<OptOut, gr::FilteredTagPropagation> { ... };     // standard keys alone
 ```
 
-The other four policies decide _where_ a forwarded tag lands. This one decides _which keys_ it still carries. Under
-every other policy the forwarder keeps only the reserved keys of `kDefaultTags` and drops the rest, so a protocol
-carrying its own key cannot cross a single stock block. Under `UnfilteredTagPropagation` every key of every forwarded
-tag survives. The multi-input dedup and the merge rule stay those of the default forwarder.
+The policies above decide _where_ a forwarded tag lands. The block's declarations decide _which
+keys_ it still carries. A tag propagates unless the framework has a reason to stop it. A block
+forwards every key of every tag, with no annotation, where it passes
+`gr::block::kUnfilteredTagPropagationAdmissible<TBlock>`. The predicate reads the block's
+declarations at compile time and holds for a block that
 
-Every tag of the consumed chunk leaves at the offset it arrived at, and the whole chunk is retired. An input
-`min_samples` or an `input_chunk_size` above one forbids a chunk boundary at a tag closer than that to the chunk's
-start; under the default policy such an interior tag is deferred and republished at the next chunk's first sample,
-and it still is there. Under this policy it is not: it leaves in its own chunk, at its own offset. What the block
-applies from that tag to its own settings is unchanged, and still takes effect from the chunk's first sample, so a
-setting an interior tag carries is in force a few samples before the forwarded tag that carries it.
+- declares neither `Resampling<>` nor `Stride<>`,
+- has only synchronous stream ports,
+- declares none of `NoTagPropagation`, `ForwardTagPropagation`, `BackwardTagPropagation`,
+  `MergeTagPropagation` and `FilteredTagPropagation`, and
+- supplies no `forwardTags()` of its own.
 
-Value substitution works as it does elsewhere and reaches further: a key the block declares as a setting is forwarded
-with the block's own current value, whether or not that key is reserved. A key named after one of the settings `Block<>`
-declares for every block — `input_chunk_size`, `output_chunk_size`, `stride`, `disconnect_on_done`, `compute_domain`,
-`unique_name`, `name`, `ui_constraints` — is forwarded with the upstream value instead, because a tag using `name`
-for its own purpose must not be rewritten with the block's name.
+Every other block keeps only its auto-forward keys: the reserved keys of `kDefaultTags` and any
+added through `settings().addAutoForwardParameters()`. The multi-input dedup and the merge rule are
+the same either way. A block composed at compile time (`MergeByIndex`, `Merge`, `SplitMergeCombine`,
+`FeedbackMergeByIndex`, `FeedbackMerge` and their tap variants) forwards every key where each of its
+member blocks does, and the auto-forward keys alone otherwise.
+
+The predicate reads declarations, not the processing function. The block author owns the
+obligation it cannot check: **a tag arriving at input offset `t` must belong at output offset
+`t`.** A block that shifts sample positions, an integer delay for instance, or drops them, as one
+that keeps every Nth sample does, passes the predicate and is still wrong to forward at the arrival
+offset. Such a block writes a `forwardTags()` override.
+
+On a block forwarding every key, every tag of the consumed chunk leaves at the offset it arrived at,
+and the whole chunk is retired. An input `min_samples` above one forbids a chunk boundary at a tag
+closer than that to the chunk's start. A key-filtered block defers such an interior tag and
+republishes it at the next chunk's first sample; a block forwarding every key publishes it in its
+own chunk, at its own offset. What the block applies from that tag to its own settings still takes
+effect from the chunk's first sample. A setting an interior tag carries is therefore in force a few
+samples before the forwarded tag that carries it.
+
+Value substitution works as it does elsewhere and reaches further: a key the block declares as a
+setting is forwarded with the block's own current value, whether or not that key is reserved. A key
+named after one of the settings `Block<>` declares for every block — `input_chunk_size`,
+`output_chunk_size`, `stride`, `disconnect_on_done`, `compute_domain`, `unique_name`, `name`,
+`ui_constraints` — is forwarded with the upstream value instead, because a tag using `name` for its
+own purpose must not be rewritten with the block's name.
 
 ```
   input tag:  {trigger_name: "burst", record_id: "r7", gain: 10}
 
-  default policy   ─►  {trigger_name: "burst"}                       record_id and gain dropped
-  unfiltered       ─►  {trigger_name: "burst", record_id: "r7",      record_id passes through,
-                        gain: 2}                                     gain substituted (the block owns it)
+  standard keys alone ─►  {trigger_name: "burst"}                    record_id and gain dropped
+  every key           ─►  {trigger_name: "burst", record_id: "r7",   record_id passes through,
+                           gain: 2}                                  gain substituted (the block owns it)
 ```
 
-The policy is refused at compile time for a block that declares `Resampling<>` or `Stride<>`, has an asynchronous
-stream port, declares another tag-propagation policy, or supplies its own `forwardTags()`. The predicate is
-`gr::block::kUnfilteredTagPropagationAdmissible<TBlock>`, and the assertion fires in every build configuration. The
-`forwardTags()` clause reads `Block<>::hasForwardTagsOverride()`, which probes the override with the span tuples the
-work path passes, so an override constrained to those types is refused rather than admitted and then called.
+`UnfilteredTagPropagation` changes nothing at run time on a block that passes the predicate. It
+turns the predicate into a requirement: a block that declares it and fails the predicate does not
+compile, and the assertion names the condition that failed, in every build configuration. The
+`forwardTags()` clause reads `Block<>::hasForwardTagsOverride()`. It probes the override with the
+span tuples the work path passes, in both tag windows an input span can retire. An override
+constrained to those types is refused rather than admitted and then called. An override whose
+return type is deduced from a body that reads the tag window escapes the probe. The build refuses
+such an override on a block forwarding every key and asks for a declared return type.
 
-What the guard cannot check is the obligation that matters, so the block author owns it: **a tag arriving at input
-offset `t` must belong at output offset `t`.** A block that shifts sample positions, an integer delay for instance, or
-drops them, as one that keeps every Nth sample does, qualifies mechanically and is still wrong under the policy; those
-write a `forwardTags()` override.
+`FilteredTagPropagation` is the opt-out. A block that passes the predicate but whose output
+differs from what a non-reserved key describes declares it. The block then forwards the
+auto-forward keys alone and defers interior tags as a key-filtered block does. The build refuses the
+opt-out beside `UnfilteredTagPropagation` or `NoTagPropagation`. Beside `Resampling<>`, `Stride<>`,
+an asynchronous port, `ForwardTagPropagation`, `BackwardTagPropagation`, `MergeTagPropagation` or a
+`forwardTags()` override it changes nothing. A block template whose variants differ in those
+respects can therefore declare it on every variant.
 
-One consequence is intended and worth stating plainly. Tags drive settings, which a later section covers in full, so
-a key that now crosses a block will also drive any downstream setting of the same name. That is the mechanism that
-makes `sample_rate` work, applied to a wider key set — pick key names accordingly.
+Tags drive settings, which a later section covers in full. A key that crosses a block also drives
+any downstream setting of the same name. That is the mechanism that makes `sample_rate` work,
+applied to a wider key set. Pick key names accordingly.
 
 ### Custom tag forwarding — `forwardTags()`
 
@@ -449,8 +488,9 @@ The set of auto-forwarded keys is `settings().autoForwardParameters()` — the s
 reference for the whole forwarding loop of every work call and takes no lock; a set that changed
 while the graph was running would be a data race on the hot path.
 
-To carry a non-standard key downstream, publish the tag from the block itself (see "Publishing
-tags" above) instead of adding the key to the forwarding set:
+A block forwarding every key carries a non-standard key downstream by itself. A key-filtered block
+that must carry one publishes the tag itself (see "Publishing tags" above) instead of adding the key
+to the forwarding set:
 
 ```cpp
 work::Status processBulk(InputSpanLike auto& input, OutputSpanLike auto& output) {
@@ -459,8 +499,8 @@ work::Status processBulk(InputSpanLike auto& input, OutputSpanLike auto& output)
 }
 ```
 
-A pass-through block that must forward _every_ input tag, whatever its keys, declares
-`NoTagPropagation` and republishes the input tags at their own offsets:
+A block that republishes _every_ input tag itself, whatever its keys, declares `NoTagPropagation`
+so that the framework forwards none on its own:
 
 ```cpp
 struct Delay : gr::Block<Delay, gr::NoTagPropagation> {
