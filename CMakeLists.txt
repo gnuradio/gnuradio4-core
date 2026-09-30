@@ -1,9 +1,27 @@
 cmake_minimum_required(VERSION 3.27)
 
 # project() creates the cache entries for the built-in build types and the build type named at that point from the _INIT
-# values in cmake/FlagsOverride.cmake. A value the caller gives on the command line, in an initial cache or in a preset
-# is already in the cache and stays in effect.
-set(CMAKE_USER_MAKE_RULES_OVERRIDE "${CMAKE_CURRENT_SOURCE_DIR}/cmake/FlagsOverride.cmake")
+# values that cmake/RulesOverride.cmake sets. A value the caller gives on the command line, in an initial cache or in a
+# preset is already in the cache and stays in effect. The rules file named here lives in the build tree, and try_compile
+# projects read it as well. It names the rules file the caller gives in CMAKE_USER_MAKE_RULES_OVERRIDE, with a relative
+# path to a file under the source directory made absolute.
+set(_grCallerRules "${CMAKE_USER_MAKE_RULES_OVERRIDE}")
+if(_grCallerRules
+   AND NOT IS_ABSOLUTE "${_grCallerRules}"
+   AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_grCallerRules}")
+  set(_grCallerRules "${CMAKE_CURRENT_SOURCE_DIR}/${_grCallerRules}")
+endif()
+set(_grRules "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/gr4RulesOverride.cmake")
+string(CONCAT _grRulesContent "set(_GR_CALLER_RULES_OVERRIDE [==[${_grCallerRules}]==])\n"
+              "include([==[${CMAKE_CURRENT_SOURCE_DIR}/cmake/RulesOverride.cmake]==])\n")
+file(
+  CONFIGURE
+  OUTPUT
+  "${_grRules}"
+  CONTENT
+  "${_grRulesContent}"
+  @ONLY)
+set(CMAKE_USER_MAKE_RULES_OVERRIDE "${_grRules}")
 
 project(
   gnuradio
@@ -182,10 +200,13 @@ if(PROJECT_IS_TOP_LEVEL)
              MinSizeRel)
 endif()
 # project() gives RelWithAssert its flags only when that build type is named at that point. An enclosing project that
-# names it creates the entry empty, and a subproject never reads cmake/FlagsOverride.cmake. This directory and those
-# below use the project's flags when the value is empty.
+# names it creates the entry empty. A subproject added after the enclosing project enables C++ never reads
+# cmake/RulesOverride.cmake. This directory and those below use the _INIT value the rules files set, or the project's
+# flags without one, when the value is empty.
 if(NOT CMAKE_CXX_FLAGS_RELWITHASSERT)
-  include(cmake/FlagsOverride.cmake)
+  if(NOT DEFINED CMAKE_CXX_FLAGS_RELWITHASSERT_INIT)
+    include(cmake/FlagsOverride.cmake)
+  endif()
   set(CMAKE_CXX_FLAGS_RELWITHASSERT "${CMAKE_CXX_FLAGS_RELWITHASSERT_INIT}")
 endif()
 
@@ -654,6 +675,14 @@ add_subdirectory(meta)
 # browser runtime has no way to invoke, so a WASM build leaves it out.
 if(ENABLE_TOOLS AND NOT EMSCRIPTEN)
   add_subdirectory(tools)
+endif()
+
+# The configure test of the compiler rules files compares the project's per-build-type defaults. A toolchain file, the
+# Emscripten one included, can replace them or name its own rules file.
+if(ENABLE_TESTING
+   AND NOT EMSCRIPTEN
+   AND NOT CMAKE_TOOLCHAIN_FILE)
+  add_subdirectory(cmake/test)
 endif()
 
 if(ENABLE_TESTING
