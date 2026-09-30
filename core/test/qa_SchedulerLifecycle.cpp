@@ -113,8 +113,8 @@ struct ThrowingStartSource : gr::Block<ThrowingStartSource> {
     }
 };
 
-// a source whose device opens only once it is plugged in: start() throws until then, and an open device delivers a
-// bounded stream
+// a source whose device opens only once it is plugged in. start() throws until then. An open device delivers a
+// bounded stream.
 struct PluggableSource : gr::Block<PluggableSource> {
     gr::PortOut<float> out;
 
@@ -141,8 +141,8 @@ struct PluggableSource : gr::Block<PluggableSource> {
     }
 };
 
-// a source whose device is slow to open: start() returns once gSlowStartReleased is set, and an open device delivers
-// an endless stream
+// a source whose device is slow to open. start() returns once gSlowStartReleased is set. An open device delivers an
+// endless stream.
 inline std::atomic<bool> gSlowStartEntered{false};
 inline std::atomic<bool> gSlowStartReleased{false};
 
@@ -473,8 +473,8 @@ struct OwnWorkerScheduler : gr::scheduler::SchedulerBase<OwnWorkerScheduler, gr:
 
 inline std::atomic<std::size_t> gTwoArgumentWorkers{0UZ};
 
-// a scheduler whose own worker takes the job list alone, without the run's generation: it runs until the scheduler
-// leaves an active state
+// a scheduler whose own worker takes the job list alone, without the run's generation. The worker runs until the
+// scheduler leaves an active state.
 struct TwoArgumentWorkerScheduler : gr::scheduler::SchedulerBase<TwoArgumentWorkerScheduler, gr::scheduler::ExecutionPolicy::multiThreaded> {
     using Base = gr::scheduler::SchedulerBase<TwoArgumentWorkerScheduler, gr::scheduler::ExecutionPolicy::multiThreaded>;
     using Base::SchedulerBase;
@@ -1182,9 +1182,11 @@ const boost::ut::suite<"job lists sized to the free pool threads"> jobListSizing
     };
 };
 
-// a blocking block leaves REQUESTED_STOP in its own work() call. In these cases no worker makes that call after the
-// stop: the run's worker is still queued, no run has started since the reset, a pause has parked the workers, or a
-// running worker reads the stop before its next call
+// a blocking block leaves REQUESTED_STOP in its own work() call. In these cases no worker calls work() after the stop:
+// - the run's worker is still queued
+// - no run has started since the reset
+// - a pause has parked the workers
+// - a running worker reads the stop before its next call
 const boost::ut::suite<"a blocking block reaches STOPPED when its scheduler stops"> blockingBlockStopTests = [] {
     using namespace boost::ut;
     using enum gr::lifecycle::State;
@@ -1464,8 +1466,9 @@ const boost::ut::suite<"adopting a sub-scheduler"> subSchedulerAdoptionTests = [
         runner.join();
     };
 
-    // the adoption waits up to watchdog_timeout for a worker of the sub-scheduler; a start that failed has none to wait for.
-    // The report and the sub-scheduler's own start errors reach msgOut together, from the test's thread and a worker
+    // the adoption waits up to watchdog_timeout for a worker of the sub-scheduler. A start that failed has none to wait
+    // for. The report and the sub-scheduler's own start errors reach msgOut together, from the test's thread and a
+    // worker
     "an adopted sub-scheduler whose start fails is reported with its reason before the timeout"_test = [] {
         auto pool = qa_sched::fixedPool(qa_sched::kAdoptionPoolName, 3U);
 
@@ -1506,7 +1509,7 @@ const boost::ut::suite<"adopting a sub-scheduler"> subSchedulerAdoptionTests = [
         runner.join();
     };
 
-    // a start still in progress has no worker yet and is not a failure: the adoption keeps waiting for the worker
+    // a start still in progress has no worker yet and is not a failure. The adoption keeps waiting for the worker.
     "an adopted sub-scheduler whose start is slow is waited for and runs"_test = [] {
         qa_sched::gSubSchedulerSamples.store(0UZ, std::memory_order_relaxed);
         qa_sched::gSlowStartEntered.store(false, std::memory_order_release);
@@ -1708,9 +1711,10 @@ const boost::ut::suite<"the zero-progress park"> zeroProgressParkTests = [] {
     };
 
     // With timeout_ms 1 a park that nothing ends early lasts one millisecond. The test alternates two
-    // trials in one run, each starting at a call that the worker follows with a park: a notify sent
-    // kSettle into the park, timed to the source's next call, and a park left alone, timed from call to
-    // call. A notify that ends the park brings the next call in a fraction of the undisturbed park.
+    // trials in one run. Each starts at a call that the worker follows with a park. In the first, a
+    // notify arrives kSettle into the park, and the trial times the source's next call. In the second,
+    // the park is left alone, and the trial times from call to call. A notify that ends the park brings
+    // the next call in a fraction of the undisturbed park.
     "a producer's notify ends the park"_test = [] {
         using Micros                       = std::chrono::duration<double, std::micro>;
         constexpr std::size_t kTrials      = 25UZ;

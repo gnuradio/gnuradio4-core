@@ -134,7 +134,7 @@ protected:
     std::recursive_mutex          _executionOrderMutex; // only used when modifying and copying the graph->local job list
     std::shared_ptr<JobLists>     _executionOrder = std::make_shared<JobLists>();
     std::mutex                    _childLifecycleMutex; // serializes start()'s and stop()'s sweeps of the children, guards _nWorkersInLoop
-    std::size_t                   _nWorkersInLoop{0UZ}; // workers inside poolWorker(); only these call a block's work()
+    std::size_t                   _nWorkersInLoop{0UZ}; // workers inside poolWorker(); only these workers call a block's work()
 
     std::mutex                               _zombieBlocksMutex;
     std::vector<std::shared_ptr<BlockModel>> _zombieBlocks;
@@ -239,9 +239,9 @@ public:
 
     [[nodiscard]] bool workerStarted() noexcept { return gr::atomic_ref(_nWorkersStarted).load_acquire() > 0UZ; }
 
-    // why the latest start could not complete and left the scheduler in ERROR; the next start clears it. The thread that
-    // runs the start writes it before it publishes ERROR. Read it once the state reads ERROR or while no start is in
-    // progress: a read during a start races with that write
+    // why the latest start could not complete and left the scheduler in ERROR. The next start clears it. The thread
+    // that runs the start writes it before it publishes ERROR. Read it once the state reads ERROR or while no start is
+    // in progress. A read during a start races with that write.
     [[nodiscard]] std::optional<Error> startError() const { return _startError; }
 
     // a worker holds its pool thread for the run's lifetime, so a start into a pool whose threads are all held
@@ -769,9 +769,9 @@ protected:
     // re-entering INITIALISED must rebuild the same execution state that init() builds, because the graph
     // may have been exchanged or edited since: a stale _executionOrder runs the previous graph's blocks
     void reset() {
-        // the previous run's workers leave before its blocks are reinitialized: one still traversing would call
-        // work() on a block whose edges this disconnects. stop() retired them, so the wait is bounded by one
-        // traversal. A reset requested by a message runs on a worker, which cannot wait for itself
+        // waits for the previous run's workers before reinitializing the blocks. A worker still traversing would call
+        // work() on a block whose edges reset() disconnects. stop() retired the workers, so the wait lasts at most one
+        // traversal. A reset requested by a message runs on a worker, which cannot wait for itself.
         if (!isOnOwnWorkerThread()) {
             waitDone();
         }
@@ -787,9 +787,9 @@ protected:
         }
     }
 
-    // ends a start that cannot complete: the children that did start are wound back down, the reason is kept for
-    // startError() and runAndWait(), and the scheduler enters ERROR. Only a reset leaves ERROR. The caller returns
-    // without spawning a worker, and no run loop then exists to settle the state later
+    // ends a start that cannot complete. The children that did start are stopped. The reason is kept for
+    // startError() and runAndWait(). The scheduler enters ERROR, which only a reset leaves. The caller returns without
+    // spawning a worker, and no run loop then exists to settle the state later.
     void failStart(Error reason) {
         _startError = std::move(reason);
         graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) {
@@ -804,13 +804,13 @@ protected:
     void start() {
         using enum gr::lifecycle::State;
 
-        // stop() publishes STOPPED and retires the run's workers by generation; it does not wait for
-        // them. A worker the pool counted but never started releases its count when the pool reaches
+        // stop() publishes STOPPED and retires the run's workers by generation, without waiting for
+        // them. A worker the pool counted but has not started releases its count when the pool reaches
         // it, and a worker in its loop leaves at its next check. This run begins only once every count
-        // of the previous run is released: a worker that started after this point would run the
-        // previous job list, whose blocks are stopped, make no progress, reach no terminal state, and
-        // hold _nRunningJobs above zero indefinitely. The generation advances here as well, for a run
-        // that ended other than through stop().
+        // of the previous run is released. A worker that started after this point would run the
+        // previous job list, whose blocks are stopped. It would make no progress, reach no terminal
+        // state, and hold _nRunningJobs above zero indefinitely. The generation advances here as well,
+        // for a run that ended other than through stop().
         //
         // The drain must happen before _executionOrderMutex is acquired: a queued worker acquires
         // that mutex to copy its job list before it can decrement _nRunningJobs, so waiting for it
@@ -993,8 +993,8 @@ protected:
         on_scope_exit restoreActiveScheduler  = [previousActiveScheduler] { tActiveSchedulerWorker = previousActiveScheduler; };
 
         // counted under the lock that stop() holds. A worker that enters after stop() read zero sees the scheduler
-        // shutting down and calls no work(). leaveLoop runs before decrementRunningJobs: when waitDone() returns,
-        // every blocking block is settled
+        // shutting down and calls no work(). leaveLoop runs before decrementRunningJobs. Every blocking block is
+        // therefore settled when waitDone() returns.
         {
             std::lock_guard childLock(_childLifecycleMutex);
             ++_nWorkersInLoop;
@@ -1051,7 +1051,7 @@ protected:
                 const auto previousState = activeState;
                 activeState              = this->state();
                 if (gr::atomic_ref(_workerGeneration).load_acquire() != generation) {
-                    break; // the run was stopped: a worker that saw no state since must not work the next run's blocks
+                    break; // the run was stopped, and a worker that saw no state since must not work the next run's blocks
                 }
                 if (hasPendingMessages || activeState != previousState) {
                     idleIterations = 0UZ;
@@ -1235,9 +1235,8 @@ protected:
     void stop() {
         using enum lifecycle::State;
         gr::atomic_ref(_nStopRequests).fetch_add(1UZ);
-        // the run's workers are retired here, not only when they see the stop: one still queued releases its count
-        // instead of running, and one in its loop leaves at its next check even if it observes no state between
-        // this stop and the next start()'s RUNNING, as under load
+        // retires the run's workers. A queued worker releases its count without running. A worker in its loop leaves
+        // at its next check, even one that misses the stop because the next start() has already set RUNNING.
         gr::atomic_ref(_workerGeneration).fetch_add(1UZ);
         wakeProgressWaiters();
         {
