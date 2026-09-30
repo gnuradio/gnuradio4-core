@@ -1190,9 +1190,9 @@ protected:
             return isCurrent();
         };
 
-        std::size_t lastProgress = _graph->_progress->value();
-        std::size_t nWarnings    = 0;
-        std::size_t warnAt       = timeOut_count; // doubles after each warning, so a permanently stalled graph logs at a decaying rate instead of every period
+        std::size_t lastProgress  = _graph->_progress->value();
+        std::size_t nWarnings     = 0;
+        bool        stallReported = false; // one report per stall; progress or a state other than RUNNING re-arms it
         do {
             if (!sleepWhileCurrent(std::chrono::milliseconds(timeOut_ms))) {
                 return;
@@ -1201,20 +1201,40 @@ protected:
 
             std::size_t currentProgress = _graph->_progress->value();
             if ((_nRunningJobs->value() > 0UZ) && (currentProgress == lastProgress)) {
-                nWarnings++;
                 lastProgress = _graph->_progress->incrementAndGet(); // watchdog triggered manual update
                 _graph->_progress->notify_all();
-                if (nWarnings >= warnAt) {
-                    std::println(stderr, "trigger watchdog update {} of {} in {}", nWarnings, timeOut_count, thisName);
-                    // log or escalate (e.g., throw, abort, notify external watchdog)
-                    warnAt *= 2UZ;
+                if (this->state() != lifecycle::State::RUNNING) { // only a RUNNING graph is expected to make progress
+                    nWarnings     = 0UZ;
+                    stallReported = false;
+                } else if (++nWarnings >= timeOut_count && !stallReported) {
+                    stallReported = true;
+                    emitStallReport(nWarnings, timeOut_ms);
                 }
             } else {
-                lastProgress = currentProgress;
-                nWarnings    = 0UZ;
-                warnAt       = timeOut_count;
+                lastProgress  = currentProgress;
+                nWarnings     = 0UZ;
+                stallReported = false;
             }
         } while (isCurrent() && _nRunningJobs->value() > 0UZ);
+    }
+
+    // The report is a notification, not an error: a parent scheduler turns an error from a child into an exception
+    // when nothing reads its msgOut. The watchdog thread publishes while the workers do. It uses a writer of its own on
+    // the multi-producer ring of msgOut.
+    void emitStallReport(std::size_t nPeriods, std::size_t periodMs) {
+        auto    writer = this->msgOut.buffer().streamBuffer.new_writer();
+        Message message;
+        message.cmd              = message::Command::Notify;
+        message.serviceName      = this->unique_name;
+        message.endpoint         = "watchdog";
+        message.data             = property_map{{"stalled_periods", static_cast<gr::Size_t>(nPeriods)}, {"period_ms", static_cast<gr::Size_t>(periodMs)}};
+        WriterSpanLike auto span = writer.template tryReserve<SpanReleasePolicy::ProcessAll>(1UZ);
+        if (span.empty()) {
+            message::droppedMessageCount().fetch_add(1UZ, std::memory_order_relaxed);
+            return;
+        }
+        span[0] = std::move(message);
+        span.publish(1UZ);
     }
 
     // a worker parked in waitUntilChanged(progress) resumes when progress moves or its timeout expires,
