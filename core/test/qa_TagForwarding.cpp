@@ -1,6 +1,7 @@
 #include <boost/ut.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <format>
 #include <limits>
@@ -79,8 +80,9 @@ struct Source : Block<Source> {
 
     GR_MAKE_REFLECTABLE(Source, out);
 
-    std::size_t              nTotal = kSamples;
-    std::vector<std::size_t> tagAt; // ordered stream indices
+    std::size_t               nTotal = kSamples;
+    std::vector<std::size_t>  tagAt;   // ordered stream indices
+    std::vector<property_map> endTags; // published at the end index, one past the last sample
 
     std::size_t _emitted = 0UZ;
     std::size_t _nextTag = 0UZ;
@@ -101,6 +103,11 @@ struct Source : Block<Source> {
         while (_nextTag < tagAt.size() && tagAt[_nextTag] < _emitted + n) {
             outSpan.publishTag(namedTag(tagAt[_nextTag]), tagAt[_nextTag] - _emitted);
             _nextTag++;
+        }
+        if (_emitted + n == nTotal) { // the last call places them where the end_of_stream tag follows
+            for (const property_map& tag : endTags) {
+                outSpan.publishTag(tag, n);
+            }
         }
         _emitted += n;
         outSpan.publish(n);
@@ -126,6 +133,123 @@ struct Sink : Block<Sink> {
         std::ignore = inSpan.consume(n);
         return work::Status::OK;
     }
+};
+
+/// records its input like Sink, and in its epilogue the tags its input ring holds at or past its last sample
+struct EndSink : Block<EndSink> {
+    PortIn<float> in;
+
+    GR_MAKE_REFLECTABLE(EndSink, in);
+
+    std::size_t            nSamples = 0UZ;
+    std::vector<TagRecord> tags;    // tags on consumed samples
+    std::vector<TagRecord> endTags; // tags at or past the end index
+
+    work::Status processBulk(InputSpanLike auto& inSpan) {
+        const std::size_t n = inSpan.size();
+        for (const Tag& tag : inSpan.rawTags) {
+            tags.push_back(TagRecord{tag.index, tag.map});
+        }
+        inSpan.consumeTags(n);
+        std::ignore = inSpan.consume(n);
+        nSamples += n;
+        return work::Status::OK;
+    }
+
+    work::Status processEpilogue(InputSpanLike auto& inSpan) {
+        const std::size_t end = inSpan.streamIndex + inSpan.size();
+        for (const Tag& tag : in.tagReader().get()) {
+            if (tag.index >= end) {
+                endTags.push_back(TagRecord{tag.index, tag.map});
+            }
+        }
+        nSamples += inSpan.size();
+        return work::Status::OK;
+    }
+};
+
+/// the samples a partial epilogue consumes and publishes from its tail
+inline constexpr std::size_t kEpilogueTake = 2UZ;
+
+/// a default-forwarding copier whose epilogue consumes and publishes only the first kEpilogueTake samples of its tail
+struct PartialEpilogue : Block<PartialEpilogue> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(PartialEpilogue, in, out);
+
+    work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
+        const std::size_t n = std::min(inSpan.size(), outSpan.size());
+        std::ranges::copy(inSpan | std::views::take(n), outSpan.begin());
+        std::ignore = inSpan.consume(n);
+        outSpan.publish(n);
+        return work::Status::OK;
+    }
+
+    work::Status processEpilogue(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
+        const std::size_t n = std::min({inSpan.size(), outSpan.size(), kEpilogueTake});
+        std::ranges::copy(inSpan | std::views::take(n), outSpan.begin());
+        std::ignore = inSpan.consume(n);
+        outSpan.publish(n);
+        return work::Status::OK;
+    }
+};
+
+/// two synchronous inputs, summed
+struct Add2 : Block<Add2> {
+    PortIn<float>  in0;
+    PortIn<float>  in1;
+    PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(Add2, in0, in1, out);
+
+    [[nodiscard]] constexpr float processOne(float a, float b) const noexcept { return a + b; }
+};
+
+/// an ordinary block: no epilogue, no forwardTags(), the default policy
+struct Relay : Block<Relay> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(Relay, in, out);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
+};
+
+/// its own forwardTags() publishes every tag of the input span, the end_of_stream key dropped; a tag past the window
+/// leaves at the output span's end
+struct WholeSpanForwarder : Block<WholeSpanForwarder> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(WholeSpanForwarder, in, out);
+
+    std::size_t nPastWindow = 0UZ; // tags handed at a relative index at or past processedIn
+
+    template<typename TInputSpans, typename TOutputSpans>
+    void forwardTags(TInputSpans& inputSpans, TOutputSpans& outputSpans, std::size_t processedIn) {
+        gr::for_each_reader_span(
+            [&](auto& inSpan) {
+                if (!inSpan.isSync || !inSpan.isConnected) {
+                    return;
+                }
+                for (const auto& [relIndex, tagMapRef] : inSpan.tags()) {
+                    property_map forwarded = tagMapRef.get();
+                    forwarded.erase(gr::tag::END_OF_STREAM.key());
+                    if (relIndex < 0 || forwarded.empty()) {
+                        continue;
+                    }
+                    const std::size_t at = static_cast<std::size_t>(relIndex);
+                    if (at >= processedIn) {
+                        nPastWindow++;
+                    }
+                    gr::for_each_writer_span([&](auto& outSpan) { outSpan.publishTag(forwarded, std::min(at, outSpan.size())); }, outputSpans);
+                }
+            },
+            inputSpans);
+    }
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
 };
 
 /// Inspect EOS with the real work-path InputSpan alive, as tag-aware blocks do.
@@ -393,6 +517,55 @@ void runChain(const std::vector<std::size_t>& tagAt, TInspect&& inspect) {
     runChain<TMiddle>(tagAt, std::forward<TInspect>(inspect), [](TMiddle&) {});
 }
 
+/// what an end sink recorded
+struct EndResult {
+    std::size_t            nSamples{};
+    std::vector<TagRecord> tags;
+    std::vector<TagRecord> endTags;
+};
+
+/// source -> TMiddle... -> end sink; `configure` sets up the source and the middle blocks, and `inspect` reads the
+/// middle blocks while the scheduler that owns them is still alive
+template<typename... TMiddle>
+[[nodiscard]] EndResult runToEnd(auto&& configure, auto&& inspect) {
+    using namespace boost::ut;
+
+    gr::Graph               flow;
+    auto&                   source = flow.emplaceBlock<Source>(gr::property_map{{"name", std::string("src")}});
+    std::tuple<TMiddle&...> middle{flow.emplaceBlock<TMiddle>()...}; // a braced initializer fixes the emplacement order
+    auto&                   sink = flow.emplaceBlock<EndSink>(gr::property_map{{"name", std::string("snk")}});
+    configure(source, middle);
+
+    const auto link  = [&flow](auto& from, auto& to) { expect(flow.connect<"out", "in">(from, to).has_value()); };
+    auto       chain = std::apply([&](auto&... blocks) { return std::tie(source, blocks..., sink); }, middle);
+    [&]<std::size_t... I>(std::index_sequence<I...>) { (link(std::get<I>(chain), std::get<I + 1UZ>(chain)), ...); }(std::make_index_sequence<sizeof...(TMiddle) + 1UZ>{});
+
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+    expect(scheduler.exchange(std::move(flow)).has_value());
+    expect(scheduler.runAndWait().has_value());
+
+    inspect(middle);
+    return EndResult{sink.nSamples, sink.tags, sink.endTags};
+}
+
+/// a source of kSamples samples that publishes `endTags` at its end index
+template<typename... TMiddle>
+[[nodiscard]] EndResult runToEnd(const std::vector<property_map>& endTags) {
+    return runToEnd<TMiddle...>([&endTags](Source& source, auto&) { source.endTags = endTags; }, [](auto&) {});
+}
+
+/// the tag named `name` stands once at the sink's end index and on no sample; the end_of_stream key stands once
+void expectAtEnd(const EndResult& result, std::string_view name) {
+    using namespace boost::ut;
+
+    expect(eq(countNamed(result.endTags, name), 1UZ)) << std::format("{} stands once past the sink's last sample", name);
+    expect(eq(countNamed(result.tags, name), 0UZ)) << std::format("{} rides no sample", name);
+    for (const TagRecord& record : result.endTags) {
+        expect(eq(record.index, result.nSamples)) << "every tag past the last sample stands at the end index";
+    }
+    expect(eq(carrying(result.endTags, gr::tag::END_OF_STREAM.key()).size(), 1UZ)) << "the end_of_stream key stands once";
+}
+
 } // namespace qa_tag_forwarding
 
 const boost::ut::suite<"tag forwarding"> _tagForwarding = [] {
@@ -569,6 +742,102 @@ const boost::ut::suite<"tag forwarding"> _tagForwarding = [] {
         expect(eq(sink.tags.size(), retuned.size())) << "no other tag may surface: an untagged source produces none";
         expect(gt(middle.lastWindow, 0UZ));
         expect(gt(middle.produced, middle.lastWindow)) << "the staging work call must not be the first";
+    };
+    "a tag at the source's end index crosses a block without an epilogue to the sink's end index"_test = [] {
+        const EndResult result = runToEnd<Relay>({namedTag(kSamples)});
+        expect(eq(result.nSamples, kSamples));
+        expectAtEnd(result, std::format("t{}", kSamples));
+    };
+
+    "a tag at the source's end index crosses two ordinary blocks"_test = [] {
+        const EndResult result = runToEnd<Relay, Relay>({namedTag(kSamples)});
+        expect(eq(result.nSamples, kSamples));
+        expectAtEnd(result, std::format("t{}", kSamples));
+    };
+
+    "a block whose epilogue reads no tag still passes the tag at the end index"_test = [] {
+        std::size_t     epilogueRuns = 0UZ;
+        const EndResult result       = runToEnd<InspectingForwarder>([](Source& source, auto&) { source.endTags = {namedTag(kSamples)}; }, [&epilogueRuns](auto& middle) { epilogueRuns = std::get<0UZ>(middle).epilogueRuns; });
+        expect(eq(epilogueRuns, 1UZ)) << "the block did not run its epilogue, so this case discriminates nothing";
+        expect(eq(result.nSamples, kSamples));
+        expectAtEnd(result, std::format("t{}", kSamples));
+    };
+
+    "a tag on samples a block without an epilogue leaves unconsumed stands at its end index"_test = [] {
+        constexpr std::size_t kTotal = 62UZ; // seven chunks of kChunk, then six samples below the input minimum
+        constexpr std::size_t kTagAt = 58UZ; // inside the tail
+        const EndResult       result = runToEnd<Relay>(
+            [](Source& source, auto& middle) {
+                source.nTotal        = kTotal;
+                source.tagAt         = {kTagAt};
+                Relay& relay         = std::get<0UZ>(middle);
+                relay.in.min_samples = kChunk;
+                relay.in.max_samples = kChunk;
+            },
+            [](auto&) {});
+        expect(eq(result.nSamples, kTotal - kTotal % kChunk)) << "the block passed the tail on, so this case discriminates nothing";
+        expectAtEnd(result, std::format("t{}", kTagAt));
+    };
+
+    "a forwardTags() override is handed the tags past the end, and the default forwarder never runs in its place"_test = [] {
+        std::size_t     nPastWindow = 0UZ;
+        const EndResult handed      = runToEnd<WholeSpanForwarder>([](Source& source, auto&) { source.endTags = {namedTag(kSamples)}; }, [&nPastWindow](auto& middle) { nPastWindow = std::get<0UZ>(middle).nPastWindow; });
+        expect(eq(nPastWindow, 1UZ)) << "the override saw the end tag past its window once";
+        expectAtEnd(handed, std::format("t{}", kSamples));
+
+        std::size_t     nPublished = 0UZ;
+        const EndResult declined   = runToEnd<MappedForwarder>([](Source& source, auto&) { source.endTags = {namedTag(kSamples)}; }, [&nPublished](auto& middle) { nPublished = std::get<0UZ>(middle).nPublished; });
+        expect(eq(nPublished, 0UZ)) << "an override that reads only its window publishes nothing at the end";
+        expect(eq(countNamed(declined.endTags, std::format("t{}", kSamples)), 0UZ)) << "no forwarder ran in place of the override";
+        expect(eq(carrying(declined.endTags, gr::tag::END_OF_STREAM.key()).size(), 1UZ)) << "the end_of_stream key stands once";
+    };
+
+    "an epilogue that consumes part of its tail places each tail tag at its end index, and both tags cross the next block"_test = [] {
+        constexpr std::size_t kTotal = 62UZ; // seven chunks of kChunk, then a six-sample tail
+        constexpr std::size_t kTagAt = 59UZ; // in the part of the tail the epilogue leaves unconsumed
+        const EndResult       result = runToEnd<PartialEpilogue, Relay>(
+            [](Source& source, auto& middle) {
+                source.nTotal          = kTotal;
+                source.tagAt           = {kTagAt};
+                source.endTags         = {namedTag(kTotal)};
+                PartialEpilogue& block = std::get<0UZ>(middle);
+                block.in.min_samples   = kChunk;
+                block.in.max_samples   = kChunk;
+            },
+            [](auto&) {});
+        expect(eq(result.nSamples, kTotal - kTotal % kChunk + kEpilogueTake)) << "the epilogue consumed its whole tail, so this case discriminates nothing";
+
+        expectAtEnd(result, std::format("t{}", kTagAt)); // the epilogue published only part of its tail, so the tag moved to its end index
+        expectAtEnd(result, std::format("t{}", kTotal));
+    };
+
+    "a block whose inputs end at different indices forwards the tags up to the first end only"_test = [] {
+        constexpr std::size_t                  kLongTotal = 8UZ * kSamples;
+        constexpr std::array<std::size_t, 2UZ> kLongTagAt{100UZ, 300UZ}; // past the short input's end
+
+        gr::Graph flow;
+        auto&     shortSource = flow.emplaceBlock<Source>(gr::property_map{{"name", std::string("short")}});
+        shortSource.endTags   = {namedTag(kSamples)};
+        auto& longSource      = flow.emplaceBlock<Source>(gr::property_map{{"name", std::string("long")}});
+        longSource.nTotal     = kLongTotal;
+        longSource.tagAt      = {kLongTagAt[0], kLongTagAt[1]};
+        auto& add             = flow.emplaceBlock<Add2>(gr::property_map{{"name", std::string("add")}});
+        auto& sink            = flow.emplaceBlock<EndSink>(gr::property_map{{"name", std::string("snk")}});
+        expect(flow.connect<"out", "in0">(shortSource, add).has_value());
+        expect(flow.connect<"out", "in1">(longSource, add).has_value());
+        expect(flow.connect<"out", "in">(add, sink).has_value());
+
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(scheduler.runAndWait().has_value());
+
+        const EndResult result{sink.nSamples, sink.tags, sink.endTags};
+        expect(eq(result.nSamples, kSamples));
+        expectAtEnd(result, std::format("t{}", kSamples));
+        for (const std::size_t at : kLongTagAt) {
+            const std::string name = std::format("t{}", at);
+            expect(eq(countNamed(result.tags, name) + countNamed(result.endTags, name), 0UZ)) << std::format("{} lies past the first input's end and leaves nowhere", name);
+        }
     };
 };
 
