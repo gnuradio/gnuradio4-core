@@ -183,9 +183,9 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
         expect(failed.output.contains("source: event_count = 1000")) << "the value set on a second block is held as well" << failed.output;
     };
 
-    // a --set value is read where the graph file's own value is read, so a value the block refuses is refused as the
-    // graph file's would be: a value outside the block's limits by the framework's own line, and a value its
-    // settingsChanged() throws on when the scheduler initializes the block, before start() runs
+    // A --set value is refused as a graph file's value would be. A value outside the block's limits gets the
+    // framework's message. A value the block's settingsChanged() throws on is refused when the scheduler initializes
+    // the block, before start() runs.
     "a --set value the block refuses is refused as the graph file's value would be"_test = [] {
         std::vector<std::string> outOfLimits = startChainRun();
         outOfLimits.insert(outOfLimits.end(), {"--set", "first.gain=2", "--show", "first"});

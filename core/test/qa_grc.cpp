@@ -663,8 +663,8 @@ connections:
 };
 
 /**
- * `loadGrc` with a caller's settings: each block reads them where it reads the file's parameters, and a name or a
- * key the graph cannot take is refused before the graph is returned.
+ * `loadGrc` with a caller's settings. Each block reads them with the file's parameters. A name or a key the graph
+ * cannot take is refused before the graph is returned.
  */
 const boost::ut::suite<"GRC load with settings"> grcSettingsTests = [] {
     using namespace boost::ut;
@@ -898,7 +898,7 @@ connections:
         }
     };
 
-    // a location follows the settings: a call passing a location third does not compile
+    // the location parameter follows the settings. A call that passes a location third does not compile.
     "loadGrc compiles with two arguments, with settings, and with settings and a location"_test = [] {
         static_assert(requires(PluginLoader& loader) { gr::loadGrc(loader, std::string_view{}); });
         static_assert(requires(PluginLoader& loader) { gr::loadGrc(loader, std::string_view{}, gr::BlockSettings{}); });
