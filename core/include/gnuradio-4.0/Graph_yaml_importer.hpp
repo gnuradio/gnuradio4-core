@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <map>
+#include <optional>
 #include <ranges>
 #include <set>
 #include <vector>
@@ -21,11 +22,12 @@ namespace gr {
 /**
  * Settings a caller puts in force over a graph file's own, each entry for one block at the file's top level.
  *
- * A key names the one block that carries it as its `unique_name` or its `name`. A key no block carries, a key two
- * blocks carry and a key for a subgraph are refused before any block is made. The entry's map replaces those keys of
- * the block's `parameters`. Every block is constructed with the merged parameters, and its settings load the same map.
- * Its constructor, `settingsChanged()` and `start()` see the given values. A port count such as `n_inputs` sizes the
- * ports before the connections are made.
+ * A key names the one block or subgraph that carries it as its `unique_name` or its `name`. A key no block carries, a
+ * key two blocks carry and two keys for one block are refused before any block is made. A key the block does not
+ * declare is refused after the block is constructed and before it joins the graph. The entry's map replaces those keys
+ * of the block's `parameters`. Every block is constructed with the merged parameters, and its settings load the same
+ * map. Its constructor, `settingsChanged()` and `start()` see the given values. A port count such as `n_inputs` sizes
+ * the ports before the connections are made.
  */
 using BlockSettings = std::map<std::string, property_map, std::less<>>;
 
@@ -172,7 +174,7 @@ inline BlockIdentity readBlockIdentity(const property_map& grcBlock) {
 /// The entry of `overrides` each block takes, indexed by the block's position in the file's list of blocks.
 ///
 /// Each key is resolved once, over all the blocks, to the one block that carries it as its unique_name or its name. A
-/// key no block carries, a key two blocks carry, a key for a subgraph and two keys for one block are refused.
+/// key no block carries, a key two blocks carry and two keys for one block are refused.
 inline std::vector<const property_map*> resolveBlockSettings(const Tensor<pmt::Value>& blocks, const BlockSettings& overrides) {
     std::vector<const property_map*> settingsByPosition(blocks.size(), nullptr);
     if (overrides.empty()) {
@@ -217,10 +219,7 @@ inline std::vector<const property_map*> resolveBlockSettings(const Tensor<pmt::V
             }
             throw gr::exception(std::format("settings are given for block '{}', and {} blocks carry that unique_name or name: {}; a key names one block", key, carriers.size(), named));
         }
-        const auto& [position, identity] = *carriers.front();
-        if (identity.isSubgraph()) {
-            throw gr::exception(std::format("settings are given for '{}', which is a subgraph and holds no settings of its own", key));
-        }
+        const std::size_t position = carriers.front()->first;
         if (settingsByPosition[position] != nullptr) {
             throw gr::exception(std::format("settings are given twice for {}, as '{}' and as '{}'", describe(*carriers.front()), keyByPosition[position], key));
         }
@@ -251,6 +250,51 @@ inline property_map mergedParameters(const property_map* fromFile, const propert
         }
     }
     return merged;
+}
+
+/// The entry's `parameters`, empty when it has none; a `parameters` field that is not a map is refused.
+inline property_map readEntryParameters(const property_map& grcBlock, const BlockIdentity& identity) {
+    const auto it = grcBlock.find("parameters");
+    if (it == grcBlock.cend()) {
+        return {};
+    }
+    const auto parameters = checked_access_ptr<const property_map, false>{it->second.get_if<property_map>()};
+    if (parameters == nullptr) {
+        throw gr::exception(std::format("Unable to create block '{}' of type '{}': parameters is not a map", identity.name, identity.type));
+    }
+    return *parameters;
+}
+
+/// Loads `parameters` and the entry's `ctx_parameters` into the block's settings and activates the default context.
+inline void loadEntrySettings(BlockModel& block, const property_map& grcBlock, const property_map& parameters, const BlockIdentity& identity) {
+    block.settings().loadParametersFromPropertyMap(parameters);
+
+    if (auto it = grcBlock.find("ctx_parameters"); it != grcBlock.end()) {
+        const auto parametersCtx = checked_access_ptr<const Tensor<pmt::Value>, false>{it->second.get_if<Tensor<pmt::Value>>()};
+        if (parametersCtx == nullptr) {
+            throw gr::exception(std::format("Unable to create block '{}' of type '{}': ctx_parameters is not a list", identity.name, identity.type));
+        }
+
+        for (const auto& ctxPmt : *parametersCtx) {
+            const auto ctxPar = checked_access_ptr<const property_map, false>{ctxPmt.get_if<property_map>()};
+            if (ctxPar == nullptr) {
+                throw gr::exception(std::format("Unable to create block '{}' of type '{}': a ctx_parameters entry is not a map", identity.name, identity.type));
+            }
+
+            const auto ctxName       = ctxPar->at(gr::tag::CONTEXT.shortKey()).value_or(std::string_view{});
+            const auto ctxTime       = checked_access_ptr<const std::uint64_t, false>{ctxPar->at(gr::tag::CONTEXT_TIME.shortKey()).get_if<std::uint64_t>()};
+            const auto ctxParameters = checked_access_ptr<const property_map, false>{ctxPar->at("parameters").get_if<property_map>()};
+            if (ctxName.data() == nullptr || ctxTime == nullptr || ctxParameters == nullptr) {
+                throw gr::exception(std::format("Unable to create block '{}' of type '{}': a ctx_parameters entry needs a context, a context_time and a parameters map", identity.name, identity.type));
+            }
+
+            block.settings().loadParametersFromPropertyMap(*ctxParameters, SettingsCtx{*ctxTime, ctxName});
+        }
+    }
+
+    if (const auto failed = block.settings().activateContext(); failed == std::nullopt) {
+        throw gr::exception("Settings for context could not be activated");
+    }
 }
 
 inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGraph, gr::property_map yaml, const BlockSettings& overrides = {}, std::source_location location = std::source_location::current()) {
@@ -294,146 +338,117 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
             }
         };
 
-        if (isSubgraph) {
-            auto loadGraph = [&grcBlock, &loader, &location, &blockName, &blockType](auto graphWrapper) {
-                // checked_access_ptr terminates on a null unless not_null is turned off, so the
-                // non-terminating form is what keeps the report below reachable: a subgraph whose
-                // graph field is present but not a map is a defect in the document and is named as one
-                const auto _graphData = checked_access_ptr<const property_map, false>{grcBlock.at("graph").get_if<property_map>()};
-                if (_graphData == nullptr) {
-                    throw gr::exception(std::format("Unable to create block '{}' of type '{}': graph is not a map", blockName, blockType));
-                }
-                const auto&        graphData    = *_graphData;
-                gr::Graph&         graph        = *graphWrapper->graph();
-                const LoadedBlocks innerBlocks  = loadGraphFromMap(loader, graph, graphData);
-                const auto         exportedIt   = graphData.find("exported_ports");
-                const auto         exportedList = exportedIt == graphData.cend() ? Tensor<pmt::Value>() : exportedIt->second.value_or(Tensor<pmt::Value>());
-                for (const auto& exportedPort_ : exportedList) {
-                    auto exportedPort = checked_access_ptr<const Tensor<pmt::Value>, false>{exportedPort_.get_if<Tensor<pmt::Value>>()};
-                    if (exportedPort == nullptr) {
-                        throw gr::exception("Unable to parse exported port (not a list)");
-                    }
-                    if (exportedPort->size() != 4) {
-                        throw gr::exception(std::format("Unable to parse exported port ({} instead of 4 elements)", exportedPort->size()));
-                    }
-
-                    const auto requiredBlockName   = (*exportedPort)[0].value_or(std::string_view{});
-                    const auto portDirectionString = (*exportedPort)[1].value_or(std::string_view{});
-                    const auto internalPortName    = (*exportedPort)[2].value_or(std::string_view{});
-                    const auto exportedPortName    = (*exportedPort)[3].value_or(std::string_view{});
-                    if (requiredBlockName.data() == nullptr || portDirectionString.data() == nullptr || internalPortName.data() == nullptr || exportedPortName.data() == nullptr) {
-                        throw gr::exception(std::format("Required fields for exported ports missing"));
-                    }
-
-                    // the writer names the inner block by unique_name, a hand-written file by name
-                    const auto innerBlock = innerBlocks.find(requiredBlockName);
-                    if (!innerBlock.has_value()) {
-                        throw gr::exception(std::format("{} in:\n{}", innerBlock.error().message, gr::graph::format(graph)), location);
-                    }
-                    const std::string innerUniqueName{innerBlock.value()->uniqueName()};
-
-                    if (auto result = graphWrapper->exportPort(true,                                       //
-                            innerUniqueName,                                                               //
-                            portDirectionString == "INPUT" ? PortDirection::INPUT : PortDirection::OUTPUT, //
-                            internalPortName,                                                              //
-                            exportedPortName);
-                        !result.has_value()) {
-                        throw result.error();
-                    }
-                }
-            };
-
-            auto       schedulerIt = grcBlock.find("scheduler");
-            const bool isManaged   = schedulerIt != grcBlock.end();
-
-            if (isManaged) {
-                auto schedulerPmt = checked_access_ptr<const property_map, false>{schedulerIt->second.get_if<property_map>()};
-                if (schedulerPmt == nullptr) {
-                    throw gr::exception(std::format("scheduler is not a property_map"));
-                }
-                auto schedulerId = getOrThrow(getProperty<std::string>(*schedulerPmt, "id"sv));
-
-                property_map schedulerParams;
-                if (auto paramsIt = schedulerPmt->find("parameters"); paramsIt != schedulerPmt->end()) {
-                    if (const auto params = checked_access_ptr<const property_map, false>{paramsIt->second.get_if<property_map>()}; params != nullptr) {
-                        schedulerParams = *params;
-                    }
-                }
-
-                auto scheduler = loader.instantiateScheduler(schedulerId, schedulerParams);
-                if (!scheduler) {
-                    throw gr::exception(std::format("Unable to create scheduler of type '{}'", schedulerId));
-                }
-
-                auto schedulerBlock = SchedulerModel::asBlockModelPtr(scheduler);
-                resultGraph.addBlock(schedulerBlock);
-                schedulerBlock->setName(blockName);
-                restoreMetaInformation(*schedulerBlock);
-                createdBlocks.add(blockUniqueName, blockName, schedulerBlock);
-
-                loadGraph(schedulerBlock);
-
-            } else {
-                const std::shared_ptr<BlockModel>& subGraph = resultGraph.addBlock(std::make_shared<GraphWrapper<gr::Graph>>(gr::Graph(loader)));
-                subGraph->setName(blockName);
-                restoreMetaInformation(*subGraph);
-                createdBlocks.add(blockUniqueName, blockName, subGraph);
-
-                loadGraph(static_cast<GraphWrapper<gr::Graph>*>(subGraph.get()));
+        auto loadGraph = [&grcBlock, &loader, &location, &blockName, &blockType](const std::shared_ptr<BlockModel>& graphWrapper) {
+            // checked_access_ptr terminates on a null unless not_null is turned off; the non-terminating form keeps the
+            // report below reachable for a graph field that is present and not a map
+            const auto _graphData = checked_access_ptr<const property_map, false>{grcBlock.at("graph").get_if<property_map>()};
+            if (_graphData == nullptr) {
+                throw gr::exception(std::format("Unable to create block '{}' of type '{}': graph is not a map", blockName, blockType));
             }
-        } else {
-            const auto          parametersPmt = grcBlock.at("parameters");
-            const property_map* parameters    = parametersPmt.get_if<property_map>();
-            const property_map* given         = settingsByPosition[position];
-            const property_map  merged        = mergedParameters(parameters, given);
+            const auto&        graphData    = *_graphData;
+            gr::Graph&         graph        = *graphWrapper->graph();
+            const LoadedBlocks innerBlocks  = loadGraphFromMap(loader, graph, graphData);
+            const auto         exportedIt   = graphData.find("exported_ports");
+            const auto         exportedList = exportedIt == graphData.cend() ? Tensor<pmt::Value>() : exportedIt->second.value_or(Tensor<pmt::Value>());
+            for (const auto& exportedPort_ : exportedList) {
+                auto exportedPort = checked_access_ptr<const Tensor<pmt::Value>, false>{exportedPort_.get_if<Tensor<pmt::Value>>()};
+                if (exportedPort == nullptr) {
+                    throw gr::exception("Unable to parse exported port (not a list)");
+                }
+                if (exportedPort->size() != 4) {
+                    throw gr::exception(std::format("Unable to parse exported port ({} instead of 4 elements)", exportedPort->size()));
+                }
 
-            auto currentBlock = loader.instantiate(blockType, merged);
+                const auto requiredBlockName   = (*exportedPort)[0].value_or(std::string_view{});
+                const auto portDirectionString = (*exportedPort)[1].value_or(std::string_view{});
+                const auto internalPortName    = (*exportedPort)[2].value_or(std::string_view{});
+                const auto exportedPortName    = (*exportedPort)[3].value_or(std::string_view{});
+                if (requiredBlockName.data() == nullptr || portDirectionString.data() == nullptr || internalPortName.data() == nullptr || exportedPortName.data() == nullptr) {
+                    throw gr::exception(std::format("Required fields for exported ports missing"));
+                }
+
+                // the writer names the inner block by unique_name, a hand-written file by name
+                const auto innerBlock = innerBlocks.find(requiredBlockName);
+                if (!innerBlock.has_value()) {
+                    throw gr::exception(std::format("{} in:\n{}", innerBlock.error().message, gr::graph::format(graph)), location);
+                }
+                const std::string innerUniqueName{innerBlock.value()->uniqueName()};
+
+                if (auto result = graphWrapper->exportPort(true,                                       //
+                        innerUniqueName,                                                               //
+                        portDirectionString == "INPUT" ? PortDirection::INPUT : PortDirection::OUTPUT, //
+                        internalPortName,                                                              //
+                        exportedPortName);
+                    !result.has_value()) {
+                    throw result.error();
+                }
+            }
+        };
+
+        std::optional<std::string> schedulerId; // set for a managed subgraph, whose scheduler is the block the entry makes
+        property_map               schedulerParams;
+        property_map               fromFile = readEntryParameters(grcBlock, identity);
+        if (const auto schedulerIt = grcBlock.find("scheduler"); isSubgraph && schedulerIt != grcBlock.end()) {
+            auto schedulerPmt = checked_access_ptr<const property_map, false>{schedulerIt->second.get_if<property_map>()};
+            if (schedulerPmt == nullptr) {
+                throw gr::exception(std::format("scheduler is not a property_map"));
+            }
+            schedulerId = getOrThrow(getProperty<std::string>(*schedulerPmt, "id"sv));
+
+            if (auto paramsIt = schedulerPmt->find("parameters"); paramsIt != schedulerPmt->end()) {
+                if (const auto params = checked_access_ptr<const property_map, false>{paramsIt->second.get_if<property_map>()}; params != nullptr) {
+                    schedulerParams = *params;
+                }
+            }
+            // the scheduler's parameters win over the entry's, and the entry keeps its name
+            schedulerParams.erase("name");
+            fromFile = mergedParameters(&fromFile, &schedulerParams);
+        }
+        const property_map* given      = settingsByPosition[position];
+        const property_map  parameters = mergedParameters(&fromFile, given);
+
+        std::shared_ptr<BlockModel> currentBlock;
+        if (!isSubgraph) {
+            currentBlock = loader.instantiate(blockType, parameters);
             if (!currentBlock) {
                 throw gr::exception(std::format("Unable to create block of type '{}'", blockType));
             }
-            // the settings take the map once, below. Settings::init() would apply the constructor's copy again and
-            // refuse a key of the file the block does not declare.
-            currentBlock->settings().setInitBlockParameters({});
-            if (given != nullptr) {
-                checkDeclared(*currentBlock, blockName, *given);
+        } else if (schedulerId.has_value()) {
+            currentBlock = SchedulerModel::asBlockModelPtr(loader.instantiateScheduler(*schedulerId, parameters));
+            if (!currentBlock) {
+                throw gr::exception(std::format("Unable to create scheduler of type '{}'", *schedulerId));
             }
+        } else {
+            currentBlock = std::make_shared<GraphWrapper<gr::Graph>>(gr::Graph(loader, parameters));
+        }
 
-            // This sets the previously read "name" field for the block
-            currentBlock->setName(blockName);
+        // the settings take the map once, below. Settings::init() would apply the constructor's copy again and refuse
+        // a key of the file the block does not declare.
+        currentBlock->settings().setInitBlockParameters({});
+        if (given != nullptr) {
+            checkDeclared(*currentBlock, blockName, *given);
+        }
 
-            currentBlock->settings().loadParametersFromPropertyMap(merged);
-
-            if (auto it = grcBlock.find("ctx_parameters"); it != grcBlock.end()) {
-                // as with the graph field above, the null tests below are reachable only because the
-                // pointers they test are the non-terminating form
-                const auto parametersCtx = checked_access_ptr<const Tensor<pmt::Value>, false>{it->second.get_if<Tensor<pmt::Value>>()};
-                if (parametersCtx == nullptr) {
-                    throw gr::exception(std::format("Unable to create block '{}' of type '{}': ctx_parameters is not a list", blockName, blockType));
+        currentBlock->setName(blockName);
+        loadEntrySettings(*currentBlock, grcBlock, parameters, identity);
+        if (schedulerId.has_value()) {
+            // A scheduler's init() hides the block init() that addBlock() calls. The loader applies the scheduler's
+            // settings here.
+            const ApplyStagedParametersResult applied = currentBlock->settings().applyStagedParameters();
+            if (!applied.failedParameters.empty()) {
+                std::string rejected;
+                for (const auto& [key, value] : applied.failedParameters) {
+                    rejected += std::format("{}'{}'", rejected.empty() ? "" : ", ", std::string_view(key.data(), key.size()));
                 }
-
-                for (const auto& ctxPmt : *parametersCtx) {
-                    const auto ctxPar = checked_access_ptr<const property_map, false>{ctxPmt.get_if<property_map>()};
-                    if (ctxPar == nullptr) {
-                        throw gr::exception(std::format("Unable to create block '{}' of type '{}': a ctx_parameters entry is not a map", blockName, blockType));
-                    }
-
-                    const auto ctxName       = ctxPar->at(gr::tag::CONTEXT.shortKey()).value_or(std::string_view{});
-                    const auto ctxTime       = checked_access_ptr<const std::uint64_t, false>{ctxPar->at(gr::tag::CONTEXT_TIME.shortKey()).get_if<std::uint64_t>()};
-                    const auto ctxParameters = checked_access_ptr<const property_map, false>{ctxPar->at("parameters").get_if<property_map>()};
-                    if (ctxName.data() == nullptr || ctxTime == nullptr || ctxParameters == nullptr) {
-                        throw gr::exception(std::format("Unable to create block '{}' of type '{}': a ctx_parameters entry needs a context, a context_time and a parameters map", blockName, blockType));
-                    }
-
-                    currentBlock->settings().loadParametersFromPropertyMap(*ctxParameters, SettingsCtx{*ctxTime, ctxName});
-                }
+                throw gr::exception(std::format("Unable to create block '{}' of type '{}': the scheduler rejects the settings {}", blockName, *schedulerId, rejected));
             }
+        }
+        restoreMetaInformation(*currentBlock);
 
-            if (const auto failed = currentBlock->settings().activateContext(); failed == std::nullopt) {
-                throw gr::exception("Settings for context could not be activated");
-            }
-
-            restoreMetaInformation(*currentBlock);
-            createdBlocks.add(blockUniqueName, blockName, resultGraph.addBlock(std::move(currentBlock)));
+        const std::shared_ptr<BlockModel>& added = resultGraph.addBlock(std::move(currentBlock));
+        createdBlocks.add(blockUniqueName, blockName, added);
+        if (isSubgraph) {
+            loadGraph(added);
         }
     } // for blocks
 

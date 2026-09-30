@@ -15,6 +15,7 @@
 #include <optional>
 #include <source_location>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -180,6 +181,39 @@ inline void registerTestBlocks() {
                && registry.insert<ConstructionRecorder>("=qa::ConstructionRecorder");
     }();
     expect(registered) << "the test blocks must reach the global registry";
+}
+
+/// a scheduler that keeps the map its constructor receives
+struct ConstructionRecordingScheduler : gr::scheduler::Simple<> {
+    property_map constructedWith; // the constructor's argument
+
+    explicit ConstructionRecordingScheduler(property_map init = {}) : gr::scheduler::Simple<>(init), constructedWith(std::move(init)) {}
+};
+
+/// a scheduler a graph file can name for a managed subgraph
+inline void registerTestScheduler() {
+    static const bool registered = gr::globalSchedulerRegistry().insert<ConstructionRecordingScheduler>("=qa::Simple");
+    expect(registered) << "the test scheduler must reach the global registry";
+}
+
+/// the value of `key` the block stores for `context`, at any time, if it stores one
+inline std::optional<pmt::Value> storedInContext(const BlockModel& block, std::string_view context, std::string_view key) {
+    const auto stored = block.settings().getStoredAll();
+    const auto entry  = stored.find(pmt::Value(std::string(context)));
+    if (entry == stored.cend()) {
+        return std::nullopt;
+    }
+    for (const auto& [ctx, parameters] : entry->second) {
+        if (const auto found = parameters.find(key); found != parameters.cend()) {
+            return found->second;
+        }
+    }
+    return std::nullopt;
+}
+
+inline BlockModel& onlyBlock(const gr::Graph& graph) {
+    expect(boost::ut::fatal(eq(graph.blocks().size(), 1UZ)));
+    return *graph.blocks().front();
 }
 
 inline void collectUniqueNames(const gr::Graph& graph, std::vector<std::string>& names) {
@@ -1022,6 +1056,157 @@ connections:
 )yaml",
             {});
         expect(eq(loaded->blocks().size(), 1UZ));
+    };
+};
+
+/**
+ * A subgraph entry's `parameters` and `ctx_parameters` reach the subgraph's own settings as a block's reach the block's,
+ * from the file, through the writer and from a caller's settings.
+ */
+const boost::ut::suite<"GRC subgraph settings"> grcSubgraphSettingsTests = [] {
+    using namespace boost::ut;
+    using namespace gr;
+    using namespace qa_grc;
+
+    static constexpr std::string_view kGroup = R"yaml(blocks:
+  - id: SUBGRAPH
+    unique_name: the-group
+    parameters:
+      name: group
+      disconnect_on_done: false
+      unread: a key the subgraph does not declare
+    ctx_parameters:
+      - context: night
+        time: !!uint64 5
+        parameters:
+          disconnect_on_done: true
+    graph:
+      blocks:
+        - id: qa::Scale
+          parameters:
+            name: inner
+            gain: 2.0
+)yaml";
+
+    static constexpr std::string_view kManaged = R"yaml(blocks:
+  - id: SUBGRAPH
+    parameters:
+      name: managed
+      timeout_ms: 5
+      watchdog_timeout: 300
+    ctx_parameters:
+      - context: night
+        time: !!uint64 5
+        parameters:
+          timeout_ms: 11
+    scheduler:
+      id: qa::Simple
+      parameters:
+        name: from-the-scheduler
+        timeout_ms: 7
+    graph:
+      blocks:
+        - id: qa::Scale
+          parameters:
+            name: inner
+)yaml";
+
+    "a subgraph's parameters and ctx_parameters load into its settings"_test = [] {
+        registerTestBlocks();
+        const auto  loaded = gr::loadGrc(gr::globalPluginLoader(), kGroup);
+        BlockModel& group  = onlyBlock(*loaded);
+
+        expect(eq(std::string(group.name()), std::string("group")));
+        expect(group.settings().get().at("disconnect_on_done") == pmt::Value(false)) << "the file's value must replace the default";
+        expect(group.metaInformation().contains("unread")) << "a key the subgraph does not declare stays meta information";
+        expect(storedInContext(group, "night", "disconnect_on_done") == std::optional(pmt::Value(true))) << "the context's value must be stored";
+        expect(fatal(group.graph() != nullptr));
+        expect(eq(group.graph()->blocks().size(), 1UZ)) << "the interior loads beside the settings";
+    };
+
+    "a managed subgraph takes its scheduler's parameters over its own and keeps its own name"_test = [] {
+        registerTestBlocks();
+        registerTestScheduler();
+        const auto         loaded     = gr::loadGrc(gr::globalPluginLoader(), kManaged);
+        BlockModel&        managed    = onlyBlock(*loaded);
+        const property_map parameters = managed.settings().get();
+
+        expect(eq(std::string(managed.name()), std::string("managed")));
+        expect(parameters.at("timeout_ms") == pmt::Value(gr::Size_t{7U})) << "the scheduler's value wins";
+        expect(parameters.at("watchdog_timeout") == pmt::Value(gr::Size_t{300U})) << "a key the scheduler leaves out keeps the entry's value";
+        expect(storedInContext(managed, "night", "timeout_ms") == std::optional(pmt::Value(gr::Size_t{11U}))) << "the context's value must be stored";
+
+        const property_map& constructedWith = static_cast<ConstructionRecordingScheduler*>(managed.raw())->constructedWith;
+        expect(constructedWith.contains("watchdog_timeout")) << "the scheduler is constructed with the entry's parameters";
+        expect(constructedWith.contains("timeout_ms") && constructedWith.at("timeout_ms") == pmt::Value(std::int64_t{7})) << "the scheduler is constructed with its own parameters over the entry's";
+        expect(constructedWith.contains("name") && constructedWith.at("name").value_or(std::string_view{}) == "managed") << "the scheduler is constructed with the entry's name";
+    };
+
+    "a subgraph's settings survive the round trip"_test = [] {
+        registerTestBlocks();
+        registerTestScheduler();
+        PluginLoader& loader = gr::globalPluginLoader();
+
+        for (const std::string_view document : {kGroup, kManaged}) {
+            const auto loaded            = gr::loadGrc(loader, document);
+            const auto [before, after]   = roundTrip(loader, *loaded);
+            const std::string difference = describeDifference(before, after);
+            expect(difference.empty()) << difference;
+        }
+
+        const auto  group = gr::loadGrc(loader, gr::saveGrc(loader, *gr::loadGrc(loader, kGroup)));
+        BlockModel& saved = onlyBlock(*group);
+        expect(saved.settings().get().at("disconnect_on_done") == pmt::Value(false)) << "the writer must save the subgraph's settings";
+        expect(storedInContext(saved, "night", "disconnect_on_done") == std::optional(pmt::Value(true))) << "the writer must save the subgraph's contexts";
+
+        const auto  managed      = gr::loadGrc(loader, gr::saveGrc(loader, *gr::loadGrc(loader, kManaged)));
+        BlockModel& savedManaged = onlyBlock(*managed);
+        expect(eq(std::string(savedManaged.name()), std::string("managed")));
+        expect(savedManaged.settings().get().at("timeout_ms") == pmt::Value(gr::Size_t{7U})) << "the writer must save the scheduler's settings";
+        expect(storedInContext(savedManaged, "night", "timeout_ms") == std::optional(pmt::Value(gr::Size_t{11U}))) << "the writer must save the scheduler's contexts";
+    };
+
+    "a caller's settings reach a subgraph by its unique_name or its name"_test = [] {
+        registerTestBlocks();
+        registerTestScheduler();
+        PluginLoader& loader = gr::globalPluginLoader();
+
+        for (const std::string_view key : {"the-group", "group"}) {
+            const auto  loaded = gr::loadGrc(loader, kGroup, gr::BlockSettings{{std::string(key), {{"disconnect_on_done", true}}}});
+            BlockModel& group  = onlyBlock(*loaded);
+            expect(group.settings().get().at("disconnect_on_done") == pmt::Value(true)) << key;
+            expect(eq(std::string(group.name()), std::string("group"))) << key;
+        }
+
+        const auto  loaded  = gr::loadGrc(loader, kManaged, gr::BlockSettings{{"managed", {{"timeout_ms", gr::Size_t{9U}}}}});
+        BlockModel& managed = onlyBlock(*loaded);
+        expect(managed.settings().get().at("timeout_ms") == pmt::Value(gr::Size_t{9U})) << "the caller's value wins over the scheduler's";
+        expect(managed.settings().get().at("watchdog_timeout") == pmt::Value(gr::Size_t{300U}));
+    };
+
+    "a key the subgraph does not declare is refused with the nearest names"_test = [] {
+        registerTestBlocks();
+        registerTestScheduler();
+
+        std::string reported;
+        try {
+            std::ignore = gr::loadGrc(gr::globalPluginLoader(), kGroup, gr::BlockSettings{{"group", {{"disconnect_on_don", true}}}});
+        } catch (const gr::exception& e) {
+            reported = e.message;
+        }
+        expect(reported.contains("block 'group'")) << reported;
+        expect(reported.contains("declares no setting named 'disconnect_on_don'")) << reported;
+        expect(reported.contains("'disconnect_on_done'")) << "the nearest key is offered" << reported;
+
+        std::string reportedManaged;
+        try {
+            std::ignore = gr::loadGrc(gr::globalPluginLoader(), kManaged, gr::BlockSettings{{"managed", {{"timeout_m", gr::Size_t{9U}}}}});
+        } catch (const gr::exception& e) {
+            reportedManaged = e.message;
+        }
+        expect(reportedManaged.contains("block 'managed'")) << reportedManaged;
+        expect(reportedManaged.contains("declares no setting named 'timeout_m'")) << reportedManaged;
+        expect(reportedManaged.contains("'timeout_ms'")) << "the nearest key is offered" << reportedManaged;
     };
 };
 
