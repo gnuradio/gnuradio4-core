@@ -349,19 +349,45 @@ makes `sample_rate` work, applied to a wider key set — pick key names accordin
 ### Custom tag forwarding — `forwardTags()`
 
 For full control, override `forwardTags()` in your block. The framework calls it instead of the
-default forwarding logic:
+default forwarding logic, at three points:
+
+- for each chunk, with `processedIn` the number of samples the chunk consumed;
+- for the trailing span that `processEpilogue()` receives, on a block that has one;
+- once more when an input's stream ends, with `processedIn` 0.
+
+In that last call the input and output spans hold no samples. An input span's `tags()` holds the tags
+at or past the block's read position, up to the first `end_of_stream` tag on any synchronous input,
+at a relative index of 0 or more. The input's own `end_of_stream` tag is among them, and an override
+drops that key, since `publishEoS()` publishes the block's own. Tags behind the read position that no
+span retired appear at a negative index, and an override skips them. Offset 0 of an output span is
+the end-of-stream index. On a block with only synchronous ports and no `processEpilogue()`, the end
+call is the only call with `processedIn` 0.
+
+The example adds a key to every tag it forwards, at a chunk and at the end of the stream:
 
 ```cpp
 struct MyBlock : gr::Block<MyBlock> {
     template<typename TInputSpans, typename TOutputSpans>
     void forwardTags(TInputSpans& inputSpans, TOutputSpans& outputSpans, std::size_t processedIn) {
-        for_each_reader_span([&](auto& in) {
-            for (const auto& [relIndex, tagMapRef] : in.tags()) {
-                property_map modified = tagMapRef.get();
-                modified["my_key"] = "my_value";
-                for_each_writer_span([&](auto& out) {
-                    out.publishTag(modified, 0);
-                }, outputSpans);
+        const auto forward = [&outputSpans](property_map tagMap) {
+            tagMap.erase(gr::tag::END_OF_STREAM.key()); // publishEoS() publishes the block's own
+            if (tagMap.empty()) {
+                return;
+            }
+            tagMap["my_key"] = "my_value";
+            for_each_writer_span([&tagMap](auto& outSpan) { outSpan.publishTag(tagMap, 0UZ); }, outputSpans);
+        };
+        for_each_reader_span([&](auto& inSpan) {
+            if (processedIn == 0UZ) { // the end of the stream: the tags at or past the read position
+                for (const auto& [relIndex, tagMapRef] : inSpan.tags()) {
+                    if (relIndex >= 0) {
+                        forward(tagMapRef.get());
+                    }
+                }
+            } else { // a chunk: the tags the input span retires
+                for (const auto& [relIndex, tagMapRef] : inSpan.tags(1UZ)) {
+                    forward(tagMapRef.get());
+                }
             }
         }, inputSpans);
     }
