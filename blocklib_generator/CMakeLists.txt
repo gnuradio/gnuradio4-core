@@ -44,4 +44,14 @@ if(ENABLE_TESTING)
         "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/test" "-DMODE=${GR_BLOCKLIB_TEST_MODE}" -P
         "${CMAKE_CURRENT_SOURCE_DIR}/test/RunGeneratorTest.cmake")
   endforeach()
+
+  # configures a fixture library four times in one build directory, dropping and listing again each of two headers whose
+  # generated file names share a prefix; the fixture is configured and never built
+  add_test(
+    NAME qa_GrBlockLibDroppedHeader
+    COMMAND
+      ${CMAKE_COMMAND} "-DPROJECT_DIR=${CMAKE_CURRENT_SOURCE_DIR}/test/dropped_header"
+      "-DMACROS=${PROJECT_BINARY_DIR}/GnuRadioBlockLibMacros.cmake" "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/test"
+      "-DGENERATOR=${CMAKE_GENERATOR}" "-DCXX_COMPILER=${CMAKE_CXX_COMPILER}" -P
+      "${CMAKE_CURRENT_SOURCE_DIR}/test/RunDroppedHeaderTest.cmake")
 endif()
