@@ -317,6 +317,26 @@ struct EndlessSource : gr::Block<EndlessSource> {
     [[nodiscard]] constexpr float processOne() const noexcept { return 1.0f; }
 };
 
+// publishes one sample for each release and nothing in between. Its graph makes no progress until the test releases a sample.
+struct ReleasedSource : gr::Block<ReleasedSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(ReleasedSource, out);
+
+    std::atomic<std::size_t>* _nReleased = nullptr;
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        if (outSpan.size() == 0UZ || _nReleased == nullptr || _nReleased->load(std::memory_order_acquire) == 0UZ) {
+            outSpan.publish(0UZ);
+            return gr::work::Status::INSUFFICIENT_INPUT_ITEMS;
+        }
+        _nReleased->fetch_sub(1UZ, std::memory_order_acq_rel);
+        outSpan[0UZ] = 1.0f;
+        outSpan.publish(1UZ);
+        return gr::work::Status::OK;
+    }
+};
+
 // paces itself to wall-clock time rather than to buffer availability: the clock port is left unconnected,
 // so BlockingSync's timer thread is what releases the next chunk. Nothing in the block ends the stream
 struct PacedSource : gr::Block<PacedSource>, gr::BlockingSync<PacedSource> {
@@ -434,6 +454,17 @@ struct StopActionSink : gr::Block<StopActionSink> {
     }
 
     void processOne(float) { gObservedSamples.fetch_add(1UZ, std::memory_order_relaxed); }
+};
+
+// samples a parent scheduler's own graph has moved, observed from outside its threads
+inline std::atomic<std::size_t> gParentSamples{0UZ};
+
+struct ParentCountingSink : gr::Block<ParentCountingSink> {
+    gr::PortIn<float> in;
+
+    GR_MAKE_REFLECTABLE(ParentCountingSink, in);
+
+    void processOne(float) { gParentSamples.fetch_add(1UZ, std::memory_order_relaxed); }
 };
 
 // adoptBlock is the scheduler's entry point for a block added to an already running graph. A message handler calls it
@@ -566,6 +597,23 @@ struct WatchdogProbe : TestScheduler {
     using TestScheduler::TestScheduler;
 
     [[nodiscard]] std::size_t nWatchdogsRunning() { return gr::atomic_ref(this->_nWatchdogsRunning).load_acquire(); }
+};
+
+// takes every message waiting on a port and counts the watchdog's stall reports among them
+struct StallReports {
+    std::size_t count       = 0UZ;
+    std::size_t lastPeriods = 0UZ; // stalled periods the latest report names
+
+    void take(gr::MsgPortIn& port) {
+        auto messages = port.streamReader().get();
+        for (const gr::Message& message : messages) {
+            if (message.endpoint == "watchdog" && message.cmd == gr::message::Command::Notify && message.data.has_value()) {
+                ++count;
+                lastPeriods = message.data->at("stalled_periods").value_or<gr::Size_t>(0U);
+            }
+        }
+        std::ignore = messages.consume(messages.size());
+    }
 };
 
 [[nodiscard]] gr::Graph makeGraph() {
@@ -1653,6 +1701,115 @@ const boost::ut::suite<"watchdog lifetime"> watchdogTests = [] {
 
         expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
         expect(qa_sched::awaitState(scheduler, STOPPED)) << "the final run did not stop";
+    };
+};
+
+const boost::ut::suite<"watchdog stall report"> watchdogStallTests = [] {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    "a stalled graph is reported once per stall on the scheduler's message port"_test = [] {
+        constexpr std::size_t kStalledPeriods = 2UZ;
+
+        std::atomic<std::size_t> nReleased{0UZ};
+        gr::Graph                flow;
+        auto&                    source = flow.emplaceBlock<qa_sched::ReleasedSource>();
+        auto&                    sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+        source._nReleased = &nReleased; // the wrapper holding the block lives on the heap. The pointer stays valid after the move.
+
+        qa_sched::TestScheduler scheduler({{"watchdog_timeout", gr::Size_t(10)}, {"timeout_inactivity_count", gr::Size_t(kStalledPeriods)}});
+        gr::MsgPortIn           fromScheduler;
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+
+        // while the graph stalls, each watchdog period advances the progress sequence by exactly one
+        const gr::Sequence&    progress = scheduler.graph().progress();
+        qa_sched::StallReports reports;
+        auto                   awaitReports     = [&](std::size_t expected) { return qa_sched::awaitCondition([&] { return (reports.take(fromScheduler), reports.count >= expected); }); };
+        auto                   awaitMorePeriods = [&progress] {
+            const std::size_t from = progress.value();
+            return qa_sched::awaitCondition([&progress, from] { return progress.value() >= from + 4UZ * kStalledPeriods; });
+        };
+
+        expect(awaitReports(1UZ)) << "the stall produced no report";
+        expect(eq(reports.lastPeriods, kStalledPeriods)) << "the report names the stalled periods";
+        expect(awaitMorePeriods()) << "the watchdog stopped observing the stall";
+        reports.take(fromScheduler);
+        expect(eq(reports.count, 1UZ)) << "a stall that continues is reported once";
+
+        nReleased.store(1UZ, std::memory_order_release); // one sample moves, which ends the first stall and starts the second
+        expect(awaitReports(2UZ)) << "the stall after progress produced no second report";
+        expect(awaitMorePeriods()) << "the watchdog stopped observing the second stall";
+        reports.take(fromScheduler);
+        expect(eq(reports.count, 2UZ)) << "each stall is reported once";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_sched::awaitState(scheduler, STOPPED)) << "the stalled graph did not stop";
+    };
+
+    "a paused graph is not reported as stalled"_test = [] {
+        constexpr std::size_t kStalledPeriods = 2UZ;
+
+        qa_sched::TestScheduler scheduler({{"watchdog_timeout", gr::Size_t(10)}, {"timeout_inactivity_count", gr::Size_t(kStalledPeriods)}});
+        gr::MsgPortIn           fromScheduler;
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+        expect(scheduler.exchange(qa_sched::makeEndlessGraph()).has_value());
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(scheduler.changeStateTo(REQUESTED_PAUSE).has_value());
+        expect(qa_sched::awaitState(scheduler, PAUSED)) << "scheduler did not reach PAUSED";
+
+        // nothing moves while paused: each watchdog period advances the progress sequence by exactly one
+        const gr::Sequence& progress = scheduler.graph().progress();
+        const std::size_t   from     = progress.value();
+        expect(qa_sched::awaitCondition([&progress, from] { return progress.value() >= from + 4UZ * kStalledPeriods; })) << "the watchdog stopped observing the paused graph";
+        qa_sched::StallReports reports;
+        reports.take(fromScheduler);
+        expect(eq(reports.count, 0UZ)) << "a paused graph was reported as stalled";
+
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_sched::awaitState(scheduler, STOPPED)) << "the resumed graph did not stop";
+    };
+
+    "a nested scheduler's stall report leaves a parent without a message reader running"_test = [] {
+        constexpr std::size_t kStalledPeriods = 2UZ;
+        qa_sched::gParentSamples              = 0UZ;
+
+        gr::Graph innerFlow;
+        auto&     innerSource = innerFlow.emplaceBlock<qa_sched::ReleasedSource>(); // never released: the nested graph stalls
+        auto&     innerSink   = innerFlow.emplaceBlock<qa_sched::CountingSink>();
+        expect(innerFlow.connect<"out", "in">(innerSource, innerSink).has_value());
+        auto inner = std::make_shared<gr::SchedulerWrapper<qa_sched::TestScheduler>>(gr::property_map{{"watchdog_timeout", gr::Size_t(10)}, {"timeout_inactivity_count", gr::Size_t(kStalledPeriods)}});
+        inner->setGraph(std::move(innerFlow));
+
+        gr::Graph outerFlow;
+        auto&     outerSource = outerFlow.emplaceBlock<qa_sched::EndlessSource>();
+        auto&     outerSink   = outerFlow.emplaceBlock<qa_sched::ParentCountingSink>();
+        expect(outerFlow.connect<"out", "in">(outerSource, outerSink).has_value());
+        outerFlow.addBlock(gr::SchedulerModel::asBlockModelPtr(inner));
+
+        qa_sched::TestScheduler parent; // no reader on its msgOut
+        expect(parent.exchange(std::move(outerFlow)).has_value());
+        expect(parent.changeStateTo(INITIALISED).has_value());
+        expect(parent.changeStateTo(RUNNING).has_value());
+        expect(qa_sched::awaitCondition([] { return qa_sched::gParentSamples.load(std::memory_order_relaxed) > 0UZ; })) << "the parent's graph never ran";
+
+        // the nested graph stalls while its scheduler is RUNNING: after this many periods its report has been sent
+        const gr::Sequence& innerProgress = inner->blockRef().graph().progress();
+        const std::size_t   from          = innerProgress.value();
+        expect(qa_sched::awaitCondition([&innerProgress, from] { return innerProgress.value() >= from + 4UZ * kStalledPeriods; })) << "the nested watchdog never observed the stall";
+        expect(inner->blockRef().state() == RUNNING) << "the nested scheduler was not RUNNING during its stall";
+
+        const std::size_t nBefore = qa_sched::gParentSamples.load(std::memory_order_relaxed);
+        expect(qa_sched::awaitCondition([nBefore] { return qa_sched::gParentSamples.load(std::memory_order_relaxed) > nBefore; })) << "the parent's graph stopped moving samples";
+        expect(parent.state() == RUNNING) << "the parent left RUNNING";
+
+        expect(parent.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_sched::awaitState(parent, STOPPED)) << "the parent did not stop";
     };
 };
 
