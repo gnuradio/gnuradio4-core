@@ -65,9 +65,9 @@ public:
     [[nodiscard]] forceinline std::size_t subAndGet(std::size_t decrement) noexcept { return gr::atomic_ref(_fieldsValue).fetch_sub(decrement) - decrement; }
     void                                  wait(std::size_t oldValue) const noexcept { gr::atomic_ref(_fieldsValue).wait(oldValue); }
 
-    // Blocks until the value leaves oldValue or the deadline passes, and returns whether it left. notify_all() after a
-    // read-modify-write of the value (incrementAndGet(), addAndGet(), subAndGet(), compareAndSet()) ends the wait at
-    // once; after setValue() the wait may last until the deadline.
+    // Blocks until the value leaves oldValue or the deadline passes, and returns whether it left. After a
+    // read-modify-write of the value, notify_all() ends the wait at once. The read-modify-writes are incrementAndGet(),
+    // addAndGet(), subAndGet() and compareAndSet(). After setValue() the wait may last until the deadline.
     bool waitUntil(std::size_t oldValue, std::chrono::steady_clock::time_point deadline) const {
         if (value() != oldValue) {
             return true;
@@ -94,9 +94,9 @@ public:
     }
 
 private:
-    // Tests the value with a compare-and-set of oldValue onto itself. As a read-modify-write it is ordered against the
-    // notifier's read-modify-write of the value: either the notifier's comes first and this one sees the new value, or
-    // this one comes first and the notifier sees this waiter in _nTimedWaiters.
+    // Tests the value with a compare-and-set of oldValue onto itself. The compare-and-set is ordered against the
+    // notifier's read-modify-write of the value. If the notifier's comes first, this call sees the new value. If this
+    // call comes first, the notifier sees this waiter in _nTimedWaiters.
     [[nodiscard]] bool hasLeft(std::size_t oldValue) const noexcept {
         std::size_t expected = oldValue;
         return !gr::atomic_ref(_fieldsValue).compare_exchange(expected, oldValue);
