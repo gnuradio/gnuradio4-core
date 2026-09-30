@@ -47,8 +47,8 @@ public:
     // instead of leaving a worker queued behind the threads the parent holds
     virtual std::expected<void, Error> startAdopted() = 0;
 
-    // runs the graph and returns when the run ends by itself, on a requested stop or on an error; the error is the
-    // result
+    // runs the graph and returns when the run ends by itself, on a requested stop or on an error. The error is the
+    // result.
     virtual std::expected<void, Error> runAndWait() = 0;
 
     [[nodiscard]] virtual bool workerStarted() = 0;

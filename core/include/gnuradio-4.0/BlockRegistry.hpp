@@ -45,9 +45,9 @@
 // boundary: `gr_plugin_base` itself, and the `BlockModel` and `SchedulerModel` interfaces whose objects a plugin or a
 // registry factory hands back. A plugin records the version it was compiled against. A registry entry records the
 // version of the code that calls `insert()`, so a block entry added through `insertBlockFactory()` records the
-// version of core. A host loads only a plugin whose version equals its own. Of the entries a shared object registers,
-// the host reads the versions of the schedulers and keeps those only at its own version, because a virtual call
-// through a mismatched interface reaches the wrong function.
+// version of core. A host loads only a plugin whose version equals its own. The host also reads the version of each
+// scheduler a shared object registers, and keeps a scheduler only at its own version. A virtual call through another
+// version's interface reaches the wrong function.
 #define GR_PLUGIN_CURRENT_ABI_VERSION 4
 
 namespace gr {
@@ -106,11 +106,10 @@ class GeneralRegistry {
         std::uint8_t                    abiVersion     = 0;
     };
 
-    // `_blockTypeHandlers` and `_generation` keep the layout of a registry that records no version: a shared object
-    // built against one inserts into them through its own inline copy of `insert()`, and never into `_abiVersions`.
-    // The reverse does not hold: during its static initialization, a shared object built against this layout writes
-    // `_abiVersions` past the end of an older registry object, and a host built against that layout cannot load it
-    // safely.
+    // `_blockTypeHandlers` and `_generation` keep the layout of a registry that records no version. A shared object
+    // built against that older layout inserts into them through its own inline copy of `insert()`, which does not
+    // write `_abiVersions`. A host built against the older layout cannot load a shared object built against this one.
+    // The shared object's static initializers write `_abiVersions` past the end of the older registry object.
     std::map<std::string, TTypeHandler, std::less<>>       _blockTypeHandlers;
     std::size_t                                            _generation = 0UZ;
     std::map<std::string, RecordedAbiVersion, std::less<>> _abiVersions;
@@ -137,7 +136,7 @@ public:
 
 #ifdef GR_ENABLE_BLOCK_REGISTRY
     /// Adds an entry a generated definition unit already produced: nothing here names the block type. The entry
-    /// records `abiVersion`, whose default argument is evaluated where the call is written: the version recorded is the
+    /// records `abiVersion`. Its default argument is evaluated at the call site. The entry therefore records the
     /// `GR_PLUGIN_CURRENT_ABI_VERSION` of the translation unit that registers, whichever copy of this function runs.
     bool insert(std::string_view name, std::string_view alias, decltype(this_t::factoryProto)* factory, std::uint8_t abiVersion = GR_PLUGIN_CURRENT_ABI_VERSION) {
         auto handler = TTypeHandler{.alias = std::string(alias), .createFunction = factory};
@@ -193,8 +192,8 @@ public:
 
     [[nodiscard]] bool contains(std::string_view blockName) const { return _blockTypeHandlers.contains(blockName); }
 
-    /// the plugin ABI version the entry under `key` was registered at; empty for a key the registry does not hold and
-    /// for an entry whose registration recorded none, as code built against a registry without versions registers
+    /// the plugin ABI version the entry under `key` was registered at. Empty for a key the registry does not hold.
+    /// Empty as well for an entry that code built against a registry without versions registered.
     [[nodiscard]] std::optional<std::uint8_t> abiVersion(std::string_view key) const {
         const auto handler  = _blockTypeHandlers.find(key);
         const auto recorded = _abiVersions.find(key);
@@ -204,12 +203,12 @@ public:
         return recorded->second.abiVersion;
     }
 
-    /// Moves every entry out and leaves the generation as it is, so that the registry holds only what is registered
-    /// afterwards until `restoreEntries()` puts the taken entries back.
+    /// Moves every entry out and leaves the generation as it is. Until `restoreEntries()` puts the taken entries back,
+    /// the registry holds only what is registered after this call.
     [[nodiscard]] Entries takeEntries() { return {.handlers = std::exchange(_blockTypeHandlers, {}), .abiVersions = std::exchange(_abiVersions, {})}; }
 
     /// Puts back the entries `takeEntries()` returned. With `keepRegistered`, an entry registered since then stays and
-    /// replaces a taken one under the same key; without it, every such entry is dropped.
+    /// replaces a taken one under the same key. Without it, every such entry is dropped.
     void restoreEntries(Entries taken, bool keepRegistered) {
         if (keepRegistered) {
             for (auto& [key, handler] : _blockTypeHandlers) {

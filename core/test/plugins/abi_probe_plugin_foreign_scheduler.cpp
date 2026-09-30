@@ -8,8 +8,8 @@
  * @brief A plugin at the plugin ABI version this core implements whose load registers a scheduler at version 1.
  *
  * A library a plugin depends on registers into the process-wide scheduler registry from its static initializers, and
- * one built against a core of another version records that version. The scheduler's factory is never called: a loader
- * has to refuse the plugin first.
+ * one built against a core of another version records that version. A loader must refuse the plugin before anything
+ * calls the scheduler's factory.
  */
 namespace gr::testing {
 

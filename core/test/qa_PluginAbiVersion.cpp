@@ -27,8 +27,8 @@
  * A plugin records the plugin ABI version it was compiled against and a host implements exactly one of them. Two of
  * the plugins in the directory below differ in nothing else, so one load of that directory shows what each of them
  * gets, and shows it before anything asks either of them for a block. The third is at the host's version and
- * registers a scheduler at another one when it loads. The same holds for the three shared objects that register a
- * scheduler without being plugins: their registrations record the version, or none.
+ * registers a scheduler at another one when it loads. The three shared objects that register a scheduler without
+ * being plugins differ in the same way. Their registrations record a version, or none.
  */
 namespace qa_plugin_abi_version {
 
@@ -53,12 +53,12 @@ constexpr gr::Size_t kTerminalCount = 1000U;
 // the reason the loader gives for a file whose load registered a scheduler at an earlier version
 [[nodiscard]] std::string earlierSchedulerReason(std::string_view key) { return std::format("scheduler {} has plugin ABI version {}, which does not match the host's plugin ABI version {}", key, kEarlierAbiVersion, GR_PLUGIN_CURRENT_ABI_VERSION); }
 
-// two factories of distinct bodies, so that no folding of identical functions gives them one address
+// two factories with distinct bodies, which identical-code folding cannot merge into one address
 [[nodiscard]] std::unique_ptr<SchedulerModel> makeNoScheduler(property_map /*parameters*/) { return nullptr; }
 
 [[nodiscard]] std::unique_ptr<SchedulerModel> makeThrowingScheduler(property_map /*parameters*/) { throw std::logic_error("the factory of a replaced entry is never called"); }
 
-// whether the process holds the shared object at `file` mapped; the probe takes a reference only when it does
+// whether the process holds the shared object at `file` mapped. The probe takes a reference only when it does.
 [[nodiscard]] bool isMapped(const std::string& file) {
     void* handle = dlopen(file.c_str(), RTLD_LAZY | RTLD_NOLOAD);
     if (handle == nullptr) {
@@ -189,7 +189,8 @@ const boost::ut::suite<"PluginAbiVersion"> pluginAbiVersionTests = [] {
         registry.insert(kKey, "", makeNoScheduler);
         expect(registry.abiVersion(kKey) == std::optional<std::uint8_t>{GR_PLUGIN_CURRENT_ABI_VERSION}) << "the first registration recorded this version";
 
-        // what a registry without versions does on a second registration of the key: the factory changes, the version stays
+        // replaces the factory and keeps the version, as a registry without versions does on a second registration
+        // of the key
         SchedulerRegistry::Entries entries                    = registry.takeEntries();
         entries.handlers.at(std::string(kKey)).createFunction = makeThrowingScheduler;
         registry.restoreEntries(std::move(entries), false);
