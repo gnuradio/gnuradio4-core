@@ -17,10 +17,15 @@
  * grinfo, driven as the program a caller runs.
  *
  * The tool's contract is its exit status and what it prints, and neither is visible from inside the process, so
- * every case here runs the built executable over core's own test plugins and test block libraries: the framework
- * report, the block listing, one block in detail, the scheduler listing, scheduler libraries refused at an earlier
- * plugin ABI version or at none, a name nothing is registered under, and a command line that cannot be used. The
- * shape of the report is part of that contract - no line wider than a terminal, one entry per block however many
+ * every case here runs the built executable over core's own test plugins and test block libraries. The cases cover:
+ * - the framework report
+ * - the block listing, and one block in detail
+ * - the scheduler listing
+ * - scheduler libraries refused at an earlier plugin ABI version or at none
+ * - a name nothing is registered under
+ * - a command line that cannot be used
+ *
+ * The shape of the report is part of that contract - no line wider than a terminal, one entry per block however many
  * instantiations it has, and a JSON document on standard output that carries no null - so each is pinned here too.
  */
 namespace qa_grinfo {
@@ -70,8 +75,8 @@ enum class Streams { both, standardOutput };
     return result;
 }
 
-// one JSON document and nothing else: it opens the text, every bracket closes in order outside a string, and only
-// white space follows its end
+// whether `text` is exactly one JSON document. The document opens the text. Every bracket outside a string closes in
+// order. Only white space follows the document.
 [[nodiscard]] bool isOneJsonDocument(std::string_view text) {
     std::size_t depth    = 0UZ;
     bool        inString = false;
@@ -149,8 +154,8 @@ constexpr std::size_t kWidth = 80UZ;
     return all;
 }
 
-// the directory of the three shared objects that register a scheduler without being plugins: one at this plugin ABI
-// version, one at an earlier version and one without a version
+// the directory of the three shared objects that register a scheduler without being plugins. They are built at this
+// plugin ABI version, at an earlier version and without a version.
 [[nodiscard]] std::vector<std::string> overSchedulerLibraries(const std::vector<std::string>& arguments) {
     std::vector<std::string> all(arguments);
     all.emplace_back("--plugin-dir");

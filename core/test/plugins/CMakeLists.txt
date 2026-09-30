@@ -70,9 +70,9 @@ add_abi_probe_plugin(abi_probe_plugin)
 add_abi_probe_plugin(abi_probe_plugin_v1)
 add_abi_probe_plugin(abi_probe_plugin_foreign_scheduler)
 
-# One shared object that registers a scheduler without being a plugin, built at the plugin ABI version this core
-# implements, at version 1 and without a version, in a directory of their own. A load of that directory keeps the first
-# and refuses the other two.
+# One shared object that registers a scheduler without being a plugin. It is built at the plugin ABI version this core
+# implements, at version 1 and without a version. The three builds share a directory of their own. A load of that
+# directory keeps the first and refuses the other two.
 function(add_scheduler_library LIBRARY_NAME)
   add_library(${LIBRARY_NAME} MODULE scheduler_library.cpp)
   target_link_libraries(${LIBRARY_NAME} PRIVATE gnuradio-options gnuradio-core gnuradio-blocklib-core)

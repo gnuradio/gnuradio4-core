@@ -2,8 +2,8 @@
 //
 // No block name is built in: the registry linked into this program, the libraries the plugin loader opens and a
 // default-constructed instance of each registered key are the only sources, so a framework that gains a block
-// reports it here without this program being rebuilt. The schedulers the tools register themselves are the one
-// exception, and they are registered as rungraph registers them.
+// reports it here without this program being rebuilt. The one exception is core's `Simple` scheduler, which this
+// program registers itself under one key per execution policy.
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE // dladdr, which names the file a block's type information was loaded from

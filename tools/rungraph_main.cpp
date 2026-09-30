@@ -339,8 +339,8 @@ struct StagedSettings {
     return true;
 }
 
-// The scheduler registered under `key`, or nothing when its factory throws or the registry holds no such key; the
-// latter is reported with the keys the registry holds.
+// The scheduler registered under `key`, or nothing when its factory throws or the registry holds no such key. An
+// unknown key is reported with the keys the registry holds.
 [[nodiscard]] std::shared_ptr<gr::SchedulerModel> schedulerOf(gr::PluginLoader& loader, std::string_view key) {
     std::shared_ptr<gr::SchedulerModel> scheduler;
     if (loader.isSchedulerAvailable(key)) {
@@ -397,8 +397,8 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    // the program's own schedulers are registered before the loader runs, so that a library the loader opens can
-    // replace one under the same key
+    // registers the program's own schedulers before the loader runs. A library the loader opens can then replace one
+    // under the same key.
     gr::tools::registerSchedulers(gr::globalSchedulerRegistry());
     const std::vector<std::string> directories = searchDirectories(options.pluginDirectories);
     std::vector<std::string>       keysBefore  = gr::globalBlockRegistry().keys();
@@ -409,8 +409,8 @@ int main(int argc, char** argv) {
     }
 
     // The scheduler is built after the loader, so that it and the blocks it holds are destroyed while the libraries
-    // they came from are still open. It is chosen and given its settings before the graph is read: a key the registry
-    // does not hold and a setting the scheduler will not take are command line problems.
+    // they came from are still open. It is chosen and given its settings before the graph is read. An unknown key or a
+    // refused setting is reported as a command-line error.
     const std::shared_ptr<gr::SchedulerModel> scheduler = schedulerOf(loader, options.scheduler);
     if (scheduler == nullptr) {
         return 2;

@@ -15,10 +15,14 @@
  * rungraph, driven as the program a caller runs.
  *
  * The tool's contract is its exit status and what it prints, and neither is visible from inside the process, so
- * every case here runs the built executable: a graph that would not end by itself, bounded by --seconds; the
- * settings --show prints when the run is over; a scheduler setting and a block setting taken and each refused; the
- * scheduler chosen by its registry key, the program's own, a plugin's and a shared object's, and a shared object's
- * refused at an earlier plugin ABI version; a command line that cannot be used; and a graph file that cannot be read.
+ * every case here runs the built executable. The cases cover:
+ * - a graph that would not end by itself, bounded by --seconds
+ * - the settings --show prints when the run is over
+ * - a scheduler setting and a block setting, each taken and each refused
+ * - the program's own scheduler, a plugin's and a shared object's, each chosen by its registry key
+ * - a shared object's scheduler refused at an earlier plugin ABI version
+ * - a command line that cannot be used
+ * - a graph file that cannot be read
  */
 namespace qa_rungraph {
 
@@ -79,7 +83,7 @@ constexpr std::string_view kUnnamedResourceFile{GR_TOOLS_TEST_ASSETS "/unnamed_r
 // the same, over the four-block chain the settings cases set a value on
 [[nodiscard]] std::vector<std::string> settingsChainRun() { return {"--graph", std::string(kSettingsChainFile), "--plugin-dir", GR_TOOLS_CORE_TEST_PLUGINS, "--seconds", "0.5"}; }
 
-// the chain, bounded by a count on its source so that the run ends by itself, on the scheduler named by `key`
+// the chain on the scheduler named by `key`. A count on its source bounds the chain, and the run ends by itself.
 [[nodiscard]] std::vector<std::string> chainToItsEnd(std::string_view key) {
     std::vector<std::string>                arguments = settingsChainRun();
     const std::array<std::string_view, 7UZ> added{"--scheduler", key, "--set", "source.event_count=1000", "--show", "source", "--verbose"};

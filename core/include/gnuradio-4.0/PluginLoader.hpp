@@ -369,9 +369,9 @@ public:
      *
      * It carries no `gr_plugin_make`; its entries reach the registries from static initializers, and it is kept
      * mapped for the lifetime of the process because those entries point into its code. A shared object that
-     * registered a scheduler at a plugin ABI version other than the host's, or at none, is refused instead: its
-     * entries are dropped, it is closed, and it is reported among the failed plugins. A plugin whose load registered
-     * such a scheduler is refused the same way.
+     * registered a scheduler at another plugin ABI version, or at none, is refused instead. The loader drops its
+     * entries, closes it and reports it among the failed plugins. A plugin whose load registered such a scheduler is
+     * refused the same way.
      */
     struct BlockLibrary {
         std::string file;
@@ -430,7 +430,7 @@ private:
 
         ~SetAsideRegistrations() { restore(false); }
 
-        /// the reason to refuse the file: a scheduler it registered at a plugin ABI version other than the host's, or at none
+        /// the reason to refuse the file, when it registered a scheduler at another plugin ABI version or at none
         [[nodiscard]] std::optional<std::string> schedulerAbiMismatch() const {
             for (const auto& [registry, taken] : _schedulers) {
                 for (const std::string& key : registry->keys()) {
