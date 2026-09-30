@@ -252,7 +252,7 @@ inline property_map mergedParameters(const property_map* fromFile, const propert
     return merged;
 }
 
-/// The entry's `parameters`, empty when it has none; a `parameters` field that is not a map is refused.
+/// The entry's `parameters`, empty when it has none. A `parameters` field that is not a map is refused.
 inline property_map readEntryParameters(const property_map& grcBlock, const BlockIdentity& identity) {
     const auto it = grcBlock.find("parameters");
     if (it == grcBlock.cend()) {
