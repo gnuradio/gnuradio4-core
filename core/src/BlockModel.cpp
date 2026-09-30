@@ -151,8 +151,8 @@ property_map serializeBlock(PluginLoader& pluginLoader, const std::shared_ptr<Bl
         map.emplace(serialization_fields::BLOCK_ID, "SUBGRAPH"s);
         map[convert_string_domain(serialization_fields::BLOCK_UNIQUE_NAME)] = std::string(block->uniqueName());
 
-        // A subgraph writes its settings as a block does. The name comes from the block: setName() leaves the settings
-        // unchanged.
+        // A subgraph writes its settings as a block does. The name comes from the block, since setName() leaves the
+        // settings unchanged.
         if (flags & BlockSerializationFlags::Settings) {
             serializeSettings(block, map);
         }
