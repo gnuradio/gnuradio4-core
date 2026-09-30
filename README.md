@@ -86,17 +86,20 @@ A value the caller or a toolchain file sets for `CMAKE_CXX_FLAGS_<CONFIG>`, `CMA
 `CMAKE_SHARED_LINKER_FLAGS_<CONFIG>` replaces the project's default for that build type, and `CXXFLAGS`, `LDFLAGS`
 and `CMAKE_CXX_FLAGS` apply to every build type.
 With GCC and Clang the project's compiler defaults (`cmake/FlagsOverride.cmake`) are `-O2 -DASSERT_ENABLED` for
-`RelWithAssert` (the default build type), `-O2 -g0 -DNDEBUG` for `Release`, `-O2 -g1 -gz -DNDEBUG` for
+`RelWithAssert` (the top-level default build type), `-O2 -g0 -DNDEBUG` for `Release`, `-O2 -g1 -gz -DNDEBUG` for
 `RelWithDebInfo`, `-Og -g1 -gz -DDEBUG -fno-omit-frame-pointer` for `Debug` and `-Os -g0 -DNDEBUG -DEMBEDDED` for
 `MinSizeRel` (with `-s` under GCC), each with `-ffunction-sections -fdata-sections`.
 `Debug`, `Release` and `MinSizeRel` link executables and shared libraries with `-Wl,--gc-sections`
 (`-Wl,-dead_strip` on macOS), the linker choice (mold or lld where found, with `-Wl,--icf=safe` unless a sanitizer
 is on) and `-Wl,-flat_namespace` on macOS.
 A per-build-type linker value from the caller replaces the section flags and keeps the linker choice.
-Built as a subproject, the tree takes the enclosing project's compiler flags for `Debug`, `Release`,
-`RelWithDebInfo` and `MinSizeRel`, CMake's own defaults included: the project's linker defaults apply there, and its
-compiler defaults do not.
+Built as a subproject, the tree uses the enclosing project's build type.
+It takes the enclosing project's compiler flags for `Debug`, `Release`, `RelWithDebInfo` and `MinSizeRel`, CMake's
+own defaults included: the project's linker defaults apply there, and its compiler defaults do not.
 For `RelWithAssert` the tree uses its own compiler flags where the enclosing project gives none.
+An empty build type gives the tree no per-build-type compiler or linker flags: no optimization, no section flags
+and no linker choice.
+A consumer names a build type to choose these flags.
 
 ### Example Combined Command
 

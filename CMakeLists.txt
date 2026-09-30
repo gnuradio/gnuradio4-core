@@ -162,10 +162,24 @@ elseif(MSVC)
   set(LINK_MINSIZE "${LINK_RELEASE} /DEBUG:NONE") # strip PDB
 endif()
 
-if(NOT CMAKE_BUILD_TYPE)
-  set(CMAKE_BUILD_TYPE
-      "RelWithAssert"
-      CACHE STRING "Default build type" FORCE)
+# A top-level build with a single-config generator defaults to RelWithAssert, and the cache lists the build types. A
+# subproject builds with the enclosing project's build type. An empty build type gives the tree no per-build-type
+# compiler or linker flags.
+if(PROJECT_IS_TOP_LEVEL)
+  if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE
+        "RelWithAssert"
+        CACHE STRING "Default build type" FORCE)
+  endif()
+  set_property(
+    CACHE CMAKE_BUILD_TYPE
+    PROPERTY STRINGS
+             None
+             Debug
+             Release
+             RelWithAssert
+             RelWithDebInfo
+             MinSizeRel)
 endif()
 # project() gives RelWithAssert its flags only when that build type is named at that point. An enclosing project that
 # names it creates the entry empty, and a subproject never reads cmake/FlagsOverride.cmake. This directory and those
@@ -174,15 +188,6 @@ if(NOT CMAKE_CXX_FLAGS_RELWITHASSERT)
   include(cmake/FlagsOverride.cmake)
   set(CMAKE_CXX_FLAGS_RELWITHASSERT "${CMAKE_CXX_FLAGS_RELWITHASSERT_INIT}")
 endif()
-set_property(
-  CACHE CMAKE_BUILD_TYPE
-  PROPERTY STRINGS
-           None
-           Debug
-           Release
-           RelWithAssert
-           RelWithDebInfo
-           MinSizeRel)
 
 set(REGISTRY_DEFAULT ON)
 if(CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
@@ -190,12 +195,9 @@ if(CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
 endif()
 
 # Determine if GR4 is built as a subproject (using add_subdirectory) or if it is the master project.
-if(NOT DEFINED GR_TOPLEVEL_PROJECT)
-  set(GR_TOPLEVEL_PROJECT OFF)
-  if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
-    set(GR_TOPLEVEL_PROJECT ON)
-    message(STATUS "CMake version: ${CMAKE_VERSION}")
-  endif()
+set(GR_TOPLEVEL_PROJECT ${PROJECT_IS_TOP_LEVEL})
+if(GR_TOPLEVEL_PROJECT)
+  message(STATUS "CMake version: ${CMAKE_VERSION}")
 endif()
 
 set(GR_USE_ADAPTIVE_CPP OFF) # Detect AdaptiveCpp via compiler executable name
