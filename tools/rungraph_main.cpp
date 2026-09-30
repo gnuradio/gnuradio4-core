@@ -373,10 +373,10 @@ int main(int argc, char** argv) {
         reportPlugins(loader, directories, keysBefore);
     }
 
-    // each block reads its --set values where it reads the graph file's own, so they are the values its start() sees;
-    // the loader refuses a graph file for a key nothing supplies, a setting a block does not declare, a value of the
-    // wrong type or a port that is not there, and a --set for a block the file does not hold, and its message is
-    // printed as it arrives
+    // Each block reads its --set values with the graph file's own. Its start() sees them. The loader refuses a graph
+    // file that names a key nothing supplies or a port that is not there. It also refuses a --set key the block does
+    // not declare, a value of the wrong type, and a --set for a block the file does not hold. Its message is printed as
+    // it arrives.
     std::optional<gr::meta::indirect<gr::Graph>> graph;
     try {
         graph.emplace(gr::loadGrc(loader, *document, staged->blocks));

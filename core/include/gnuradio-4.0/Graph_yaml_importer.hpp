@@ -21,11 +21,11 @@ namespace gr {
 /**
  * Settings a caller puts in force over a graph file's own, each entry for one block at the file's top level.
  *
- * A key names the one block that carries it as its `unique_name` or its `name`; a key no block carries, a key two
+ * A key names the one block that carries it as its `unique_name` or its `name`. A key no block carries, a key two
  * blocks carry and a key for a subgraph are refused before any block is made. The entry's map replaces those keys of
- * the block's `parameters`. Every block is constructed with its parameters, merged where it has an entry, and its
- * settings load the same map, so its constructor, its `settingsChanged()` and its `start()` see a given value, and a
- * port count such as `n_inputs` sizes the ports before the connections are made.
+ * the block's `parameters`. Every block is constructed with the merged parameters, and its settings load the same map.
+ * Its constructor, `settingsChanged()` and `start()` see the given values. A port count such as `n_inputs` sizes the
+ * ports before the connections are made.
  */
 using BlockSettings = std::map<std::string, property_map, std::less<>>;
 
@@ -230,8 +230,8 @@ inline std::vector<const property_map*> resolveBlockSettings(const Tensor<pmt::V
     return settingsByPosition;
 }
 
-/// Throws for a key of `overrides` the block does not declare: the settings map files an unknown key as meta
-/// information, and the run would then proceed as if the caller had asked for nothing.
+/// Throws for a key of `overrides` the block does not declare. The settings map would otherwise keep that key as meta
+/// information and apply nothing.
 inline void checkDeclared(const BlockModel& block, std::string_view blockName, const property_map& overrides) {
     const std::set<std::string>& declared = block.settings().writableMembers();
     for (const auto& [key, value] : overrides) {
@@ -391,8 +391,8 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
             if (!currentBlock) {
                 throw gr::exception(std::format("Unable to create block of type '{}'", blockType));
             }
-            // the settings take the map once, below; the constructor's copy would be applied again by Settings::init(),
-            // which refuses a key of the file the block does not declare
+            // the settings take the map once, below. Settings::init() would apply the constructor's copy again and
+            // refuse a key of the file the block does not declare.
             currentBlock->settings().setInitBlockParameters({});
             if (given != nullptr) {
                 checkDeclared(*currentBlock, blockName, *given);
@@ -579,7 +579,8 @@ inline gr::property_map saveGraphToMap(PluginLoader& loader, const gr::Graph& ro
 } // namespace detail
 
 /// Reads a graph from a GRC document, with `overrides` merged over the parameters of the top-level blocks its keys name
-/// (see `BlockSettings`); a key no block carries, a key two blocks carry and a key a block does not declare are refused.
+/// (see `BlockSettings`). A key no block carries, a key two blocks carry and a key a block does not declare are
+/// refused.
 inline gr::meta::indirect<gr::Graph> loadGrc(PluginLoader& loader, std::string_view yamlSrc, const BlockSettings& overrides = {}, std::source_location location = std::source_location::current()) {
     gr::meta::indirect<gr::Graph> resultGraph{loader};
     const auto                    yaml = pmt::yaml::deserialize(yamlSrc);

@@ -32,7 +32,7 @@ struct start_recorder : gr::Block<start_recorder<T>> {
     std::string                                        resource;          // the name start() opens
     std::string                                        resource_at_start; // the name start() read
     gr::Annotated<float, "gain", gr::Limits<0.f, 1.f>> gain        = 1.f;
-    float                                              sample_rate = 1.f; // forwarded downstream; zero or less is refused
+    float                                              sample_rate = 1.f; // forwarded downstream, refused at zero or less
 
     GR_MAKE_REFLECTABLE(start_recorder, in, out, resource, resource_at_start, gain, sample_rate);
 
