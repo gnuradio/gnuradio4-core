@@ -96,13 +96,20 @@ template<typename T>
 requires(std::is_floating_point_v<T>)
 std::expected<T, std::string> parseStringToFloat(std::string_view trimmed) {
     using namespace std::string_literals;
+    if (trimmed.empty()) {
+        return std::unexpected("the text is empty or holds only whitespace or a comment"s);
+    }
 #if defined(__clang__)
-    // Fallback to std::strtof / strtod for Clang versions prior to 20
+    // every Clang version takes this branch; the condition tests __clang__ alone
     // strtof and strtod read up to a terminator, which a std::string_view does not carry
+    // strtof and strtod return 0 when they consume no character, and such a parse is refused
     const std::string terminated(trimmed);
     if constexpr (std::is_same_v<T, float>) {
         char* endPtr = nullptr;
         float valF   = std::strtof(terminated.c_str(), &endPtr);
+        if (endPtr == terminated.c_str()) {
+            return std::unexpected("no number at the start of the text"s);
+        }
         if (endPtr == terminated.c_str() + terminated.size() && !std::isinf(valF)) {
             return valF;
         }
@@ -114,6 +121,9 @@ std::expected<T, std::string> parseStringToFloat(std::string_view trimmed) {
         // double
         char*  endPtr = nullptr;
         double valD   = std::strtod(terminated.c_str(), &endPtr);
+        if (endPtr == terminated.c_str()) {
+            return std::unexpected("no number at the start of the text"s);
+        }
         if (endPtr == terminated.c_str() + terminated.size() && !std::isinf(valD)) {
             return static_cast<T>(valD);
         }
