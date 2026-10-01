@@ -263,11 +263,13 @@ public:
         auto& portCollection        = portDirection == PortDirection::INPUT ? this->_dynamicInputPorts : this->_dynamicOutputPorts;
         if (exportFlag) {
             bookkeepingCollection.emplace(uniqueBlockName, PortNameMapper{std::string(portName), std::string(exportedName)});
+            graph()->_exportedPorts.push_back({std::string(uniqueBlockName), portDirection, std::string(portName)});
             auto& createdDynamicPort                                    = portCollection.emplace_back(gr::DynamicPort(port.value()->weakRef()));
             std::get<gr::DynamicPort>(createdDynamicPort).metaInfo.name = exportedName;
         } else {
             auto exportedPortName = infoIt->second.exportedName;
             bookkeepingCollection.erase(infoIt);
+            std::erase_if(graph()->_exportedPorts, [&](const auto& entry) { return entry.blockName == uniqueBlockName && entry.direction == portDirection && entry.portName == portName; });
             auto portIt = std::ranges::find_if(portCollection, [&exportedPortName](const auto& portOrCollection) { return BlockModel::portName(portOrCollection) == exportedPortName; });
             if (portIt != portCollection.end()) {
                 portCollection.erase(portIt);
@@ -363,6 +365,14 @@ struct Graph : Block<Graph> {
 
     gr::PluginLoader* _pluginLoader = nullptr;
 
+    // a block port that the graph's wrapper exports to the parent graph
+    struct ExportedPort {
+        std::string   blockName;
+        PortDirection direction;
+        std::string   portName;
+    };
+    std::vector<ExportedPort> _exportedPorts;
+
     // _subgraphExportHandler and _subgraphExportContext are on BlockBase
 
 public:
@@ -378,7 +388,7 @@ public:
         : gr::Block<gr::Graph>(std::move(other)),                             //
           _edges(std::move(other._edges)), _blocks(std::move(other._blocks)), //
           _progress(std::move(other._progress)),                              //
-          _pluginLoader(std::exchange(other._pluginLoader, nullptr)) {}
+          _pluginLoader(std::exchange(other._pluginLoader, nullptr)), _exportedPorts(std::move(other._exportedPorts)) {}
 
     Graph(Graph&)                   = delete; // there can be only one owner of Graph
     Graph& operator=(Graph&)        = delete; // there can be only one owner of Graph
@@ -827,16 +837,34 @@ public:
         return maxSize;
     }
 
+    // A port that the wrapper of this graph exports keeps its connection. The edge on that port belongs to the parent
+    // graph, and the parent graph connects it.
     void disconnectAllEdges() {
         for (auto& block : _blocks) {
             block->initDynamicPorts();
 
-            auto disconnectAll = [](auto& ports) {
+            std::vector<const DynamicPort*> exported;
+            for (const ExportedPort& entry : _exportedPorts) {
+                if (entry.blockName == block->uniqueName()) {
+                    auto port = entry.direction == PortDirection::INPUT ? block->dynamicInputPort(std::string_view(entry.portName)) : block->dynamicOutputPort(std::string_view(entry.portName));
+                    if (port.has_value()) {
+                        exported.push_back(port.value());
+                    }
+                }
+            }
+            auto disconnectUnlessExported = [&exported](gr::DynamicPort& port) {
+                if (std::ranges::find(exported, std::addressof(port)) == exported.end()) {
+                    std::ignore = port.disconnect();
+                }
+            };
+            auto disconnectAll = [&disconnectUnlessExported](auto& ports) {
                 for (auto& port : ports) {
                     if (auto* p = std::get_if<gr::DynamicPort>(&port)) {
-                        std::ignore = p->disconnect();
+                        disconnectUnlessExported(*p);
                     } else {
-                        std::ignore = std::get<BlockModel::NamedPortCollection>(port).disconnect();
+                        for (gr::DynamicPort& collectionPort : std::get<BlockModel::NamedPortCollection>(port).ports) {
+                            disconnectUnlessExported(collectionPort);
+                        }
                     }
                 }
             };
