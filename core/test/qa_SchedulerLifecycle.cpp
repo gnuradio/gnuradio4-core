@@ -1882,4 +1882,83 @@ const boost::ut::suite<"a job list that finishes before the others"> upstreamRel
     };
 };
 
+namespace qa_sched {
+
+constexpr std::size_t kSamplesPerRun = 64UZ;
+
+// publishes kSamplesPerRun samples after each start and then idles without ending the run
+struct CountedSource : gr::Block<CountedSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(CountedSource, out);
+
+    std::size_t _nEmitted = 0UZ;
+
+    void start() { _nEmitted = 0UZ; }
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        const std::size_t nPublish = std::min(outSpan.size(), kSamplesPerRun - _nEmitted);
+        _nEmitted += nPublish;
+        outSpan.publish(nPublish);
+        return nPublish == 0UZ ? gr::work::Status::INSUFFICIENT_INPUT_ITEMS : gr::work::Status::OK;
+    }
+};
+
+struct Forwarder : gr::Block<Forwarder> {
+    gr::PortIn<float>  in;
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(Forwarder, in, out);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
+};
+
+} // namespace qa_sched
+
+const boost::ut::suite<"a sub-scheduler's exported stream ports"> exportedPortTests = [] {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    // The parent connects the edges into and out of the sub-scheduler's exported ports before it starts the
+    // sub-scheduler on its own thread. The sub-scheduler's start reconnects its own graph and must leave those
+    // two connections in place.
+    "a sub-scheduler's exported ports carry every sample of the parent's edges, run after run"_test = [] {
+        qa_sched::gObservedSamples.store(0UZ, std::memory_order_relaxed);
+
+        gr::Graph innerFlow;
+        auto&     first  = innerFlow.emplaceBlock<qa_sched::Forwarder>();
+        auto&     second = innerFlow.emplaceBlock<qa_sched::Forwarder>();
+        expect(innerFlow.connect<"out", "in">(first, second).has_value());
+        auto inner = std::make_shared<gr::SchedulerWrapper<qa_sched::TestScheduler>>();
+        inner->setGraph(std::move(innerFlow));
+        expect(inner->exportPort(true, std::string(first.unique_name), gr::PortDirection::INPUT, "in", "in").has_value());
+        expect(inner->exportPort(true, std::string(second.unique_name), gr::PortDirection::OUTPUT, "out", "out").has_value());
+
+        gr::Graph                             outerFlow;
+        auto&                                 source  = outerFlow.emplaceBlock<qa_sched::CountedSource>();
+        auto&                                 sink    = outerFlow.emplaceBlock<qa_sched::ObservedSink>();
+        const std::shared_ptr<gr::BlockModel> managed = outerFlow.addBlock(gr::SchedulerModel::asBlockModelPtr(inner));
+        expect(outerFlow.connect(outerFlow.blocks()[0], gr::PortDefinition{"out"}, managed, gr::PortDefinition{"in"}).has_value());
+        expect(outerFlow.connect(managed, gr::PortDefinition{"out"}, outerFlow.blocks()[1], gr::PortDefinition{"in"}).has_value());
+
+        qa_sched::TestScheduler parent;
+        expect(parent.exchange(std::move(outerFlow)).has_value());
+
+        for (std::size_t run = 1UZ; run <= 2UZ; ++run) {
+            expect(parent.changeStateTo(INITIALISED).has_value()) << std::format("run {} did not initialize", run);
+            expect(parent.changeStateTo(RUNNING).has_value()) << std::format("run {} did not start", run);
+
+            const std::size_t nExpected = run * qa_sched::kSamplesPerRun;
+            expect(qa_sched::awaitCondition([nExpected] { return qa_sched::gObservedSamples.load(std::memory_order_relaxed) >= nExpected; })) << std::format("run {} did not deliver its samples", run);
+            expect(eq(qa_sched::gObservedSamples.load(std::memory_order_relaxed), nExpected)) << std::format("run {}: the sink count differs from the source count", run);
+            expect(eq(source.out.nReaders(), 1UZ)) << std::format("run {}: the edge into the exported input has no reader", run);
+            expect(eq(second.out.nReaders(), 1UZ)) << std::format("run {}: the edge out of the exported output has no reader", run);
+            expect(sink.in.isConnected()) << std::format("run {}: the sink lost its input", run);
+
+            expect(parent.changeStateTo(REQUESTED_STOP).has_value());
+            expect(qa_sched::awaitState(parent, STOPPED)) << std::format("run {} did not stop", run);
+        }
+    };
+};
+
 int main() { /* tests are statically registered */ }
