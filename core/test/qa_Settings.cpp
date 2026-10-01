@@ -516,6 +516,33 @@ const boost::ut::suite<"text held in a Value"> textValueTests = [] {
         }
     };
 
+    "a float or double setting refuses text that holds no number"_test = [] {
+        constexpr std::array blankTexts{"", " ", "\t", " \t\n\r\v\f ", "  # comment"};
+        constexpr std::array trailingLetterTexts{"1.5abc", "48000Hz", "0 x"};
+        for (std::string_view text : blankTexts) {
+            const auto asFloat  = gr::settings::convertParameter<float>("sample_rate", pmt::Value{text});
+            const auto asDouble = gr::settings::convertParameter<double>("frequency", pmt::Value{text});
+            expect(!asFloat.has_value() && asFloat.error().contains("sample_rate")) << std::format("'{}' as a float setting", text);
+            expect(!asDouble.has_value() && asDouble.error().contains("frequency")) << std::format("'{}' as a double setting", text);
+
+            const auto floatReason  = fromText<float>(text);
+            const auto doubleReason = fromText<double>(text);
+            expect(!floatReason.has_value() && floatReason.error().contains("empty")) << floatReason.error_or("a value");
+            expect(!doubleReason.has_value() && doubleReason.error().contains("empty")) << doubleReason.error_or("a value");
+        }
+        for (std::string_view text : trailingLetterTexts) {
+            expect(!gr::settings::convertParameter<float>("sample_rate", pmt::Value{text}).has_value()) << std::format("'{}' as a float setting", text);
+            expect(!gr::settings::convertParameter<double>("frequency", pmt::Value{text}).has_value()) << std::format("'{}' as a double setting", text);
+        }
+
+        for (std::string_view text : {std::string_view("0"), std::string_view(" 0 ")}) {
+            const auto asFloat  = gr::settings::convertParameter<float>("sample_rate", pmt::Value{text});
+            const auto asDouble = gr::settings::convertParameter<double>("frequency", pmt::Value{text});
+            expect(asFloat == 0.0f) << asFloat.error_or("a different value");
+            expect(asDouble == 0.0) << asDouble.error_or("a different value");
+        }
+    };
+
     "a std::string_view is parsed within its bounds"_test = [] {
         const std::string_view                  prefix = std::string_view("1.25").substr(0UZ, 3UZ);
         const std::expected<float, std::string> parsed = pmt::convert_safely<float>(prefix);
