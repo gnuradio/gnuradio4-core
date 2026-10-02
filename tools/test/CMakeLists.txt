@@ -57,8 +57,8 @@ if(TARGET rungraph)
     target_compile_definitions(
       qa_RunGraph PRIVATE GR_TOOLS_CORE_TEST_PLUGINS="${CMAKE_BINARY_DIR}/core/test/plugins"
                           GR_TOOLS_TEST_SCHEDULER_LIBRARY="${CMAKE_BINARY_DIR}/core/test/scheduler_library")
-    # the settings cases need GoodRegistryPlugin (good::identity and good::start_recorder), good_math_plugin
-    # (a plugin's scheduler) and scheduler_library (a scheduler from a shared object that is not a plugin)
+    # the settings cases need GoodRegistryPlugin (good::identity and good::start_recorder), good_math_plugin (a plugin's
+    # scheduler) and scheduler_library (a scheduler from a shared object that is not a plugin)
     add_dependencies(
       qa_RunGraph
       GoodBasePlugin
