@@ -555,6 +555,11 @@ struct Port {
               rawTags(getTagsInRange(nSamples_, tagReader, reader.position())),                                   //
               streamIndex{reader.position()}, isConnected(connected), isSync(sync) {}
 
+        /// no samples, and every tag the ring holds at an index up to lastIndex: a tag at or past the read position
+        /// sits at a relative index of zero or more
+        InputSpan(ReaderType& reader, TagReaderType& tagReader, std::size_t lastIndex, bool connected, bool sync) //
+            : ReaderSpanType<spanReleasePolicy>(reader.template get<spanReleasePolicy>(0UZ)), rawTags(getTagsUpTo(lastIndex, tagReader)), streamIndex{reader.position()}, isConnected(connected), isSync(sync) {}
+
         InputSpan(const InputSpan&)                = delete;
         InputSpan& operator=(const InputSpan&)     = delete;
         InputSpan(InputSpan&&) noexcept            = default;
@@ -613,6 +618,12 @@ struct Port {
             const auto it   = std::ranges::find_if_not(tags, [nSamples, currentStreamOffset](const auto& tag) { return tag.index < currentStreamOffset + nSamples; });
             const auto n    = static_cast<std::size_t>(std::distance(tags.begin(), it));
             return reader.get(n);
+        }
+
+        auto getTagsUpTo(std::size_t lastIndex, TagReaderType& reader) {
+            const auto tags = reader.get(reader.available());
+            const auto it   = std::ranges::find_if(tags, [lastIndex](const auto& tag) { return tag.index > lastIndex; });
+            return reader.get(static_cast<std::size_t>(std::distance(tags.begin(), it)));
         }
     }; // end of InputSpan
     static_assert(ReaderSpanLike<InputSpan<gr::SpanReleasePolicy::ProcessAll, false>>);
@@ -993,6 +1004,15 @@ public:
     requires(kIsInput)
     {
         return InputSpan<spanReleasePolicy, consumeOnlyFirstTag>(nSamples, streamReader(), tagReader(), this->isConnected(), this->isSynchronous());
+    }
+
+    /// a span of no samples whose tags() holds every tag left in the ring at an index up to lastIndex, those at or past
+    /// the read position included
+    template<SpanReleasePolicy spanReleasePolicy, bool consumeOnlyFirstTag = false>
+    InputSpan<spanReleasePolicy, consumeOnlyFirstTag> getRemainingTags(std::size_t lastIndex = std::numeric_limits<std::size_t>::max())
+    requires(kIsInput)
+    {
+        return InputSpan<spanReleasePolicy, consumeOnlyFirstTag>(streamReader(), tagReader(), lastIndex, this->isConnected(), this->isSynchronous());
     }
 
     template<SpanReleasePolicy spanReleasePolicy>

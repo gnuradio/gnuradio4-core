@@ -83,6 +83,9 @@ struct Source : Block<Source> {
             outSpan.publishTag(tag.map, tag.index >= _emitted ? tag.index - _emitted : 0UZ);
             _nextTag++;
         }
+        for (; _emitted + n == nTotal && _nextTag < tagsToEmit.size(); ++_nextTag) { // a tag at or past the last sample leaves at the end index
+            outSpan.publishTag(tagsToEmit[_nextTag].map, n);
+        }
         _emitted += n;
         outSpan.publish(n);
         return work::Status::OK;
@@ -105,6 +108,33 @@ struct Sink : Block<Sink> {
         inSpan.consumeTags(n);
         samples.insert(samples.end(), inSpan.begin(), inSpan.end());
         std::ignore = inSpan.consume(n);
+        return work::Status::OK;
+    }
+};
+
+/// records the tags its input ring holds at or past its last sample, in its epilogue
+struct EndSink : Block<EndSink> {
+    PortIn<float> in;
+
+    GR_MAKE_REFLECTABLE(EndSink, in);
+
+    std::size_t            nSamples = 0UZ;
+    std::vector<TagRecord> endTags;
+
+    work::Status processBulk(InputSpanLike auto& inSpan) {
+        nSamples += inSpan.size();
+        std::ignore = inSpan.consume(inSpan.size());
+        return work::Status::OK;
+    }
+
+    work::Status processEpilogue(InputSpanLike auto& inSpan) {
+        const std::size_t end = inSpan.streamIndex + inSpan.size();
+        for (const Tag& tag : in.tagReader().get()) {
+            if (tag.index >= end) {
+                endTags.push_back(TagRecord{tag.index, tag.map});
+            }
+        }
+        nSamples += inSpan.size();
         return work::Status::OK;
     }
 };
@@ -376,6 +406,32 @@ template<typename TMiddle>
     return std::addressof(sink);
 }
 
+/// what an end sink recorded
+struct EndResult {
+    std::size_t            nSamples{};
+    std::vector<TagRecord> endTags;
+};
+
+/// source -> TMiddle -> end sink, with `tags` published by the source
+template<typename TMiddle>
+[[nodiscard]] EndResult runToEnd(const std::vector<TagRecord>& tags) {
+    using namespace boost::ut;
+
+    gr::Graph flow;
+    auto&     source  = flow.emplaceBlock<Source>(gr::property_map{{"name", std::string("src")}});
+    source.tagsToEmit = tags;
+    auto& middle      = flow.emplaceBlock<TMiddle>(gr::property_map{{"name", std::string("mid")}});
+    auto& sink        = flow.emplaceBlock<EndSink>(gr::property_map{{"name", std::string("snk")}});
+    expect(flow.connect<"out", "in">(source, middle).has_value());
+    expect(flow.connect<"out", "in">(middle, sink).has_value());
+
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler;
+    expect(scheduler.exchange(std::move(flow)).has_value());
+    expect(scheduler.runAndWait().has_value());
+
+    return EndResult{sink.nSamples, sink.endTags};
+}
+
 void expectTagIndices(std::string_view scenario, const std::vector<TagRecord>& tags, const std::vector<std::size_t>& expected) {
     using namespace boost::ut;
 
@@ -599,6 +655,61 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
 
         const RunResult result = runOnce([&tags](gr::Graph& flow) { return buildWindowed<UnfilteredTailRelay>(flow, tags, kTotal, kInputMinimum, 7UZ); });
         expectTagIndices("stream tail", result.tags, {3UZ, 8UZ});
+    };
+
+    "at the end index the default key filter drops a custom key and the unfiltered policy keeps it"_test = [] {
+        const std::vector<TagRecord> tags{TagRecord{kSamples, protocolTag("end")}};
+
+        const auto expectOnce = [](const EndResult& sink, std::string_view scenario) {
+            expect(eq(sink.nSamples, kSamples)) << scenario;
+            const std::vector<TagRecord> reserved = carrying(sink.endTags, kReservedKey);
+            expect(eq(reserved.size(), 1UZ)) << std::format("{}: the tag stands once past the last sample", scenario);
+            for (const TagRecord& record : sink.endTags) {
+                expect(eq(record.index, kSamples)) << std::format("{}: every tag past the last sample stands at the end index", scenario);
+            }
+            expect(eq(carrying(sink.endTags, gr::tag::END_OF_STREAM.key()).size(), 1UZ)) << std::format("{}: the end_of_stream key stands once", scenario);
+            return reserved;
+        };
+
+        const std::vector<TagRecord> filtered = expectOnce(runToEnd<Relay>(tags), "default policy");
+        for (const TagRecord& record : filtered) {
+            expect(!record.map.contains(kCustomKey)) << "the default key filter drops a custom key at the end index";
+        }
+
+        const std::vector<TagRecord> unfiltered = expectOnce(runToEnd<UnfilteredRelay>(tags), "unfiltered policy");
+        for (const TagRecord& record : unfiltered) {
+            const pmt::Value* value = valueOf(record.map, kCustomKey);
+            expect(value != nullptr) << "the unfiltered policy keeps a custom key at the end index";
+            if (value != nullptr) {
+                expect(eq(value->value_or(std::string_view{}), std::string_view("end"))) << "the value is forwarded verbatim";
+            }
+        }
+    };
+
+    "at the end index a key the block declares leaves with the value the end tag sets"_test = [] {
+        property_map map = protocolTag("end");
+        gr::tag::put(map, kOwnedKey, kUpstreamGain);
+        gr::tag::put(map, "sample_rate", kUpstreamRate);
+
+        const EndResult              result  = runToEnd<UnfilteredCap>({TagRecord{kSamples, map}});
+        const std::vector<TagRecord> carried = carrying(result.endTags, kCustomKey);
+        expect(eq(carried.size(), 1UZ)) << "the tag stands once past the last sample";
+        if (carried.empty()) {
+            return;
+        }
+        expect(eq(carried.front().index, result.nSamples)) << "the tag stands at the end index";
+        const property_map& arrived = carried.front().map;
+
+        const pmt::Value* owned = valueOf(arrived, kOwnedKey);
+        expect(owned != nullptr);
+        if (owned != nullptr) {
+            expect(eq(owned->value_or<float>(0.f), kGainCeiling)) << "the block applied the end tag and forwards its capped value";
+        }
+        const pmt::Value* rate = valueOf(arrived, "sample_rate");
+        expect(rate != nullptr);
+        if (rate != nullptr) {
+            expect(eq(rate->value_or<float>(0.f), kRateCeiling)) << "the block applied the end tag and forwards its capped value";
+        }
     };
 
     "tags two samples apart all keep their custom keys"_test = [] {

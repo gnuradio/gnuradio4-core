@@ -1086,6 +1086,11 @@ public:
 
     /// whether the block supplies the forwardTags() that workInternal() calls in place of the default forwarder
     ///
+    /// The framework calls the override for each chunk, for the epilogue's trailing window, and once more at the end of
+    /// the stream with processedIn 0. A tag at a relative index at or past processedIn appears only in that last call,
+    /// and belongs at offset 0 of its output spans, which hold no samples: the end-of-stream index. Calling
+    /// forwardRemainingInputTags(inputSpans, outputSpans) there forwards those tags by the default rule.
+    ///
     /// The probe passes the span tuples prepareStreams() builds from this block's own stream ports, which are the
     /// types the work path and the epilogue path pass, so an override constrained to them answers the same here as
     /// there. A probe on empty tuples answers "no override" for every such constrained override.
@@ -1392,6 +1397,128 @@ public:
         }
     }
 
+    /// default forwarding of the tags a stream leaves at or past each synchronous input's read position
+    ///
+    /// The input spans are those of prepareStreams<true>() and the output spans hold no samples, so every tag leaves at
+    /// output offset 0, the end-of-stream index. The key filter, the substitution, the multi-input dedup and the merge
+    /// rule are those of forwardInputTags(). The block's settings already hold the values these tags set, so a key the
+    /// block declares leaves with the value its last tag set. The end_of_stream key stays behind, as publishEoS()
+    /// publishes its own.
+    template<typename TInputSpans, typename TOutputSpans>
+    void forwardRemainingInputTags(TInputSpans& inputSpans, TOutputSpans& outputSpans) {
+        if constexpr (noTagPropagation) {
+            return;
+        }
+        constexpr bool kDedup = traits::block::stream_input_ports<Derived>::size > 1;
+
+        std::optional<property_map>                       cachedSettings;
+        const std::pmr::string                            endOfStream = static_cast<std::pmr::string>(gr::tag::END_OF_STREAM);
+        std::vector<const Tag*>                           seen;
+        std::vector<std::pair<std::size_t, property_map>> remaining; // input index and forwarded map
+        for_each_reader_span(
+            [&](auto& in) {
+                if (!in.isSync || !in.isConnected) {
+                    return;
+                }
+                for (const Tag& tag : in.rawTags) {
+                    if (tag.index < in.streamIndex) { // deferred out of a chunk before the read position
+                        continue;
+                    }
+                    if constexpr (kDedup) {
+                        if (std::ranges::any_of(seen, [&tag](const Tag* other) { return other->index == tag.index && other->map == tag.map; })) {
+                            continue;
+                        }
+                        seen.push_back(&tag);
+                    }
+                    property_map forwarded = filterAndSubstituteTag(tag.map, cachedSettings);
+                    forwarded.erase(endOfStream);
+                    if (!forwarded.empty()) {
+                        remaining.emplace_back(tag.index, std::move(forwarded));
+                    }
+                }
+            },
+            inputSpans);
+        std::ranges::stable_sort(remaining, {}, &std::pair<std::size_t, property_map>::first);
+
+        if constexpr (mergeTagPropagation) {
+            property_map merged;
+            for (auto& [_, forwarded] : remaining) {
+                for (auto& [key, value] : forwarded) {
+                    merged.insert_or_assign(key, std::move(value));
+                }
+            }
+            if (!merged.empty()) {
+                for_each_writer_span([&merged](auto& out) { out.publishTag(merged, 0UZ); }, outputSpans);
+            }
+        } else {
+            for (const auto& [_, forwarded] : remaining) {
+                for_each_writer_span([&forwarded](auto& out) { out.publishTag(forwarded, 0UZ); }, outputSpans);
+            }
+        }
+    }
+
+    /// forward the tags a stream leaves at or past each input's read position to the end-of-stream index
+    ///
+    /// The tags reach as far as the first end_of_stream tag on any synchronous input. Their settings and port meta
+    /// information are applied first, as the ordinary path applies a chunk's tags before it forwards them. A block with
+    /// a forwardTags() override is handed them there: the call passes processedIn 0, input spans of no samples whose
+    /// tags() holds each such tag at a relative index of 0 or more, and output spans of no samples on which offset 0 is
+    /// the end-of-stream index. tags() also holds, at a negative index, tags already retired, which an override must skip.
+    /// The input's own end_of_stream tag is among the others, and an override must drop that key, as publishEoS()
+    /// publishes its own. Every other block forwards them through forwardRemainingInputTags(). workInternal() calls
+    /// this when an input's stream ends; a stop request forwards none.
+    void forwardTagsAtEndOfStream() {
+        if constexpr (traits::block::stream_input_ports<Derived>::size > 0 && traits::block::stream_output_ports<Derived>::size > 0) {
+            std::size_t endIndex = std::numeric_limits<std::size_t>::max();
+            for_each_port(
+                [&endIndex]<PortLike TPort>(TPort& port) {
+                    if constexpr (std::remove_cvref_t<TPort>::kIsSynch) {
+                        if (port.isConnected()) {
+                            if (const std::optional<std::size_t> toEnd = samples_to_eos_tag(port); toEnd.has_value()) {
+                                endIndex = std::min(endIndex, port.streamReader().position() + *toEnd);
+                            }
+                        }
+                    }
+                },
+                inputPorts<PortType::STREAM>(&self()));
+
+            auto endIn  = prepareStreams<true>(inputPorts<PortType::STREAM>(&self()), endIndex);
+            auto endOut = prepareStreams(outputPorts<PortType::STREAM>(&self()), 0UZ);
+
+            const std::pmr::string endOfStream = static_cast<std::pmr::string>(gr::tag::END_OF_STREAM);
+            for_each_port_and_reader_span(
+                [this, &endOfStream]<PortLike TPort, ReaderSpanLike TReaderSpan>(TPort& port, TReaderSpan& span) {
+                    if (!span.isSync || !span.isConnected) {
+                        return;
+                    }
+                    for (const Tag& tag : span.rawTags) {
+                        if (tag.index < span.streamIndex) {
+                            continue;
+                        }
+                        property_map map = tag.map;
+                        map.erase(endOfStream);
+                        if (map.empty()) {
+                            continue;
+                        }
+                        settings().autoUpdate(Tag{0UZ, map});
+                        if (const auto res = port.metaInfo.update(map); !res.has_value()) {
+                            emitMessage("Block::forwardTagsAtEndOfStream - rejected tag", {{"error", res.error().message}});
+                        }
+                    }
+                },
+                inputPorts<PortType::STREAM>(&self()), endIn);
+            applyChangedSettings(false);
+
+            if constexpr (requires { self().forwardTags(endIn, endOut, 0UZ); }) {
+                self().forwardTags(endIn, endOut, 0UZ);
+            } else {
+                forwardRemainingInputTags(endIn, endOut);
+            }
+            publishSamples(0UZ, endOut);
+            consumeReaders(0UZ, endIn);
+        }
+    }
+
     /// apply settings from per-port input tags and update PortMetaInfo — no merge, no intermediate storage
     template<typename TInputSpans>
     void applyInputTagsFromPorts(TInputSpans& inputSpans, std::size_t untilLocalIndex = 1UZ) noexcept {
@@ -1463,6 +1590,9 @@ public:
         outputStreamCache.invalidateConfig();
     }
 
+    /// with kRemainingTags, each input span holds no samples, and a synchronous one every tag its ring holds at an
+    /// index up to nSyncSamples, which is then the last stream index and not a sample count
+    template<bool kRemainingTags = false>
     constexpr static auto prepareStreams(auto ports, std::size_t nSyncSamples) {
         return meta::tuple_transform(
             [nSyncSamples]<typename PortOrCollection>(PortOrCollection& outputPortOrCollection) noexcept {
@@ -1470,13 +1600,15 @@ public:
                     using enum gr::SpanReleasePolicy;
                     if constexpr (std::remove_cvref_t<Port>::kIsInput) {
                         if constexpr (std::remove_cvref_t<Port>::kIsSynch) {
-                            if constexpr (std::remove_cvref_t<Port>::isOptional()) { // handle unconnected Optional ports: request 0 samples (like async)
+                            if constexpr (kRemainingTags) {
+                                return std::forward<Port>(port).template getRemainingTags<ProcessAll, !kWholeChunkTagWindow>(nSyncSamples);
+                            } else if constexpr (std::remove_cvref_t<Port>::isOptional()) { // handle unconnected Optional ports: request 0 samples (like async)
                                 return std::forward<Port>(port).template get<ProcessAll, !kWholeChunkTagWindow>(port.isConnected() ? nSyncSamples : 0UZ);
                             } else {
                                 return std::forward<Port>(port).template get<ProcessAll, !kWholeChunkTagWindow>(nSyncSamples);
                             }
                         } else {
-                            return std::forward<Port>(port).template get<ProcessNone, !kWholeChunkTagWindow>(port.streamReader().available());
+                            return std::forward<Port>(port).template get<ProcessNone, !kWholeChunkTagWindow>(kRemainingTags ? 0UZ : port.streamReader().available());
                         }
                     } else if constexpr (std::remove_cvref_t<Port>::kIsOutput) {
                         if constexpr (std::remove_cvref_t<Port>::kIsSynch) {
@@ -2366,8 +2498,30 @@ public:
                     _pendingForwardParams.clear();
                 }
                 invokeProcessEpilogue(epilogueIn, epilogueOut);
+                // a tag placed past what the epilogue published moves to the end-of-stream index, which keeps the
+                // output's tag ring in index order
+                for_each_writer_span(
+                    [](auto& out) {
+                        const std::size_t endIndex = out.streamIndex + out.nRequestedSamplesToPublish();
+                        for (std::size_t i = 0UZ; i < out.tagsPublished; ++i) {
+                            out.tags[i].index = std::min(out.tags[i].index, endIndex);
+                        }
+                    },
+                    epilogueOut);
+                // the default forwarder forwarded every tag of the trailing span, and an override was handed them all;
+                // an epilogue that consumes less leaves them behind
+                for_each_reader_span(
+                    [trailing](auto& in) {
+                        if (in.isSync && in.isConnected) {
+                            in.consumeTags(trailing);
+                        }
+                    },
+                    epilogueIn);
                 publishSamples(0UZ, epilogueOut); // publish only what the block explicitly requested via out.publish(n)
                 consumeReaders(trailing, epilogueIn);
+            }
+            if (limits.isEosPresent && !lifecycle::isShuttingDown(this->state())) {
+                forwardTagsAtEndOfStream();
             }
             emitErrorMessageIfAny("workInternal(): EOS tag arrived -> REQUESTED_STOP", this->changeStateTo(lifecycle::State::REQUESTED_STOP));
             publishEoS();
