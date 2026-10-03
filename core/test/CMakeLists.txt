@@ -98,7 +98,9 @@ endif()
 # shares one binary directory, so they may not run concurrently.
 set(_COMPILE_FAIL_TESTS cf_UnfilteredTagPropagation_resampling cf_UnfilteredTagPropagation_async
                         cf_UnfilteredTagPropagation_forwardtags_constrained)
-foreach(TEST_NAME IN LISTS _COMPILE_FAIL_TESTS)
+set(_COMPILE_FAIL_FILTERED_TESTS cf_FilteredTagPropagation_unfiltered cf_FilteredTagPropagation_notag)
+set(_COMPILE_FAIL_EVERY_KEY_TESTS cf_ForwardsEveryKey_forwardtags_deduced)
+foreach(TEST_NAME IN LISTS _COMPILE_FAIL_TESTS _COMPILE_FAIL_FILTERED_TESTS _COMPILE_FAIL_EVERY_KEY_TESTS)
   add_executable(${TEST_NAME} EXCLUDE_FROM_ALL compile_fail/${TEST_NAME}.cpp)
   target_include_directories(${TEST_NAME} PRIVATE ${CMAKE_BINARY_DIR}/include ${CMAKE_CURRENT_BINARY_DIR})
   target_link_libraries(${TEST_NAME} PRIVATE gnuradio-options gnuradio-core)
@@ -109,6 +111,22 @@ set_tests_properties(
   ${_COMPILE_FAIL_TESTS}
   PROPERTIES PASS_REGULAR_EXPRESSION
              "UnfilteredTagPropagation is not available"
+             RESOURCE_LOCK
+             gr_core_build_tree
+             TIMEOUT
+             300)
+set_tests_properties(
+  ${_COMPILE_FAIL_FILTERED_TESTS}
+  PROPERTIES PASS_REGULAR_EXPRESSION
+             "FilteredTagPropagation cannot be combined"
+             RESOURCE_LOCK
+             gr_core_build_tree
+             TIMEOUT
+             300)
+set_tests_properties(
+  ${_COMPILE_FAIL_EVERY_KEY_TESTS}
+  PROPERTIES PASS_REGULAR_EXPRESSION
+             "calls a forwardTags\\(\\) that hasForwardTagsOverride\\(\\) does not see"
              RESOURCE_LOCK
              gr_core_build_tree
              TIMEOUT

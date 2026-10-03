@@ -121,6 +121,20 @@ constexpr std::size_t subblockChunkSize() {
     }
 }
 
+template<typename TMember>
+consteval bool memberForwardsEveryKey() {
+    if constexpr (std::is_void_v<TMember>) {
+        return true;
+    } else {
+        return TMember::forwardsEveryKey();
+    }
+}
+
+/// a composed block forwards every key only where each member block does, and keeps the auto-forward keys otherwise.
+/// An optional member left out as void does not count.
+template<typename TComposed, typename... TMembers>
+using MergedBlockBase = std::conditional_t<(memberForwardsEveryKey<TMembers>() && ...), Block<TComposed>, Block<TComposed, FilteredTagPropagation>>;
+
 } // namespace detail
 
 /**
@@ -136,7 +150,7 @@ constexpr std::size_t subblockChunkSize() {
 
 template<BlockLike Left, std::size_t OutId, //
     BlockLike Right, std::size_t InId>
-class MergeByIndex : public Block<MergeByIndex<Left, OutId, Right, InId>> {
+class MergeByIndex : public detail::MergedBlockBase<MergeByIndex<Left, OutId, Right, InId>, Left, Right> {
     template<typename TDesc>
     friend struct detail::to_right_descriptor;
 
@@ -166,7 +180,7 @@ public:
     MergeByIndex(MergeByIndex&& other) noexcept(std::is_nothrow_move_constructible_v<Left> && std::is_nothrow_move_constructible_v<Right>) : _leftBlock(std::move(other._leftBlock)), _rightBlock(std::move(other._rightBlock)) {}
 
     // copy-paste from above, keep in sync
-    using base = Block<MergeByIndex<Left, OutId, Right, InId>>;
+    using base = detail::MergedBlockBase<MergeByIndex<Left, OutId, Right, InId>, Left, Right>;
 
     mutable Left  _leftBlock;
     mutable Right _rightBlock;
@@ -395,7 +409,7 @@ struct SplitMergeCombine;
 
 // specialisation: no OutputSigns — all signs default to +1 (keep in sync with OutputSigns specialisation below)
 template<BlockLike... Paths>
-struct SplitMergeCombine<Paths...> : Block<SplitMergeCombine<Paths...>> {
+struct SplitMergeCombine<Paths...> : detail::MergedBlockBase<SplitMergeCombine<Paths...>, Paths...> {
     using Traits     = detail::SplitMergeCombineTraits<Paths...>;
     using InputType  = typename Traits::InputType;
     using OutputType = typename Traits::OutputType;
@@ -479,7 +493,7 @@ struct SplitMergeCombine<Paths...> : Block<SplitMergeCombine<Paths...>> {
     Graph graph() const { return std::move(graphWithPortMaps().graph); }
 
 private:
-    using base = Block<SplitMergeCombine<Paths...>>;
+    using base = detail::MergedBlockBase<SplitMergeCombine<Paths...>, Paths...>;
     friend base;
 
     static constexpr std::size_t merged_work_chunk_size() noexcept { return Traits::mergedWorkChunkSize(); }
@@ -487,7 +501,7 @@ private:
 
 // specialisation: with OutputSigns — per-path sign/weight before summation (keep in sync with no-signs specialisation above)
 template<auto... Vs, BlockLike... Paths>
-struct SplitMergeCombine<OutputSigns<Vs...>, Paths...> : Block<SplitMergeCombine<OutputSigns<Vs...>, Paths...>> {
+struct SplitMergeCombine<OutputSigns<Vs...>, Paths...> : detail::MergedBlockBase<SplitMergeCombine<OutputSigns<Vs...>, Paths...>, Paths...> {
     using Traits     = detail::SplitMergeCombineTraits<Paths...>;
     using InputType  = typename Traits::InputType;
     using OutputType = typename Traits::OutputType;
@@ -577,7 +591,7 @@ struct SplitMergeCombine<OutputSigns<Vs...>, Paths...> : Block<SplitMergeCombine
     Graph graph() const { return std::move(graphWithPortMaps().graph); }
 
 private:
-    using base = Block<SplitMergeCombine<OutputSigns<Vs...>, Paths...>>;
+    using base = detail::MergedBlockBase<SplitMergeCombine<OutputSigns<Vs...>, Paths...>, Paths...>;
     friend base;
 
     static constexpr std::size_t merged_work_chunk_size() noexcept { return Traits::mergedWorkChunkSize(); }
@@ -719,11 +733,12 @@ template<BlockLike Forward, std::size_t ForwardOutputPortIndex, //
     BlockLike Feedback, std::size_t FeedbackOutputPortIndex,    //
     std::size_t ForwardFeedbackInputPortIndex,                  //
     typename Monitor>
-class FeedbackMergeByIndex : public Block<FeedbackMergeByIndex<Forward, ForwardOutputPortIndex,    //
-                                 Feedback, FeedbackOutputPortIndex, ForwardFeedbackInputPortIndex, //
-                                 Monitor>>,                                                        //
-                             public FeedbackMergeBase<Forward, ForwardOutputPortIndex,             //
-                                 Feedback, FeedbackOutputPortIndex, ForwardFeedbackInputPortIndex, //
+class FeedbackMergeByIndex : public detail::MergedBlockBase<FeedbackMergeByIndex<Forward, ForwardOutputPortIndex,                 //
+                                                                Feedback, FeedbackOutputPortIndex, ForwardFeedbackInputPortIndex, //
+                                                                Monitor>,                                                         //
+                                 Forward, Feedback, Monitor>,                                                                     //
+                             public FeedbackMergeBase<Forward, ForwardOutputPortIndex,                                            //
+                                 Feedback, FeedbackOutputPortIndex, ForwardFeedbackInputPortIndex,                                //
                                  Monitor> {
     using impl_t = FeedbackMergeBase<Forward, ForwardOutputPortIndex,     //
         Feedback, FeedbackOutputPortIndex, ForwardFeedbackInputPortIndex, //
@@ -779,7 +794,7 @@ template<BlockLike Forward, std::size_t ForwardOutputPortIndex, //
     BlockLike Feedback, std::size_t FeedbackOutputPortIndex,    //
     std::size_t ForwardFeedbackInputPortIndex,                  //
     typename Monitor>
-class FeedbackMergeWithTapByIndex : public Block<FeedbackMergeWithTapByIndex<Forward, ForwardOutputPortIndex, Feedback, FeedbackOutputPortIndex, ForwardFeedbackInputPortIndex, Monitor>>, //
+class FeedbackMergeWithTapByIndex : public detail::MergedBlockBase<FeedbackMergeWithTapByIndex<Forward, ForwardOutputPortIndex, Feedback, FeedbackOutputPortIndex, ForwardFeedbackInputPortIndex, Monitor>, Forward, Feedback, Monitor>, //
                                     public FeedbackMergeBase<Forward, ForwardOutputPortIndex, Feedback, FeedbackOutputPortIndex, ForwardFeedbackInputPortIndex, Monitor> {
     using impl_t = FeedbackMergeBase<Forward, ForwardOutputPortIndex, Feedback, FeedbackOutputPortIndex, ForwardFeedbackInputPortIndex, Monitor>;
     using this_t = FeedbackMergeWithTapByIndex<Forward, ForwardOutputPortIndex, Feedback, FeedbackOutputPortIndex, ForwardFeedbackInputPortIndex, Monitor>;
@@ -795,7 +810,7 @@ public:
         gr::meta::typelist<                                                                     //
             gr::detail::PortDescriptor<typename impl_t::FeedbackConnectionPortType, "splitOut", //
                 gr::PortType::STREAM, gr::PortDirection::OUTPUT, gr::detail::SinglePort,        //
-                /*KindExtraData=*/0, /*MemberIdx=*/refl::data_member_count<Block<this_t>>>>>;
+                /*KindExtraData=*/0, /*MemberIdx=*/refl::data_member_count<detail::MergedBlockBase<this_t, Forward, Feedback, Monitor>>>>>;
 
     using impl_t::impl_t;
     using impl_t::settingsChanged;

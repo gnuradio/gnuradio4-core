@@ -633,13 +633,16 @@ enum class Category {
 inline constexpr std::array<std::string_view, 8UZ> kFrameworkOwnedSettings{"input_chunk_size", "output_chunk_size", "stride", "disconnect_on_done", "compute_domain", "unique_name", "name", "ui_constraints"};
 
 /**
- * @brief Whether `UnfilteredTagPropagation` may be declared for `TBlock`.
+ * @brief Whether `TBlock` forwards every tag key and may declare `UnfilteredTagPropagation`.
  *
- * The policy promises that a tag arriving at input offset `t` leaves at output offset `t`. Declared resampling and
- * declared stride both break that; the default forwarder never reads an asynchronous input port, and an asynchronous
- * output port publishes a sample count the forwarded offset does not derive from; each of the other four
- * tag-propagation policies moves or suppresses the forwarded tag; and a `forwardTags()` override replaces the default
- * forwarder outright. What the predicate cannot express is the block's own obligation to preserve sample positions.
+ * Forwarding every key promises that a tag arriving at input offset `t` leaves at output offset `t`. The predicate is
+ * false for a block with any of:
+ * - `Resampling<>` or `Stride<>`
+ * - an asynchronous stream port
+ * - a tag-propagation policy other than `UnfilteredTagPropagation`
+ * - a `forwardTags()` override
+ *
+ * The predicate cannot check that the block keeps sample positions.
  */
 template<typename TBlock>
 constexpr bool kUnfilteredTagPropagationAdmissible =                                                                                  //
@@ -647,7 +650,7 @@ constexpr bool kUnfilteredTagPropagationAdmissible =                            
     && traits::block::stream_input_ports<TBlock>::template all_of<traits::port::is_synchronous>                                       //
     && traits::block::stream_output_ports<TBlock>::template all_of<traits::port::is_synchronous>                                      //
     && !TBlock::noTagPropagation && !TBlock::forwardTagPropagation && !TBlock::backwardTagPropagation && !TBlock::mergeTagPropagation //
-    && !TBlock::hasForwardTagsOverride();
+    && !TBlock::filteredTagPropagation && !TBlock::hasForwardTagsOverride();
 } // namespace block
 
 /**
@@ -794,11 +797,18 @@ public:
     constexpr static bool backwardTagPropagation   = std::disjunction_v<std::is_same<BackwardTagPropagation, Arguments>...>;
     constexpr static bool mergeTagPropagation      = std::disjunction_v<std::is_same<MergeTagPropagation, Arguments>...>;
     constexpr static bool unfilteredTagPropagation = std::disjunction_v<std::is_same<UnfilteredTagPropagation, Arguments>...>;
+    constexpr static bool filteredTagPropagation   = std::disjunction_v<std::is_same<FilteredTagPropagation, Arguments>...>;
+
+    /// whether the default forwarder keeps every key of every tag. It does on a block passing
+    /// block::kUnfilteredTagPropagationAdmissible, which every block declaring UnfilteredTagPropagation must pass. The
+    /// predicate reads Derived's ports and its forwardTags(). Derived is complete only inside a function body. The
+    /// predicate is therefore evaluated there, not in the class body.
+    [[nodiscard]] static consteval bool forwardsEveryKey() noexcept { return block::kUnfilteredTagPropagationAdmissible<Derived>; }
 
     /// the input span retires, and the default forwarder reads, every tag of the chunk rather than only the tags at
-    /// its first sample: BackwardTagPropagation needs it to place an interior tag on the chunk that consumed it,
-    /// UnfilteredTagPropagation to leave it at the offset it arrived at
-    constexpr static bool kWholeChunkTagWindow = backwardTagPropagation || unfilteredTagPropagation;
+    /// its first sample: BackwardTagPropagation needs it to place an interior tag on the chunk that consumed it, a
+    /// block forwarding every key to leave it at the offset it arrived at
+    [[nodiscard]] static consteval bool hasWholeChunkTagWindow() noexcept { return backwardTagPropagation || forwardsEveryKey(); }
 
     constexpr static block::Category blockCategory = block::Category::NormalBlock;
 
@@ -1086,15 +1096,23 @@ public:
 
     /// whether the block supplies the forwardTags() that workInternal() calls in place of the default forwarder
     ///
-    /// The probe passes the span tuples prepareStreams() builds from this block's own stream ports, which are the
-    /// types the work path and the epilogue path pass, so an override constrained to them answers the same here as
-    /// there. A probe on empty tuples answers "no override" for every such constrained override.
-    [[nodiscard]] static constexpr bool hasForwardTagsOverride() noexcept {
-        using TInputSpans  = decltype(prepareStreams(inputPorts<PortType::STREAM>(std::declval<Derived*>()), 0UZ));
-        using TOutputSpans = decltype(prepareStreams(outputPorts<PortType::STREAM>(std::declval<Derived*>()), 0UZ));
+    /// The probe passes the span tuples prepareStreams() builds from this block's own stream ports. The work path and
+    /// the epilogue path pass the same types, and an override constrained to them answers the same here as there. A
+    /// probe on empty tuples answers "no override" for every such constrained override. The input span type carries
+    /// the tag window it retires, and that window depends on this answer. The probe tries the spans of both windows.
+    /// The probe misses an override with a deduced return type whose body reads the window.
+    /// checkBlockArgumentContracts() refuses such an override on a block forwarding every key.
+    [[nodiscard]] static constexpr bool hasForwardTagsOverride() noexcept { return acceptsForwardTagsSpans<true>() || acceptsForwardTagsSpans<false>(); }
+
+private:
+    template<bool kRetireOnlyFirstTag>
+    [[nodiscard]] static constexpr bool acceptsForwardTagsSpans() noexcept {
+        using TInputSpans  = decltype(prepareStreamsRetiring<kRetireOnlyFirstTag>(inputPorts<PortType::STREAM>(std::declval<Derived*>()), 0UZ));
+        using TOutputSpans = decltype(prepareStreamsRetiring<kRetireOnlyFirstTag>(outputPorts<PortType::STREAM>(std::declval<Derived*>()), 0UZ));
         return requires(Derived& block, TInputSpans& inputSpans, TOutputSpans& outputSpans) { block.forwardTags(inputSpans, outputSpans, 0UZ); };
     }
 
+public:
     /// contracts between a block's declared Arguments, its ports and its processing function; the body is
     /// static_asserts only, so the check costs nothing at run time and holds in every build configuration
     constexpr void checkBlockArgumentContracts() const noexcept {
@@ -1114,9 +1132,17 @@ public:
             static_assert(!StrideControl::kEnabled, "UnfilteredTagPropagation is not available for a block declaring Stride<>: skipped or overlapping input leaves a consumed sample without an output sample at the same offset, so forwardTags() must map the offsets.");
             static_assert(traits::block::stream_input_ports<Derived>::template all_of<traits::port::is_synchronous>, "UnfilteredTagPropagation is not available for a block with an asynchronous stream input port: the default forwarder never reads such a port, so nothing would be forwarded from it.");
             static_assert(traits::block::stream_output_ports<Derived>::template all_of<traits::port::is_synchronous>, "UnfilteredTagPropagation is not available for a block with an asynchronous stream output port: the forwarded offset is derived from the synchronous sample count and means nothing on a port that publishes its own.");
-            static_assert(!noTagPropagation && !forwardTagPropagation && !backwardTagPropagation && !mergeTagPropagation, "UnfilteredTagPropagation cannot be combined with another tag-propagation policy: each of the other four either suppresses forwarding or moves the output offset the policy promises to preserve.");
+            static_assert(!noTagPropagation && !forwardTagPropagation && !backwardTagPropagation && !mergeTagPropagation && !filteredTagPropagation, "UnfilteredTagPropagation cannot be combined with another tag-propagation policy: each of the other five suppresses forwarding, moves the output offset the policy promises to preserve, or filters the keys the policy promises to keep.");
             static_assert(!hasForwardTagsOverride(), "UnfilteredTagPropagation is not available for a block supplying forwardTags(): the override replaces the default forwarder entirely, so the policy would have no effect.");
             static_assert(block::kUnfilteredTagPropagationAdmissible<Derived>, "UnfilteredTagPropagation admissibility and the assertions above must state the same conditions.");
+        }
+        if constexpr (filteredTagPropagation) {
+            static_assert(!unfilteredTagPropagation && !noTagPropagation, "FilteredTagPropagation cannot be combined with UnfilteredTagPropagation or NoTagPropagation: the first requires every key, and the second forwards no tag.");
+        }
+        if constexpr (forwardsEveryKey()) {
+            using TInputSpans  = decltype(prepareStreams(inputPorts<PortType::STREAM>(std::declval<Derived*>()), 0UZ));
+            using TOutputSpans = decltype(prepareStreams(outputPorts<PortType::STREAM>(std::declval<Derived*>()), 0UZ));
+            static_assert(!requires(Derived& block, TInputSpans& inputSpans, TOutputSpans& outputSpans) { block.forwardTags(inputSpans, outputSpans, 0UZ); }, "A block forwarding every key calls a forwardTags() that hasForwardTagsOverride() does not see: the override deduces its return type from a body that reads the tag window. Declare the override's return type.");
         }
     }
 
@@ -1256,7 +1282,7 @@ public:
         }
     }
 
-    /// keep the auto-forward keys of an incoming tag — every key under UnfilteredTagPropagation — substituting this
+    /// keep the auto-forward keys of an incoming tag, or every key where forwardsEveryKey(), substituting this
     /// block's own current value for a key it declares as a setting, and on a resampling block the rate it publishes
     /// at for the rate it is fed. The settings snapshot is taken lazily, and only where a key is actually owned, so a
     /// tag of keys this block knows nothing about costs no copy.
@@ -1266,7 +1292,7 @@ public:
         property_map                 dst;
         for (const auto& [key, value] : src) {
             auto shortKey = convert_string_domain(key);
-            if constexpr (!unfilteredTagPropagation) {
+            if constexpr (!forwardsEveryKey()) {
                 if (!autoForwardKeys.contains(shortKey)) {
                     continue;
                 }
@@ -1290,16 +1316,14 @@ public:
 
     /// default tag forwarding — called by workInternal unless the user provides forwardTags()
     ///
-    /// The window read here is the window the input span retires: prepareStreams() builds it with
-    /// consumeOnlyFirstTag = !kWholeChunkTagWindow. Under the default policy the span drops exactly the tags at
-    /// relIndex <= 0, which is what tags(1) yields, and a tag interior to a chunk that could not be broken at it —
-    /// min_samples, or input_chunk_size > 1 — stays in the buffer and returns in the next chunk at a negative
-    /// relIndex, still unforwarded, so clamping it to offset 0 publishes it for the first time rather than a second.
-    /// Under BackwardTagPropagation and under UnfilteredTagPropagation the window is the whole consumed chunk: the
-    /// span retires every tag it holds, nothing is ever deferred, and no tag can return at a negative relIndex.
-    /// UnfilteredTagPropagation then publishes each at its own relIndex, which is what its offset promise means. A
-    /// forwardTags() override reading a wider window than its policy retires sees a deferred tag twice and must skip
-    /// relIndex < 0.
+    /// This function reads the window the input span retires. prepareStreams() builds that window with
+    /// consumeOnlyFirstTag = !hasWholeChunkTagWindow(). On a key-filtered block the span retires the tags at
+    /// relIndex <= 0, the tags that tags(1) returns. An input min_samples, or an input_chunk_size above one, can keep a
+    /// chunk from breaking at a tag. That tag stays in the buffer and returns in the next chunk at a negative relIndex.
+    /// It has not been forwarded yet. Clamping it to offset 0 publishes it once. Under BackwardTagPropagation, and
+    /// on a block forwarding every key, the span retires every tag of the consumed chunk. A block forwarding every key
+    /// publishes each tag at its own relIndex. A forwardTags() override reading a wider window than its policy retires
+    /// sees a deferred tag twice and must skip relIndex < 0.
     template<typename TInputSpans, typename TOutputSpans>
     void forwardInputTags(TInputSpans& inputSpans, TOutputSpans& outputSpans, std::size_t processedIn, std::optional<std::size_t> tagWindowOverride = {}) noexcept {
         if constexpr (noTagPropagation) {
@@ -1307,7 +1331,7 @@ public:
         }
         // the override widens the window for the stream's final window, where no later chunk
         // exists to retire a deferred interior tag
-        const std::size_t tagWindow = tagWindowOverride.value_or(kWholeChunkTagWindow ? processedIn : 1UZ);
+        const std::size_t tagWindow = tagWindowOverride.value_or(hasWholeChunkTagWindow() ? processedIn : 1UZ);
 
         std::optional<property_map> cachedSettings;
         auto                        filterAndSubstitute = [&](const property_map& src) { return filterAndSubstituteTag(src, cachedSettings); };
@@ -1315,7 +1339,7 @@ public:
         auto publishFiltered = [&](std::ptrdiff_t relIndex, const property_map& tagMap) {
             auto forwarded = filterAndSubstitute(tagMap);
             if (!forwarded.empty()) {
-                if constexpr (unfilteredTagPropagation) {
+                if constexpr (forwardsEveryKey()) {
                     assert(relIndex >= 0 && "a chunk that retires every tag it forwards cannot be handed one back");
                 }
                 const auto offset = backwardTagPropagation ? 0UZ : static_cast<std::size_t>(std::max(std::ptrdiff_t(0), relIndex));
@@ -1397,7 +1421,7 @@ public:
     void applyInputTagsFromPorts(TInputSpans& inputSpans, std::size_t untilLocalIndex = 1UZ) noexcept {
         // the window matches the one the span retires, or a tag retired without being read here would never reach
         // settings at all; an interior tag's settings take effect from the chunk's first sample, not from its own
-        const std::size_t tagWindow = kWholeChunkTagWindow ? untilLocalIndex : 1UZ;
+        const std::size_t tagWindow = hasWholeChunkTagWindow() ? untilLocalIndex : 1UZ;
 
         for_each_reader_span(
             [this, tagWindow](auto& in) {
@@ -1463,7 +1487,12 @@ public:
         outputStreamCache.invalidateConfig();
     }
 
-    constexpr static auto prepareStreams(auto ports, std::size_t nSyncSamples) {
+    constexpr static auto prepareStreams(auto ports, std::size_t nSyncSamples) { return prepareStreamsRetiring<!hasWholeChunkTagWindow()>(ports, nSyncSamples); }
+
+private:
+    /// the spans prepareStreams() builds, with the input tag window named by the caller
+    template<bool kRetireOnlyFirstTag>
+    constexpr static auto prepareStreamsRetiring(auto ports, std::size_t nSyncSamples) {
         return meta::tuple_transform(
             [nSyncSamples]<typename PortOrCollection>(PortOrCollection& outputPortOrCollection) noexcept {
                 auto processSinglePort = [&nSyncSamples]<typename Port>(Port&& port) {
@@ -1471,12 +1500,12 @@ public:
                     if constexpr (std::remove_cvref_t<Port>::kIsInput) {
                         if constexpr (std::remove_cvref_t<Port>::kIsSynch) {
                             if constexpr (std::remove_cvref_t<Port>::isOptional()) { // handle unconnected Optional ports: request 0 samples (like async)
-                                return std::forward<Port>(port).template get<ProcessAll, !kWholeChunkTagWindow>(port.isConnected() ? nSyncSamples : 0UZ);
+                                return std::forward<Port>(port).template get<ProcessAll, kRetireOnlyFirstTag>(port.isConnected() ? nSyncSamples : 0UZ);
                             } else {
-                                return std::forward<Port>(port).template get<ProcessAll, !kWholeChunkTagWindow>(nSyncSamples);
+                                return std::forward<Port>(port).template get<ProcessAll, kRetireOnlyFirstTag>(nSyncSamples);
                             }
                         } else {
-                            return std::forward<Port>(port).template get<ProcessNone, !kWholeChunkTagWindow>(port.streamReader().available());
+                            return std::forward<Port>(port).template get<ProcessNone, kRetireOnlyFirstTag>(port.streamReader().available());
                         }
                     } else if constexpr (std::remove_cvref_t<Port>::kIsOutput) {
                         if constexpr (std::remove_cvref_t<Port>::kIsSynch) {
@@ -1498,6 +1527,7 @@ public:
             ports);
     }
 
+public:
     template<typename TInputSpans, typename TOutputSpans>
     [[nodiscard]] work::Status preparedStreamsStatus(const TInputSpans& inputSpans, const TOutputSpans& outputSpans, std::size_t expectedIn, std::size_t expectedOut) noexcept {
         bool        insufficientInput  = false;
