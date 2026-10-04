@@ -151,6 +151,7 @@ protected:
     std::size_t                    _nDeferredExchanges{0UZ}; // claimed swaps still running outside the job count
     std::size_t                    _nStopRequests{0UZ};
     bool                           _pendingStopRequest{false}; // a requested stop that no run loop has consumed yet
+    bool                           _startReturned{false};      // set when start() returns, cleared when the next run is prepared
     std::optional<Error>           _startError;                // written by failStart(), cleared when a start begins
 
     // for blocks that were added while scheduler was running. They need to be adopted by a thread
@@ -180,6 +181,21 @@ protected:
     void stopWatchdogs() {
         gr::atomic_ref(_watchdogGeneration).fetch_add(1UZ);
         gr::atomic_ref(_watchdogGeneration).notify_all();
+    }
+
+    // A single-threaded run executes its worker inside start(), on the thread that requested RUNNING. Without this
+    // check, a swap from another thread during that call would restart the new graph on the caller's thread and hold
+    // the caller until the graph ends. The scheduler refuses such a swap and keeps its run, from the moment the state
+    // reads RUNNING until start() returns; the job count rises only partway through start(). After start() has
+    // returned, the swap proceeds.
+    [[nodiscard]] std::expected<void, Error> swapAllowedFromThisThread() {
+        if constexpr (executionPolicy() == ExecutionPolicy::singleThreaded || executionPolicy() == ExecutionPolicy::singleThreadedBlocking) {
+            const auto state = this->state();
+            if (!isOnOwnWorkerThread() && lifecycle::isActive(state) && !gr::atomic_ref(_startReturned).load_acquire()) {
+                return std::unexpected(Error(std::format("exchange(): the single-threaded scheduler '{}' is {} on another thread; stop it before exchanging its graph", this->unique_name, gr::meta::enumName(state).value_or(""))));
+            }
+        }
+        return {};
     }
 
     // a worker occupies its pool thread for the scheduler's lifetime, so a job list that never gets one
@@ -359,6 +375,10 @@ public:
             return meta::indirect<Graph>{};
         }
 
+        if (auto allowed = swapAllowedFromThisThread(); !allowed) {
+            return std::unexpected(allowed.error());
+        }
+
         if (lifecycle::isActive(oldState)) { // need to stop running scheduler
             if (auto result = this->changeStateTo(REQUESTED_STOP); !result) {
                 return std::unexpected(result.error());
@@ -444,6 +464,9 @@ public:
     void stateChanged(lifecycle::State newState) {
         if (newState == lifecycle::State::REQUESTED_STOP) { // set with the claim, before stop() collapses the state to STOPPED
             gr::atomic_ref(_pendingStopRequest).store_release(true);
+        }
+        if (newState == lifecycle::State::INITIALISED) { // every run is prepared in this state before it enters RUNNING
+            gr::atomic_ref(_startReturned).store_release(false);
         }
         this->notifyListeners(block::property::kLifeCycleState, {{"state", std::string(gr::meta::enumName(newState).value_or(""))}});
     }
@@ -804,6 +827,7 @@ protected:
 
     void start() {
         using enum gr::lifecycle::State;
+        on_scope_exit markStartReturned = [this] { gr::atomic_ref(_startReturned).store_release(true); };
 
         // stop() publishes STOPPED and retires the run's workers by generation, without waiting for
         // them. A worker the pool counted but has not started releases its count when the pool reaches
@@ -1833,6 +1857,10 @@ protected:
                 try {
                     auto newGraph = gr::loadGrc(pluginLoader, yamlContent);
 
+                    if (auto allowed = swapAllowedFromThisThread(); !allowed) { // before the current blocks are retired
+                        message.data = std::unexpected(allowed.error());
+                        return message;
+                    }
                     makeAllZombies();
 
                     const auto originalState = this->state();
