@@ -130,6 +130,9 @@ namespace detail {
 /**
  * Get the minimum sequence from an array of Sequences.
  *
+ * Each sequence is read once. For sequences that only advance, the result is no greater than any of their values when
+ * the call returns.
+ *
  * \param sequences sequences to compare.
  * \param minimum the initial default minimum. If the array is empty, this value will be returned.
  * \returns the minimum sequence found or lon.MaxValue if the array is empty.

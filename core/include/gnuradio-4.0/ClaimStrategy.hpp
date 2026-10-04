@@ -116,7 +116,7 @@ private:
         if (_snapshotReadSequences->empty()) {
             return _reserveCursor; // no readers: nothing gates the writer, published samples are discarded
         }
-        return std::ranges::min(*_snapshotReadSequences | std::views::transform([](const auto& cursor) { return cursor->value(); }));
+        return detail::getMinimumSequence(*_snapshotReadSequences);
     }
 };
 
@@ -306,7 +306,7 @@ private:
         if (readSequences->size() == 1UZ) {
             return readSequences->front()->value();
         }
-        return std::ranges::min(*readSequences | std::views::transform([](const auto& cursor) { return cursor->value(); }));
+        return detail::getMinimumSequence(*readSequences);
     }
 };
 

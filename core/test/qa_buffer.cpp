@@ -1929,6 +1929,127 @@ const boost::ut::suite<"CursorCacheStaleness"> _cursorCacheTests = [] {
     };
 };
 
+namespace {
+using SlowestReaderStrategies = std::tuple<std::type_identity<gr::SingleProducerStrategy<std::dynamic_extent, gr::NoWaitStrategy>>, std::type_identity<gr::MultiProducerStrategy<std::dynamic_extent, gr::NoWaitStrategy>>>;
+
+// With the reserve cursor at the capacity and every reader at or below it, getRemainingCapacity() returns the slowest
+// reader's position.
+template<typename Strategy>
+std::vector<std::shared_ptr<gr::Sequence>> attachReadersAtCapacity(Strategy& strategy, std::size_t nReaders, std::size_t capacity) {
+    std::vector<std::shared_ptr<gr::Sequence>> readers;
+    for (std::size_t i = 0UZ; i < nReaders; ++i) {
+        readers.push_back(std::make_shared<gr::Sequence>());
+    }
+    gr::detail::addSequences(strategy._readSequences, strategy._publishCursor, readers);
+    strategy.notifyReaderSetChanged();
+    if constexpr (std::is_same_v<decltype(strategy._reserveCursor), std::size_t>) {
+        strategy._reserveCursor = capacity;
+    } else {
+        strategy._reserveCursor.setValue(capacity);
+    }
+    return readers;
+}
+} // namespace
+
+const boost::ut::suite<"SlowestReader"> _slowestReaderTests = [] {
+    using namespace boost::ut;
+
+    "the writer's bound is the slowest reader's position"_test = []<typename StrategyType> {
+        using Strategy            = typename StrategyType::type;
+        constexpr std::size_t cap = 1024UZ;
+        Strategy              strategy(cap);
+        const auto            readers = attachReadersAtCapacity(strategy, 3UZ, cap);
+        readers[0]->setValue(7UZ);
+        readers[1]->setValue(3UZ);
+        readers[2]->setValue(11UZ);
+        expect(eq(strategy.getRemainingCapacity(), 3UZ));
+        readers[1]->setValue(20UZ);
+        expect(eq(strategy.getRemainingCapacity(), 7UZ));
+    } | SlowestReaderStrategies{};
+
+    // Three readers take turns. The reader at the back moves to one past the reader at the front. The slowest reader
+    // changes at every step. Reader cursors only advance. The readers start together and stop once the writer has seen
+    // the slowest reader change nChangesWanted times. The bound the writer takes must not exceed any reader position
+    // read after it. A minimum that loads a cursor twice, as libc++'s std::ranges::min does, fails this case. With
+    // libstdc++, whose std::ranges::min loads each cursor once, the case pins the single-read minimum's result alone.
+    "the writer's bound stays at or below every reader while readers overtake one another"_test = []<typename StrategyType> {
+        using Strategy                       = typename StrategyType::type;
+        constexpr std::size_t cap            = 1UZ << 18UZ;
+        constexpr std::size_t nReaders       = 3UZ;
+        constexpr std::size_t nChangesWanted = 1UZ << 12UZ;
+        Strategy              strategy(cap);
+        const auto            readers = attachReadersAtCapacity(strategy, nReaders, cap);
+
+        std::atomic<bool>        go{false};
+        std::atomic<bool>        stop{false};
+        std::atomic<std::size_t> nReadersDone{0UZ};
+        auto                     readerJob = [&](std::size_t self) {
+            while (!go.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            while (!stop.load(std::memory_order_acquire)) {
+                const std::size_t own    = readers[self]->value();
+                std::size_t       front  = 0UZ;
+                bool              atBack = true;
+                for (std::size_t i = 0UZ; i < nReaders; ++i) {
+                    const std::size_t position = readers[i]->value();
+                    front                      = std::max(front, position);
+                    if (position < own || (position == own && i < self)) {
+                        atBack = false;
+                    }
+                }
+                if (front >= cap) {
+                    break;
+                }
+                if (atBack) {
+                    readers[self]->setValue(front + 1UZ);
+                } else {
+                    std::this_thread::yield();
+                }
+            }
+            nReadersDone.fetch_add(1UZ, std::memory_order_acq_rel);
+        };
+
+        std::vector<std::thread> threads;
+        for (std::size_t i = 0UZ; i < nReaders; ++i) {
+            threads.emplace_back(readerJob, i);
+        }
+        go.store(true, std::memory_order_release);
+
+        std::size_t nSamples        = 0UZ;
+        std::size_t nAboveAReader   = 0UZ;
+        std::size_t nSlowestChanges = 0UZ;
+        std::size_t lastSlowest     = nReaders;
+        while (nReadersDone.load(std::memory_order_acquire) < nReaders) {
+            const std::size_t bound   = strategy.getRemainingCapacity();
+            std::size_t       slowest = 0UZ;
+            std::size_t       lowest  = cap + 1UZ;
+            for (std::size_t i = 0UZ; i < nReaders; ++i) {
+                const std::size_t position = readers[i]->value();
+                if (position < bound) {
+                    ++nAboveAReader;
+                }
+                if (position < lowest) {
+                    lowest  = position;
+                    slowest = i;
+                }
+            }
+            nSlowestChanges += (slowest != lastSlowest) ? 1UZ : 0UZ;
+            lastSlowest = slowest;
+            ++nSamples;
+            if (nSlowestChanges >= nChangesWanted) {
+                stop.store(true, std::memory_order_release);
+            }
+        }
+        for (auto& thread : threads) {
+            thread.join();
+        }
+
+        expect(ge(nSlowestChanges, nChangesWanted)) << "the readers must overtake one another while the writer samples";
+        expect(eq(nAboveAReader, 0UZ)) << std::format("the writer's bound exceeded a reader's position in {} of {} samples", nAboveAReader, nSamples);
+    } | SlowestReaderStrategies{};
+};
+
 const boost::ut::suite<"WrapAroundAndEdgeCases"> _wrapAroundTests = [] {
     using namespace boost::ut;
     using gr::CircularBuffer;
