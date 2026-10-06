@@ -138,7 +138,8 @@ private:
         }
 
         _schedulerThread = std::thread([&sched] {
-            // this will invoke scheduler's start(), which blocks
+            // runs the scheduler's start(). Under a single-threaded policy start() returns when the run ends, and under
+            // the others once the workers are queued
             if (!sched.changeStateTo(gr::lifecycle::State::RUNNING)) {
                 std::ignore = sched.changeStateTo(gr::lifecycle::State::ERROR);
             }

@@ -214,13 +214,13 @@ protected:
 public:
     using base_t = Block<Derived>;
 
-    Annotated<gr::Size_t, "timeout", Unit<"ms">, Doc<"sleep timeout to wait if graph has made no progress ">>                  timeout_ms                      = 100U;
-    Annotated<gr::Size_t, "watchdog_timeout", Unit<"ms">, Doc<"sleep timeout for watchdog">>                                   watchdog_timeout                = 1000U;
-    Annotated<gr::Size_t, "timeout_inactivity_count", Doc<"number of inactive cycles w/o progress before sleep is triggered">> timeout_inactivity_count        = 5U;
-    Annotated<gr::Size_t, "process_stream_to_message_ratio", Doc<"number of stream to msg processing">>                        process_stream_to_message_ratio = 16U;
-    Annotated<std::string, "pool name", Doc<"default pool name">>                                                              poolName                        = std::string(gr::thread_pool::kDefaultCpuPoolId);
-    Annotated<std::size_t, "max_work_items", Doc<"number of work items per work scheduling interval (controls latency)">>      max_work_items                  = std::numeric_limits<std::size_t>::max(); // TODO: check whether we can keep this std::size_t or more consistently to gr::Size_t
-    Annotated<property_map, "sched_settings", Doc<"scheduler implementation specific settings">>                               sched_settings{};
+    Annotated<gr::Size_t, "timeout", Unit<"ms">, Doc<"longest wait of an idle or paused worker">>                                          timeout_ms                      = 100U;
+    Annotated<gr::Size_t, "watchdog_timeout", Unit<"ms">, Doc<"sleep timeout for watchdog">>                                               watchdog_timeout                = 1000U;
+    Annotated<gr::Size_t, "timeout_inactivity_count", Doc<"inactive traversals before a park, or watchdog periods before a stall report">> timeout_inactivity_count        = 5U;
+    Annotated<gr::Size_t, "process_stream_to_message_ratio", Doc<"number of stream to msg processing">>                                    process_stream_to_message_ratio = 16U;
+    Annotated<std::string, "pool name", Doc<"default pool name">>                                                                          poolName                        = std::string(gr::thread_pool::kDefaultCpuPoolId);
+    Annotated<std::size_t, "max_work_items", Doc<"number of work items per work scheduling interval (controls latency)">>                  max_work_items                  = std::numeric_limits<std::size_t>::max(); // TODO: check whether we can keep this std::size_t or more consistently to gr::Size_t
+    Annotated<property_map, "sched_settings", Doc<"scheduler implementation specific settings">>                                           sched_settings{};
 
     GR_MAKE_REFLECTABLE(SchedulerBase, timeout_ms, watchdog_timeout, timeout_inactivity_count, process_stream_to_message_ratio, max_work_items, poolName, sched_settings);
 
@@ -1109,7 +1109,7 @@ protected:
                 }
 
                 currentProgress = progressAfter;
-                // parking in a non-RUNNING state would hold the worker until the watchdog's next progress bump
+                // parking in a non-RUNNING state would delay the worker's next state read by up to timeout_ms
                 if (activeState == RUNNING && inactiveCycleCount > timeout_inactivity_count) {
                     // allow a scheduler process to wait on progress before retrying (N.B. intended to save CPU/battery power)
                     // N.B. a watchdog will periodically update the progress to check for non-responsive blocks.
@@ -1142,8 +1142,7 @@ protected:
         }
     }
 
-    // chunked so a lifecycle change is picked up within a chunk instead of at the end of a full timeout_ms
-    // sleep; only reached when the scheduler is not RUNNING, so it does not touch the idle-worker CPU path
+    // polls the state every millisecond until it changes or timeout_ms passes. Only a worker outside RUNNING calls it.
     void sleepUntilStateChanges(lifecycle::State observedState) {
         constexpr auto kChunk   = std::chrono::milliseconds(1);
         const auto     deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms.value);
@@ -1950,6 +1949,33 @@ protected:
     }
 };
 
+namespace detail {
+// contiguous slices keep chain neighbors on the same worker
+inline JobLists batchBlocks(std::span<const std::shared_ptr<BlockModel>> blocks, std::size_t n_batches) {
+    JobLists result;
+    result.reserve(n_batches);
+    const std::size_t nBlocks = blocks.size();
+    for (std::size_t batch = 0UZ; batch < n_batches; ++batch) {
+        const std::size_t first = batch * nBlocks / n_batches;
+        const std::size_t last  = (batch + 1UZ) * nBlocks / n_batches;
+        const auto        slice = blocks.subspan(first, last - first);
+        result.emplace_back(slice.begin(), slice.end());
+    }
+    return result;
+}
+
+inline void printExecutionOrder(const std::vector<std::vector<std::shared_ptr<BlockModel>>>& executionOrder) {
+    std::size_t batchIndex = 0;
+    for (const auto& batch : executionOrder) {
+        std::print("Batch #{}:\n", batchIndex++);
+        for (const auto& block : batch) {
+            std::print("  - {} ({})\n", block->name(), block->uniqueName());
+        }
+    }
+}
+
+} // namespace detail
+
 template<ExecutionPolicy execution = ExecutionPolicy::singleThreaded, profiling::ProfilerLike TProfiler = profiling::null::Profiler>
 struct Simple : SchedulerBase<Simple<execution, TProfiler>, execution, TProfiler> {
     using Description = Doc<R""(Simple loop based Scheduler, which iterates over all blocks in the order they have beein defined and emplaced definition in the graph.)"">;
@@ -1975,43 +2001,9 @@ struct Simple : SchedulerBase<Simple<execution, TProfiler>, execution, TProfiler
         std::lock_guard guard(this->_adoptionBlocksMutex);
         this->_adoptionBlocks.clear();
         this->_adoptionBlocks.resize(n_batches);
-        this->_executionOrder->clear();
-        this->_executionOrder->reserve(n_batches);
-        // contiguous slices keep chain neighbors on the same worker
-        const std::span<const std::shared_ptr<BlockModel>> allBlocks = flatGraph.blocks();
-        for (std::size_t i = 0; i < n_batches; i++) {
-            const std::size_t first = i * nBlocks / n_batches;
-            const std::size_t last  = (i + 1UZ) * nBlocks / n_batches;
-            auto&             job   = this->_executionOrder->emplace_back(std::vector<std::shared_ptr<BlockModel>>());
-            job.assign(allBlocks.begin() + static_cast<std::ptrdiff_t>(first), allBlocks.begin() + static_cast<std::ptrdiff_t>(last));
-        }
+        *this->_executionOrder = detail::batchBlocks(flatGraph.blocks(), n_batches);
     }
 };
-
-namespace detail {
-// contiguous slices keep chain neighbors on the same worker
-inline JobLists batchBlocks(const std::vector<std::shared_ptr<BlockModel>>& blocks, std::size_t n_batches) {
-    JobLists          result(n_batches);
-    const std::size_t nBlocks = blocks.size();
-    for (std::size_t batch = 0UZ; batch < n_batches; ++batch) {
-        const std::size_t first = batch * nBlocks / n_batches;
-        const std::size_t last  = (batch + 1UZ) * nBlocks / n_batches;
-        result[batch].assign(blocks.begin() + static_cast<std::ptrdiff_t>(first), blocks.begin() + static_cast<std::ptrdiff_t>(last));
-    }
-    return result;
-}
-
-inline void printExecutionOrder(const std::vector<std::vector<std::shared_ptr<BlockModel>>>& executionOrder) {
-    std::size_t batchIndex = 0;
-    for (const auto& batch : executionOrder) {
-        std::print("Batch #{}:\n", batchIndex++);
-        for (const auto& block : batch) {
-            std::print("  - {} ({})\n", block->name(), block->uniqueName());
-        }
-    }
-}
-
-} // namespace detail
 
 template<ExecutionPolicy execution = ExecutionPolicy::singleThreaded, profiling::ProfilerLike TProfiler = profiling::null::Profiler>
 struct BreadthFirst : SchedulerBase<BreadthFirst<execution, TProfiler>, execution, TProfiler> {
