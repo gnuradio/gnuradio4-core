@@ -1481,6 +1481,63 @@ const boost::ut::suite<"MultiProducerStrategy"> _multiProducerStrategy1 = [] {
     };
 };
 
+const boost::ut::suite<"MultiProducerStrategy wake sequence"> _multiProducerWake = [] {
+    using namespace boost::ut;
+    using gr::CircularBuffer;
+    using gr::ProducerType;
+
+    // a publish that moves the cursor advances the registered counter once and ends a timed wait on the notified sequence
+    "a registered wake advances its counter with each publish until it is removed"_test = [] {
+        using Buffer                     = CircularBuffer<int, std::dynamic_extent, ProducerType::Multi>;
+        constexpr std::size_t kPublishes = 100UZ;
+        constexpr auto        kDeadline  = std::chrono::seconds(10);
+        Buffer                buffer(64);
+        auto                  reader   = buffer.new_reader();
+        auto                  writer   = buffer.new_writer();
+        auto                  counter  = std::make_shared<gr::Sequence>();
+        auto                  notified = std::make_shared<gr::Sequence>();
+
+        // a writer span publishes when it is destroyed; the reader asks for the sample after the span leaves its scope
+        auto publishOne = [&writer, &reader](int value) {
+            {
+                auto span = writer.tryReserve<gr::SpanReleasePolicy::ProcessAll>(1UZ);
+                expect(fatal(eq(span.size(), 1UZ)));
+                span[0] = value;
+                span.publish(1UZ);
+            }
+            expect(fatal(eq(reader.available(), 1UZ)));
+            auto taken = reader.get<gr::SpanReleasePolicy::ProcessAll>(1UZ);
+            expect(eq(taken[0], value));
+            expect(taken.consume(1UZ));
+        };
+
+        buffer.addWakeSequence(counter, notified);
+        const auto   waitStart = std::chrono::steady_clock::now();
+        bool         woke      = false;
+        std::jthread waiter([&counter, &notified, &woke, waitStart, kDeadline] { woke = notified->waitUntil(0UZ, *counter, 0UZ, waitStart + kDeadline); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        publishOne(0);
+        waiter.join();
+        expect(woke) << "the wait on the notified sequence ran to its deadline";
+        expect(lt(std::chrono::steady_clock::now() - waitStart, kDeadline));
+        expect(eq(notified->value(), 0UZ)) << "a publish advanced the notified sequence";
+
+        for (std::size_t i = 1UZ; i < kPublishes; ++i) {
+            publishOne(static_cast<int>(i));
+        }
+        expect(eq(counter->value(), kPublishes));
+
+        const gr::Sequence* previousExempt = std::exchange(gr::detail::publishWakeExempt(), counter.get());
+        publishOne(-1);
+        gr::detail::publishWakeExempt() = previousExempt;
+        expect(eq(counter->value(), kPublishes)) << "a publish on the exempt thread advanced the counter";
+
+        buffer.removeWakeSequence(counter);
+        publishOne(-1);
+        expect(eq(counter->value(), kPublishes)) << "a publish advanced a removed counter";
+    };
+};
+
 const boost::ut::suite<"SingleProducerStrategy"> _singleProducerStrategy = [] {
     using namespace boost::ut;
     using gr::CircularBuffer;

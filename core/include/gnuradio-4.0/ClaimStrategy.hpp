@@ -9,10 +9,12 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <stdexcept>
 #include <vector>
 
+#include <gnuradio-4.0/SharedState.hpp>
 #include <gnuradio-4.0/meta/CacheLineSize.hpp>
 #include <gnuradio-4.0/meta/utils.hpp>
 
@@ -122,6 +124,52 @@ private:
 
 static_assert(ClaimStrategyLike<SingleProducerStrategy<1024, NoWaitStrategy>>);
 
+namespace detail {
+// The wakes that a multi-producer ring runs after a publish moves its cursor. A wake advances one sequence and notifies
+// another. A consumer that waits on a sequence other threads also advance registers a counter of its own as the
+// advanced sequence. The counter tells the consumer that a message arrived. The mutex guards the list and orders a
+// change of the list against a producer's wake. The flag lets a producer skip the mutex while the list is empty.
+class PublishWakeList {
+    struct Wake {
+        std::shared_ptr<Sequence> advanced;
+        std::shared_ptr<Sequence> notified;
+    };
+
+    std::mutex        _mutex;
+    std::vector<Wake> _wakes;
+    mutable bool      _armed{false};
+
+public:
+    void add(std::shared_ptr<Sequence> advanced, std::shared_ptr<Sequence> notified) {
+        std::lock_guard lock(_mutex);
+        _wakes.push_back({std::move(advanced), std::move(notified)});
+        gr::atomic_ref(_armed).store_release(true);
+    }
+
+    // removes one wake that advances the sequence
+    void remove(const std::shared_ptr<Sequence>& advanced) {
+        std::lock_guard lock(_mutex);
+        if (auto it = std::ranges::find(_wakes, advanced, &Wake::advanced); it != _wakes.end()) {
+            _wakes.erase(it);
+        }
+        gr::atomic_ref(_armed).store_release(!_wakes.empty());
+    }
+
+    [[nodiscard]] bool armed() const noexcept { return gr::atomic_ref(_armed).load_acquire(); }
+
+    void wake() {
+        const Sequence* exempt = publishWakeExempt();
+        std::lock_guard lock(_mutex);
+        for (const Wake& wake : _wakes) {
+            if (wake.advanced.get() != exempt) {
+                wake.advanced->incrementAndGet();
+                wake.notified->notify_all();
+            }
+        }
+    }
+};
+} // namespace detail
+
 /**
  * @brief Multi-producer claim strategy using per-slot sequence counters (LMAX Disruptor pattern).
  *
@@ -169,6 +217,7 @@ public:
     Sequence                                                _publishCursor;
     TWaitStrategy                                           _waitStrategy;
     std::shared_ptr<std::vector<std::shared_ptr<Sequence>>> _readSequences{std::make_shared<std::vector<std::shared_ptr<Sequence>>>()};
+    detail::PublishWakeList                                 _publishWake;
 
     MultiProducerStrategy() = delete;
 
@@ -191,6 +240,21 @@ public:
     // next()/tryNext() take _cachedMinReaderCursor as a lower bound on every reader's position and claim without
     // recomputing while it holds, so a changed reader set leaves the minimum over the new set behind.
     void notifyReaderSetChanged() const noexcept { refreshMinReaderCursor(); }
+
+    // Registers a wake: each later publish advances `advanced` and then calls notify_all() on `notified`. A publish made
+    // on a thread whose detail::publishWakeExempt() names `advanced` skips the wake. The call ends with a
+    // read-modify-write of the cursor that keeps its value. A producer whose cursor update comes after it in the
+    // cursor's modification order reads the registration. A producer whose update comes before it has already moved
+    // the cursor, and the caller reads that cursor next.
+    void addWakeSequence(std::shared_ptr<Sequence> advanced, std::shared_ptr<Sequence> notified) {
+        _publishWake.add(std::move(advanced), std::move(notified));
+        std::size_t cursor = _publishCursor.value();
+        while (!_publishCursor.compareAndSet(cursor, cursor)) {
+            cursor = _publishCursor.value();
+        }
+    }
+
+    void removeWakeSequence(const std::shared_ptr<Sequence>& advanced) { _publishWake.remove(advanced); }
 
     [[nodiscard]] std::size_t next(std::size_t nSlotsToClaim = 1) noexcept {
         assert((nSlotsToClaim > 0 && nSlotsToClaim <= _size) && "nSlotsToClaim must be > 0 and <= bufferSize");
@@ -276,6 +340,9 @@ public:
             }
         } while (!_publishCursor.compareAndSet(currentPublishCursor, nextPublishCursor));
 
+        if (_publishWake.armed()) [[unlikely]] {
+            _publishWake.wake();
+        }
         if constexpr (hasSignalAllWhenBlocking<TWaitStrategy>) {
             _waitStrategy.signalAllWhenBlocking();
         }

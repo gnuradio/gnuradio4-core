@@ -9,12 +9,28 @@
 // The values below are defined once, in the library gnuradio-shared-state. Code from every shared object of a program
 // reads and writes the same values. A per-thread value has one copy per thread for the whole program.
 
+namespace gr {
+class Sequence;
+}
+
 namespace gr::message {
 
 // messages dropped because the destination ring was full -- process-global diagnostic counter
 GNURADIO_EXPORT std::atomic<std::size_t>& droppedMessageCount() noexcept;
 
 } // namespace gr::message
+
+namespace gr::detail {
+
+// The wake sequence of the consumer that runs on the calling thread. A publish on that thread leaves the sequence
+// alone: the consumer is not waiting while it publishes.
+GNURADIO_EXPORT const Sequence*& publishWakeExempt() noexcept;
+
+// the message spans that Block::processScheduledMessages() handed to a block's handler on the calling thread. Handling
+// a message is not work: the progress sequence moves only for samples.
+GNURADIO_EXPORT std::size_t& handledMessageSpans() noexcept;
+
+} // namespace gr::detail
 
 namespace gr::scheduler {
 

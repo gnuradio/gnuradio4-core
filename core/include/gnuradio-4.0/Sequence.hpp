@@ -72,18 +72,17 @@ public:
         if (value() != oldValue) {
             return true;
         }
-        if (std::chrono::steady_clock::now() >= deadline) {
-            return false;
+        return waitForChange(deadline, [this, oldValue] { return hasLeft(oldValue); });
+    }
+
+    // Blocks until this sequence leaves oldValue, `other` leaves otherOldValue, or the deadline passes, and returns
+    // whether either left. A read-modify-write of `other` followed by notify_all() on this sequence ends the wait at
+    // once, as a read-modify-write of this sequence does.
+    bool waitUntil(std::size_t oldValue, const Sequence& other, std::size_t otherOldValue, std::chrono::steady_clock::time_point deadline) const {
+        if (value() != oldValue || other.value() != otherOldValue) {
+            return true;
         }
-        detail::SequenceWaitSlot& slot = waitSlot();
-        gr::atomic_ref(_nTimedWaiters).fetch_add(1U);
-        bool changed = false;
-        {
-            std::unique_lock lock(slot.mutex);
-            changed = slot.changed.wait_until(lock, deadline, [this, oldValue] { return hasLeft(oldValue); });
-        }
-        gr::atomic_ref(_nTimedWaiters).fetch_sub(1U);
-        return changed;
+        return waitForChange(deadline, [this, oldValue, &other, otherOldValue] { return hasLeft(oldValue) || other.hasLeft(otherOldValue); });
     }
 
     void notify_all() noexcept {
@@ -94,6 +93,22 @@ public:
     }
 
 private:
+    template<typename TChanged>
+    bool waitForChange(std::chrono::steady_clock::time_point deadline, TChanged changed) const {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        detail::SequenceWaitSlot& slot = waitSlot();
+        gr::atomic_ref(_nTimedWaiters).fetch_add(1U);
+        bool left = false;
+        {
+            std::unique_lock lock(slot.mutex);
+            left = slot.changed.wait_until(lock, deadline, changed);
+        }
+        gr::atomic_ref(_nTimedWaiters).fetch_sub(1U);
+        return left;
+    }
+
     // Tests the value with a compare-and-set of oldValue onto itself. The compare-and-set is ordered against the
     // notifier's read-modify-write of the value. If the notifier's comes first, this call sees the new value. If this
     // call comes first, the notifier sees this waiter in _nTimedWaiters.

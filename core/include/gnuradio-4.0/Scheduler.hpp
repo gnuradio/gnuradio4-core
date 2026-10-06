@@ -43,6 +43,13 @@ inline void waitUntilChanged(gr::Sequence& sequence, T oldValue, unsigned int ti
     sequence.waitUntil(oldValue, std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms));
 }
 
+// Returns when the sequence leaves oldValue, `wake` leaves wakeOldValue, or after timeout_ms, whichever comes first.
+// Advancing `wake` ends the wait once the advancing thread calls notify_all() on the sequence.
+template<typename T>
+inline void waitUntilChanged(gr::Sequence& sequence, T oldValue, const gr::Sequence& wake, std::size_t wakeOldValue, unsigned int timeout_ms) {
+    sequence.waitUntil(oldValue, wake, wakeOldValue, std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms));
+}
+
 namespace gr::scheduler {
 using namespace gr::message;
 
@@ -135,6 +142,10 @@ protected:
     std::mutex                    _childLifecycleMutex; // serializes start()'s and stop()'s sweeps; a worker never takes it to count itself
     std::mutex                    _workersInLoopMutex;  // guards _nWorkersInLoop; no block's stop() hook runs under it
     std::size_t                   _nWorkersInLoop{0UZ}; // workers inside poolWorker(); only these workers call a block's work()
+    // advanced by everything that ends a park and is not work (see wakeWorkers() and registerWake()). The rings in
+    // _wakeRings are changed under _workersInLoopMutex
+    std::shared_ptr<gr::Sequence>      _wake = std::make_shared<gr::Sequence>();
+    std::vector<MsgPortIn::BufferType> _wakeRings;
 
     std::mutex                               _zombieBlocksMutex;
     std::vector<std::shared_ptr<BlockModel>> _zombieBlocks;
@@ -381,6 +392,9 @@ public:
     constexpr static block::Category blockCategory = block::Category::ScheduledBlockGroup;
 
     [[nodiscard]] static constexpr auto executionPolicy() { return execution; }
+
+    // whether an idle worker parks on the graph's progress sequence until work or a wake ends the park
+    [[nodiscard]] static constexpr bool parksIdleWorkers() { return executionPolicy() == ExecutionPolicy::singleThreadedBlocking; }
 
     // seq_cst: this store and the worker's _nWorkersInWork increment must not sink below the load that follows them
     void requestWorkQuiescence() {
@@ -1329,6 +1343,7 @@ protected:
         on_scope_exit leaveLoop = [this] {
             std::lock_guard workersLock(_workersInLoopMutex);
             if (--_nWorkersInLoop == 0UZ) {
+                removeWake();
                 settleStoppedBlockingBlocks();
             }
         };
@@ -1347,16 +1362,25 @@ protected:
             std::ranges::copy(blocks, std::back_inserter(localBlockList));
         }
 
+        {
+            std::lock_guard workersLock(_workersInLoopMutex);
+            registerWake(progress);
+        }
+        const gr::Sequence* previousWakeExempt = std::exchange(gr::detail::publishWakeExempt(), _wake.get());
+        on_scope_exit       restoreWakeExempt  = [previousWakeExempt] { gr::detail::publishWakeExempt() = previousWakeExempt; };
+
         [[maybe_unused]] auto currentProgress    = this->_graph->progress().value();
+        [[maybe_unused]] auto currentWake        = _wake->value();
         std::size_t           inactiveCycleCount = 0UZ;
         std::size_t           idleIterations     = 0UZ;
         std::size_t           msgToCount         = 0UZ;
         auto                  activeState        = this->state();
         do {
             [[maybe_unused]] auto pe = profiler_handler->startCompleteEvent("scheduler_base.work");
-            if constexpr (executionPolicy() == ExecutionPolicy::singleThreadedBlocking) {
+            if constexpr (parksIdleWorkers()) {
                 // optionally tracking progress and block if there is none
                 currentProgress = progress->value();
+                currentWake     = _wake->value();
             }
 
             // Process messages either when the ratio gate opens, or immediately when any entry-point port has
@@ -1378,7 +1402,11 @@ protected:
 
                 adoptBlocks(runnerID, localBlockList);
 
+                const std::size_t nHandledBefore = gr::detail::handledMessageSpans();
                 std::ranges::for_each(localBlockList, &BlockModel::processScheduledMessages);
+                if (gr::detail::handledMessageSpans() != nHandledBefore) {
+                    wakeWorkers(); // a reply a block wrote on this thread waits in the children's ring for the next pass
+                }
                 const auto previousState = activeState;
                 activeState              = this->state();
                 if (gr::atomic_ref(_run.generation).load_acquire() != generation) {
@@ -1427,7 +1455,7 @@ protected:
             }
 
             // optionally tracking progress and block if there is none
-            if constexpr (executionPolicy() == ExecutionPolicy::singleThreadedBlocking) {
+            if constexpr (parksIdleWorkers()) {
                 auto progressAfter = progress->value();
                 if (currentProgress == progressAfter) {
                     inactiveCycleCount++;
@@ -1439,8 +1467,8 @@ protected:
                 // parking in a non-RUNNING state would delay the worker's next state read by up to timeout_ms
                 if (activeState == RUNNING && inactiveCycleCount > timeout_inactivity_count) {
                     // allow a scheduler process to wait on progress before retrying (N.B. intended to save CPU/battery power)
-                    // N.B. a watchdog will periodically update the progress to check for non-responsive blocks.
-                    waitUntilChanged(*progress, currentProgress, timeout_ms);
+                    // work, or a wake since the top of this pass, ends the park. A wake does not count as progress
+                    waitUntilChanged(*progress, currentProgress, *_wake, currentWake, timeout_ms);
                     msgToCount = 0UZ;
                 }
             }
@@ -1539,12 +1567,10 @@ protected:
             if (_watchdogGeneration.waitUntil(generation, std::chrono::steady_clock::now() + std::chrono::milliseconds(timeOut_ms))) {
                 return;
             }
-            // check and increase progress if there hasn't been none.
-
+            // a period without progress wakes the parked workers, which then call every block again. The wake follows the
+            // state read and leaves the progress sequence unchanged.
             std::size_t currentProgress = _graph->_progress->value();
             if ((_nRunningJobs->value() > 0UZ) && (currentProgress == lastProgress)) {
-                lastProgress = _graph->_progress->incrementAndGet(); // watchdog triggered manual update
-                _graph->_progress->notify_all();
                 if (this->state() != lifecycle::State::RUNNING) { // only a RUNNING graph is expected to make progress
                     nWarnings     = 0UZ;
                     stallReported = false;
@@ -1552,6 +1578,7 @@ protected:
                     stallReported = true;
                     emitStallReport(nWarnings, timeOut_ms);
                 }
+                wakeWorkers();
             } else {
                 lastProgress  = currentProgress;
                 nWarnings     = 0UZ;
@@ -1585,16 +1612,53 @@ protected:
         span.publish(1UZ);
     }
 
-    // a worker parked in waitUntilChanged(progress) resumes when progress moves or its timeout expires,
-    // so a lifecycle change bumps progress to be observed now rather than at the timeout
-    void wakeProgressWaiters() {
-        _graph->_progress->incrementAndGet();
+    // A parked worker waits until the graph's progress sequence or _wake leaves the value it read at the top of its
+    // pass, or until timeout_ms passes. Work advances progress, which the inactivity count and the watchdog read.
+    // Everything else that must end a park advances _wake and notifies the progress sequence: stop(), pause(),
+    // resume(), the watchdog's period, a message from another thread (see registerWake()), and a worker's message pass
+    // in which a block handled a message.
+    void wakeWorkers() {
+        _wake->incrementAndGet();
         _graph->_progress->notify_all();
     }
 
+    // While a worker of a parking policy is inside poolWorker(), each message published into msgIn or into the ring
+    // the children send on advances _wake and notifies the progress sequence the worker parks on. A parked worker
+    // handles the message without waiting out timeout_ms, and the graph's progress, which the watchdog reads, stays
+    // unchanged. A message published on the worker's own thread leaves _wake alone and waits for the next message
+    // pass. A reply that a block writes there is forwarded on that pass without a park between, since the pass in which
+    // the block handled the request advances _wake. A message published while no worker is inside stays in its ring
+    // until the first message pass of the next run. A worker that finds no registration registers, and the last worker
+    // out removes the registration, so each run registers its own graph's progress sequence. Called under
+    // _workersInLoopMutex.
+    void registerWake(const std::shared_ptr<gr::Sequence>& progress) {
+        if constexpr (parksIdleWorkers()) {
+            if (!_wakeRings.empty()) {
+                return;
+            }
+            _wakeRings.reserve(2UZ);
+            for (MsgPortIn::BufferType ring : {this->msgIn.buffer().streamBuffer, _fromChildMessagePort.buffer().streamBuffer}) {
+                ring.addWakeSequence(_wake, progress);
+                _wakeRings.push_back(std::move(ring));
+            }
+        }
+    }
+
+    // called under _workersInLoopMutex by the last worker to leave poolWorker()
+    void removeWake() {
+        for (MsgPortIn::BufferType& ring : _wakeRings) {
+            ring.removeWakeSequence(_wake);
+        }
+        _wakeRings.clear();
+    }
+
     // a blocking block leaves REQUESTED_STOP in its own next work() call. With no worker inside poolWorker(), no such
-    // call follows, and the scheduler moves the block to STOPPED itself. That transition runs no stop() hook. Called
-    // under _workersInLoopMutex with _nWorkersInLoop at zero, by stop() or by the last worker leaving poolWorker()
+    // call follows, and the scheduler moves the block to STOPPED itself. That transition runs no stop() hook. The block
+    // is settled by whichever comes second: its REQUESTED_STOP in stop()'s sweep, or the last worker leaving
+    // poolWorker(). The sweep settles a block it reaches after the last worker left. That worker can leave before the
+    // sweep reaches the block, since stop() retires the workers before it sweeps. The last worker out settles every
+    // block the sweep reached before. Both read _nWorkersInLoop under _workersInLoopMutex. Called by the last worker
+    // under that mutex
     void settleStoppedBlockingBlocks() {
         graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) {
             if (block->blockCategory() != ScheduledBlockGroup && block->isBlocking() && block->state() == lifecycle::State::REQUESTED_STOP) {
@@ -1608,7 +1672,7 @@ protected:
         // retires the run's workers. A queued worker releases its count without running. A worker in its loop leaves
         // at its next check, even one that misses the stop because the next start() has already set RUNNING.
         advanceRunGeneration();
-        wakeProgressWaiters();
+        wakeWorkers();
         {
             std::lock_guard childLock(_childLifecycleMutex); // serialized against start()'s sweep
             graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) {
@@ -1631,10 +1695,6 @@ protected:
                     }
                 }
             });
-            std::lock_guard workersLock(_workersInLoopMutex);
-            if (_nWorkersInLoop == 0UZ) { // otherwise the last worker to leave poolWorker() settles the blocking blocks
-                settleStoppedBlockingBlocks();
-            }
         }
 
         if (this->state() != ERROR) { // stop() also runs on the way into ERROR, which only reset() leaves
@@ -1647,7 +1707,7 @@ protected:
 
     void pause() {
         using enum lifecycle::State;
-        wakeProgressWaiters();
+        wakeWorkers();
         graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) {
             this->emitErrorMessageIfAny("pause() -> LifecycleState", block->changeStateTo(REQUESTED_PAUSE));
             if (!block->isBlocking()) { // N.B. no other thread/constraint to consider before shutting down
@@ -1662,7 +1722,7 @@ protected:
 
     void resume() {
         using enum lifecycle::State;
-        wakeProgressWaiters();
+        wakeWorkers();
         {
             WorkQuiescenceGuard quiescence(this);
             auto                result = connectPendingEdges();
@@ -1671,6 +1731,7 @@ protected:
             }
         }
         graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) { this->emitErrorMessageIfAny("resume() -> LifecycleState", block->changeStateTo(RUNNING)); });
+        wakeWorkers(); // a worker that parked before the blocks reached RUNNING calls them now
         if constexpr (requires(Derived& d) { d.customResume(); }) {
             static_cast<Derived*>(this)->customResume();
         }
