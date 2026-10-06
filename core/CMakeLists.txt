@@ -22,8 +22,23 @@ target_link_libraries(
   gnuradio-core
   PUBLIC gnuradio-options
          gnuradio-meta
+         gnuradio-shared-state
          magic_enum
          vir)
+
+# the values that gnuradio-4.0/SharedState.hpp declares, one copy that every shared object of a program shares. The
+# library links no other core library, and gnuradio-core links it
+if(EMSCRIPTEN)
+  add_library(gnuradio-shared-state STATIC src/SharedState.cpp)
+else()
+  add_library(gnuradio-shared-state SHARED src/SharedState.cpp)
+endif()
+add_library(gnuradio4::gnuradio-shared-state ALIAS gnuradio-shared-state)
+target_include_directories(gnuradio-shared-state PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include/)
+target_link_libraries(gnuradio-shared-state PRIVATE gnuradio-options)
+if(WIN32)
+  target_compile_definitions(gnuradio-shared-state PRIVATE BUILDING_MYPLUGIN)
+endif()
 
 if(EMSCRIPTEN)
   add_library(gnuradio-blocklib-core STATIC src/BlockRegistry.cpp)
@@ -48,7 +63,7 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/include/gnuradio-4.0/config.hpp"
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/gnuradio-4.0")
 
 install(
-  TARGETS gnuradio-core gnuradio-blocklib-core
+  TARGETS gnuradio-core gnuradio-blocklib-core gnuradio-shared-state
   EXPORT gnuradio4Targets
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
