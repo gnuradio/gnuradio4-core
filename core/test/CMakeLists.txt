@@ -101,7 +101,15 @@ set(_COMPILE_FAIL_TESTS cf_UnfilteredTagPropagation_resampling cf_UnfilteredTagP
                         cf_UnfilteredTagPropagation_forwardtags_constrained)
 set(_COMPILE_FAIL_FILTERED_TESTS cf_FilteredTagPropagation_unfiltered cf_FilteredTagPropagation_notag)
 set(_COMPILE_FAIL_EVERY_KEY_TESTS cf_ForwardsEveryKey_forwardtags_deduced)
-foreach(TEST_NAME IN LISTS _COMPILE_FAIL_TESTS _COMPILE_FAIL_FILTERED_TESTS _COMPILE_FAIL_EVERY_KEY_TESTS)
+set(_COMPILE_FAIL_DROPPED_TESTS cf_UnfilteredTagPropagation_dropped)
+set(_COMPILE_FAIL_DROPPED_TWICE_TESTS cf_DroppedTagKeys_twice)
+foreach(
+  TEST_NAME IN
+  LISTS _COMPILE_FAIL_TESTS
+        _COMPILE_FAIL_FILTERED_TESTS
+        _COMPILE_FAIL_EVERY_KEY_TESTS
+        _COMPILE_FAIL_DROPPED_TESTS
+        _COMPILE_FAIL_DROPPED_TWICE_TESTS)
   add_executable(${TEST_NAME} EXCLUDE_FROM_ALL compile_fail/${TEST_NAME}.cpp)
   target_include_directories(${TEST_NAME} PRIVATE ${CMAKE_BINARY_DIR}/include ${CMAKE_CURRENT_BINARY_DIR})
   target_link_libraries(${TEST_NAME} PRIVATE gnuradio-options gnuradio-core)
@@ -128,6 +136,22 @@ set_tests_properties(
   ${_COMPILE_FAIL_EVERY_KEY_TESTS}
   PROPERTIES PASS_REGULAR_EXPRESSION
              "calls a forwardTags\\(\\) that hasForwardTagsOverride\\(\\) does not see"
+             RESOURCE_LOCK
+             gr_core_build_tree
+             TIMEOUT
+             300)
+set_tests_properties(
+  ${_COMPILE_FAIL_DROPPED_TESTS}
+  PROPERTIES PASS_REGULAR_EXPRESSION
+             "UnfilteredTagPropagation is not available for a block declaring DroppedTagKeys"
+             RESOURCE_LOCK
+             gr_core_build_tree
+             TIMEOUT
+             300)
+set_tests_properties(
+  ${_COMPILE_FAIL_DROPPED_TWICE_TESTS}
+  PROPERTIES PASS_REGULAR_EXPRESSION
+             "A block declares at most one DroppedTagKeys list"
              RESOURCE_LOCK
              gr_core_build_tree
              TIMEOUT

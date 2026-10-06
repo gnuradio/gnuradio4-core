@@ -789,6 +789,7 @@ public:
     using block_template_parameters  = meta::typelist<Arguments...>;
     using ResamplingControl          = ArgumentsTypeList::template find_or_default<is_resampling, Resampling<1UL, 1UL, true>>;
     using StrideControl              = ArgumentsTypeList::template find_or_default<is_stride, Stride<0UL, true>>;
+    using DroppedTagKeysControl      = ArgumentsTypeList::template find_or_default<is_dropped_tag_keys, DroppedTagKeys<>>;
     using AllowIncompleteFinalUpdate = ArgumentsTypeList::template find_or_default<is_incompleteFinalUpdatePolicy, IncompleteFinalUpdatePolicy<IncompleteFinalUpdateEnum::DROP>>;
     using DrawableControl            = ArgumentsTypeList::template find_or_default<is_drawable, Drawable<UICategory::None, "">>;
 
@@ -799,10 +800,10 @@ public:
     constexpr static bool unfilteredTagPropagation = std::disjunction_v<std::is_same<UnfilteredTagPropagation, Arguments>...>;
     constexpr static bool filteredTagPropagation   = std::disjunction_v<std::is_same<FilteredTagPropagation, Arguments>...>;
 
-    /// whether the default forwarder keeps every key of every tag. It does on a block passing
-    /// block::kUnfilteredTagPropagationAdmissible, which every block declaring UnfilteredTagPropagation must pass. The
-    /// predicate reads Derived's ports and its forwardTags(). Derived is complete only inside a function body. The
-    /// predicate is therefore evaluated there, not in the class body.
+    /// whether the default forwarder keeps every key of every tag, less the keys listed in DroppedTagKeys. It does on a
+    /// block passing block::kUnfilteredTagPropagationAdmissible, which every block declaring UnfilteredTagPropagation
+    /// must pass. The predicate reads Derived's ports and its forwardTags(). Derived is complete only inside a function
+    /// body. The predicate is therefore evaluated there, not in the class body.
     [[nodiscard]] static consteval bool forwardsEveryKey() noexcept { return block::kUnfilteredTagPropagationAdmissible<Derived>; }
 
     /// the input span retires, and the default forwarder reads, every tag of the chunk rather than only the tags at
@@ -1144,8 +1145,10 @@ public:
             static_assert(traits::block::stream_output_ports<Derived>::template all_of<traits::port::is_synchronous>, "UnfilteredTagPropagation is not available for a block with an asynchronous stream output port: the forwarded offset is derived from the synchronous sample count and means nothing on a port that publishes its own.");
             static_assert(!noTagPropagation && !forwardTagPropagation && !backwardTagPropagation && !mergeTagPropagation && !filteredTagPropagation, "UnfilteredTagPropagation cannot be combined with another tag-propagation policy: each of the other five suppresses forwarding, moves the output offset the policy promises to preserve, or filters the keys the policy promises to keep.");
             static_assert(!hasForwardTagsOverride(), "UnfilteredTagPropagation is not available for a block supplying forwardTags(): the override replaces the default forwarder entirely, so the policy would have no effect.");
+            static_assert(DroppedTagKeysControl::kKeys.empty(), "UnfilteredTagPropagation is not available for a block declaring DroppedTagKeys: the policy requires every key, and the annotation names keys the block drops.");
             static_assert(block::kUnfilteredTagPropagationAdmissible<Derived>, "UnfilteredTagPropagation admissibility and the assertions above must state the same conditions.");
         }
+        static_assert((0UZ + ... + std::size_t{is_dropped_tag_keys<Arguments>::value}) <= 1UZ, "A block declares at most one DroppedTagKeys list: the block would drop the keys of one list and forward those of the others. Name every dropped key in one list.");
         if constexpr (filteredTagPropagation) {
             static_assert(!unfilteredTagPropagation && !noTagPropagation, "FilteredTagPropagation cannot be combined with UnfilteredTagPropagation or NoTagPropagation: the first requires every key, and the second forwards no tag.");
         }
@@ -1292,16 +1295,20 @@ public:
         }
     }
 
-    /// keep the auto-forward keys of an incoming tag, or every key where forwardsEveryKey(), substituting this
-    /// block's own current value for a key it declares as a setting, and on a resampling block the rate it publishes
-    /// at for the rate it is fed. The settings snapshot is taken lazily, and only where a key is actually owned, so a
-    /// tag of keys this block knows nothing about costs no copy.
+    /// keep the auto-forward keys of an incoming tag, or every key where forwardsEveryKey(), less the keys listed in
+    /// DroppedTagKeys, substituting this block's own current value for a key it declares as a setting, and on a
+    /// resampling block the rate it publishes at for the rate it is fed. A listed key is also dropped from the map a
+    /// trigger_meta_info key holds. The settings snapshot is taken lazily, and only where a key is actually owned. A tag
+    /// whose keys are none of this block's settings costs no copy.
     [[nodiscard]] property_map filterAndSubstituteTag(const property_map& src, std::optional<property_map>& cachedSettings) {
         [[maybe_unused]] const auto& autoForwardKeys = settings().autoForwardParameters();
         const auto&                  blockSettings   = CtxSettings<Derived>::allWritableMembers();
         property_map                 dst;
         for (const auto& [key, value] : src) {
             auto shortKey = convert_string_domain(key);
+            if (std::ranges::contains(DroppedTagKeysControl::kKeys, shortKey)) {
+                continue;
+            }
             if constexpr (!forwardsEveryKey()) {
                 if (!autoForwardKeys.contains(shortKey)) {
                     continue;
@@ -1313,6 +1320,18 @@ public:
                 }
                 if (auto it = cachedSettings->find(key); it != cachedSettings->end()) {
                     dst.insert_or_assign(key, it->second);
+                    continue;
+                }
+            }
+            if constexpr (!DroppedTagKeysControl::kKeys.empty()) {
+                if (const property_map* meta = value.get_if<property_map>(); meta != nullptr && key == gr::tag::TRIGGER_META_INFO) {
+                    property_map kept;
+                    for (const auto& [metaKey, metaValue] : *meta) {
+                        if (!std::ranges::contains(DroppedTagKeysControl::kKeys, convert_string_domain(metaKey))) {
+                            kept.insert_or_assign(metaKey, metaValue);
+                        }
+                    }
+                    dst.insert_or_assign(key, pmt::Value(std::move(kept)));
                     continue;
                 }
             }

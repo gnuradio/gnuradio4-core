@@ -20,6 +20,7 @@ of annotated signal data.
   offset.
 - **Forwarding policies**: default (forward), `BackwardTagPropagation`, or `NoTagPropagation`.
   `FilteredTagPropagation` keeps the standard keys alone on a block that would forward every key.
+  `DroppedTagKeys<"key", ...>` drops the listed keys and forwards the rest.
   Override `forwardTags()` for full custom control.
 - A **negative `relIndex`** is a tag deferred out of an earlier chunk and not yet forwarded — not a
   tag seen twice. A custom `forwardTags()` reading more than `tags(1)` is the one case where it is.
@@ -309,12 +310,13 @@ struct MyBlock : gr::Block<MyBlock, gr::NoTagPropagation> { ... };
 The framework does not forward any tags. The block handles tag propagation entirely in `processBulk`
 or via a custom `forwardTags()` override.
 
-### Which keys a forwarded tag carries (`UnfilteredTagPropagation`, `FilteredTagPropagation`)
+### Which keys a forwarded tag carries (`UnfilteredTagPropagation`, `FilteredTagPropagation`, `DroppedTagKeys`)
 
 ```cpp
 struct Plain : gr::Block<Plain> { ... };                                 // every key where admissible
 struct Checked : gr::Block<Checked, gr::UnfilteredTagPropagation> { ... }; // every key, or no build
 struct OptOut : gr::Block<OptOut, gr::FilteredTagPropagation> { ... };     // standard keys alone
+struct Shift : gr::Block<Shift, gr::DroppedTagKeys<"freq_est">> { ... };  // every key but freq_est
 ```
 
 The policies above decide _where_ a forwarded tag lands. The block's declarations decide _which
@@ -381,6 +383,17 @@ auto-forward keys alone and defers interior tags as a key-filtered block does. T
 opt-out beside `UnfilteredTagPropagation` or `NoTagPropagation`. It changes nothing on a block that
 fails the predicate for another reason. A block template whose variants differ in whether they
 pass the predicate can therefore declare it on every variant.
+
+`DroppedTagKeys<"key", ...>` is the narrow opt-out. A block lists the keys whose values do not
+describe its output. A block that shifts the carrier frequency, for instance, lists the key that
+states a frequency estimate. The default forwarder drops each listed key, on every chunk and at the
+end-of-stream index, and keeps every other key it would keep without the annotation. It drops a
+listed key at the top level of a tag and inside the map a `trigger_meta_info` key holds. A block
+forwarding every key still forwards the rest at the offset each tag arrived at. A key-filtered block
+drops a listed key even where it is a standard key. A `forwardTags()` override publishes what it
+writes, and the list reaches it only through `filterAndSubstituteTag()`. A block composed at compile
+time drops the keys of every member. A block declares at most one list, and the build refuses the
+annotation beside `UnfilteredTagPropagation`.
 
 Tags drive settings, which a later section covers in full. A key that crosses a block also drives
 any downstream setting of the same name. That is the mechanism that makes `sample_rate` work,

@@ -130,10 +130,47 @@ consteval bool memberForwardsEveryKey() {
     }
 }
 
+template<typename TMember>
+struct MemberDroppedTagKeys {
+    using type = typename TMember::DroppedTagKeysControl;
+};
+
+template<>
+struct MemberDroppedTagKeys<void> {
+    using type = DroppedTagKeys<>;
+};
+
+/// the keys of every list, in member order
+template<typename... TLists>
+struct JoinedDroppedTagKeys {
+    using type = DroppedTagKeys<>;
+};
+
+template<gr::meta::fixed_string... Keys>
+struct JoinedDroppedTagKeys<DroppedTagKeys<Keys...>> {
+    using type = DroppedTagKeys<Keys...>;
+};
+
+template<gr::meta::fixed_string... First, gr::meta::fixed_string... Second, typename... TRest>
+struct JoinedDroppedTagKeys<DroppedTagKeys<First...>, DroppedTagKeys<Second...>, TRest...> : JoinedDroppedTagKeys<DroppedTagKeys<First..., Second...>, TRest...> {};
+
+/// the composed block's base, with the dropped keys among its arguments only where a member lists any
+template<typename TComposed, typename TDropped, typename... TPolicy>
+struct MergedBlockBaseOf {
+    using type = Block<TComposed, TPolicy..., TDropped>;
+};
+
+template<typename TComposed, typename... TPolicy>
+struct MergedBlockBaseOf<TComposed, DroppedTagKeys<>, TPolicy...> {
+    using type = Block<TComposed, TPolicy...>;
+};
+
 /// a composed block forwards every key only where each member block does, and keeps the auto-forward keys otherwise.
-/// An optional member left out as void does not count.
+/// It drops every key a member lists in DroppedTagKeys. An optional member left out as void does not count.
 template<typename TComposed, typename... TMembers>
-using MergedBlockBase = std::conditional_t<(memberForwardsEveryKey<TMembers>() && ...), Block<TComposed>, Block<TComposed, FilteredTagPropagation>>;
+using MergedBlockBase = std::conditional_t<(memberForwardsEveryKey<TMembers>() && ...),                                                 //
+    typename MergedBlockBaseOf<TComposed, typename JoinedDroppedTagKeys<typename MemberDroppedTagKeys<TMembers>::type...>::type>::type, //
+    typename MergedBlockBaseOf<TComposed, typename JoinedDroppedTagKeys<typename MemberDroppedTagKeys<TMembers>::type...>::type, FilteredTagPropagation>::type>;
 
 } // namespace detail
 

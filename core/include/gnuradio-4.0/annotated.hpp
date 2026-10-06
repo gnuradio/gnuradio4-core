@@ -1,6 +1,7 @@
 #ifndef GNURADIO_ANNOTATED_HPP
 #define GNURADIO_ANNOTATED_HPP
 
+#include <array>
 #include <format>
 #include <memory_resource>
 #include <sstream>
@@ -126,7 +127,8 @@ struct MergeTagPropagation {};
  * The remaining obligation is the author's, because no compile-time fact expresses it: a tag arriving at input
  * offset `t` must belong at output offset `t`. A block that shifts sample positions, an integer delay for instance,
  * or drops them, as one that keeps every Nth sample does, writes its own `forwardTags()`. A block whose output differs
- * from what a non-reserved key describes declares `FilteredTagPropagation`.
+ * from what some keys describe lists them in `DroppedTagKeys`. A block that keeps the auto-forward keys alone declares
+ * `FilteredTagPropagation`.
  */
 struct UnfilteredTagPropagation {};
 
@@ -143,6 +145,30 @@ struct UnfilteredTagPropagation {};
  * these respects may declare it on every variant.
  */
 struct FilteredTagPropagation {};
+
+/**
+ * @brief Drop the listed tag keys in the default forwarder and forward every other key.
+ *
+ * A block lists the keys whose values do not describe its output. A block that shifts the carrier frequency, for
+ * instance, lists the keys that state a frequency estimate. A block forwarding every key still forwards the other keys
+ * at the offset each tag arrived at. A key-filtered block drops a listed key even where it is an auto-forward key. A
+ * listed key is dropped at the top level of a tag and inside the map its `trigger_meta_info` key holds. A
+ * `forwardTags()` override publishes what it writes. The list reaches it only through `filterAndSubstituteTag()`. A
+ * block composed at compile time drops the keys of every member. A block declares at most one list, and the build
+ * refuses the annotation beside `UnfilteredTagPropagation`.
+ *
+ * @tparam Keys the short names of the dropped keys
+ */
+template<gr::meta::fixed_string... Keys>
+struct DroppedTagKeys {
+    static constexpr std::array<std::string_view, sizeof...(Keys)> kKeys{std::string_view(Keys)...};
+};
+
+template<typename T>
+struct is_dropped_tag_keys : std::false_type {};
+
+template<gr::meta::fixed_string... Keys>
+struct is_dropped_tag_keys<DroppedTagKeys<Keys...>> : std::true_type {};
 
 /**
  * @brief Annotates block, indicating to perform resampling based on the provided `inputChunkSize` and `outputChunkSize`.

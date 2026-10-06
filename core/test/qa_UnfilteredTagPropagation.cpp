@@ -1,6 +1,7 @@
 #include <boost/ut.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <format>
@@ -26,9 +27,9 @@
  * - a key named after a setting `Block<>` declares for every block keeps the upstream value
  * - a tag inside a chunk keeps its offset where an input minimum forbids a boundary at it
  *
- * They also check the multi-input dedup, the merge rule, and the key-filtered forwarding of a block the predicate
- * refuses. The compile-time guards are checked twice. This file checks the predicate, and six translation units under
- * `compile_fail/` must fail to build.
+ * They also check the multi-input dedup, the merge rule, the key-filtered forwarding of a block the predicate refuses,
+ * and the keys a block lists in `DroppedTagKeys`. The compile-time guards are checked twice. This file checks the
+ * predicate, and seven translation units under `compile_fail/` must fail to build.
  *
  * The blocks are defined here: gnuradio4-core carries no standard block library, so a core test may not depend on one.
  */
@@ -45,6 +46,7 @@ inline constexpr std::size_t kInputMinimum = 4UZ;
 inline constexpr std::string_view kReservedKey = "trigger_name"; ///< reserved: survives the default key filter
 inline constexpr std::string_view kCustomKey   = "record_id";    ///< neither reserved nor any block's setting
 inline constexpr std::string_view kOwnedKey    = "gain";         ///< not reserved, but a declared setting of one block
+inline constexpr std::string_view kDroppedKey  = "phase_offset"; ///< not reserved, and listed by the dropping blocks
 
 inline constexpr float kUpstreamGain = 10.f;
 inline constexpr float kUpstreamRate = 96000.f;
@@ -194,6 +196,36 @@ struct FilteredBulkRelay : Block<FilteredBulkRelay, FilteredTagPropagation> {
         outSpan.publish(n);
         return work::Status::OK;
     }
+};
+
+/// forwards every key but the one it lists
+struct DroppingRelay : Block<DroppingRelay, DroppedTagKeys<"phase_offset">> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(DroppingRelay, in, out);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
+};
+
+/// keeps the auto-forward keys and drops one of them
+struct FilteredDroppingRelay : Block<FilteredDroppingRelay, FilteredTagPropagation, DroppedTagKeys<"trigger_name">> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(FilteredDroppingRelay, in, out);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
+};
+
+/// lists the carrier estimates, as a block that alters the carrier frequency or phase does
+struct CarrierEstimateDropper : Block<CarrierEstimateDropper, DroppedTagKeys<"freq_est", "phase_est">> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(CarrierEstimateDropper, in, out);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
 };
 
 /// keeps every second sample and declares no tag-propagation policy
@@ -489,6 +521,8 @@ using FeedbackPlain     = FeedbackMergeByIndex<FeedbackRelay, 0UZ, Relay, 0UZ, 1
 using FeedbackFiltered  = FeedbackMergeByIndex<FeedbackRelay, 0UZ, FilteredRelay, 0UZ, 1UZ, void>;
 using FeedbackMonitored = FeedbackMergeByIndex<FeedbackRelay, 0UZ, Relay, 0UZ, 1UZ, FilteredRelay>;
 using TapFiltered       = FeedbackMergeWithTapByIndex<FeedbackRelay, 0UZ, FilteredRelay, 0UZ, 1UZ, void>;
+using MergedDropping    = MergeByIndex<Relay, 0UZ, DroppingRelay, 0UZ>;
+using MergedBothDrop    = MergeByIndex<DroppingRelay, 0UZ, FilteredDroppingRelay, 0UZ>;
 
 [[nodiscard]] const pmt::Value* valueOf(const property_map& map, std::string_view key) {
     const auto it = map.find(key);
@@ -675,6 +709,11 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
     static_assert(MergedPlain::forwardsEveryKey() && !MergedFiltered::forwardsEveryKey() && !MergedSilent::forwardsEveryKey());
     static_assert(SplitPlain::forwardsEveryKey() && !SplitFiltered::forwardsEveryKey() && !SignedFiltered::forwardsEveryKey());
     static_assert(FeedbackPlain::forwardsEveryKey() && !FeedbackFiltered::forwardsEveryKey() && !FeedbackMonitored::forwardsEveryKey() && !TapFiltered::forwardsEveryKey());
+    static_assert(DroppingRelay::forwardsEveryKey() && DroppingRelay::hasWholeChunkTagWindow(), "a dropped key changes neither the tag window nor the offsets");
+    static_assert(!FilteredDroppingRelay::forwardsEveryKey());
+    static_assert(MergedDropping::forwardsEveryKey() && std::ranges::equal(MergedDropping::DroppedTagKeysControl::kKeys, std::array<std::string_view, 1UZ>{kDroppedKey}));
+    static_assert(!MergedBothDrop::forwardsEveryKey() && std::ranges::equal(MergedBothDrop::DroppedTagKeysControl::kKeys, std::array<std::string_view, 2UZ>{kDroppedKey, kReservedKey}));
+    static_assert(MergedPlain::DroppedTagKeysControl::kKeys.empty() && std::is_same_v<MergedPlain::base_t, Block<MergedPlain>>, "a merge of members listing no key declares no list");
 
     "an undeclared admissible block forwards every key with its value and offset intact"_test = [] {
         const std::vector<TagRecord> tags{TagRecord{0UZ, protocolTag("r0")}, TagRecord{700UZ, protocolTag("r1")}};
@@ -819,6 +858,42 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
                 expect(end->holds<bool>() && *end->get_if<bool>()) << "tx_eob keeps its type and value";
             }
         }
+    };
+
+    "a block listing DroppedTagKeys drops that key and forwards every other key at its offset"_test = [] {
+        property_map map = protocolTag("r0");
+        gr::tag::put(map, kDroppedKey, 0.5f);
+        const std::vector<TagRecord>   tags{TagRecord{0UZ, map}, TagRecord{700UZ, map}};
+        const std::vector<std::size_t> offsets{tags[0].index, tags[1].index};
+
+        const RunResult plain = runOnce([&tags](gr::Graph& flow) { return buildSeries<Relay>(flow, tags); });
+        expect(indicesCarrying(plain.tags, kDroppedKey) == offsets) << "the key crosses a block that lists nothing";
+
+        const RunResult dropping = runOnce([&tags](gr::Graph& flow) { return buildSeries<DroppingRelay, Relay>(flow, tags); });
+        expect(carrying(dropping.tags, kDroppedKey).empty()) << "the listed key stops at the block";
+        expect(indicesCarrying(dropping.tags, kCustomKey) == offsets) << "a custom key the block does not list crosses at its offset";
+        expect(indicesCarrying(dropping.tags, kReservedKey) == offsets) << "the reserved key crosses at its offset";
+    };
+
+    "a key-filtered block listing a reserved key drops it and keeps the other reserved keys"_test = [] {
+        property_map map = protocolTag("r0");
+        gr::tag::put(map, "signal_name", std::string("carrier"));
+        const std::vector<TagRecord> tags{TagRecord{0UZ, map}};
+
+        const RunResult result = runOnce([&tags](gr::Graph& flow) { return buildSeries<FilteredDroppingRelay>(flow, tags); });
+        expect(eq(carrying(result.tags, "signal_name").size(), 1UZ)) << "an unlisted reserved key crosses";
+        expect(carrying(result.tags, kReservedKey).empty()) << "the listed reserved key stops at the block";
+        expect(carrying(result.tags, kCustomKey).empty()) << "the key filter still applies";
+    };
+
+    "a compile-time merge drops the keys its members list"_test = [] {
+        property_map map = protocolTag("r0");
+        gr::tag::put(map, kDroppedKey, 0.5f);
+        const std::vector<TagRecord> tags{TagRecord{0UZ, map}, TagRecord{700UZ, map}};
+
+        const RunResult result = runOnce([&tags](gr::Graph& flow) { return buildSeries<MergedDropping>(flow, tags); });
+        expect(carrying(result.tags, kDroppedKey).empty()) << "a key one member lists stops at the composed block";
+        expect(indicesCarrying(result.tags, kCustomKey) == std::vector<std::size_t>{tags[0].index, tags[1].index}) << "the other keys cross the composed block at their offsets";
     };
 
     "a custom key crosses a chain of unfiltered blocks with its value and offset intact"_test = [] {
@@ -1030,6 +1105,82 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
         if (rate != nullptr) {
             expect(eq(rate->value_or<float>(0.f), kRateCeiling)) << "the block applied the end tag and forwards its capped value";
         }
+    };
+
+    "at the end index a listed key stops and an unlisted key crosses"_test = [] {
+        property_map map = protocolTag("end");
+        gr::tag::put(map, kDroppedKey, 0.5f);
+        const std::vector<TagRecord> tags{TagRecord{kSamples, map}};
+
+        const EndResult plain = runToEnd<Relay>(tags);
+        expect(eq(carrying(plain.endTags, kDroppedKey).size(), 1UZ)) << "the key crosses a block that lists nothing";
+
+        const EndResult              dropping = runToEnd<DroppingRelay>(tags);
+        const std::vector<TagRecord> carried  = carrying(dropping.endTags, kCustomKey);
+        expect(eq(carried.size(), 1UZ)) << "an unlisted custom key crosses once";
+        for (const TagRecord& record : carried) {
+            expect(eq(record.index, dropping.nSamples)) << "the unlisted key stands at the end index";
+            expect(record.map.contains(kReservedKey)) << "the reserved key crosses with it";
+        }
+        expect(carrying(dropping.endTags, kDroppedKey).empty()) << "the listed key stops at the block";
+        expect(eq(carrying(dropping.endTags, gr::tag::END_OF_STREAM.key()).size(), 1UZ)) << "the end_of_stream key stands once";
+    };
+
+    "a stale carrier estimate stops at a block that lists it, in a chunk and at the end index"_test = [] {
+        property_map map = protocolTag("stale");
+        gr::tag::put(map, "freq_est", 1250.f);
+        gr::tag::put(map, "phase_est", 0.75f);
+        const std::vector<TagRecord>   interior{TagRecord{0UZ, map}, TagRecord{700UZ, map}};
+        const std::vector<TagRecord>   atEnd{TagRecord{kSamples, map}};
+        const std::vector<std::size_t> offsets{interior[0].index, interior[1].index};
+
+        const RunResult plainChunks = runOnce([&interior](gr::Graph& flow) { return buildSeries<Relay>(flow, interior); });
+        const EndResult plainEnd    = runToEnd<Relay>(atEnd);
+        for (std::string_view key : {std::string_view("freq_est"), std::string_view("phase_est")}) {
+            expect(indicesCarrying(plainChunks.tags, key) == offsets) << std::format("{} crosses a block that lists nothing", key);
+            expect(eq(carrying(plainEnd.endTags, key).size(), 1UZ)) << std::format("{} crosses a block that lists nothing at the end index", key);
+        }
+
+        const RunResult droppingChunks = runOnce([&interior](gr::Graph& flow) { return buildSeries<CarrierEstimateDropper>(flow, interior); });
+        const EndResult droppingEnd    = runToEnd<CarrierEstimateDropper>(atEnd);
+        for (std::string_view key : {std::string_view("freq_est"), std::string_view("phase_est")}) {
+            expect(carrying(droppingChunks.tags, key).empty()) << std::format("{} stops at the block that lists it", key);
+            expect(carrying(droppingEnd.endTags, key).empty()) << std::format("{} stops at the block that lists it at the end index", key);
+        }
+        expect(indicesCarrying(droppingChunks.tags, kCustomKey) == offsets) << "an unlisted key crosses at its offsets";
+        expect(eq(carrying(droppingEnd.endTags, kCustomKey).size(), 1UZ)) << "an unlisted key crosses at the end index";
+        expect(eq(carrying(plainEnd.endTags, gr::tag::END_OF_STREAM.key()).size(), 1UZ)) << "the end_of_stream key stands once past a block that lists nothing";
+        expect(eq(carrying(droppingEnd.endTags, gr::tag::END_OF_STREAM.key()).size(), 1UZ)) << "the end_of_stream key stands once past the listing block";
+    };
+
+    "a listed key inside trigger_meta_info stops at the listing block and an unlisted one crosses"_test = [] {
+        property_map meta;
+        meta.insert_or_assign(std::pmr::string("phase_est"), pmt::Value(0.75f));
+        meta.insert_or_assign(std::pmr::string("snr_db"), pmt::Value(12.f));
+        property_map map = protocolTag("meta");
+        map.insert_or_assign(std::pmr::string(gr::tag::TRIGGER_META_INFO.shortKey()), pmt::Value(meta));
+        const std::vector<TagRecord> tags{TagRecord{0UZ, map}, TagRecord{700UZ, map}};
+
+        const auto metaKeysAt = [](const RunResult& result, std::string_view key) {
+            std::vector<std::size_t> indices;
+            for (const TagRecord& record : carrying(result.tags, gr::tag::TRIGGER_META_INFO.shortKey())) {
+                const pmt::Value*   value  = valueOf(record.map, gr::tag::TRIGGER_META_INFO.shortKey());
+                const property_map* nested = value == nullptr ? nullptr : value->get_if<property_map>();
+                if (nested != nullptr && nested->contains(std::pmr::string(key))) {
+                    indices.push_back(record.index);
+                }
+            }
+            return indices;
+        };
+        const std::vector<std::size_t> offsets{tags[0].index, tags[1].index};
+
+        const RunResult plain = runOnce([&tags](gr::Graph& flow) { return buildSeries<Relay>(flow, tags); });
+        expect(metaKeysAt(plain, "phase_est") == offsets) << "the nested key crosses a block that lists nothing";
+
+        const RunResult dropping = runOnce([&tags](gr::Graph& flow) { return buildSeries<CarrierEstimateDropper>(flow, tags); });
+        expect(metaKeysAt(dropping, "phase_est").empty()) << "the listed key inside trigger_meta_info stops at the block";
+        expect(metaKeysAt(dropping, "snr_db") == offsets) << "an unlisted key inside trigger_meta_info crosses at its offsets";
+        expect(indicesCarrying(dropping.tags, kCustomKey) == offsets) << "the tag's other keys cross";
     };
 
     "tags two samples apart all keep their custom keys"_test = [] {
