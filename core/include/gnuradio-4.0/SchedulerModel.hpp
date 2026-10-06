@@ -3,7 +3,9 @@
 
 #include <gnuradio-4.0/BlockModel.hpp>
 
+#include <memory>
 #include <thread>
+#include <vector>
 
 namespace gr {
 
@@ -61,8 +63,20 @@ public:
     virtual void releaseWorkQuiescence() = 0;
 };
 
+// A scheduler that holds a nested scheduler and exports its ports hands it the progress sequences of the graphs beyond
+// the holder. A wrapper without this interface advances only the sequence of the graph that holds it.
+class OuterProgressReceiver {
+public:
+    OuterProgressReceiver()                                        = default;
+    OuterProgressReceiver(const OuterProgressReceiver&)            = delete;
+    OuterProgressReceiver& operator=(const OuterProgressReceiver&) = delete;
+    virtual ~OuterProgressReceiver()                               = default;
+
+    virtual void setOuterProgress(std::vector<std::shared_ptr<gr::Sequence>> outerProgress) = 0;
+};
+
 template<BlockLike TScheduler>
-class SchedulerWrapper : public GraphWrapper<TScheduler, gr::Graph>, public SchedulerModel {
+class SchedulerWrapper : public GraphWrapper<TScheduler, gr::Graph>, public SchedulerModel, public OuterProgressReceiver {
     static_assert(std::is_same_v<TScheduler, std::remove_reference_t<TScheduler>>);
 
 public:
@@ -76,6 +90,14 @@ public:
 
     // members are destroyed before bases, so a joinable _schedulerThread here would terminate the process
     ~SchedulerWrapper() override { stop(); }
+
+    // A graph calls init() on each block it adds, and a scheduler calls it on each nested scheduler at its start. The
+    // scheduler's own init() takes no progress sequence and runs when the scheduler initializes its graph. The wrapper
+    // stores the given sequence in the scheduler's progress member. The scheduler advances that sequence after each
+    // pass in which a block with an exported port moves samples.
+    void init(std::shared_ptr<gr::Sequence> progress, std::string_view /*ioThreadPool*/ = gr::thread_pool::kDefaultIoPoolId) override { this->blockRef().progress = std::move(progress); }
+
+    void setOuterProgress(std::vector<std::shared_ptr<gr::Sequence>> outerProgress) final { this->blockRef().setOuterProgress(std::move(outerProgress)); }
 
     void setGraph(gr::Graph&& graph) final { std::ignore = this->blockRef().exchange(std::move(graph)); }
 
