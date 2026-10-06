@@ -1,10 +1,15 @@
 #include <boost/ut.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <format>
 #include <functional>
+#include <optional>
 #include <span>
+#include <string>
 #include <thread>
+#include <utility>
 
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/Message.hpp>
@@ -23,9 +28,16 @@ struct SwapRequester : gr::Block<SwapRequester> {
     GR_MAKE_REFLECTABLE(SwapRequester, out);
 
     std::function<void()> _onSwapRequest;
+    std::function<void()> _onReset;
     std::atomic<bool>*    _swapReturned = nullptr;
 
     [[nodiscard]] constexpr float processOne() const noexcept { return 1.0f; }
+
+    void reset() {
+        if (_onReset) {
+            _onReset();
+        }
+    }
 
     void processMessages(const gr::MsgPortInBuiltin&, std::span<const gr::Message> messages) {
         for (const gr::Message& message : messages) {
@@ -41,6 +53,67 @@ struct SwapRequester : gr::Block<SwapRequester> {
     }
 };
 
+constexpr std::size_t kFiniteSamples = 4096UZ;
+
+// publishes kFiniteSamples samples and then ends its stream
+struct FiniteSource : gr::Block<FiniteSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(FiniteSource, out);
+
+    std::size_t _nRemaining = kFiniteSamples;
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        const std::size_t nPublish = std::min(outSpan.size(), _nRemaining);
+        for (std::size_t i = 0UZ; i < nPublish; ++i) {
+            outSpan[i] = 1.0f;
+        }
+        outSpan.publish(nPublish);
+        _nRemaining -= nPublish;
+        return _nRemaining == 0UZ ? gr::work::Status::DONE : gr::work::Status::OK;
+    }
+};
+
+// its start() hook reports that it has begun and returns only once the test releases it, which holds the scheduler's
+// start() between the state change to RUNNING and the dispatch of its worker
+struct HeldStartSource : gr::Block<HeldStartSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(HeldStartSource, out);
+
+    std::atomic<bool>* _entered  = nullptr;
+    std::atomic<bool>* _released = nullptr;
+
+    void start() {
+        _entered->store(true);
+        _entered->notify_all();
+        _released->wait(false);
+    }
+
+    [[nodiscard]] constexpr float processOne() const noexcept { return 1.0f; }
+};
+
+// its stop() hook reports that it has begun and returns only once the test releases it, which holds the scheduler in
+// REQUESTED_STOP. The hook clears the gate, and a later stop passes
+struct HeldStopSource : gr::Block<HeldStopSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(HeldStopSource, out);
+
+    std::atomic<bool>* _entered  = nullptr;
+    std::atomic<bool>* _released = nullptr;
+
+    void stop() {
+        if (std::atomic<bool>* entered = std::exchange(_entered, nullptr); entered != nullptr) {
+            entered->store(true);
+            entered->notify_all();
+            _released->wait(false);
+        }
+    }
+
+    [[nodiscard]] constexpr float processOne() const noexcept { return 1.0f; }
+};
+
 template<std::atomic<std::size_t>* counter>
 struct CountingSink : gr::Block<CountingSink<counter>> {
     gr::PortIn<float> in;
@@ -50,15 +123,119 @@ struct CountingSink : gr::Block<CountingSink<counter>> {
     void processOne(float) { counter->fetch_add(1UZ, std::memory_order_relaxed); }
 };
 
-using FirstSink     = CountingSink<&gFirstGraphSamples>;
-using SecondSink    = CountingSink<&gSecondGraphSamples>;
-using TestScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>;
+using FirstSink       = CountingSink<&gFirstGraphSamples>;
+using SecondSink      = CountingSink<&gSecondGraphSamples>;
+using TestScheduler   = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>;
+using SerialScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>;
+
+// exposes the handler of a graph replacement by message, to call it from a thread of the test's choosing
+struct GrcProbe : SerialScheduler {
+    using SerialScheduler::propertyCallbackGraphGRC;
+    using SerialScheduler::SerialScheduler;
+};
+
+// a scheduler whose hook for a satisfied transition reports that the request has read the state and returns only once
+// the test releases it. The test sets the gate before one stop request that the state satisfies, and the thread that
+// makes the request clears it
+template<gr::scheduler::ExecutionPolicy execution>
+struct SatisfiedStopGate : gr::scheduler::SchedulerBase<SatisfiedStopGate<execution>, execution> {
+    using Base = gr::scheduler::SchedulerBase<SatisfiedStopGate<execution>, execution>;
+    using Base::Base;
+
+    std::atomic<std::atomic<bool>*> _satisfiedEntered{nullptr};
+    std::atomic<bool>*              _satisfiedReleased = nullptr;
+
+    void customInit() {
+        const gr::Graph flatGraph = gr::graph::flatten(*this->_graph);
+        std::lock_guard lock(this->_executionOrderMutex);
+        std::lock_guard guard(this->_adoptionBlocksMutex);
+        this->_adoptionBlocks.assign(1UZ, {});
+        this->_executionOrder->assign(1UZ, std::vector<std::shared_ptr<gr::BlockModel>>(flatGraph.blocks().begin(), flatGraph.blocks().end()));
+    }
+
+    void transitionSatisfied(gr::lifecycle::State requested, gr::lifecycle::State satisfiedBy) {
+        if (std::atomic<bool>* entered = _satisfiedEntered.exchange(nullptr); entered != nullptr) {
+            entered->store(true);
+            entered->notify_all();
+            _satisfiedReleased->wait(false);
+        }
+        Base::transitionSatisfied(requested, satisfiedBy);
+    }
+};
+
+template<typename TSink>
+[[nodiscard]] gr::Graph makeFiniteGraph() {
+    using namespace boost::ut;
+
+    gr::Graph flow;
+    auto&     source = flow.emplaceBlock<FiniteSource>();
+    auto&     sink   = flow.emplaceBlock<TSink>();
+    expect(flow.connect<"out", "in">(source, sink).has_value());
+    return flow;
+}
+
+[[nodiscard]] gr::Message makeGraphReplacement(std::string yaml) {
+    gr::Message request;
+    request.cmd      = gr::message::Command::Set;
+    request.endpoint = gr::scheduler::property::kGraphGRC;
+    request.data     = gr::property_map{{"value", std::move(yaml)}};
+    return request;
+}
+
+[[nodiscard]] gr::Graph makeFirstGraph() {
+    using namespace boost::ut;
+
+    gr::Graph flow;
+    auto&     source = flow.emplaceBlock<SwapRequester>();
+    auto&     sink   = flow.emplaceBlock<FirstSink>();
+    expect(flow.connect<"out", "in">(source, sink).has_value());
+    return flow;
+}
+
+// emits for 200 ms after its first work() call and then returns DONE
+struct TimedSource : gr::Block<TimedSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(TimedSource, out);
+
+    std::chrono::steady_clock::time_point _endAt{};
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        const auto now = std::chrono::steady_clock::now();
+        if (_endAt == std::chrono::steady_clock::time_point{}) {
+            _endAt = now + std::chrono::milliseconds(200);
+        }
+        if (now >= _endAt) {
+            outSpan.publish(0UZ);
+            return gr::work::Status::DONE;
+        }
+        outSpan.publish(std::min(outSpan.size(), 8UZ));
+        return gr::work::Status::OK;
+    }
+};
+
+// reads the flag that the destructor sets first
+struct DestructionProbe : TestScheduler {
+    using TestScheduler::TestScheduler;
+
+    [[nodiscard]] bool destroying() { return gr::atomic_ref(this->_run.destroying).load_acquire(); }
+};
 
 [[nodiscard]] gr::Graph makeSecondGraph() {
     using namespace boost::ut;
 
     gr::Graph flow;
     auto&     source = flow.emplaceBlock<SwapRequester>();
+    auto&     sink   = flow.emplaceBlock<SecondSink>();
+    expect(flow.connect<"out", "in">(source, sink).has_value());
+    return flow;
+}
+
+[[nodiscard]] gr::Graph makeTimedGraph() {
+    using namespace boost::ut;
+
+    gr::Graph flow;
+    auto&     source = flow.emplaceBlock<TimedSource>();
     auto&     sink   = flow.emplaceBlock<SecondSink>();
     expect(flow.connect<"out", "in">(source, sink).has_value());
     return flow;
@@ -71,7 +248,8 @@ using TestScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::mult
     return flag.load();
 }
 
-[[nodiscard]] bool awaitState(const TestScheduler& scheduler, gr::lifecycle::State expected) {
+template<typename TScheduler>
+[[nodiscard]] bool awaitState(const TScheduler& scheduler, gr::lifecycle::State expected) {
     for (std::size_t i = 0UZ; i < 3000UZ && scheduler.state() != expected; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
@@ -165,6 +343,265 @@ const boost::ut::suite<"scheduler graph exchange"> schedulerExchangeTests = [] {
 
         expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
         expect(qa_exchange::awaitState(scheduler, STOPPED)) << "second graph did not stop";
+    };
+
+    "a destruction that begins inside a deferred swap waits out no watchdog period"_test = [] {
+        // timed on the wall clock. The swap passes its check of the destruction flag, and the old graph's reset() hook
+        // then holds it until the destruction has begun and has passed its check of the state. The restart then reads
+        // the flag as set, stops the scheduler and spawns no watchdog. The watchdog period is 2 s. The bound holds only
+        // when the destruction retires the old run's watchdog at once and the restart runs nothing.
+        constexpr auto kBound = std::chrono::milliseconds(1000);
+
+        qa_exchange::gFirstGraphSamples  = 0UZ;
+        qa_exchange::gSecondGraphSamples = 0UZ;
+
+        std::atomic<bool>                            resetEntered{false};
+        std::optional<qa_exchange::DestructionProbe> scheduler;
+        scheduler.emplace(gr::property_map{{"watchdog_timeout", gr::Size_t(2'000)}});
+        qa_exchange::DestructionProbe* probe     = &*scheduler;
+        qa_exchange::SwapRequester*    requester = nullptr;
+
+        {
+            gr::Graph flow;
+            auto&     source = flow.emplaceBlock<qa_exchange::SwapRequester>();
+            auto&     sink   = flow.emplaceBlock<qa_exchange::FirstSink>();
+            expect(flow.connect<"out", "in">(source, sink).has_value());
+
+            source._onSwapRequest = [probe] { std::ignore = probe->exchange(qa_exchange::makeTimedGraph()); };
+            source._onReset       = [probe, &resetEntered] {
+                if (resetEntered.exchange(true)) {
+                    return;
+                }
+                for (std::size_t i = 0UZ; i < 3000UZ && !probe->destroying(); ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(20)); // the destructor reads the state meanwhile
+            };
+            requester = &source;
+
+            expect(scheduler->exchange(std::move(flow)).has_value());
+        }
+
+        expect(scheduler->changeStateTo(INITIALISED).has_value());
+        expect(scheduler->changeStateTo(RUNNING).has_value());
+        expect(qa_exchange::awaitCount(qa_exchange::gFirstGraphSamples, 1UZ)) << "first graph never ran";
+
+        qa_exchange::requestSwap(*requester);
+        expect(qa_exchange::awaitFlag(resetEntered)) << "the deferred swap never reset the old graph";
+
+        const auto destructionStart = std::chrono::steady_clock::now();
+        scheduler.reset();
+        const auto destructionTime = std::chrono::steady_clock::now() - destructionStart;
+
+        expect(destructionTime < kBound) << std::format("the destruction took {}", std::chrono::duration_cast<std::chrono::milliseconds>(destructionTime));
+    };
+
+    "a running single-threaded scheduler refuses a graph swap from another thread"_test = [] {
+        qa_exchange::gFirstGraphSamples  = 0UZ;
+        qa_exchange::gSecondGraphSamples = 0UZ;
+
+        qa_exchange::SerialScheduler scheduler;
+        expect(scheduler.exchange(qa_exchange::makeFirstGraph()).has_value());
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+
+        // a single-threaded run executes on the thread that requests RUNNING and returns when the run ends
+        std::thread runner([&scheduler] { std::ignore = scheduler.changeStateTo(RUNNING); });
+        expect(qa_exchange::awaitCount(qa_exchange::gFirstGraphSamples, 1UZ)) << "first graph never ran";
+
+        std::atomic<bool> swapReturned{false};
+        std::atomic<bool> swapRefused{false};
+        std::thread       swapper([&scheduler, &swapReturned, &swapRefused] {
+            swapRefused.store(!scheduler.exchange(qa_exchange::makeSecondGraph()).has_value());
+            swapReturned.store(true);
+        });
+
+        expect(qa_exchange::awaitFlag(swapReturned)) << "exchange() blocked its caller";
+        expect(swapRefused.load()) << "exchange() did not return an error";
+        expect(scheduler.state() == RUNNING) << "the refused swap changed the scheduler's state";
+        const std::size_t nFirstBefore = qa_exchange::gFirstGraphSamples.load(std::memory_order_relaxed);
+        expect(qa_exchange::awaitCount(qa_exchange::gFirstGraphSamples, nFirstBefore + 1UZ)) << "the running graph stopped";
+        expect(eq(qa_exchange::gSecondGraphSamples.load(std::memory_order_relaxed), 0UZ)) << "the refused graph ran";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        swapper.join();
+        runner.join();
+        expect(qa_exchange::awaitState(scheduler, STOPPED)) << "the scheduler did not stop";
+    };
+
+    "a single-threaded scheduler refuses a swap from another thread while its start is in progress"_test = [] {
+        qa_exchange::gFirstGraphSamples  = 0UZ;
+        qa_exchange::gSecondGraphSamples = 0UZ;
+
+        std::atomic<bool> hookEntered{false};
+        std::atomic<bool> hookReleased{false};
+        gr::Graph         flow;
+        auto&             source = flow.emplaceBlock<qa_exchange::HeldStartSource>();
+        auto&             sink   = flow.emplaceBlock<qa_exchange::FirstSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+        source._entered  = &hookEntered; // the wrapper holding the block lives on the heap. The pointers stay valid after the move.
+        source._released = &hookReleased;
+
+        qa_exchange::SerialScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+
+        std::thread runner([&scheduler] { std::ignore = scheduler.changeStateTo(RUNNING); });
+        expect(qa_exchange::awaitFlag(hookEntered)) << "the start hook never ran";
+        expect(scheduler.state() == RUNNING) << "the scheduler did not read RUNNING during its start";
+
+        std::atomic<bool> swapReturned{false};
+        std::atomic<bool> swapRefused{false};
+        std::thread       swapper([&scheduler, &swapReturned, &swapRefused] {
+            swapRefused.store(!scheduler.exchange(qa_exchange::makeSecondGraph()).has_value());
+            swapReturned.store(true);
+        });
+        const bool        returnedDuringStart = qa_exchange::awaitFlag(swapReturned);
+
+        hookReleased.store(true);
+        hookReleased.notify_all();
+        expect(returnedDuringStart) << "exchange() waited for the start in progress";
+        expect(swapRefused.load()) << "exchange() did not refuse the swap during the start";
+        expect(qa_exchange::awaitCount(qa_exchange::gFirstGraphSamples, 1UZ)) << "the run did not begin after its start hook returned";
+        expect(eq(qa_exchange::gSecondGraphSamples.load(std::memory_order_relaxed), 0UZ)) << "the refused graph ran";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        swapper.join();
+        runner.join();
+        expect(qa_exchange::awaitState(scheduler, STOPPED)) << "the scheduler did not stop";
+    };
+
+    "the thread that ran a finished single-threaded run swaps in and runs the next graph"_test = [] {
+        qa_exchange::gFirstGraphSamples  = 0UZ;
+        qa_exchange::gSecondGraphSamples = 0UZ;
+
+        qa_exchange::SerialScheduler scheduler;
+        expect(scheduler.exchange(qa_exchange::makeFiniteGraph<qa_exchange::FirstSink>()).has_value());
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value()); // runs the finite graph on this thread and returns when it ends
+        expect(eq(qa_exchange::gFirstGraphSamples.load(std::memory_order_relaxed), qa_exchange::kFiniteSamples)) << "the first graph did not run to its end";
+
+        expect(scheduler.exchange(qa_exchange::makeFiniteGraph<qa_exchange::SecondSink>()).has_value()) << "the thread that ran the finished graph was refused";
+        expect(eq(qa_exchange::gSecondGraphSamples.load(std::memory_order_relaxed), qa_exchange::kFiniteSamples)) << "the swapped-in graph did not run on this thread";
+
+        if (scheduler.state() == RUNNING) {
+            expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        }
+        expect(qa_exchange::awaitState(scheduler, STOPPED)) << "the scheduler did not stop";
+    };
+
+    "a refused graph replacement by message keeps the running graph"_test = [] {
+        qa_exchange::gFirstGraphSamples  = 0UZ;
+        qa_exchange::gSecondGraphSamples = 0UZ;
+
+        qa_exchange::GrcProbe scheduler;
+        expect(scheduler.exchange(qa_exchange::makeFirstGraph()).has_value());
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+
+        std::thread runner([&scheduler] { std::ignore = scheduler.changeStateTo(RUNNING); });
+        expect(qa_exchange::awaitCount(qa_exchange::gFirstGraphSamples, 1UZ)) << "first graph never ran";
+
+        const std::size_t          nBlocks = scheduler.graph().blocks().size();
+        const gr::Message          request = qa_exchange::makeGraphReplacement(gr::saveGrc(gr::globalPluginLoader(), gr::Graph{}));
+        std::optional<gr::Message> refused = scheduler.propertyCallbackGraphGRC(gr::scheduler::property::kGraphGRC, request);
+        expect(refused.has_value() && !refused->data.has_value()) << "the refused replacement sent no error reply";
+        expect(eq(scheduler.graph().blocks().size(), nBlocks)) << "the refused replacement retired the running graph's blocks";
+        const std::size_t nFirstBefore = qa_exchange::gFirstGraphSamples.load(std::memory_order_relaxed);
+        expect(qa_exchange::awaitCount(qa_exchange::gFirstGraphSamples, nFirstBefore + 1UZ)) << "the running graph stopped";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        runner.join();
+        expect(qa_exchange::awaitState(scheduler, STOPPED)) << "the scheduler did not stop";
+
+        // the same request succeeds once the run has stopped: the refusal above came from the running worker alone
+        std::optional<gr::Message> accepted = scheduler.propertyCallbackGraphGRC(gr::scheduler::property::kGraphGRC, request);
+        expect(accepted.has_value() && accepted->data.has_value()) << "the stopped scheduler refused the replacement";
+    };
+
+    // a second thread requests a stop while the scheduler reads STOPPED. The request is satisfied and held after its
+    // state read, while the test starts the next run. The stop belongs to the run that had ended
+    "a stop request satisfied by STOPPED leaves the next run running"_test = [] {
+        qa_exchange::gFirstGraphSamples = 0UZ;
+
+        qa_exchange::SatisfiedStopGate<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler;
+        expect(scheduler.exchange(qa_exchange::makeFirstGraph()).has_value());
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        std::thread firstRun([&scheduler] { std::ignore = scheduler.changeStateTo(RUNNING); });
+        expect(qa_exchange::awaitCount(qa_exchange::gFirstGraphSamples, 1UZ)) << "first run never ran";
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        firstRun.join();
+        expect(qa_exchange::awaitState(scheduler, STOPPED)) << "the first run did not stop";
+
+        std::atomic<bool> satisfiedEntered{false};
+        std::atomic<bool> satisfiedReleased{false};
+        scheduler._satisfiedReleased = &satisfiedReleased;
+        scheduler._satisfiedEntered  = &satisfiedEntered;
+        std::thread requester([&scheduler] { std::ignore = scheduler.changeStateTo(REQUESTED_STOP); });
+        satisfiedEntered.wait(false);
+
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        const std::size_t samplesBefore = qa_exchange::gFirstGraphSamples.load();
+        std::thread       secondRun([&scheduler] { std::ignore = scheduler.changeStateTo(RUNNING); });
+        expect(qa_exchange::awaitCount(qa_exchange::gFirstGraphSamples, samplesBefore + 1UZ)) << "the second run never ran";
+
+        satisfiedReleased.store(true);
+        satisfiedReleased.notify_all();
+        requester.join();
+        const std::size_t samplesAfterRequest = qa_exchange::gFirstGraphSamples.load();
+        expect(qa_exchange::awaitCount(qa_exchange::gFirstGraphSamples, samplesAfterRequest + 1UZ)) << "the earlier stop ended the second run";
+        expect(scheduler.state() == RUNNING) << "the earlier stop moved the scheduler out of RUNNING";
+
+        std::ignore = scheduler.changeStateTo(REQUESTED_STOP);
+        secondRun.join();
+        expect(qa_exchange::awaitState(scheduler, STOPPED)) << "the second run did not stop";
+    };
+
+    // A second thread requests a stop while exchange() stops the running graph for its swap. The request reads
+    // REQUESTED_STOP and is held after its state read. Meanwhile exchange() resets the scheduler and restores the run on
+    // the new graph. The stop came after the run began, and it ends the run that the swap restored
+    "a stop request satisfied during a swap's own stop ends the run that the swap restores"_test = [] {
+        qa_exchange::gFirstGraphSamples  = 0UZ;
+        qa_exchange::gSecondGraphSamples = 0UZ;
+
+        std::atomic<bool>                                                             stopEntered{false};
+        std::atomic<bool>                                                             stopReleased{false};
+        qa_exchange::SatisfiedStopGate<gr::scheduler::ExecutionPolicy::multiThreaded> scheduler;
+        {
+            gr::Graph flow;
+            auto&     source = flow.emplaceBlock<qa_exchange::HeldStopSource>();
+            auto&     sink   = flow.emplaceBlock<qa_exchange::FirstSink>();
+            expect(flow.connect<"out", "in">(source, sink).has_value());
+            source._released = &stopReleased;
+            source._entered  = &stopEntered;
+            expect(scheduler.exchange(std::move(flow)).has_value());
+        }
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(qa_exchange::awaitCount(qa_exchange::gFirstGraphSamples, 1UZ)) << "first graph never ran";
+
+        std::atomic<bool> swapped{false};
+        std::thread       swapper([&scheduler, &swapped] { swapped = scheduler.exchange(qa_exchange::makeSecondGraph()).has_value(); });
+        stopEntered.wait(false);
+
+        std::atomic<bool> satisfiedEntered{false};
+        std::atomic<bool> satisfiedReleased{false};
+        scheduler._satisfiedReleased = &satisfiedReleased;
+        scheduler._satisfiedEntered  = &satisfiedEntered;
+        std::thread requester([&scheduler] { std::ignore = scheduler.changeStateTo(REQUESTED_STOP); });
+        satisfiedEntered.wait(false);
+
+        stopReleased.store(true);
+        stopReleased.notify_all();
+        swapper.join();
+        expect(swapped.load()) << "the swap failed";
+        expect(qa_exchange::awaitCount(qa_exchange::gSecondGraphSamples, 1UZ)) << "the swap did not restore the run";
+
+        satisfiedReleased.store(true);
+        satisfiedReleased.notify_all();
+        requester.join();
+        expect(qa_exchange::awaitState(scheduler, STOPPED)) << "the stop requested during the swap's own stop left the restored run running";
+
+        std::ignore = scheduler.changeStateTo(REQUESTED_STOP);
+        expect(qa_exchange::awaitState(scheduler, STOPPED)) << "the scheduler did not stop";
     };
 };
 

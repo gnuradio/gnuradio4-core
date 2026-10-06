@@ -134,6 +134,9 @@ enum class StorageType { ATOMIC, NON_ATOMIC };
  * and forward the exception details.
  *
  * To react to state changes, TDerived can implement the `stateChanged(State newState)` method.
+ * A request that the current state already satisfies changes no state and calls no lifecycle method. TDerived can
+ * observe such a request by implementing the `transitionSatisfied(State requested, State satisfiedBy)` method, which
+ * receives the state that the request read.
  *
  * @tparam TDerived The derived class type implementing specific lifecycle methods.
  * @tparam storageType Specifies the storage type for the state, allowing for atomic operations
@@ -159,6 +162,12 @@ protected:
     // a transition that is already satisfied: reported as success without running any hook
     [[nodiscard]] static constexpr bool isSatisfiedTransition(State from, State to) noexcept { //
         return from == to || (from == State::STOPPED && to == State::REQUESTED_STOP) || (from == State::PAUSED && to == State::REQUESTED_PAUSE);
+    }
+
+    void notifyTransitionSatisfied(State requested, State satisfiedBy) {
+        if constexpr (requires(TDerived d) { d.transitionSatisfied(requested, satisfiedBy); }) {
+            static_cast<TDerived*>(this)->transitionSatisfied(requested, satisfiedBy);
+        }
     }
 
     [[nodiscard]] Error invalidTransitionError(State from, State to, const std::source_location& location) {
@@ -236,6 +245,7 @@ public:
                 }
             }
             if (isSatisfiedTransition(oldState, newState)) {
+                notifyTransitionSatisfied(newState, oldState);
                 return {};
             }
             if constexpr (requires(TDerived d) { d.stateChanged(newState); }) {
@@ -245,6 +255,7 @@ public:
         } else {
             oldState = _state;
             if (isSatisfiedTransition(oldState, newState)) {
+                notifyTransitionSatisfied(newState, oldState);
                 return {};
             }
             if (!isValidTransition(oldState, newState)) {
