@@ -152,16 +152,22 @@ protected:
         std::optional<std::size_t> restoredFrom;      // the generation of the scheduler's own stop that restoreRun() last restarted from
     };
 
+    // a graph swap or a restart that a worker of this scheduler requested. The worker whose message handler made the
+    // latest request claims it when it releases its count. No other worker claims it. The claimed request stays here
+    // until every other worker has left, and a start or a swap that another worker requests in that time joins it. The
+    // claiming worker then takes the request and applies it. A restart requested by start() carries no graph.
     struct PendingExchange {
-        meta::indirect<gr::Graph> graph;
-        profiling::Options        option;
-        bool                      restart{false};
-        std::size_t               generation{0UZ}; // the generation the swap's own stop advanced to
+        std::optional<meta::indirect<gr::Graph>> graph;
+        profiling::Options                       option;
+        bool                                     restart{false};
+        std::size_t                              generation{0UZ}; // a start or a stop that changes it cancels the restart
+        std::thread::id                          requester;       // the worker that claims the request
+        bool                                     claimed{false};
     };
     std::mutex                     _runMutex; // guards _run, _pendingExchange and the claim of a pending swap
     RunRecord                      _run;
     std::optional<PendingExchange> _pendingExchange;
-    std::size_t                    _nDeferredExchanges{0UZ}; // claimed swaps still running outside the job count
+    std::size_t                    _nDeferredExchanges{0UZ}; // claimed swaps and restarts still running outside the job count
     bool                           _exchangeClaimed{false};  // held by exchange() while it swaps the graph of an inactive scheduler
     std::optional<Error>           _startError;              // written by failStart(), cleared when a start begins
 
@@ -222,11 +228,12 @@ protected:
 
     // The run executes on the caller's thread inside start(). The scheduler refuses a swap from another thread from the
     // moment the state reads RUNNING until start() returns. The job count rises only partway through start(). After
-    // start() has returned, the swap proceeds.
+    // start() has returned, the swap proceeds. The thread that applies a swap requested on the scheduler's worker
+    // swaps as the worker would: a start in the same message batch has published RUNNING without running a worker.
     [[nodiscard]] std::expected<void, Error> swapAllowedFromThisThread() {
         if constexpr (executionPolicy() == ExecutionPolicy::singleThreaded || executionPolicy() == ExecutionPolicy::singleThreadedBlocking) {
             const auto state = this->state();
-            if (!isOnOwnWorkerThread() && lifecycle::isActive(state)) {
+            if (!isOnOwnWorkerThread() && applyingScheduler() != static_cast<const void*>(this) && lifecycle::isActive(state)) {
                 std::lock_guard guard(_runMutex);
                 if (_run.phase != RunPhase::started) {
                     return std::unexpected(Error(std::format("exchange(): the single-threaded scheduler '{}' is {} on another thread; stop it before exchanging its graph", this->unique_name, gr::meta::enumName(state).value_or(""))));
@@ -302,11 +309,37 @@ protected:
     }
 
     // a worker occupies its pool thread for the scheduler's lifetime, so a job list that never gets one
-    // never runs its blocks and back-pressure stalls the whole graph -- claim only the free threads
+    // never runs its blocks and back-pressure stalls the whole graph -- claim only the free threads.
+    // A worker that runs a reset from a message, and a thread that applies a deferred swap or restart, hold their
+    // thread only until the next run is dispatched. That thread counts as free.
     [[nodiscard]] std::size_t nJobLists(std::size_t nBlocks) const {
         const std::size_t nThreads = static_cast<std::size_t>(_pool->maxThreads());
-        const std::size_t nBusy    = std::min(_pool->numTasksRunning(), nThreads);
+        const std::size_t nOwn     = isOnOwnWorkerThread() || applyingScheduler() == static_cast<const void*>(this) ? 1UZ : 0UZ;
+        const std::size_t nRunning = _pool->numTasksRunning();
+        const std::size_t nBusy    = std::min(nRunning - std::min(nRunning, nOwn), nThreads);
         return std::min(std::max(nThreads - nBusy, 1UZ), nBlocks);
+    }
+
+    // waits until every worker count except the caller's own is released. A lifecycle command sent as a message can
+    // run on one of the scheduler's workers. That worker holds its own count until it leaves poolWorker() at its next
+    // generation check.
+    void waitForOtherWorkers() {
+        const std::size_t nOwn = isOnOwnWorkerThread() ? 1UZ : 0UZ;
+        for (std::size_t nRunning = _nRunningJobs->value(); nRunning > nOwn; nRunning = _nRunningJobs->value()) {
+            _nRunningJobs->wait(nRunning);
+        }
+    }
+
+    // waits until no worker and no claimed swap or restart remain. A worker that claims a swap or a restart releases its
+    // count before it applies the claim, and the next run's workers are counted only while the claim is applied.
+    void waitForRunAndClaims() {
+        auto nDeferred = [this] { return gr::atomic_ref(_nDeferredExchanges).load_acquire(); };
+        do {
+            waitDone();
+            for (std::size_t n = nDeferred(); n != 0UZ; n = nDeferred()) {
+                gr::atomic_ref(_nDeferredExchanges).wait(n);
+            }
+        } while (_nRunningJobs->value() != 0UZ);
     }
 
     void rebuildProfiler(const profiling::Options& opt) {
@@ -432,10 +465,10 @@ public:
             _pendingExchange.reset();
         }
 
-        // A swap claimed before the flag was set runs outside the job count. It can restart the run after a pass has
-        // read the state, and that restart spawns a watchdog. Each pass stops an active run, waits for the workers and
-        // the claimed swaps, then retires the watchdogs and waits for them. The watchdog dereferences SchedulerBase.
-        // The passes repeat until no run, worker, swap or watchdog remains.
+        // A swap or a restart claimed before the flag was set runs outside the job count. It can restart the run after
+        // a pass has read the state, and that restart spawns a watchdog. Each pass stops an active run, waits for the
+        // workers and the claims, then retires the watchdogs and waits for them. The watchdog dereferences
+        // SchedulerBase. The passes repeat until no run, worker, claim or watchdog remains.
         auto nDeferred  = [this] { return gr::atomic_ref(_nDeferredExchanges).load_acquire(); };
         auto nWatchdogs = [this] { return gr::atomic_ref(_nWatchdogsRunning).load_acquire(); };
         do {
@@ -445,10 +478,7 @@ public:
                     std::abort();
                 }
             }
-            waitDone();
-            for (std::size_t n = nDeferred(); n != 0UZ; n = nDeferred()) {
-                gr::atomic_ref(_nDeferredExchanges).wait(n);
-            }
+            waitForRunAndClaims();
             retireWatchdogs();
         } while (lifecycle::isActive(this->state()) || _nRunningJobs->value() != 0UZ || nDeferred() != 0UZ || nWatchdogs() != 0UZ);
 
@@ -493,11 +523,9 @@ public:
         const auto oldState = this->state();
 
         if (isOnOwnWorkerThread()) {
-            // a message handler on a worker of this scheduler cannot wait for the job count to reach zero --
-            // its own increment is part of it. Request the stop, stash the graph, and let the last worker out swap.
-            // The stop is requested before the record is published so that the record carries its restart from the
-            // moment it is visible: a worker leaving in between would otherwise claim one that still reads as a
-            // plain swap, and the scheduler would never start again.
+            // a message handler on a worker of this scheduler cannot wait for the job count to reach zero. Its own count
+            // is part of it. Request the stop and record the graph. The worker that claims the record applies the swap
+            // once every other worker has left.
             const bool  restart       = lifecycle::isActive(oldState);
             std::size_t ownGeneration = 0UZ;
             if (restart) {
@@ -508,7 +536,8 @@ public:
             }
             {
                 std::lock_guard guard(_runMutex);
-                _pendingExchange = PendingExchange{std::move(newGraph), option, restart, ownGeneration};
+                const bool      joinsClaim = _pendingExchange.has_value() && _pendingExchange->claimed;
+                _pendingExchange           = PendingExchange{std::move(newGraph), option, restart, ownGeneration, std::this_thread::get_id(), joinsClaim};
             }
             return meta::indirect<Graph>{};
         }
@@ -791,7 +820,8 @@ public:
         // N.B. the transition to lifecycle::State::RUNNING will for the ExecutionPolicy:
         // * singleThreaded[Blocking] naturally block in the calling thread
         // * multiThreaded[Blocking] spawn two worker and block on 'waitDone()'
-        waitDone();
+        // A swap or a restart that a worker requested runs the next run of this call.
+        waitForRunAndClaims();
 
         // the message drain can throw when a child's error message would otherwise be dropped
         // (no msgOut subscriber); at this boundary that becomes the call's own error vocabulary
@@ -946,10 +976,8 @@ protected:
         awaitExchange();
         // waits for the previous run's workers before reinitializing the blocks. A worker still traversing would call
         // work() on a block whose edges reset() disconnects. stop() retired the workers, so the wait lasts at most one
-        // traversal. A reset requested by a message runs on a worker, which cannot wait for itself.
-        if (!isOnOwnWorkerThread()) {
-            waitDone();
-        }
+        // traversal.
+        waitForOtherWorkers();
         gr::atomic_ref(_nWorkersStarted).store_release(0UZ); // workerStarted() reports the next start's workers, not the last run's
         graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) { this->emitErrorMessageIfAny("reset() -> LifecycleState", block->changeStateTo(lifecycle::INITIALISED)); });
         disconnectAllEdges();
@@ -978,6 +1006,10 @@ protected:
 
     void start() {
         using enum gr::lifecycle::State;
+        if (isOnOwnWorkerThread()) {
+            deferStart();
+            return;
+        }
         on_scope_exit markStarted = [this] {
             std::lock_guard guard(_runMutex);
             if (_run.phase == RunPhase::starting) {
@@ -1144,6 +1176,22 @@ protected:
         }
     }
 
+    // A start requested on a worker of this scheduler, by a lifecycle message, records a restart and returns. A swap or
+    // a restart already recorded takes the restart instead. A run dispatched inside the handler would block the
+    // scheduler's messages under a single-threaded policy, and its start() would wait for the worker that runs it. The
+    // restart keeps the generation it found. A start or a stop before the restart is applied cancels it.
+    void deferStart() {
+        std::lock_guard   guard(_runMutex);
+        const std::size_t generation = _run.generation;
+        if (_pendingExchange.has_value()) {
+            _pendingExchange->restart    = true;
+            _pendingExchange->generation = generation;
+            _pendingExchange->requester  = std::this_thread::get_id();
+        } else {
+            _pendingExchange = PendingExchange{std::nullopt, profiling::Options{}, true, generation, std::this_thread::get_id()};
+        }
+    }
+
     // a scheduler's own poolWorker() takes the run's generation as a third parameter or omits it. A worker without the
     // generation ends only when it observes an inactive state
     void dispatchWorker(std::size_t runnerID, std::shared_ptr<JobLists> jobList, std::size_t generation) {
@@ -1158,19 +1206,23 @@ protected:
     // was retired before starting. The pending graph exchange is claimed before the count is
     // released so that ~SchedulerBase()'s waitDone() cannot complete before the swap is applied.
     void releaseWorkerCount(gr::Sequence& nRunningJobs) {
-        std::optional<PendingExchange> claimed;
+        bool claimed = false;
         {
             std::lock_guard guard(_runMutex);
-            if (_pendingExchange.has_value()) {
-                claimed = std::move(_pendingExchange);
-                _pendingExchange.reset();
+            if (_pendingExchange.has_value() && !_pendingExchange->claimed && _pendingExchange->requester == std::this_thread::get_id()) {
+                _pendingExchange->claimed = true;
+                claimed                   = true;
                 gr::atomic_ref(_nDeferredExchanges).fetch_add(1UZ);
             }
         }
         std::ignore = nRunningJobs.subAndGet(1UZ);
         nRunningJobs.notify_all();
-        if (claimed.has_value()) {
-            applyPendingExchange(std::move(*claimed));
+        if (claimed) {
+            {
+                const void*   previousApplying = std::exchange(applyingScheduler(), static_cast<const void*>(this));
+                on_scope_exit restoreApplying  = [previousApplying] { applyingScheduler() = previousApplying; };
+                applyPendingExchange();
+            }
             gr::atomic_ref(_nDeferredExchanges).fetch_sub(1UZ);
             gr::atomic_ref(_nDeferredExchanges).notify_all();
         }
@@ -1236,6 +1288,11 @@ protected:
             if (hasMessagesToProcess) {
                 if (runnerID == 0UZ || nRunningJobs->value() == 0UZ) {
                     this->processScheduledMessages(); // execute the scheduler- and Graph-specific message handler only once globally
+                }
+                // the run was retired. A restart among the messages above runs with the next run's workers, which own
+                // the blocks from here
+                if (gr::atomic_ref(_run.generation).load_acquire() != generation) {
+                    break;
                 }
 
                 // Zombies are cleaned per-thread, as we remove from the localBlockList as well.
@@ -1313,27 +1370,61 @@ protected:
         } while (lifecycle::isActive(activeState) && gr::atomic_ref(_run.generation).load_acquire() == generation);
     }
 
-    // performs a graph swap that exchange() had to defer because it was requested from a scheduler worker
-    void applyPendingExchange(PendingExchange pending) {
+    // performs the graph swap or the restart that this thread claimed. The request is taken once every other worker has
+    // left, with any start or swap that joined it
+    void applyPendingExchange() {
         using enum lifecycle::State;
 
         waitDone(); // the claiming worker has already released its own count
+        PendingExchange pending;
         {
             std::lock_guard guard(_runMutex);
-            if (_run.destroying) {
-                return; // destruction started: do not touch the graph
+            if (_run.destroying || !_pendingExchange.has_value()) {
+                return; // destruction started and dropped the request: do not touch the graph
             }
+            pending = std::move(*_pendingExchange);
+            _pendingExchange.reset();
         }
 
+        if (!pending.graph.has_value()) {
+            applyDeferredStart(pending.generation);
+            return;
+        }
         if (this->state() == REQUESTED_STOP) {
             this->emitErrorMessageIfAny("applyPendingExchange() -> STOPPED", this->changeStateTo(STOPPED));
         }
-        if (auto result = exchange(std::move(pending.graph), pending.option); !result) {
+        // A start in the same message batch as the swap leaves the scheduler active. exchange() then stops the run and
+        // restores it itself. Under a single-threaded policy the restored run executes inside exchange() and has ended
+        // when exchange() returns. The claim then restores no run of its own.
+        const bool restoredByExchange = lifecycle::isActive(this->state());
+        if (auto result = exchange(std::move(*pending.graph), pending.option); !result) {
             this->emitErrorMessage("applyPendingExchange()", result.error());
             return;
         }
-        if (pending.restart) {
+        if (pending.restart && !restoredByExchange && !lifecycle::isActive(this->state())) {
             this->emitErrorMessageIfAny("applyPendingExchange() -> RUNNING", restoreRun(pending.generation, RUNNING));
+        }
+    }
+
+    // The message that requested the start has published RUNNING. An unchanged generation runs the start. A changed one
+    // means a stop came since, and the scheduler stops in place of the start.
+    void applyDeferredStart(std::size_t generation) {
+        using enum lifecycle::State;
+        if (runGeneration() == generation && this->state() == RUNNING) {
+            try {
+                start();
+            } catch (const std::exception& e) {
+                this->emitErrorMessage("applyDeferredStart()", Error(std::format("start() throws: {}", e.what())));
+                this->emitErrorMessageIfAny("applyDeferredStart() -> ERROR", this->changeStateTo(ERROR));
+            }
+            return;
+        }
+        if (lifecycle::isActive(this->state())) {
+            this->emitErrorMessageIfAny("applyDeferredStart() -> REQUESTED_STOP", this->changeStateTo(REQUESTED_STOP));
+        }
+        std::lock_guard guard(_runMutex);
+        if (_run.phase == RunPhase::starting) {
+            _run.phase = RunPhase::started;
         }
     }
 

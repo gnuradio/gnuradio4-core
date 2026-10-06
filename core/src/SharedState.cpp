@@ -7,6 +7,11 @@ const void*& activeSchedulerWorker() noexcept {
     return scheduler;
 }
 
+const void*& applyingScheduler() noexcept {
+    thread_local const void* scheduler = nullptr;
+    return scheduler;
+}
+
 const void*& exchangingScheduler() noexcept {
     thread_local const void* scheduler = nullptr;
     return scheduler;

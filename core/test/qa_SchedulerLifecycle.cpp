@@ -22,12 +22,17 @@
 #include <type_traits>
 #include <vector>
 
+#include <gnuradio-4.0/BlockRegistry.hpp>
 #include <gnuradio-4.0/BlockingSync.hpp>
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/LifeCycle.hpp>
+#include <gnuradio-4.0/PluginLoader.hpp>
 #include <gnuradio-4.0/Scheduler.hpp>
 #include <gnuradio-4.0/SchedulerModel.hpp>
 #include <gnuradio-4.0/thread/thread_pool.hpp>
+
+#include "build_configure.hpp"
+#include "plugins/cross_object_scheduler.hpp"
 
 namespace qa_sched {
 
@@ -796,6 +801,52 @@ void startAndPause(TestScheduler& scheduler) {
     expect(awaitState(scheduler, PAUSED)) << "scheduler did not reach PAUSED";
 }
 
+#ifdef GR_TEST_WITH_BLOCK_LIBRARY
+constexpr std::string_view kLibraryScheduler = "test::cross_object_scheduler";
+
+// loads the test's shared object with a scheduler once. The loader keeps an object that registered entries
+// mapped after the loader is gone
+[[nodiscard]] inline bool loadCrossObjectLibrary() {
+    static const bool loaded = [] {
+        const std::vector<std::string> directories{std::string(TESTS_BINARY_PATH) + "/cross_object_library"};
+        gr::PluginLoader               loader(gr::globalBlockRegistry(), gr::globalSchedulerRegistry(), directories);
+        return gr::globalSchedulerRegistry().contains(kLibraryScheduler);
+    }();
+    return loaded;
+}
+
+// work() calls and start() calls of ThreadMarkProbe, and the answers it got
+inline std::atomic<std::size_t> gMarkWorkCalls{0UZ};
+inline std::atomic<std::size_t> gMarkOwnWorkerCalls{0UZ};
+inline std::atomic<std::size_t> gMarkStarts{0UZ};
+inline std::atomic<bool>        gMarkFirstStartAdmitted{false};
+inline std::atomic<bool>        gMarkRestartAdmitted{false};
+
+// asks the scheduler that runs it, with this program's code, whether the calling thread is the scheduler's worker,
+// and whether the scheduler admits a graph swap from the thread that starts the blocks
+struct ThreadMarkProbe : gr::Block<ThreadMarkProbe> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(ThreadMarkProbe, out);
+
+    gr::testing::CrossObjectScheduler* _scheduler = nullptr;
+
+    void start() {
+        const bool admitted = _scheduler->swapAllowedFromThisThread().has_value();
+        (gMarkStarts.fetch_add(1UZ) == 0UZ ? gMarkFirstStartAdmitted : gMarkRestartAdmitted).store(admitted);
+    }
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        if (_scheduler->isOnOwnWorkerThread()) {
+            gMarkOwnWorkerCalls.fetch_add(1UZ);
+        }
+        gMarkWorkCalls.fetch_add(1UZ);
+        outSpan.publish(0UZ);
+        return gr::work::Status::INSUFFICIENT_INPUT_ITEMS;
+    }
+};
+#endif
+
 } // namespace qa_sched
 
 const boost::ut::suite<"scheduler pause lifecycle"> schedulerLifecycleTests = [] {
@@ -1365,6 +1416,190 @@ const boost::ut::suite<"job lists sized to the free pool threads"> jobListSizing
         } else {
             restarter.detach(); // joining a thread stuck on the mutex would hang the suite instead of failing it
         }
+    };
+};
+
+namespace qa_sched {
+
+// sends a stop, a reset and a start in one span to the scheduler's message port. One worker handles all three
+void sendRestartBatch(gr::MsgPortOut& toScheduler, std::string_view schedulerName) {
+    using enum gr::lifecycle::State;
+    constexpr std::array kCommands{REQUESTED_STOP, INITIALISED, RUNNING};
+
+    auto span = toScheduler.streamWriter().reserve<gr::SpanReleasePolicy::ProcessAll>(kCommands.size());
+    for (std::size_t i = 0UZ; i < kCommands.size(); ++i) {
+        span[i].cmd         = gr::message::Command::Set;
+        span[i].serviceName = schedulerName;
+        span[i].endpoint    = gr::block::property::kLifeCycleState;
+        span[i].data        = gr::property_map{{"state", std::string(gr::meta::enumName(kCommands[i]).value_or(""))}};
+    }
+    span.publish(kCommands.size());
+}
+
+// reads the scheduler's count of workers that have not yet left their loop
+struct WorkerCountProbe : TestScheduler {
+    using TestScheduler::TestScheduler;
+
+    [[nodiscard]] std::size_t nRunningJobs() const { return this->_nRunningJobs->value(); }
+};
+
+// handlers that took the probe message, handlers that returned from it, and handlers whose wait ran out
+inline std::atomic<int>  gProbeTakers{0};
+inline std::atomic<int>  gProbeReturns{0};
+inline std::atomic<bool> gProbeWaitExpired{false};
+
+// posts a probe message to its own msgIn from its second start() hook. The message is then waiting when the restarted
+// run begins. The handler holds each taker until a second taker arrives or _workersSettled() reports that only the
+// restarted run's workers remain. A single taker means a single worker handled the message.
+struct SelfMessagingSource : gr::Block<SelfMessagingSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(SelfMessagingSource, out);
+
+    std::function<bool()> _workersSettled;
+
+    void start() {
+        if (gStartHooks.fetch_add(1, std::memory_order_acq_rel) + 1 == 2) {
+            gr::Message probe;
+            probe.cmd      = gr::message::Command::Set;
+            probe.endpoint = "probe";
+            probe.data     = gr::property_map{};
+
+            auto writer = this->msgIn.buffer().streamBuffer.new_writer();
+            auto span   = writer.tryReserve<gr::SpanReleasePolicy::ProcessAll>(1UZ);
+            if (!span.empty()) {
+                span[0] = std::move(probe);
+                span.publish(1UZ);
+            }
+        }
+        gStartHooks.notify_all();
+    }
+
+    [[nodiscard]] constexpr float processOne() const noexcept { return 1.0f; }
+
+    void processMessages(gr::MsgPortInBuiltin&, auto&& messages) {
+        for (const gr::Message& message : messages) {
+            if (message.endpoint != "probe") {
+                continue;
+            }
+            gProbeTakers.fetch_add(1, std::memory_order_acq_rel);
+            if (!awaitCondition([this] { return gProbeTakers.load(std::memory_order_acquire) >= 2 || _workersSettled(); })) {
+                gProbeWaitExpired.store(true, std::memory_order_relaxed);
+            }
+            gProbeReturns.fetch_add(1, std::memory_order_release);
+        }
+    }
+};
+
+} // namespace qa_sched
+
+const boost::ut::suite<"lifecycle commands on the scheduler's message port"> messageLifecycleTests = [] {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    "a stop, a reset and a start in one message batch restart the run"_test = [] {
+        qa_sched::gStartHooks.store(0, std::memory_order_release);
+        qa_sched::gObservedSamples.store(0UZ, std::memory_order_relaxed);
+
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::RaceSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::ObservedSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        auto scheduler = std::make_unique<qa_sched::TestScheduler>();
+        expect(scheduler->exchange(std::move(flow)).has_value());
+        gr::MsgPortOut toScheduler;
+        expect(toScheduler.connect(scheduler->msgIn).has_value());
+        expect(scheduler->changeStateTo(INITIALISED).has_value());
+        expect(scheduler->changeStateTo(RUNNING).has_value());
+        expect(qa_sched::awaitObservedSamplesAbove(0UZ)) << "the first run moved no samples";
+
+        qa_sched::sendRestartBatch(toScheduler, scheduler->unique_name);
+
+        const bool restarted = qa_sched::awaitCondition([] { return qa_sched::gStartHooks.load(std::memory_order_acquire) >= 2; });
+        expect(restarted) << "the start in the batch never started the blocks";
+        if (!restarted) {
+            std::ignore = scheduler.release(); // its worker waits on itself, so destroying the scheduler would hang the suite
+            return;
+        }
+        const std::size_t afterRestart = qa_sched::gObservedSamples.load(std::memory_order_relaxed);
+        expect(qa_sched::awaitObservedSamplesAbove(afterRestart)) << "the restarted run moved no samples";
+        expect(scheduler->state() == RUNNING) << "the restarted run left RUNNING";
+
+        expect(scheduler->changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_sched::awaitState(*scheduler, STOPPED)) << "the restarted run did not stop";
+    };
+
+    // the worker that handled the batch leaves before it touches a block again, so it never handles a block's message
+    // at the same time as the restarted run's worker
+    "a block message waiting when a restart by message begins is handled once"_test = [] {
+        qa_sched::gStartHooks.store(0, std::memory_order_release);
+        qa_sched::gObservedSamples.store(0UZ, std::memory_order_relaxed);
+        qa_sched::gProbeTakers.store(0, std::memory_order_release);
+        qa_sched::gProbeReturns.store(0, std::memory_order_release);
+        qa_sched::gProbeWaitExpired.store(false, std::memory_order_relaxed);
+
+        auto      scheduler = std::make_unique<qa_sched::WorkerCountProbe>();
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::SelfMessagingSource>(); // the first block is in the first job list
+        auto&     sink   = flow.emplaceBlock<qa_sched::ObservedSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+        source._workersSettled = [probe = scheduler.get()] { return probe->nRunningJobs() <= probe->jobs()->size(); };
+
+        expect(scheduler->exchange(std::move(flow)).has_value());
+        gr::MsgPortOut toScheduler;
+        expect(toScheduler.connect(scheduler->msgIn).has_value());
+        expect(scheduler->changeStateTo(INITIALISED).has_value());
+        expect(scheduler->changeStateTo(RUNNING).has_value());
+        expect(qa_sched::awaitObservedSamplesAbove(0UZ)) << "the first run moved no samples";
+
+        qa_sched::sendRestartBatch(toScheduler, scheduler->unique_name);
+
+        const bool handled = qa_sched::awaitCondition([] { return qa_sched::gProbeReturns.load(std::memory_order_acquire) >= 1; });
+        expect(handled) << "no worker handled the message posted during the restart";
+        if (!handled) {
+            std::ignore = scheduler.release(); // a worker may still wait on itself, so destroying the scheduler would hang the suite
+            return;
+        }
+        expect(eq(qa_sched::gProbeTakers.load(std::memory_order_acquire), 1)) << "more than one worker handled the message";
+        expect(!qa_sched::gProbeWaitExpired.load(std::memory_order_relaxed)) << "the worker that handled the batch never left";
+
+        expect(scheduler->changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_sched::awaitState(*scheduler, STOPPED)) << "the restarted run did not stop";
+    };
+
+    // the worker that handled the batch still occupies its pool thread while the reset sizes the job lists. It leaves
+    // once the restarted run is dispatched, so the restart claims that thread as free
+    "a restart by message builds as many job lists as the first start"_test = [] {
+        qa_sched::gStartHooks.store(0, std::memory_order_release);
+        qa_sched::gObservedSamples.store(0UZ, std::memory_order_relaxed);
+
+        auto pool = qa_sched::twoThreadPool();
+
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::RaceSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::ObservedSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        qa_sched::TestScheduler scheduler({{"poolName", std::string(qa_sched::kOccupiedPoolName)}});
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        gr::MsgPortOut toScheduler;
+        expect(toScheduler.connect(scheduler.msgIn).has_value());
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(qa_sched::awaitObservedSamplesAbove(0UZ)) << "the first run moved no samples";
+        const std::size_t nFirstJobLists = scheduler.jobs()->size();
+        expect(eq(nFirstJobLists, 2UZ)) << "the first start did not give each block its own pool thread";
+
+        qa_sched::sendRestartBatch(toScheduler, scheduler.unique_name);
+
+        expect(qa_sched::awaitCondition([] { return qa_sched::gStartHooks.load(std::memory_order_acquire) >= 2; })) << "the start in the batch never started the blocks";
+        expect(eq(scheduler.jobs()->size(), nFirstJobLists)) << "the restart by message built fewer job lists than the first start";
+        const std::size_t afterRestart = qa_sched::gObservedSamples.load(std::memory_order_relaxed);
+        expect(qa_sched::awaitObservedSamplesAbove(afterRestart)) << "the restarted run moved no samples";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_sched::awaitState(scheduler, STOPPED)) << "the restarted run did not stop";
     };
 };
 
@@ -2969,6 +3204,159 @@ const boost::ut::suite<"a stop requested while exchange() stops a running graph"
         }
         expect(qa_sched::awaitState(scheduler, STOPPED));
     };
+};
+
+namespace qa_sched {
+
+void sendLifecycleRequest(gr::MsgPortOut& toScheduler, std::string_view schedulerName, gr::lifecycle::State state) {
+    auto span           = toScheduler.streamWriter().reserve<gr::SpanReleasePolicy::ProcessAll>(1UZ);
+    span[0].cmd         = gr::message::Command::Set;
+    span[0].serviceName = schedulerName;
+    span[0].endpoint    = gr::block::property::kLifeCycleState;
+    span[0].data        = gr::property_map{{"state", std::string(gr::meta::enumName(state).value_or(""))}};
+    span.publish(1UZ);
+}
+
+// runs runAndWait() on its own thread. With restartFirst it sends a stop, a reset and a start in one batch and waits for
+// the restarted run to move samples. It then sends a stop by message and reports whether the runner's call returned. On
+// a miss it stops the scheduler from the test thread. A scheduler whose runner still does not return is leaked, so the
+// case fails instead of hanging.
+template<typename TScheduler>
+[[nodiscard]] bool stopByMessageEndsRun(bool restartFirst) {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+    gStartHooks.store(0, std::memory_order_release);
+    gObservedSamples.store(0UZ, std::memory_order_relaxed);
+
+    gr::Graph flow;
+    auto&     source = flow.emplaceBlock<RaceSource>();
+    auto&     sink   = flow.emplaceBlock<ObservedSink>();
+    expect(flow.connect<"out", "in">(source, sink).has_value());
+
+    auto scheduler = std::make_unique<TScheduler>();
+    expect(scheduler->exchange(std::move(flow)).has_value());
+    gr::MsgPortOut toScheduler;
+    expect(toScheduler.connect(scheduler->msgIn).has_value());
+
+    auto        runnerDone = std::make_shared<std::atomic<bool>>(false);
+    TScheduler* raw        = scheduler.get();
+    std::thread runner([raw, runnerDone] {
+        std::ignore = raw->runAndWait();
+        runnerDone->store(true, std::memory_order_release);
+    });
+    expect(awaitObservedSamplesAbove(0UZ)) << "the first run moved no samples";
+    if (restartFirst) {
+        sendRestartBatch(toScheduler, scheduler->unique_name);
+        expect(awaitCondition([] { return gStartHooks.load(std::memory_order_acquire) >= 2; })) << "the start in the batch never started the blocks";
+        expect(awaitObservedSamplesAbove(gObservedSamples.load(std::memory_order_relaxed))) << "the restarted run moved no samples";
+    }
+
+    sendLifecycleRequest(toScheduler, scheduler->unique_name, REQUESTED_STOP);
+    const bool ended = awaitCondition([&runnerDone] { return runnerDone->load(std::memory_order_acquire); });
+    if (!ended) {
+        std::ignore = scheduler->changeStateTo(REQUESTED_STOP);
+    }
+    if (!awaitCondition([&runnerDone] { return runnerDone->load(std::memory_order_acquire); })) {
+        runner.detach();
+        std::ignore = scheduler.release();
+        return false;
+    }
+    runner.join();
+    return ended;
+}
+
+} // namespace qa_sched
+
+const boost::ut::suite<"a restart applied once the workers have left"> deferredRestartTests = [] {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    // the control: without a restart, a stop by message ends a single-threaded run
+    "a stop by message ends a single-threaded run"_test = []<typename TPolicy>() { expect(qa_sched::stopByMessageEndsRun<typename TPolicy::type>(false)) << "the stop by message did not end the run"; } | std::tuple<std::type_identity<qa_sched::SerialScheduler>, std::type_identity<qa_sched::BlockingScheduler>>{};
+
+    // the restarted run must answer the scheduler's messages as the first run did
+    "a stop by message ends a single-threaded run that a message restarted"_test = []<typename TPolicy>() { expect(qa_sched::stopByMessageEndsRun<typename TPolicy::type>(true)) << "the restarted run ignored the stop by message"; } | std::tuple<std::type_identity<qa_sched::SerialScheduler>, std::type_identity<qa_sched::BlockingScheduler>>{};
+
+    // the worker that requested the swap leaves its loop and applies the swap on its pool thread. That thread returns
+    // to the pool once the restarted run is dispatched, so the swap claims it as free
+    "a graph swap requested from a worker builds as many job lists as the first start"_test = [] {
+        auto pool = qa_sched::twoThreadPool();
+
+        std::atomic<bool>               end{false};
+        std::atomic<bool>               restartWorked{false};
+        qa_sched::TestScheduler         scheduler({{"poolName", std::string(qa_sched::kOccupiedPoolName)}});
+        qa_sched::SwapRequestingSource* requester = nullptr;
+
+        {
+            gr::Graph flow;
+            auto&     source = flow.emplaceBlock<qa_sched::SwapRequestingSource>();
+            auto&     sink   = flow.emplaceBlock<qa_sched::ObservedSink>();
+            expect(flow.connect<"out", "in">(source, sink).has_value());
+
+            source._onSwapRequest = [&scheduler, &end, &restartWorked] { std::ignore = scheduler.exchange(qa_sched::makeEndableGraph(&end, [&restartWorked] { restartWorked.store(true); })); };
+            requester             = &source; // the wrapper holding it lives on the heap, so this survives the move
+
+            expect(scheduler.exchange(std::move(flow)).has_value());
+        }
+
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        const std::size_t observedBefore = qa_sched::gObservedSamples.load(std::memory_order_relaxed);
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(qa_sched::awaitObservedSamplesAbove(observedBefore)) << "the first graph never ran";
+        const std::size_t nFirstJobLists = scheduler.jobs()->size();
+        expect(eq(nFirstJobLists, 2UZ)) << "the first start did not give each block its own pool thread";
+
+        qa_sched::requestSwap(*requester);
+        expect(qa_sched::awaitCondition([&restartWorked] { return restartWorked.load(); })) << "the deferred swap never restarted the scheduler";
+        expect(eq(scheduler.jobs()->size(), nFirstJobLists)) << "the swap from a worker built fewer job lists than the first start";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_sched::awaitState(scheduler, STOPPED)) << "the restarted run did not stop";
+    };
+
+#ifdef GR_TEST_WITH_BLOCK_LIBRARY
+    // The scheduler comes from the shared object, which runs its workers and applies its restarts with code of its own.
+    // The probe block asks the scheduler with this program's code. The first start runs on the caller's thread, and the
+    // scheduler refuses that thread a swap while the run starts. A restart by message starts the blocks on the thread
+    // that applies it, and the scheduler admits a swap from that thread
+    "a scheduler from a shared object reads its own worker and its restarting thread from a program's code"_test = [] {
+        expect(fatal(qa_sched::loadCrossObjectLibrary())) << "the shared object did not load";
+        qa_sched::gMarkWorkCalls.store(0UZ);
+        qa_sched::gMarkOwnWorkerCalls.store(0UZ);
+        qa_sched::gMarkStarts.store(0UZ);
+        qa_sched::gMarkFirstStartAdmitted.store(false);
+        qa_sched::gMarkRestartAdmitted.store(false);
+
+        std::unique_ptr<gr::SchedulerModel> model = gr::globalSchedulerRegistry().create(qa_sched::kLibraryScheduler, gr::property_map{});
+        expect(fatal(model != nullptr));
+        auto* scheduler = static_cast<gr::testing::CrossObjectScheduler*>(model->asBlockModel()->raw());
+
+        gr::Graph flow;
+        auto&     probe  = flow.emplaceBlock<qa_sched::ThreadMarkProbe>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        probe._scheduler = scheduler;
+        expect(flow.connect<"out", "in">(probe, sink).has_value());
+        model->setGraph(std::move(flow));
+        gr::MsgPortOut toScheduler;
+        expect(toScheduler.connect(scheduler->msgIn).has_value());
+
+        std::thread runner([&model] { std::ignore = model->runAndWait(); });
+        expect(qa_sched::awaitCondition([] { return qa_sched::gMarkWorkCalls.load() > 0UZ; })) << "the first run made no work() call";
+        qa_sched::sendRestartBatch(toScheduler, scheduler->unique_name);
+        expect(qa_sched::awaitCondition([] { return qa_sched::gMarkStarts.load() >= 2UZ; })) << "the start in the batch never started the blocks";
+        const std::size_t callsAfterRestart = qa_sched::gMarkWorkCalls.load();
+        expect(qa_sched::awaitCondition([callsAfterRestart] { return qa_sched::gMarkWorkCalls.load() > callsAfterRestart; })) << "the restarted run made no work() call";
+        gr::sendMessage<gr::message::Command::Set>(toScheduler, scheduler->unique_name, gr::block::property::kLifeCycleState, gr::property_map{{"state", std::string("REQUESTED_STOP")}});
+        runner.join();
+
+        const std::size_t nWorkCalls = qa_sched::gMarkWorkCalls.load();
+        const std::size_t nOwn       = qa_sched::gMarkOwnWorkerCalls.load();
+        std::println("scheduler from a shared object: {} of {} work() calls on its own worker, first start admitted a swap: {}, restart admitted a swap: {}", nOwn, nWorkCalls, qa_sched::gMarkFirstStartAdmitted.load(), qa_sched::gMarkRestartAdmitted.load());
+        expect(eq(nOwn, nWorkCalls)) << "a work() call on the scheduler's worker did not read as its own worker";
+        expect(!qa_sched::gMarkFirstStartAdmitted.load()) << "the caller's thread was admitted to swap the starting run";
+        expect(qa_sched::gMarkRestartAdmitted.load()) << "the thread that applies the restart was refused a swap";
+    };
+#endif
 };
 
 int main() { /* tests are statically registered */ }
