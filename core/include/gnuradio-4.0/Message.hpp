@@ -3,6 +3,7 @@
 
 #include <gnuradio-4.0/Buffer.hpp>
 #include <gnuradio-4.0/CircularBuffer.hpp>
+#include <gnuradio-4.0/SharedState.hpp>
 #include <gnuradio-4.0/Tag.hpp>
 #include <gnuradio-4.0/meta/formatter.hpp>
 #include <gnuradio-4.0/meta/reflection.hpp>
@@ -86,12 +87,6 @@ std::string commandName() noexcept {
 
 inline const std::string        defaultBlockProtocol  = "MDPW03";
 inline static const std::string defaultClientProtocol = "MDPC03";
-
-// messages dropped because the destination ring was full -- process-global diagnostic counter
-inline std::atomic<std::size_t>& droppedMessageCount() noexcept {
-    static std::atomic<std::size_t> nDropped{0UZ};
-    return nDropped;
-}
 
 } // namespace message
 

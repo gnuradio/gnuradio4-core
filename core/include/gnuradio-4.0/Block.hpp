@@ -8,6 +8,7 @@
 #include <map>
 #include <print>
 #include <source_location>
+#include <vector>
 
 #include <format>
 
@@ -574,6 +575,10 @@ struct BlockBase {
     std::map<std::string, PropertyCallback>      propertyCallbacks;
     std::map<std::string, std::set<std::string>> propertySubscriptions;
 
+    // replies that found msgOut full, oldest first. They are sent before any newer reply. They are at most as many as
+    // msgOut holds.
+    std::vector<Message> _unsentReplies;
+
     // out-of-line so the 12-entry map literal is compiled once, not per Block<T>::Block body.
     void initStandardPropertyCallbacks() noexcept;
 
@@ -603,6 +608,11 @@ struct BlockBase {
     void emitErrorMessage(std::string_view endpoint, Error e, std::string_view clientRequestID = "") noexcept;
     void emitErrorMessageIfAny(std::string_view endpoint, std::expected<void, Error> e, std::string_view clientRequestID = "") noexcept;
     void processMessages(const MsgPortInBuiltin& port, std::span<const Message> messages);
+    // sends a reply on msgOut, or keeps it when msgOut is full. A kept reply stays until msgOut has room. When the kept
+    // replies outnumber the slots of msgOut, the oldest is dropped and counted in droppedMessageCount().
+    void sendReply(Message reply);
+    // sends the kept replies that fit in msgOut, oldest first
+    void sendUnsentReplies();
 
     // 12 callback implementations (compiled once, not per block type)
     std::optional<Message> propertyCallbackHeartbeat(std::string_view propertyName, Message message);
@@ -1787,6 +1797,9 @@ public:
 
     constexpr void processScheduledMessages() {
         using namespace std::chrono;
+        if (!_unsentReplies.empty()) {
+            sendUnsentReplies();
+        }
         // notifyListeners() is a no-op without a kHeartbeat subscriber, which is the common case on every poll,
         // so the payload map is built only where a subscription exists.
         if (propertySubscriptions.contains(block::property::kHeartbeat)) {

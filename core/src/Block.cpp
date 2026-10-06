@@ -78,15 +78,44 @@ void BlockBase::processMessages([[maybe_unused]] const MsgPortInBuiltin& port, s
             continue; // function does not produce any return message
         }
 
-        retMessage->cmd             = Final; // N.B. could enable/allow for partial if we return multiple messages (e.g. using coroutines?)
-        retMessage->serviceName     = cbUniqueName();
-        WriterSpanLike auto msgSpan = cbMsgOut().streamWriter().tryReserve<SpanReleasePolicy::ProcessAll>(1UZ);
-        if (msgSpan.empty()) {
-            throw gr::exception(std::format("{}::processMessages() can not reserve span for message\n", cbName()));
-        } else {
-            msgSpan[0] = *retMessage;
-        }
+        retMessage->cmd         = Final; // N.B. could enable/allow for partial if we return multiple messages (e.g. using coroutines?)
+        retMessage->serviceName = cbUniqueName();
+        sendReply(std::move(*retMessage));
     } // - end - for (const auto &message : messages) { ..
+}
+
+void BlockBase::sendReply(Message reply) {
+    sendUnsentReplies();
+    if (_unsentReplies.empty()) {
+        WriterSpanLike auto msgSpan = cbMsgOut().streamWriter().tryReserve<SpanReleasePolicy::ProcessAll>(1UZ);
+        if (!msgSpan.empty()) {
+            msgSpan[0] = std::move(reply);
+            msgSpan.publish(1UZ);
+            return;
+        }
+    }
+    _unsentReplies.push_back(std::move(reply));
+    if (const std::size_t capacity = cbMsgOut().bufferSize(); _unsentReplies.size() > capacity) {
+        const std::size_t nDropped = _unsentReplies.size() - capacity;
+        _unsentReplies.erase(_unsentReplies.begin(), _unsentReplies.begin() + static_cast<std::ptrdiff_t>(nDropped));
+        message::droppedMessageCount().fetch_add(nDropped, std::memory_order_relaxed);
+    }
+}
+
+void BlockBase::sendUnsentReplies() {
+    if (_unsentReplies.empty()) {
+        return;
+    }
+    auto&             writer = cbMsgOut().streamWriter();
+    const std::size_t nFit   = std::min(_unsentReplies.size(), writer.available());
+    if (nFit == 0UZ) {
+        return;
+    }
+    WriterSpanLike auto msgSpan = writer.tryReserve<SpanReleasePolicy::ProcessAll>(nFit);
+    const auto          nSent   = static_cast<std::ptrdiff_t>(msgSpan.size());
+    std::ranges::move(_unsentReplies.begin(), _unsentReplies.begin() + nSent, msgSpan.begin());
+    msgSpan.publish(msgSpan.size());
+    _unsentReplies.erase(_unsentReplies.begin(), _unsentReplies.begin() + nSent);
 }
 
 std::optional<Message> BlockBase::propertyCallbackHeartbeat(std::string_view propertyName, Message message) {

@@ -6,6 +6,7 @@
 #include <expected>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/Message.hpp>
@@ -99,6 +100,23 @@ struct ErrorAfterReportSource : gr::Block<ErrorAfterReportSource> {
 struct SilentBlock : gr::Block<SilentBlock> {
     GR_MAKE_REFLECTABLE(SilentBlock);
 };
+
+// exposes the replies the scheduler keeps for a full msgOut
+struct ReplyKeepingScheduler : gr::scheduler::Simple<> {
+    using gr::scheduler::Simple<>::_unforwardedReplies;
+};
+
+// messages to the kSetting property with the given command, each carrying its index as the client request ID
+[[nodiscard]] std::vector<gr::Message> makeNumberedMessages(std::size_t count, gr::message::Command cmd, std::string_view serviceName) {
+    std::vector<gr::Message> messages(count);
+    for (std::size_t i = 0UZ; i < count; ++i) {
+        messages[i].cmd             = cmd;
+        messages[i].serviceName     = serviceName;
+        messages[i].endpoint        = gr::block::property::kSetting;
+        messages[i].clientRequestID = std::to_string(i);
+    }
+    return messages;
+}
 
 [[nodiscard]] gr::Graph makeFloodGraph(gr::Size_t nMessages) {
     using namespace boost::ut;
@@ -262,6 +280,71 @@ const boost::ut::suite<"a block error that ends the run"> blockErrorRunTests = [
                 expect(eq(message.find(qa_msg::kSensorFault) != std::string::npos, reportFirst)) << "the error carries the failing block's own report exactly when it sent one: " << message;
             }
         }
+    };
+};
+
+const boost::ut::suite<"replies kept for a full message output"> keptReplyTests = [] {
+    using namespace boost::ut;
+    using namespace gr;
+
+    // The reader is connected and consumes nothing until msgOut is full and the replies past it have arrived.
+    "a block keeps at most a full msgOut of replies and drops the oldest"_test = [] {
+        qa_msg::SilentBlock block;
+        MsgPortIn           reader;
+        expect(block.msgOut.connect(reader).has_value());
+
+        const std::size_t capacity = block.msgOut.bufferSize();
+        for (std::size_t i = 0UZ; i < capacity; ++i) {
+            block.emitMessage("fill", {});
+        }
+        expect(eq(reader.streamReader().available(), capacity)) << "the notifications should fill msgOut";
+
+        constexpr std::size_t nOverflow = 3UZ;
+        const auto            requests  = qa_msg::makeNumberedMessages(capacity + nOverflow, message::Command::Get, block.unique_name);
+        const std::size_t     nBefore   = message::droppedMessageCount().load(std::memory_order_relaxed);
+        block.processMessages(block.msgIn, requests);
+        expect(eq(block._unsentReplies.size(), capacity)) << "the kept replies should stop at the size of msgOut";
+        expect(eq(message::droppedMessageCount().load(std::memory_order_relaxed) - nBefore, nOverflow)) << "each reply past the bound should be counted as a drop";
+
+        {
+            auto notifications = reader.streamReader().get(); // the consume takes effect when the span is released
+            expect(notifications.consume(notifications.size()));
+        }
+        block.processScheduledMessages();
+        auto replies = reader.streamReader().get();
+        expect(eq(replies.size(), capacity)) << "every kept reply should go out once msgOut has room";
+        expect(eq(replies.front().clientRequestID, std::to_string(nOverflow))) << "the oldest replies should be the ones dropped";
+        expect(eq(replies.back().clientRequestID, std::to_string(capacity + nOverflow - 1UZ))) << "the newest reply should be kept";
+        expect(block._unsentReplies.empty());
+    };
+
+    "a scheduler keeps at most a full msgOut of its children's replies and drops the oldest"_test = [] {
+        qa_msg::ReplyKeepingScheduler sched;
+        MsgPortIn                     reader;
+        expect(sched.msgOut.connect(reader).has_value());
+
+        const std::size_t capacity = sched.msgOut.bufferSize();
+        for (std::size_t i = 0UZ; i < capacity; ++i) {
+            sendMessage<message::Command::Notify>(sched.msgOut, "qa_MessagePlane", "fill", property_map{});
+        }
+        expect(eq(reader.streamReader().available(), capacity)) << "the notifications should fill msgOut";
+
+        constexpr std::size_t nOverflow = 3UZ;
+        const std::size_t     nBefore   = message::droppedMessageCount().load(std::memory_order_relaxed);
+        sched.forwardToMsgOut(qa_msg::makeNumberedMessages(capacity + nOverflow, message::Command::Final, "child"));
+        expect(eq(sched._unforwardedReplies.size(), capacity)) << "the kept replies should stop at the size of msgOut";
+        expect(eq(message::droppedMessageCount().load(std::memory_order_relaxed) - nBefore, nOverflow)) << "each reply past the bound should be counted as a drop";
+
+        {
+            auto notifications = reader.streamReader().get(); // the consume takes effect when the span is released
+            expect(notifications.consume(notifications.size()));
+        }
+        sched.forwardToMsgOut({});
+        auto replies = reader.streamReader().get();
+        expect(eq(replies.size(), capacity)) << "every kept reply should go out once msgOut has room";
+        expect(eq(replies.front().clientRequestID, std::to_string(nOverflow))) << "the oldest replies should be the ones dropped";
+        expect(eq(replies.back().clientRequestID, std::to_string(capacity + nOverflow - 1UZ))) << "the newest reply should be kept";
+        expect(sched._unforwardedReplies.empty());
     };
 };
 

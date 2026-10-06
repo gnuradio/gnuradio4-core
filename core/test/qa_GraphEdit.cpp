@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cstddef>
@@ -9,6 +10,7 @@
 #include <expected>
 #include <format>
 #include <memory_resource>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -135,11 +137,85 @@ struct LoaderCanary : gr::Block<LoaderCanary> {
 
 using TestScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>;
 
+// ends its stream at its first call
+struct EndingSource : gr::Block<EndingSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(EndingSource, out);
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        outSpan.publish(0UZ);
+        return gr::work::Status::DONE;
+    }
+};
+
+constexpr std::string_view kLateFault = "the late source failed";
+
+// reports kLateFault on its 50th call and ends its stream on its 300th
+struct LateErrorSource : gr::Block<LateErrorSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(LateErrorSource, out);
+
+    static constexpr std::size_t kCallsToError = 50UZ;
+    static constexpr std::size_t kCallsToEnd   = 300UZ;
+
+    std::size_t _nCalls = 0UZ;
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (++_nCalls == kCallsToError) {
+            this->emitErrorMessage("processBulk", kLateFault);
+        }
+        outSpan.publish(0UZ);
+        return _nCalls >= kCallsToEnd ? gr::work::Status::DONE : gr::work::Status::OK;
+    }
+};
+
+inline std::atomic<std::size_t> gWorkingTickers{0UZ};
+
+// counts itself once in gWorkingTickers at its first work() call. Its one output is optional and stays unconnected. The
+// output is asynchronous. Each call reserves at most the free space in the port's buffer.
+struct Ticker : gr::Block<Ticker> {
+    gr::PortOut<float, gr::Async, gr::Optional> out;
+
+    GR_MAKE_REFLECTABLE(Ticker, out);
+
+    bool _counted = false;
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        if (!_counted) {
+            _counted = true;
+            gWorkingTickers.fetch_add(1UZ);
+        }
+        outSpan.publish(0UZ);
+        return gr::work::Status::OK;
+    }
+};
+
+// reads the job lists and the count of workers that have not left
+struct JobListProbe : TestScheduler {
+    using TestScheduler::TestScheduler;
+
+    [[nodiscard]] std::size_t nRunningJobs() const { return this->_nRunningJobs->value(); }
+
+    [[nodiscard]] std::size_t nJobLists() {
+        std::lock_guard lock(this->_executionOrderMutex);
+        return this->_executionOrder->size();
+    }
+
+    [[nodiscard]] bool firstJobListHolds(std::string_view uniqueName) {
+        std::lock_guard lock(this->_executionOrderMutex);
+        return !this->_executionOrder->empty() && std::ranges::any_of(this->_executionOrder->front(), [uniqueName](const std::shared_ptr<gr::BlockModel>& block) { return block->uniqueName() == uniqueName; });
+    }
+};
+
 void registerTestBlocks() {
     static const bool registered = [] {
         std::ignore = gr::globalBlockRegistry().insert<Tunable>();
         std::ignore = gr::globalBlockRegistry().insert<Source>();
         std::ignore = gr::globalBlockRegistry().insert<Sink>();
+        std::ignore = gr::globalBlockRegistry().insert<Ticker>();
         return true;
     }();
     std::ignore = registered;
@@ -221,6 +297,31 @@ struct StdoutCapture {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     return {};
+}
+
+// consumes every message it reads, so a later call sees only a later reply
+[[nodiscard]] bool takeReply(gr::MsgPortIn& port, std::string_view endpoint) {
+    for (std::size_t i = 0UZ; i < 3000UZ; ++i) {
+        auto       messages = port.streamReader().get();
+        const bool found    = std::ranges::any_of(messages, [endpoint](const gr::Message& message) { return message.endpoint == endpoint; });
+        std::ignore         = messages.consume(messages.size());
+        if (found) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return false;
+}
+
+template<typename TPredicate>
+[[nodiscard]] bool awaitCondition(TPredicate satisfied) {
+    for (std::size_t i = 0UZ; i < 3000UZ; ++i) {
+        if (satisfied()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return satisfied();
 }
 
 void sendMessage(gr::MsgPortOut& port, std::string_view endpoint, gr::property_map data) { gr::sendMessage<gr::message::Command::Set>(port, "", endpoint, std::move(data)); }
@@ -1136,6 +1237,123 @@ const boost::ut::suite<"graph port rings"> graphPortRingTests = [] {
         expect(neq(edgeSize, gr::PortOut<float>::kDefaultBufferSize)) << "the edge must differ from the default size for the count to tell them apart";
         expect(eq(recorder.nDefaultRings(), 0UZ)) << std::format("building and destroying a graph built {} heap rings of the default size", recorder.nDefaultRings());
     };
+};
+
+const boost::ut::suite<"messages after a job list ends"> laterMessageTests = [] {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    // under multiThreaded each job list has a worker of its own, and a worker leaves once every block of its job list
+    // is done. Here the first job list ends at once and the second runs until the stop.
+    "the scheduler replies after its first job list has ended"_test = [] {
+        constexpr std::string_view kPoolName = "qa_edit_two_threads";
+        gr::thread_pool::Manager::instance().replacePool(std::string(kPoolName), std::make_shared<gr::thread_pool::ThreadPoolWrapper>(std::make_unique<gr::thread_pool::BasicThreadPool>(kPoolName, gr::thread_pool::TaskType::CPU_BOUND, 2U, 2U), "CPU"));
+
+        gr::Graph flow;
+        auto&     ending     = flow.emplaceBlock<qa_edit::EndingSource>();
+        auto&     endingSink = flow.emplaceBlock<qa_edit::Sink>();
+        auto&     source     = flow.emplaceBlock<qa_edit::Source>();
+        auto&     sink       = flow.emplaceBlock<qa_edit::Sink>();
+        expect(flow.connect<"out", "in">(ending, endingSink).has_value());
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+        const std::string endingName{ending.unique_name};
+
+        qa_edit::JobListProbe scheduler({{"poolName", std::string(kPoolName)}});
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(toScheduler.connect(scheduler.msgIn).has_value());
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+
+        qa_edit::sendMessage(toScheduler, gr::scheduler::property::kSchedulerInspect, {});
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(qa_edit::takeReply(fromScheduler, gr::scheduler::property::kSchedulerInspected)) << "the request sent before the run got no reply";
+
+        expect(fatal(eq(scheduler.nJobLists(), 2UZ))) << "the graph was not split into two job lists";
+        expect(fatal(scheduler.firstJobListHolds(endingName))) << "the ending source is not in the first job list";
+        expect(fatal(qa_edit::awaitCondition([&scheduler] { return scheduler.nRunningJobs() == 1UZ; }))) << "the first job list did not end";
+
+        qa_edit::sendMessage(toScheduler, gr::scheduler::property::kSchedulerInspect, {});
+        expect(qa_edit::takeReply(fromScheduler, gr::scheduler::property::kSchedulerInspected)) << "the request sent after the first job list ended got no reply";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
+    };
+
+    // no reader is connected to msgOut, so a child's error ends the run. The first job list ends at once, and the
+    // source in the second one reports its error later
+    "a child's error after the first job list has ended fails runAndWait()"_test = [] {
+        constexpr std::string_view kPoolName = "qa_edit_two_threads";
+        gr::thread_pool::Manager::instance().replacePool(std::string(kPoolName), std::make_shared<gr::thread_pool::ThreadPoolWrapper>(std::make_unique<gr::thread_pool::BasicThreadPool>(kPoolName, gr::thread_pool::TaskType::CPU_BOUND, 2U, 2U), "CPU"));
+
+        gr::Graph flow;
+        auto&     ending      = flow.emplaceBlock<qa_edit::EndingSource>();
+        auto&     endingSink  = flow.emplaceBlock<qa_edit::Sink>();
+        auto&     failing     = flow.emplaceBlock<qa_edit::LateErrorSource>();
+        auto&     failingSink = flow.emplaceBlock<qa_edit::Sink>();
+        expect(flow.connect<"out", "in">(ending, endingSink).has_value());
+        expect(flow.connect<"out", "in">(failing, failingSink).has_value());
+        const std::string endingName{ending.unique_name};
+        const std::string failingName{failing.unique_name};
+        const auto*       failingBlock = &failing;
+
+        qa_edit::JobListProbe scheduler({{"poolName", std::string(kPoolName)}});
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        const std::expected<void, gr::Error> result = scheduler.runAndWait();
+
+        expect(fatal(eq(scheduler.nJobLists(), 2UZ))) << "the graph was not split into two job lists";
+        expect(fatal(scheduler.firstJobListHolds(endingName))) << "the ending source is not in the first job list";
+        expect(fatal(!result.has_value())) << "runAndWait() reported success";
+        expect(result.error().message.find(failingName) != std::string::npos) << "the error must name the block: " << result.error().message;
+        expect(result.error().message.find(qa_edit::kLateFault) != std::string::npos) << "the error must carry the block's reason: " << result.error().message;
+        expect(scheduler.state() == ERROR) << "the run did not end in ERROR";
+        expect(lt(failingBlock->_nCalls, qa_edit::LateErrorSource::kCallsToEnd)) << "the run went on to the source's own end";
+    };
+
+#ifndef GR_TEST_WITHOUT_BLOCK_REGISTRY // emplacement by name resolves the type through the registry
+    "a block added after the first job list has ended runs"_test = [] {
+        constexpr std::size_t      kBlocks   = 4UZ;
+        constexpr std::string_view kPoolName = "qa_edit_two_threads";
+        gr::thread_pool::Manager::instance().replacePool(std::string(kPoolName), std::make_shared<gr::thread_pool::ThreadPoolWrapper>(std::make_unique<gr::thread_pool::BasicThreadPool>(kPoolName, gr::thread_pool::TaskType::CPU_BOUND, 2U, 2U), "CPU"));
+        qa_edit::registerTestBlocks();
+        qa_edit::gWorkingTickers.store(0UZ);
+
+        gr::Graph flow;
+        auto&     ending     = flow.emplaceBlock<qa_edit::EndingSource>();
+        auto&     endingSink = flow.emplaceBlock<qa_edit::Sink>();
+        auto&     source     = flow.emplaceBlock<qa_edit::Source>();
+        auto&     sink       = flow.emplaceBlock<qa_edit::Sink>();
+        expect(flow.connect<"out", "in">(ending, endingSink).has_value());
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+        const std::string endingName{ending.unique_name};
+
+        qa_edit::JobListProbe scheduler({{"poolName", std::string(kPoolName)}});
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(toScheduler.connect(scheduler.msgIn).has_value());
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(fatal(eq(scheduler.nJobLists(), 2UZ))) << "the graph was not split into two job lists";
+        expect(fatal(scheduler.firstJobListHolds(endingName))) << "the ending source is not in the first job list";
+        expect(fatal(qa_edit::awaitCondition([&scheduler] { return scheduler.nRunningJobs() == 1UZ; }))) << "the first job list did not end";
+
+        for (std::size_t i = 0UZ; i < kBlocks; ++i) {
+            qa_edit::sendMessage(toScheduler, gr::scheduler::property::kEmplaceBlock, {{"type", gr::meta::type_name<qa_edit::Ticker>()}});
+            expect(qa_edit::takeReply(fromScheduler, gr::scheduler::property::kBlockEmplaced)) << std::format("block {} was never emplaced", i);
+        }
+        expect(qa_edit::awaitCondition([] { return qa_edit::gWorkingTickers.load() == kBlocks; })) << std::format("{} of {} added blocks ran", qa_edit::gWorkingTickers.load(), kBlocks);
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
+    };
+#endif
 };
 
 int main() { /* tests are statically registered */ }

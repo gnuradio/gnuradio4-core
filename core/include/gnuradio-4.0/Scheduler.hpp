@@ -175,10 +175,12 @@ protected:
     std::mutex _adoptionBlocksMutex;
     // fixed-sized vector indexed by runnerId. Cheaper than a map.
     std::vector<std::vector<std::shared_ptr<BlockModel>>> _adoptionBlocks;
+    std::vector<bool>                                     _adoptionListClosed; // the job list's worker has left its loop
 
     MsgPortOutForChildren                     _toChildMessagePort;
     MsgPortInFromChildren                     _fromChildMessagePort;
     std::vector<gr::Message>                  _pendingMessagesToChildren;
+    std::vector<gr::Message>                  _unforwardedReplies; // children's replies that found msgOut full, oldest first
     bool                                      _messagePortsConnected = false;
     std::optional<Error>                      _firstErrorFromChildren; // the first error a child sent since the latest start, named for the child
     std::map<std::string, Error, std::less<>> _latestErrorByChild;     // each child's latest error since the latest start, keyed by its unique name
@@ -696,6 +698,8 @@ public:
         }
     }
 
+    // callable from any thread. One caller at a time runs the scheduler's and the graph's handlers, and a caller that
+    // finds them running returns at once
     void processScheduledMessages() {
         if (std::atomic_flag_test_and_set_explicit(&_processingScheduledMessages, std::memory_order_acquire)) {
             return;
@@ -720,6 +724,9 @@ public:
         ReaderSpanLike auto messagesFromChildren = _fromChildMessagePort.streamReader().get();
         const std::size_t   nFromChildren        = messagesFromChildren.size();
         if (nFromChildren == 0UZ) {
+            if (!_unforwardedReplies.empty() && this->msgOut.nReaders() != 0) {
+                forwardToMsgOut(std::span<const gr::Message>{});
+            }
             return;
         }
 
@@ -756,19 +763,46 @@ public:
             return;
         }
 
-        // forward what fits, drop the rest: a subscriber that stops consuming must not wedge worker 0
-        auto&             msgWriter  = this->msgOut.streamWriter();
-        const std::size_t nToForward = std::min(nFromChildren, msgWriter.available());
-        if (nToForward > 0UZ) {
-            WriterSpanLike auto msgSpan = msgWriter.template tryReserve<SpanReleasePolicy::ProcessAll>(nToForward);
-            std::ranges::copy_n(messagesFromChildren.begin(), static_cast<std::ptrdiff_t>(msgSpan.size()), msgSpan.begin());
-            msgSpan.publish(msgSpan.size());
-        }
-        if (nToForward < nFromChildren) {
-            message::droppedMessageCount().fetch_add(nFromChildren - nToForward, std::memory_order_relaxed);
-        }
+        forwardToMsgOut(std::span<const gr::Message>(messagesFromChildren.begin(), messagesFromChildren.end()));
         if (!messagesFromChildren.consume(nFromChildren)) {
             this->emitErrorMessage("process child return messages", "Failed to consume messages from child message port");
+        }
+    }
+
+    // forwards what fits in msgOut and never blocks: a subscriber that stops consuming must not block a worker. The
+    // replies kept from earlier calls go first, in order. A notification that does not fit is dropped and counted. Any
+    // other message that does not fit is kept for a later call. When the kept replies outnumber the slots of msgOut,
+    // the oldest is dropped and counted.
+    void forwardToMsgOut(std::span<const gr::Message> messages) {
+        auto&             msgWriter = this->msgOut.streamWriter();
+        const std::size_t nPending  = _unforwardedReplies.size() + messages.size();
+        const std::size_t nToSend   = std::min(nPending, msgWriter.available());
+        std::size_t       nSent     = 0UZ;
+        if (nToSend > 0UZ) {
+            WriterSpanLike auto msgSpan = msgWriter.template tryReserve<SpanReleasePolicy::ProcessAll>(nToSend);
+            nSent                       = msgSpan.size();
+            const std::size_t nKept     = std::min(nSent, _unforwardedReplies.size());
+            std::ranges::move(_unforwardedReplies.begin(), _unforwardedReplies.begin() + static_cast<std::ptrdiff_t>(nKept), msgSpan.begin());
+            std::ranges::copy_n(messages.begin(), static_cast<std::ptrdiff_t>(nSent - nKept), msgSpan.begin() + static_cast<std::ptrdiff_t>(nKept));
+            msgSpan.publish(nSent);
+            _unforwardedReplies.erase(_unforwardedReplies.begin(), _unforwardedReplies.begin() + static_cast<std::ptrdiff_t>(nKept));
+            nSent -= nKept;
+        }
+        std::size_t nDropped = 0UZ;
+        for (const gr::Message& message : messages.subspan(nSent)) {
+            if (message.cmd == message::Command::Notify) {
+                ++nDropped;
+            } else {
+                _unforwardedReplies.push_back(message);
+            }
+        }
+        if (const std::size_t capacity = this->msgOut.bufferSize(); _unforwardedReplies.size() > capacity) {
+            const std::size_t nOverflow = _unforwardedReplies.size() - capacity;
+            _unforwardedReplies.erase(_unforwardedReplies.begin(), _unforwardedReplies.begin() + static_cast<std::ptrdiff_t>(nOverflow));
+            nDropped += nOverflow;
+        }
+        if (nDropped > 0UZ) {
+            message::droppedMessageCount().fetch_add(nDropped, std::memory_order_relaxed);
         }
     }
 
@@ -1157,6 +1191,11 @@ protected:
             return;
         }
 
+        { // every job list of this run takes adopted blocks until its worker leaves its loop
+            std::lock_guard guard(_adoptionBlocksMutex);
+            _adoptionListClosed.assign(_adoptionBlocks.size(), false);
+        }
+
         assert(_executionOrder != nullptr && !_executionOrder->empty());
         constexpr bool    singleThreaded = executionPolicy() == ExecutionPolicy::singleThreaded || executionPolicy() == ExecutionPolicy::singleThreadedBlocking;
         auto              jobListsCopy   = _executionOrder;
@@ -1293,6 +1332,7 @@ protected:
                 settleStoppedBlockingBlocks();
             }
         };
+        on_scope_exit closeAdoption = [this, runnerID] { closeAdoptionList(runnerID); };
 
         gr::thread_pool::thread::setThreadName(std::format("pW{}-{}", runnerID, gr::meta::shorten_type_name(this->unique_name)));
 
@@ -1325,9 +1365,7 @@ protected:
             const bool hasPendingMessages   = this->msgIn.available() > 0UZ || _fromChildMessagePort.available() > 0UZ;
             const bool hasMessagesToProcess = msgToCount == 0UZ || hasPendingMessages;
             if (hasMessagesToProcess) {
-                if (runnerID == 0UZ || nRunningJobs->value() == 0UZ) {
-                    this->processScheduledMessages(); // execute the scheduler- and Graph-specific message handler only once globally
-                }
+                this->processScheduledMessages();
                 // the run was retired. A restart among the messages above runs with the next run's workers, which own
                 // the blocks from here
                 if (gr::atomic_ref(_run.generation).load_acquire() != generation) {
@@ -1694,6 +1732,32 @@ protected:
         }
     }
 
+    [[nodiscard]] bool hasOpenAdoptionList() {
+        std::lock_guard guard(_adoptionBlocksMutex);
+        for (std::size_t i = 0UZ; i < _adoptionBlocks.size(); ++i) {
+            if (i >= _adoptionListClosed.size() || !_adoptionListClosed[i]) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // queues the block for a job list whose worker remains. Returns false when every worker has left
+    [[nodiscard]] bool queueForAdoption(const std::shared_ptr<BlockModel>& newBlock) {
+        std::lock_guard          guard(_adoptionBlocksMutex);
+        std::vector<std::size_t> openLists;
+        for (std::size_t i = 0UZ; i < _adoptionBlocks.size(); ++i) {
+            if (i >= _adoptionListClosed.size() || !_adoptionListClosed[i]) {
+                openLists.push_back(i);
+            }
+        }
+        if (openLists.empty()) {
+            return false;
+        }
+        _adoptionBlocks[openLists[std::hash<BlockModel*>{}(newBlock.get()) % openLists.size()]].push_back(newBlock);
+        return true;
+    }
+
     void adoptBlock(const std::shared_ptr<BlockModel>& newBlock) {
         using enum lifecycle::State;
         if (const auto connectResult = _toChildMessagePort.connect(*newBlock->msgIn); !connectResult.has_value()) {
@@ -1706,17 +1770,16 @@ protected:
             return;
         }
 
-        {
-            std::lock_guard guard(_adoptionBlocksMutex);
-            const auto      nBatches = _adoptionBlocks.size();
-            if (nBatches == 0) {
-                return;
-            }
-            _adoptionBlocks[std::hash<BlockModel*>{}(newBlock.get()) % nBatches].push_back(newBlock);
-        }
-
         if (newBlock->blockCategory() == ScheduledBlockGroup) {
-            startAdoptedScheduler(newBlock);
+            // the scheduler starts an added scheduler and then queues it. The worker that takes it calls into it, and its
+            // init() runs inside the start
+            if (hasOpenAdoptionList()) {
+                startAdoptedScheduler(newBlock);
+                std::ignore = queueForAdoption(newBlock);
+            }
+            return;
+        }
+        if (!queueForAdoption(newBlock)) {
             return;
         }
 
@@ -2046,6 +2109,24 @@ protected:
 
             } else {
                 ++it;
+            }
+        }
+    }
+
+    // a worker that leaves its loop hands the blocks still queued for its job list to a job list whose worker remains
+    void closeAdoptionList(std::size_t runnerID) {
+        std::lock_guard guard(_adoptionBlocksMutex);
+        if (runnerID >= _adoptionListClosed.size()) {
+            return;
+        }
+        _adoptionListClosed[runnerID] = true;
+        if (runnerID >= _adoptionBlocks.size()) {
+            return;
+        }
+        for (std::size_t i = 0UZ; i < _adoptionBlocks.size() && !_adoptionBlocks[runnerID].empty(); ++i) {
+            if (i >= _adoptionListClosed.size() || !_adoptionListClosed[i]) {
+                std::ranges::move(_adoptionBlocks[runnerID], std::back_inserter(_adoptionBlocks[i]));
+                _adoptionBlocks[runnerID].clear();
             }
         }
     }
