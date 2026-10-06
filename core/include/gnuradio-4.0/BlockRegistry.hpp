@@ -47,8 +47,9 @@
 // version of the code that calls `insert()`, so a block entry added through `insertBlockFactory()` records the
 // version of core. A host loads only a plugin whose version equals its own. The host also reads the version of each
 // scheduler a shared object registers, and keeps a scheduler only at its own version. A virtual call through another
-// version's interface reaches the wrong function.
-#define GR_PLUGIN_CURRENT_ABI_VERSION 5
+// version's interface reaches the wrong function. A plugin's port also shares its stream ring and its tag ring with a
+// port of the host, and the layout of `gr::Tag`, the tag ring's element, crosses the boundary with them.
+#define GR_PLUGIN_CURRENT_ABI_VERSION 6
 
 namespace gr {
 

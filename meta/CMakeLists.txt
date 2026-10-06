@@ -16,8 +16,8 @@ set(meta_public_headers
     include/gnuradio-4.0/meta/typelist.hpp
     include/gnuradio-4.0/meta/utils.hpp)
 
-# gr::kCacheLine is the alignment, and so the layout, of public types such as gr::Tag and gr::Sequence, so an override
-# is defined on the interface: a consumer has to be built with the same value as the library.
+# gr::kCacheLine is the alignment, and so the layout, of public types such as gr::Sequence and the claim strategies. An
+# override is therefore defined on the interface: a consumer has to be built with the same value as the library.
 set(GR_CACHE_LINE_SIZE
     ""
     CACHE STRING "Cache line size gr::kCacheLine resolves to, in bytes (empty: detect from the platform)")

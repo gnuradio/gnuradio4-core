@@ -439,6 +439,16 @@ const boost::ut::suite<"Port"> _portTests = [] { // NOSONAR (N.B. lambda size)
         expect(eq(span[kChunk - 1UZ], static_cast<T>(kChunk - 1UZ)));
     };
 
+    // A tag ring is written and read in order. A tag carries no padding beyond its members' alignment.
+    "a tag is the size of its members"_test = [] {
+        struct Members {
+            std::size_t  index;
+            property_map map;
+        };
+        expect(eq(sizeof(Tag), sizeof(Members))) << std::format("a tag takes {} bytes for {} bytes of members", sizeof(Tag), sizeof(Members));
+        expect(eq(alignof(Tag), alignof(Members)));
+    };
+
     "Async/Optional attribute flags"_test = [] {
         using OptionalPort = PortIn<int, gr::Optional>;
         using AsyncPort    = PortIn<int, gr::Async>;

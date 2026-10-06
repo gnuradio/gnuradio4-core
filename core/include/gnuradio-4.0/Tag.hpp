@@ -71,7 +71,7 @@ concept PropertyMapType = std::same_as<std::decay_t<T>, property_map>;
  * may choose to chunk the data based on the MIN_SAMPLES/MAX_SAMPLES criteria only, or in addition break-up the stream
  * so that there is only one tag per scheduler iteration. Multiple tags on the same sample shall be merged to one.
  */
-struct alignas(kCacheLine) Tag {
+struct Tag {
     std::size_t  index{0UZ};
     property_map map{};
 
