@@ -6,15 +6,23 @@
 #include <expected>
 #include <format>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <tuple>
+#include <type_traits>
 #include <utility>
+#include <vector>
 
+#include <gnuradio-4.0/BlockRegistry.hpp>
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/Message.hpp>
 #include <gnuradio-4.0/Scheduler.hpp>
+#include <gnuradio-4.0/thread/thread_pool.hpp>
 
 namespace qa_exchange {
 
@@ -124,10 +132,11 @@ struct CountingSink : gr::Block<CountingSink<counter>> {
     void processOne(float) { counter->fetch_add(1UZ, std::memory_order_relaxed); }
 };
 
-using FirstSink       = CountingSink<&gFirstGraphSamples>;
-using SecondSink      = CountingSink<&gSecondGraphSamples>;
-using TestScheduler   = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>;
-using SerialScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>;
+using FirstSink         = CountingSink<&gFirstGraphSamples>;
+using SecondSink        = CountingSink<&gSecondGraphSamples>;
+using TestScheduler     = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>;
+using SerialScheduler   = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>;
+using BlockingScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking>;
 
 // exposes the handler of a graph replacement by message, to call it from a thread of the test's choosing
 struct GrcProbe : SerialScheduler {
@@ -208,6 +217,122 @@ template<typename TSink>
     request.data     = gr::property_map{{"value", std::move(yaml)}};
     return request;
 }
+
+// counts the samples of a graph that a replacement by message loads
+struct ReplacementSink : gr::Block<ReplacementSink> {
+    gr::PortIn<float> in;
+
+    GR_MAKE_REFLECTABLE(ReplacementSink, in);
+
+    void processOne(float) { gSecondGraphSamples.fetch_add(1UZ, std::memory_order_relaxed); }
+};
+
+// the graph that a replacement by message loads: an endless source and a sink that counts into gSecondGraphSamples
+[[nodiscard]] std::string replacementGraphYaml() {
+    using namespace boost::ut;
+    static const bool registered = [] {
+        std::ignore = gr::globalBlockRegistry().insert<SwapRequester>();
+        std::ignore = gr::globalBlockRegistry().insert<ReplacementSink>();
+        return true;
+    }();
+    std::ignore = registered;
+
+    gr::Graph flow;
+    auto&     source = flow.emplaceBlock<SwapRequester>();
+    auto&     sink   = flow.emplaceBlock<ReplacementSink>();
+    expect(flow.connect<"out", "in">(source, sink).has_value());
+    return gr::saveGrc(gr::globalPluginLoader(), flow);
+}
+
+// a lifecycle command that sets the scheduler's state
+[[nodiscard]] gr::Message makeStateChange(std::string_view schedulerName, gr::lifecycle::State state) {
+    gr::Message message;
+    message.cmd         = gr::message::Command::Set;
+    message.serviceName = schedulerName;
+    message.endpoint    = gr::block::property::kLifeCycleState;
+    message.data        = gr::property_map{{"state", std::string(gr::meta::enumName(state).value_or(""))}};
+    return message;
+}
+
+// sends a graph replacement, a reset and a start in one span to the scheduler's message port. One worker handles all
+// three
+void sendReplacementAndStart(gr::MsgPortOut& toScheduler, std::string_view schedulerName, std::string yaml) {
+    using enum gr::lifecycle::State;
+    auto span           = toScheduler.streamWriter().reserve<gr::SpanReleasePolicy::ProcessAll>(3UZ);
+    span[0]             = makeGraphReplacement(std::move(yaml));
+    span[0].serviceName = schedulerName;
+    span[1]             = makeStateChange(schedulerName, INITIALISED);
+    span[2]             = makeStateChange(schedulerName, RUNNING);
+    span.publish(3UZ);
+}
+
+// sends a reset and a start in one span to the scheduler's message port. One worker handles both
+void sendResetAndStart(gr::MsgPortOut& toScheduler, std::string_view schedulerName) {
+    using enum gr::lifecycle::State;
+    auto span = toScheduler.streamWriter().reserve<gr::SpanReleasePolicy::ProcessAll>(2UZ);
+    span[0]   = makeStateChange(schedulerName, INITIALISED);
+    span[1]   = makeStateChange(schedulerName, RUNNING);
+    span.publish(2UZ);
+}
+
+constexpr std::string_view kTwoThreadPoolName = "qa_exchange_two_threads";
+
+// a pool of two threads that the manager holds under kTwoThreadPoolName until the case ends. A scheduler on it gives a
+// graph of two blocks two job lists on any number of hardware threads
+struct TwoThreadPool {
+    TwoThreadPool() { gr::thread_pool::Manager::instance().replacePool(std::string(kTwoThreadPoolName), std::make_shared<gr::thread_pool::ThreadPoolWrapper>(std::make_unique<gr::thread_pool::BasicThreadPool>(kTwoThreadPoolName, gr::thread_pool::TaskType::CPU_BOUND, 2U, 2U), "CPU")); }
+    TwoThreadPool(const TwoThreadPool&)            = delete;
+    TwoThreadPool& operator=(const TwoThreadPool&) = delete;
+    ~TwoThreadPool() { gr::thread_pool::Manager::instance().replacePool(std::string(kTwoThreadPoolName), gr::thread_pool::Manager::defaultCpuPool()); }
+};
+
+// a swap or a restart that a worker requested, as a scheduler finds it at its first reset: none, one that waits for its
+// requester to claim it, or one that its requester has claimed and that waits for the other workers to leave
+enum class PendingAtReset { unread, none, waiting, claimed };
+
+// a multi-threaded scheduler that reads the pending swap or restart at its first reset. Its job lists are those of a
+// multi-threaded Simple scheduler. The worker that takes the first lifecycle command from msgIn runs
+// _beforeLifecycleCommands once, before it handles the command
+struct PendingExchangeProbe : gr::scheduler::SchedulerBase<PendingExchangeProbe, gr::scheduler::ExecutionPolicy::multiThreaded> {
+    using Base = gr::scheduler::SchedulerBase<PendingExchangeProbe, gr::scheduler::ExecutionPolicy::multiThreaded>;
+    using Base::Base;
+
+    std::atomic<PendingAtReset> _pendingAtFirstReset{PendingAtReset::unread};
+    std::function<void()>       _beforeLifecycleCommands;
+
+    void customInit() {
+        const gr::Graph   flatGraph = gr::graph::flatten(*this->_graph);
+        const std::size_t nBatches  = this->nJobLists(flatGraph.blocks().size());
+        std::lock_guard   lock(this->_executionOrderMutex);
+        std::lock_guard   guard(this->_adoptionBlocksMutex);
+        this->_adoptionBlocks.assign(nBatches, {});
+        *this->_executionOrder = gr::scheduler::detail::batchBlocks(flatGraph.blocks(), nBatches);
+    }
+
+    void customReset() {
+        PendingAtReset unread = PendingAtReset::unread;
+        _pendingAtFirstReset.compare_exchange_strong(unread, pendingExchange());
+        customInit();
+    }
+
+    void processMessages(gr::MsgPortInBuiltin& port, std::span<const gr::Message> messages) {
+        const bool lifecycleCommand = std::ranges::any_of(messages, [](const gr::Message& message) { return message.endpoint == gr::block::property::kLifeCycleState; });
+        if (&port == &this->msgIn && lifecycleCommand) {
+            if (std::function<void()> hold = std::exchange(_beforeLifecycleCommands, {}); hold) {
+                hold();
+            }
+        }
+        Base::processMessages(port, messages);
+    }
+
+    [[nodiscard]] PendingAtReset pendingExchange() {
+        std::lock_guard guard(this->_runMutex);
+        if (!this->_pendingExchange.has_value()) {
+            return PendingAtReset::none;
+        }
+        return this->_pendingExchange->claimed ? PendingAtReset::claimed : PendingAtReset::waiting;
+    }
+};
 
 [[nodiscard]] gr::Graph makeFirstGraph() {
     using namespace boost::ut;
@@ -301,6 +426,24 @@ void requestSwap(SwapRequester& block) {
     boost::ut::expect(!span.empty()) << "could not queue the swap request";
     span[0] = std::move(request);
     span.publish(1UZ);
+}
+
+// consumes every message waiting on the port and returns the lifecycle states among them, in order
+[[nodiscard]] std::vector<std::string> takeStates(gr::MsgPortIn& port) {
+    std::vector<std::string> states;
+    auto                     messages = port.streamReader().get();
+    for (const gr::Message& message : messages) {
+        if (message.endpoint != gr::block::property::kLifeCycleState || !message.data.has_value()) {
+            continue;
+        }
+        for (const auto& [key, value] : *message.data) {
+            if (key == "state") {
+                states.push_back(value.value_or(std::string()));
+            }
+        }
+    }
+    std::ignore = messages.consume(messages.size());
+    return states;
 }
 
 } // namespace qa_exchange
@@ -582,6 +725,135 @@ const boost::ut::suite<"scheduler graph exchange"> schedulerExchangeTests = [] {
         // the same request succeeds once the run has stopped: the refusal above came from the running worker alone
         std::optional<gr::Message> accepted = scheduler.propertyCallbackGraphGRC(gr::scheduler::property::kGraphGRC, request);
         expect(accepted.has_value() && accepted->data.has_value()) << "the stopped scheduler refused the replacement";
+    };
+
+    // The worker handles the replacement, which stops the run and keeps the new graph. The worker that handled the batch
+    // claims it when it releases its count. The reset and the start follow in the same batch, and the start arrives while the swap is
+    // pending. runAndWait() returns once the swap is applied, and every state the scheduler published is on the port
+    "a graph replacement followed by a start in one message batch runs the new graph"_test = []<typename TPolicy>() {
+        using TScheduler                 = typename TPolicy::type;
+        qa_exchange::gFirstGraphSamples  = 0UZ;
+        qa_exchange::gSecondGraphSamples = 0UZ;
+        std::string yaml                 = qa_exchange::replacementGraphYaml();
+
+        TScheduler     scheduler;
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(toScheduler.connect(scheduler.msgIn).has_value());
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+        expect(scheduler.exchange(qa_exchange::makeFirstGraph()).has_value());
+        gr::sendMessage<gr::message::Command::Subscribe>(toScheduler, scheduler.unique_name, gr::block::property::kLifeCycleState, gr::property_map{}, "states");
+
+        std::thread runner([&scheduler] { std::ignore = scheduler.runAndWait(); });
+        expect(qa_exchange::awaitCount(qa_exchange::gFirstGraphSamples, 1UZ)) << "first graph never ran";
+
+        qa_exchange::sendReplacementAndStart(toScheduler, scheduler.unique_name, std::move(yaml));
+        expect(qa_exchange::awaitCount(qa_exchange::gSecondGraphSamples, 1UZ)) << "the start after the replacement never ran the new graph";
+        expect(scheduler.state() == RUNNING) << "the scheduler left RUNNING";
+        std::ignore = qa_exchange::takeStates(fromScheduler);
+
+        std::ignore = scheduler.changeStateTo(REQUESTED_STOP);
+        runner.join();
+        expect(qa_exchange::awaitState(scheduler, STOPPED)) << "the scheduler did not stop";
+        const std::vector<std::string> statesAfterStop = qa_exchange::takeStates(fromScheduler);
+        const std::string              resetState(gr::meta::enumName(INITIALISED).value_or(""));
+        expect(std::ranges::find(statesAfterStop, resetState) == statesAfterStop.end()) << std::format("the scheduler was reset after the stop: {}", statesAfterStop);
+    } | std::tuple<std::type_identity<qa_exchange::SerialScheduler>, std::type_identity<qa_exchange::BlockingScheduler>, std::type_identity<qa_exchange::TestScheduler>>{};
+
+    // The source's worker holds in the source's message handler while the sink's worker handles the batch. It leaves
+    // its loop once the replacement is recorded, and the reset in the batch waits for it. The replacement still waits
+    // unclaimed at that reset. The worker that handles the batch claims it with the start, and the new graph runs.
+    "a worker that leaves while another worker handles a replacement does not claim it"_test = [] {
+        qa_exchange::gFirstGraphSamples  = 0UZ;
+        qa_exchange::gSecondGraphSamples = 0UZ;
+        std::string yaml                 = qa_exchange::replacementGraphYaml();
+
+        qa_exchange::TwoThreadPool        pool;
+        qa_exchange::PendingExchangeProbe scheduler({{"poolName", std::string(qa_exchange::kTwoThreadPoolName)}});
+        gr::MsgPortOut                    toScheduler;
+        expect(toScheduler.connect(scheduler.msgIn).has_value());
+        std::atomic<bool>           holding{false};
+        qa_exchange::SwapRequester* holder = nullptr;
+        {
+            gr::Graph flow;
+            auto&     sink   = flow.emplaceBlock<qa_exchange::FirstSink>();
+            auto&     source = flow.emplaceBlock<qa_exchange::SwapRequester>();
+            expect(flow.connect<"out", "in">(source, sink).has_value());
+            source._onSwapRequest = [&scheduler, &holding] {
+                holding.store(true);
+                for (std::size_t i = 0UZ; i < 3000UZ && scheduler.pendingExchange() == qa_exchange::PendingAtReset::none; ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            };
+            holder = &source; // the wrapper holding it lives on the heap, so this survives the move
+            expect(scheduler.exchange(std::move(flow)).has_value());
+        }
+
+        std::thread runner([&scheduler] { std::ignore = scheduler.runAndWait(); });
+        expect(qa_exchange::awaitCount(qa_exchange::gFirstGraphSamples, 1UZ)) << "first graph never ran";
+        expect(eq(scheduler.jobs()->size(), 2UZ)) << "the source and the sink must run on two workers";
+
+        qa_exchange::requestSwap(*holder);
+        expect(qa_exchange::awaitFlag(holding)) << "the source's worker never held";
+        qa_exchange::sendReplacementAndStart(toScheduler, scheduler.unique_name, std::move(yaml));
+        expect(qa_exchange::awaitCount(qa_exchange::gSecondGraphSamples, 1UZ)) << "the start after the replacement never ran the new graph";
+        expect(scheduler.state() == RUNNING) << "the scheduler left RUNNING";
+        expect(scheduler._pendingAtFirstReset.load() == qa_exchange::PendingAtReset::waiting) << "the worker that left during the batch claimed the replacement";
+
+        std::ignore = scheduler.changeStateTo(REQUESTED_STOP);
+        runner.join();
+        expect(qa_exchange::awaitState(scheduler, STOPPED)) << "the scheduler did not stop";
+    };
+
+    // The source's handler swaps the graph on its worker while the sink's worker holds before a reset and a start sent
+    // in one span. The source's worker claims the swap when it leaves. The claimed swap still waits at the reset for
+    // the sink's worker, the start joins it, and one thread applies both. The new graph runs.
+    "a swap that a block's handler records is applied once with the start that another worker handles"_test = [] {
+        qa_exchange::gFirstGraphSamples  = 0UZ;
+        qa_exchange::gSecondGraphSamples = 0UZ;
+
+        qa_exchange::TwoThreadPool        pool;
+        qa_exchange::PendingExchangeProbe scheduler({{"poolName", std::string(qa_exchange::kTwoThreadPoolName)}});
+        gr::MsgPortOut                    toScheduler;
+        expect(toScheduler.connect(scheduler.msgIn).has_value());
+        std::atomic<bool> handlerEntered{false};
+        std::atomic<bool> commandsHeld{false};
+        std::atomic<bool> swapRecorded{false};
+        scheduler._beforeLifecycleCommands = [&commandsHeld, &swapRecorded] {
+            commandsHeld.store(true);
+            std::ignore = qa_exchange::awaitFlag(swapRecorded);
+        };
+        qa_exchange::SwapRequester* requester = nullptr;
+        {
+            gr::Graph flow;
+            auto&     sink   = flow.emplaceBlock<qa_exchange::FirstSink>();
+            auto&     source = flow.emplaceBlock<qa_exchange::SwapRequester>();
+            expect(flow.connect<"out", "in">(source, sink).has_value());
+            source._onSwapRequest = [&scheduler, &handlerEntered, &commandsHeld, &swapRecorded] {
+                handlerEntered.store(true);
+                std::ignore = qa_exchange::awaitFlag(commandsHeld);
+                std::ignore = scheduler.exchange(qa_exchange::makeSecondGraph());
+                swapRecorded.store(true);
+            };
+            requester = &source; // the wrapper holding it lives on the heap, so this survives the move
+            expect(scheduler.exchange(std::move(flow)).has_value());
+        }
+
+        std::thread runner([&scheduler] { std::ignore = scheduler.runAndWait(); });
+        expect(qa_exchange::awaitCount(qa_exchange::gFirstGraphSamples, 1UZ)) << "first graph never ran";
+        expect(eq(scheduler.jobs()->size(), 2UZ)) << "the source and the sink must run on two workers";
+
+        qa_exchange::requestSwap(*requester);
+        expect(qa_exchange::awaitFlag(handlerEntered)) << "the source's worker never entered the handler";
+        qa_exchange::sendResetAndStart(toScheduler, scheduler.unique_name);
+        expect(qa_exchange::awaitFlag(swapRecorded)) << "the source's handler never swapped the graph";
+        expect(qa_exchange::awaitCount(qa_exchange::gSecondGraphSamples, 1UZ)) << "the start never ran the swapped-in graph";
+        expect(scheduler.state() == RUNNING) << "the scheduler left RUNNING";
+        expect(scheduler._pendingAtFirstReset.load() == qa_exchange::PendingAtReset::claimed) << "the swap was taken for applying before the reset and the start on the other worker";
+
+        std::ignore = scheduler.changeStateTo(REQUESTED_STOP);
+        runner.join();
+        expect(qa_exchange::awaitState(scheduler, STOPPED)) << "the scheduler did not stop";
     };
 
     // a second thread requests a stop while the scheduler reads STOPPED. The request is satisfied and held after its

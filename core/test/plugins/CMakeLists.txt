@@ -55,6 +55,9 @@ add_block_library(block_library_second block_library)
 add_block_library(block_library_duplicate block_library_duplicate)
 add_block_library(block_library_duplicate_second block_library_duplicate)
 
+# blocks and a scheduler whose code runs beside the loading program's code
+add_block_library(cross_object_library cross_object_library)
+
 # One plugin at two plugin ABI versions, in a directory of their own: one at the version this core implements and one at
 # version 1. A third plugin is at the version this core implements and registers a scheduler at version 1 when it loads.
 # A single load of that directory reaches every outcome of the loader's version checks for plugins.

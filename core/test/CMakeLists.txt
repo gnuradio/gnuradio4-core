@@ -199,6 +199,10 @@ endif()
 if(GR_ENABLE_BLOCK_REGISTRY AND INTERNAL_ENABLE_BLOCK_PLUGINS)
   add_subdirectory(plugins)
 
+  # the cases with blocks or a scheduler from a shared object load that object
+  add_dependencies(qa_SchedulerLifecycle cross_object_library)
+  target_compile_definitions(qa_SchedulerLifecycle PRIVATE GR_TEST_WITH_BLOCK_LIBRARY)
+
   add_dependencies(
     qa_SubGraphAssets
     GoodBasePlugin
