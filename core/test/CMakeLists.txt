@@ -173,6 +173,10 @@ if(GR_ENABLE_BLOCK_REGISTRY)
 endif()
 set_tests_properties(${_CORE_DEADLOCK_TESTS} PROPERTIES TIMEOUT 120)
 
+# the cases time a parked worker's wake on the wall clock
+add_ut_test(qa_SchedulerNestedProgress)
+set_tests_properties(qa_SchedulerNestedProgress PROPERTIES TIMEOUT 60)
+
 add_ut_test(qa_SubGraphAssets)
 # only the case that instantiates an asset needs the registry; the rest run without one
 if(NOT GR_ENABLE_BLOCK_REGISTRY)

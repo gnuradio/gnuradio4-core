@@ -206,6 +206,56 @@ protected:
     // own worker is counted as well; a worker the pool has only queued is not counted
     std::size_t _nWorkersStarted{0};
 
+    // A graph that holds this scheduler as a block connects the ports that this scheduler's graph exports. Each start
+    // records the blocks that own those ports and the progress sequences that their work advances: the sequence that
+    // this scheduler holds, followed by the outer sequences its holder handed it. A port exported while the scheduler
+    // runs takes effect at the next start.
+    std::vector<const BlockModel*>             _exportedBlocks;
+    std::vector<std::shared_ptr<gr::Sequence>> _outerProgress;    // handed by the holder; empty unless it exports this scheduler
+    std::vector<std::shared_ptr<gr::Sequence>> _exportedProgress; // read by the workers of one run
+
+    void recordExportedBlocks() {
+        _exportedProgress.assign(1UZ, this->progress);
+        std::ranges::copy(_outerProgress, std::back_inserter(_exportedProgress));
+        _exportedBlocks.clear();
+        graph::forEachBlock<block::Category::TransparentBlockGroup>(*_graph, [this](auto& block) {
+            if (std::ranges::any_of(_graph->_exportedPorts, [&block](const auto& entry) { return entry.blockName == block->uniqueName(); })) {
+                _exportedBlocks.push_back(block.get());
+            }
+        });
+    }
+
+    [[nodiscard]] bool isExported(const BlockModel& block) const { return std::ranges::find(_exportedBlocks, std::addressof(block)) != _exportedBlocks.end(); }
+
+    // A nested scheduler holds the progress sequence of this scheduler's graph. When this scheduler exports the nested
+    // scheduler's ports in turn, the graphs beyond this one read or write those rings as well, and the nested scheduler
+    // receives their sequences as its outer sequences. Each start hands both before the nested scheduler starts.
+    void handProgressToNestedSchedulers() {
+        graph::forEachBlock<block::Category::TransparentBlockGroup>(*_graph, [this](auto& block) {
+            if (block->blockCategory() != block::Category::ScheduledBlockGroup) {
+                return;
+            }
+            block->init(_graph->_progress, this->compute_domain);
+            if (auto* receiver = dynamic_cast<OuterProgressReceiver*>(block.get()); receiver != nullptr) {
+                receiver->setOuterProgress(isExported(*block) ? _exportedProgress : std::vector<std::shared_ptr<gr::Sequence>>{});
+            }
+        });
+    }
+
+    // A worker of a graph that connects the exported ports parks on that graph's progress sequence. A pass in which an
+    // exported block moves samples can publish into or free a ring that the graph reads or writes. The pass advances
+    // each recorded sequence after its work calls return and wakes those workers. The pass that ends the run advances
+    // them as well. Work that stays inside this scheduler's graph leaves them alone.
+    void advanceEnclosingProgress(bool exportedBlockMoved, bool runEnds) {
+        if (!exportedBlockMoved && !(runEnds && !_exportedBlocks.empty())) {
+            return;
+        }
+        for (const std::shared_ptr<gr::Sequence>& sequence : _exportedProgress) {
+            sequence->incrementAndGet();
+            sequence->notify_all();
+        }
+    }
+
     // a watchdog only leaves on its own once the run's jobs are gone, which a restart inside its check
     // interval undoes, so every start retires the previous generation explicitly
     void stopWatchdogs() {
@@ -409,6 +459,9 @@ public:
     void releaseWorkQuiescence() { gr::atomic_ref(_workQuiescenceRequested).store_release(false); }
 
     [[nodiscard]] bool workerStarted() noexcept { return gr::atomic_ref(_nWorkersStarted).load_acquire() > 0UZ; }
+
+    // the progress sequences of the graphs beyond the holder that can read or write this scheduler's exported rings
+    void setOuterProgress(std::vector<std::shared_ptr<gr::Sequence>> outerProgress) { _outerProgress = std::move(outerProgress); }
 
     // why the latest start could not complete and left the scheduler in ERROR. The next start clears it. The thread
     // that runs the start writes it before it publishes ERROR. Read it once the state reads ERROR or while no start is
@@ -1017,9 +1070,13 @@ protected:
         const std::size_t requestedWorkAllBlocks = max_work_items;
         std::size_t       performedWorkAllBlocks = 0UZ;
         bool              unfinishedBlocksExist  = false; // i.e. at least one block returned OK, INSUFFICIENT_INPUT_ITEMS, or INSUFFICIENT_OUTPU_ITEMS
+        bool              exportedBlockMoved     = false;
         for (auto& currentBlock : blocks) {
             const auto [requested_work, performed_work, status] = currentBlock->work(requestedWorkAllBlocks);
             performedWorkAllBlocks += performed_work;
+            if (performed_work > 0UZ && !exportedBlockMoved && isExported(*currentBlock)) {
+                exportedBlockMoved = true;
+            }
 
             if (status == work::Status::ERROR) {
                 std::lock_guard guard(_runEndingBlockMutex);
@@ -1041,6 +1098,7 @@ protected:
 #ifdef __EMSCRIPTEN__
         std::this_thread::sleep_for(std::chrono::microseconds(10u)); // workaround for incomplete std::atomic implementation (at least it seems for nodejs)
 #endif
+        advanceEnclosingProgress(exportedBlockMoved, !unfinishedBlocksExist);
         return {max_work_items, performedWorkAllBlocks, unfinishedBlocksExist ? work::Status::OK : work::Status::DONE};
     }
 
@@ -1151,6 +1209,9 @@ protected:
         }
 
         std::lock_guard lock(_executionOrderMutex);
+
+        recordExportedBlocks();
+        handProgressToNestedSchedulers();
 
         std::optional<Error>                     firstChildError;
         std::vector<std::shared_ptr<BlockModel>> startedSubSchedulers;
