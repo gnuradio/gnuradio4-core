@@ -10,4 +10,4 @@ Description: Next-generation GNU Radio framework
 Version: @GR4_PKG_VERSION@
 
 Cflags: -I${includedir}
-Libs: -L${libdir} -lgnuradio-core -lgnuradio-blocklib-core@GR4_PKGCONFIG_PLUGIN_LIB@ @GR4_PKGCONFIG_EXTRA_LIBS@
+Libs: -L${libdir} -lgnuradio-core -lgnuradio-shared-state -lgnuradio-blocklib-core@GR4_PKGCONFIG_PLUGIN_LIB@ @GR4_PKGCONFIG_EXTRA_LIBS@
