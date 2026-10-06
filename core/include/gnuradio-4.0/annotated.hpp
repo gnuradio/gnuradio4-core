@@ -101,26 +101,48 @@ struct BackwardTagPropagation {};
 struct MergeTagPropagation {};
 
 /**
- * @brief Forward every input tag key, not only the auto-forward (reserved) keys.
+ * @brief Require that the block forwards every key of every tag, at the offset the tag arrived at.
  *
- * The default forwarder keeps only the keys in `gr::tag::kDefaultTags`. A block annotated with
- * `UnfilteredTagPropagation` keeps every key of every tag it forwards, substituting its own current value for a key
- * it declares as a setting. A surviving key that names a setting of a downstream block drives that setting, exactly
- * as `sample_rate` does. The multi-input dedup and the merge rule stay those of the default forwarder.
+ * The default forwarder keeps every key on a block that passes `gr::block::kUnfilteredTagPropagationAdmissible`. The
+ * predicate holds for a block that
+ * - declares neither `Resampling<>` nor `Stride<>`
+ * - has only synchronous stream ports
+ * - declares no tag-propagation policy other than this one
+ * - supplies no `forwardTags()` of its own
  *
- * Each tag leaves at the offset it arrived at, and the whole consumed chunk is retired, so an input `min_samples` or
- * an `input_chunk_size` above one — which forbids a chunk boundary at every tag — does not defer an interior tag to
- * the next chunk here as it does under the default policy. What the block itself applies from that tag, its settings,
- * still takes effect from the chunk's first sample.
+ * Such a block needs no annotation. A block annotated with `UnfilteredTagPropagation` must pass the predicate, and
+ * fails to compile where it does not. Every other block keeps only its auto-forward keys. Those are the keys in
+ * `gr::tag::kDefaultTags` and any added through `settings().addAutoForwardParameters()`.
  *
- * Refused at compile time for a block that declares `Resampling<>`, declares `Stride<>`, has an asynchronous stream
- * port, declares another tag-propagation policy, or supplies its own `forwardTags()` — see Block.hpp.
+ * The forwarder substitutes the block's own current value for a key the block declares as a setting. A surviving key
+ * that names a setting of a downstream block drives that setting, exactly as `sample_rate` does. The multi-input dedup
+ * and the merge rule stay those of the key-filtered forwarder.
+ *
+ * Each tag leaves at the offset it arrived at, and the whole consumed chunk is retired. An input `min_samples` above
+ * one can leave a tag inside a chunk. A key-filtered block defers that tag to the next chunk. A block forwarding every
+ * key publishes it at its own offset. What the block itself applies from that tag, its settings, still takes effect
+ * from the chunk's first sample.
  *
  * The remaining obligation is the author's, because no compile-time fact expresses it: a tag arriving at input
  * offset `t` must belong at output offset `t`. A block that shifts sample positions, an integer delay for instance,
- * or drops them, as one that keeps every Nth sample does, writes its own `forwardTags()` instead.
+ * or drops them, as one that keeps every Nth sample does, writes its own `forwardTags()`. A block whose output differs
+ * from what a non-reserved key describes declares `FilteredTagPropagation`.
  */
 struct UnfilteredTagPropagation {};
+
+/**
+ * @brief Forward only the auto-forward keys of each tag on a block that would otherwise forward every key.
+ *
+ * The forwarder keeps the keys in `gr::tag::kDefaultTags` and any added through
+ * `settings().addAutoForwardParameters()`. It substitutes the block's own value for a key the block declares as a
+ * setting, and it defers a tag interior to a chunk to the next chunk's first sample. The build refuses the annotation
+ * beside `UnfilteredTagPropagation` or `NoTagPropagation`.
+ *
+ * The annotation changes nothing on a block that fails `gr::block::kUnfilteredTagPropagationAdmissible` for another
+ * reason, such as `Resampling<>`, `Stride<>` or a `forwardTags()` override. A block template whose variants differ in
+ * these respects may declare it on every variant.
+ */
+struct FilteredTagPropagation {};
 
 /**
  * @brief Annotates block, indicating to perform resampling based on the provided `inputChunkSize` and `outputChunkSize`.
