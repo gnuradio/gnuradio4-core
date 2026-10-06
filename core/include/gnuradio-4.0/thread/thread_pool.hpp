@@ -340,7 +340,11 @@ class BasicThreadPool {
     std::atomic_bool _initialised = ATOMIC_FLAG_INIT;
     std::atomic_bool _shutdown    = false;
 
+    // Workers wait, take a task and leave under _waitMutex. execute() queues a task and decides to add a worker under
+    // it. addWorker() releases _waitMutex before it takes _threadListMutex.
+    std::mutex              _waitMutex;
     std::condition_variable _condition;
+    std::size_t             _numIdleWorkers  = 0U; // workers without a task, guarded by _waitMutex
     std::atomic_size_t      _numTaskedQueued = 0U; // cache for _taskQueue.size()
     std::atomic_size_t      _numTasksRunning = 0U;
     std::atomic_size_t      _numTasksFailed  = 0U;
@@ -369,13 +373,14 @@ public:
     BasicThreadPool(const std::string_view& name = generateName(), const TaskType taskType = CPU_BOUND, uint32_t min = std::thread::hardware_concurrency(), uint32_t max = std::thread::hardware_concurrency(), std::source_location location = std::source_location::current()) //
         : _poolName(name), _taskType(taskType), _minThreads(std::min(min, max)), _maxThreads(max) {
         for (uint32_t i = 0; i < minThreads(); ++i) {
-            createWorkerThread(location);
+            std::unique_lock lock(_waitMutex);
+            addWorker(lock, location);
         }
     }
 
     ~BasicThreadPool() {
         _shutdown = true;
-        _condition.notify_all();
+        wakeAllWorkers();
         for (auto& t : _threads) {
             t.join();
         }
@@ -408,12 +413,12 @@ public:
 
         _minThreads.store(minThreads, std::memory_order_release);
         _maxThreads.store(maxThreads, std::memory_order_release);
-        _condition.notify_all(); // Wake threads to adapt
+        wakeAllWorkers(); // Wake threads to adapt
     }
 
     void requestShutdown() {
         _shutdown = true;
-        _condition.notify_all();
+        wakeAllWorkers();
         for (auto& t : _threads) {
             t.join();
         }
@@ -441,31 +446,37 @@ public:
         updateThreadConstraints();
     }
 
+    // Queues the task for a worker of the pool. When the idle workers are no more than the tasks queued ahead and the
+    // pool holds fewer than maxThreads() workers, execute() adds a worker. If the worker cannot be added, at the
+    // process-wide thread limit (std::out_of_range), because the thread count cannot be read (std::runtime_error) or
+    // because the system refuses a new thread (std::system_error), the exception reaches the caller and nothing is
+    // queued. A queued task waits for a busy worker only when the pool holds maxThreads() workers, or when another
+    // submitter adds the last of them and that worker is then refused.
     template<const detail::basic_fixed_string taskName = "", uint32_t priority = 0, int32_t cpuID = -1, std::invocable Callable, typename... Args, typename R = gr::meta::invoke_result_t<Callable, Args...>>
     requires(std::is_same_v<R, void>)
     void execute(Callable&& func, Args&&... args, const std::source_location& location = std::source_location::current()) {
-        static thread_local gr::SpinWait spinWait;
         if constexpr (cpuID >= 0) {
             if (cpuID >= _affinityMask.size() || (!_affinityMask[cpuID])) {
                 throw std::invalid_argument(std::format("pool({}): requested cpuID {} incompatible with set affinity mask({}): [{}]", poolName(), cpuID, _affinityMask.size(), gr::join(_affinityMask, ", ")));
             }
         }
+        TaskQueue::TaskContainer task = createTask<taskName, priority, cpuID>(std::forward<decltype(func)>(func), std::forward<decltype(func)>(args)...);
+
+        std::unique_lock lock(_waitMutex);
+        const bool       needsWorker = _numIdleWorkers <= numTasksQueued() && numThreads() < maxThreads();
+        // The queued count includes the task from here on. A worker that sees it stays.
         _numTaskedQueued.fetch_add(1U);
-
-        _taskQueue.push(createTask<taskName, priority, cpuID>(std::forward<decltype(func)>(func), std::forward<decltype(func)>(args)...));
-        _condition.notify_one();
-
-        spinWait.spinOnce();
-        spinWait.spinOnce();
-        while (_taskQueue.size() > 0 && (numThreads() < maxThreads())) { // pending tasks and can grow
-            if (const auto nThreads = numThreads(); nThreads <= numTasksRunning() && nThreads <= maxThreads()) {
-                createWorkerThread(location);
+        if (needsWorker) {
+            try {
+                addWorker(lock, location);
+            } catch (...) {
+                _numTaskedQueued.fetch_sub(1U);
+                throw;
             }
-            _condition.notify_one();
-            spinWait.spinOnce();
-            spinWait.spinOnce();
         }
-        spinWait.reset();
+        _taskQueue.push(std::move(task));
+        lock.unlock();
+        _condition.notify_one();
     }
 
     template<const detail::basic_fixed_string taskName = "", uint32_t priority = 0, int32_t cpuID = -1, std::invocable Callable, typename... Args, typename R = gr::meta::invoke_result_t<Callable, Args...>>
@@ -494,6 +505,11 @@ public:
     }
 
 private:
+    void wakeAllWorkers() {
+        std::scoped_lock lock(_waitMutex);
+        _condition.notify_all();
+    }
+
     void cleanupFinishedThreads() {
         std::scoped_lock lock(_threadListMutex);
         // TODO:
@@ -540,23 +556,44 @@ private:
         return affinityMask;
     }
 
-    void createWorkerThread(std::source_location location = std::source_location::current()) {
-        std::scoped_lock lock(_threadListMutex);
-        _globalThreadCount.fetch_add(1UZ, std::memory_order_relaxed);
-        const std::size_t nTotalThreads = getTotalThreadCount();
-        if (nTotalThreads + 1UZ >= thread::getThreadLimit()) {
-            _globalThreadCount.fetch_sub(1UZ, std::memory_order_relaxed);
-            throw std::out_of_range(std::format("pool({}): about to exhaust global thread limit: {} out of {} : at {}", poolName(), nTotalThreads, thread::getThreadLimit(), location));
-        }
+    // Adds a worker that counts as idle from the start. The caller holds waitLock on _waitMutex, and holds it again
+    // when addWorker() returns or throws. The slot is reserved under _waitMutex. The limit check and the thread's
+    // creation run under _threadListMutex alone, and the workers keep taking tasks meanwhile. A refusal undoes the
+    // reservation: the process-wide limit (std::out_of_range), a thread count that cannot be read and a thread the
+    // system refuses (std::system_error). A worker whose name or scheduling cannot be set stays in the pool, and the
+    // exception reaches the caller.
+    void addWorker(std::unique_lock<std::mutex>& waitLock, std::source_location location) {
         const std::size_t threadIdx = _numThreads.fetch_add(1UZ, std::memory_order_acq_rel);
+        ++_numIdleWorkers;
+        waitLock.unlock();
+
+        std::unique_lock threadListLock(_threadListMutex);
+        const auto       relock = [&] {
+            threadListLock.unlock();
+            waitLock.lock();
+        };
+        _globalThreadCount.fetch_add(1UZ, std::memory_order_relaxed);
+        std::thread* newThread = nullptr;
         try {
-            std::thread& thread = _threads.emplace_back(&BasicThreadPool::worker, this, threadIdx);
-            updateThreadConstraints(threadIdx + 1UZ, thread);
+            const std::size_t nTotalThreads = getTotalThreadCount();
+            if (nTotalThreads + 1UZ >= thread::getThreadLimit()) {
+                throw std::out_of_range(std::format("pool({}): about to exhaust global thread limit: {} out of {} : at {}", poolName(), nTotalThreads, thread::getThreadLimit(), location));
+            }
+            newThread = &_threads.emplace_back(&BasicThreadPool::worker, this, threadIdx);
         } catch (...) {
-            _numThreads.fetch_sub(1UZ, std::memory_order_acq_rel);
             _globalThreadCount.fetch_sub(1UZ, std::memory_order_relaxed);
+            relock();
+            --_numIdleWorkers;
+            _numThreads.fetch_sub(1UZ, std::memory_order_acq_rel);
             throw;
         }
+        try {
+            updateThreadConstraints(threadIdx + 1UZ, *newThread);
+        } catch (...) {
+            relock();
+            throw;
+        }
+        relock();
         if (numThreads() >= minThreads()) {
             std::atomic_store_explicit(&_initialised, true, std::memory_order_release);
             _initialised.notify_all();
@@ -598,101 +635,80 @@ private:
         return taskContainer;
     }
 
+    // called with _waitMutex held
     TaskQueue::TaskContainer popTask() {
         auto result = _taskQueue.pop();
         if (!result.empty()) {
+            --_numIdleWorkers;
+            _numTasksRunning.fetch_add(1U);
             _numTaskedQueued.fetch_sub(1U);
         }
         return result;
     }
 
-    void worker(std::size_t threadID) {
-        constexpr uint32_t N_SPIN       = 1 << 8;
-        uint32_t           noop_counter = 0;
-        // _numThreads incremented in createWorkerThread()
-        std::mutex       mutex;
-        std::unique_lock lock(mutex);
-        auto             lastUsed              = std::chrono::steady_clock::now();
-        auto             timeDiffSinceLastUsed = std::chrono::steady_clock::now() - lastUsed;
-        bool             running               = true;
-        do {
-            if (TaskQueue::TaskContainer currentTaskContainer = popTask(); !currentTaskContainer.empty()) {
-                assert(!currentTaskContainer.empty());
-                auto& currentTask = currentTaskContainer.front();
-                _numTasksRunning.fetch_add(1);
-                bool nameSet = !(currentTask.name.empty());
-                if (nameSet) {
-                    thread::setThreadName(currentTask.name);
-                }
-                // a task escaping an exception would unwind into std::thread and terminate the process
-                try {
-                    currentTask.func();
-                } catch (const std::exception& e) {
-                    _numTasksFailed.fetch_add(1U);
-                    std::print(stderr, "{}: task '{}' threw: {}\n", _poolName, currentTask.name, e.what());
-                } catch (...) {
-                    _numTasksFailed.fetch_add(1U);
-                    std::print(stderr, "{}: task '{}' threw an unknown exception\n", _poolName, currentTask.name);
-                }
-                // execute dependent children
-                currentTask.reset();
-                _recycledTasks.push(std::move(currentTaskContainer));
-                _numTasksRunning.fetch_sub(1);
-                if (nameSet) {
-                    thread::setThreadName(std::format("{}#{}", _poolName, threadID));
-                }
-                lastUsed     = std::chrono::steady_clock::now();
-                noop_counter = 0;
-            } else if (++noop_counter > N_SPIN) [[unlikely]] {
-                // perform some thread maintenance tasks before going to sleep
-                noop_counter = noop_counter / 2;
-                cleanupFinishedThreads();
+    void runTask(Task& currentTask, std::size_t threadID) {
+        bool nameSet = !(currentTask.name.empty());
+        if (nameSet) {
+            thread::setThreadName(currentTask.name);
+        }
+        // a task escaping an exception would unwind into std::thread and terminate the process
+        try {
+            currentTask.func();
+        } catch (const std::exception& e) {
+            _numTasksFailed.fetch_add(1U);
+            std::print(stderr, "{}: task '{}' threw: {}\n", _poolName, currentTask.name, e.what());
+        } catch (...) {
+            _numTasksFailed.fetch_add(1U);
+            std::print(stderr, "{}: task '{}' threw an unknown exception\n", _poolName, currentTask.name);
+        }
+        if (nameSet) {
+            thread::setThreadName(std::format("{}#{}", _poolName, threadID));
+        }
+    }
 
-#if defined(__APPLE__)
-                // macOS + Homebrew libc++ workaround: condition_variable::wait_for() with per-thread
-                // mutexes triggers EINVAL (POSIX requires same mutex for all concurrent waiters on
-                // the same condvar, and macOS enforces this unlike Linux).
-                // Use a short-sleep polling loop with 10μs granularity instead.
-                {
-                    auto deadline = std::chrono::steady_clock::now() + keepAliveDuration;
-                    while (!(numTasksQueued() > 0 || isShutdown())) {
-                        if (std::chrono::steady_clock::now() >= deadline) {
-                            break;
-                        }
-                        std::this_thread::sleep_for(std::chrono::microseconds(10));
-                    }
+    // A worker leaves at its keep-alive only when no task is queued or about to be queued and the pool holds more than
+    // minThreads() workers. The worker decides and lowers the thread count under _waitMutex. execute() then sees the
+    // worker either idle or gone, and adds a worker when it is gone.
+    void worker(std::size_t threadID) {
+        // _numThreads and _numIdleWorkers are raised in addWorker()
+        auto             lastUsed = std::chrono::steady_clock::now();
+        std::unique_lock lock(_waitMutex);
+        while (true) {
+            if (!isShutdown()) {
+                if (TaskQueue::TaskContainer currentTaskContainer = popTask(); !currentTaskContainer.empty()) {
+                    lock.unlock();
+                    auto& currentTask = currentTaskContainer.front();
+                    runTask(currentTask, threadID);
+                    // execute dependent children
+                    currentTask.reset();
+                    _recycledTasks.push(std::move(currentTaskContainer));
+                    _numTasksRunning.fetch_sub(1);
+                    lastUsed = std::chrono::steady_clock::now();
+                    lock.lock();
+                    ++_numIdleWorkers;
+                    continue;
                 }
-#else
-                _condition.wait_for(lock, keepAliveDuration, [this] { return numTasksQueued() > 0 || isShutdown(); });
-#endif
+                const auto now          = std::chrono::steady_clock::now();
+                const auto keepAliveEnd = lastUsed + keepAliveDuration;
+                const bool keepWorker   = now < keepAliveEnd || numTasksQueued() > 0UZ || numThreads() <= minThreads();
+                if (keepWorker) {
+                    // a worker kept past its keep-alive checks again one keep-alive later
+                    _condition.wait_until(lock, now < keepAliveEnd ? keepAliveEnd : now + keepAliveDuration);
+                    continue;
+                }
             }
-            // check if this thread is to be kept
-            timeDiffSinceLastUsed = std::chrono::steady_clock::now() - lastUsed;
-            if (isShutdown()) {
-                auto nThread = _numThreads.fetch_sub(1);
-                _globalThreadCount.fetch_sub(1UZ);
-                _numThreads.notify_all();
-                if (nThread == 1) { // cleanup last thread
-                    _recycledTasks.clear();
+            const std::size_t nThreads = _numThreads.fetch_sub(1UZ, std::memory_order_acq_rel);
+            --_numIdleWorkers;
+            _globalThreadCount.fetch_sub(1UZ, std::memory_order_relaxed);
+            lock.unlock();
+            if (nThreads == 1UZ) { // cleanup last thread
+                _recycledTasks.clear();
+                if (isShutdown()) {
                     _taskQueue.clear();
                 }
-                running = false;
-            } else if (timeDiffSinceLastUsed > keepAliveDuration) { // decrease to the minimum of _minThreads in a thread safe way
-                std::size_t nThreads = numThreads();
-                while (nThreads > minThreads()) { // compare and swap loop
-                    if (_numThreads.compare_exchange_weak(nThreads, nThreads - 1, std::memory_order_acq_rel)) {
-                        _globalThreadCount.fetch_sub(1UZ);
-                        _numThreads.notify_all();
-                        if (nThreads == 1) { // cleanup last thread
-                            _recycledTasks.clear();
-                            _taskQueue.clear();
-                        }
-                        running = false;
-                        break;
-                    }
-                }
             }
-        } while (running);
+            return;
+        }
     }
 };
 

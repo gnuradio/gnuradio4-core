@@ -105,13 +105,12 @@ const boost::ut::suite<"gr::thread_pool GR4 default"> defaultThreadPool = [] {
                     });
                 }
                 expect(that % pool.numThreads() >= minThreads);
-                // the maximum number of threads is not a hard limit, if there is a burst of execute calls, it will spwawn more than maxThreads trheads.
                 // expect(that % pool.numThreads() == std::min(std::uint32_t(taskCount), maxThreads));
 
                 for (std::size_t i = 0UZ; i < taskCount; ++i) {
                     counter.wait(i);
                     expect(that % pool.numThreads() >= minThreads);
-                    // expect(that % pool.numThreads() <= maxThreads); // not a hard limit
+                    expect(that % pool.numThreads() <= maxThreads);
                 }
 
                 // We should have gotten back to minimum
@@ -175,7 +174,7 @@ const boost::ut::suite<"gr::thread_pool GR4 default"> defaultThreadPool = [] {
         BasicThreadPool pool("IdleWakeUpTest", TaskType::IO_BOUND, 0U, 1U);
         pool.keepAliveDuration = std::chrono::seconds(1);
 
-        // the delays sweep the moment the idle worker stops spinning and blocks on the condition variable
+        // the delays sweep the moment the idle worker blocks on the condition variable
         constexpr std::size_t kSubmissions = 50'000UZ;
         std::binary_semaphore started{0};
         Clock::duration       longestWait{};
