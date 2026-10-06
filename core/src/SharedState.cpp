@@ -7,6 +7,11 @@ const void*& activeSchedulerWorker() noexcept {
     return scheduler;
 }
 
+std::size_t& activeWorkerGeneration() noexcept {
+    thread_local std::size_t generation = 0UZ;
+    return generation;
+}
+
 const void*& applyingScheduler() noexcept {
     thread_local const void* scheduler = nullptr;
     return scheduler;

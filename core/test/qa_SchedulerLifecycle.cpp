@@ -6,6 +6,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <expected>
 #include <format>
 #include <functional>
 #include <map>
@@ -801,6 +802,185 @@ void startAndPause(TestScheduler& scheduler) {
     expect(awaitState(scheduler, PAUSED)) << "scheduler did not reach PAUSED";
 }
 
+// set by a failing block when its work() call starts. The test requests the stop once it reads true
+inline std::atomic<bool> gInsideWork{false};
+// the lifecycle state a failing block read when it failed. IDLE means the block has not failed
+inline std::atomic<gr::lifecycle::State> gStateAtFailure{gr::lifecycle::State::IDLE};
+// a failing block holds its failure while this reads false
+inline std::atomic<bool> gFailureReleased{true};
+
+constexpr std::string_view kFlushFailure = "the device could not flush its last buffer";
+constexpr std::string_view kReadFailure  = "the device could not deliver its last sample";
+constexpr std::string_view kRunFailure   = "the device stopped delivering samples";
+
+// waits inside work() until the stop has moved the block to `stopState`, records that state, and then holds until the
+// test releases the failure. A stop that never arrives leaves the recorded state at IDLE and the case fails on it
+inline void awaitStopInsideWork(const auto& block, gr::lifecycle::State stopState) {
+    gInsideWork.store(true, std::memory_order_release);
+    if (awaitCondition([&block, stopState] { return block.state() == stopState; })) {
+        gStateAtFailure.store(stopState, std::memory_order_release);
+    }
+    std::ignore = awaitCondition([] { return gFailureReleased.load(std::memory_order_acquire); });
+}
+
+// a device that cannot flush on its way down. The processBulk() call that the stop reaches reports the failure and
+// returns ERROR. A blocking source reads REQUESTED_STOP at that point, a non-blocking source STOPPED
+template<bool kBlocking>
+struct FlushFailingSource : gr::Block<FlushFailingSource<kBlocking>> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(FlushFailingSource, out);
+
+    [[nodiscard]] constexpr bool isBlocking() const noexcept { return kBlocking; }
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        outSpan.publish(0UZ);
+        awaitStopInsideWork(*this, kBlocking ? gr::lifecycle::State::REQUESTED_STOP : gr::lifecycle::State::STOPPED);
+        this->emitErrorMessage("processBulk", kFlushFailure);
+        return gr::work::Status::ERROR;
+    }
+};
+
+// a device that fails while the graph runs. The first processBulk() call reports the failure and returns ERROR
+struct RunningFailingSource : gr::Block<RunningFailingSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(RunningFailingSource, out);
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        outSpan.publish(0UZ);
+        gStateAtFailure.store(this->state(), std::memory_order_release);
+        this->emitErrorMessage("processBulk", kRunFailure);
+        return gr::work::Status::ERROR;
+    }
+};
+
+// a device that fails and requests its own stop in the same processBulk() call
+struct SelfStoppingFailingSource : gr::Block<SelfStoppingFailingSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(SelfStoppingFailingSource, out);
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        outSpan.publish(0UZ);
+        this->requestStop();
+        gStateAtFailure.store(this->state(), std::memory_order_release);
+        this->emitErrorMessage("processBulk", kRunFailure);
+        return gr::work::Status::ERROR;
+    }
+};
+
+// a device whose last sample cannot be read. The processOne() call that the stop reaches throws
+struct ReadFailingSource : gr::Block<ReadFailingSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(ReadFailingSource, out);
+
+    [[nodiscard]] float processOne() const {
+        awaitStopInsideWork(*this, gr::lifecycle::State::STOPPED);
+        throw gr::exception(kReadFailure);
+    }
+};
+
+struct StopInsideWorkResult {
+    bool                           entered = false; // a block entered its work() call before the stop
+    std::expected<void, gr::Error> outcome;
+};
+
+// runs the graph on its own thread and requests the stop once a block is inside its work() call
+template<typename TScheduler>
+[[nodiscard]] StopInsideWorkResult runAndStopInsideWork(TScheduler& scheduler) {
+    gInsideWork.store(false, std::memory_order_release);
+    gStateAtFailure.store(gr::lifecycle::State::IDLE, std::memory_order_release);
+    std::expected<void, gr::Error> outcome;
+    std::thread                    runner([&scheduler, &outcome] { outcome = scheduler.runAndWait(); });
+    const bool                     entered = awaitCondition([] { return gInsideWork.load(std::memory_order_acquire); });
+    std::ignore                            = scheduler.changeStateTo(gr::lifecycle::State::REQUESTED_STOP);
+    runner.join();
+    return {entered, outcome};
+}
+
+// the error messages taken from a port, as pairs of sender and text
+struct ErrorReports {
+    std::vector<std::pair<std::string, std::string>> errors;
+
+    void take(gr::MsgPortIn& port) {
+        auto messages = port.streamReader().get();
+        for (const gr::Message& message : messages) {
+            if (!message.data.has_value()) {
+                errors.emplace_back(message.serviceName, message.data.error().message);
+            }
+        }
+        std::ignore = messages.consume(messages.size());
+    }
+
+    [[nodiscard]] bool has(std::string_view sender, std::string_view text) const {
+        return std::ranges::any_of(errors, [sender, text](const auto& error) { return error.first == sender && error.second.find(text) != std::string::npos; });
+    }
+};
+
+// a source that fails after the stop reached it, feeding a counting sink, under scheduler TScheduler
+template<typename TScheduler, typename TSource>
+void expectErrorAfterStopFailsRun(gr::lifecycle::State expectedStateAtFailure, std::string_view failure) {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    gr::Graph flow;
+    auto&     source = flow.emplaceBlock<TSource>();
+    auto&     sink   = flow.emplaceBlock<CountingSink>();
+    expect(flow.connect<"out", "in">(source, sink).has_value());
+
+    TScheduler    scheduler;
+    gr::MsgPortIn fromScheduler;
+    expect(scheduler.msgOut.connect(fromScheduler).has_value());
+    expect(scheduler.exchange(std::move(flow)).has_value());
+
+    const auto [entered, outcome] = runAndStopInsideWork(scheduler);
+    expect(entered) << "the source never entered its work() call";
+    expect(gStateAtFailure.load(std::memory_order_acquire) == expectedStateAtFailure) << "the stop had not reached the source when it failed";
+    expect(!outcome.has_value()) << "a run whose block failed while stopping is reported as a clean stop";
+    if (!outcome.has_value()) {
+        expect(outcome.error().message.find(failure) != std::string::npos) << "the run's error carries what the block reported";
+    }
+    expect(scheduler.state() == STOPPED) << "the stop's STOPPED stays the scheduler's state";
+    ErrorReports reports;
+    reports.take(fromScheduler);
+    expect(reports.has(source.unique_name, failure)) << "the scheduler's message port carries the block's error";
+    expect(reports.has(scheduler.unique_name, source.unique_name)) << "the scheduler reports the block that failed after the stop";
+    expect(source.state() == STOPPED) << "the failing block completes the stop it was asked for";
+}
+
+// a source that fails before any stop, feeding a counting sink, under scheduler TScheduler
+template<typename TScheduler, typename TSource>
+void expectErrorWhileRunningEndsRun(gr::lifecycle::State expectedStateAtFailure) {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    gr::Graph flow;
+    auto&     source = flow.emplaceBlock<TSource>();
+    auto&     sink   = flow.emplaceBlock<CountingSink>();
+    expect(flow.connect<"out", "in">(source, sink).has_value());
+
+    TScheduler    scheduler;
+    gr::MsgPortIn fromScheduler;
+    expect(scheduler.msgOut.connect(fromScheduler).has_value());
+    expect(scheduler.exchange(std::move(flow)).has_value());
+
+    gStateAtFailure.store(IDLE, std::memory_order_release);
+    const std::expected<void, gr::Error> outcome = scheduler.runAndWait();
+    expect(gStateAtFailure.load(std::memory_order_acquire) == expectedStateAtFailure) << "the source failed in another state";
+    expect(!outcome.has_value()) << "a run whose block failed is reported as a success";
+    if (!outcome.has_value()) {
+        expect(outcome.error().message.find(kRunFailure) != std::string::npos) << "the run's error carries what the block reported";
+    }
+    expect(scheduler.state() == ERROR) << "the scheduler finishes in ERROR";
+    ErrorReports reports;
+    reports.take(fromScheduler);
+    expect(reports.has(source.unique_name, kRunFailure)) << "the scheduler's message port carries the block's error";
+    expect(source.state() == STOPPED) << "the failing block ends STOPPED";
+    expect(eq(sink._nStopCalls, 1)) << "the scheduler stops the blocks torn down alongside the failing one";
+}
+
 #ifdef GR_TEST_WITH_BLOCK_LIBRARY
 constexpr std::string_view kLibraryScheduler = "test::cross_object_scheduler";
 
@@ -999,6 +1179,106 @@ const boost::ut::suite<"block stop hook on terminal paths"> stopHookTests = [] {
 
         expect(eq(source._nStopCalls, 1)) << "the REQUESTED_STOP path must not fire stop() a second time on the way to STOPPED";
         expect(eq(sink._nStopCalls, 1));
+    };
+};
+
+const boost::ut::suite<"a block error while the scheduler stops"> errorWhileStoppingTests = [] {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    "a processBulk() ERROR after the stop reached a non-blocking block fails the run"_test = [] {
+        qa_sched::expectErrorAfterStopFailsRun<qa_sched::SerialScheduler, qa_sched::FlushFailingSource<false>>(STOPPED, qa_sched::kFlushFailure);
+        qa_sched::expectErrorAfterStopFailsRun<qa_sched::BlockingScheduler, qa_sched::FlushFailingSource<false>>(STOPPED, qa_sched::kFlushFailure);
+    };
+
+    "a processBulk() ERROR after the stop reached a blocking block fails the run"_test = [] {
+        qa_sched::expectErrorAfterStopFailsRun<qa_sched::SerialScheduler, qa_sched::FlushFailingSource<true>>(REQUESTED_STOP, qa_sched::kFlushFailure);
+        qa_sched::expectErrorAfterStopFailsRun<qa_sched::BlockingScheduler, qa_sched::FlushFailingSource<true>>(REQUESTED_STOP, qa_sched::kFlushFailure);
+    };
+
+    "a processOne() that throws after the stop reached the block fails the run"_test = [] {
+        qa_sched::expectErrorAfterStopFailsRun<qa_sched::SerialScheduler, qa_sched::ReadFailingSource>(STOPPED, qa_sched::kReadFailure);
+        qa_sched::expectErrorAfterStopFailsRun<qa_sched::BlockingScheduler, qa_sched::ReadFailingSource>(STOPPED, qa_sched::kReadFailure);
+    };
+
+    "a processBulk() ERROR before any stop ends the run in ERROR"_test = [] {
+        qa_sched::expectErrorWhileRunningEndsRun<qa_sched::SerialScheduler, qa_sched::RunningFailingSource>(RUNNING);
+        qa_sched::expectErrorWhileRunningEndsRun<qa_sched::BlockingScheduler, qa_sched::RunningFailingSource>(RUNNING);
+    };
+
+    "a block that requests its own stop and returns ERROR ends the run in ERROR"_test = [] {
+        qa_sched::expectErrorWhileRunningEndsRun<qa_sched::SerialScheduler, qa_sched::SelfStoppingFailingSource>(REQUESTED_STOP);
+        qa_sched::expectErrorWhileRunningEndsRun<qa_sched::BlockingScheduler, qa_sched::SelfStoppingFailingSource>(REQUESTED_STOP);
+    };
+
+    "a failing call that returns after the stop leaves the scheduler STOPPED and free to restart"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::FlushFailingSource<false>>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        qa_sched::TestScheduler scheduler;
+        gr::MsgPortIn           fromScheduler;
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        qa_sched::gInsideWork.store(false, std::memory_order_release);
+        qa_sched::gStateAtFailure.store(IDLE, std::memory_order_release);
+        qa_sched::gFailureReleased.store(false, std::memory_order_release);
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(qa_sched::awaitCondition([] { return qa_sched::gInsideWork.load(std::memory_order_acquire); })) << "the source never entered its work() call";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(scheduler.state() == STOPPED) << "the stop returns with the scheduler STOPPED while the failing call still runs";
+        expect(qa_sched::awaitCondition([] { return qa_sched::gStateAtFailure.load(std::memory_order_acquire) == STOPPED; })) << "the stop did not reach the source";
+
+        qa_sched::gFailureReleased.store(true, std::memory_order_release);
+        qa_sched::ErrorReports reports;
+        expect(qa_sched::awaitCondition([&] { return (reports.take(fromScheduler), reports.has(scheduler.unique_name, source.unique_name)); })) << "the scheduler did not report the block that failed after the stop";
+        expect(scheduler.state() == STOPPED) << "the failing call that returns after the stop must not move the scheduler out of STOPPED";
+
+        qa_sched::gInsideWork.store(false, std::memory_order_release);
+        expect(scheduler.changeStateTo(INITIALISED).has_value()) << "the restart after the stop is refused";
+        expect(scheduler.changeStateTo(RUNNING).has_value()) << "the restart after the stop is refused";
+        expect(qa_sched::awaitCondition([] { return qa_sched::gInsideWork.load(std::memory_order_acquire); })) << "the restarted run never called the source";
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_sched::awaitState(scheduler, STOPPED)) << "the restarted run did not stop";
+    };
+
+    "a graph swap completes when a block of the running graph returns ERROR while stopping"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::FlushFailingSource<false>>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+        const std::string failingName(source.unique_name);
+
+        qa_sched::TestScheduler scheduler;
+        gr::MsgPortIn           fromScheduler;
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        qa_sched::gInsideWork.store(false, std::memory_order_release);
+        qa_sched::gStateAtFailure.store(IDLE, std::memory_order_release);
+        qa_sched::gObservedSamples.store(0UZ, std::memory_order_relaxed);
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(qa_sched::awaitCondition([] { return qa_sched::gInsideWork.load(std::memory_order_acquire); })) << "the source never entered its work() call";
+
+        gr::Graph next;
+        auto&     nextSource = next.emplaceBlock<qa_sched::EndlessSource>();
+        auto&     nextSink   = next.emplaceBlock<qa_sched::ObservedSink>();
+        expect(next.connect<"out", "in">(nextSource, nextSink).has_value());
+
+        const auto swapped = scheduler.exchange(std::move(next));
+        expect(swapped.has_value()) << "the swap is refused because a block of the old graph failed while stopping";
+        expect(qa_sched::gStateAtFailure.load(std::memory_order_acquire) == STOPPED) << "the swap's stop had not reached the source when it failed";
+        expect(qa_sched::awaitCondition([] { return qa_sched::gObservedSamples.load(std::memory_order_relaxed) > 0UZ; })) << "the swapped-in graph does not run";
+
+        qa_sched::ErrorReports reports;
+        expect(qa_sched::awaitCondition([&] { return (reports.take(fromScheduler), reports.has(scheduler.unique_name, failingName)); })) << "the scheduler did not report the block that failed while stopping";
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_sched::awaitState(scheduler, STOPPED)) << "the swapped-in graph did not stop";
     };
 };
 
@@ -3357,6 +3637,61 @@ const boost::ut::suite<"a restart applied once the workers have left"> deferredR
         expect(qa_sched::gMarkRestartAdmitted.load()) << "the thread that applies the restart was refused a swap";
     };
 #endif
+};
+
+const boost::ut::suite<"a child's error drained after the stop"> drainedErrorAfterStopTests = [] {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    // the stop arrives by message, and a worker runs it. The sink's stop hook reports an error. The same message pass
+    // drains that error on the worker after the stop retired the run, with no reader on msgOut
+    "a child's error drained on a worker after the stop leaves STOPPED, fails runAndWait() with the child's name and lets a restart run"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::EndlessSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::StopActionSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+        const std::string sinkName(sink.unique_name);
+        sink._onStop = [&sink] {
+            if (sink._nStopCalls == 0) {
+                sink.emitErrorMessage("stop", qa_sched::kFlushFailure);
+            }
+        };
+        qa_sched::gObservedSamples.store(0UZ, std::memory_order_relaxed);
+
+        qa_sched::TestScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        gr::MsgPortOut toScheduler;
+        expect(toScheduler.connect(scheduler.msgIn).has_value());
+
+        auto runOnce = [&scheduler](auto stopRun) {
+            std::expected<void, gr::Error> outcome;
+            std::atomic<bool>              done{false};
+            std::thread                    runner([&scheduler, &outcome, &done] {
+                outcome = scheduler.runAndWait();
+                done.store(true, std::memory_order_release);
+            });
+            expect(qa_sched::awaitObservedSamplesAbove(qa_sched::gObservedSamples.load(std::memory_order_relaxed))) << "the run moved no samples";
+            stopRun();
+            if (!qa_sched::awaitCondition([&done] { return done.load(std::memory_order_acquire); })) {
+                std::ignore = scheduler.changeStateTo(REQUESTED_STOP);
+            }
+            runner.join();
+            return outcome;
+        };
+
+        const auto first = runOnce([&] { qa_sched::sendLifecycleRequest(toScheduler, scheduler.unique_name, REQUESTED_STOP); });
+        expect(eq(sink._nStopCalls, 1)) << "the stop by message did not reach the sink";
+        expect(!first.has_value()) << "a run whose child reported an error while stopping is reported as a clean stop";
+        if (!first.has_value()) {
+            expect(first.error().message.find(sinkName) != std::string::npos) << "the run's error does not name the child";
+            expect(first.error().message.find(qa_sched::kFlushFailure) != std::string::npos) << "the run's error does not carry the child's error";
+        }
+        expect(scheduler.state() == STOPPED) << std::format("the stop's STOPPED must stay the scheduler's state, it reads {}", gr::meta::enumName(scheduler.state()).value_or(""));
+
+        const auto second = runOnce([&scheduler] { std::ignore = scheduler.changeStateTo(REQUESTED_STOP); });
+        expect(second.has_value()) << "the restart after the stop failed";
+        expect(eq(sink._nStopCalls, 2)) << "the restarted run did not stop";
+    };
 };
 
 int main() { /* tests are statically registered */ }

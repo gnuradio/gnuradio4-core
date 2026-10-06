@@ -2422,12 +2422,16 @@ public:
             for_each_writer_span([](auto& outSpan) { outSpan.tagsPublished = 0; }, outputSpans);
         }
 
+        // a call that ends after the stop reached the block returns DONE, and an ERROR from the user's work stays ERROR
         property_map forwardParams;
-        if (lifecycle::isShuttingDown(this->state())) {
+        const bool   shuttingDown = lifecycle::isShuttingDown(this->state());
+        if (shuttingDown) {
             emitErrorMessageIfAny("isShuttingDown -> STOPPED", this->changeStateTo(lifecycle::State::REQUESTED_STOP));
             applyChangedSettings(true, &forwardParams);
-            userReturnStatus = DONE;
-            processedIn      = 0UZ;
+            if (userReturnStatus != ERROR) {
+                userReturnStatus = DONE;
+            }
+            processedIn = 0UZ;
         }
 
         // publish/consume
@@ -2455,6 +2459,9 @@ public:
                 for_each_writer_span([&forwardParams](auto& outSpan) { publishForwardParams(outSpan, forwardParams); }, outputSpans);
             }
             publishEoS(outputSpans);
+        } else if (userReturnStatus == ERROR && shuttingDown) {
+            // the block completes the requested stop and publishes no end-of-stream tag: its stream did not end cleanly
+            emitErrorMessageIfAny("work() ERROR while stopping -> STOPPED", this->changeStateTo(lifecycle::State::STOPPED));
         }
     }
 
