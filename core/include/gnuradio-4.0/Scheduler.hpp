@@ -183,7 +183,7 @@ protected:
     std::optional<Error>                      _firstErrorFromChildren; // the first error a child sent since the latest start, named for the child
     std::map<std::string, Error, std::less<>> _latestErrorByChild;     // each child's latest error since the latest start, keyed by its unique name
     std::mutex                                _runEndingBlockMutex;
-    std::optional<std::string>                _runEndingBlock; // the first block whose work() returned ERROR since the latest start
+    std::optional<std::string>                _runEndingBlock; // the first block that ended the run since the latest start (see failRun())
 
     std::atomic_flag _processingScheduledMessages;
     // separate cache lines: every worker reads the flag and updates the counter on each iteration
@@ -576,8 +576,10 @@ public:
             }
             waitDone(); // wait for all jobs to complete
 
-            if (auto result = this->changeStateTo(STOPPED); !result) {
-                return std::unexpected(result.error());
+            if (this->state() != ERROR) { // a block that failed before the stop leaves ERROR, and reset() below leaves it
+                if (auto result = this->changeStateTo(STOPPED); !result) {
+                    return std::unexpected(result.error());
+                }
             }
         }
 
@@ -722,6 +724,7 @@ public:
         }
 
         std::optional<Error> firstError;
+        std::string          firstErrorChild;
         for (const gr::Message& message : messagesFromChildren) {
             if (message.data.has_value()) {
                 continue;
@@ -729,7 +732,8 @@ public:
             const Error& reason = message.data.error();
             Error        named{std::format("block '{}' reports an error on '{}': {}", message.serviceName, message.endpoint, reason.message), reason.sourceLocation, reason.errorTime};
             if (!firstError.has_value()) {
-                firstError = named;
+                firstError      = named;
+                firstErrorChild = message.serviceName;
             }
             if (!_firstErrorFromChildren.has_value()) {
                 _firstErrorFromChildren = named;
@@ -743,6 +747,10 @@ public:
                 this->emitErrorMessage("process child return messages", "Failed to consume messages from child message port");
             }
             if (firstError.has_value()) {
+                if (isOnOwnWorkerThread()) { // the worker's pool would drop the exception
+                    failRun(firstErrorChild, activeWorkerGeneration(), "reported an error");
+                    return;
+                }
                 throw gr::exception(firstError->message, firstError->sourceLocation);
             }
             return;
@@ -839,7 +847,7 @@ public:
         if (_startError.has_value()) {
             return std::unexpected(*_startError);
         }
-        if (this->state() == ERROR) {
+        if (this->state() == ERROR || runEndingBlock().has_value()) {
             return std::unexpected(runEndingError());
         }
         return {};
@@ -855,15 +863,18 @@ public:
     [[nodiscard]] std::shared_ptr<JobLists> jobs() const noexcept { return _executionOrder; }
 
 protected:
-    // the error of a run that ended in ERROR. It names the first block whose work() returned ERROR and carries that
-    // block's latest reported error, or the name alone when the block reported none. A run that no block's ERROR ended
-    // returns the first error any child reported
+    // the first block whose work() returned ERROR, or whose error a worker drained with no msgOut reader, since the
+    // latest start
+    [[nodiscard]] std::optional<std::string> runEndingBlock() {
+        std::lock_guard guard(_runEndingBlockMutex);
+        return _runEndingBlock;
+    }
+
+    // the error of a run that ended in ERROR, or of a run that a block's error after the stop ended. It names the first
+    // block that ended the run and carries that block's latest reported error, or the name alone when the block
+    // reported none. A run that no block ended returns the first error any child reported
     [[nodiscard]] Error runEndingError() {
-        std::optional<std::string> endingBlock;
-        {
-            std::lock_guard guard(_runEndingBlockMutex);
-            endingBlock = _runEndingBlock;
-        }
+        const std::optional<std::string> endingBlock = runEndingBlock();
         if (endingBlock.has_value()) {
             if (const auto reported = _latestErrorByChild.find(*endingBlock); reported != _latestErrorByChild.end()) {
                 return reported->second;
@@ -871,6 +882,30 @@ protected:
             return Error{std::format("block '{}' ended the run: its work() returned ERROR", *endingBlock)};
         }
         return _firstErrorFromChildren.value_or(Error{"a block error ended the run: the scheduler finished in the ERROR state"});
+    }
+
+    // A worker meets an ERROR from a block's work() or from a child's error that no msgOut reader takes. The block or
+    // child is recorded for runAndWait() unless an earlier one was. While the worker's run is current, the scheduler
+    // moves to ERROR. Otherwise a stop retired the run while the worker met the error. stop() publishes STOPPED without
+    // waiting for the worker, and the state stays STOPPED. A restart or a graph swap that follows the stop proceeds.
+    // runAndWait() returns the error, and a message on msgOut reports it.
+    void failRun(std::string_view blockName, std::size_t generation, std::string_view what) {
+        {
+            std::lock_guard guard(_runEndingBlockMutex);
+            if (!_runEndingBlock.has_value()) {
+                _runEndingBlock = std::string(blockName);
+            }
+        }
+        if (gr::atomic_ref(_run.generation).load_acquire() == generation) {
+            this->emitErrorMessageIfAny("LifecycleState (ERROR)", this->changeStateTo(lifecycle::State::ERROR));
+            return;
+        }
+        Message report;
+        report.cmd         = message::Command::Notify;
+        report.serviceName = this->unique_name;
+        report.endpoint    = "error after the stop";
+        report.data        = std::unexpected(Error{std::format("block '{}' {} after the stop reached it", blockName, what)});
+        publishOnOwnWriter(std::move(report));
     }
 
     void disconnectAllEdges() {
@@ -1236,8 +1271,12 @@ protected:
         on_scope_exit decrementRunningJobs = [this, &nRunningJobs] { releaseWorkerCount(*nRunningJobs); }; // start() counted this worker in before queueing it
 
         // runs out before decrementRunningJobs, so applyPendingExchange() is not seen as on-worker
-        const void*   previousActiveScheduler = std::exchange(activeSchedulerWorker(), static_cast<const void*>(this));
-        on_scope_exit restoreActiveScheduler  = [previousActiveScheduler] { activeSchedulerWorker() = previousActiveScheduler; };
+        const void*       previousActiveScheduler  = std::exchange(activeSchedulerWorker(), static_cast<const void*>(this));
+        const std::size_t previousWorkerGeneration = std::exchange(activeWorkerGeneration(), generation);
+        on_scope_exit     restoreActiveScheduler   = [previousActiveScheduler, previousWorkerGeneration] {
+            activeSchedulerWorker()  = previousActiveScheduler;
+            activeWorkerGeneration() = previousWorkerGeneration;
+        };
 
         // counted under the lock that stop() takes to read the count. A worker that enters after stop() read zero sees
         // the scheduler shutting down and calls no work(). leaveLoop runs before decrementRunningJobs. Every blocking
@@ -1332,7 +1371,7 @@ protected:
                         if (result.status == work::Status::DONE) {
                             break; // nothing happened -> shutdown this worker
                         } else if (result.status == work::Status::ERROR) {
-                            this->emitErrorMessageIfAny("LifecycleState (ERROR)", this->changeStateTo(ERROR));
+                            failRun(runEndingBlock().value_or(""), generation, "returned ERROR");
                             break;
                         }
                         idleIterations = result.performed_work > 0UZ ? 0UZ : idleIterations + 1UZ;
@@ -1484,16 +1523,22 @@ protected:
     }
 
     // The report is a notification, not an error: a parent scheduler turns an error from a child into an exception
-    // when nothing reads its msgOut. The watchdog thread publishes while the workers do. It uses a writer of its own on
-    // the multi-producer ring of msgOut.
+    // when nothing reads its msgOut. The watchdog thread publishes while the workers do.
     void emitStallReport(std::size_t nPeriods, std::size_t periodMs) {
-        auto    writer = this->msgOut.buffer().streamBuffer.new_writer();
         Message message;
-        message.cmd              = message::Command::Notify;
-        message.serviceName      = this->unique_name;
-        message.endpoint         = "watchdog";
-        message.data             = property_map{{"stalled_periods", static_cast<gr::Size_t>(nPeriods)}, {"period_ms", static_cast<gr::Size_t>(periodMs)}};
-        WriterSpanLike auto span = writer.template tryReserve<SpanReleasePolicy::ProcessAll>(1UZ);
+        message.cmd         = message::Command::Notify;
+        message.serviceName = this->unique_name;
+        message.endpoint    = "watchdog";
+        message.data        = property_map{{"stalled_periods", static_cast<gr::Size_t>(nPeriods)}, {"period_ms", static_cast<gr::Size_t>(periodMs)}};
+        publishOnOwnWriter(std::move(message));
+    }
+
+    // publishes one message on msgOut through a writer of its own on the multi-producer ring. The port's own writer
+    // belongs to the caller that holds the message service's flag. A message that finds msgOut full is dropped and
+    // counted.
+    void publishOnOwnWriter(Message message) {
+        auto                writer = this->msgOut.buffer().streamBuffer.new_writer();
+        WriterSpanLike auto span   = writer.template tryReserve<SpanReleasePolicy::ProcessAll>(1UZ);
         if (span.empty()) {
             message::droppedMessageCount().fetch_add(1UZ, std::memory_order_relaxed);
             return;
