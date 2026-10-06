@@ -324,11 +324,13 @@ protected:
     // a worker occupies its pool thread for the scheduler's lifetime, so a job list that never gets one
     // never runs its blocks and back-pressure stalls the whole graph -- claim only the free threads.
     // A worker that runs a reset from a message, and a thread that applies a deferred swap or restart, hold their
-    // thread only until the next run is dispatched. That thread counts as free.
+    // thread only until the next run is dispatched. That thread counts as free. A task the pool has queued and no
+    // thread has taken yet counts as a held thread, whatever its length: a worker of a scheduler that started a moment
+    // earlier holds its thread for the run, and a short task of another component counts the same.
     [[nodiscard]] std::size_t nJobLists(std::size_t nBlocks) const {
         const std::size_t nThreads = static_cast<std::size_t>(_pool->maxThreads());
         const std::size_t nOwn     = isOnOwnWorkerThread() || applyingScheduler() == static_cast<const void*>(this) ? 1UZ : 0UZ;
-        const std::size_t nRunning = _pool->numTasksRunning();
+        const std::size_t nRunning = _pool->numTasksRunning() + _pool->numTasksQueued();
         const std::size_t nBusy    = std::min(nRunning - std::min(nRunning, nOwn), nThreads);
         return std::min(std::max(nThreads - nBusy, 1UZ), nBlocks);
     }
@@ -414,11 +416,11 @@ public:
     [[nodiscard]] std::optional<Error> startError() const { return _startError; }
 
     // a worker holds its pool thread for the run's lifetime, so a start into a pool whose threads are all held
-    // queues that worker behind them for as long as the holders live
+    // queues that worker behind them for as long as the holders live. A queued task counts as held
     [[nodiscard]] std::expected<void, Error> checkWorkerCapacity() const {
         if constexpr (executionPolicy() == ExecutionPolicy::multiThreaded) {
             const std::size_t nThreads = static_cast<std::size_t>(_pool->maxThreads());
-            const std::size_t nBusy    = std::min(_pool->numTasksRunning(), nThreads);
+            const std::size_t nBusy    = std::min(_pool->numTasksRunning() + _pool->numTasksQueued(), nThreads);
             if (nBusy >= nThreads) {
                 return std::unexpected(Error(std::format("thread pool '{}' runs {} of its {} threads and has none free for a worker of '{}'", _pool->name(), nBusy, nThreads, this->unique_name)));
             }
