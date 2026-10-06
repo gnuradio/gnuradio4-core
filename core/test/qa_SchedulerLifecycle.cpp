@@ -311,6 +311,55 @@ inline std::size_t awaitOfferedSourceCallBeyond(std::size_t nCalls) {
     return values.empty() ? 0.0 : values[values.size() / 2UZ];
 }
 
+constexpr std::size_t kEndingSamples = 16UZ;
+
+// Publishes kEndingSamples on its first call and nothing on its second. Its third call publishes kEndingSamples more
+// and returns DONE.
+struct EndingSource : gr::Block<EndingSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(EndingSource, out);
+
+    std::size_t _nCalls = 0UZ;
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        ++_nCalls;
+        if (_nCalls == 2UZ) {
+            outSpan.publish(0UZ);
+            return gr::work::Status::INSUFFICIENT_INPUT_ITEMS;
+        }
+        const std::size_t nPublish = std::min(outSpan.size(), kEndingSamples);
+        for (std::size_t i = 0UZ; i < nPublish; ++i) {
+            outSpan[i] = 1.0f;
+        }
+        outSpan.publish(nPublish);
+        return _nCalls == 1UZ ? gr::work::Status::OK : gr::work::Status::DONE;
+    }
+};
+
+constexpr std::size_t kIdleRecords = 8UZ;
+
+// Publishes nothing. Once `_finished` reads STOPPED, it records the progress sequence at each of its next
+// kIdleRecords calls.
+struct IdleSource : gr::Block<IdleSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(IdleSource, out);
+
+    const CountingSink*      _finished = nullptr;
+    std::vector<std::size_t> _progressSeen;
+    std::atomic<std::size_t> _nRecorded{0UZ};
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        outSpan.publish(0UZ);
+        if (_finished != nullptr && _finished->state() == gr::lifecycle::State::STOPPED && _progressSeen.size() < kIdleRecords) {
+            _progressSeen.push_back(this->progress->value());
+            _nRecorded.store(_progressSeen.size(), std::memory_order_release);
+        }
+        return gr::work::Status::INSUFFICIENT_INPUT_ITEMS;
+    }
+};
+
 struct EndlessSource : gr::Block<EndlessSource> {
     gr::PortOut<float> out;
 
@@ -1945,6 +1994,50 @@ const boost::ut::suite<"the zero-progress park"> zeroProgressParkTests = [] {
         });
         expect(completed) << "the parked worker never re-ran the source";
         expect(eq(sink._nReceived, qa_sched::kSamplesBeforeTerminal));
+    };
+
+    // The sink comes first in the worker's block list, so the source's last call is the only work of its pass. That
+    // call publishes the last samples and returns DONE. With timeout_inactivity_count 0, a pass that leaves the
+    // progress sequence unchanged parks the worker, and the park outlasts the run bound. The run ends in time only if
+    // the DONE call advances the sequence.
+    "a work call that returns DONE moves the progress sequence"_test = [] {
+        gr::Graph flow;
+        auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        auto&     source = flow.emplaceBlock<qa_sched::EndingSource>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        qa_sched::BlockingScheduler scheduler({{"timeout_ms", gr::Size_t(60'000)}, {"timeout_inactivity_count", gr::Size_t(0)}, {"watchdog_timeout", gr::Size_t(60'000)}});
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        expect(qa_sched::runAndWaitWithin(scheduler, qa_sched::kEventBound)) << "the worker parked after the source's DONE call";
+        expect(eq(source._nCalls, 3UZ)) << "the source ended on its third call";
+        expect(eq(sink._nReceived, 2UZ * qa_sched::kEndingSamples)) << "every sample at the sink";
+    };
+
+    // One chain ends while an idle source beside it keeps the worker in its loop. The worker calls the stopped
+    // blocks on every pass, and each such call returns DONE. With nothing published, the progress sequence must
+    // stay where it is from one call of the idle source to the next, or the worker never parks.
+    "a stopped block called again leaves the progress sequence unchanged"_test = [] {
+        gr::Graph flow;
+        auto&     source  = flow.emplaceBlock<qa_sched::EndingSource>();
+        auto&     sink    = flow.emplaceBlock<qa_sched::CountingSink>();
+        auto&     idle    = flow.emplaceBlock<qa_sched::IdleSource>();
+        auto&     idleOut = flow.emplaceBlock<qa_sched::CountingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+        expect(flow.connect<"out", "in">(idle, idleOut).has_value());
+        idle._finished = &sink;
+
+        qa_sched::BlockingScheduler scheduler({{"timeout_ms", gr::Size_t(1)}, {"timeout_inactivity_count", gr::Size_t(0)}, {"watchdog_timeout", gr::Size_t(60'000)}});
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        bool recorded = false;
+        expect(qa_sched::runAndWaitWithin(scheduler, qa_sched::kEventBound, [&] {
+            recorded = qa_sched::awaitCondition([&idle] { return idle._nRecorded.load(std::memory_order_acquire) == qa_sched::kIdleRecords; });
+            scheduler.requestStop();
+        })) << "the run did not end";
+        expect(fatal(recorded)) << "the idle source was not called after the chain beside it stopped";
+        expect(eq(sink._nReceived, 2UZ * qa_sched::kEndingSamples)) << "every sample at the sink";
+        expect(std::ranges::all_of(idle._progressSeen, [&idle](std::size_t value) { return value == idle._progressSeen.front(); })) << std::format("the progress sequence moved between calls of the idle source: {}", idle._progressSeen);
     };
 
     // With timeout_ms 1 a park that nothing ends early lasts one millisecond. The test alternates two
