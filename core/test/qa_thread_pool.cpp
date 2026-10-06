@@ -3,6 +3,10 @@
 #include <gnuradio-4.0/meta/UnitTestHelper.hpp>
 #include <gnuradio-4.0/thread/thread_pool.hpp>
 
+#include <semaphore>
+#include <thread>
+#include <vector>
+
 const boost::ut::suite<"gr::thread_pool GR4 default"> defaultThreadPool = [] {
     using namespace boost::ut;
 
@@ -163,6 +167,90 @@ const boost::ut::suite<"gr::thread_pool GR4 default"> defaultThreadPool = [] {
         expect(ranAfterThrow.load()) << "the worker must keep serving tasks after one threw";
     };
 
+    "ThreadPool: a task submitted to an idle worker never waits for the keep-alive"_test = [] {
+        using namespace gr::thread_pool;
+        using Clock = std::chrono::steady_clock;
+
+        // the pool starts its only worker at the first task, after the keep-alive is set
+        BasicThreadPool pool("IdleWakeUpTest", TaskType::IO_BOUND, 0U, 1U);
+        pool.keepAliveDuration = std::chrono::seconds(1);
+
+        // the delays sweep the moment the idle worker stops spinning and blocks on the condition variable
+        constexpr std::size_t kSubmissions = 50'000UZ;
+        std::binary_semaphore started{0};
+        Clock::duration       longestWait{};
+        bool                  allStarted = true;
+        for (std::size_t i = 0UZ; i < kSubmissions; ++i) {
+            const Clock::time_point submitAfter = Clock::now() + std::chrono::nanoseconds((i * 37UZ) % 20'000UZ);
+            while (Clock::now() < submitAfter) {
+            }
+            const Clock::time_point submitted = Clock::now();
+            pool.execute([&started] { started.release(); });
+            // The wait is bounded. A task that never starts fails the case.
+            if (!started.try_acquire_for(2 * pool.keepAliveDuration)) {
+                allStarted = false;
+                break;
+            }
+            longestWait = std::max(longestWait, Clock::now() - submitted);
+        }
+        const auto longestWaitMs = std::chrono::duration_cast<std::chrono::milliseconds>(longestWait).count();
+        expect(allStarted) << "a task did not start";
+        expect(lt(longestWaitMs, (pool.keepAliveDuration / 2).count())) << "a task waited for the worker's keep-alive timeout";
+    };
+
+    "ThreadPool: tasks submitted at once from several threads each start on a worker of their own"_test = [] {
+        using namespace gr::thread_pool;
+        using Clock = std::chrono::steady_clock;
+
+        // Each task waits until every task of its round has started. A task queued behind a busy worker while the pool
+        // could still add one does not start within the round.
+        constexpr std::size_t kRounds = 500UZ;
+        for (const std::size_t nSubmitters : {4UZ, 8UZ}) {
+            std::size_t firstStuckRound = kRounds;
+            for (std::size_t round = 0UZ; round < kRounds && firstStuckRound == kRounds; ++round) {
+                std::atomic<std::size_t> nStarted{0UZ};
+                std::atomic<bool>        go{false};
+                std::atomic<bool>        stuck{false};
+                BasicThreadPool          pool("ConcurrentSubmitTest", TaskType::IO_BOUND, 1U, static_cast<std::uint32_t>(nSubmitters));
+                pool.waitUntilInitialised();
+                std::vector<std::thread> submitters;
+                for (std::size_t i = 0UZ; i < nSubmitters; ++i) {
+                    submitters.emplace_back([&] {
+                        // setThreadAffinity() applies the mask to its calling thread, and a new thread inherits it.
+                        // Each submitter allows every core again, for itself and for the workers it adds.
+                        thread::setThreadAffinity(std::vector<bool>(std::thread::hardware_concurrency(), true));
+                        // the submitters spin on the flag and reach execute() together
+                        while (!go.load(std::memory_order_acquire)) {
+                        }
+                        pool.execute([&] {
+                            nStarted.fetch_add(1UZ);
+                            const Clock::time_point deadline = Clock::now() + std::chrono::seconds(5);
+                            while (nStarted.load() < nSubmitters) {
+                                if (Clock::now() > deadline) {
+                                    stuck = true;
+                                    break;
+                                }
+                                std::this_thread::yield();
+                            }
+                        });
+                    });
+                }
+                go.store(true, std::memory_order_release);
+                for (std::thread& submitter : submitters) {
+                    submitter.join();
+                }
+                const Clock::time_point deadline = Clock::now() + std::chrono::seconds(10);
+                while (nStarted.load() < nSubmitters && !stuck.load() && Clock::now() < deadline) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                if (stuck.load() || nStarted.load() < nSubmitters) {
+                    firstStuckRound = round;
+                }
+            }
+            expect(eq(firstStuckRound, kRounds)) << std::format("with {} submitters a task did not start in round {}", nSubmitters, firstStuckRound);
+        }
+    };
+
     "ThreadPool: recycled task count increases"_test = [] {
         using namespace gr::thread_pool;
 
@@ -202,6 +290,34 @@ const boost::ut::suite<"gr::thread_pool GR4 default"> defaultThreadPool = [] {
         expect(nothrow([&] { pool.setThreadBounds(3U, 3U); }));
         expect(pool.minThreads() == 3U);
         expect(pool.maxThreads() == 3U);
+    };
+
+    "ThreadPool: a task submitted as the idle worker's keep-alive expires still runs"_test = [] {
+        using namespace gr::thread_pool;
+        using Clock = std::chrono::steady_clock;
+
+        // with no minimum, the pool's only worker leaves at its keep-alive and the next task starts a new one
+        BasicThreadPool pool("KeepAliveExitTest", TaskType::IO_BOUND, 0U, 1U);
+        pool.keepAliveDuration = std::chrono::milliseconds(1);
+
+        // the delays after each task sweep the end of the worker's keep-alive
+        constexpr std::size_t kSubmissions = 2'000UZ;
+        bool                  allStarted   = true;
+        for (std::size_t i = 0UZ; i < kSubmissions; ++i) {
+            auto started = std::make_shared<std::promise<void>>();
+            auto future  = started->get_future();
+            pool.execute([started] { started->set_value(); });
+            if (future.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
+                allStarted = false;
+                break;
+            }
+
+            const Clock::time_point submitAfter = Clock::now() + pool.keepAliveDuration - std::chrono::microseconds(30) + std::chrono::nanoseconds((i * 61UZ) % 120'000UZ);
+            while (Clock::now() < submitAfter) {
+            }
+        }
+        expect(allStarted) << "a task queued as the worker left was never started";
+        expect(eq(pool.numTasksQueued(), 0UZ));
     };
 };
 

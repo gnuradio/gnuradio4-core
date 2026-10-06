@@ -53,7 +53,8 @@ set(_CORE_TESTS
     qa_YamlPmt
     qa_PortableTypeName
     qa_thread_affinity
-    qa_thread_pool)
+    qa_thread_pool
+    qa_thread_pool_limit)
 
 set(_STANDARD_BLOCK_INTEGRATION_TESTS
     qa_DynamicBlock
