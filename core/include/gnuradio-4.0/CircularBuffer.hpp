@@ -836,6 +836,20 @@ public:
     [[nodiscard]] const auto& claim_strategy() { return _sharedBufferPtr->_claimStrategy; }
     [[nodiscard]] const auto& wait_strategy() { return _sharedBufferPtr->_claimStrategy._wait_strategy; }
     [[nodiscard]] const auto& cursor_sequence() { return _sharedBufferPtr->_claimStrategy._publishCursor; }
+
+    // every publish into this ring advances `advanced` and notifies `notified` until the wake is removed (see
+    // MultiProducerStrategy::addWakeSequence())
+    void addWakeSequence(std::shared_ptr<Sequence> advanced, std::shared_ptr<Sequence> notified)
+    requires(producerType == ProducerType::Multi)
+    {
+        _sharedBufferPtr->_claimStrategy.addWakeSequence(std::move(advanced), std::move(notified));
+    }
+
+    void removeWakeSequence(const std::shared_ptr<Sequence>& advanced)
+    requires(producerType == ProducerType::Multi)
+    {
+        _sharedBufferPtr->_claimStrategy.removeWakeSequence(advanced);
+    }
 };
 static_assert(BufferLike<CircularBuffer<int32_t>>);
 

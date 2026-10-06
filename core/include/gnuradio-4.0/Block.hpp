@@ -24,6 +24,7 @@
 #include <gnuradio-4.0/MemoryAllocators.hpp>
 #include <gnuradio-4.0/Port.hpp>
 #include <gnuradio-4.0/Sequence.hpp>
+#include <gnuradio-4.0/SharedState.hpp>
 #include <gnuradio-4.0/Tag.hpp>
 #include <gnuradio-4.0/thread/thread_pool.hpp>
 
@@ -1825,9 +1826,7 @@ public:
             } else {
                 return;
             }
-            // notify scheduler and others that block did some work -> progress
-            progress->incrementAndGet();
-            progress->notify_all();
+            ++detail::handledMessageSpans();
         };
         processPort(msgIn);
         for_each_port(processPort, inputPorts<PortType::MESSAGE>(&self()));

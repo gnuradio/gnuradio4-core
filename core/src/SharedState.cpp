@@ -9,6 +9,20 @@ std::atomic<std::size_t>& droppedMessageCount() noexcept {
 
 } // namespace gr::message
 
+namespace gr::detail {
+
+const Sequence*& publishWakeExempt() noexcept {
+    thread_local const Sequence* exempt = nullptr;
+    return exempt;
+}
+
+std::size_t& handledMessageSpans() noexcept {
+    thread_local std::size_t nHandled = 0UZ;
+    return nHandled;
+}
+
+} // namespace gr::detail
+
 namespace gr::scheduler {
 
 const void*& activeSchedulerWorker() noexcept {
