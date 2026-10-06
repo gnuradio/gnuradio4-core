@@ -1,12 +1,20 @@
 #ifndef GNURADIO_SHARED_STATE_HPP
 #define GNURADIO_SHARED_STATE_HPP
 
+#include <atomic>
 #include <cstddef>
 
 #include <gnuradio-4.0/Export.hpp>
 
 // The values below are defined once, in the library gnuradio-shared-state. Code from every shared object of a program
 // reads and writes the same values. A per-thread value has one copy per thread for the whole program.
+
+namespace gr::message {
+
+// messages dropped because the destination ring was full -- process-global diagnostic counter
+GNURADIO_EXPORT std::atomic<std::size_t>& droppedMessageCount() noexcept;
+
+} // namespace gr::message
 
 namespace gr::scheduler {
 

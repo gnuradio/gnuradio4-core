@@ -981,16 +981,34 @@ void expectErrorWhileRunningEndsRun(gr::lifecycle::State expectedStateAtFailure)
     expect(eq(sink._nStopCalls, 1)) << "the scheduler stops the blocks torn down alongside the failing one";
 }
 
+// sends 64 notifications on its message port for every call that receives samples, which fills an undrained msgOut fast
+struct NotifyingSink : gr::Block<NotifyingSink> {
+    gr::PortIn<float> in;
+
+    GR_MAKE_REFLECTABLE(NotifyingSink, in);
+
+    std::atomic<std::size_t> _nReceived{0UZ};
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& inSpan) {
+        _nReceived.fetch_add(inSpan.size(), std::memory_order_relaxed);
+        for (std::size_t i = 0UZ; i < 64UZ; ++i) {
+            this->emitMessage("tick", {});
+        }
+        return gr::work::Status::OK;
+    }
+};
+
 #ifdef GR_TEST_WITH_BLOCK_LIBRARY
+constexpr std::string_view kLibrarySink      = "test::library_quiet_sink";
 constexpr std::string_view kLibraryScheduler = "test::cross_object_scheduler";
 
-// loads the test's shared object with a scheduler once. The loader keeps an object that registered entries
+// loads the test's shared object of blocks and a scheduler once. The loader keeps an object that registered entries
 // mapped after the loader is gone
 [[nodiscard]] inline bool loadCrossObjectLibrary() {
     static const bool loaded = [] {
         const std::vector<std::string> directories{std::string(TESTS_BINARY_PATH) + "/cross_object_library"};
         gr::PluginLoader               loader(gr::globalBlockRegistry(), gr::globalSchedulerRegistry(), directories);
-        return gr::globalSchedulerRegistry().contains(kLibraryScheduler);
+        return gr::globalBlockRegistry().contains(kLibrarySink) && gr::globalSchedulerRegistry().contains(kLibraryScheduler);
     }();
     return loaded;
 }
@@ -3692,6 +3710,93 @@ const boost::ut::suite<"a child's error drained after the stop"> drainedErrorAft
         expect(second.has_value()) << "the restart after the stop failed";
         expect(eq(sink._nStopCalls, 2)) << "the restarted run did not stop";
     };
+};
+
+const boost::ut::suite<"a message output that nothing drains"> undrainedOutputTests = [] {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    // A reader is connected to msgOut and never consumes. The sink's notifications fill msgOut, and those that do not
+    // fit are dropped. A request to the scheduler and one to the sink arrive while msgOut is full. The run keeps
+    // moving samples, and both replies arrive once the reader drains msgOut.
+    "a reply to a full message output waits for room and the run continues"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::EndlessSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::NotifyingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        qa_sched::TestScheduler scheduler;
+        gr::MsgPortOut          toScheduler;
+        gr::MsgPortIn           fromScheduler;
+        expect(toScheduler.connect(scheduler.msgIn).has_value());
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+
+        const std::size_t capacity = fromScheduler.buffer().streamBuffer.size();
+        expect(qa_sched::awaitCondition([&] { return fromScheduler.streamReader().available() >= capacity; })) << "msgOut never filled";
+        const std::size_t droppedAtFull = gr::message::droppedMessageCount().load();
+        expect(qa_sched::awaitCondition([&] { return gr::message::droppedMessageCount().load() > droppedAtFull; })) << "no notification was dropped from a full msgOut";
+
+        gr::sendMessage<gr::message::Command::Get>(toScheduler, scheduler.unique_name, gr::block::property::kSetting, gr::property_map{}, "scheduler-request");
+        gr::sendMessage<gr::message::Command::Get>(toScheduler, sink.unique_name, gr::block::property::kSetting, gr::property_map{}, "sink-request");
+        expect(qa_sched::awaitCondition([&] { return scheduler.msgIn.streamReader().available() == 0UZ; })) << "the scheduler did not take the requests";
+        const std::size_t samplesAtRequests = sink._nReceived.load();
+        expect(qa_sched::awaitCondition([&] { return sink._nReceived.load() > samplesAtRequests; })) << "the run stopped moving samples after the requests";
+        expect(scheduler.state() == RUNNING) << "the run left RUNNING";
+
+        bool schedulerReplied = false;
+        bool sinkReplied      = false;
+        expect(qa_sched::awaitCondition([&] {
+            auto messages = fromScheduler.streamReader().get();
+            for (const gr::Message& message : messages) {
+                schedulerReplied = schedulerReplied || (message.clientRequestID == "scheduler-request" && message.cmd == gr::message::Command::Final);
+                sinkReplied      = sinkReplied || (message.clientRequestID == "sink-request" && message.cmd == gr::message::Command::Final);
+            }
+            std::ignore = messages.consume(messages.size());
+            return schedulerReplied && sinkReplied;
+        }));
+        expect(schedulerReplied) << "the scheduler's reply never arrived";
+        expect(sinkReplied) << "the sink's reply never arrived";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_sched::awaitState(scheduler, STOPPED)) << "the run did not stop";
+    };
+
+#ifdef GR_TEST_WITH_BLOCK_LIBRARY
+    // The sink comes from a shared object. Its code keeps the replies that find msgOut full and drops those past the
+    // bound. The reader never consumes. The program's droppedMessageCount() counts every drop.
+    "the program counts the replies that a block from a shared object drops"_test = [] {
+        expect(fatal(qa_sched::loadCrossObjectLibrary())) << "the shared object did not load";
+        std::shared_ptr<gr::BlockModel> sink = gr::globalBlockRegistry().create(qa_sched::kLibrarySink, gr::property_map{});
+        expect(fatal(sink != nullptr)) << "the shared object's sink was not created";
+        gr::MsgPortOut toSink;
+        gr::MsgPortIn  fromSink;
+        expect(fatal(toSink.connect(*sink->msgIn).has_value()));
+        expect(fatal(sink->msgOut->connect(fromSink).has_value()));
+
+        // msgOut takes the first replies, the sink keeps up to the bound, and it drops the rest
+        const std::size_t bound     = sink->msgOut->bufferSize();
+        const std::size_t nRequests = 2UZ * fromSink.buffer().streamBuffer.size() + 3UZ;
+        const std::size_t nBefore   = gr::message::droppedMessageCount().load();
+        for (std::size_t nSent = 0UZ; nSent < nRequests;) {
+            const std::size_t nBatch = std::min(nRequests - nSent, toSink.streamWriter().available());
+            expect(fatal(gt(nBatch, 0UZ))) << "the sink's msgIn stayed full";
+            for (std::size_t i = 0UZ; i < nBatch; ++i) {
+                gr::sendMessage<gr::message::Command::Get>(toSink, sink->uniqueName(), gr::block::property::kSetting, gr::property_map{});
+            }
+            nSent += nBatch;
+            sink->processScheduledMessages();
+        }
+        const std::size_t nInMsgOut = fromSink.streamReader().available();
+        const std::size_t nKept     = std::min(nRequests - nInMsgOut, bound);
+        const std::size_t nDropped  = nRequests - nInMsgOut - nKept;
+        std::println("replies of a sink from a shared object: {} requests, {} in msgOut, {} kept, {} dropped, {} counted by the program", nRequests, nInMsgOut, nKept, nDropped, gr::message::droppedMessageCount().load() - nBefore);
+        expect(gt(nDropped, 0UZ)) << "the sink dropped no reply";
+        expect(eq(gr::message::droppedMessageCount().load() - nBefore, nDropped)) << "the program did not count the drops of the shared object's sink";
+    };
+#endif
 };
 
 int main() { /* tests are statically registered */ }

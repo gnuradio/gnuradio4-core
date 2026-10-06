@@ -1,5 +1,14 @@
 #include <gnuradio-4.0/SharedState.hpp>
 
+namespace gr::message {
+
+std::atomic<std::size_t>& droppedMessageCount() noexcept {
+    static std::atomic<std::size_t> nDropped{0UZ};
+    return nDropped;
+}
+
+} // namespace gr::message
+
 namespace gr::scheduler {
 
 const void*& activeSchedulerWorker() noexcept {
