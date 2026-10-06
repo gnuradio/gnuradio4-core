@@ -800,6 +800,58 @@ struct NamedPool {
 
 [[nodiscard]] NamedPool<gr::thread_pool::TaskExecutor> twoThreadPool() { return fixedPool(kOccupiedPoolName, 2U); }
 
+constexpr std::string_view kDeferringPoolName = "qa_deferring_cpu";
+
+// a growable pool whose execute() returns before a thread takes the task. It holds every task until release() hands
+// the held tasks to its threads, and it counts a held task as queued
+struct DeferringPool : gr::thread_pool::TaskExecutor {
+    std::unique_ptr<gr::thread_pool::BasicThreadPool>        _threads;
+    mutable std::mutex                                       _mutex;
+    std::vector<gr::thread_pool::detail::move_only_function> _held;
+    bool                                                     _released = false;
+
+    explicit DeferringPool(std::uint32_t maxThreads) : _threads(std::make_unique<gr::thread_pool::BasicThreadPool>(kDeferringPoolName, gr::thread_pool::TaskType::CPU_BOUND, 1U, maxThreads)) {}
+
+    void execute(gr::thread_pool::detail::move_only_function&& task) override {
+        std::unique_lock lock(_mutex);
+        if (!_released) {
+            _held.push_back(std::move(task));
+            return;
+        }
+        lock.unlock();
+        _threads->execute(std::move(task));
+    }
+
+    void release() {
+        std::vector<gr::thread_pool::detail::move_only_function> held;
+        {
+            std::lock_guard lock(_mutex);
+            _released = true;
+            held.swap(_held);
+        }
+        for (auto& task : held) {
+            _threads->execute(std::move(task));
+        }
+    }
+
+    [[nodiscard]] gr::thread_pool::TaskType type() const noexcept override { return _threads->poolType(); }
+    [[nodiscard]] std::string_view          name() const noexcept override { return _threads->poolName(); }
+    [[nodiscard]] std::string_view          device() const noexcept override { return "CPU"; }
+    [[nodiscard]] std::size_t               numThreads() const override { return _threads->numThreads(); }
+    [[nodiscard]] std::size_t               numTasksQueued() const override {
+        std::lock_guard lock(_mutex);
+        return _held.size() + _threads->numTasksQueued();
+    }
+    [[nodiscard]] std::size_t                   numTasksRunning() const override { return _threads->numTasksRunning(); }
+    [[nodiscard]] std::size_t                   numTasksRecycled() const override { return _threads->numTasksRecycled(); }
+    void                                        setThreadBounds(std::uint32_t min, std::uint32_t max) override { _threads->setThreadBounds(min, max); }
+    [[nodiscard]] std::pair<uint32_t, uint32_t> threadBounds() const override { return {_threads->minThreads(), _threads->maxThreads()}; }
+    [[nodiscard]] std::uint32_t                 minThreads() const override { return _threads->minThreads(); }
+    [[nodiscard]] std::uint32_t                 maxThreads() const override { return _threads->maxThreads(); }
+    void                                        requestShutdown() override { _threads->requestShutdown(); }
+    [[nodiscard]] bool                          isShutdown() const override { return _threads->isShutdown(); }
+};
+
 void startAndPause(TestScheduler& scheduler) {
     using namespace boost::ut;
     using enum gr::lifecycle::State;
@@ -1666,6 +1718,45 @@ const boost::ut::suite<"job lists sized to the free pool threads"> jobListSizing
 
         expect(qa_sched::runAndWaitWithin(scheduler, std::chrono::seconds(5))) << "a job list that got no pool thread stranded its blocks";
         expect(ge(sink._nReceived, qa_sched::kSamplesBeforeTerminal)) << "the sink must run for the stream to end";
+    };
+
+    // the first scheduler's workers are queued and no thread has taken them when the second scheduler builds its job
+    // lists. The second claims only the threads the first one's workers leave
+    "a second scheduler started at once on a growable pool builds no more job lists than the free threads"_test = [] {
+        using enum gr::lifecycle::State;
+        constexpr std::uint32_t kThreads = 4U;
+
+        qa_sched::NamedPool pool(qa_sched::kDeferringPoolName, std::make_shared<qa_sched::DeferringPool>(kThreads));
+
+        auto endlessChains = [](std::size_t nChains) {
+            gr::Graph flow;
+            for (std::size_t i = 0UZ; i < nChains; ++i) {
+                auto& source = flow.emplaceBlock<qa_sched::EndlessSource>();
+                auto& sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+                expect(flow.connect<"out", "in">(source, sink).has_value());
+            }
+            return flow;
+        };
+
+        qa_sched::TestScheduler first({{"poolName", std::string(qa_sched::kDeferringPoolName)}});
+        qa_sched::TestScheduler second({{"poolName", std::string(qa_sched::kDeferringPoolName)}});
+        expect(first.exchange(endlessChains(1UZ)).has_value());
+        expect(second.exchange(endlessChains(2UZ)).has_value());
+
+        expect(first.changeStateTo(INITIALISED).has_value());
+        expect(first.changeStateTo(RUNNING).has_value());
+        const std::size_t nFirstJobLists = first.jobs()->size();
+        expect(eq(pool->numTasksQueued(), nFirstJobLists)) << "the first scheduler's workers must still be queued";
+
+        expect(second.changeStateTo(INITIALISED).has_value());
+        expect(le(second.jobs()->size(), std::size_t(kThreads) - nFirstJobLists)) << std::format("the second scheduler built {} job lists while {} of {} threads were claimed", second.jobs()->size(), nFirstJobLists, kThreads);
+        expect(second.changeStateTo(RUNNING).has_value());
+
+        pool->release();
+        expect(qa_sched::awaitCondition([&] { return first.workerStarted() && second.workerStarted(); })) << "the workers did not start";
+        expect(first.changeStateTo(REQUESTED_STOP).has_value());
+        expect(second.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_sched::awaitCondition([&] { return !first.isProcessing() && !second.isProcessing(); })) << "the workers did not leave";
     };
 
     // start() counts a worker generation before queueing it, so a stop that publishes STOPPED can
