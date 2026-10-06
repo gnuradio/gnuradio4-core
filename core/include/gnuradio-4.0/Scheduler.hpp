@@ -122,10 +122,8 @@ private:
 protected:
     using ProfileHandle = decltype(std::declval<TProfiler&>().forThisThread());
 
-    bool                          _valid{true};
     std::size_t                   _nWatchdogsRunning{0};
-    std::size_t                   _watchdogGeneration{0UZ}; // a watchdog runs only while it matches this
-    std::size_t                   _workerGeneration{0UZ};   // a queued worker runs only while it matches this
+    gr::Sequence                  _watchdogGeneration{}; // a watchdog runs only while it matches this. An advance wakes it.
     meta::indirect<gr::Graph>     _graph{};
     TProfiler                     _profiler{};
     ProfileHandle                 _profilerHandler{_profiler.forThisThread()};
@@ -140,18 +138,30 @@ protected:
     std::mutex                               _zombieBlocksMutex;
     std::vector<std::shared_ptr<BlockModel>> _zombieBlocks;
 
+    // the stage of the latest run. awaiting: no run has begun since construction or since the scheduler was last
+    // initialized. starting: RUNNING is published and start() has not returned. started: start() has returned, or an
+    // awaited run ended without a start.
+    enum class RunPhase { awaiting, starting, started };
+
+    // The run record. Every field is written under _runMutex. A worker reads the generation without the lock.
+    struct RunRecord {
+        std::size_t                generation{0UZ}; // advanced by start(), by stop(), and by a stop request that the state already satisfies
+        RunPhase                   phase{RunPhase::awaiting};
+        bool                       destroying{false}; // set by the destructor. A start that reads it set runs nothing.
+        std::optional<std::size_t> restoredFrom;      // the generation of the scheduler's own stop that restoreRun() last restarted from
+    };
+
     struct PendingExchange {
         meta::indirect<gr::Graph> graph;
         profiling::Options        option;
         bool                      restart{false};
-        std::size_t               stopGeneration{0UZ}; // a later stop request cancels the restart
+        std::size_t               generation{0UZ}; // the generation the swap's own stop advanced to
     };
-    std::mutex                     _pendingExchangeMutex;
+    std::mutex                     _runMutex; // guards _run, _pendingExchange and the claim of a pending swap
+    RunRecord                      _run;
     std::optional<PendingExchange> _pendingExchange;
     std::size_t                    _nDeferredExchanges{0UZ}; // claimed swaps still running outside the job count
-    std::size_t                    _nStopRequests{0UZ};
-    bool                           _pendingStopRequest{false}; // a requested stop that no run loop has consumed yet
-    std::optional<Error>           _startError;                // written by failStart(), cleared when a start begins
+    std::optional<Error>           _startError;              // written by failStart(), cleared when a start begins
 
     // for blocks that were added while scheduler was running. They need to be adopted by a thread
     std::mutex _adoptionBlocksMutex;
@@ -178,8 +188,89 @@ protected:
     // a watchdog only leaves on its own once the run's jobs are gone, which a restart inside its check
     // interval undoes, so every start retires the previous generation explicitly
     void stopWatchdogs() {
-        gr::atomic_ref(_watchdogGeneration).fetch_add(1UZ);
-        gr::atomic_ref(_watchdogGeneration).notify_all();
+        _watchdogGeneration.incrementAndGet();
+        _watchdogGeneration.notify_all();
+    }
+
+    // retires the watchdogs and waits until each has returned. A watchdog wakes at once on its retirement.
+    void retireWatchdogs() {
+        stopWatchdogs();
+        for (std::size_t n = gr::atomic_ref(_nWatchdogsRunning).load_acquire(); n != 0UZ; n = gr::atomic_ref(_nWatchdogsRunning).load_acquire()) {
+            gr::atomic_ref(_nWatchdogsRunning).wait(n);
+        }
+    }
+
+    [[nodiscard]] std::size_t runGeneration() {
+        std::lock_guard guard(_runMutex);
+        return _run.generation;
+    }
+
+    void advanceRunGeneration() {
+        std::lock_guard guard(_runMutex);
+        gr::atomic_ref(_run.generation).fetch_add(1UZ);
+    }
+
+    // a run that was awaited and ended without one: the next runAndWait() runs the graph
+    void endAwaitedRun() {
+        std::lock_guard guard(_runMutex);
+        if (_run.phase == RunPhase::awaiting) {
+            _run.phase = RunPhase::started;
+        }
+    }
+
+    // The run executes on the caller's thread inside start(). The scheduler refuses a swap from another thread from the
+    // moment the state reads RUNNING until start() returns. The job count rises only partway through start(). After
+    // start() has returned, the swap proceeds.
+    [[nodiscard]] std::expected<void, Error> swapAllowedFromThisThread() {
+        if constexpr (executionPolicy() == ExecutionPolicy::singleThreaded || executionPolicy() == ExecutionPolicy::singleThreadedBlocking) {
+            const auto state = this->state();
+            if (!isOnOwnWorkerThread() && lifecycle::isActive(state)) {
+                std::lock_guard guard(_runMutex);
+                if (_run.phase != RunPhase::started) {
+                    return std::unexpected(Error(std::format("exchange(): the single-threaded scheduler '{}' is {} on another thread; stop it before exchanging its graph", this->unique_name, gr::meta::enumName(state).value_or(""))));
+                }
+            }
+        }
+        return {};
+    }
+
+    // Restarts a run that this scheduler stopped on its own, for a graph swap. ownStopGeneration is the generation that
+    // the swap's own stop advanced to. The scheduler leaves STOPPED first and reads the generation after that. An
+    // unchanged generation restores RUNNING and the pause the run had. A changed one means a start or a stop came
+    // since. The scheduler then requests a stop in place of RUNNING. A stop request that the state satisfied before the
+    // read has advanced the generation. One that finds the state already left STOPPED requests its own stop.
+    std::expected<void, Error> restoreRun(std::size_t ownStopGeneration, lifecycle::State runState) {
+        using enum lifecycle::State;
+        {
+            std::lock_guard guard(_runMutex);
+            _run.restoredFrom = ownStopGeneration;
+        }
+        if (auto result = this->changeStateTo(INITIALISED); !result) {
+            return std::unexpected(result.error());
+        }
+        if (runGeneration() != ownStopGeneration) {
+            this->emitErrorMessageIfAny("restoreRun() -> REQUESTED_STOP", this->changeStateTo(REQUESTED_STOP));
+            endAwaitedRun();
+            return {};
+        }
+        if (auto result = this->changeStateTo(RUNNING); !result) {
+            if (lifecycle::isShuttingDown(this->state())) { // a stop claimed the transition first
+                endAwaitedRun();
+                return {};
+            }
+            return std::unexpected(result.error());
+        }
+        if (runState == REQUESTED_PAUSE || runState == PAUSED) {
+            if (auto result = this->changeStateTo(REQUESTED_PAUSE); !result) {
+                return std::unexpected(result.error());
+            }
+        }
+        if (runState == PAUSED) {
+            if (auto result = this->changeStateTo(PAUSED); !result) {
+                return std::unexpected(result.error());
+            }
+        }
+        return {};
     }
 
     // a worker occupies its pool thread for the scheduler's lifetime, so a job list that never gets one
@@ -305,35 +396,69 @@ public:
     }
 
     ~SchedulerBase() {
-        gr::atomic_ref(_valid).store_release(false); // mark as invalid: also stops a deferred swap from restarting the scheduler
-        stopWatchdogs();
-        { // a deferred graph swap must not restart a scheduler that is being destroyed
-            std::lock_guard guard(_pendingExchangeMutex);
+        {
+            // start() reads the flag under this lock. A start that read it unset has published RUNNING already, and
+            // the loop below stops that run. A pending swap is dropped and does not restart the scheduler.
+            std::lock_guard guard(_runMutex);
+            gr::atomic_ref(_run.destroying).store_release(true);
             _pendingExchange.reset();
         }
 
-        if (lifecycle::isActive(this->state())) { // RUNNING, REQUESTED_PAUSE or PAUSED -- workers are parked, not gone
-            if (auto e = this->changeStateTo(lifecycle::REQUESTED_STOP); !e) {
-                std::println(std::cerr, "Failed to stop execution at destruction of scheduler: {} ({})", e.error().message, e.error().srcLoc());
-                std::abort();
+        // A swap claimed before the flag was set runs outside the job count. It can restart the run after a pass has
+        // read the state, and that restart spawns a watchdog. Each pass stops an active run, waits for the workers and
+        // the claimed swaps, then retires the watchdogs and waits for them. The watchdog dereferences SchedulerBase.
+        // The passes repeat until no run, worker, swap or watchdog remains.
+        auto nDeferred  = [this] { return gr::atomic_ref(_nDeferredExchanges).load_acquire(); };
+        auto nWatchdogs = [this] { return gr::atomic_ref(_nWatchdogsRunning).load_acquire(); };
+        do {
+            if (lifecycle::isActive(this->state())) { // RUNNING, REQUESTED_PAUSE or PAUSED -- workers are parked, not gone
+                if (auto e = this->changeStateTo(lifecycle::REQUESTED_STOP); !e) {
+                    std::println(std::cerr, "Failed to stop execution at destruction of scheduler: {} ({})", e.error().message, e.error().srcLoc());
+                    std::abort();
+                }
             }
-        }
-        waitDone();
-
-        // a swap claimed before _valid was cleared runs outside the job count, so wait for it separately
-        for (std::size_t nDeferred = gr::atomic_ref(_nDeferredExchanges).load_acquire(); nDeferred != 0UZ; nDeferred = gr::atomic_ref(_nDeferredExchanges).load_acquire()) {
-            gr::atomic_ref(_nDeferredExchanges).wait(nDeferred);
-        }
-
-        // the watchdog dereferences SchedulerBase, wait until it finishes
-        for (std::size_t nWatchdogs = gr::atomic_ref(_nWatchdogsRunning).load_acquire(); nWatchdogs != 0UZ; nWatchdogs = gr::atomic_ref(_nWatchdogsRunning).load_acquire()) {
-            gr::atomic_ref(_nWatchdogsRunning).wait(nWatchdogs);
-        }
+            waitDone();
+            for (std::size_t n = nDeferred(); n != 0UZ; n = nDeferred()) {
+                gr::atomic_ref(_nDeferredExchanges).wait(n);
+            }
+            retireWatchdogs();
+        } while (lifecycle::isActive(this->state()) || _nRunningJobs->value() != 0UZ || nDeferred() != 0UZ || nWatchdogs() != 0UZ);
 
         _executionOrder.reset(); // force earlier crashes if this is accessed after destruction (e.g. from thread that was kept running)
     }
 
     [[nodiscard]] bool isOnOwnWorkerThread() const noexcept { return tActiveSchedulerWorker == static_cast<const void*>(this); }
+
+    // A stop requested while the scheduler is stopping or stopped changes no state. satisfiedBy is the state that the
+    // request read. While the state still satisfies a stop, the request advances the run generation. A swap that
+    // restarts the run reads the generation once it has left STOPPED. The state can leave STOPPED between the
+    // request's read and this call. A restart by restoreRun() that saw no start or stop since its own stop, other than
+    // the start it runs itself, belongs to the swap: the request advances the generation and stops the run that the
+    // swap restores. Any other start or reset in that interval follows the stop, and the request changes nothing.
+    void transitionSatisfied(lifecycle::State requested, lifecycle::State satisfiedBy) {
+        using enum lifecycle::State;
+        if (requested != REQUESTED_STOP) {
+            return;
+        }
+        const bool stopRestoredRun = [this, satisfiedBy] {
+            std::lock_guard        guard(_runMutex);
+            const lifecycle::State current = this->state();
+            if (current == satisfiedBy || lifecycle::isShuttingDown(current)) {
+                gr::atomic_ref(_run.generation).fetch_add(1UZ);
+                return false;
+            }
+            const std::size_t generation = _run.generation;
+            // restoreRun()'s own start advances the generation once
+            const bool restoring = _run.restoredFrom.has_value() && (generation == *_run.restoredFrom || generation == *_run.restoredFrom + 1UZ);
+            if (restoring) {
+                gr::atomic_ref(_run.generation).fetch_add(1UZ);
+            }
+            return restoring;
+        }();
+        if (stopRestoredRun) {
+            this->emitErrorMessageIfAny("transitionSatisfied() -> REQUESTED_STOP", this->changeStateTo(REQUESTED_STOP));
+        }
+    }
 
     [[nodiscard]] std::expected<meta::indirect<Graph>, Error> exchange(meta::indirect<Graph>&& newGraph, const profiling::Options& option = {}) {
         using enum lifecycle::State;
@@ -345,21 +470,28 @@ public:
             // The stop is requested before the record is published so that the record carries its restart from the
             // moment it is visible: a worker leaving in between would otherwise claim one that still reads as a
             // plain swap, and the scheduler would never start again.
-            const bool restart = lifecycle::isActive(oldState);
+            const bool  restart       = lifecycle::isActive(oldState);
+            std::size_t ownGeneration = 0UZ;
             if (restart) {
+                ownGeneration = runGeneration() + 1UZ; // the stop below advances the generation once
                 if (auto result = this->changeStateTo(REQUESTED_STOP); !result) {
                     return std::unexpected(result.error());
                 }
             }
             {
-                std::lock_guard guard(_pendingExchangeMutex);
-                // the generation is this stop's own; a later one cancels the restart
-                _pendingExchange = PendingExchange{std::move(newGraph), option, restart, gr::atomic_ref(_nStopRequests).load_acquire()};
+                std::lock_guard guard(_runMutex);
+                _pendingExchange = PendingExchange{std::move(newGraph), option, restart, ownGeneration};
             }
             return meta::indirect<Graph>{};
         }
 
-        if (lifecycle::isActive(oldState)) { // need to stop running scheduler
+        if (auto allowed = swapAllowedFromThisThread(); !allowed) {
+            return std::unexpected(allowed.error());
+        }
+
+        std::size_t ownGeneration = 0UZ;
+        if (lifecycle::isActive(oldState)) {       // need to stop running scheduler
+            ownGeneration = runGeneration() + 1UZ; // the stop below advances the generation once
             if (auto result = this->changeStateTo(REQUESTED_STOP); !result) {
                 return std::unexpected(result.error());
             }
@@ -374,8 +506,8 @@ public:
             reset(); // reset internal states
         }
 
+        retireWatchdogs(); // the watchdog reads _graph
         auto oldGraph = std::exchange(_graph, std::move(newGraph));
-        stopWatchdogs(); // the retired graph's watchdog must not observe the new one's progress
 
         if ((option != profiling::Options{})) { // need to update profiler
             rebuildProfiler(option);
@@ -390,26 +522,9 @@ public:
             }
         }
 
-        // restore the original lifecycle state
         if (lifecycle::isActive(oldState)) {
-            if (auto result = this->changeStateTo(INITIALISED); !result) { // Need to go to INITIALISED first
+            if (auto result = restoreRun(ownGeneration, oldState); !result) {
                 return std::unexpected(result.error());
-            }
-            if (auto result = this->changeStateTo(RUNNING); !result) {
-                return std::unexpected(result.error());
-            }
-
-            if (oldState == REQUESTED_PAUSE) {
-                if (auto result = this->changeStateTo(REQUESTED_PAUSE); !result) {
-                    return std::unexpected(result.error());
-                }
-            } else if (oldState == PAUSED) {
-                if (auto result = this->changeStateTo(REQUESTED_PAUSE); !result) {
-                    return std::unexpected(result.error());
-                }
-                if (auto result = this->changeStateTo(PAUSED); !result) {
-                    return std::unexpected(result.error());
-                }
             }
         }
         return oldGraph;
@@ -442,8 +557,9 @@ public:
     }
 
     void stateChanged(lifecycle::State newState) {
-        if (newState == lifecycle::State::REQUESTED_STOP) { // set with the claim, before stop() collapses the state to STOPPED
-            gr::atomic_ref(_pendingStopRequest).store_release(true);
+        if (newState == lifecycle::State::INITIALISED || newState == lifecycle::State::RUNNING) {
+            std::lock_guard guard(_runMutex);
+            _run.phase = newState == lifecycle::State::INITIALISED ? RunPhase::awaiting : RunPhase::starting;
         }
         this->notifyListeners(block::property::kLifeCycleState, {{"state", std::string(gr::meta::enumName(newState).value_or(""))}});
     }
@@ -573,9 +689,10 @@ public:
         using enum lifecycle::State;
         [[maybe_unused]] const auto pe = this->_profilerHandler->startCompleteEvent("scheduler_base.runAndWait");
 
-        // a stop requested before RUNNING is claimed has no run loop to observe it, and the reinitialization
-        // below erases the STOPPED it produced: honor the latch instead, and consume it on the way out
-        on_scope_exit consumeStopRequest = [this] { gr::atomic_ref(_pendingStopRequest).store_release(false); };
+        // a stop that arrives while no run has begun belongs to the run this call would start. No run loop observes
+        // it, and the reinitialization below would erase the STOPPED it produced. This call honors it in place of the
+        // run and counts as that run on the way out
+        on_scope_exit endAwaited = [this] { endAwaitedRun(); };
 
         auto settleStopped = [this]() -> std::expected<void, Error> {
             if (this->state() == RUNNING) {
@@ -594,7 +711,11 @@ public:
         };
 
         processScheduledMessages(); // make sure initial subscriptions are processed
-        if (gr::atomic_ref(_pendingStopRequest).load_acquire()) {
+        const bool runAwaited = [this] {
+            std::lock_guard guard(_runMutex);
+            return _run.phase == RunPhase::awaiting;
+        }();
+        if (lifecycle::isShuttingDown(this->state()) && runAwaited) {
             return settleStopped();
         }
         if (this->state() == STOPPED || this->state() == ERROR) {
@@ -805,21 +926,40 @@ protected:
 
     void start() {
         using enum gr::lifecycle::State;
+        on_scope_exit markStarted = [this] {
+            std::lock_guard guard(_runMutex);
+            if (_run.phase == RunPhase::starting) {
+                _run.phase = RunPhase::started;
+            }
+        };
+
+        // A start that reads the destructor's flag requests a stop and returns before it counts or dispatches a
+        // worker. The destructor sets the flag under the same lock and then reads the state.
+        std::optional<std::size_t> workerGeneration;
+        {
+            std::lock_guard guard(_runMutex);
+            if (!_run.destroying) {
+                workerGeneration = gr::atomic_ref(_run.generation).fetch_add(1UZ) + 1UZ;
+            }
+        }
+        if (!workerGeneration.has_value()) {
+            this->emitErrorMessageIfAny("start() -> REQUESTED_STOP", this->changeStateTo(REQUESTED_STOP));
+            return;
+        }
 
         // stop() publishes STOPPED and retires the run's workers by generation, without waiting for
         // them. A worker the pool counted but has not started releases its count when the pool reaches
         // it, and a worker in its loop leaves at its next check. This run begins only once every count
         // of the previous run is released. A worker that started after this point would run the
         // previous job list, whose blocks are stopped. It would make no progress, reach no terminal
-        // state, and hold _nRunningJobs above zero indefinitely. The generation advances here as well,
-        // for a run that ended other than through stop().
+        // state, and hold _nRunningJobs above zero indefinitely. The advance of the generation above also
+        // retires a run that ended other than through stop().
         //
         // The drain must happen before _executionOrderMutex is acquired: a queued worker acquires
         // that mutex to copy its job list before it can decrement _nRunningJobs, so waiting for it
         // while holding the mutex deadlocks the restart. A recursive mutex does not help, because
         // the two are different threads. Draining first also keeps the graph from being rewired and
         // keeps children and the watchdog from starting while the previous run unwinds.
-        const std::size_t workerGeneration = gr::atomic_ref(_workerGeneration).fetch_add(1UZ) + 1UZ;
         waitDone();
         gr::atomic_ref(_nWorkersStarted).store_release(0UZ);
         _startError.reset();
@@ -897,42 +1037,42 @@ protected:
             return;
         }
 
-        // start watchdog
-        auto ioThreadPool = gr::thread_pool::Manager::defaultIoPool();
+        assert(_executionOrder != nullptr && !_executionOrder->empty());
+        constexpr bool    singleThreaded = executionPolicy() == ExecutionPolicy::singleThreaded || executionPolicy() == ExecutionPolicy::singleThreadedBlocking;
+        auto              jobListsCopy   = _executionOrder;
+        const std::size_t nWorkers       = singleThreaded ? 1UZ : jobListsCopy->size();
+        auto              ioThreadPool   = gr::thread_pool::Manager::defaultIoPool();
 
         stopWatchdogs();
-        const std::size_t generation = gr::atomic_ref(_watchdogGeneration).load_acquire();
+        const std::size_t generation = _watchdogGeneration.value();
+
+        // the whole generation is counted before the watchdog starts and before any worker is queued. waitDone() then
+        // also covers the workers the pool has not started yet, and the watchdog finds the run's jobs counted
+        std::ignore = _nRunningJobs->addAndGet(nWorkers);
+        _nRunningJobs->notify_all();
 
         // keep outside of the lambda, as ~SchedulerBase() might finish before watchdog even starts
         gr::atomic_ref(_nWatchdogsRunning).fetch_add(1UZ);
 
         try {
             ioThreadPool->execute([this, generation] { this->runWatchDog(watchdog_timeout.value, timeout_inactivity_count.value, generation); });
-        } catch (...) { // a rejected task would strand the count and spin ~SchedulerBase() forever
+        } catch (...) { // a rejected task would strand both counts and spin waitDone() and ~SchedulerBase() forever
             gr::atomic_ref(_nWatchdogsRunning).fetch_sub(1UZ);
             gr::atomic_ref(_nWatchdogsRunning).notify_all();
+            std::ignore = _nRunningJobs->subAndGet(nWorkers);
+            _nRunningJobs->notify_all();
             throw;
         }
 
-        assert(_executionOrder != nullptr && !_executionOrder->empty());
-        if constexpr (executionPolicy() == ExecutionPolicy::singleThreaded || executionPolicy() == ExecutionPolicy::singleThreadedBlocking) {
-            _nRunningJobs->incrementAndGet();
-            _nRunningJobs->notify_all();
+        if constexpr (singleThreaded) {
             gr::atomic_ref(_nWorkersStarted).fetch_add(1UZ);
-            dispatchWorker(0UZ, _executionOrder, workerGeneration);
+            dispatchWorker(0UZ, std::move(jobListsCopy), *workerGeneration);
         } else { // run on processing thread pool
-            [[maybe_unused]] const auto pe           = _profilerHandler->startCompleteEvent("scheduler_base.runOnPool");
-            auto                        jobListsCopy = _executionOrder;
-            const std::size_t           nWorkers     = jobListsCopy->size();
-
-            // the whole generation is counted before any of it is queued, so waitDone() also covers the
-            // workers the pool has not started yet
-            std::ignore = _nRunningJobs->addAndGet(nWorkers);
-            _nRunningJobs->notify_all();
+            [[maybe_unused]] const auto pe = _profilerHandler->startCompleteEvent("scheduler_base.runOnPool");
             for (std::size_t runnerID = 0UZ; runnerID < nWorkers; runnerID++) {
                 try {
-                    _pool->execute([this, runnerID, jobListsCopy, workerGeneration]() {
-                        if (gr::atomic_ref(_workerGeneration).load_acquire() != workerGeneration) { // a restart occurred before the pool reached this task
+                    _pool->execute([this, runnerID, jobListsCopy, workerGeneration = *workerGeneration]() {
+                        if (gr::atomic_ref(_run.generation).load_acquire() != workerGeneration) { // a restart occurred before the pool reached this task
                             releaseWorkerCount(*_nRunningJobs);
                             return;
                         }
@@ -967,7 +1107,7 @@ protected:
     void releaseWorkerCount(gr::Sequence& nRunningJobs) {
         std::optional<PendingExchange> claimed;
         {
-            std::lock_guard guard(_pendingExchangeMutex);
+            std::lock_guard guard(_runMutex);
             if (_pendingExchange.has_value()) {
                 claimed = std::move(_pendingExchange);
                 _pendingExchange.reset();
@@ -1054,7 +1194,7 @@ protected:
                 std::ranges::for_each(localBlockList, &BlockModel::processScheduledMessages);
                 const auto previousState = activeState;
                 activeState              = this->state();
-                if (gr::atomic_ref(_workerGeneration).load_acquire() != generation) {
+                if (gr::atomic_ref(_run.generation).load_acquire() != generation) {
                     break; // the run was stopped, and a worker that saw no state since must not work the next run's blocks
                 }
                 if (hasPendingMessages || activeState != previousState) {
@@ -1117,7 +1257,7 @@ protected:
                     msgToCount = 0UZ;
                 }
             }
-        } while (lifecycle::isActive(activeState) && gr::atomic_ref(_workerGeneration).load_acquire() == generation);
+        } while (lifecycle::isActive(activeState) && gr::atomic_ref(_run.generation).load_acquire() == generation);
     }
 
     // performs a graph swap that exchange() had to defer because it was requested from a scheduler worker
@@ -1125,8 +1265,11 @@ protected:
         using enum lifecycle::State;
 
         waitDone(); // the claiming worker has already released its own count
-        if (!gr::atomic_ref(_valid).load_acquire()) {
-            return; // destruction started: do not touch the graph
+        {
+            std::lock_guard guard(_runMutex);
+            if (_run.destroying) {
+                return; // destruction started: do not touch the graph
+            }
         }
 
         if (this->state() == REQUESTED_STOP) {
@@ -1136,9 +1279,8 @@ protected:
             this->emitErrorMessage("applyPendingExchange()", result.error());
             return;
         }
-        if (pending.restart && gr::atomic_ref(_nStopRequests).load_acquire() == pending.stopGeneration) {
-            this->emitErrorMessageIfAny("applyPendingExchange() -> INITIALISED", this->changeStateTo(INITIALISED));
-            this->emitErrorMessageIfAny("applyPendingExchange() -> RUNNING", this->changeStateTo(RUNNING));
+        if (pending.restart) {
+            this->emitErrorMessageIfAny("applyPendingExchange() -> RUNNING", restoreRun(pending.generation, RUNNING));
         }
     }
 
@@ -1163,38 +1305,17 @@ protected:
         auto thisName = gr::meta::shorten_type_name(this->unique_name);
         gr::thread_pool::thread::setThreadName(std::format("WatchDog-{}", thisName));
 
-        auto isCurrent = [this, generation] { return gr::atomic_ref(_valid).load_acquire() && gr::atomic_ref(_watchdogGeneration).load_acquire() == generation; };
-
-        // the startup wait has no deadline: start() may spend arbitrarily long in waitDone() before
-        // the run's jobs register, and a watchdog that gives up then leaves the run without one
-        const auto checkInterval = std::chrono::milliseconds(std::max(timeout_ms / 10UZ, 1UZ));
-        while (isCurrent() && _nRunningJobs->value() == 0UZ && lifecycle::isActive(this->state())) {
-            std::this_thread::sleep_for(checkInterval);
-        }
-
-        if (!isCurrent() || _nRunningJobs->value() == 0UZ || !lifecycle::isActive(this->state())) {
+        // start() counts the run's jobs before it spawns the watchdog. A count of zero means the run has ended.
+        if (_watchdogGeneration.value() != generation || _nRunningJobs->value() == 0UZ || !lifecycle::isActive(this->state())) {
             return; // abort watchdog: retired, scheduler inactive, or jobs already finished.
         }
-
-        // chunked with a capped interval so a retired generation is observed within 100 ms however
-        // long the watchdog period is; a destructor waits on exactly this observation
-        auto sleepWhileCurrent = [&isCurrent](std::chrono::milliseconds total) {
-            const auto chunk    = std::clamp(total / 10, std::chrono::milliseconds(1), std::chrono::milliseconds(100));
-            const auto wakeUpAt = std::chrono::steady_clock::now() + total;
-            while (std::chrono::steady_clock::now() < wakeUpAt) {
-                if (!isCurrent()) {
-                    return false;
-                }
-                std::this_thread::sleep_for(chunk);
-            }
-            return isCurrent();
-        };
 
         std::size_t lastProgress  = _graph->_progress->value();
         std::size_t nWarnings     = 0;
         bool        stallReported = false; // one report per stall; progress or a state other than RUNNING re-arms it
         do {
-            if (!sleepWhileCurrent(std::chrono::milliseconds(timeOut_ms))) {
+            // the wait ends early only when the watchdog is retired
+            if (_watchdogGeneration.waitUntil(generation, std::chrono::steady_clock::now() + std::chrono::milliseconds(timeOut_ms))) {
                 return;
             }
             // check and increase progress if there hasn't been none.
@@ -1215,7 +1336,7 @@ protected:
                 nWarnings     = 0UZ;
                 stallReported = false;
             }
-        } while (isCurrent() && _nRunningJobs->value() > 0UZ);
+        } while (_nRunningJobs->value() > 0UZ);
     }
 
     // The report is a notification, not an error: a parent scheduler turns an error from a child into an exception
@@ -1257,10 +1378,9 @@ protected:
 
     void stop() {
         using enum lifecycle::State;
-        gr::atomic_ref(_nStopRequests).fetch_add(1UZ);
         // retires the run's workers. A queued worker releases its count without running. A worker in its loop leaves
         // at its next check, even one that misses the stop because the next start() has already set RUNNING.
-        gr::atomic_ref(_workerGeneration).fetch_add(1UZ);
+        advanceRunGeneration();
         wakeProgressWaiters();
         {
             std::lock_guard childLock(_childLifecycleMutex); // serialized against start()'s sweep
@@ -1833,6 +1953,10 @@ protected:
                 try {
                     auto newGraph = gr::loadGrc(pluginLoader, yamlContent);
 
+                    if (auto allowed = swapAllowedFromThisThread(); !allowed) { // before the current blocks are retired
+                        message.data = std::unexpected(allowed.error());
+                        return message;
+                    }
                     makeAllZombies();
 
                     const auto originalState = this->state();
