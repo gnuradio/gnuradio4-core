@@ -105,6 +105,9 @@ inline static constexpr std::size_t  defaultMinBufferSize(bool isArithmeticLike)
 inline static constexpr std::int32_t defaultWeight   = 0;
 inline static const std::string      defaultEdgeName = "unnamed edge"; // Emscripten doesn't want constexpr strings
 
+// the tag ring of an edge of the default size keeps one slot per requested sample
+static_assert(PortOut<float>::kMaxTagBufferSize >= defaultMinBufferSize(true));
+
 inline constexpr double      kDefaultEdgeBufferSeconds = 0.05;
 inline constexpr std::size_t kMinEdgeBufferSize        = 1UZ << 12; // see edgeBufferSizeFor()
 inline constexpr std::size_t kMaxEdgeBufferSize        = 1UZ << 22;

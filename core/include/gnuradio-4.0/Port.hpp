@@ -504,6 +504,8 @@ struct Port {
 
     static constexpr bool        kIsArithmeticLikeValueType = gr::arithmetic_sample_like<T> && sizeof(T) <= 16UZ;
     static constexpr std::size_t kDefaultBufferSize         = 4096UZ; // TODO: limit initial max buffer size based on kIsArithmeticLikeValueType
+    /// largest number of tag ring slots of an output port, besides the end-of-stream slot
+    static constexpr std::size_t kMaxTagBufferSize = 65536UZ;
 
     // constexpr members:
     static constexpr PortDirection kDirection = portDirection;
@@ -742,11 +744,17 @@ private:
     // element costs nothing unless the requested size already falls on a page-rounding boundary.
     static constexpr std::size_t kTagRingReserve = 1UZ;
 
+    // The tag ring has one slot per requested stream sample, up to kMaxTagBufferSize slots, plus
+    // kTagRingReserve. The cap keeps the tag ring of a deep stream ring at a fixed size. A tag that
+    // finds the ring full is dropped and counted in nTagsDropped. Beyond the cap, the ring fills once
+    // more than kMaxTagBufferSize tags wait for the reader.
+    [[nodiscard]] static constexpr std::size_t tagRingSize(std::size_t streamBufferSize) noexcept { return std::min(streamBufferSize, kMaxTagBufferSize) + kTagRingReserve; }
+
     [[nodiscard]] constexpr auto newTagIoHandler(std::size_t bufferSize = kDefaultBufferSize) const noexcept {
         if constexpr (kIsInput) {
             return TagBufferType(bufferSize).new_reader();
         } else {
-            return TagBufferType(bufferSize + kTagRingReserve).new_writer();
+            return TagBufferType(tagRingSize(bufferSize)).new_writer();
         }
     }
 
@@ -881,9 +889,9 @@ public:
                     _ioHandler = BufferType(min_size).new_writer();
                 }
                 if (tagResource) {
-                    _tagIoHandler = TagBufferType(min_size + kTagRingReserve, typename TagBufferType::Allocator(tagResource)).new_writer();
+                    _tagIoHandler = TagBufferType(tagRingSize(min_size), typename TagBufferType::Allocator(tagResource)).new_writer();
                 } else {
-                    _tagIoHandler = TagBufferType(min_size + kTagRingReserve).new_writer();
+                    _tagIoHandler = TagBufferType(tagRingSize(min_size)).new_writer();
                 }
             } catch (const std::exception& e) {
                 return std::unexpected(Error(std::format("failed to resize buffer to {}: {}", min_size, e.what())));

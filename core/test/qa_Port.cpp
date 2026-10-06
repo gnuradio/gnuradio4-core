@@ -1,7 +1,9 @@
 #include <boost/ut.hpp>
 
 #include <chrono>
+#include <complex>
 #include <format>
+#include <memory_resource>
 #include <numeric>
 #include <ranges>
 #include <stdexcept>
@@ -28,6 +30,18 @@ bool equalTags(auto tags, auto expected) {
     }
     return true;
 }
+
+// counts the bytes a ring allocates through it
+struct CountingResource : std::pmr::memory_resource {
+    std::size_t allocated{0UZ};
+
+    void* do_allocate(std::size_t bytes, std::size_t alignment) override {
+        allocated += bytes;
+        return std::pmr::new_delete_resource()->allocate(bytes, alignment);
+    }
+    void do_deallocate(void* p, std::size_t bytes, std::size_t alignment) override { std::pmr::new_delete_resource()->deallocate(p, bytes, alignment); }
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override { return this == &other; }
+};
 
 static inline gr::property_map propMap(std::initializer_list<std::pair<const std::string, gr::pmt::Value>> init) { return gr::property_map{init.begin(), init.end()}; }
 
@@ -319,6 +333,110 @@ const boost::ut::suite<"Port"> _portTests = [] { // NOSONAR (N.B. lambda size)
         expect(eq(out.nEoSTagsLost, 1UZ)) << "a marker with nowhere to go must be counted as the terminal failure it is";
         expect(lt(elapsed, std::chrono::milliseconds(50))) << "the marker path waited on a consumer that was never going to run";
         std::ignore = tagReader.get<SpanReleasePolicy::ProcessAll>();
+    };
+
+    // A deep edge's tag ring has as many slots, and allocates as many bytes, as a ring at the cap.
+    "a deep edge's tag ring stops at the cap"_test = [] {
+        using T                     = std::complex<float>;
+        constexpr std::size_t kCap  = PortOut<T>::kMaxTagBufferSize;
+        constexpr std::size_t kDeep = 4194304UZ;
+        static_assert(kDeep > kCap);
+
+        CountingResource deepTags;
+        CountingResource capTags;
+        PortOut<T>       deep;
+        PortOut<T>       atCap;
+        expect(deep.resizeBuffer(kDeep, nullptr, &deepTags).has_value());
+        expect(atCap.resizeBuffer(kCap, nullptr, &capTags).has_value());
+        expect(ge(deep.bufferSize(), kDeep)) << "the stream ring keeps the depth it was asked for";
+
+        const std::size_t deepSlots = deep.buffer().tagBuffer.size();
+        const std::size_t capSlots  = atCap.buffer().tagBuffer.size();
+        expect(gt(capSlots, kCap)) << std::format("a tag ring at the cap holds {} slots, short of one tag per sample", capSlots);
+        expect(eq(deepSlots, capSlots)) << std::format("the deep edge's tag ring has {} slots against {} at the cap", deepSlots, capSlots);
+        expect(eq(deepTags.allocated, capTags.allocated)) << std::format("the deep edge's tag ring allocates {} bytes against {} at the cap", deepTags.allocated, capTags.allocated);
+        expect(lt(deepTags.allocated, deep.bufferSize() * sizeof(T))) << std::format("the deep edge's tags take {} bytes, more than its {} bytes of samples", deepTags.allocated, deep.bufferSize() * sizeof(T));
+    };
+
+    // A reader that consumes a whole span retires the span's tags with its samples. A run carries
+    // more tags than the cap through the capped ring while no more than the cap wait for the reader.
+    "a deep edge carries more tags than the cap over a run and loses none"_test = [] {
+        using T                       = float;
+        constexpr std::size_t kCap    = PortOut<T>::kMaxTagBufferSize;
+        constexpr std::size_t kDeep   = 4194304UZ;
+        constexpr std::size_t kChunk  = kCap / 4UZ;
+        constexpr std::size_t kRounds = 3UZ;
+
+        PortOut<T> out;
+        PortIn<T>  in;
+        expect(out.resizeBuffer(kDeep).has_value());
+        expect(out.connect(in).has_value());
+
+        std::size_t written   = 0UZ;
+        std::size_t received  = 0UZ;
+        std::size_t misplaced = 0UZ;
+        for (std::size_t round = 0UZ; round < kRounds; ++round) {
+            for (std::size_t c = 0UZ; c < kCap / kChunk; ++c) { // the reader lags a whole cap of tagged samples
+                auto span = out.tryReserve<SpanReleasePolicy::ProcessAll>(kChunk);
+                expect(fatal(eq(span.size(), kChunk)));
+                for (std::size_t i = 0UZ; i < kChunk; ++i) {
+                    span.publishTag(propMap({{"n", static_cast<int>(written + i)}}), i);
+                    span[i] = static_cast<T>(written + i);
+                }
+                span.publish(kChunk);
+                written += kChunk;
+            }
+            auto span = in.get<SpanReleasePolicy::ProcessAll>(kCap);
+            expect(fatal(eq(span.size(), kCap)));
+            for (const auto& tag : span.rawTags) {
+                const auto n = static_cast<std::size_t>(tag.map.at("n").value_or(-1));
+                misplaced += (tag.index != n || span[tag.index - span.streamIndex] != static_cast<T>(n)) ? 1UZ : 0UZ;
+                ++received;
+            }
+        }
+        expect(gt(written, kCap)) << "the run must carry more tags than the ring holds";
+        expect(eq(out.nTagsDropped, 0UZ)) << "no tag found the ring full";
+        expect(eq(received, written)) << "every published tag reaches the reader";
+        expect(eq(misplaced, 0UZ)) << "every tag arrives at the sample it was published on";
+    };
+
+    // A writer that attaches a tag to every sample of a chunk longer than the cap fills the ring
+    // inside one publish. The samples pass whole. The first kMaxTagBufferSize tags arrive at their
+    // samples, the rest are dropped and counted, and the end-of-stream marker keeps its slot.
+    "a tag per sample beyond the cap is counted as dropped, the samples and the ending pass"_test = [] {
+        using T                      = float;
+        constexpr std::size_t kCap   = PortOut<T>::kMaxTagBufferSize;
+        constexpr std::size_t kDeep  = 4194304UZ;
+        constexpr std::size_t kChunk = 2UZ * kCap;
+
+        PortOut<T> out;
+        PortIn<T>  in;
+        expect(out.resizeBuffer(kDeep).has_value());
+        expect(out.connect(in).has_value());
+        {
+            auto span = out.tryReserve<SpanReleasePolicy::ProcessAll>(kChunk);
+            expect(fatal(eq(span.size(), kChunk)));
+            for (std::size_t i = 0UZ; i < kChunk; ++i) {
+                span.publishTag(propMap({{"n", static_cast<int>(i)}}), i);
+                span[i] = static_cast<T>(i);
+            }
+            span.publishEoSTag(property_map{{static_cast<std::pmr::string>(gr::tag::END_OF_STREAM), true}}, kChunk - 1UZ);
+            span.publish(kChunk);
+        }
+        expect(eq(out.nTagsDropped, kChunk - kCap)) << "every tag past the cap is counted";
+        expect(eq(out.nEoSTagsLost, 0UZ)) << "the end-of-stream marker keeps its slot";
+
+        auto span = in.get<SpanReleasePolicy::ProcessAll>(kChunk);
+        expect(fatal(eq(span.size(), kChunk))) << "every sample of the chunk passes";
+        expect(fatal(eq(span.rawTags.size(), kCap + 1UZ))) << "the cap's tags and the end-of-stream marker arrive";
+        std::size_t misplaced = 0UZ;
+        for (std::size_t i = 0UZ; i < kCap; ++i) {
+            misplaced += (span.rawTags[i].index != i || span.rawTags[i].map.at("n").value_or(-1) != static_cast<int>(i)) ? 1UZ : 0UZ;
+        }
+        expect(eq(misplaced, 0UZ)) << "the kept tags are the first ones, each at its sample";
+        expect(eq(span.rawTags[kCap].index, kChunk - 1UZ));
+        expect(span.rawTags[kCap].map.contains(static_cast<std::pmr::string>(gr::tag::END_OF_STREAM))) << "the ending passes";
+        expect(eq(span[kChunk - 1UZ], static_cast<T>(kChunk - 1UZ)));
     };
 
     "Async/Optional attribute flags"_test = [] {
