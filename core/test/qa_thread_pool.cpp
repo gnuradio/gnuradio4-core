@@ -355,6 +355,55 @@ const boost::ut::suite<"gr::thread_pool GR4 default"> defaultThreadPool = [] {
             expect(workerMask == expectedMask) << std::format("worker {} runs on '{}', expected '{}'", worker, bits(workerMask), bits(expectedMask));
         }
     };
+
+    "ThreadPool: a pool holding a worker that left at its keep-alive takes a new mask and scheduling policy"_test = [] {
+        using namespace gr::thread_pool;
+
+        const std::vector<bool>         callerMask = thread::getThreadAffinity();
+        const std::optional<TwoCpuMask> mask       = twoCpuMask(2UZ);
+        if (!mask) {
+            boost::ut::log << "skipped: the calling thread may run on fewer than two CPUs";
+            return;
+        }
+
+        // In each round two tasks make the pool start a second worker, and one of the two workers leaves at its
+        // keep-alive. The pool holds the departed worker until a call joins it.
+        HeldWorkers maskRound;
+        HeldWorkers policyRound;
+        // the pool starts its workers at the tasks, after the keep-alive is set
+        BasicThreadPool pool("DepartedTest", TaskType::IO_BOUND, 0U, 2U);
+        pool.keepAliveDuration = std::chrono::milliseconds(10);
+        pool.setThreadBounds(1U, 2U);
+        const auto leaveOne = [&pool](HeldWorkers& round) {
+            const std::string refusal = round.hold(pool, 2UZ);
+            round.releaseAll();
+            return refusal.empty() && waitForNumThreads(pool, 1UZ) && pool.numThreadsHeld() == 2UZ;
+        };
+        const auto failureOf = [](const auto& call) -> std::string {
+            try {
+                call();
+            } catch (const std::exception& e) {
+                return e.what();
+            }
+            return {};
+        };
+
+        const bool              maskRoundLeft   = leaveOne(maskRound);
+        const std::string       maskFailure     = failureOf([&pool, &mask] { pool.setAffinityMask(mask->pool); });
+        const std::size_t       heldAfterMask   = pool.numThreadsHeld();
+        const bool              policyRoundLeft = leaveOne(policyRound);
+        const std::string       policyFailure   = failureOf([&pool] { pool.setThreadSchedulingPolicy(pool.getSchedulingPolicy(), pool.getSchedulingPriority()); });
+        const std::size_t       heldAfterPolicy = pool.numThreadsHeld();
+        const std::vector<bool> workerMask      = pool.execute([] { return thread::getThreadAffinity(); }).get();
+
+        expect(maskRoundLeft && policyRoundLeft) << "a worker did not leave at its keep-alive";
+        expect(maskFailure.empty()) << std::format("setAffinityMask() failed: {}", maskFailure);
+        expect(eq(heldAfterMask, 1UZ)) << "setAffinityMask() left the departed worker unjoined";
+        expect(policyFailure.empty()) << std::format("setThreadSchedulingPolicy() failed: {}", policyFailure);
+        expect(eq(heldAfterPolicy, 1UZ)) << "setThreadSchedulingPolicy() left the departed worker unjoined";
+        expect(workerMask == mask->pool) << std::format("the remaining worker runs on '{}', expected '{}'", bits(workerMask), bits(mask->pool));
+        expect(thread::getThreadAffinity() == callerMask) << "the calling thread's mask changed";
+    };
 #endif
 
     "ThreadPool: CPU affinity rejection"_test = [] {

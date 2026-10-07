@@ -343,8 +343,9 @@ class BasicThreadPool {
     std::atomic_bool _shutdown    = false;
 
     // Workers wait, take a task and leave under _waitMutex. execute() queues a task and decides to add a worker under
-    // it. The lock order is _threadListMutex, then _waitMutex. A thread holding _waitMutex never waits for
-    // _threadListMutex, and every hold of _waitMutex is short.
+    // it. setAffinityMask() and setThreadSchedulingPolicy() set the live workers under it. The lock order is
+    // _threadListMutex, then _waitMutex. A thread holding _waitMutex never waits for _threadListMutex, and every hold
+    // of _waitMutex is short.
     std::mutex                   _waitMutex;
     std::condition_variable      _condition;
     std::size_t                  _numIdleWorkers  = 0U; // workers without a task, guarded by _waitMutex
@@ -525,10 +526,21 @@ private:
         // std::erase_if(_threads, [](auto &thread) { return !thread.joinable(); });
     }
 
+    // Sets the name, scheduling and affinity of every live worker. The workers that left at their keep-alive are
+    // joined first. The others are set under _waitMutex, where no worker decides to leave. A worker that left after
+    // the join keeps its record and is skipped. During shutdown a worker leaves without a record, and no worker is set.
     void updateThreadConstraints() {
-        std::scoped_lock lock(_threadListMutex);
+        std::scoped_lock threadListLock(_threadListMutex);
+        std::unique_lock waitLock(_waitMutex, std::defer_lock);
+        joinDepartedThreads(waitLock);
+        waitLock.lock();
+        if (isShutdown()) {
+            return;
+        }
         for (auto& [threadID, thread] : _threads) {
-            updateThreadConstraints(threadID, thread);
+            if (std::ranges::find(_departedThreads, thread.get_id()) == _departedThreads.end()) {
+                updateThreadConstraints(threadID, thread);
+            }
         }
     }
 
@@ -622,7 +634,8 @@ private:
     // cannot be set stays in the pool, and the exception reaches the caller.
     // The join runs under _threadListMutex. No other worker starts while a departed thread still runs. A
     // thread-local destructor of a departed worker therefore must not call execute() on its own pool. That call can
-    // wait for _threadListMutex while addWorker() holds it and joins the calling thread.
+    // wait for _threadListMutex while addWorker(), setAffinityMask() or setThreadSchedulingPolicy() holds it and joins
+    // the calling thread.
     void addWorker(std::unique_lock<std::mutex>& waitLock, std::source_location location) {
         _numThreads.fetch_add(1UZ, std::memory_order_acq_rel);
         ++_numIdleWorkers;
