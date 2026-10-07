@@ -534,26 +534,29 @@ private:
         thread::setThreadSchedulingParameter(_schedulingPolicy, _schedulingPriority, thread);
         if (!_affinityMask.empty()) {
             if (_taskType == TaskType::IO_BOUND) {
-                thread::setThreadAffinity(_affinityMask);
+                thread::setThreadAffinity(_affinityMask, thread);
                 return;
             }
             const std::vector<bool> affinityMask = distributeThreadAffinityAcrossCores(_affinityMask, threadID);
-            thread::setThreadAffinity(affinityMask);
+            thread::setThreadAffinity(affinityMask, thread);
         }
     }
 
+    // The stripe count is the smaller of minThreads() and the CPUs in the mask, at least one. Worker threadID runs on
+    // stripe threadID modulo that count.
     std::vector<bool> distributeThreadAffinityAcrossCores(const std::vector<bool>& globalAffinityMask, const std::size_t threadID) const {
         if (globalAffinityMask.empty()) {
             return {};
         }
+        const auto nCpus = static_cast<std::size_t>(std::ranges::count(globalAffinityMask, true));
         // pools with minThreads == 0 (e.g. the Emscripten CPU pool, lazily spawned) would divide
         // by zero below; fall back to a single-stripe layout until the pool actually grows.
-        const std::size_t stripe = std::max<std::size_t>(minThreads(), 1UZ);
+        const std::size_t stripe = std::clamp<std::size_t>(minThreads(), 1UZ, std::max(nCpus, 1UZ));
         std::vector<bool> affinityMask;
         std::size_t       coreCount = 0;
         for (bool value : globalAffinityMask) {
             if (value) {
-                affinityMask.push_back(coreCount++ % stripe == threadID);
+                affinityMask.push_back(coreCount++ % stripe == threadID % stripe);
             } else {
                 affinityMask.push_back(false);
             }
@@ -642,7 +645,7 @@ private:
             throw;
         }
         try {
-            updateThreadConstraints(threadIdx + 1UZ, *newThread);
+            updateThreadConstraints(threadIdx, *newThread);
         } catch (...) {
             relock();
             throw;
@@ -724,7 +727,9 @@ private:
     // minThreads() workers. The worker decides and lowers the thread count under _waitMutex. execute() then sees the
     // worker either idle or gone, and adds a worker when it is gone.
     void worker(std::size_t threadID) {
-        // _numThreads and _numIdleWorkers are raised in addWorker()
+        // _numThreads and _numIdleWorkers are raised in addWorker(). addWorker() holds _threadListMutex until it has set
+        // the name, scheduling and affinity of this thread, and the worker takes no task before then.
+        { std::scoped_lock constraintsSet(_threadListMutex); }
         auto             lastUsed = std::chrono::steady_clock::now();
         std::unique_lock lock(_waitMutex);
         while (true) {

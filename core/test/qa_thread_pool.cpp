@@ -3,9 +3,109 @@
 #include <gnuradio-4.0/meta/UnitTestHelper.hpp>
 #include <gnuradio-4.0/thread/thread_pool.hpp>
 
+#include <algorithm>
+#include <array>
+#include <condition_variable>
+#include <mutex>
+#include <optional>
 #include <semaphore>
+#include <string>
 #include <thread>
 #include <vector>
+
+#if not defined(__EMSCRIPTEN__) && not defined(__APPLE__)
+namespace {
+
+// Tasks that hold their workers until released. Each task records the name and the affinity mask of its worker. An
+// instance declared before the pool outlives the workers that read it.
+struct HeldWorkers {
+    struct Worker {
+        std::string       name;
+        std::vector<bool> mask;
+    };
+
+    std::mutex              mutex;
+    std::condition_variable changed;
+    std::vector<Worker>     workers;
+    bool                    releasedAll = false;
+
+    // Queues up to nTasks tasks and waits until each queued task holds a worker. Returns the message of the refusal
+    // that stops the queueing, or an empty string when the pool takes every task.
+    std::string hold(gr::thread_pool::BasicThreadPool& pool, std::size_t nTasks) {
+        std::string refusal;
+        std::size_t nQueued = 0UZ;
+        try {
+            for (; nQueued < nTasks; ++nQueued) {
+                pool.execute([this] { holdWorker(); });
+            }
+        } catch (const std::exception& e) {
+            refusal = e.what();
+        }
+        std::unique_lock lock(mutex);
+        changed.wait(lock, [this, nQueued] { return workers.size() >= nQueued; });
+        return refusal;
+    }
+
+    // The mask of the worker with the given name, or an empty mask when no task ran on that worker.
+    [[nodiscard]] std::vector<bool> maskOf(std::string_view name) const {
+        const auto found = std::ranges::find(workers, name, &Worker::name);
+        return found == workers.end() ? std::vector<bool>{} : found->mask;
+    }
+
+    void releaseAll() {
+        {
+            std::scoped_lock lock(mutex);
+            releasedAll = true;
+        }
+        changed.notify_all();
+    }
+
+private:
+    void holdWorker() {
+        std::unique_lock lock(mutex);
+        workers.push_back({.name = gr::thread_pool::thread::getThreadName(), .mask = gr::thread_pool::thread::getThreadAffinity()});
+        changed.notify_all();
+        changed.wait(lock, [this] { return releasedAll; });
+    }
+};
+
+// Two CPUs of the calling thread. The pool's mask holds both, and each stripe holds one.
+struct TwoCpuMask {
+    std::vector<bool>                pool;
+    std::array<std::vector<bool>, 2> stripes;
+};
+
+// Returns no mask when the calling thread may run on fewer than nCallerCpus CPUs.
+std::optional<TwoCpuMask> twoCpuMask(std::size_t nCallerCpus) {
+    const std::vector<bool>  callerMask = gr::thread_pool::thread::getThreadAffinity();
+    std::vector<std::size_t> callerCpus;
+    for (std::size_t cpu = 0UZ; cpu < callerMask.size(); ++cpu) {
+        if (callerMask[cpu]) {
+            callerCpus.push_back(cpu);
+        }
+    }
+    if (callerCpus.size() < nCallerCpus) {
+        return std::nullopt;
+    }
+    TwoCpuMask mask{.pool = std::vector<bool>(callerMask.size(), false), .stripes = {}};
+    mask.stripes.fill(mask.pool);
+    for (std::size_t i = 0UZ; i < mask.stripes.size(); ++i) {
+        mask.pool[callerCpus[i]]       = true;
+        mask.stripes[i][callerCpus[i]] = true;
+    }
+    return mask;
+}
+
+std::string bits(const std::vector<bool>& mask) {
+    std::string text;
+    for (const bool cpuSet : mask) {
+        text.push_back(cpuSet ? '1' : '0');
+    }
+    return text;
+}
+
+} // namespace
+#endif
 
 const boost::ut::suite<"gr::thread_pool GR4 default"> defaultThreadPool = [] {
     using namespace boost::ut;
@@ -121,6 +221,75 @@ const boost::ut::suite<"gr::thread_pool GR4 default"> defaultThreadPool = [] {
         }
     };
 
+#if not defined(__EMSCRIPTEN__) && not defined(__APPLE__)
+    "ThreadPool: an affinity mask pins each worker to its stripe and leaves the calling thread's mask"_test = [] {
+        using namespace gr::thread_pool;
+
+        // The pool's mask leaves out at least one CPU of the calling thread. A pool of two workers has two stripes of
+        // one CPU each.
+        const std::vector<bool>         callerMask = thread::getThreadAffinity();
+        const std::optional<TwoCpuMask> mask       = twoCpuMask(3UZ);
+        if (!mask) {
+            boost::ut::log << "skipped: the calling thread may run on fewer than three CPUs";
+            return;
+        }
+
+        for (const TaskType taskType : {TaskType::IO_BOUND, TaskType::CPU_BOUND}) {
+            const std::string_view poolKind = taskType == TaskType::IO_BOUND ? "IO-bound" : "CPU-bound";
+            // An IO-bound worker runs on the whole mask and a CPU-bound worker on its stripe. The third worker shares the first stripe.
+            const auto expectedMask = [&](std::size_t worker) { return taskType == TaskType::IO_BOUND ? mask->pool : mask->stripes[worker % mask->stripes.size()]; };
+
+            HeldWorkers     held;
+            BasicThreadPool pool("AffinityTest", taskType, 2U, 3U);
+            pool.waitUntilInitialised();
+            pool.setAffinityMask(mask->pool);
+            // Three tasks for two idle workers make the pool start its third worker.
+            const std::string       refusal         = held.hold(pool, 3UZ);
+            const std::vector<bool> callerMaskAfter = thread::getThreadAffinity();
+            held.releaseAll();
+
+            expect(refusal.empty()) << std::format("{} pool: the third worker was refused: {}", poolKind, refusal);
+            expect(callerMaskAfter == callerMask) << std::format("{} pool: the calling thread's mask {} became {}", poolKind, bits(callerMask), bits(callerMaskAfter));
+            for (std::size_t worker = 0UZ; worker < 3UZ; ++worker) {
+                const std::vector<bool> workerMask = held.maskOf(std::format("AffinityTest#{}", worker));
+                expect(workerMask == expectedMask(worker)) << std::format("{} pool: worker {} runs on '{}', expected '{}'", poolKind, worker, bits(workerMask), bits(expectedMask(worker)));
+            }
+        }
+    };
+
+    "ThreadPool: a CPU-bound pool with more workers than CPUs in its mask pins every worker to one CPU of the mask"_test = [] {
+        using namespace gr::thread_pool;
+
+        const std::optional<TwoCpuMask> mask = twoCpuMask(2UZ);
+        if (!mask) {
+            boost::ut::log << "skipped: the calling thread may run on fewer than two CPUs";
+            return;
+        }
+
+        // Three workers share two stripes of one CPU each. A fourth task makes the pool start a fourth worker, which
+        // takes the second stripe.
+        HeldWorkers     held;
+        BasicThreadPool pool("FewCpusTest", TaskType::CPU_BOUND, 3U, 4U);
+        pool.waitUntilInitialised();
+        std::string maskFailure;
+        try {
+            pool.setAffinityMask(mask->pool);
+        } catch (const std::exception& e) {
+            maskFailure = e.what();
+        }
+        const std::string refusal = held.hold(pool, 4UZ);
+        held.releaseAll();
+
+        expect(maskFailure.empty()) << std::format("setAffinityMask() failed: {}", maskFailure);
+        expect(refusal.empty()) << std::format("the fourth worker was refused: {}", refusal);
+        for (std::size_t worker = 0UZ; worker < 4UZ; ++worker) {
+            const std::vector<bool>& expectedMask = mask->stripes[worker % mask->stripes.size()];
+            const std::vector<bool>  workerMask   = held.maskOf(std::format("FewCpusTest#{}", worker));
+            expect(workerMask == expectedMask) << std::format("worker {} runs on '{}', expected '{}'", worker, bits(workerMask), bits(expectedMask));
+        }
+    };
+#endif
+
     "ThreadPool: CPU affinity rejection"_test = [] {
         using namespace gr::thread_pool;
 
@@ -215,9 +384,6 @@ const boost::ut::suite<"gr::thread_pool GR4 default"> defaultThreadPool = [] {
                 std::vector<std::thread> submitters;
                 for (std::size_t i = 0UZ; i < nSubmitters; ++i) {
                     submitters.emplace_back([&] {
-                        // setThreadAffinity() applies the mask to its calling thread, and a new thread inherits it.
-                        // Each submitter allows every core again, for itself and for the workers it adds.
-                        thread::setThreadAffinity(std::vector<bool>(std::thread::hardware_concurrency(), true));
                         // the submitters spin on the flag and reach execute() together
                         while (!go.load(std::memory_order_acquire)) {
                         }
