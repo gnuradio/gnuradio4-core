@@ -64,6 +64,15 @@ when its synchronous inputs have ended and no asynchronous input holds `min_samp
 items in front of its end or is still owed items. Until then the block runs on its other inputs.
 A block that ends at the first end of any input calls `requestStop()` from `processBulk()`.
 
+A block whose inputs all have their end in view, and that moves no sample on 1024 calls in a row,
+ends as if its inputs had ended. It sends one `Notify` on the endpoint `drain stall`, with
+`min_samples`, the largest minimum of its inputs, and `samples_left`, the most samples one input
+still held. A call that finds the block waiting on its outputs starts the count again. A block
+waits on its outputs when its last call returned `INSUFFICIENT_OUTPUT_ITEMS`, or when an output has
+less room than its `min_samples` or, for a synchronous output, one output chunk. A block that holds
+samples back publishes its true need as the input's `min_samples`, and then ends at the end of the
+stream without these calls.
+
 ### Backward propagation (sink → source)
 
 1. A block with `disconnect_on_done = true` (default) checks whether all its **non-optional**
@@ -202,8 +211,8 @@ Returned by `computeSampleLimits()`:
 struct SampleLimits {
     std::size_t  resampledIn{}, resampledOut{}, inputSkipBefore{};
     work::Status resampledStatus = work::Status::OK;
-    bool         hasTag{}, hasAnyTag{}, asyncEoS{}, isEosPresent{}, limitByFirstTag{};
-    bool         hasAsyncIn{}, hasAsyncOut{};
+    bool         hasTag{}, hasAnyTag{}, asyncEoS{}, isEosPresent{};
+    bool         hasAsyncIn{}, hasAsyncOut{}, draining{};
 };
 ```
 
