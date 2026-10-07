@@ -8,9 +8,11 @@
 #include <cstdint>
 #include <format>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <print>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -2115,6 +2117,251 @@ const boost::ut::suite<"a sub-scheduler's exported stream ports"> exportedPortTe
             expect(parent.changeStateTo(REQUESTED_STOP).has_value());
             expect(qa_sched::awaitState(parent, STOPPED)) << std::format("run {} did not stop", run);
         }
+    };
+};
+
+namespace qa_sched {
+
+using BreadthFirstScheduler = gr::scheduler::BreadthFirst<gr::scheduler::ExecutionPolicy::multiThreaded>;
+using DepthFirstScheduler   = gr::scheduler::DepthFirst<gr::scheduler::ExecutionPolicy::multiThreaded>;
+
+// the threads that ran each block's processOne(), keyed by the block
+inline std::mutex                                       gProcessingThreadsMutex;
+inline std::map<const void*, std::set<std::thread::id>> gProcessingThreads;
+
+struct ThreadRecordingForwarder : gr::Block<ThreadRecordingForwarder> {
+    gr::PortIn<float>  in;
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(ThreadRecordingForwarder, in, out);
+
+    float processOne(float value) {
+        std::lock_guard lock(gProcessingThreadsMutex);
+        gProcessingThreads[this].insert(std::this_thread::get_id());
+        return value;
+    }
+};
+
+[[nodiscard]] std::size_t nProcessingThreads(const void* block) {
+    std::lock_guard lock(gProcessingThreadsMutex);
+    const auto      found = gProcessingThreads.find(block);
+    return found == gProcessingThreads.end() ? 0UZ : found->second.size();
+}
+
+// The parent's source feeds a sub-scheduler whose graph is a chain of three blocks, and the chain feeds the parent's
+// sink. The sub-scheduler runs the chain on its own thread. The parent's job lists hold the sub-scheduler once and none
+// of the chain's blocks, in every order.
+template<typename TParent>
+void checkSubSchedulerChainStaysInside() {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    {
+        std::lock_guard lock(gProcessingThreadsMutex);
+        gProcessingThreads.clear();
+    }
+
+    gr::Graph innerFlow;
+    auto&     first  = innerFlow.emplaceBlock<ThreadRecordingForwarder>();
+    auto&     middle = innerFlow.emplaceBlock<ThreadRecordingForwarder>();
+    auto&     last   = innerFlow.emplaceBlock<ThreadRecordingForwarder>();
+    expect(innerFlow.connect<"out", "in">(first, middle).has_value());
+    expect(innerFlow.connect<"out", "in">(middle, last).has_value());
+    auto inner = std::make_shared<gr::SchedulerWrapper<SerialScheduler>>();
+    inner->setGraph(std::move(innerFlow));
+    expect(inner->exportPort(true, std::string(first.unique_name), gr::PortDirection::INPUT, "in", "in").has_value());
+    expect(inner->exportPort(true, std::string(last.unique_name), gr::PortDirection::OUTPUT, "out", "out").has_value());
+
+    gr::Graph outerFlow;
+    std::ignore                                 = outerFlow.emplaceBlock<DoneSource>();
+    auto&                                 sink  = outerFlow.emplaceBlock<CountingSink>();
+    const std::shared_ptr<gr::BlockModel> child = outerFlow.addBlock(gr::SchedulerModel::asBlockModelPtr(inner));
+    expect(outerFlow.connect(outerFlow.blocks()[0], gr::PortDefinition{"out"}, child, gr::PortDefinition{"in"}).has_value());
+    expect(outerFlow.connect(child, gr::PortDefinition{"out"}, outerFlow.blocks()[1], gr::PortDefinition{"in"}).has_value());
+
+    TParent parent;
+    expect(parent.exchange(std::move(outerFlow)).has_value());
+    expect(parent.changeStateTo(INITIALISED).has_value());
+
+    const std::array<std::string, 3UZ> chainNames{std::string(first.unique_name), std::string(middle.unique_name), std::string(last.unique_name)};
+    std::size_t                        nChainBlocksListed = 0UZ;
+    std::size_t                        nChildListed       = 0UZ;
+    for (const auto& jobList : *parent.jobs()) {
+        for (const auto& block : jobList) {
+            nChainBlocksListed += static_cast<std::size_t>(std::ranges::count(chainNames, block->uniqueName()));
+            nChildListed += block == child ? 1UZ : 0UZ;
+        }
+    }
+    expect(eq(nChainBlocksListed, 0UZ)) << "the parent's job lists hold blocks of the sub-scheduler's chain";
+    expect(eq(nChildListed, 1UZ)) << "the parent's job lists must hold the sub-scheduler once";
+    if (nChainBlocksListed != 0UZ) {
+        return; // the run would call work() on the chain's blocks from two threads at once
+    }
+
+    expect(runAndWaitWithin(parent, kEventBound)) << "the run did not complete";
+    expect(eq(sink._nReceived, kSamplesBeforeTerminal)) << "the sink count differs from the source count";
+    for (const ThreadRecordingForwarder* block : {&first, &middle, &last}) {
+        expect(eq(nProcessingThreads(block), 1UZ)) << std::format("{} must run on the sub-scheduler's thread alone", block->unique_name);
+    }
+}
+
+// The parent's graph is one sub-scheduler and holds no edge. The sub-scheduler's graph is a finite source and a sink.
+// The parent's job lists hold the sub-scheduler once and no block of its graph. The sub-scheduler runs its stream to
+// the end.
+template<typename TParent>
+void checkUnconnectedSubSchedulerRuns() {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    gSubSchedulerSamples.store(0UZ, std::memory_order_relaxed);
+
+    gr::Graph innerFlow;
+    auto&     innerSource = innerFlow.emplaceBlock<DoneSource>();
+    auto&     innerSink   = innerFlow.emplaceBlock<SharedCountingSink>();
+    expect(innerFlow.connect<"out", "in">(innerSource, innerSink).has_value());
+    auto inner = std::make_shared<gr::SchedulerWrapper<SerialScheduler>>();
+    inner->setGraph(std::move(innerFlow));
+
+    gr::Graph                             outerFlow;
+    const std::shared_ptr<gr::BlockModel> child = outerFlow.addBlock(gr::SchedulerModel::asBlockModelPtr(inner));
+
+    TParent parent;
+    expect(parent.exchange(std::move(outerFlow)).has_value());
+    expect(parent.changeStateTo(INITIALISED).has_value());
+
+    const std::array<std::string, 2UZ> innerNames{std::string(innerSource.unique_name), std::string(innerSink.unique_name)};
+    std::size_t                        nInnerBlocksListed = 0UZ;
+    std::size_t                        nChildListed       = 0UZ;
+    for (const auto& jobList : *parent.jobs()) {
+        for (const auto& block : jobList) {
+            nInnerBlocksListed += static_cast<std::size_t>(std::ranges::count(innerNames, block->uniqueName()));
+            nChildListed += block == child ? 1UZ : 0UZ;
+        }
+    }
+    expect(gt(parent.jobs()->size(), 0UZ)) << "the parent holds no job list";
+    expect(eq(nInnerBlocksListed, 0UZ)) << "the parent's job lists hold blocks of the sub-scheduler's graph";
+    expect(eq(nChildListed, 1UZ)) << "the parent's job lists must hold the sub-scheduler once";
+    if (parent.jobs()->empty()) {
+        return; // the start requires at least one job list
+    }
+
+    expect(parent.changeStateTo(RUNNING).has_value());
+    expect(awaitCondition([] { return gSubSchedulerSamples.load(std::memory_order_relaxed) >= kSamplesBeforeTerminal; })) << "the sub-scheduler's stream did not reach its end";
+    expect(parent.changeStateTo(REQUESTED_STOP).has_value());
+    expect(awaitCondition([&parent] { return parent.state() == STOPPED; })) << "the parent did not stop";
+    expect(eq(gSubSchedulerSamples.load(std::memory_order_relaxed), kSamplesBeforeTerminal)) << "the sink count differs from the source count";
+}
+
+} // namespace qa_sched
+
+const boost::ut::suite<"a sub-scheduler in its parent's execution order"> subSchedulerOrderTests = [] {
+    using namespace boost::ut;
+
+    "a simple parent leaves the sub-scheduler's chain to the sub-scheduler"_test = [] { qa_sched::checkSubSchedulerChainStaysInside<qa_sched::TestScheduler>(); };
+
+    "a breadth-first parent leaves the sub-scheduler's chain to the sub-scheduler"_test = [] { qa_sched::checkSubSchedulerChainStaysInside<qa_sched::BreadthFirstScheduler>(); };
+
+    "a depth-first parent leaves the sub-scheduler's chain to the sub-scheduler"_test = [] { qa_sched::checkSubSchedulerChainStaysInside<qa_sched::DepthFirstScheduler>(); };
+
+    "a simple parent runs a sub-scheduler that has no edge in the parent's graph"_test = [] { qa_sched::checkUnconnectedSubSchedulerRuns<qa_sched::TestScheduler>(); };
+
+    "a breadth-first parent runs a sub-scheduler that has no edge in the parent's graph"_test = [] { qa_sched::checkUnconnectedSubSchedulerRuns<qa_sched::BreadthFirstScheduler>(); };
+
+    "a depth-first parent runs a sub-scheduler that has no edge in the parent's graph"_test = [] { qa_sched::checkUnconnectedSubSchedulerRuns<qa_sched::DepthFirstScheduler>(); };
+};
+
+namespace qa_sched {
+
+// the number of samples the loop's blocks found at their inputs. Each block consumes what it finds and publishes nothing.
+// The count therefore holds the samples primed on the loop's edges.
+inline std::atomic<std::size_t> gLoopSamples{0UZ};
+
+struct LoopAbsorber : gr::Block<LoopAbsorber> {
+    gr::PortIn<float>  in;
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(LoopAbsorber, in, out);
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& inSpan, gr::OutputSpanLike auto& outSpan) {
+        gLoopSamples.fetch_add(inSpan.size(), std::memory_order_relaxed);
+        std::ignore = inSpan.consume(inSpan.size());
+        outSpan.publish(0UZ);
+        return gr::work::Status::OK;
+    }
+};
+
+struct Loop {
+    LoopAbsorber* front;
+    LoopAbsorber* back;
+};
+
+[[nodiscard]] Loop addLoop(gr::Graph& flow) {
+    using namespace boost::ut;
+
+    auto& front = flow.emplaceBlock<LoopAbsorber>();
+    auto& back  = flow.emplaceBlock<LoopAbsorber>();
+    expect(flow.connect<"out", "in">(front, back).has_value());
+    expect(flow.connect<"out", "in">(back, front).has_value());
+    return {&front, &back};
+}
+
+struct LoopStart {
+    std::size_t nPrimedSamples = 0UZ;
+    std::size_t nPrimingErrors = 0UZ;
+};
+
+// the start primes before the first work() call on the loop. The count is final once a sample has arrived and both
+// inputs are empty.
+[[nodiscard]] LoopStart startLoop(gr::Graph flow, Loop loop) {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    gLoopSamples.store(0UZ, std::memory_order_relaxed);
+    TestScheduler scheduler;
+    gr::MsgPortIn fromScheduler;
+    expect(scheduler.msgOut.connect(fromScheduler).has_value());
+    expect(scheduler.exchange(std::move(flow)).has_value());
+    expect(scheduler.changeStateTo(INITIALISED).has_value());
+    expect(scheduler.changeStateTo(RUNNING).has_value());
+    expect(awaitCondition([&loop] { return gLoopSamples.load(std::memory_order_relaxed) > 0UZ && loop.front->in.available() == 0UZ && loop.back->in.available() == 0UZ; })) << "the primed samples did not drain";
+
+    LoopStart result{.nPrimedSamples = gLoopSamples.load(std::memory_order_relaxed)};
+    auto      messages    = fromScheduler.streamReader().get();
+    result.nPrimingErrors = static_cast<std::size_t>(std::ranges::count_if(messages, [](const gr::Message& message) { return message.endpoint == "connectPendingEdges()" && !message.data.has_value(); }));
+    std::ignore           = messages.consume(messages.size());
+
+    expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+    expect(awaitState(scheduler, STOPPED)) << "the loop's scheduler did not stop";
+    return result;
+}
+
+} // namespace qa_sched
+
+const boost::ut::suite<"a feedback loop inside a group"> nestedLoopPrimingTests = [] {
+    using namespace boost::ut;
+
+    "a loop inside a transparent subgraph or a sub-scheduler is primed as often as one at the top level"_test = [] {
+        gr::Graph                 topFlow;
+        const qa_sched::Loop      topLoop = qa_sched::addLoop(topFlow);
+        const qa_sched::LoopStart top     = qa_sched::startLoop(std::move(topFlow), topLoop);
+        expect(gt(top.nPrimedSamples, 0UZ)) << "a loop at the top level must be primed";
+
+        auto                 wrapper   = std::make_shared<gr::GraphWrapper<gr::Graph>>();
+        const qa_sched::Loop groupLoop = qa_sched::addLoop(*wrapper->graph());
+        gr::Graph            groupFlow;
+        std::ignore                     = groupFlow.addBlock(wrapper);
+        const qa_sched::LoopStart group = qa_sched::startLoop(std::move(groupFlow), groupLoop);
+        expect(eq(group.nPrimedSamples, top.nPrimedSamples)) << "a loop inside a transparent subgraph";
+
+        gr::Graph            innerFlow;
+        const qa_sched::Loop childLoop = qa_sched::addLoop(innerFlow);
+        auto                 inner     = std::make_shared<gr::SchedulerWrapper<qa_sched::SerialScheduler>>();
+        inner->setGraph(std::move(innerFlow));
+        gr::Graph childFlow;
+        std::ignore                     = childFlow.addBlock(gr::SchedulerModel::asBlockModelPtr(inner));
+        const qa_sched::LoopStart child = qa_sched::startLoop(std::move(childFlow), childLoop);
+        expect(eq(child.nPrimedSamples, top.nPrimedSamples)) << "a loop inside a sub-scheduler";
+        expect(eq(child.nPrimingErrors, top.nPrimingErrors)) << "priming errors for a loop inside a sub-scheduler";
     };
 };
 

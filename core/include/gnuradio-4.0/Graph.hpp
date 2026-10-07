@@ -15,6 +15,7 @@
 #include <bit>
 #include <map>
 #include <tuple>
+#include <unordered_set>
 #include <variant>
 
 #if !__has_include(<source_location> )
@@ -1059,16 +1060,28 @@ template<block::Category traverseCategory>
     return n;
 }
 
+// lists the blocks of root and of every traverseCategory group inside it, with each edge whose two blocks are both
+// listed. A group of another category, such as a sub-scheduler, is one listed block, and the edges of its own graph
+// stay out.
 template<gr::block::Category traverseCategory = gr::block::Category::TransparentBlockGroup>
 gr::Graph flatten(GraphLike auto const& root, std::source_location location = std::source_location::current()) {
     using enum block::Category;
 
     gr::Graph flattenedGraph;
     gr::graph::forEachBlock<traverseCategory>(root, [&flattenedGraph](const std::shared_ptr<BlockModel>& block) { flattenedGraph.addBlock(block, false); });
-    std::ranges::for_each(root.edges(), [&flattenedGraph, &location](const Edge& edge) { std::ignore = flattenedGraph.addEdge(edge, location); }); // add edges from root graph
+    std::unordered_set<const BlockModel*> listed;
+    for (const auto& block : flattenedGraph.blocks()) {
+        listed.insert(block.get());
+    }
+    auto addListedEdge = [&flattenedGraph, &listed, &location](const Edge& edge) {
+        if (listed.contains(edge.sourceBlock().get()) && listed.contains(edge.destinationBlock().get())) {
+            std::ignore = flattenedGraph.addEdge(edge, location);
+        }
+    };
+    std::ranges::for_each(root.edges(), addListedEdge); // add edges from root graph
 
     // add edges related to blocks in flattened Graph
-    gr::graph::forEachBlock<traverseCategory>(root, [&flattenedGraph, &location](const std::shared_ptr<BlockModel>& block) { std::ranges::for_each(block->edges(), [&flattenedGraph, &location](const Edge& edge) { std::ignore = flattenedGraph.addEdge(edge, location); }); });
+    gr::graph::forEachBlock<traverseCategory>(root, [&addListedEdge](const std::shared_ptr<BlockModel>& block) { std::ranges::for_each(block->edges(), addListedEdge); });
 
     return flattenedGraph;
 }

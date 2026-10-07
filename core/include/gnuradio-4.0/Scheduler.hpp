@@ -2033,6 +2033,7 @@ detecting cycles and blocks which can be reached from several source blocks.)"">
          *     - add B to result
          *   - for each outgoing edge from B:
          *     - if target not yet reached, enqueue target
+         * 5. append every block of the flattened graph that Q never reached, in the flattened graph's order
          *
          * For more details see also:
          * [1] T. H. Cormen, C. E. Leiserson, R. L. Rivest, and C. Stein, "Introduction to Algorithms", 3rd ed., MIT Press, 2009, ch. 22.2.
@@ -2077,6 +2078,12 @@ detecting cycles and blocks which can be reached from several source blocks.)"">
             }
         }
 
+        for (const auto& block : flatGraph.blocks()) {
+            if (!visited.contains(block)) {
+                blockList.push_back(block);
+            }
+        }
+
         const std::size_t n_batches = (execution == ExecutionPolicy::multiThreaded) ? this->nJobLists(blockList.size()) : 1UZ;
 
         std::lock_guard lock(this->_executionOrderMutex);
@@ -2109,6 +2116,7 @@ struct DepthFirst : SchedulerBase<DepthFirst<execution, TProfiler>, execution, T
          *   - add B to result
          *   - for each outgoing edge from B:
          *     - recursively visit(destination)
+         * 6. append every block of the flattened graph that no visit reached, in the flattened graph's order
          *
          * For more details see also:
          * [1] T. H. Cormen, C. E. Leiserson, R. L. Rivest, and C. Stein, "Introduction to Algorithms", 3rd ed., MIT Press, 2009, ch. 22.2.
@@ -2141,6 +2149,12 @@ struct DepthFirst : SchedulerBase<DepthFirst<execution, TProfiler>, execution, T
 
         for (const auto& src : sourceBlocks) {
             dfs(src);
+        }
+
+        for (const auto& block : flatGraph.blocks()) {
+            if (!visited.contains(block)) {
+                blockList.push_back(block);
+            }
         }
 
         const std::size_t n_batches = (execution == ExecutionPolicy::multiThreaded) ? this->nJobLists(blockList.size()) : 1UZ;
