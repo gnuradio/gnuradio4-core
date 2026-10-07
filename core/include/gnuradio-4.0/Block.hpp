@@ -789,7 +789,6 @@ constexpr bool kUnfilteredTagPropagationAdmissible =                            
  */
 template<typename Derived, typename... Arguments>
 class Block : public lifecycle::StateMachine<Derived>, public BlockBase {
-    static inline std::size_t _uniqueIdCounter{0UZ};
     template<typename T, gr::meta::fixed_string description = "", typename... Args>
     using A = Annotated<T, description, Args...>;
 
@@ -849,7 +848,7 @@ public:
 
     gr::Size_t strideCounter = 0UL; // leftover stride from previous calls
 
-    gr::meta::immutable<std::size_t> unique_id   = gr::atomic_ref(_uniqueIdCounter).fetch_add(1UZ);
+    gr::meta::immutable<std::size_t> unique_id   = gr::detail::nextBlockId(gr::meta::type_name<Derived>());
     gr::meta::immutable<std::string> unique_name = std::format("{}#{}", gr::meta::type_name<Derived>(), unique_id);
 
     //
