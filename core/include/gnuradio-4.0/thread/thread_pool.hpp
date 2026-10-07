@@ -11,6 +11,7 @@
 #include <functional>
 #include <future>
 #include <list>
+#include <map>
 #include <mutex>
 #include <span>
 #include <string>
@@ -354,9 +355,9 @@ class BasicThreadPool {
     TaskQueue                    _recycledTasks;
     std::vector<std::thread::id> _departedThreads; // workers that left at their keep-alive, guarded by _waitMutex
 
-    mutable std::mutex     _threadListMutex;
-    std::atomic_size_t     _numThreads = 0U;
-    std::list<std::thread> _threads;
+    mutable std::mutex                 _threadListMutex;
+    std::atomic_size_t                 _numThreads = 0U;
+    std::map<std::size_t, std::thread> _threads; // the worker threads by index
 
     std::vector<bool> _affinityMask;
     thread::Policy    _schedulingPolicy   = thread::Policy::OTHER;
@@ -526,7 +527,9 @@ private:
 
     void updateThreadConstraints() {
         std::scoped_lock lock(_threadListMutex);
-        std::for_each(_threads.begin(), _threads.end(), [this, threadID = std::size_t{0}](auto& thread) mutable { this->updateThreadConstraints(threadID++, thread); });
+        for (auto& [threadID, thread] : _threads) {
+            updateThreadConstraints(threadID, thread);
+        }
     }
 
     void updateThreadConstraints(const std::size_t threadID, std::thread& thread) const {
@@ -578,7 +581,8 @@ private:
         if (departedThreads.empty()) {
             return;
         }
-        std::erase_if(_threads, [&departedThreads](std::thread& thread) {
+        std::erase_if(_threads, [&departedThreads](auto& entry) {
+            std::thread& thread = entry.second;
             if (std::ranges::find(departedThreads, thread.get_id()) == departedThreads.end()) {
                 return false;
             }
@@ -588,20 +592,20 @@ private:
         });
     }
 
-    // The threads are taken out of the list under the lock and joined after it is released. A task that is still
+    // The threads are taken out of _threads under the lock and joined after it is released. A task that is still
     // running can call execute(), which takes the lock to add a worker.
     void joinAllThreads() {
         while (true) {
-            std::list<std::thread> threads;
+            std::map<std::size_t, std::thread> threads;
             {
                 std::scoped_lock lock(_threadListMutex, _waitMutex);
-                threads.splice(threads.end(), _threads);
+                threads.swap(_threads);
                 _departedThreads.clear();
             }
             if (threads.empty()) {
                 return;
             }
-            for (auto& thread : threads) {
+            for (auto& [threadID, thread] : threads) {
                 thread.join();
                 _globalThreadCount.fetch_sub(1UZ, std::memory_order_relaxed);
             }
@@ -611,15 +615,16 @@ private:
     // Adds a worker that counts as idle from the start. The caller holds waitLock on _waitMutex, and holds it again
     // when addWorker() returns or throws. The slot is reserved under _waitMutex. The join of departed workers, the
     // limit check and the thread's creation run under _threadListMutex, and the workers keep taking tasks meanwhile.
-    // A worker that leaves after the records are taken is joined by the next addWorker() or the destructor. A refusal
-    // undoes the reservation: the process-wide limit (std::out_of_range), a thread count that cannot be read and a
-    // thread the system refuses (std::system_error). A worker whose name or scheduling cannot be set stays in the
-    // pool, and the exception reaches the caller.
+    // The new worker takes the lowest index that no thread in _threads holds. Its name and its stripe of the affinity
+    // mask follow that index. A worker that leaves after the records are taken is joined by the next addWorker() or
+    // the destructor. A refusal undoes the reservation: the process-wide limit (std::out_of_range), a thread count
+    // that cannot be read and a thread the system refuses (std::system_error). A worker whose name or scheduling
+    // cannot be set stays in the pool, and the exception reaches the caller.
     // The join runs under _threadListMutex. No other worker starts while a departed thread still runs. A
     // thread-local destructor of a departed worker therefore must not call execute() on its own pool. That call can
     // wait for _threadListMutex while addWorker() holds it and joins the calling thread.
     void addWorker(std::unique_lock<std::mutex>& waitLock, std::source_location location) {
-        const std::size_t threadIdx = _numThreads.fetch_add(1UZ, std::memory_order_acq_rel);
+        _numThreads.fetch_add(1UZ, std::memory_order_acq_rel);
         ++_numIdleWorkers;
         waitLock.unlock();
 
@@ -630,13 +635,17 @@ private:
         };
         _globalThreadCount.fetch_add(1UZ, std::memory_order_relaxed);
         std::thread* newThread = nullptr;
+        std::size_t  threadIdx = 0UZ;
         try {
             joinDepartedThreads(waitLock);
             const std::size_t nTotalThreads = getTotalThreadCount();
             if (nTotalThreads + 1UZ >= thread::getThreadLimit()) {
                 throw std::out_of_range(std::format("pool({}): about to exhaust global thread limit: {} out of {} : at {}", poolName(), nTotalThreads, thread::getThreadLimit(), location));
             }
-            newThread = &_threads.emplace_back(&BasicThreadPool::worker, this, threadIdx);
+            while (_threads.contains(threadIdx)) {
+                ++threadIdx;
+            }
+            newThread = &_threads.try_emplace(threadIdx, &BasicThreadPool::worker, this, threadIdx).first->second;
         } catch (...) {
             _globalThreadCount.fetch_sub(1UZ, std::memory_order_relaxed);
             relock();

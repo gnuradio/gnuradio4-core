@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <optional>
@@ -24,10 +25,11 @@ struct HeldWorkers {
         std::vector<bool> mask;
     };
 
-    std::mutex              mutex;
-    std::condition_variable changed;
-    std::vector<Worker>     workers;
-    bool                    releasedAll = false;
+    std::mutex               mutex;
+    std::condition_variable  changed;
+    std::vector<Worker>      workers;
+    std::vector<std::string> releasedNames;
+    bool                     releasedAll = false;
 
     // Queues up to nTasks tasks and waits until each queued task holds a worker. Returns the message of the refusal
     // that stops the queueing, or an empty string when the pool takes every task.
@@ -52,6 +54,15 @@ struct HeldWorkers {
         return found == workers.end() ? std::vector<bool>{} : found->mask;
     }
 
+    // Releases the task held by the worker with the given name.
+    void release(std::string name) {
+        {
+            std::scoped_lock lock(mutex);
+            releasedNames.push_back(std::move(name));
+        }
+        changed.notify_all();
+    }
+
     void releaseAll() {
         {
             std::scoped_lock lock(mutex);
@@ -62,12 +73,21 @@ struct HeldWorkers {
 
 private:
     void holdWorker() {
-        std::unique_lock lock(mutex);
-        workers.push_back({.name = gr::thread_pool::thread::getThreadName(), .mask = gr::thread_pool::thread::getThreadAffinity()});
+        std::unique_lock  lock(mutex);
+        const std::string name = gr::thread_pool::thread::getThreadName();
+        workers.push_back({.name = name, .mask = gr::thread_pool::thread::getThreadAffinity()});
         changed.notify_all();
-        changed.wait(lock, [this] { return releasedAll; });
+        changed.wait(lock, [this, &name] { return releasedAll || std::ranges::find(releasedNames, name) != releasedNames.end(); });
     }
 };
+
+// A worker leaves at its keep-alive without a signal. The wait polls the pool's thread count for five seconds at most.
+bool waitForNumThreads(const gr::thread_pool::BasicThreadPool& pool, std::size_t nThreads) {
+    for (std::size_t i = 0UZ; i < 5000UZ && pool.numThreads() != nThreads; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return pool.numThreads() == nThreads;
+}
 
 // Two CPUs of the calling thread. The pool's mask holds both, and each stripe holds one.
 struct TwoCpuMask {
@@ -285,6 +305,53 @@ const boost::ut::suite<"gr::thread_pool GR4 default"> defaultThreadPool = [] {
         for (std::size_t worker = 0UZ; worker < 4UZ; ++worker) {
             const std::vector<bool>& expectedMask = mask->stripes[worker % mask->stripes.size()];
             const std::vector<bool>  workerMask   = held.maskOf(std::format("FewCpusTest#{}", worker));
+            expect(workerMask == expectedMask) << std::format("worker {} runs on '{}', expected '{}'", worker, bits(workerMask), bits(expectedMask));
+        }
+    };
+
+    "ThreadPool: a worker started after another left takes the lowest index no worker holds"_test = [] {
+        using namespace gr::thread_pool;
+
+        const std::optional<TwoCpuMask> mask = twoCpuMask(2UZ);
+        if (!mask) {
+            boost::ut::log << "skipped: the calling thread may run on fewer than two CPUs";
+            return;
+        }
+
+        // Workers 0 and 2 run on the first stripe and worker 1 on the second. Worker 1 leaves at its keep-alive. The
+        // worker started in its place takes index 1. It carries that index in its name and runs on the second stripe.
+        HeldWorkers firstRound;
+        HeldWorkers secondRound;
+        // the pool starts its workers at the tasks, after the keep-alive is set
+        BasicThreadPool pool("RegrowTest", TaskType::CPU_BOUND, 0U, 3U);
+        pool.keepAliveDuration = std::chrono::milliseconds(10);
+        pool.setThreadBounds(2U, 3U);
+        pool.setAffinityMask(mask->pool);
+
+        std::string refusal = firstRound.hold(pool, 3UZ);
+        firstRound.release("RegrowTest#1");
+        const bool workerLeft = waitForNumThreads(pool, 2UZ);
+        firstRound.releaseAll();
+        if (refusal.empty()) {
+            refusal = secondRound.hold(pool, 3UZ);
+        }
+        secondRound.releaseAll();
+
+        expect(refusal.empty()) << std::format("a worker was refused: {}", refusal);
+        expect(workerLeft) << "worker 1 did not leave at its keep-alive";
+        std::vector<std::string> names;
+        for (const HeldWorkers::Worker& worker : secondRound.workers) {
+            names.push_back(worker.name);
+        }
+        std::ranges::sort(names);
+        std::string nameList;
+        for (const std::string& name : names) {
+            nameList += nameList.empty() ? name : ", " + name;
+        }
+        expect(names == std::vector<std::string>{"RegrowTest#0", "RegrowTest#1", "RegrowTest#2"}) << std::format("the workers are named {}", nameList);
+        for (std::size_t worker = 0UZ; worker < 3UZ; ++worker) {
+            const std::vector<bool>& expectedMask = mask->stripes[worker % mask->stripes.size()];
+            const std::vector<bool>  workerMask   = secondRound.maskOf(std::format("RegrowTest#{}", worker));
             expect(workerMask == expectedMask) << std::format("worker {} runs on '{}', expected '{}'", worker, bits(workerMask), bits(expectedMask));
         }
     };
