@@ -1087,4 +1087,53 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
     };
 };
 
+namespace qa_edit {
+// records the size of each allocation made through it while it is the default resource
+struct SizeRecordingResource : std::pmr::memory_resource {
+    std::vector<std::size_t>   sizes;
+    std::pmr::memory_resource* previous = std::pmr::set_default_resource(this);
+
+    SizeRecordingResource() { sizes.reserve(1024UZ); }
+    ~SizeRecordingResource() override { restore(); }
+
+    void restore() { std::pmr::set_default_resource(previous); }
+
+    void* do_allocate(std::size_t bytes, std::size_t alignment) override {
+        sizes.push_back(bytes);
+        return std::pmr::new_delete_resource()->allocate(bytes, alignment);
+    }
+    void do_deallocate(void* pointer, std::size_t bytes, std::size_t alignment) override { std::pmr::new_delete_resource()->deallocate(pointer, bytes, alignment); }
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override { return this == &other; }
+
+    // the heap rings a port of the default size holds: the message ring and the tag ring of either direction
+    [[nodiscard]] std::size_t nDefaultRings() const {
+        constexpr std::size_t kSlots       = gr::MsgPortOut::kDefaultBufferSize;
+        const std::size_t     ringSizes[3] = {2UZ * kSlots * sizeof(gr::Message), 2UZ * kSlots * sizeof(gr::Tag), 2UZ * (kSlots + 1UZ) * sizeof(gr::Tag)};
+        return static_cast<std::size_t>(std::ranges::count_if(sizes, [&ringSizes](std::size_t size) { return std::ranges::find(ringSizes, size) != std::ranges::end(ringSizes); }));
+    }
+};
+} // namespace qa_edit
+
+const boost::ut::suite<"graph port rings"> graphPortRingTests = [] {
+    using namespace boost::ut;
+
+    "a graph builds no default ring for a port it sizes"_test = [] {
+        qa_edit::SizeRecordingResource recorder;
+        std::size_t                    edgeSize = 0UZ;
+        {
+            gr::Graph flow;
+            auto&     source = flow.emplaceBlock<qa_edit::DualSource>();
+            auto&     sink   = flow.emplaceBlock<qa_edit::Sink>();
+            expect(fatal(flow.connect<"out", "in">(source, sink).has_value()));
+            expect(fatal(flow.connectPendingEdges()));
+            edgeSize = source.out.bufferSize();
+            expect(eq(sink.in.bufferSize(), edgeSize)) << "the input reads the edge's ring";
+            expect(!source.monitor.isConnected());
+        }
+        recorder.restore();
+        expect(neq(edgeSize, gr::PortOut<float>::kDefaultBufferSize)) << "the edge must differ from the default size for the count to tell them apart";
+        expect(eq(recorder.nDefaultRings(), 0UZ)) << std::format("building and destroying a graph built {} heap rings of the default size", recorder.nDefaultRings());
+    };
+};
+
 int main() { /* tests are statically registered */ }

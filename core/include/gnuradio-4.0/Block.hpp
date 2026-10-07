@@ -1610,7 +1610,7 @@ public:
         }
 
         auto processPort = [this]<PortLike TPort>(TPort& inPort) {
-            const auto available = inPort.streamReader().available();
+            const auto available = inPort.available();
             if (available == 0UZ) {
                 return;
             }

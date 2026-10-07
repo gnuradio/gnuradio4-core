@@ -3,8 +3,11 @@
 
 #include <algorithm>
 #include <any>
+#include <atomic>
 #include <chrono>
 #include <complex>
+#include <mutex>
+#include <optional>
 #include <set>
 #include <span>
 #include <thread>
@@ -726,9 +729,47 @@ public:
     std::size_t nEoSTagsLost{0UZ}; // end-of-stream markers this port could not publish
 
 private:
-    IoType    _ioHandler    = newIoHandler();
-    TagIoType _tagIoHandler = newTagIoHandler();
-    Tag       _cachedTag{}; // todo: for now this is only used in the output ports
+    // A port builds its stream and tag rings when it is sized or connected. Otherwise the first call that hands
+    // out its reader or writer builds them at kDefaultBufferSize. An unconnected output publishes into that
+    // ring, and a message port connected without a size gets it. Before that, nReaders(), nWriters(),
+    // bufferSize() and available() report an empty ring of kDefaultBufferSize slots with no reader or writer,
+    // and build nothing. disconnect() releases the rings.
+    //
+    // Every accessor of a ring reads _hasRings first. _ringsMutex serializes building, replacing and releasing
+    // the rings, and _hasRings turns true only after both rings are whole. Threads that take a port's first
+    // reader or writer at the same time build one pair of rings, and each of them sees that pair whole. The flag
+    // does not order a connection or a disconnect() that replaces or releases the rings of a port another thread
+    // reads.
+    mutable std::optional<IoType>    _ioHandler;
+    mutable std::optional<TagIoType> _tagIoHandler;
+    mutable std::atomic<bool>        _hasRings{false};
+    mutable std::mutex               _ringsMutex;
+    Tag                              _cachedTag{}; // todo: for now this is only used in the output ports
+
+    [[nodiscard]] bool hasRings() const noexcept { return _hasRings.load(std::memory_order_acquire); }
+
+    void buildDefaultRings() const {
+        std::lock_guard lock(_ringsMutex);
+        if (!_hasRings.load(std::memory_order_relaxed)) {
+            _ioHandler.emplace(newIoHandler());
+            _tagIoHandler.emplace(newTagIoHandler());
+            _hasRings.store(true, std::memory_order_release);
+        }
+    }
+
+    constexpr IoType& ioHandler() const {
+        if (!hasRings()) [[unlikely]] {
+            buildDefaultRings();
+        }
+        return *_ioHandler;
+    }
+
+    constexpr TagIoType& tagIoHandler() const {
+        if (!hasRings()) [[unlikely]] {
+            buildDefaultRings();
+        }
+        return *_tagIoHandler;
+    }
 
     [[nodiscard]] constexpr auto newIoHandler(std::size_t bufferSize = kDefaultBufferSize) const noexcept {
         if constexpr (kIsInput) {
@@ -760,8 +801,8 @@ private:
 
 public:
     constexpr Port() noexcept = default;
-    explicit Port(std::int16_t priority_, std::size_t min_samples_ = 0UZ, std::size_t max_samples_ = SIZE_MAX) noexcept : priority{priority_}, min_samples(min_samples_), max_samples(max_samples_), _ioHandler{newIoHandler()}, _tagIoHandler{newTagIoHandler()} {}
-    constexpr Port(Port&& other) noexcept : priority{other.priority}, min_samples(other.min_samples), max_samples(other.max_samples), metaInfo(std::move(other.metaInfo)), _ioHandler(std::move(other._ioHandler)), _tagIoHandler(std::move(other._tagIoHandler)) {}
+    explicit Port(std::int16_t priority_, std::size_t min_samples_ = 0UZ, std::size_t max_samples_ = SIZE_MAX) noexcept : priority{priority_}, min_samples(min_samples_), max_samples(max_samples_) {}
+    constexpr Port(Port&& other) noexcept : priority{other.priority}, min_samples(other.min_samples), max_samples(other.max_samples), metaInfo(std::move(other.metaInfo)), _ioHandler(std::move(other._ioHandler)), _tagIoHandler(std::move(other._tagIoHandler)), _hasRings(other.hasRings()) {}
     Port(const Port&)                                = delete;
     auto            operator=(const Port&)           = delete;
     constexpr Port& operator=(Port&& other) noexcept = delete;
@@ -771,7 +812,7 @@ public:
     [[nodiscard]] constexpr bool initBuffer(std::size_t nSamples = 0) noexcept {
         if constexpr (kIsOutput) {
             // write one default value into output -- needed for cyclic graph initialisation
-            return _ioHandler.try_publish([val = default_value](std::span<T>& out) { std::ranges::fill(out, val); }, nSamples);
+            return ioHandler().try_publish([val = default_value](std::span<T>& out) { std::ranges::fill(out, val); }, nSamples);
         }
         return true;
     }
@@ -779,7 +820,7 @@ public:
     [[nodiscard]] InternalPortBuffers writerHandlerInternal() noexcept
     requires(kIsOutput)
     {
-        return {static_cast<void*>(std::addressof(_ioHandler)), static_cast<void*>(std::addressof(_tagIoHandler))};
+        return {static_cast<void*>(std::addressof(ioHandler())), static_cast<void*>(std::addressof(tagIoHandler()))};
     }
 
     [[nodiscard]] bool updateReaderInternal(InternalPortBuffers buffer_writer_handler_other) noexcept
@@ -823,26 +864,31 @@ public:
     [[nodiscard]] constexpr std::size_t nReaders() const noexcept {
         if constexpr (kIsInput) {
             return -1UZ;
-        } else if constexpr (requires { _ioHandler.nReaders(); }) {
-            return _ioHandler.nReaders();
+        } else if (!hasRings()) {
+            return 0UZ;
+        } else if constexpr (requires { _ioHandler->nReaders(); }) {
+            return _ioHandler->nReaders();
         } else {
-            return _ioHandler.buffer().n_readers();
+            return _ioHandler->buffer().n_readers();
         }
     }
 
     [[nodiscard]] constexpr std::size_t nWriters() const noexcept {
         if constexpr (kIsInput) {
-            if constexpr (requires { _ioHandler.nWriters(); }) {
-                return _ioHandler.nWriters();
+            if (!hasRings()) {
+                return 0UZ;
+            }
+            if constexpr (requires { _ioHandler->nWriters(); }) {
+                return _ioHandler->nWriters();
             } else {
-                return _ioHandler.buffer().n_writers();
+                return _ioHandler->buffer().n_writers();
             }
         } else {
             return -1UZ;
         }
     }
 
-    [[nodiscard]] constexpr std::size_t bufferSize() const noexcept { return _ioHandler.buffer().size(); }
+    [[nodiscard]] constexpr std::size_t bufferSize() const noexcept { return hasRings() ? _ioHandler->buffer().size() : kDefaultBufferSize; }
 
     [[nodiscard]] std::any defaultValue() const noexcept { return default_value; }
 
@@ -855,11 +901,10 @@ public:
     }
 
     [[nodiscard]] constexpr std::size_t available() const noexcept {
-        if constexpr (kIsInput) {
-            return streamReader().available();
-        } else {
-            return streamWriter().available();
+        if (hasRings()) {
+            return _ioHandler->available();
         }
+        return kIsInput ? 0UZ : kDefaultBufferSize;
     }
 
     [[nodiscard]] constexpr std::size_t min_buffer_size() const noexcept {
@@ -883,16 +928,9 @@ public:
             return {};
         } else {
             try {
-                if (dataResource) {
-                    _ioHandler = BufferType(min_size, typename BufferType::Allocator(dataResource)).new_writer();
-                } else {
-                    _ioHandler = BufferType(min_size).new_writer();
-                }
-                if (tagResource) {
-                    _tagIoHandler = TagBufferType(tagRingSize(min_size), typename TagBufferType::Allocator(tagResource)).new_writer();
-                } else {
-                    _tagIoHandler = TagBufferType(tagRingSize(min_size)).new_writer();
-                }
+                BufferType    streamBuffer = dataResource ? BufferType(min_size, typename BufferType::Allocator(dataResource)) : BufferType(min_size);
+                TagBufferType tagBuffer    = tagResource ? TagBufferType(tagRingSize(min_size), typename TagBufferType::Allocator(tagResource)) : TagBufferType(tagRingSize(min_size));
+                setBuffer(std::move(streamBuffer), std::move(tagBuffer));
             } catch (const std::exception& e) {
                 return std::unexpected(Error(std::format("failed to resize buffer to {}: {}", min_size, e.what())));
             } catch (...) {
@@ -908,10 +946,11 @@ public:
             TagBufferType tagBuffer;
         };
 
-        return port_buffers{_ioHandler.buffer(), _tagIoHandler.buffer()};
+        return port_buffers{ioHandler().buffer(), tagIoHandler().buffer()};
     }
 
     void setBuffer(gr::BufferLike auto streamBuffer, gr::BufferLike auto tagBuffer) noexcept {
+        std::lock_guard lock(_ringsMutex);
         if constexpr (kIsInput) {
             _ioHandler    = streamBuffer.new_reader();
             _tagIoHandler = tagBuffer.new_reader();
@@ -919,56 +958,57 @@ public:
             _ioHandler    = streamBuffer.new_writer();
             _tagIoHandler = tagBuffer.new_writer();
         }
+        _hasRings.store(true, std::memory_order_release);
     }
 
     [[nodiscard]] constexpr const ReaderType& streamReader() const noexcept {
         static_assert(!kIsOutput, "streamReader() not applicable for outputs (yet)");
-        return _ioHandler;
+        return ioHandler();
     }
 
     [[nodiscard]] constexpr ReaderType& streamReader() noexcept {
         static_assert(!kIsOutput, "streamReader() not applicable for outputs (yet)");
-        return _ioHandler;
+        return ioHandler();
     }
 
     [[nodiscard]] constexpr const WriterType& streamWriter() const noexcept {
         static_assert(!kIsInput, "streamWriter() not applicable for inputs (yet)");
-        return _ioHandler;
+        return ioHandler();
     }
 
     [[nodiscard]] constexpr WriterType& streamWriter() noexcept {
         static_assert(!kIsInput, "streamWriter() not applicable for inputs (yet)");
-        return _ioHandler;
+        return ioHandler();
     }
 
     [[nodiscard]] constexpr const TagReaderType& tagReader() const noexcept {
         static_assert(!kIsOutput, "tagReader() not applicable for outputs (yet)");
-        return _tagIoHandler;
+        return tagIoHandler();
     }
 
     [[nodiscard]] constexpr TagReaderType& tagReader() noexcept {
         static_assert(!kIsOutput, "tagReader() not applicable for outputs (yet)");
-        return _tagIoHandler;
+        return tagIoHandler();
     }
 
     [[nodiscard]] constexpr const TagWriterType& tagWriter() const noexcept {
         static_assert(!kIsInput, "tagWriter() not applicable for inputs (yet)");
-        return _tagIoHandler;
+        return tagIoHandler();
     }
 
     [[nodiscard]] constexpr TagWriterType& tagWriter() noexcept {
         static_assert(!kIsInput, "tagWriter() not applicable for inputs (yet)");
-        return _tagIoHandler;
+        return tagIoHandler();
     }
 
     [[nodiscard]] constexpr std::pmr::memory_resource* tagResource() const noexcept {
         static_assert(!kIsInput, "tagResource() not applicable for inputs (yet)");
-        return _tagIoHandler.resource();
+        return tagIoHandler().resource();
     }
 
     [[nodiscard]] constexpr std::pmr::memory_resource* dataResource() const noexcept {
         static_assert(!kIsInput, "dataResource() not applicable for inputs (yet)");
-        return _ioHandler.resource();
+        return ioHandler().resource();
     }
 
     [[nodiscard]] property_map makeTagMap() const noexcept {
@@ -980,8 +1020,10 @@ public:
         if (!isConnected()) {
             return std::unexpected(Error("port not connected"));
         }
-        _ioHandler    = newIoHandler();
-        _tagIoHandler = newTagIoHandler();
+        std::lock_guard lock(_ringsMutex);
+        _hasRings.store(false, std::memory_order_relaxed);
+        _ioHandler.reset();
+        _tagIoHandler.reset();
         return {};
     }
 
@@ -1344,8 +1386,11 @@ inline constexpr TagPredicate auto defaultEOSTagMatcher = [](const Tag& tag, std
 inline constexpr std::optional<std::size_t> nSamplesToNextTagConditional(PortLike auto& port, detail::TagPredicate auto& predicate, std::size_t readOffset) {
     // The default ProcessNone release leaves consumption to any live InputSpan.
     // An explicit consume(0) would instead override its reader-owned consume request.
+    if (!port.isConnected()) {
+        return std::nullopt;
+    }
     ReaderSpanLike auto tagData = port.tagReader().get();
-    if (!port.isConnected() || tagData.empty()) [[likely]] {
+    if (tagData.empty()) [[likely]] {
         return std::nullopt; // default: no tags in sight
     }
     const std::size_t readPosition = port.streamReader().position();

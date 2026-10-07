@@ -1,13 +1,22 @@
 #include <boost/ut.hpp>
 
+#include <any>
+#include <array>
+#include <atomic>
+#include <bit>
 #include <chrono>
 #include <complex>
+#include <cstdint>
 #include <format>
+#include <latch>
+#include <memory>
 #include <memory_resource>
 #include <numeric>
 #include <ranges>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include <gnuradio-4.0/Port.hpp>
 #include <gnuradio-4.0/meta/formatter.hpp>
@@ -1202,6 +1211,199 @@ const boost::ut::suite<"Port PMR resource access"> portResourceTests = [] {
         expect(tagMap.contains(std::pmr::string("trigger_offset")));
 
         expect(eq(tagMap[std::pmr::string("trigger_time")].value_or(std::uint64_t{0}), std::uint64_t{123456789}));
+    };
+};
+
+// makes a resource the default one for a scope; a ring on the heap allocates through the default resource
+struct DefaultResourceScope {
+    std::pmr::memory_resource* previous;
+
+    explicit DefaultResourceScope(std::pmr::memory_resource* resource) : previous(std::pmr::set_default_resource(resource)) {}
+    ~DefaultResourceScope() { std::pmr::set_default_resource(previous); }
+
+    DefaultResourceScope(const DefaultResourceScope&)            = delete;
+    DefaultResourceScope& operator=(const DefaultResourceScope&) = delete;
+};
+
+// counts the bytes allocated through it from any thread
+struct SharedCountingResource : std::pmr::memory_resource {
+    std::atomic<std::size_t> allocated{0UZ};
+
+    void* do_allocate(std::size_t bytes, std::size_t alignment) override {
+        allocated.fetch_add(bytes, std::memory_order_relaxed);
+        return std::pmr::new_delete_resource()->allocate(bytes, alignment);
+    }
+    void do_deallocate(void* p, std::size_t bytes, std::size_t alignment) override { std::pmr::new_delete_resource()->deallocate(p, bytes, alignment); }
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override { return this == &other; }
+};
+
+// A tag ring, a message ring and the stream ring of a type that is not trivially copyable come
+// from the default resource. A counting default resource sees each of those rings.
+const boost::ut::suite<"Port rings on first use"> _ringsOnFirstUse = [] { // NOSONAR (N.B. lambda size)
+    using namespace boost::ut;
+    using namespace gr;
+    using namespace std::string_literals;
+    static constexpr std::size_t kDefault = PortOut<float>::kDefaultBufferSize;
+
+    "a constructed port allocates no ring"_test = [] {
+        CountingResource counted;
+        {
+            DefaultResourceScope scope(&counted);
+            PortIn<float>        in;
+            PortOut<float>       out;
+            PortOut<std::string> text;
+            MsgPortIn            msgIn;
+            MsgPortOut           msgOut;
+
+            expect(!in.isConnected() && !out.isConnected() && !text.isConnected() && !msgIn.isConnected() && !msgOut.isConnected());
+            expect(eq(in.available(), 0UZ)) << "an unconnected input has nothing to read";
+            expect(eq(out.available(), kDefault)) << "an unconnected output takes as many samples as its ring will hold";
+            expect(eq(out.bufferSize(), kDefault));
+            expect(eq(msgOut.bufferSize(), kDefault));
+        }
+        expect(eq(counted.allocated, 0UZ)) << std::format("five ports allocated {} bytes before their first use", counted.allocated);
+    };
+
+    "an unconnected output publishes into the ring it builds at the first reservation"_test = [] {
+        property_map         tagData = propMap({{"key", "value"}});
+        CountingResource     counted;
+        DefaultResourceScope scope(&counted);
+        PortOut<std::string> out;
+
+        out.publishTag(tagData, 0UZ);
+        expect(eq(out.nTagsDropped, 0UZ)) << "a tag on an unconnected output is not a drop";
+        expect(eq(counted.allocated, 0UZ)) << std::format("a tag on an unconnected output allocated {} bytes", counted.allocated);
+
+        {
+            auto span = out.tryReserve<SpanReleasePolicy::ProcessAll>(kDefault);
+            expect(fatal(eq(span.size(), kDefault))) << "an unconnected output takes a whole default ring";
+            std::ranges::fill(span, "sample"s);
+            span.publish(kDefault);
+        }
+        expect(gt(counted.allocated, 0UZ)) << "the first reservation builds the rings";
+        expect(eq(out.bufferSize(), kDefault));
+        expect(eq(out.available(), kDefault)) << "samples nobody reads leave the ring free";
+    };
+
+    "a message port takes its first message once connected"_test = [] {
+        CountingResource     counted;
+        DefaultResourceScope scope(&counted);
+        MsgPortOut           out;
+        MsgPortIn            in;
+        expect(eq(counted.allocated, 0UZ));
+
+        expect(fatal(out.connect(in).has_value()));
+        expect(gt(counted.allocated, 0UZ)) << "connecting builds the output's rings";
+        expect(eq(in.bufferSize(), out.bufferSize())) << "the input reads the output's ring";
+        expect(eq(out.bufferSize(), kDefault));
+        {
+            auto span        = out.streamWriter().tryReserve<SpanReleasePolicy::ProcessAll>(1UZ);
+            span[0].endpoint = "first";
+            span.publish(1UZ);
+        }
+        expect(fatal(eq(in.available(), 1UZ)));
+        auto received = in.streamReader().get<SpanReleasePolicy::ProcessAll>(1UZ);
+        expect(eq(received[0].endpoint, "first"s));
+    };
+
+    "a disconnected port releases its rings and connects again"_test = [] {
+        auto publishThree = [](PortOut<float>& out) {
+            auto span = out.tryReserve<SpanReleasePolicy::ProcessAll>(3UZ);
+            std::ranges::fill(span, 1.0f);
+            span.publish(3UZ);
+        };
+        PortOut<float> outA;
+        PortIn<float>  inA;
+        PortOut<float> outB;
+        PortIn<float>  inB;
+        expect(fatal(outA.connect(inA).has_value()));
+        expect(fatal(outB.connect(inB).has_value()));
+
+        CountingResource counted;
+        {
+            DefaultResourceScope scope(&counted);
+            expect(inA.disconnect().has_value());
+            expect(outB.disconnect().has_value());
+        }
+        expect(eq(counted.allocated, 0UZ)) << std::format("disconnecting an input and an output allocated {} bytes", counted.allocated);
+        expect(!inA.isConnected() && !outA.isConnected());
+        expect(!inB.isConnected() && !outB.isConnected());
+
+        expect(fatal(outA.connect(inA).has_value()));
+        expect(fatal(outB.connect(inB).has_value()));
+        publishThree(outA);
+        publishThree(outB);
+        expect(eq(inA.available(), 3UZ)) << "the reconnected input reads the output's samples";
+        expect(eq(inB.available(), 3UZ)) << "the input of the reconnected output reads its samples";
+    };
+
+    "an unconnected input reads nothing and takes primed samples"_test = [] {
+        CountingResource     counted;
+        DefaultResourceScope scope(&counted);
+        PortIn<std::string>  in;
+
+        expect(!nSamplesUntilNextTag(in).has_value());
+        expect(eq(in.available(), 0UZ));
+        expect(eq(counted.allocated, 0UZ)) << std::format("inspecting an unconnected input allocated {} bytes", counted.allocated);
+
+        auto writer = in.buffer().streamBuffer.new_writer();
+        {
+            auto span = writer.tryReserve<SpanReleasePolicy::ProcessAll>(2UZ);
+            std::ranges::fill(span, "primed"s);
+            span.publish(2UZ);
+        }
+        expect(eq(in.available(), 2UZ)) << "the input reads samples written into its own ring";
+    };
+
+    "threads that take a port's first reader or writer at once share one pair of rings"_test = [] {
+        constexpr std::size_t  kThreads = 8UZ; // half on the input, half on the output
+        constexpr std::size_t  kRounds  = 100UZ;
+        SharedCountingResource counted;
+        DefaultResourceScope   scope(&counted);
+
+        std::size_t onePair = 0UZ;
+        {
+            MsgPortIn  in;
+            MsgPortOut out;
+            std::ignore = in.streamReader();
+            std::ignore = out.streamWriter();
+            onePair     = counted.allocated.exchange(0UZ);
+        }
+        expect(fatal(gt(onePair, 0UZ))) << "the first reader and writer allocate their rings";
+
+        // a ring's identity is the address of the state its readers and writers share
+        auto ringIdentity = [](auto ring) { return std::bit_cast<std::uintptr_t>(std::addressof(ring.claim_strategy())); };
+
+        for (std::size_t round = 0UZ; round < kRounds; ++round) {
+            MsgPortIn                            in;
+            MsgPortOut                           out;
+            std::array<std::uintptr_t, kThreads> seen{};
+            std::array<std::any, kThreads>       taken; // holds every ring a thread took until the check; no later ring can take its address
+            {
+                std::latch                start(kThreads);
+                std::vector<std::jthread> threads;
+                for (std::size_t i = 0UZ; i < kThreads; ++i) {
+                    threads.emplace_back([&in, &out, &start, &seen, &taken, &ringIdentity, i] {
+                        auto take = [&](auto ring) {
+                            seen[i]  = ringIdentity(ring);
+                            taken[i] = std::move(ring);
+                        };
+                        start.arrive_and_wait();
+                        switch (i % 4UZ) {
+                        case 0UZ: take(in.streamReader().buffer()); break;
+                        case 1UZ: take(in.tagReader().buffer()); break;
+                        case 2UZ: take(out.streamWriter().buffer()); break;
+                        default: take(out.tagWriter().buffer()); break;
+                        }
+                    });
+                }
+            }
+            const std::array<std::uintptr_t, 4UZ> held{ringIdentity(in.streamReader().buffer()), ringIdentity(in.tagReader().buffer()), ringIdentity(out.streamWriter().buffer()), ringIdentity(out.tagWriter().buffer())};
+            for (std::size_t i = 0UZ; i < kThreads; ++i) {
+                expect(eq(seen[i], held[i % 4UZ])) << std::format("round {}: thread {} took a ring the port does not hold", round, i);
+            }
+            expect(fatal(eq(counted.allocated.exchange(0UZ), onePair))) << std::format("round {}: the ports built more than one pair of rings", round);
+        }
     };
 };
 
