@@ -60,10 +60,20 @@ GNURADIO_EXPORT ComputeRegistry& computeRegistry();
 // the resource that double_mapped_memory_resource::defaultAllocator() returns
 GNURADIO_EXPORT double_mapped_memory_resource* defaultDoubleMappedResource();
 
+// the number in the memory file name of the next double-mapped buffer
+GNURADIO_EXPORT std::atomic<std::size_t>& doubleMappedBufferCount() noexcept;
+
 // the unique_id of the next block whose type has the name typeName. Each type name counts from zero.
 GNURADIO_EXPORT std::size_t nextBlockId(std::string_view typeName);
 
 } // namespace gr::detail
+
+namespace gr::profiling::detail {
+
+// the number in the file name of the next Profiler that writes to a file without a given name
+GNURADIO_EXPORT std::atomic<std::size_t>& traceFileCount() noexcept;
+
+} // namespace gr::profiling::detail
 
 namespace gr::scheduler {
 

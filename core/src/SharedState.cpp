@@ -72,6 +72,11 @@ double_mapped_memory_resource* defaultDoubleMappedResource() {
     return &resource;
 }
 
+std::atomic<std::size_t>& doubleMappedBufferCount() noexcept {
+    static std::atomic<std::size_t> nBuffers{0UZ};
+    return nBuffers;
+}
+
 std::size_t nextBlockId(std::string_view typeName) {
     static std::mutex                                   mutex;
     static std::unordered_map<std::string, std::size_t> nextIds;
@@ -80,6 +85,15 @@ std::size_t nextBlockId(std::string_view typeName) {
 }
 
 } // namespace gr::detail
+
+namespace gr::profiling::detail {
+
+std::atomic<std::size_t>& traceFileCount() noexcept {
+    static std::atomic<std::size_t> nFiles{0UZ};
+    return nFiles;
+}
+
+} // namespace gr::profiling::detail
 
 namespace gr::scheduler {
 
