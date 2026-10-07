@@ -1,4 +1,5 @@
 #include <mutex>
+#include <string>
 #include <unordered_map>
 
 #include <gnuradio-4.0/CircularBuffer.hpp>
@@ -69,6 +70,13 @@ ComputeRegistry& computeRegistry() {
 double_mapped_memory_resource* defaultDoubleMappedResource() {
     static double_mapped_memory_resource resource;
     return &resource;
+}
+
+std::size_t nextBlockId(std::string_view typeName) {
+    static std::mutex                                   mutex;
+    static std::unordered_map<std::string, std::size_t> nextIds;
+    std::scoped_lock                                    lock(mutex);
+    return nextIds[std::string(typeName)]++;
 }
 
 } // namespace gr::detail

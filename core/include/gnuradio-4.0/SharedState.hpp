@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 
 #include <gnuradio-4.0/Export.hpp>
 
@@ -58,6 +59,9 @@ GNURADIO_EXPORT ComputeRegistry& computeRegistry();
 
 // the resource that double_mapped_memory_resource::defaultAllocator() returns
 GNURADIO_EXPORT double_mapped_memory_resource* defaultDoubleMappedResource();
+
+// the unique_id of the next block whose type has the name typeName. Each type name counts from zero.
+GNURADIO_EXPORT std::size_t nextBlockId(std::string_view typeName);
 
 } // namespace gr::detail
 

@@ -7,6 +7,7 @@
 #include <memory>
 #include <memory_resource>
 #include <print>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -92,6 +93,30 @@ using namespace qa_shared_object_state;
 
 const boost::ut::suite<"values shared with a shared object"> sharedObjectStateTests = [] {
     using namespace boost::ut;
+
+    // The program and the shared object each construct the same block type. Every instance takes an id and a name that
+    // no other instance of the type holds
+    "a block type built into the program and into a shared object takes distinct ids and names"_test = [] {
+        expect(fatal(loadCrossObjectLibrary())) << "the shared object did not load";
+        std::vector<std::shared_ptr<gr::BlockModel>>                fromLibrary;
+        std::vector<std::unique_ptr<gr::testing::CrossObjectProbe>> fromProgram;
+        std::set<std::size_t>                                       ids;
+        std::set<std::string>                                       names;
+        for (std::size_t i = 0UZ; i < 3UZ; ++i) {
+            fromLibrary.push_back(gr::globalBlockRegistry().create(kLibraryProbe, gr::property_map{}));
+            expect(fatal(fromLibrary.back() != nullptr)) << "the shared object's probe was not created";
+            fromProgram.push_back(std::make_unique<gr::testing::CrossObjectProbe>());
+            const gr::testing::CrossObjectProbe& library = libraryProbe(fromLibrary.back());
+            const gr::testing::CrossObjectProbe& program = *fromProgram.back();
+            std::println("probe from the shared object: {}, from the program: {}", library.unique_name.value(), program.unique_name.value());
+            ids.insert(library.unique_id.value());
+            ids.insert(program.unique_id.value());
+            names.insert(library.unique_name.value());
+            names.insert(program.unique_name.value());
+        }
+        expect(eq(ids.size(), 6UZ)) << "two instances hold one unique_id";
+        expect(eq(names.size(), 6UZ)) << "two instances hold one unique_name";
+    };
 
     // The schedulers come from the shared object, whose code asks the thread pool manager for the default pool when it
     // constructs a scheduler. The multi-threaded one runs its workers on the program's default pool, and no second set
