@@ -59,6 +59,11 @@ A flowgraph terminates through two propagation paths:
 5. Before returning `DONE`, each block calls `publishEoS()` to propagate the tag downstream.
 6. The process repeats until all blocks in the chain have stopped.
 
+The synchronous inputs of a block end together, at the first end among them. The block ends
+when its synchronous inputs have ended and no asynchronous input holds `min_samples` or more
+items in front of its end or is still owed items. Until then the block runs on its other inputs.
+A block that ends at the first end of any input calls `requestStop()` from `processBulk()`.
+
 ### Backward propagation (sink → source)
 
 1. A block with `disconnect_on_done = true` (default) checks whether all its **non-optional**

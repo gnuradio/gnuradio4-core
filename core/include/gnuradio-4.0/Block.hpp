@@ -1869,19 +1869,25 @@ public:
             bool        hasAnyTag  = false; // true if any tag exists in the tag buffer (not just at current position)
             std::size_t nextTag    = std::numeric_limits<std::size_t>::max();
             std::size_t nextEosTag = std::numeric_limits<std::size_t>::max();
-            bool        asyncEoS   = false;
+            bool        asyncEoS   = false; // an async input is at its end, and so is every other connected input
             bool        asyncDrain = false; // an async input still holds items in front of its end-of-stream marker
+            bool        asyncOwed  = false; // an async input holds min_samples or more items in front of its end, or has not seen its end
         } result;
 
         bool hasInputStillToCome = false; // a connected input that has not seen the end of its stream is still owed samples
+        bool hasAsyncInputAtEnd  = false;
+        bool syncHoldsSamples    = false; // a synchronous input holds samples in front of its end-of-stream marker
 
-        auto adjustForInputPort = [&result, &hasInputStillToCome]<PortLike Port>(Port& port) {
+        auto adjustForInputPort = [&result, &hasInputStillToCome, &hasAsyncInputAtEnd, &syncHoldsSamples]<PortLike Port>(Port& port) {
             if (!port.isConnected()) {
                 return;
             }
             RandomAccessReaderSpanLike auto tagData = port.tagReader().get();
             if (tagData.empty()) [[likely]] {
                 hasInputStillToCome = true;
+                if constexpr (!std::remove_cvref_t<Port>::kIsSynch) {
+                    result.asyncOwed = true;
+                }
                 return;
             }
             std::ignore                    = tagData.consume(0UZ);
@@ -1897,6 +1903,7 @@ public:
                 }
                 if (eosTagIt != tagData.end()) {
                     result.nextEosTag = std::min(result.nextEosTag, eosTagIt->index - readPosition);
+                    syncHoldsSamples  = syncHoldsSamples || eosTagIt->index > readPosition;
                 } else {
                     hasInputStillToCome = true;
                 }
@@ -1909,16 +1916,21 @@ public:
                     // while items it was handed are still queued in front of it
                     const std::size_t nBeforeEoS = eosTagIt->index - readPosition;
                     if (nBeforeEoS == 0UZ || nBeforeEoS < port.min_samples) {
-                        result.asyncEoS = true;
+                        hasAsyncInputAtEnd = true;
                     } else {
                         result.asyncDrain = true;
+                        result.asyncOwed  = true;
                     }
                 } else {
                     hasInputStillToCome = true;
+                    result.asyncOwed    = true;
                 }
             }
         };
         for_each_port([&adjustForInputPort](PortLike auto& port) { adjustForInputPort(port); }, inputPorts<PortType::STREAM>(&self()));
+        // An async input's end ends the block only when no connected input holds or is still owed samples. Until then
+        // the block runs on its other inputs. A block that ends at the first end requests its own stop.
+        result.asyncEoS = hasAsyncInputAtEnd && !result.asyncDrain && !syncHoldsSamples && !hasInputStillToCome;
         // draining is the end of the graph, where what the block still holds is all it will ever get; while any
         // input is still owed samples the block is in its steady state and nothing about its remainder is settled
         result.asyncDrain = result.asyncDrain && !hasInputStillToCome;
@@ -2326,7 +2338,7 @@ public:
         std::size_t maxSyncAvailableOut = outputStreamCache.maxSyncAvailable();
         bool        hasAsyncOut         = outputStreamCache.hasASyncAvailable();
 
-        auto [hasTag, hasAnyTag, nextTag, nextEosTag, asyncEoS, asyncDrain] = getNextTagAndEosPosition();
+        auto [hasTag, hasAnyTag, nextTag, nextEosTag, asyncEoS, asyncDrain, asyncOwed] = getNextTagAndEosPosition();
         if constexpr (forwardTagPropagation) {
             nextTag = std::numeric_limits<std::size_t>::max(); // don't break chunks at tags — tags carry forward
         }
@@ -2340,7 +2352,9 @@ public:
         const std::size_t availableToProcess              = std::min({maxSyncIn, maxChunk, availAfterSkip, ensureMinimalDecimation, eosAfterSkip});
         const std::size_t availableToPublish              = std::min({maxSyncOut, maxSyncAvailableOut});
         auto [resampledIn, resampledOut, resampledStatus] = computeResampling(std::min(minSyncIn, nextEosTag), availableToProcess, minSyncOut, availableToPublish, requestedWork);
-        const bool isEosPresent                           = nextEosTag <= 0 || eosAfterSkip < minSyncIn || eosAfterSkip < input_chunk_size || output_chunk_size * (eosAfterSkip / input_chunk_size) < minSyncOut;
+        // the end of the synchronous inputs ends the block only when no async input holds min_samples or more items or
+        // is still owed items
+        const bool isEosPresent = !asyncOwed && (nextEosTag <= 0 || eosAfterSkip < minSyncIn || eosAfterSkip < input_chunk_size || output_chunk_size * (eosAfterSkip / input_chunk_size) < minSyncOut);
         return {.resampledIn = resampledIn, .resampledOut = resampledOut, .inputSkipBefore = inputSkipBefore, .resampledStatus = resampledStatus, .hasTag = hasTag, .hasAnyTag = hasAnyTag, .asyncEoS = asyncEoS, .isEosPresent = isEosPresent, .hasAsyncIn = hasAsyncIn, .hasAsyncOut = hasAsyncOut, .asyncDrain = asyncDrain};
     }
 
