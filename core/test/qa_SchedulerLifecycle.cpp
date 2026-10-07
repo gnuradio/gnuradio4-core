@@ -2306,8 +2306,9 @@ struct Loop {
 }
 
 struct LoopStart {
-    std::size_t nPrimedSamples = 0UZ;
-    std::size_t nPrimingErrors = 0UZ;
+    std::size_t nPrimedSamples     = 0UZ;
+    std::size_t nPrimingErrors     = 0UZ;
+    std::size_t nPrimedAfterResume = 0UZ;
 };
 
 // the start primes before the first work() call on the loop. The count is final once a sample has arrived and both
@@ -2329,6 +2330,13 @@ struct LoopStart {
     auto      messages    = fromScheduler.streamReader().get();
     result.nPrimingErrors = static_cast<std::size_t>(std::ranges::count_if(messages, [](const gr::Message& message) { return message.endpoint == "connectPendingEdges()" && !message.data.has_value(); }));
     std::ignore           = messages.consume(messages.size());
+
+    // the resume primes before it returns. Both inputs empty after it means the loop consumed what the resume primed.
+    expect(scheduler.changeStateTo(REQUESTED_PAUSE).has_value());
+    expect(awaitState(scheduler, PAUSED)) << "the loop's scheduler did not pause";
+    expect(scheduler.changeStateTo(RUNNING).has_value());
+    expect(awaitCondition([&loop] { return loop.front->in.available() == 0UZ && loop.back->in.available() == 0UZ; })) << "the samples primed at the resume did not drain";
+    result.nPrimedAfterResume = gLoopSamples.load(std::memory_order_relaxed);
 
     expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
     expect(awaitState(scheduler, STOPPED)) << "the loop's scheduler did not stop";
@@ -2352,6 +2360,8 @@ const boost::ut::suite<"a feedback loop inside a group"> nestedLoopPrimingTests 
         std::ignore                     = groupFlow.addBlock(wrapper);
         const qa_sched::LoopStart group = qa_sched::startLoop(std::move(groupFlow), groupLoop);
         expect(eq(group.nPrimedSamples, top.nPrimedSamples)) << "a loop inside a transparent subgraph";
+        expect(eq(group.nPrimingErrors, top.nPrimingErrors)) << "priming errors for a loop inside a transparent subgraph";
+        expect(eq(group.nPrimedAfterResume, top.nPrimedAfterResume)) << "a loop inside a transparent subgraph after a pause and resume";
 
         gr::Graph            innerFlow;
         const qa_sched::Loop childLoop = qa_sched::addLoop(innerFlow);
@@ -2362,6 +2372,7 @@ const boost::ut::suite<"a feedback loop inside a group"> nestedLoopPrimingTests 
         const qa_sched::LoopStart child = qa_sched::startLoop(std::move(childFlow), childLoop);
         expect(eq(child.nPrimedSamples, top.nPrimedSamples)) << "a loop inside a sub-scheduler";
         expect(eq(child.nPrimingErrors, top.nPrimingErrors)) << "priming errors for a loop inside a sub-scheduler";
+        expect(eq(child.nPrimedAfterResume, top.nPrimedAfterResume)) << "a loop inside a sub-scheduler after a pause and resume";
     };
 };
 

@@ -697,14 +697,15 @@ protected:
         };
 
         bool result = _graph->connectPendingEdges();
-        primeFeedbackPorts(gr::graph::flatten(*_graph)); // need to flatten graph due to potential loops from within the subgraph to blocks in the parents.
-        graph::forEachBlock<TransparentBlockGroup>(*_graph, [&result, &primeFeedbackPorts](auto& block) {
+        graph::forEachBlock<TransparentBlockGroup>(*_graph, [&result](auto& block) {
             if (block->blockCategory() == TransparentBlockGroup) {
                 auto* graph = static_cast<GraphWrapper<gr::Graph>*>(block.get());
-                result      = result && graph->blockRef().connectPendingEdges();
-                primeFeedbackPorts(gr::graph::flatten(graph->blockRef()));
+                result      = graph->blockRef().connectPendingEdges() && result;
             }
         });
+        // priming writes into the buffer of a connected edge. It runs once, after every transparent group's edges are
+        // connected, and the flattened graph holds each loop inside a group.
+        primeFeedbackPorts(gr::graph::flatten(*_graph)); // need to flatten graph due to potential loops from within the subgraph to blocks in the parents.
         return result;
     }
 
