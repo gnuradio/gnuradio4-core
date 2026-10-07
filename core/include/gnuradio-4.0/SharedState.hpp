@@ -49,8 +49,9 @@ GNURADIO_EXPORT const Sequence*& publishWakeExempt() noexcept;
 // a message is not work: the progress sequence moves only for samples.
 GNURADIO_EXPORT std::size_t& handledMessageSpans() noexcept;
 
-// the work() calls on the calling thread to a block that drains an asynchronous input. Such a block ends after a bound
-// of calls in which nothing it waits on moved.
+// the work() calls on the calling thread to a draining block that does not wait on its outputs. A draining block's
+// connected inputs all have their end in view, and one input holds samples in front of its end, an asynchronous input
+// at least min_samples. Such a block ends after a bound of calls in which nothing it waits on moved.
 GNURADIO_EXPORT std::size_t& drainingCalls() noexcept;
 
 // the registry that ComputeRegistry::instance() returns. A provider runs the code of the shared object that defines it,

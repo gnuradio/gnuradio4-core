@@ -5,8 +5,10 @@
 #include <condition_variable>
 #include <cstddef>
 #include <mutex>
+#include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include <gnuradio-4.0/Block.hpp>
 #include <gnuradio-4.0/Graph.hpp>
@@ -307,9 +309,179 @@ struct SyncPairSink : gr::Block<SyncPairSink> {
     }
 };
 
+// needs a window of samples to make one item and takes one sample per call, and keeps the default input minimum of
+// one: at the end of a finite stream it is offered the last samples on every call and never takes them
+struct HoldBackRelay : gr::Block<HoldBackRelay> {
+    gr::PortIn<int>  in;
+    gr::PortOut<int> out;
+
+    GR_MAKE_REFLECTABLE(HoldBackRelay, in, out);
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& inSpan, gr::OutputSpanLike auto& outSpan) {
+        if (inSpan.size() < kWindow) {
+            std::ignore = inSpan.consume(0UZ);
+            outSpan.publish(0UZ);
+            return gr::work::Status::INSUFFICIENT_INPUT_ITEMS;
+        }
+        if (outSpan.size() == 0UZ) {
+            std::ignore = inSpan.consume(0UZ);
+            outSpan.publish(0UZ);
+            return gr::work::Status::INSUFFICIENT_OUTPUT_ITEMS;
+        }
+        outSpan[0UZ] = inSpan[0UZ];
+        std::ignore  = inSpan.consume(1UZ);
+        outSpan.publish(1UZ);
+        return gr::work::Status::OK;
+    }
+};
+
+// publishes one and a half of its output ring as fast as the ring takes them and then ends its stream
+struct RingAndAHalfSource : gr::Block<RingAndAHalfSource> {
+    gr::PortOut<int> out;
+
+    GR_MAKE_REFLECTABLE(RingAndAHalfSource, out);
+
+    std::size_t _nItems     = 0UZ;
+    std::size_t _nPublished = 0UZ;
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        if (_nItems == 0UZ) {
+            _nItems = out.bufferSize() + out.bufferSize() / 2UZ;
+        }
+        const std::size_t n = std::min(outSpan.size(), _nItems - _nPublished);
+        for (std::size_t i = 0UZ; i < n; ++i) {
+            outSpan[i] = static_cast<int>(_nPublished + i);
+        }
+        outSpan.publish(n);
+        _nPublished += n;
+        return _nPublished == _nItems ? gr::work::Status::DONE : gr::work::Status::OK;
+    }
+};
+
+struct Passthrough : gr::Block<Passthrough> {
+    gr::PortIn<int>  in;
+    gr::PortOut<int> out;
+
+    GR_MAKE_REFLECTABLE(Passthrough, in, out);
+
+    [[nodiscard]] int processOne(int value) const noexcept { return value; }
+};
+
+constexpr gr::Size_t kInterpolation = 2U;
+
+// writes each input sample kInterpolation times. One input sample needs room for kInterpolation output samples.
+struct Interpolator : gr::Block<Interpolator, gr::Resampling<1U, kInterpolation, true>> {
+    gr::PortIn<int>  in;
+    gr::PortOut<int> out;
+
+    GR_MAKE_REFLECTABLE(Interpolator, in, out);
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& inSpan, gr::OutputSpanLike auto& outSpan) {
+        const std::size_t n = inSpan.size();
+        for (std::size_t i = 0UZ; i < n; ++i) {
+            for (std::size_t k = 0UZ; k < kInterpolation; ++k) {
+                outSpan[i * kInterpolation + k] = inSpan[i];
+            }
+        }
+        std::ignore = inSpan.consume(n);
+        outSpan.publish(n * kInterpolation);
+        return gr::work::Status::OK;
+    }
+};
+
+constexpr std::size_t kDrainStallCalls = 1024UZ; // idle calls after which a block with its input's end in view ends
+constexpr std::size_t kLateCalls       = 2UZ * kDrainStallCalls;
+
+// takes nothing on its first kLateCalls calls and everything after them, like a consumer busy for a long time in one
+// call. With _nTakenWhenFull set, it takes that many items the first time it finds its ring full and leaves its
+// producer that much room. It counts the calls it declines after the source has published its last item.
+struct LateSink : gr::Block<LateSink> {
+    gr::PortIn<int> in;
+
+    GR_MAKE_REFLECTABLE(LateSink, in);
+
+    const RingAndAHalfSource* _source         = nullptr;
+    std::size_t               _nTakenWhenFull = 0UZ;
+
+    bool        _tookWhenFull              = false;
+    std::size_t _nCalls                    = 0UZ;
+    std::size_t _ringSize                  = 0UZ;
+    std::size_t _nLargestDeclined          = 0UZ; // the most items one declined call was offered
+    std::size_t _nDeclinedAfterSourceEnded = 0UZ;
+    std::size_t _nReceived                 = 0UZ;
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& inSpan) {
+        _nCalls++;
+        _ringSize = in.bufferSize();
+        if (_nCalls <= kLateCalls) {
+            if (_nTakenWhenFull > 0UZ && !_tookWhenFull && inSpan.size() == _ringSize) {
+                _tookWhenFull = true;
+                _nReceived += _nTakenWhenFull;
+                std::ignore = inSpan.consume(_nTakenWhenFull);
+                return gr::work::Status::OK;
+            }
+            _nLargestDeclined = std::max(_nLargestDeclined, inSpan.size());
+            if (_source != nullptr && _source->_nItems > 0UZ && _source->_nPublished == _source->_nItems) {
+                _nDeclinedAfterSourceEnded++;
+            }
+            std::ignore = inSpan.consume(0UZ);
+            return gr::work::Status::INSUFFICIENT_INPUT_ITEMS;
+        }
+        _nReceived += inSpan.size();
+        std::ignore = inSpan.consume(inSpan.size());
+        return gr::work::Status::OK;
+    }
+};
+
+// returns INSUFFICIENT_OUTPUT_ITEMS with nothing taken on its first kLateCalls calls and takes everything after them,
+// like a sink that waits on a device to accept samples at the device's own pace
+struct DeviceSink : gr::Block<DeviceSink> {
+    gr::PortIn<int> in;
+
+    GR_MAKE_REFLECTABLE(DeviceSink, in);
+
+    std::size_t _nCalls              = 0UZ;
+    std::size_t _nWaitsWithEndInView = 0UZ;
+    std::size_t _nReceived           = 0UZ;
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& inSpan) {
+        _nCalls++;
+        if (_nCalls <= kLateCalls) {
+            if (gr::samples_to_eos_tag(in).has_value()) {
+                _nWaitsWithEndInView++;
+            }
+            std::ignore = inSpan.consume(0UZ);
+            return gr::work::Status::INSUFFICIENT_OUTPUT_ITEMS;
+        }
+        _nReceived += inSpan.size();
+        std::ignore = inSpan.consume(inSpan.size());
+        return gr::work::Status::OK;
+    }
+};
+
+constexpr std::string_view kDrainStallEndpoint = "drain stall";
+
+// takes every message waiting on the port and returns the drain-stall notifications the named block sent
+[[nodiscard]] std::vector<gr::Message> takeDrainStallReports(gr::MsgPortIn& port, std::string_view blockName) {
+    std::vector<gr::Message> reports;
+    auto                     messages = port.streamReader().get();
+    for (const gr::Message& message : messages) {
+        if (message.cmd == gr::message::Command::Notify && message.serviceName == blockName && message.endpoint == kDrainStallEndpoint && message.data.has_value()) {
+            reports.push_back(message);
+        }
+    }
+    std::ignore = messages.consume(messages.size());
+    return reports;
+}
+
+[[nodiscard]] std::size_t reportedValue(const gr::Message& report, std::string_view key) { return report.data->at(std::pmr::string(key)).value_or<gr::Size_t>(0U); }
+
 using SerialScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>;
 
 constexpr auto kRunBound = std::chrono::seconds(5);
+
+// The cases whose consumer declines for kLateCalls calls run this long at most. The scheduler sleeps on each idle pass.
+constexpr auto kSlowConsumerBound = std::chrono::seconds(30);
 
 // runAndWait() on its own thread with a deadline, so a graph that fails to end fails the assertion
 // instead of hanging ctest
@@ -371,12 +543,20 @@ const boost::ut::suite<"end-of-stream drain"> drainTests = [] {
         expect(flow.connect<"out", "in">(relay, sink).has_value());
 
         qa_drain::SerialScheduler scheduler;
+        gr::MsgPortIn             fromScheduler;
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
         expect(scheduler.exchange(std::move(flow)).has_value());
         expect(qa_drain::runWithin(scheduler, std::chrono::duration_cast<std::chrono::milliseconds>(qa_drain::kRunBound))) << "a block making no progress held the graph open";
 
         expect(gt(relay._nCalls, 1UZ)) << "the block was not offered its remainder at all";
         expect(eq(sink._nReceived, 0UZ));
         expect(relay.state() == STOPPED);
+        const std::vector<gr::Message> reports = qa_drain::takeDrainStallReports(fromScheduler, relay.unique_name);
+        expect(eq(reports.size(), 1UZ)) << "the block's end was not reported once";
+        if (reports.size() == 1UZ) {
+            expect(eq(qa_drain::reportedValue(reports[0UZ], "min_samples"), relay.in.min_samples));
+            expect(eq(qa_drain::reportedValue(reports[0UZ], "samples_left"), qa_drain::kBurst));
+        }
     };
 
     "an input minimum published from processBulk governs the next call and ends the stream"_test = [] {
@@ -507,6 +687,94 @@ const boost::ut::suite<"end-of-stream drain"> drainTests = [] {
         expect(lt(sink._nSecond, qa_drain::kLongBranch)) << "the block ran past the end of its first input";
         expect(sink.state() == STOPPED);
         expect(longSource.state() == STOPPED) << "the source left without a reader did not stop";
+    };
+
+    "a block holding back the end of a finite stream ends within the bound and reports what it left"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_drain::BurstSource>();
+        auto&     relay  = flow.emplaceBlock<qa_drain::HoldBackRelay>();
+        auto&     sink   = flow.emplaceBlock<qa_drain::CountingSink>();
+        expect(flow.connect<"out", "in">(source, relay).has_value());
+        expect(flow.connect<"out", "in">(relay, sink).has_value());
+
+        qa_drain::SerialScheduler scheduler;
+        gr::MsgPortIn             fromScheduler;
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(qa_drain::runWithin(scheduler, std::chrono::duration_cast<std::chrono::milliseconds>(qa_drain::kRunBound))) << "a block holding back the end of its stream held the graph open";
+
+        expect(eq(sink._nReceived, qa_drain::kBurst - qa_drain::kWindow + 1UZ)) << "one item per sample a window could be filled from";
+        expect(relay.state() == STOPPED);
+        const std::vector<gr::Message> reports = qa_drain::takeDrainStallReports(fromScheduler, relay.unique_name);
+        expect(eq(reports.size(), 1UZ)) << "the block's end was not reported once";
+        if (reports.size() == 1UZ) {
+            expect(eq(qa_drain::reportedValue(reports[0UZ], "min_samples"), relay.in.min_samples));
+            expect(eq(qa_drain::reportedValue(reports[0UZ], "samples_left"), qa_drain::kWindow - 1UZ));
+        }
+    };
+
+    "a block waiting on a full output is not ended while its input holds samples"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_drain::RingAndAHalfSource>();
+        auto&     relay  = flow.emplaceBlock<qa_drain::Passthrough>();
+        auto&     sink   = flow.emplaceBlock<qa_drain::LateSink>();
+
+        sink._source = &source;
+        expect(flow.connect<"out", "in">(source, relay).has_value());
+        expect(flow.connect<"out", "in">(relay, sink).has_value());
+
+        qa_drain::SerialScheduler scheduler;
+        gr::MsgPortIn             fromScheduler;
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(qa_drain::runWithin(scheduler, std::chrono::duration_cast<std::chrono::milliseconds>(qa_drain::kSlowConsumerBound))) << "the graph did not end";
+
+        expect(eq(sink._nLargestDeclined, sink._ringSize)) << "the relay's output never filled while the sink declined";
+        expect(gt(source._nItems, sink._ringSize)) << "the relay held no samples behind its full output";
+        expect(gt(sink._nDeclinedAfterSourceEnded, qa_drain::kDrainStallCalls)) << "the relay's input end was not in view for long while the sink declined";
+        expect(eq(sink._nReceived, source._nItems)) << "the relay ended while a slow consumer kept its output full";
+        expect(qa_drain::takeDrainStallReports(fromScheduler, relay.unique_name).empty());
+    };
+
+    "a resampling block whose output has room for less than one chunk is not ended while its input holds samples"_test = [] {
+        gr::Graph flow;
+        auto&     source       = flow.emplaceBlock<qa_drain::RingAndAHalfSource>();
+        auto&     interpolator = flow.emplaceBlock<qa_drain::Interpolator>();
+        auto&     sink         = flow.emplaceBlock<qa_drain::LateSink>();
+
+        sink._source         = &source;
+        sink._nTakenWhenFull = 1UZ;
+        expect(flow.connect<"out", "in">(source, interpolator).has_value());
+        expect(flow.connect<"out", "in">(interpolator, sink).has_value());
+
+        qa_drain::SerialScheduler scheduler;
+        gr::MsgPortIn             fromScheduler;
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(qa_drain::runWithin(scheduler, std::chrono::duration_cast<std::chrono::milliseconds>(qa_drain::kSlowConsumerBound))) << "the graph did not end";
+
+        expect(sink._tookWhenFull) << "the interpolator's output never filled";
+        expect(eq(sink._nLargestDeclined + sink._nTakenWhenFull, sink._ringSize)) << "the interpolator's output had room for a chunk while the sink declined";
+        expect(gt(sink._nDeclinedAfterSourceEnded, qa_drain::kDrainStallCalls)) << "the interpolator's input end was not in view for long while the sink declined";
+        expect(eq(sink._nReceived, source._nItems * qa_drain::kInterpolation)) << "the interpolator ended while its output had room for less than one chunk";
+        expect(qa_drain::takeDrainStallReports(fromScheduler, interpolator.unique_name).empty());
+    };
+
+    "a block that returns INSUFFICIENT_OUTPUT_ITEMS is not ended while its input holds samples"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_drain::BurstSource>();
+        auto&     sink   = flow.emplaceBlock<qa_drain::DeviceSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        qa_drain::SerialScheduler scheduler;
+        gr::MsgPortIn             fromScheduler;
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(qa_drain::runWithin(scheduler, std::chrono::duration_cast<std::chrono::milliseconds>(qa_drain::kSlowConsumerBound))) << "the graph did not end";
+
+        expect(gt(sink._nWaitsWithEndInView, qa_drain::kDrainStallCalls)) << "the sink's input end was not in view for long while it waited";
+        expect(eq(sink._nReceived, qa_drain::kBurst)) << "the sink was ended while it waited on its device";
+        expect(qa_drain::takeDrainStallReports(fromScheduler, sink.unique_name).empty());
     };
 
     "a graph ending on an error does not drain"_test = [] {
