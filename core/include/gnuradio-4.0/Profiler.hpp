@@ -2,6 +2,7 @@
 #define GNURADIO_PROFILER_HPP
 
 #include "CircularBuffer.hpp"
+#include "SharedState.hpp"
 
 #include <chrono>
 #include <format>
@@ -338,8 +339,7 @@ public:
             std::ofstream out_file;
             if (options.output_mode == OutputMode::File) {
                 if (file_name.empty()) {
-                    static int counter = 0;
-                    file_name          = std::format("profile.{}.{}.trace", getpid(), gr::atomic_ref(counter).fetch_add(1));
+                    file_name = std::format("profile.{}.{}.trace", getpid(), detail::traceFileCount().fetch_add(1UZ));
                 }
                 out_file = std::ofstream(file_name, std::ios::out | std::ios::binary);
             }
