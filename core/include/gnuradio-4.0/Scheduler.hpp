@@ -454,7 +454,7 @@ public:
     [[nodiscard]] std::span<const Edge>                        edges() const noexcept { return _graph->edges(); }
 
     void connectBlockMessagePorts() {
-        const auto available = _graph->msgIn.streamReader().available();
+        const auto available = _graph->msgIn.available();
         if (available != 0UZ) {
             ReaderSpanLike auto msgInSpan = _graph->msgIn.streamReader().get<SpanReleasePolicy::ProcessAll>(available);
             _pendingMessagesToChildren.insert(_pendingMessagesToChildren.end(), msgInSpan.begin(), msgInSpan.end());
