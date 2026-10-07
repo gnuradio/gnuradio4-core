@@ -1,5 +1,6 @@
 #include <boost/ut.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -163,6 +164,149 @@ struct CountingSink : gr::Block<CountingSink> {
     void processOne(int) { _nReceived++; }
 };
 
+constexpr std::size_t kShortBranch = 10UZ;
+constexpr std::size_t kLongBranch  = 1000UZ;
+constexpr std::size_t kMaxPerCall  = 8UZ;
+
+// publishes _nItems items, at most _maxPerCall per call, and ends its stream in the call that publishes the last one
+struct CountedSource : gr::Block<CountedSource> {
+    gr::PortOut<int> out;
+
+    GR_MAKE_REFLECTABLE(CountedSource, out);
+
+    std::size_t _nItems     = 0UZ;
+    std::size_t _maxPerCall = 0UZ;
+    std::size_t _nPublished = 0UZ;
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        const std::size_t n = std::min({outSpan.size(), _maxPerCall, _nItems - _nPublished});
+        for (std::size_t i = 0UZ; i < n; ++i) {
+            outSpan[i] = static_cast<int>(_nPublished + i);
+        }
+        outSpan.publish(n);
+        _nPublished += n;
+        return _nPublished == _nItems ? gr::work::Status::DONE : gr::work::Status::OK;
+    }
+};
+
+// takes everything its two asynchronous inputs hold and counts it per input
+struct AsyncPairSink : gr::Block<AsyncPairSink> {
+    gr::PortIn<int, gr::Async> first;
+    gr::PortIn<int, gr::Async> second;
+
+    GR_MAKE_REFLECTABLE(AsyncPairSink, first, second);
+
+    std::size_t _nFirst  = 0UZ;
+    std::size_t _nSecond = 0UZ;
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& firstSpan, gr::InputSpanLike auto& secondSpan) {
+        const std::size_t nFirst  = firstSpan.size();
+        const std::size_t nSecond = secondSpan.size();
+        std::ignore               = firstSpan.consume(nFirst);
+        std::ignore               = secondSpan.consume(nSecond);
+        _nFirst += nFirst;
+        _nSecond += nSecond;
+        return nFirst + nSecond > 0UZ ? gr::work::Status::OK : gr::work::Status::INSUFFICIENT_INPUT_ITEMS;
+    }
+};
+
+// counts like AsyncPairSink and ends its own stream at the end of its first input
+struct FirstEndSink : gr::Block<FirstEndSink> {
+    gr::PortIn<int, gr::Async> first;
+    gr::PortIn<int, gr::Async> second;
+
+    GR_MAKE_REFLECTABLE(FirstEndSink, first, second);
+
+    std::size_t _nFirst  = 0UZ;
+    std::size_t _nSecond = 0UZ;
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& firstSpan, gr::InputSpanLike auto& secondSpan) {
+        if (firstSpan.size() == 0UZ && gr::samples_to_eos_tag(first) == 0UZ) {
+            std::ignore = firstSpan.consume(0UZ);
+            std::ignore = secondSpan.consume(0UZ);
+            this->requestStop();
+            return gr::work::Status::OK;
+        }
+        const std::size_t nFirst  = firstSpan.size();
+        const std::size_t nSecond = secondSpan.size();
+        std::ignore               = firstSpan.consume(nFirst);
+        std::ignore               = secondSpan.consume(nSecond);
+        _nFirst += nFirst;
+        _nSecond += nSecond;
+        return nFirst + nSecond > 0UZ ? gr::work::Status::OK : gr::work::Status::INSUFFICIENT_INPUT_ITEMS;
+    }
+};
+
+// takes everything a synchronous and an asynchronous input hold and counts it per input
+struct MixedPairSink : gr::Block<MixedPairSink> {
+    gr::PortIn<int>            data;
+    gr::PortIn<int, gr::Async> aux;
+
+    GR_MAKE_REFLECTABLE(MixedPairSink, data, aux);
+
+    std::size_t _nData              = 0UZ;
+    std::size_t _nAux               = 0UZ;
+    std::size_t _nCallsAfterDataEnd = 0UZ; // calls that found the synchronous input at its end
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& dataSpan, gr::InputSpanLike auto& auxSpan) {
+        if (dataSpan.size() == 0UZ && gr::samples_to_eos_tag(data) == 0UZ) {
+            _nCallsAfterDataEnd++;
+        }
+        const std::size_t nData = dataSpan.size();
+        const std::size_t nAux  = auxSpan.size();
+        std::ignore             = dataSpan.consume(nData);
+        std::ignore             = auxSpan.consume(nAux);
+        _nData += nData;
+        _nAux += nAux;
+        return nData + nAux > 0UZ ? gr::work::Status::OK : gr::work::Status::INSUFFICIENT_INPUT_ITEMS;
+    }
+};
+
+constexpr std::size_t kStreamItems = 1000UZ; // one source's stream, fed to a block over a direct edge and a slow branch
+
+// forwards one sample per call. A branch through it delivers each sample later than a direct edge from the same source.
+struct OneSamplePerCall : gr::Block<OneSamplePerCall> {
+    gr::PortIn<int>  in;
+    gr::PortOut<int> out;
+
+    GR_MAKE_REFLECTABLE(OneSamplePerCall, in, out);
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& inSpan, gr::OutputSpanLike auto& outSpan) {
+        outSpan[0UZ] = inSpan[0UZ];
+        std::ignore  = inSpan.consume(1UZ);
+        outSpan.publish(1UZ);
+        return gr::work::Status::OK;
+    }
+};
+
+// takes what its two synchronous inputs hold together and counts the pairs whose values differ
+struct SyncPairSink : gr::Block<SyncPairSink> {
+    gr::PortIn<int> first;
+    gr::PortIn<int> second;
+
+    GR_MAKE_REFLECTABLE(SyncPairSink, first, second);
+
+    std::size_t _nReceived          = 0UZ;
+    std::size_t _nMismatched        = 0UZ;
+    std::size_t _nCallsFirstEndOnly = 0UZ; // calls that found the end of the first input in view and none on the second
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& firstSpan, gr::InputSpanLike auto& secondSpan) {
+        if (gr::samples_to_eos_tag(first).has_value() && !gr::samples_to_eos_tag(second).has_value()) {
+            _nCallsFirstEndOnly++;
+        }
+        const std::size_t n = firstSpan.size();
+        for (std::size_t i = 0UZ; i < n; ++i) {
+            if (firstSpan[i] != secondSpan[i]) {
+                _nMismatched++;
+            }
+        }
+        std::ignore = firstSpan.consume(n);
+        std::ignore = secondSpan.consume(n);
+        _nReceived += n;
+        return gr::work::Status::OK;
+    }
+};
+
 using SerialScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>;
 
 constexpr auto kRunBound = std::chrono::seconds(5);
@@ -251,6 +395,118 @@ const boost::ut::suite<"end-of-stream drain"> drainTests = [] {
         expect(eq(sink._nReceived, qa_drain::kBurst - qa_drain::kWindow + 1UZ)) << "one item per sample the window could be filled from";
         expect(relay._epilogueRan) << "a block whose minimum can no longer be met was not driven to its epilogue";
         expect(eq(relay._tail, qa_drain::kWindow - 1UZ)) << "the tail is what no window could be filled from";
+    };
+
+    "an asynchronous input's end leaves the block running while another input is owed items"_test = [] {
+        gr::Graph flow;
+        auto&     shortSource = flow.emplaceBlock<qa_drain::CountedSource>();
+        auto&     longSource  = flow.emplaceBlock<qa_drain::CountedSource>();
+        auto&     sink        = flow.emplaceBlock<qa_drain::AsyncPairSink>();
+
+        shortSource._nItems     = qa_drain::kShortBranch;
+        shortSource._maxPerCall = qa_drain::kShortBranch;
+        longSource._nItems      = qa_drain::kLongBranch;
+        longSource._maxPerCall  = qa_drain::kMaxPerCall;
+        expect(flow.connect<"out", "first">(shortSource, sink).has_value());
+        expect(flow.connect<"out", "second">(longSource, sink).has_value());
+
+        qa_drain::SerialScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(qa_drain::runWithin(scheduler, std::chrono::duration_cast<std::chrono::milliseconds>(qa_drain::kRunBound))) << "the graph did not end";
+
+        expect(eq(sink._nFirst, qa_drain::kShortBranch));
+        expect(eq(sink._nSecond, qa_drain::kLongBranch)) << "the block ended at the end of its short branch";
+        expect(eq(sink._nFirst + sink._nSecond, qa_drain::kShortBranch + qa_drain::kLongBranch));
+        expect(sink.state() == STOPPED);
+    };
+
+    "an asynchronous input's end leaves the block running while its synchronous input is owed samples"_test = [] {
+        gr::Graph flow;
+        auto&     shortSource = flow.emplaceBlock<qa_drain::CountedSource>();
+        auto&     longSource  = flow.emplaceBlock<qa_drain::CountedSource>();
+        auto&     sink        = flow.emplaceBlock<qa_drain::MixedPairSink>();
+
+        shortSource._nItems     = qa_drain::kShortBranch;
+        shortSource._maxPerCall = qa_drain::kShortBranch;
+        longSource._nItems      = qa_drain::kLongBranch;
+        longSource._maxPerCall  = qa_drain::kMaxPerCall;
+        expect(flow.connect<"out", "aux">(shortSource, sink).has_value());
+        expect(flow.connect<"out", "data">(longSource, sink).has_value());
+
+        qa_drain::SerialScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(qa_drain::runWithin(scheduler, std::chrono::duration_cast<std::chrono::milliseconds>(qa_drain::kRunBound))) << "the graph did not end";
+
+        expect(eq(sink._nAux, qa_drain::kShortBranch));
+        expect(eq(sink._nData, qa_drain::kLongBranch)) << "the block ended at the end of its asynchronous input";
+        expect(sink.state() == STOPPED);
+    };
+
+    "a block with two synchronous inputs fed by branches of different latency receives every sample"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_drain::CountedSource>();
+        auto&     relay  = flow.emplaceBlock<qa_drain::OneSamplePerCall>();
+        auto&     sink   = flow.emplaceBlock<qa_drain::SyncPairSink>();
+
+        source._nItems     = qa_drain::kStreamItems;
+        source._maxPerCall = qa_drain::kMaxPerCall;
+        expect(flow.connect<"out", "first">(source, sink).has_value());
+        expect(flow.connect<"out", "in">(source, relay).has_value());
+        expect(flow.connect<"out", "second">(relay, sink).has_value());
+
+        qa_drain::SerialScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(qa_drain::runWithin(scheduler, std::chrono::duration_cast<std::chrono::milliseconds>(qa_drain::kRunBound))) << "the graph did not end";
+
+        expect(gt(sink._nCallsFirstEndOnly, 0UZ)) << "the direct edge's end never reached the block ahead of the slow branch's";
+        expect(eq(sink._nReceived, qa_drain::kStreamItems)) << "the block ended at the end of its direct edge";
+        expect(eq(sink._nMismatched, 0UZ)) << "the two inputs did not advance together";
+        expect(sink.state() == STOPPED);
+    };
+
+    "a synchronous input's end leaves the block running while its asynchronous input is owed items"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_drain::CountedSource>();
+        auto&     relay  = flow.emplaceBlock<qa_drain::OneSamplePerCall>();
+        auto&     sink   = flow.emplaceBlock<qa_drain::MixedPairSink>();
+
+        source._nItems     = qa_drain::kStreamItems;
+        source._maxPerCall = qa_drain::kMaxPerCall;
+        expect(flow.connect<"out", "data">(source, sink).has_value());
+        expect(flow.connect<"out", "in">(source, relay).has_value());
+        expect(flow.connect<"out", "aux">(relay, sink).has_value());
+
+        qa_drain::SerialScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(qa_drain::runWithin(scheduler, std::chrono::duration_cast<std::chrono::milliseconds>(qa_drain::kRunBound))) << "the graph did not end";
+
+        expect(eq(sink._nData, qa_drain::kStreamItems));
+        expect(eq(sink._nAux, qa_drain::kStreamItems)) << "the block ended at the end of its synchronous input";
+        expect(gt(sink._nCallsAfterDataEnd, 0UZ)) << "the block did not run with its synchronous input at its end";
+        expect(sink.state() == STOPPED);
+    };
+
+    "a block that requests its own stop at the end of one input ends there"_test = [] {
+        gr::Graph flow;
+        auto&     shortSource = flow.emplaceBlock<qa_drain::CountedSource>();
+        auto&     longSource  = flow.emplaceBlock<qa_drain::CountedSource>();
+        auto&     sink        = flow.emplaceBlock<qa_drain::FirstEndSink>();
+
+        shortSource._nItems     = qa_drain::kShortBranch;
+        shortSource._maxPerCall = qa_drain::kShortBranch;
+        longSource._nItems      = qa_drain::kLongBranch;
+        longSource._maxPerCall  = qa_drain::kMaxPerCall;
+        expect(flow.connect<"out", "first">(shortSource, sink).has_value());
+        expect(flow.connect<"out", "second">(longSource, sink).has_value());
+
+        qa_drain::SerialScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(qa_drain::runWithin(scheduler, std::chrono::duration_cast<std::chrono::milliseconds>(qa_drain::kRunBound))) << "the graph did not end after the block stopped";
+
+        expect(eq(sink._nFirst, qa_drain::kShortBranch));
+        expect(lt(sink._nSecond, qa_drain::kLongBranch)) << "the block ran past the end of its first input";
+        expect(sink.state() == STOPPED);
+        expect(longSource.state() == STOPPED) << "the source left without a reader did not stop";
     };
 
     "a graph ending on an error does not drain"_test = [] {
