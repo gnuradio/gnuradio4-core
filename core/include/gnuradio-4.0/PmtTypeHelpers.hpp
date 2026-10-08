@@ -350,7 +350,7 @@ template<class T, bool strictCheck = false, typename From>
         // 6d) string->bool
         else if constexpr (std::is_same_v<T, bool>) {
             std::string s(srcValue);
-            std::ranges::transform(s, s.begin(), [](unsigned char c) { return std::tolower(c); });
+            std::ranges::transform(s, s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
             if (s == "true" || s == "1") {
                 return true;
             } else if (s == "false" || s == "0") {
