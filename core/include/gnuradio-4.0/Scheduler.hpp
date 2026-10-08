@@ -764,6 +764,11 @@ public:
             }
         }
 
+        // an initialized scheduler builds the new graph's job lists here. Its next start() builds none
+        if (oldState == INITIALISED) {
+            reset();
+        }
+
         if (lifecycle::isActive(oldState)) {
             if (auto result = restoreRun(ownGeneration, oldState); !result) {
                 return std::unexpected(result.error());

@@ -570,6 +570,30 @@ const boost::ut::suite<"scheduler graph exchange"> schedulerExchangeTests = [] {
         expect(qa_exchange::awaitState(scheduler, STOPPED)) << "second graph did not stop";
     };
 
+    "an initialized scheduler given a new graph starts that graph"_test = [] {
+        qa_exchange::gFirstGraphSamples  = 0UZ;
+        qa_exchange::gSecondGraphSamples = 0UZ;
+
+        qa_exchange::TestScheduler scheduler;
+
+        gr::Graph first;
+        auto&     firstSource = first.emplaceBlock<qa_exchange::SwapRequester>();
+        auto&     firstSink   = first.emplaceBlock<qa_exchange::FirstSink>();
+        expect(first.connect<"out", "in">(firstSource, firstSink).has_value());
+
+        expect(scheduler.exchange(std::move(first)).has_value());
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.exchange(qa_exchange::makeSecondGraph()).has_value());
+        expect(scheduler.state() == INITIALISED) << "the swap left the initialized state";
+
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(qa_exchange::awaitCount(qa_exchange::gSecondGraphSamples, 1UZ)) << "the start ran the job lists of the replaced graph";
+        expect(eq(qa_exchange::gFirstGraphSamples.load(), 0UZ)) << "the replaced graph's blocks ran";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_exchange::awaitState(scheduler, STOPPED)) << "the new graph did not stop";
+    };
+
     "a destruction that begins inside a deferred swap waits out no watchdog period"_test = [] {
         // timed on the wall clock. The swap passes its check of the destruction flag, and the old graph's reset() hook
         // then holds it until the destruction has begun and has passed its check of the state. The restart then reads
