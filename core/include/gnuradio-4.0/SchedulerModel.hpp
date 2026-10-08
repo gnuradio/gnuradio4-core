@@ -114,6 +114,15 @@ public:
 
     [[nodiscard]] bool workerStarted() override { return this->blockRef().workerStarted(); }
 
+    // a scheduler whose start or run ended in ERROR on its own thread or on its workers returns ERROR to the scheduler
+    // that runs it. That run fails as it does for a block's ERROR.
+    [[nodiscard]] work::Result work(std::size_t requestedWork = undefined_size) override {
+        if (this->blockRef().state() == gr::lifecycle::State::ERROR) {
+            return {requestedWork, 0UZ, work::Status::ERROR};
+        }
+        return GraphWrapper<TScheduler, gr::Graph>::work(requestedWork);
+    }
+
     [[nodiscard]] std::optional<Error> startError() const override { return this->blockRef().startError(); }
 
     void requestWorkQuiescence() override { this->blockRef().requestWorkQuiescence(); }
@@ -170,9 +179,10 @@ private:
 
         _schedulerThread = std::thread([&sched] {
             // runs the scheduler's start(). Under a single-threaded policy start() returns when the run ends, and under
-            // the others once the workers are queued
-            if (!sched.changeStateTo(RUNNING)) {
-                sched.emitErrorMessageIfAny("SchedulerWrapper::start() -> ERROR", sched.changeStateTo(ERROR));
+            // the others once the workers are queued. A stop that claims the transition first leaves the stop's state.
+            // Any other error fails the start and reaches the scheduler that runs this one.
+            if (auto started = sched.changeStateTo(RUNNING); !started.has_value() && !gr::lifecycle::isShuttingDown(sched.state())) {
+                sched.failStartAndReport(std::move(started.error()));
             }
         });
         return {};

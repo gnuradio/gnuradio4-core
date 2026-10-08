@@ -471,6 +471,19 @@ public:
     // in progress. A read during a start races with that write.
     [[nodiscard]] std::optional<Error> startError() const { return _startError; }
 
+    // ends a start whose move to RUNNING returned an error on a thread that is not one of this scheduler's workers. The
+    // error goes out on msgOut through a writer of the caller's own and is kept for startError(). The scheduler then
+    // stops the children that started and enters ERROR.
+    void failStartAndReport(Error reason) {
+        Message report;
+        report.cmd         = message::Command::Notify;
+        report.serviceName = this->unique_name;
+        report.endpoint    = "start()";
+        report.data        = std::unexpected(reason);
+        publishOnOwnWriter(std::move(report));
+        failStart(std::move(reason));
+    }
+
     // a worker holds its pool thread for the run's lifetime, so a start into a pool whose threads are all held
     // queues that worker behind them for as long as the holders live. A queued task counts as held
     [[nodiscard]] std::expected<void, Error> checkWorkerCapacity() const {
@@ -996,10 +1009,11 @@ protected:
     }
 
     // A worker meets an ERROR from a block's work() or from a child's error that no msgOut reader takes. The block or
-    // child is recorded for runAndWait() unless an earlier one was. While the worker's run is current, the scheduler
-    // moves to ERROR. Otherwise a stop retired the run while the worker met the error. stop() publishes STOPPED without
-    // waiting for the worker, and the state stays STOPPED. A restart or a graph swap that follows the stop proceeds.
-    // runAndWait() returns the error, and a message on msgOut reports it.
+    // child is recorded for runAndWait() unless an earlier one was, and a message on msgOut names it. While the worker's
+    // run is current, the scheduler moves to ERROR after that message. A scheduler that runs this one and reads ERROR
+    // then finds the message. Otherwise a stop retired the run while the worker met the error. stop() publishes STOPPED
+    // without waiting for the worker, and the state stays STOPPED. A restart or a graph swap that follows the stop
+    // proceeds. runAndWait() returns the error.
     void failRun(std::string_view blockName, std::size_t generation, std::string_view what) {
         {
             std::lock_guard guard(_runEndingBlockMutex);
@@ -1007,16 +1021,16 @@ protected:
                 _runEndingBlock = std::string(blockName);
             }
         }
-        if (gr::atomic_ref(_run.generation).load_acquire() == generation) {
-            this->emitErrorMessageIfAny("LifecycleState (ERROR)", this->changeStateTo(lifecycle::State::ERROR));
-            return;
-        }
-        Message report;
+        const bool runIsCurrent = gr::atomic_ref(_run.generation).load_acquire() == generation;
+        Message    report;
         report.cmd         = message::Command::Notify;
         report.serviceName = this->unique_name;
-        report.endpoint    = "error after the stop";
-        report.data        = std::unexpected(Error{std::format("block '{}' {} after the stop reached it", blockName, what)});
+        report.endpoint    = runIsCurrent ? "error in the run" : "error after the stop";
+        report.data        = std::unexpected(Error{std::format("block '{}' {}{}", blockName, what, runIsCurrent ? "" : " after the stop reached it")});
         publishOnOwnWriter(std::move(report));
+        if (runIsCurrent) {
+            this->emitErrorMessageIfAny("LifecycleState (ERROR)", this->changeStateTo(lifecycle::State::ERROR));
+        }
     }
 
     void disconnectAllEdges() {
