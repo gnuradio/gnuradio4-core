@@ -1,3 +1,5 @@
+#include <atomic>
+
 #include <benchmark.hpp>
 #include <boost/ut.hpp>
 
@@ -62,7 +64,8 @@ struct BenchBlock : Block<BenchBlock> {
 
 template<typename T>
 inline void black_box(const T& v) {
-    asm volatile("" : : "g"(v) : "memory");
+    ::benchmark::force_store(v);
+    std::atomic_signal_fence(std::memory_order_acq_rel); // the barrier force_store's operand alone does not impose
 }
 
 // ---- UT + Bench ---------------------------------------------------

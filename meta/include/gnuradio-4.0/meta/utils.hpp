@@ -6,11 +6,12 @@
 #include <complex>
 #include <concepts>
 #include <cstdint>
-#include <cxxabi.h>
+#include <cstdlib>
 #include <format>
 #include <map>
 #include <new>
 
+#include <gnuradio-4.0/meta/Attributes.hpp>
 #include <gnuradio-4.0/meta/CacheLineSize.hpp>
 #include <numeric>
 #include <print>
@@ -22,6 +23,14 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#ifndef _MSC_VER
+#include <cxxabi.h>
+#endif
+
+#ifdef _MSC_VER
+#include <intrin.h> // __debugbreak
+#endif
 
 #if __has_include(<stdfloat>) && !defined(__ADAPTIVECPP__)
 #include <stdfloat>
@@ -45,6 +54,7 @@ static_assert(std::numeric_limits<float64_t>::is_iec559 && sizeof(float64_t) * 8
 
 namespace gr {
 
+#if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic push // suppress unavoidable float/int/size_t conversion warnings
 #pragma GCC diagnostic ignored "-Wconversion"
 #ifdef __clang__
@@ -52,6 +62,7 @@ namespace gr {
 #pragma GCC diagnostic ignored "-Wshorten-64-to-32"
 #pragma GCC diagnostic ignored "-Wimplicit-int-float-conversion"
 #pragma GCC diagnostic ignored "-Wimplicit-float-conversion"
+#endif
 #endif
 
 using Size_t                                = std::uint32_t; // strict type definition in view of cross-platform/cross-compiler/cross-network portability similar to 'std::size_t' (N.B. which is not portable)
@@ -65,7 +76,9 @@ T cast(U value) { /// gcc/clang warning suppressing cast
     return static_cast<T>(value);
 }
 
+#if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
+#endif
 
 namespace meta {
 
@@ -85,8 +98,21 @@ struct null_type {};
 template<typename... Ts>
 struct print_types;
 
+// break into the debugger, then tell the compiler the path does not return
+#if defined(_MSC_VER)
+#define GR_TRAP()                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              \
+    do {                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       \
+        __debugbreak();                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        \
+        __assume(0);                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           \
+    } while (0)
+#elif defined(__GNUC__) || defined(__clang__)
+#define GR_TRAP() __builtin_trap()
+#else
+#define GR_TRAP() std::abort()
+#endif
+
 #if HAVE_SOURCE_LOCATION
-[[gnu::always_inline]] constexpr void precondition(bool cond, const std::source_location loc = std::source_location::current()) {
+GR_ALWAYS_INLINE constexpr void precondition(bool cond, const std::source_location loc = std::source_location::current()) {
     if consteval {
         if (not cond) {
             std::unreachable();
@@ -95,7 +121,7 @@ struct print_types;
         struct handle {
             [[noreturn]] static void failure(std::source_location const& loc) {
                 std::clog << "failed precondition in " << loc.file_name() << ':' << loc.line() << ':' << loc.column() << ": `" << loc.function_name() << "`\n";
-                __builtin_trap();
+                GR_TRAP();
             }
         };
 
@@ -105,7 +131,7 @@ struct print_types;
     }
 }
 #else
-[[gnu::always_inline]] constexpr void precondition(bool cond) {
+GR_ALWAYS_INLINE constexpr void precondition(bool cond) {
     if consteval {
         if (not cond) {
             std::unreachable();
@@ -114,7 +140,7 @@ struct print_types;
         struct handle {
             [[noreturn]] static void failure() {
                 std::println(stderr, "failed precondition");
-                __builtin_trap();
+                GR_TRAP();
             }
         };
 

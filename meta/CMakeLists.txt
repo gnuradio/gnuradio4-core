@@ -5,6 +5,7 @@ target_include_directories(gnuradio-meta INTERFACE $<BUILD_INTERFACE:${CMAKE_CUR
 target_link_libraries(gnuradio-meta INTERFACE gnuradio4::gnuradio-options gnuradio4::vir)
 
 set(meta_public_headers
+    include/gnuradio-4.0/meta/Attributes.hpp
     include/gnuradio-4.0/meta/CacheLineSize.hpp
     include/gnuradio-4.0/meta/RangesHelper.hpp
     include/gnuradio-4.0/meta/UnitTestHelper.hpp
