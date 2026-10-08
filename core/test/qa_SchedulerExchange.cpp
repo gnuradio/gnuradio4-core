@@ -148,6 +148,7 @@ struct GrcProbe : SerialScheduler {
 // returns only once the test releases it. The test then decides what the scheduler does before the swap continues.
 struct GatedScheduler : gr::scheduler::SchedulerBase<GatedScheduler, gr::scheduler::ExecutionPolicy::singleThreaded> {
     using gr::scheduler::SchedulerBase<GatedScheduler, gr::scheduler::ExecutionPolicy::singleThreaded>::SchedulerBase;
+    using gr::scheduler::SchedulerBase<GatedScheduler, gr::scheduler::ExecutionPolicy::singleThreaded>::propertyCallbackGraphGRC;
 
     std::atomic<bool>* _exchangeEntered  = nullptr;
     std::atomic<bool>* _exchangeReleased = nullptr;
@@ -243,6 +244,60 @@ struct ReplacementSink : gr::Block<ReplacementSink> {
     expect(flow.connect<"out", "in">(source, sink).has_value());
     return gr::saveGrc(gr::globalPluginLoader(), flow);
 }
+
+std::atomic<std::size_t> gLiveCountedBlocks{0UZ};
+
+// counts the live instances of the block that holds it in gLiveCountedBlocks
+struct LiveCount {
+    LiveCount() noexcept { gLiveCountedBlocks.fetch_add(1UZ); }
+    LiveCount(const LiveCount&) noexcept : LiveCount() {}
+    LiveCount& operator=(const LiveCount&) noexcept = default;
+    ~LiveCount() { gLiveCountedBlocks.fetch_sub(1UZ); }
+};
+
+struct LiveSource : gr::Block<LiveSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(LiveSource, out);
+
+    LiveCount _liveCount;
+
+    [[nodiscard]] constexpr float processOne() const noexcept { return 1.0f; }
+};
+
+// counts its samples into gSecondGraphSamples
+struct LiveSink : gr::Block<LiveSink> {
+    gr::PortIn<float> in;
+
+    GR_MAKE_REFLECTABLE(LiveSink, in);
+
+    LiveCount _liveCount;
+
+    void processOne(float) { gSecondGraphSamples.fetch_add(1UZ, std::memory_order_relaxed); }
+};
+
+// the graph of LiveSource and LiveSink that each replacement in a case loads
+[[nodiscard]] std::string liveGraphYaml() {
+    using namespace boost::ut;
+    static const bool registered = [] {
+        std::ignore = gr::globalBlockRegistry().insert<LiveSource>();
+        std::ignore = gr::globalBlockRegistry().insert<LiveSink>();
+        return true;
+    }();
+    std::ignore = registered;
+
+    gr::Graph flow;
+    auto&     source = flow.emplaceBlock<LiveSource>();
+    auto&     sink   = flow.emplaceBlock<LiveSink>();
+    expect(flow.connect<"out", "in">(source, sink).has_value());
+    return gr::saveGrc(gr::globalPluginLoader(), flow);
+}
+
+// exposes the handler of a graph replacement by message on a multi-threaded scheduler
+struct ParallelGrcProbe : TestScheduler {
+    using TestScheduler::propertyCallbackGraphGRC;
+    using TestScheduler::TestScheduler;
+};
 
 // a lifecycle command that sets the scheduler's state
 [[nodiscard]] gr::Message makeStateChange(std::string_view schedulerName, gr::lifecycle::State state) {
@@ -699,6 +754,49 @@ const boost::ut::suite<"scheduler graph exchange"> schedulerExchangeTests = [] {
         expect(qa_exchange::awaitState(scheduler, STOPPED)) << "the scheduler did not stop";
     };
 
+    "a graph replacement by message whose state check precedes another thread's start is refused and the run is kept"_test = [] {
+        qa_exchange::gFirstGraphSamples = 0UZ;
+
+        qa_exchange::GatedScheduler scheduler;
+        expect(scheduler.exchange(qa_exchange::makeFiniteGraph<qa_exchange::FirstSink>()).has_value());
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        const std::size_t     nBlocks = scheduler.graph().blocks().size();
+        const gr::BlockModel* source  = scheduler.graph().blocks().front().get();
+
+        std::atomic<bool> exchangeEntered{false};
+        std::atomic<bool> exchangeReleased{false};
+        scheduler._exchangeEntered  = &exchangeEntered;
+        scheduler._exchangeReleased = &exchangeReleased;
+
+        // the replacement's swap reads the initialized state and waits in the hook. Another thread then starts the run,
+        // and the swap resumes only once the state reads RUNNING
+        const gr::Message          request = qa_exchange::makeGraphReplacement(gr::saveGrc(gr::globalPluginLoader(), gr::Graph{}));
+        std::optional<gr::Message> reply;
+
+        std::thread swapper([&scheduler, &request, &reply] { reply = scheduler.propertyCallbackGraphGRC(gr::scheduler::property::kGraphGRC, request); });
+        expect(qa_exchange::awaitFlag(exchangeEntered)) << "exchange() never reached its hook";
+        std::thread runner([&scheduler] { std::ignore = scheduler.changeStateTo(RUNNING); });
+        expect(qa_exchange::awaitState(scheduler, RUNNING)) << "the run did not start while the swap waited";
+        exchangeReleased.store(true);
+        exchangeReleased.notify_all();
+        swapper.join();
+
+        const bool refused = reply.has_value() && !reply->data.has_value();
+        expect(refused) << "the replacement was not answered with a refusal";
+        if (refused) {
+            expect(reply->data.error().message.contains("RUNNING")) << "the refusal does not name the state: " << reply->data.error().message;
+        }
+        expect(eq(scheduler.graph().blocks().size(), nBlocks)) << "the refused replacement retired the graph's blocks";
+        expect(!scheduler.graph().blocks().empty() && scheduler.graph().blocks().front().get() == source) << "the refused replacement changed the source";
+        expect(qa_exchange::awaitCount(qa_exchange::gFirstGraphSamples, qa_exchange::kFiniteSamples)) << "the original graph did not run to its end";
+
+        if (scheduler.state() == RUNNING) {
+            expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        }
+        runner.join();
+        expect(qa_exchange::awaitState(scheduler, STOPPED)) << "the scheduler did not stop";
+    };
+
     "a refused graph replacement by message keeps the running graph"_test = [] {
         qa_exchange::gFirstGraphSamples  = 0UZ;
         qa_exchange::gSecondGraphSamples = 0UZ;
@@ -725,6 +823,34 @@ const boost::ut::suite<"scheduler graph exchange"> schedulerExchangeTests = [] {
         // the same request succeeds once the run has stopped: the refusal above came from the running worker alone
         std::optional<gr::Message> accepted = scheduler.propertyCallbackGraphGRC(gr::scheduler::property::kGraphGRC, request);
         expect(accepted.has_value() && accepted->data.has_value()) << "the stopped scheduler refused the replacement";
+    };
+
+    // each replacement retires the graph of the run that it stops and restores. The live blocks are those of one graph
+    "a graph replacement by message destroys the blocks of the graph it retires"_test = [] {
+        qa_exchange::gSecondGraphSamples = 0UZ;
+        const gr::Message request        = qa_exchange::makeGraphReplacement(qa_exchange::liveGraphYaml());
+        const std::size_t nLiveBefore    = qa_exchange::gLiveCountedBlocks.load();
+
+        qa_exchange::ParallelGrcProbe scheduler;
+        std::optional<gr::Message>    reply = scheduler.propertyCallbackGraphGRC(gr::scheduler::property::kGraphGRC, request);
+        expect(fatal(reply.has_value() && reply->data.has_value())) << "the first replacement was refused";
+        const std::size_t nGraphBlocks = scheduler.graph().blocks().size();
+        expect(eq(qa_exchange::gLiveCountedBlocks.load() - nLiveBefore, nGraphBlocks)) << "the loaded graph's blocks are not all counted";
+
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        for (std::size_t replacement = 1UZ; replacement <= 3UZ; ++replacement) {
+            const std::size_t nSamplesBefore = qa_exchange::gSecondGraphSamples.load(std::memory_order_relaxed);
+            expect(qa_exchange::awaitCount(qa_exchange::gSecondGraphSamples, nSamplesBefore + 1UZ)) << "the graph did not run before replacement " << replacement;
+
+            reply = scheduler.propertyCallbackGraphGRC(gr::scheduler::property::kGraphGRC, request);
+            expect(reply.has_value() && reply->data.has_value()) << "replacement " << replacement << " was refused";
+            expect(eq(qa_exchange::gLiveCountedBlocks.load() - nLiveBefore, nGraphBlocks)) << "replacement " << replacement << " left the retired blocks alive";
+        }
+        expect(scheduler.state() == RUNNING) << "the replacements did not restore the run";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_exchange::awaitState(scheduler, STOPPED)) << "the scheduler did not stop";
     };
 
     // The worker handles the replacement, which stops the run and keeps the new graph. The worker that handled the batch
