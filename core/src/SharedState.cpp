@@ -1,3 +1,6 @@
+#include <mutex>
+#include <unordered_map>
+
 #include <gnuradio-4.0/SharedState.hpp>
 
 namespace gr::message {
@@ -10,6 +13,35 @@ std::atomic<std::size_t>& droppedMessageCount() noexcept {
 } // namespace gr::message
 
 namespace gr::detail {
+
+namespace {
+
+struct RefusedLibraries {
+    std::mutex                                      mutex;
+    std::unordered_map<const void*, RefusedLibrary> refusals;
+};
+
+RefusedLibraries& refusedLibraries() {
+    static RefusedLibraries libraries;
+    return libraries;
+}
+
+} // namespace
+
+void recordRefusedLibrary(const void* handle, const RefusedLibrary& refusal) {
+    RefusedLibraries& libraries = refusedLibraries();
+    std::scoped_lock  lock(libraries.mutex);
+    libraries.refusals.insert_or_assign(handle, refusal);
+}
+
+std::optional<RefusedLibrary> refusedLibrary(const void* handle) {
+    RefusedLibraries& libraries = refusedLibraries();
+    std::scoped_lock  lock(libraries.mutex);
+    if (const auto it = libraries.refusals.find(handle); it != libraries.refusals.end()) {
+        return it->second;
+    }
+    return std::nullopt;
+}
 
 const Sequence*& publishWakeExempt() noexcept {
     thread_local const Sequence* exempt = nullptr;

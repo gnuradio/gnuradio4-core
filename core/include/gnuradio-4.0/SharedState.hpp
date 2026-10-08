@@ -3,6 +3,8 @@
 
 #include <atomic>
 #include <cstddef>
+#include <optional>
+#include <string>
 
 #include <gnuradio-4.0/Export.hpp>
 
@@ -21,6 +23,19 @@ GNURADIO_EXPORT std::atomic<std::size_t>& droppedMessageCount() noexcept;
 } // namespace gr::message
 
 namespace gr::detail {
+
+// a plugin loader's refusal of a shared object: the reason it gave, and the warning it printed or an empty string
+struct RefusedLibrary {
+    std::string reason;
+    std::string warning;
+};
+
+// Records that a plugin loader refused the shared object that the dlopen handle names. The caller leaves the object
+// mapped. A later dlopen of its file then returns the same handle, and no other object takes that handle.
+GNURADIO_EXPORT void recordRefusedLibrary(const void* handle, const RefusedLibrary& refusal);
+
+// the refusal recorded for the shared object that the dlopen handle names, if a plugin loader refused it
+GNURADIO_EXPORT std::optional<RefusedLibrary> refusedLibrary(const void* handle);
 
 // The wake sequence of the consumer that runs on the calling thread. A publish on that thread leaves the sequence
 // alone: the consumer is not waiting while it publishes.
