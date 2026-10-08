@@ -1827,6 +1827,40 @@ const boost::ut::suite<"a scheduler started on its own thread"> ownThreadStartTe
         }
         inner->stop();
     };
+
+    // a single-threaded sub-scheduler runs its graph on its own thread, and a block that fails ends that run in ERROR.
+    // A subscriber reads the parent's message port. A parent with a reader does not turn a child's error message into
+    // its own.
+    "a sub-scheduler whose run fails on its own thread fails its parent's run with the reason"_test = [] {
+        gr::Graph innerFlow;
+        auto&     innerSource = innerFlow.emplaceBlock<qa_sched::FailingSource>();
+        auto&     innerSink   = innerFlow.emplaceBlock<qa_sched::CountingSink>();
+        expect(innerFlow.connect<"out", "in">(innerSource, innerSink).has_value());
+        const std::string failingName(innerSource.unique_name);
+
+        auto inner = std::make_shared<gr::SchedulerWrapper<qa_sched::SerialScheduler>>();
+        inner->setGraph(std::move(innerFlow));
+
+        gr::Graph                             flow       = qa_sched::makeEndlessGraph();
+        const std::shared_ptr<gr::BlockModel> innerBlock = flow.addBlock(gr::SchedulerModel::asBlockModelPtr(inner));
+        const std::string                     innerName(innerBlock->uniqueName());
+
+        qa_sched::TestScheduler scheduler;
+        gr::MsgPortIn           fromScheduler;
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        std::expected<void, gr::Error> result;
+        expect(qa_sched::runAndWaitWithin(scheduler, qa_sched::kEventBound, [] {}, &result)) << "the parent ran on after its sub-scheduler failed";
+        expect(!result.has_value()) << "a sub-scheduler that failed while it ran must fail its parent's run";
+        if (!result.has_value()) {
+            expect(result.error().message.find(innerName) != std::string::npos) << "the error must name the sub-scheduler: " << result.error().message;
+            expect(result.error().message.find(failingName) != std::string::npos) << "the error must carry the sub-scheduler's reason: " << result.error().message;
+        }
+        expect(scheduler.state() == ERROR) << "the parent's run must end in ERROR";
+        expect(inner->blockRef().state() == ERROR) << "the sub-scheduler's run must end in ERROR";
+        inner->stop();
+    };
 };
 
 const boost::ut::suite<"a scheduler that supplies its own worker"> ownWorkerTests = [] {
