@@ -96,17 +96,7 @@ function(setup_test_no_asan TEST_NAME)
     target_link_options(${TEST_NAME} PRIVATE /STACK:8388608)
   endif()
   add_test(NAME ${TEST_NAME} COMMAND ${CMAKE_CROSSCOMPILING_EMULATOR} ${CMAKE_CURRENT_BINARY_DIR}/${TEST_NAME})
-  if(WIN32)
-    # Windows has no RPATH: the loader locates the shared libraries the tests link against via PATH only.
-    set(_gr_test_dll_dirs "PATH=path_list_prepend:$<TARGET_FILE_DIR:gnuradio-blocklib-core>")
-    if(TARGET gnuradio-plugin)
-      list(APPEND _gr_test_dll_dirs "PATH=path_list_prepend:$<TARGET_FILE_DIR:gnuradio-plugin>")
-    endif()
-    set_property(
-      TEST ${TEST_NAME}
-      APPEND
-      PROPERTY ENVIRONMENT_MODIFICATION ${_gr_test_dll_dirs})
-  endif()
+  gr_test_add_dll_directories(${TEST_NAME})
 endfunction()
 
 function(setup_test TEST_NAME)
@@ -116,6 +106,21 @@ function(setup_test TEST_NAME)
   endif()
 
   setup_test_no_asan(${TEST_NAME})
+endfunction()
+
+# Puts the directories holding the shared libraries a test loads, directly or through a tool it
+# runs, on PATH. Windows resolves them there and has no RPATH equivalent. A no-op elsewhere.
+function(gr_test_add_dll_directories)
+  if(NOT WIN32)
+    return()
+  endif()
+  set(_gr_test_dll_dirs "PATH=path_list_prepend:$<TARGET_FILE_DIR:gnuradio-blocklib-core>")
+  foreach(_gr_test IN LISTS ARGV)
+    set_property(
+      TEST ${_gr_test}
+      APPEND
+      PROPERTY ENVIRONMENT_MODIFICATION ${_gr_test_dll_dirs})
+  endforeach()
 endfunction()
 
 function(add_ut_test TEST_NAME)
