@@ -1167,12 +1167,7 @@ protected:
     // state later.
     void failStart(Error reason) {
         _startError = std::move(reason);
-        graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) {
-            if (block->state() == lifecycle::State::RUNNING) {
-                this->emitErrorMessageIfAny("LifecycleState -> REQUESTED_STOP", block->changeStateTo(lifecycle::REQUESTED_STOP));
-                this->emitErrorMessageIfAny("LifecycleState -> STOPPED", block->changeStateTo(lifecycle::STOPPED));
-            }
-        });
+        graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) { stopChild(*block, "failStart() -> LifecycleState"); });
         this->emitErrorMessageIfAny("failStart() -> LifecycleState -> ERROR", this->changeStateTo(lifecycle::State::ERROR));
     }
 
@@ -1782,6 +1777,28 @@ protected:
         });
     }
 
+    // asks an active child to stop, then settles a child that reads REQUESTED_STOP. A non-blocking child moves to
+    // STOPPED at once. A blocking child moves to STOPPED here only while no worker is inside poolWorker(). Otherwise its
+    // own next work() call or the last worker to leave settles it. A child that never started, or that has stopped or
+    // failed already, keeps its state, and its stop() hook does not run.
+    void stopChild(BlockModel& block, std::string_view caller) {
+        using enum lifecycle::State;
+        if (lifecycle::isActive(block.state())) {
+            this->emitErrorMessageIfAny(caller, block.changeStateTo(REQUESTED_STOP));
+        }
+        if (block.state() != REQUESTED_STOP) {
+            return;
+        }
+        if (!block.isBlocking()) {
+            this->emitErrorMessageIfAny(caller, block.changeStateTo(STOPPED));
+            return;
+        }
+        std::lock_guard workersLock(_workersInLoopMutex);
+        if (_nWorkersInLoop == 0UZ && block.state() == REQUESTED_STOP) {
+            this->emitErrorMessageIfAny(caller, block.changeStateTo(STOPPED));
+        }
+    }
+
     void stop() {
         using enum lifecycle::State;
         // retires the run's workers. A queued worker releases its count without running. A worker in its loop leaves
@@ -1799,15 +1816,7 @@ protected:
                         throw gr::exception(std::format("ScheduledBlockGroup is not a SchedulerModel {}", block->uniqueName()));
                     }
                 } else {
-                    this->emitErrorMessageIfAny("forEachBlock -> stop() -> LifecycleState", block->changeStateTo(REQUESTED_STOP));
-                    if (!block->isBlocking()) { // N.B. no other thread/constraint to consider before shutting down
-                        this->emitErrorMessageIfAny("forEachBlock -> stop() -> LifecycleState", block->changeStateTo(STOPPED));
-                    } else { // a blocking block that the sweep reaches after the last worker left is settled here
-                        std::lock_guard workersLock(_workersInLoopMutex);
-                        if (_nWorkersInLoop == 0UZ && block->state() == REQUESTED_STOP) {
-                            this->emitErrorMessageIfAny("forEachBlock -> stop() -> LifecycleState", block->changeStateTo(STOPPED));
-                        }
-                    }
+                    stopChild(*block, "forEachBlock -> stop() -> LifecycleState");
                 }
             });
         }
@@ -2265,11 +2274,11 @@ protected:
             case REQUESTED_STOP: // block will be deleted later
                 break;
             case REQUESTED_PAUSE: // zombie that never reached PAUSED -- stop it directly
-                this->emitErrorMessageIfAny("cleanupZombieBlocks", (*it)->changeStateTo(REQUESTED_STOP));
+                stopChild(**it, "cleanupZombieBlocks");
                 break;
             case PAUSED: // zombie was in REQUESTED_PAUSE and now finally in PAUSED. Can be stopped now.
                 // Will be deleted in a next zombie maintenance period
-                this->emitErrorMessageIfAny("cleanupZombieBlocks", (*it)->changeStateTo(REQUESTED_STOP));
+                stopChild(**it, "cleanupZombieBlocks");
                 break;
             case RUNNING: assert(false && "Doesn't happen: zombie blocks are never running"); break;
             }
@@ -2330,17 +2339,14 @@ protected:
     /*
       Moves a block to the zombie list:
 
-      - Requests stop if the block is still running or paused.
+      - Stops the block through stopChild() if it is still running or paused.
       - Removes the block from adoption lists (to handle edge cases such as Add Block → Remove Block).
       - Adds it to the zombie list.
 
       The block will be physically deleted by cleanupZombieBlocks() when it reaches a safe state.
     */
     void makeZombie(std::shared_ptr<BlockModel> block) {
-        using enum lifecycle::State;
-        if (lifecycle::isActive(block->state())) {
-            this->emitErrorMessageIfAny("makeZombie", block->changeStateTo(REQUESTED_STOP));
-        }
+        stopChild(*block, "makeZombie");
 
         {
             // Handle edge case: If we receive two consecutive "Add Block X" "Remove Block X" messages
@@ -2361,29 +2367,10 @@ protected:
     // Moves all blocks into the zombie list
     // Useful for bulk operations such as "set grc yaml" message
     void makeAllZombies() {
-        using enum lifecycle::State;
         std::lock_guard guard(_zombieBlocksMutex);
 
         for (auto& block : this->_graph->blocks()) {
-            switch (block->state()) {
-            case RUNNING:
-            case REQUESTED_PAUSE:
-            case PAUSED: //
-                this->emitErrorMessageIfAny("makeAllZombies", block->changeStateTo(REQUESTED_STOP));
-                break;
-
-            case INITIALISED: //
-                this->emitErrorMessageIfAny("makeAllZombies", block->changeStateTo(STOPPED));
-                break;
-            case IDLE:
-            case STOPPED:
-            case ERROR:
-            case REQUESTED_STOP:
-                // Can go into the zombie list and deleted
-                break;
-            default:;
-            }
-
+            stopChild(*block, "makeAllZombies");
             _zombieBlocks.push_back(std::move(block));
         }
 
