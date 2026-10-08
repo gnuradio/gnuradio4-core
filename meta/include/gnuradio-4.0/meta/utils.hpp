@@ -513,7 +513,9 @@ inline std::string makePortableTypeName(std::string_view name) {
 
     using namespace std::string_literals;
     using gr::meta::detail::local_type_name;
-    static const auto typeMapping = std::array<std::pair<std::string, std::string>, 17>{{
+    // Never destroyed. A function-local static with a non-trivial destructor registers an atexit
+    // handler, and this function is reachable from threads that may still run as the process exits.
+    static const auto& typeMapping = *new std::array<std::pair<std::string, std::string>, 17>{{
         {local_type_name<std::int8_t>(), "int8"s}, {local_type_name<std::int16_t>(), "int16"s}, {local_type_name<std::int32_t>(), "int32"s}, {local_type_name<std::int64_t>(), "int64"s},         //
         {local_type_name<std::uint8_t>(), "uint8"s}, {local_type_name<std::uint16_t>(), "uint16"s}, {local_type_name<std::uint32_t>(), "uint32"s}, {local_type_name<std::uint64_t>(), "uint64"s}, //
         {local_type_name<float>(), "float32"s}, {local_type_name<double>(), "float64"},                                                                                                           //                                                                                                                                                                                                                                                        //
@@ -531,7 +533,7 @@ inline std::string makePortableTypeName(std::string_view name) {
     // The same types as `typeMapping`, spelled the way source text spells them: a registration alias or a compiler-rendered
     // template argument writes "int16_t" or "short int" where the demangler prints "short". Every entry maps to the demangled
     // spelling of the same type, so `typeMapping` still decides the portable name.
-    static const auto writtenMapping = std::array<std::pair<std::string, std::string>, 27>{{
+    static const auto& writtenMapping = *new std::array<std::pair<std::string, std::string>, 27>{{
         {"int8_t"s, local_type_name<std::int8_t>()}, {"std::int8_t"s, local_type_name<std::int8_t>()},                        //
         {"int16_t"s, local_type_name<std::int16_t>()}, {"std::int16_t"s, local_type_name<std::int16_t>()},                    //
         {"int32_t"s, local_type_name<std::int32_t>()}, {"std::int32_t"s, local_type_name<std::int32_t>()},                    //
