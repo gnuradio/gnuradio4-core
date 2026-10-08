@@ -125,7 +125,7 @@ const boost::ut::suite PortApiTests = [] {
         expect(eq(buffers.streamBuffer.n_readers(), 1UZ));
 
         WriterSpanLike auto pSpan = writer.reserve<SpanReleasePolicy::ProcessAll>(32UZ);
-        std::iota(pSpan.begin(), pSpan.end(), 1);
+        std::iota(pSpan.begin(), pSpan.end(), 1.f); // N.B. float seed: the port is PortOut<float>
         std::string list = gr::join(pSpan, ", ");
         std::println("typed-port connected output vector: {}", list);
     };
@@ -192,7 +192,7 @@ const boost::ut::suite PortApiTests = [] {
 
         expect(flow.connect<"sum", "sink">(added, out).has_value());
 
-        gr::scheduler::Simple sched;
+        gr::scheduler::Simple<> sched;
         if (auto ret = sched.exchange(std::move(flow)); !ret) {
             throw std::runtime_error(std::format("failed to initialize scheduler: {}", ret.error()));
         }
