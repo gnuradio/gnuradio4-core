@@ -34,31 +34,78 @@ std::pair<std::shared_ptr<BlockModel>, std::shared_ptr<BlockModel>> Graph::repla
     if (found == _blocks.end()) {
         throw gr::exception(std::format("Block {} was not found in {}", uniqueName, this->unique_name));
     }
-    // addBlock() may reallocate _blocks, so keep an index rather than the iterator
-    const auto                        oldIndex = static_cast<std::size_t>(std::ranges::distance(_blocks.begin(), found));
-    const std::shared_ptr<BlockModel> replaced = _blocks[oldIndex];
+    if (std::ranges::any_of(_exportedPorts, [&uniqueName](const ExportedPort& exported) { return exported.blockName == uniqueName; })) {
+        throw gr::exception(std::format("Block {} in {} exports a port and cannot be replaced", uniqueName, this->unique_name));
+    }
+    const std::shared_ptr<BlockModel> replaced = *found;
 
-    auto newBlock = _pluginLoader->instantiate(type, properties);
+    std::shared_ptr<BlockModel> newBlock = _pluginLoader->instantiate(type, properties);
     if (!newBlock) {
         throw gr::exception(std::format("Can not create block {}", type));
     }
+    newBlock->init(_progress, this->compute_domain); // a setting can size a port collection
 
-    addBlock(newBlock);
-
-    for (auto& edge : _edges) {
-        if (edge._sourceBlock == replaced) {
-            edge._sourceBlock = newBlock;
+    // Each port of the replaced block that an edge names pairs with one port of the new block. All pairs are checked
+    // before any buffer moves.
+    struct PortPair {
+        DynamicPort* replacedPort;
+        DynamicPort* newPort;
+    };
+    std::vector<PortPair> pairs;
+    auto                  pairPort = [&](const PortDefinition& definition, bool isOutput) {
+        auto replacedPort = isOutput ? replaced->dynamicOutputPort(definition) : replaced->dynamicInputPort(definition);
+        auto newPort      = isOutput ? newBlock->dynamicOutputPort(definition) : newBlock->dynamicInputPort(definition);
+        if (!replacedPort || !newPort) {
+            throw gr::exception(std::format("Block {} cannot replace {} in {}: {}", type, uniqueName, this->unique_name, (!newPort ? newPort.error() : replacedPort.error()).message));
         }
-
-        if (edge._destinationBlock == replaced) {
-            edge._destinationBlock = newBlock;
+        if (auto exchange = (*replacedPort)->checkHandlerExchange(**newPort); !exchange) {
+            throw gr::exception(std::format("Block {} cannot replace {} in {}: {}", type, uniqueName, this->unique_name, exchange.error().message));
         }
+        for (const PortPair& pair : pairs) {
+            if ((pair.replacedPort == *replacedPort) != (pair.newPort == *newPort)) {
+                throw gr::exception(std::format("Block {} cannot replace {} in {}: two edges name one port on one block and two ports on the other", type, uniqueName, this->unique_name));
+            }
+        }
+        if (std::ranges::none_of(pairs, [&replacedPort](const PortPair& pair) { return pair.replacedPort == *replacedPort; })) {
+            pairs.push_back({*replacedPort, *newPort});
+        }
+        return *newPort;
+    };
+
+    struct EdgePorts {
+        std::size_t  index;
+        DynamicPort* source;
+        DynamicPort* destination;
+    };
+    std::vector<EdgePorts> takenOver;
+    for (std::size_t index = 0UZ; index < _edges.size(); ++index) {
+        const Edge& edge = _edges[index];
+        if (edge._sourceBlock != replaced && edge._destinationBlock != replaced) {
+            continue;
+        }
+        DynamicPort* source      = edge._sourceBlock == replaced ? pairPort(edge._sourcePortDefinition, true) : edge._sourcePort;
+        DynamicPort* destination = edge._destinationBlock == replaced ? pairPort(edge._destinationPortDefinition, false) : edge._destinationPort;
+        takenOver.push_back({index, source, destination});
     }
 
-    std::shared_ptr<BlockModel> oldBlock = replaced;
-    _blocks.erase(_blocks.begin() + static_cast<std::ptrdiff_t>(oldIndex));
+    for (const PortPair& pair : pairs) {
+        pair.replacedPort->exchangeHandlers(*pair.newPort);
+    }
+    for (const EdgePorts& ports : takenOver) {
+        Edge& edge = _edges[ports.index];
+        if (edge._sourceBlock == replaced) {
+            edge._sourceBlock = newBlock;
+            edge._sourcePort  = ports.source;
+        }
+        if (edge._destinationBlock == replaced) {
+            edge._destinationBlock = newBlock;
+            edge._destinationPort  = ports.destination;
+        }
+    }
+    *found = newBlock;
+    sizeUnconnectedOptionalOutputs(*newBlock);
 
-    return {std::move(oldBlock), newBlock};
+    return {replaced, newBlock};
 }
 
 std::optional<Message> Graph::propertyCallbackRegistryBlockTypes([[maybe_unused]] std::string_view propertyName, Message message) {
