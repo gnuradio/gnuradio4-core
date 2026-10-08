@@ -48,8 +48,9 @@ public:
     [[nodiscard]] virtual std::expected<void, Error> start() = 0;
     virtual void                                     stop()  = 0;
 
-    // an adopted scheduler shares its parent's processing pool, so its start reports what keeps it from running
-    // instead of leaving a worker queued behind the threads the parent holds
+    // starts an adopted scheduler as start() does. The scheduler works on the pool its setting names, and on the
+    // default IO pool when that setting names the default CPU pool and no pool is staged. The start fails when that
+    // pool has no free thread for a worker. No worker then waits queued behind the threads that other runs hold.
     virtual std::expected<void, Error> startAdopted() = 0;
 
     // runs the graph and returns when the run ends by itself, on a requested stop or on an error. The error is the
@@ -166,9 +167,19 @@ private:
             return std::unexpected(Error(std::format("sub-scheduler '{}' is {} and cannot be started", sched.unique_name, gr::meta::enumName(sched.state()).value_or(""))));
         }
 
-        if (std::string_view(sched.poolName.value) == gr::thread_pool::kDefaultCpuPoolId) {
-            std::ignore = sched.settings().set({{"poolName", std::string(gr::thread_pool::kDefaultIoPoolId)}});
-            std::ignore = sched.settings().applyStagedParameters();
+        // the scheduler holds its pool threads for as long as it runs. It takes the default IO pool in place of the
+        // default CPU pool when no pool is staged. A staged pool applies here. The capacity check below and the start
+        // then read the pool the workers use.
+        const auto poolStaged = [&sched] { return sched.settings().stagedParameters().contains(std::pmr::string("poolName")); };
+        if (!poolStaged() && std::string_view(sched.poolName.value) == gr::thread_pool::kDefaultCpuPoolId) {
+            if (property_map refused = sched.settings().setStaged({{"poolName", std::string(gr::thread_pool::kDefaultIoPoolId)}}); !refused.empty()) {
+                return std::unexpected(Error(std::format("sub-scheduler '{}' refused the pool '{}'", sched.unique_name, gr::thread_pool::kDefaultIoPoolId)));
+            }
+        }
+        if (poolStaged()) {
+            if (auto applied = sched.applyStagedSettings(); !applied.has_value()) {
+                return applied;
+            }
         }
 
         if (requireWorkerCapacity) {

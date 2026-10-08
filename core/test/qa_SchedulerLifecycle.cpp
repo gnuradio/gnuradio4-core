@@ -703,6 +703,14 @@ struct WakeProbe : TScheduler {
     [[nodiscard]] std::size_t nWakes() const { return this->_wake->value(); }
 };
 
+// reads the pool the scheduler dispatches its workers on
+template<typename TScheduler>
+struct PoolProbe : TScheduler {
+    using TScheduler::TScheduler;
+
+    [[nodiscard]] std::string poolInUse() const { return std::string(this->_pool->name()); }
+};
+
 // takes every message waiting on a port and counts the watchdog's stall reports among them
 struct StallReports {
     std::size_t count       = 0UZ;
@@ -1860,6 +1868,50 @@ const boost::ut::suite<"a scheduler started on its own thread"> ownThreadStartTe
         expect(scheduler.state() == ERROR) << "the parent's run must end in ERROR";
         expect(inner->blockRef().state() == ERROR) << "the sub-scheduler's run must end in ERROR";
         inner->stop();
+    };
+};
+
+const boost::ut::suite<"the pool of a scheduler started on its own thread"> ownThreadPoolTests = [] {
+    using namespace boost::ut;
+
+    // a scheduler started on its own thread holds pool threads for as long as it runs. One that names the default CPU
+    // pool runs on the default IO pool instead.
+    "a scheduler started on its own thread runs its workers on the pool its setting names"_test = [] {
+        qa_sched::gObservedSamples.store(0UZ, std::memory_order_relaxed);
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::EndlessSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::ObservedSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        gr::SchedulerWrapper<qa_sched::PoolProbe<qa_sched::TestScheduler>> wrapper;
+        wrapper.setGraph(std::move(flow));
+        expect(eq(std::string(wrapper.blockRef().poolName.value), std::string(gr::thread_pool::kDefaultCpuPoolId)));
+
+        expect(wrapper.start().has_value());
+        expect(qa_sched::awaitObservedSamplesAbove(0UZ)) << "the scheduler did not run its graph";
+        expect(eq(std::string(wrapper.blockRef().poolName.value), std::string(gr::thread_pool::kDefaultIoPoolId))) << "the setting must name the IO pool";
+        expect(eq(wrapper.blockRef().poolInUse(), std::string(gr::thread_pool::kDefaultIoPoolId))) << "the workers must run on the pool the setting names";
+        wrapper.stop();
+    };
+
+    "a scheduler started on its own thread runs its workers on the pool staged for it"_test = [] {
+        constexpr std::string_view kStagedPoolName = "qa_own_thread_staged_cpu";
+        auto                       pool            = qa_sched::fixedPool(kStagedPoolName, 2U);
+        qa_sched::gObservedSamples.store(0UZ, std::memory_order_relaxed);
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::EndlessSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::ObservedSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        gr::SchedulerWrapper<qa_sched::PoolProbe<qa_sched::TestScheduler>> wrapper;
+        wrapper.setGraph(std::move(flow));
+        expect(wrapper.blockRef().settings().setStaged({{"poolName", std::string(kStagedPoolName)}}).empty()) << "the scheduler must stage poolName";
+
+        expect(wrapper.start().has_value());
+        expect(qa_sched::awaitObservedSamplesAbove(0UZ)) << "the scheduler did not run its graph";
+        expect(eq(std::string(wrapper.blockRef().poolName.value), std::string(kStagedPoolName))) << "the setting must name the staged pool";
+        expect(eq(wrapper.blockRef().poolInUse(), std::string(kStagedPoolName))) << "the workers must run on the staged pool";
+        wrapper.stop();
     };
 };
 
