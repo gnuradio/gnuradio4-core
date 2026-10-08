@@ -21,6 +21,11 @@ std::size_t& handledMessageSpans() noexcept {
     return nHandled;
 }
 
+std::size_t& drainingCalls() noexcept {
+    thread_local std::size_t nCalls = 0UZ;
+    return nCalls;
+}
+
 } // namespace gr::detail
 
 namespace gr::scheduler {

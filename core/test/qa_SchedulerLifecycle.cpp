@@ -89,6 +89,24 @@ struct DoneSource : gr::Block<DoneSource> {
     }
 };
 
+// consumes none of the items on its asynchronous input. Once the stream ends behind the items queued there, the block
+// drains, and only the bound on its calls in which nothing moved ends it
+struct UntakenRemainderRelay : gr::Block<UntakenRemainderRelay> {
+    gr::PortIn<float, gr::Async>  in;
+    gr::PortOut<float, gr::Async> out;
+
+    GR_MAKE_REFLECTABLE(UntakenRemainderRelay, in, out);
+
+    std::size_t _nCalls = 0UZ;
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& inSpan, gr::OutputSpanLike auto& outSpan) {
+        _nCalls++;
+        std::ignore = inSpan.consume(0UZ);
+        outSpan.publish(0UZ);
+        return gr::work::Status::INSUFFICIENT_INPUT_ITEMS;
+    }
+};
+
 struct FailingSource : gr::Block<FailingSource> {
     gr::PortOut<float> out;
 
@@ -3502,6 +3520,36 @@ const boost::ut::suite<"workers that park"> parkingWorkerTests = [] {
 
     "a singleThreadedBlocking worker does not park while a pause sweeps the blocks"_test                 = [&] { pauseParksNoWorker.operator()<qa_sched::BlockingScheduler>("singleThreadedBlocking, released in the sweep", false, parkingSettings); };
     "a singleThreadedBlocking worker whose work() call spans a pause does not park after the pause"_test = [&] { pauseParksNoWorker.operator()<qa_sched::BlockingScheduler>("singleThreadedBlocking, work() spanning the pause", true, parkingSettings); };
+
+    // The source ends its stream behind items that the relay never takes. The relay then drains, and it ends after a
+    // bound of calls in which nothing it waits on moved. Nothing else moves. A worker parked between those calls would
+    // therefore call the relay once per park. Under multiThreaded the bound passes at the idle back-off's pace.
+    auto untakenRemainderEnds = [&]<typename TScheduler>(std::string_view policyName) {
+        constexpr std::string_view kDrainPoolName = "qa_drain_cpu";
+        auto                       pool           = qa_sched::fixedPool(kDrainPoolName, 3U);
+
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::DoneSource>();
+        auto&     relay  = flow.emplaceBlock<qa_sched::UntakenRemainderRelay>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        expect(flow.connect<"out", "in">(source, relay).has_value());
+        expect(flow.connect<"out", "in">(relay, sink).has_value());
+
+        TScheduler scheduler({{"timeout_ms", static_cast<gr::Size_t>(kParkTimeout.count())}, {"watchdog_timeout", gr::Size_t(60'000)}, {"poolName", std::string(kDrainPoolName)}});
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        const auto startedAt = std::chrono::steady_clock::now();
+        const bool completed = qa_sched::runAndWaitWithin(scheduler, qa_sched::kEventBound);
+        const auto elapsedMs = qa_sched::Millis(std::chrono::steady_clock::now() - startedAt).count();
+        std::println("untaken remainder, {} (timeout_ms {}): ended {} after {:.0f} ms, {} calls of the relay", policyName, kParkTimeout.count(), completed, elapsedMs, relay._nCalls);
+        expect(completed) << policyName << "the drain waited for parks to time out";
+        expect(eq(source._nEmitted, qa_sched::kSamplesBeforeTerminal)) << policyName;
+        expect(gt(relay._nCalls, 1UZ)) << policyName << "the relay was not offered its remainder";
+        expect(eq(sink._nReceived, 0UZ)) << policyName;
+    };
+
+    "a block that never takes its remainder ends the graph under multiThreaded"_test                         = [&] { untakenRemainderEnds.operator()<qa_sched::TestScheduler>("multiThreaded"); };
+    "a block that never takes its remainder keeps its worker from parking under singleThreadedBlocking"_test = [&] { untakenRemainderEnds.operator()<qa_sched::BlockingScheduler>("singleThreadedBlocking"); };
 };
 
 namespace qa_sched {

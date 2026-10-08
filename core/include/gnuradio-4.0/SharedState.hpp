@@ -30,6 +30,10 @@ GNURADIO_EXPORT const Sequence*& publishWakeExempt() noexcept;
 // a message is not work: the progress sequence moves only for samples.
 GNURADIO_EXPORT std::size_t& handledMessageSpans() noexcept;
 
+// the work() calls on the calling thread to a block that drains an asynchronous input. Such a block ends after a bound
+// of calls in which nothing it waits on moved.
+GNURADIO_EXPORT std::size_t& drainingCalls() noexcept;
+
 } // namespace gr::detail
 
 namespace gr::scheduler {
