@@ -146,6 +146,22 @@ struct DualSource : gr::Block<DualSource> {
     }
 };
 
+// a source with a mandatory and an optional output, both fed with ones
+struct MonitoredSource : gr::Block<MonitoredSource> {
+    gr::PortOut<float>               out;
+    gr::PortOut<float, gr::Optional> monitor;
+
+    GR_MAKE_REFLECTABLE(MonitoredSource, out, monitor);
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan, gr::OutputSpanLike auto& monitorSpan) {
+        std::ranges::fill(outSpan, 1.0f);
+        outSpan.publish(outSpan.size());
+        std::ranges::fill(monitorSpan, 1.0f);
+        monitorSpan.publish(monitorSpan.size());
+        return gr::work::Status::OK;
+    }
+};
+
 // resolvable only through a test-local registry, never the global one, so a lookup that
 // succeeds proves which loader served it
 struct LoaderCanary : gr::Block<LoaderCanary> {
@@ -696,6 +712,26 @@ struct ReplacementRecord {
         record.uniqueName = it->second.value_or(std::string());
     }
     return record;
+}
+
+// the unique names that a reply lists under the key, empty when the reply lacks the list
+[[nodiscard]] std::vector<std::string> listedNames(const gr::property_map& reply, std::string_view key) {
+    std::vector<std::string> names;
+    if (const auto it = reply.find(std::pmr::string(key)); it != reply.end()) {
+        if (const auto* list = it->second.get_if<gr::Tensor<gr::pmt::Value>>(); list != nullptr) {
+            for (std::size_t i = 0UZ; i < list->size(); ++i) {
+                names.push_back((*list)[i].value_or(std::string()));
+            }
+        }
+    }
+    return names;
+}
+
+// the data of a RemoveEdge request for the edge from the source's "out" to the destination's "in"
+[[nodiscard]] gr::property_map removeEdgeRequest(std::string_view sourceBlock, std::string_view destinationBlock) {
+    using namespace gr::serialization_fields;
+    return {{std::pmr::string(EDGE_SOURCE_BLOCK), std::string(sourceBlock)}, {std::pmr::string(EDGE_SOURCE_PORT), std::string("out")}, //
+        {std::pmr::string(EDGE_DESTINATION_BLOCK), std::string(destinationBlock)}, {std::pmr::string(EDGE_DESTINATION_PORT), std::string("in")}};
 }
 
 // Runs HeldSource -> HoldingStage -> HeldSink until the source has published its samples and the stage has passed its
@@ -1642,6 +1678,7 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(fatal(displacedEdge != nullptr));
         expect(eq(displacedEdge->at(std::pmr::string(EDGE_SOURCE_BLOCK)).value_or(std::string_view{}), std::string_view(first.unique_name))) << "the reply names another edge as displaced";
         expect(eq(displacedEdge->at(std::pmr::string(EDGE_DESTINATION_BLOCK)).value_or(std::string_view{}), std::string_view(sink.unique_name)));
+        expect(qa_edit::listedNames(*reply, "sourcesWithoutReader") == std::vector{std::string(first.unique_name)}) << "the reply does not name the displaced source";
         expect(eq(first.out.nReaders(), 0UZ)) << "the displaced source still feeds the input";
         expect(eq(second.out.nReaders(), 1UZ)) << "the emplaced source does not feed the input";
 
@@ -2173,5 +2210,178 @@ const boost::ut::suite<"a replacement in a running graph"> runningReplacementTes
     };
 };
 #endif
+
+const boost::ut::suite<"edits that give a block a reader or take its last one"> readerEditTests = [] {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+    using namespace gr::scheduler::property;
+
+    "a RemoveEdge reply names a source that the removal leaves without a reader"_test = [] {
+        gr::Graph flow;
+        auto&     source  = flow.emplaceBlock<qa_edit::Source>();
+        auto&     kept    = flow.emplaceBlock<qa_edit::Sink>();
+        auto&     removed = flow.emplaceBlock<qa_edit::Sink>();
+        expect(flow.connect<"out", "in">(source, kept).has_value());
+        expect(flow.connect<"out", "in">(source, removed).has_value());
+        const std::string sourceName{source.unique_name};
+        const std::string keptName{kept.unique_name};
+        const std::string removedName{removed.unique_name};
+
+        qa_edit::TestScheduler scheduler;
+        expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(fatal(toScheduler.connect(scheduler.msgIn).has_value()));
+        expect(fatal(scheduler.msgOut.connect(fromScheduler).has_value()));
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+
+        gr::sendMessage<gr::message::Command::Set>(toScheduler, "", kRemoveEdge, qa_edit::removeEdgeRequest(sourceName, removedName), "fan-out");
+        const std::optional<gr::Message> fanOutReply = qa_edit::takeReplyTo(fromScheduler, "fan-out");
+        expect(fatal(fanOutReply.has_value() && fanOutReply->data.has_value())) << "the removal of one edge of the fan-out was refused";
+        expect(fanOutReply->data->find("sourcesWithoutReader") == fanOutReply->data->end()) << "the reply names a source that keeps a reader";
+
+        gr::sendMessage<gr::message::Command::Set>(toScheduler, "", kRemoveEdge, qa_edit::removeEdgeRequest(sourceName, keptName), "last");
+        const std::optional<gr::Message> lastReply = qa_edit::takeReplyTo(fromScheduler, "last");
+        expect(fatal(lastReply.has_value() && lastReply->data.has_value())) << "the removal of the last edge was refused";
+        expect(qa_edit::listedNames(*lastReply->data, "sourcesWithoutReader") == std::vector{sourceName}) << "the reply does not name the source left without a reader";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
+    };
+
+    // a block stops for want of a reader when no mandatory stream output has one
+    "a RemoveEdge reply names a source whose remaining edges leave an optional or a message output"_test = [] {
+        gr::Graph flow;
+        auto&     monitored   = flow.emplaceBlock<qa_edit::MonitoredSource>();
+        auto&     mainSink    = flow.emplaceBlock<qa_edit::Sink>();
+        auto&     monitorSink = flow.emplaceBlock<qa_edit::Sink>();
+        auto&     messenger   = flow.emplaceBlock<qa_edit::MessageSource>();
+        auto&     messageSink = flow.emplaceBlock<qa_edit::MessageSink>();
+        expect(flow.connect<"out", "in">(monitored, mainSink).has_value());
+        expect(flow.connect<"monitor", "in">(monitored, monitorSink).has_value());
+        expect(flow.connect<"out", "in">(messenger, messageSink).has_value());
+        expect(flow.connect<"cmd", "cmd">(messenger, messageSink).has_value());
+        const std::string monitoredName{monitored.unique_name};
+        const std::string messengerName{messenger.unique_name};
+
+        qa_edit::TestScheduler scheduler;
+        expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(fatal(toScheduler.connect(scheduler.msgIn).has_value()));
+        expect(fatal(scheduler.msgOut.connect(fromScheduler).has_value()));
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+
+        gr::sendMessage<gr::message::Command::Set>(toScheduler, "", kRemoveEdge, qa_edit::removeEdgeRequest(monitoredName, std::string(mainSink.unique_name)), "optional");
+        const std::optional<gr::Message> optionalReply = qa_edit::takeReplyTo(fromScheduler, "optional");
+        expect(fatal(optionalReply.has_value() && optionalReply->data.has_value())) << "the removal of the mandatory output's edge was refused";
+        expect(qa_edit::listedNames(*optionalReply->data, "sourcesWithoutReader") == std::vector{monitoredName}) << "the reply does not name a source whose optional output keeps an edge";
+
+        gr::sendMessage<gr::message::Command::Set>(toScheduler, "", kRemoveEdge, qa_edit::removeEdgeRequest(messengerName, std::string(messageSink.unique_name)), "message");
+        const std::optional<gr::Message> messageReply = qa_edit::takeReplyTo(fromScheduler, "message");
+        expect(fatal(messageReply.has_value() && messageReply->data.has_value())) << "the removal of the stream edge was refused";
+        expect(qa_edit::listedNames(*messageReply->data, "sourcesWithoutReader") == std::vector{messengerName}) << "the reply does not name a source whose message output keeps an edge";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
+    };
+
+    "a RemoveBlock reply names a source that the removal leaves without a reader"_test = [] {
+        gr::Graph flow;
+        auto&     shared    = flow.emplaceBlock<qa_edit::Source>();
+        auto&     keptStage = flow.emplaceBlock<qa_edit::Tunable>();
+        auto&     keptSink  = flow.emplaceBlock<qa_edit::Sink>();
+        auto&     lone      = flow.emplaceBlock<qa_edit::Source>();
+        auto&     loneStage = flow.emplaceBlock<qa_edit::Tunable>();
+        expect(flow.connect<"out", "in">(shared, keptStage).has_value());
+        expect(flow.connect<"out", "in">(shared, keptSink).has_value());
+        expect(flow.connect<"out", "in">(lone, loneStage).has_value());
+        const std::string keptStageName{keptStage.unique_name};
+        const std::string loneName{lone.unique_name};
+        const std::string loneStageName{loneStage.unique_name};
+
+        qa_edit::TestScheduler scheduler;
+        expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(fatal(toScheduler.connect(scheduler.msgIn).has_value()));
+        expect(fatal(scheduler.msgOut.connect(fromScheduler).has_value()));
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+
+        gr::sendMessage<gr::message::Command::Set>(toScheduler, "", kRemoveBlock, {{"uniqueName", keptStageName}}, "kept");
+        const std::optional<gr::Message> keptReply = qa_edit::takeReplyTo(fromScheduler, "kept");
+        expect(fatal(keptReply.has_value() && keptReply->data.has_value())) << "the removal of the stage of the fan-out was refused";
+        expect(keptReply->data->find("sourcesWithoutReader") == keptReply->data->end()) << "the reply names a source that keeps a reader";
+
+        gr::sendMessage<gr::message::Command::Set>(toScheduler, "", kRemoveBlock, {{"uniqueName", loneStageName}}, "lone");
+        const std::optional<gr::Message> loneReply = qa_edit::takeReplyTo(fromScheduler, "lone");
+        expect(fatal(loneReply.has_value() && loneReply->data.has_value())) << "the removal of the lone stage was refused";
+        expect(qa_edit::listedNames(*loneReply->data, "sourcesWithoutReader") == std::vector{loneName}) << "the reply does not name the source left without a reader";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
+    };
+
+    // An edge from the subgraph's exported output counts for the interior source. Each edit below takes the last such
+    // edge away, and each reply names the interior source
+    "the replies name the block behind a subgraph's exported output as the source left without a reader"_test = [] {
+        gr::Graph                             flow;
+        auto                                  wrapper  = std::make_shared<gr::GraphWrapper<gr::Graph>>();
+        auto&                                 interior = wrapper->graph()->emplaceBlock<qa_edit::Source>();
+        const std::string                     interiorName{interior.unique_name};
+        const auto*                           interiorBlock = &interior;
+        const std::shared_ptr<gr::BlockModel> subgraph      = flow.addBlock(wrapper);
+        const std::string                     subgraphName{subgraph->uniqueName()};
+        expect(wrapper->exportPort(true, interior.unique_name, gr::PortDirection::OUTPUT, "out", "out").has_value());
+        const std::string                     firstSinkName{flow.emplaceBlock<qa_edit::Sink>().unique_name};
+        const std::shared_ptr<gr::BlockModel> firstSink  = flow.blocks().back();
+        auto&                                 secondSink = flow.emplaceBlock<qa_edit::Sink>();
+        auto&                                 spare      = flow.emplaceBlock<qa_edit::Source>();
+        expect(flow.connect(subgraph, gr::PortDefinition{"out"}, firstSink, gr::PortDefinition{"in"}).has_value());
+        expect(flow.connect<"out", "in">(spare, secondSink).has_value());
+        const std::string secondSinkName{secondSink.unique_name};
+        const std::string spareName{spare.unique_name};
+
+        qa_edit::TestScheduler scheduler;
+        expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(fatal(toScheduler.connect(scheduler.msgIn).has_value()));
+        expect(fatal(scheduler.msgOut.connect(fromScheduler).has_value()));
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+
+        gr::sendMessage<gr::message::Command::Set>(toScheduler, "", kEmplaceEdge, qa_edit::edgeRequest(spareName, firstSinkName, std::int32_t{0}), "displacing");
+        const std::optional<gr::Message> displacingReply = qa_edit::takeReplyTo(fromScheduler, "displacing");
+        expect(fatal(displacingReply.has_value() && displacingReply->data.has_value())) << "the displacing edge was refused";
+        expect(qa_edit::listedNames(*displacingReply->data, "sourcesWithoutReader") == std::vector{interiorName}) << "the EmplaceEdge reply does not name the interior source";
+        expect(fatal(qa_edit::awaitCondition([interiorBlock] { return interiorBlock->state() == STOPPED; }))) << "the interior source without a reader did not stop";
+
+        gr::sendMessage<gr::message::Command::Set>(toScheduler, "", kEmplaceEdge, qa_edit::edgeRequest(subgraphName, secondSinkName, std::int32_t{0}), "rejoined");
+        const std::optional<gr::Message> rejoinedReply = qa_edit::takeReplyTo(fromScheduler, "rejoined");
+        expect(fatal(rejoinedReply.has_value() && rejoinedReply->data.has_value())) << "the edge from the exported output was refused";
+        expect(rejoinedReply->data->find("sourcesWithoutReader") == rejoinedReply->data->end()) << "the reply names the spare source, which keeps a reader";
+
+        gr::sendMessage<gr::message::Command::Set>(toScheduler, "", kRemoveEdge, qa_edit::removeEdgeRequest(subgraphName, secondSinkName), "removed");
+        const std::optional<gr::Message> removedReply = qa_edit::takeReplyTo(fromScheduler, "removed");
+        expect(fatal(removedReply.has_value() && removedReply->data.has_value())) << "the removal of the edge from the exported output was refused";
+        expect(qa_edit::listedNames(*removedReply->data, "sourcesWithoutReader") == std::vector{interiorName}) << "the RemoveEdge reply does not name the interior source";
+
+        gr::sendMessage<gr::message::Command::Set>(toScheduler, "", kEmplaceEdge, qa_edit::edgeRequest(subgraphName, secondSinkName, std::int32_t{0}), "restored");
+        const std::optional<gr::Message> restoredReply = qa_edit::takeReplyTo(fromScheduler, "restored");
+        expect(fatal(restoredReply.has_value() && restoredReply->data.has_value())) << "the restored edge was refused";
+
+        gr::sendMessage<gr::message::Command::Set>(toScheduler, "", kRemoveBlock, {{"uniqueName", secondSinkName}}, "sink removed");
+        const std::optional<gr::Message> sinkRemovedReply = qa_edit::takeReplyTo(fromScheduler, "sink removed");
+        expect(fatal(sinkRemovedReply.has_value() && sinkRemovedReply->data.has_value())) << "the removal of the sink was refused";
+        expect(qa_edit::listedNames(*sinkRemovedReply->data, "sourcesWithoutReader") == std::vector{interiorName}) << "the RemoveBlock reply does not name the interior source";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
+    };
+};
 
 int main() { /* tests are statically registered */ }
