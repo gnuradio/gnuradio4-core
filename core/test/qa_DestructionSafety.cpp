@@ -78,7 +78,7 @@ const boost::ut::suite<"destruction safety"> destructionSafetyTests = [] {
         for (std::size_t cycle = 0UZ; cycle < kCycles; ++cycle) {
             gr::SchedulerWrapper<qa_destroy::InnerScheduler> wrapper;
             wrapper.setGraph(qa_destroy::makeGraph());
-            wrapper.start();
+            expect(wrapper.start().has_value());
             // no stop(): the destructor must request it and join the scheduler thread
         }
         expect(true) << "construct/start/destroy cycles completed";
@@ -88,9 +88,9 @@ const boost::ut::suite<"destruction safety"> destructionSafetyTests = [] {
         gr::SchedulerWrapper<qa_destroy::InnerScheduler> wrapper;
         wrapper.setGraph(qa_destroy::makeGraph());
 
-        wrapper.start();
+        expect(wrapper.start().has_value());
         wrapper.stop();
-        wrapper.start(); // must not assign over a joinable thread
+        expect(wrapper.start().has_value()); // must not assign over a joinable thread
         wrapper.stop();
 
         expect(true) << "start/stop/start/stop completed";
