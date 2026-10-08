@@ -456,7 +456,10 @@ public:
         }
     }
 
-    void releaseWorkQuiescence() { gr::atomic_ref(_workQuiescenceRequested).store_release(false); }
+    void releaseWorkQuiescence() {
+        gr::atomic_ref(_workQuiescenceRequested).store_release(false);
+        wakeParkedWorkers();
+    }
 
     [[nodiscard]] bool workerStarted() noexcept { return gr::atomic_ref(_nWorkersStarted).load_acquire() > 0UZ; }
 
@@ -753,17 +756,22 @@ public:
     void processMessages(gr::MsgPortInBuiltin& port, std::span<const gr::Message> messages) {
         base_t::processMessages(port, messages); // filters messages and calls own property handler
 
+        bool forwarded = false;
         for (const gr::Message& msg : messages) {
             if (msg.serviceName != this->unique_name && msg.serviceName != this->name && msg.endpoint != block::property::kLifeCycleState) {
                 // only forward wildcard, non-scheduler messages, and non-lifecycle messages (N.B. the latter is exclusively handled by the scheduler)
                 if (_messagePortsConnected) {
                     WriterSpanLike auto msgSpan = _toChildMessagePort.streamWriter().template reserve<SpanReleasePolicy::ProcessAll>(1UZ);
                     msgSpan[0]                  = msg;
+                    forwarded                   = true;
                 } else {
                     // if not yet connected, keep messages to children in cache and forward when connecting
                     _pendingMessagesToChildren.push_back(msg);
                 }
             }
+        }
+        if (forwarded) {
+            wakeParkedWorkers();
         }
     }
 
@@ -1527,8 +1535,11 @@ protected:
                 }
 
                 currentProgress = progressAfter;
-                // parking in a non-RUNNING state would delay the worker's next state read by up to timeout_ms
-                if (activeState == RUNNING && inactiveCycleCount > timeout_inactivity_count) {
+                // parking in a non-RUNNING state would delay the worker's next state read by up to timeout_ms, and a
+                // worker of a stopped run leaves instead. activeState can come from a message pass before a pause. The
+                // worker therefore reads the state again. A pause publishes REQUESTED_PAUSE before its wake. A worker
+                // that still reads RUNNING here read _wake before that wake, and the wake ends its park.
+                if (activeState == RUNNING && inactiveCycleCount > timeout_inactivity_count && gr::atomic_ref(_run.generation).load_acquire() == generation && this->state() == RUNNING) {
                     // allow a scheduler process to wait on progress before retrying (N.B. intended to save CPU/battery power)
                     // work, or a wake since the top of this pass, ends the park. A wake does not count as progress
                     waitUntilChanged(*progress, currentProgress, *_wake, currentWake, timeout_ms);
@@ -1678,11 +1689,21 @@ protected:
     // A parked worker waits until the graph's progress sequence or _wake leaves the value it read at the top of its
     // pass, or until timeout_ms passes. Work advances progress, which the inactivity count and the watchdog read.
     // Everything else that must end a park advances _wake and notifies the progress sequence: stop(), pause(),
-    // resume(), the watchdog's period, a message from another thread (see registerWake()), and a worker's message pass
-    // in which a block handled a message.
+    // resume(), the watchdog's period, a message from another thread (see registerWake()), a worker's message pass in
+    // which a block handled a message, and an edit or a forward (see wakeParkedWorkers()).
     void wakeWorkers() {
         _wake->incrementAndGet();
         _graph->_progress->notify_all();
+    }
+
+    // The scheduler's message service runs on any thread, and a parent's worker runs a nested scheduler's. The service
+    // can forward a message to a block, or add or remove a block or an edge, while the worker that calls the block
+    // concerned is parked. A worker woken while a work quiescence holds parks again without calling its blocks. The
+    // end of every work quiescence, an edit's or a parent's, therefore wakes the workers.
+    void wakeParkedWorkers() {
+        if constexpr (parksIdleWorkers()) {
+            wakeWorkers();
+        }
     }
 
     // While a worker of a parking policy is inside poolWorker(), each message published into msgIn or into the ring
@@ -1899,7 +1920,9 @@ protected:
             // init() runs inside the start
             if (hasOpenAdoptionList()) {
                 startAdoptedScheduler(newBlock);
-                std::ignore = queueForAdoption(newBlock);
+                if (queueForAdoption(newBlock)) {
+                    wakeParkedWorkers();
+                }
             }
             return;
         }
@@ -1918,6 +1941,7 @@ protected:
             break;
         default: this->emitErrorMessage("propertyCallbackEmplaceBlock", std::format("Unexpected block state during emplacement: {}", gr::meta::enumName(newBlock->state()).value_or("")));
         }
+        wakeParkedWorkers();
     }
 
     std::optional<Message> propertyCallbackEmplaceBlock([[maybe_unused]] std::string_view propertyName, Message message) {
@@ -2455,6 +2479,7 @@ protected:
             return targetGraph->replaceBlock(uniqueName, type, properties);
         }();
         makeZombie(std::move(oldBlock));
+        wakeParkedWorkers();
 
         std::optional<Message> result = gr::Message{};
         result->endpoint              = scheduler::property::kBlockReplaced;
