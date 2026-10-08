@@ -286,7 +286,7 @@ const boost::ut::suite WaitStrategiesTests = [] {
         expect(WaitStrategyLike<YieldingWaitStrategy>);
         expect(not WaitStrategyLike<int>);
 
-        TestStruct a;
+        TestStruct<> a;
         expect(a.test());
     };
 };
@@ -446,7 +446,7 @@ const boost::ut::suite<"CircularBuffer<T>"> _circ0 = [] {
                 {
                     WriterSpanLike auto pSpan = writer.template tryReserve<SpanReleasePolicy::ProcessAll>(blockSize);
                     expect(eq(pSpan.size(), blockSize));
-                    std::iota(pSpan.begin(), pSpan.end(), counter += pSpan.size());
+                    std::iota(pSpan.begin(), pSpan.end(), static_cast<std::ranges::range_value_t<decltype(pSpan)>>(counter += pSpan.size()));
                 }
                 ReaderSpanLike auto cSpan = reader.get(blockSize);
                 expect(eq(cSpan.size(), blockSize));
@@ -699,7 +699,7 @@ const boost::ut::suite StreamTagConcept = [] {
             WriterSpanLike auto pSpan = writer.tryReserve<SpanReleasePolicy::ProcessAll>(10);
             expect(eq(pSpan.size(), 10UZ));
             static std::size_t offset = 1;
-            std::iota(pSpan.begin(), pSpan.end(), offset);
+            std::iota(pSpan.begin(), pSpan.end(), static_cast<std::ranges::range_value_t<decltype(pSpan)>>(offset));
             offset += pSpan.size();
 
             WriterSpanLike auto pSpanTag = tagWriter.tryReserve<SpanReleasePolicy::ProcessAll>(1);
@@ -728,9 +728,11 @@ const boost::ut::suite NonPowerTwoTests = [] {
     using namespace gr;
 
     "std::vector<T>"_test = [] {
-        using Type                     = std::vector<int>;
-        constexpr std::size_t typeSize = sizeof(std::vector<int>);
-        expect(not std::has_single_bit(typeSize)) << "type is non-power-of-two";
+        using Type = std::vector<int>;
+        // what this suite exercises is a composite element type, which forces the STL-allocator path instead
+        // of the power-of-two mmap fast path. sizeof(std::vector) itself is an ABI detail -- 24 bytes on
+        // libstdc++, 32 with MSVC's debug iterators -- so it is not something to assert on.
+        static_assert(not std::is_trivially_copyable_v<Type>);
         BufferLike auto buffer = CircularBuffer<Type>(1024);
         expect(ge(buffer.size(), 1024u));
 
@@ -988,7 +990,7 @@ const boost::ut::suite HistoryBufferTest = [] {
         }
 
         static_assert(!std::is_const_v<std::remove_pointer_t<decltype(hb_double.data())>>, "is non-const");
-        const auto& const_buffer = hb_double;
+        [[maybe_unused]] const auto& const_buffer = hb_double;
         static_assert(std::is_const_v<std::remove_pointer_t<decltype(const_buffer.data())>>, "is const");
     };
 
@@ -1279,7 +1281,7 @@ const boost::ut::suite<"non power of two"> _nonPo2 = [] {
         for (std::size_t round = 0UZ; round < 3UZ; ++round) {
             {
                 auto write_span = writer.tryReserve(writeReadQuanta);
-                std::iota(write_span.begin(), write_span.end(), round * writeReadQuanta);
+                std::iota(write_span.begin(), write_span.end(), static_cast<int32_t>(round * writeReadQuanta));
                 write_span.publish(writeReadQuanta);
             } // RAII mechanics - bytes published on destruction of the 'writer_span'.
 
