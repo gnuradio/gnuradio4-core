@@ -5,6 +5,7 @@
 #include <utility>
 
 #include <gnuradio-4.0/Block.hpp>
+#include <gnuradio-4.0/CircularBuffer.hpp>
 #include <gnuradio-4.0/ComputeDomain.hpp>
 
 namespace gr::testing {
@@ -19,12 +20,13 @@ inline constexpr gr::ComputeDomain kCrossObjectDomain = gr::ComputeDomain::gpu_s
  * the registry holds the values that the object's code reads.
  */
 struct CrossObjectProbe : gr::Block<CrossObjectProbe> {
-    using Description = gr::Doc<"holds a compute provider's resource that its constructing code reads">;
+    using Description = gr::Doc<"holds the default buffer resource and a compute provider's resource that its constructing code reads">;
 
     gr::PortIn<float> in;
 
     GR_MAKE_REFLECTABLE(CrossObjectProbe, in);
 
+    std::pmr::memory_resource* defaultResource  = gr::double_mapped_memory_resource::defaultAllocator();
     std::pmr::memory_resource* providerResource = gr::ComputeRegistry::instance().tryResolve(kCrossObjectDomain);
 
     explicit CrossObjectProbe(gr::property_map init = {}) : gr::Block<CrossObjectProbe>(std::move(init)) {}

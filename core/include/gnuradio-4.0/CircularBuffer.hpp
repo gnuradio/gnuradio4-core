@@ -56,6 +56,7 @@ inline constexpr bool has_posix_mmap_interface = false;
 #include "Buffer.hpp"
 #include "ClaimStrategy.hpp"
 #include "Sequence.hpp"
+#include "SharedState.hpp"
 #include "WaitStrategy.hpp"
 
 namespace gr {
@@ -168,10 +169,7 @@ class double_mapped_memory_resource : public std::pmr::memory_resource {
     [[nodiscard]] bool do_is_equal(const memory_resource& other) const noexcept override { return this == &other; }
 
 public:
-    static inline double_mapped_memory_resource* defaultAllocator() {
-        static auto instance = double_mapped_memory_resource();
-        return &instance;
-    }
+    static inline double_mapped_memory_resource* defaultAllocator() { return detail::defaultDoubleMappedResource(); }
 
     template<typename T>
     static inline std::pmr::polymorphic_allocator<T> allocator() {
@@ -246,13 +244,18 @@ private:
         std::size_t               _reader_count{0UZ};
         std::size_t               _writer_count{0UZ};
 
+        // A buffer recognizes the default resource by its address. The library gnuradio-shared-state builds that
+        // resource, and a dynamic_cast to its type fails across shared objects where the standard library compares type
+        // information by address.
+        [[nodiscard]] static bool isDoubleMapped(const std::pmr::memory_resource* resource) { return resource == double_mapped_memory_resource::defaultAllocator() || dynamic_cast<const double_mapped_memory_resource*>(resource) != nullptr; }
+
         BufferImpl() = delete;
         BufferImpl(const std::size_t min_size, Allocator allocator)
-            : _allocator(allocator),                                                                 //
-              _isMmapAllocated(dynamic_cast<double_mapped_memory_resource*>(_allocator.resource())), //
-              _size(align_with_page_size(min_size, _isMmapAllocated)), _mask(_size - 1),             //
-              _is_power_of_two(std::has_single_bit(_size)),                                          //
-              _data(buffer_size(_size, _isMmapAllocated), _allocator),                               //
+            : _allocator(allocator),                                                     //
+              _isMmapAllocated(isDoubleMapped(_allocator.resource())),                   //
+              _size(align_with_page_size(min_size, _isMmapAllocated)), _mask(_size - 1), //
+              _is_power_of_two(std::has_single_bit(_size)),                              //
+              _data(buffer_size(_size, _isMmapAllocated), _allocator),                   //
               _claimStrategy(ClaimType(_size)) {}
 
         BufferImpl(const BufferImpl&)            = delete;
