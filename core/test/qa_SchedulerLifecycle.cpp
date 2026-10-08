@@ -4040,10 +4040,10 @@ const boost::ut::suite<"the zero-progress park"> zeroProgressParkTests = [] {
     // the park is left alone, and the trial times from call to call. A notify that ends the park brings
     // the next call in a fraction of the undisturbed park.
     "a producer's notify ends the park"_test = [] {
-        using Micros                       = std::chrono::duration<double, std::micro>;
-        constexpr std::size_t kTrials      = 25UZ;
-        constexpr std::size_t kMaxAttempts = 2000UZ;
-        constexpr auto        kSettle      = std::chrono::microseconds(100); // the worker reaches its park well inside this
+        using Micros                              = std::chrono::duration<double, std::micro>;
+        static constexpr std::size_t kTrials      = 25UZ;
+        static constexpr std::size_t kMaxAttempts = 2000UZ;
+        static constexpr auto        kSettle      = std::chrono::microseconds(100); // the worker reaches its park well inside this
 
         qa_sched::gOfferedSamples.store(0UZ);
         qa_sched::gPublishedOffers.store(0UZ);
