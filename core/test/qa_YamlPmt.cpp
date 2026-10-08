@@ -274,7 +274,7 @@ const boost::ut::suite<"GrepTests"> _GrepTests = [] {
 };
 
 const boost::ut::suite<"YamlPmtTests"> _yamlPmtTests = [] {
-#ifndef __clang__
+#if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic ignored "-Wuseless-cast" // we want explicit casts for testing
 #endif
     using namespace boost::ut;
@@ -569,9 +569,9 @@ doubles:
 
         testYAML(src, expected);
 
-        expect(fuzzy_eq(formatResult(yaml::deserialize("value: !!float64 string")), "Error in 1:18: std::invalid_argument exception for expected floating-point value of 'string' - error: stod"sv));
-        expect(fuzzy_eq(formatResult(yaml::deserialize("value: !!int64 0xGG")), "Error in 1:16: Invalid integral-type value 'GG' (error: Invalid argument)"sv));
-        expect(fuzzy_eq(formatResult(yaml::deserialize("value: !!int64 0o99")), "Error in 1:16: Invalid integral-type value '99' (error: Invalid argument)"sv));
+        expect(fuzzy_eq(formatResult(yaml::deserialize("value: !!float64 string")), "Error in 1:18: std::invalid_argument exception for expected floating-point value of 'string' - error: "sv));
+        expect(fuzzy_eq(formatResult(yaml::deserialize("value: !!int64 0xGG")), "Error in 1:16: Invalid integral-type value 'GG' (error: "sv));
+        expect(fuzzy_eq(formatResult(yaml::deserialize("value: !!int64 0o99")), "Error in 1:16: Invalid integral-type value '99' (error: "sv));
         expect(fuzzy_eq(formatResult(yaml::deserialize("value: !!int64 0b1234")), "Error in 1:16: Invalid integral-type value"sv));
         expect(fuzzy_eq(formatResult(yaml::deserialize("value: !!int8 128")), "Error in 1:15: Invalid integral-type value"sv));
     };
@@ -684,7 +684,7 @@ vectorWithColons:
 
         testYAML(src1, expected);
 
-        expect(fuzzy_eq(formatResult(yaml::deserialize("key: !!int64 [foo, bar]")), "Error in 1:15: Invalid integral-type value 'foo' (error: Invalid argument)"sv));
+        expect(fuzzy_eq(formatResult(yaml::deserialize("key: !!int64 [foo, bar]")), "Error in 1:15: Invalid integral-type value 'foo' (error: "sv));
         expect(fuzzy_eq(formatResult(yaml::deserialize("key: !!str [foo, !!str bar]")), "Error in 1:24: Cannot have type tag for both list and list item"sv));
         expect(fuzzy_eq(formatResult(yaml::deserialize("key: !!unknown [foo, bar]")), "Error in 1:6: Unsupported type"sv));
         expect(fuzzy_eq(formatResult(yaml::deserialize("key: [foo\nbar]")), "Error in 2:1: Expected ',' or ']'"sv));
@@ -707,7 +707,7 @@ value:
 value:
     - !!int64 value
 )";
-        expect(fuzzy_eq(formatResult(yaml::deserialize(invalidScalarInList)), "Error in 3:15: Invalid integral-type value 'value' (error: Invalid argument)"sv));
+        expect(fuzzy_eq(formatResult(yaml::deserialize(invalidScalarInList)), "Error in 3:15: Invalid integral-type value 'value' (error: "sv));
 
         constexpr std::string_view taggedListInTaggedList = R"(
 value: !!str
@@ -876,8 +876,8 @@ complex5: !!complex32 (  1.0  ,   -1.0)
         expect(fuzzy_eq(formatResult(yaml::deserialize("complex: !!complex64 (1.01.0)")), "Error in 1:22: Invalid value for complex<>-type"sv));
         expect(fuzzy_eq(formatResult(yaml::deserialize("complex: !!complex64 Hello")), "Error in 1:22: Invalid value for complex<>-type"sv));
         expect(fuzzy_eq(formatResult(yaml::deserialize("complex: !!complex64 (1.0, -1.0, 2.0)")), "Error in 1:22: Invalid value for complex<>-type"sv));
-        expect(fuzzy_eq(formatResult(yaml::deserialize("complex: !!complex64 (foo, bar)")), "Error in 1:22: std::invalid_argument exception for expected floating-point value of 'foo' - error: stod"sv));
-        expect(fuzzy_eq(formatResult(yaml::deserialize("complex: !!complex64 (1.0, bar)")), "Error in 1:22: std::invalid_argument exception for expected floating-point value of 'bar' - error: stod"sv));
+        expect(fuzzy_eq(formatResult(yaml::deserialize("complex: !!complex64 (foo, bar)")), "Error in 1:22: std::invalid_argument exception for expected floating-point value of 'foo' - error: "sv));
+        expect(fuzzy_eq(formatResult(yaml::deserialize("complex: !!complex64 (1.0, bar)")), "Error in 1:22: std::invalid_argument exception for expected floating-point value of 'bar' - error: "sv));
     };
 
     "empty lines"_test = [] {
@@ -1141,7 +1141,7 @@ const boost::ut::suite<"yaml error formatter"> _yamlFormatter = [] {
     using namespace std::string_literals;
     using namespace std::string_view_literals;
 
-    constexpr auto testString = "Line one\nLine two with spaces at the end    \nLine three with extra text\nAnother line\nFinal line";
+    static constexpr auto testString = "Line one\nLine two with spaces at the end    \nLine three with extra text\nAnother line\nFinal line";
 
     "no error message"_test              = [] { expect(nothrow([] { std::println("no error message:\n{}", yaml::formatAsLines(testString, 2, 5)); })); };
     "short error message"_test           = [] { expect(nothrow([] { std::println("short error message:\n{}", yaml::formatAsLines(testString, 2, 5, "error")); })); };
