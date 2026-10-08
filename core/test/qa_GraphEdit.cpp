@@ -273,11 +273,16 @@ struct Ticker : gr::Block<Ticker> {
     }
 };
 
-// reads the job lists and the count of workers that have not left
+// reads the job lists, the count of workers that have not left and the size of the zombie list
 struct JobListProbe : TestScheduler {
     using TestScheduler::TestScheduler;
 
     [[nodiscard]] std::size_t nRunningJobs() const { return this->_nRunningJobs->value(); }
+
+    [[nodiscard]] std::size_t nZombieBlocks() {
+        std::lock_guard guard(this->_zombieBlocksMutex);
+        return this->_zombieBlocks.size();
+    }
 
     [[nodiscard]] std::size_t nJobLists() {
         std::lock_guard lock(this->_executionOrderMutex);
@@ -316,6 +321,25 @@ struct CountedTunable : gr::Block<CountedTunable> {
     }
 };
 
+inline std::atomic<std::size_t> gStagePassed{0UZ};
+
+// passes kPassed samples, counted in gStagePassed, and then requests its own stop
+struct EndingStage : gr::Block<EndingStage> {
+    gr::PortIn<float>  in;
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(EndingStage, in, out);
+
+    static constexpr std::size_t kPassed = 64UZ;
+
+    [[nodiscard]] float processOne(float value) {
+        if (gStagePassed.fetch_add(1UZ) + 1UZ >= kPassed) {
+            this->requestStop();
+        }
+        return value;
+    }
+};
+
 inline std::atomic<std::size_t> gHeldPublished{0UZ};
 inline std::atomic<std::size_t> gHeldPassed{0UZ};
 inline std::atomic<bool>        gSinkReleased{false};
@@ -338,6 +362,57 @@ struct HeldSource : gr::Block<HeldSource> {
         gHeldPublished.fetch_add(nPublish);
         return gr::work::Status::OK;
     }
+};
+
+inline std::atomic<std::size_t> gSourcedSamples{0UZ};
+
+// a Source that counts the samples it produces in gSourcedSamples
+struct CountedSource : gr::Block<CountedSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(CountedSource, out);
+
+    [[nodiscard]] float processOne() noexcept {
+        gSourcedSamples.fetch_add(1UZ, std::memory_order_relaxed);
+        return 1.0f;
+    }
+};
+
+constexpr std::string_view kStopEndpoint = "Stop";
+
+// a CountedSource that requests its own stop on a message to kStopEndpoint. Its worker handles the message between two
+// work() calls. The source stops without an end-of-stream tag
+struct StoppableSource : gr::Block<StoppableSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(StoppableSource, out);
+
+    explicit StoppableSource(gr::property_map initParameters = {}) : gr::Block<StoppableSource>(std::move(initParameters)) { propertyCallbacks[std::string(kStopEndpoint)] = static_cast<gr::BlockBase::PropertyCallback>(&StoppableSource::propertyCallbackStop); }
+
+    std::optional<gr::Message> propertyCallbackStop(std::string_view, gr::Message) {
+        this->requestStop();
+        return std::nullopt;
+    }
+
+    [[nodiscard]] float processOne() noexcept {
+        gSourcedSamples.fetch_add(1UZ, std::memory_order_relaxed);
+        return 1.0f;
+    }
+};
+
+inline std::atomic<float> gLevel{0.0f};
+
+// a source that produces its level and stores each level it takes in gLevel
+struct LevelSource : gr::Block<LevelSource> {
+    gr::PortOut<float> out;
+
+    gr::Annotated<float, "level"> level = 1.0f;
+
+    GR_MAKE_REFLECTABLE(LevelSource, out, level);
+
+    [[nodiscard]] float processOne() const noexcept { return level; }
+
+    void settingsChanged(const gr::property_map&, const gr::property_map&) { gLevel.store(level); }
 };
 
 // passes its first kPassed samples, counted in gHeldPassed, and keeps every later one at its input
@@ -386,6 +461,33 @@ struct FreeSink : gr::Block<FreeSink> {
     GR_MAKE_REFLECTABLE(FreeSink, in);
 
     void processOne(float) { gFreeRunningSamples.fetch_add(1UZ, std::memory_order_relaxed); }
+};
+
+constexpr std::string_view kSecondStart = "the source starts once";
+
+inline std::atomic<std::size_t> gOneRunSourceCalls{0UZ};
+
+// ends its stream at its first call. Its start() throws kSecondStart from the second start on, and every later call
+// publishes nothing. It counts its calls in gOneRunSourceCalls
+struct OneRunSource : gr::Block<OneRunSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(OneRunSource, out);
+
+    std::size_t _nStarts = 0UZ;
+    bool        _ended   = false;
+
+    void start() {
+        if (++_nStarts > 1UZ) {
+            throw gr::exception(std::string(kSecondStart));
+        }
+    }
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        gOneRunSourceCalls.fetch_add(1UZ, std::memory_order_relaxed);
+        outSpan.publish(0UZ);
+        return std::exchange(_ended, true) ? gr::work::Status::OK : gr::work::Status::DONE;
+    }
 };
 
 // its stop() hook watches gFreeRunningSamples for 100 ms or until the first change, and stores the change in
@@ -732,6 +834,105 @@ struct ReplacementRecord {
     using namespace gr::serialization_fields;
     return {{std::pmr::string(EDGE_SOURCE_BLOCK), std::string(sourceBlock)}, {std::pmr::string(EDGE_SOURCE_PORT), std::string("out")}, //
         {std::pmr::string(EDGE_DESTINATION_BLOCK), std::string(destinationBlock)}, {std::pmr::string(EDGE_DESTINATION_PORT), std::string("in")}};
+}
+
+// Runs first -> sink and a second source without an edge, which stops at its first call. The case then adds the edge
+// from the second source to the sink. The added edge displaces the first source's edge, and the second source runs
+// again and feeds the sink
+template<typename TScheduler>
+void expectEmplacedEdgeRestartsStoppedSource() {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+    gSourcedSamples.store(0UZ);
+    gFreeRunningSamples.store(0UZ);
+
+    gr::Graph flow;
+    auto&     sink   = flow.emplaceBlock<FreeSink>();
+    auto&     first  = flow.emplaceBlock<Source>();
+    auto&     second = flow.emplaceBlock<CountedSource>();
+    expect(flow.connect<"out", "in">(first, sink).has_value());
+    const std::string sinkName{sink.unique_name};
+    const std::string firstName{first.unique_name};
+    const std::string secondName{second.unique_name};
+    const auto*       secondBlock = &second;
+
+    TScheduler scheduler;
+    expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+    gr::MsgPortOut toScheduler;
+    gr::MsgPortIn  fromScheduler;
+    expect(fatal(toScheduler.connect(scheduler.msgIn).has_value()));
+    expect(fatal(scheduler.msgOut.connect(fromScheduler).has_value()));
+
+    std::thread runner([&scheduler] { std::ignore = scheduler.runAndWait(); }); // a single-threaded run executes on the thread that starts it
+    expect(awaitCondition([secondBlock] { return secondBlock->state() == STOPPED; })) << "the source without an edge did not stop";
+    expect(awaitCondition([] { return gFreeRunningSamples.load() > 0UZ; })) << "the first source never fed the sink";
+
+    sendMessage(toScheduler, gr::scheduler::property::kEmplaceEdge, edgeRequest(secondName, sinkName, std::int32_t{0}));
+    const std::optional<gr::property_map> reply = awaitReplyData(fromScheduler, gr::scheduler::property::kEdgeEmplaced);
+    expect(reply.has_value()) << "the edge was refused";
+    expect(reply.has_value() && listedNames(*reply, "restartedBlocks") == std::vector{secondName}) << "the reply does not name the restarted source";
+    expect(reply.has_value() && listedNames(*reply, "sourcesWithoutReader") == std::vector{firstName}) << "the reply does not name the displaced source";
+    expect(awaitCondition([] { return gSourcedSamples.load() > 0UZ; })) << "the source at the end of the added edge never ran again";
+    expect(secondBlock->state() == RUNNING);
+
+    expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+    runner.join();
+}
+
+// Runs Source -> EndingStage -> FreeSink beside a free-running Source -> Sink, each block of the chain with the given
+// disconnect_on_done. The stage ends, and the sink stops at the stage's end-of-stream tag. The case then replaces the
+// stage, and the reply names the restarted sink. A sink that released its input on done is connected to the
+// replacement at the ring's write position, and samples reach it. A sink that kept its input reads the same ring,
+// reads the end-of-stream tag again and stops without a sample
+template<bool disconnectOnDone>
+void expectSinkAfterEndedStageReplaced() {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+    registerTestBlocks();
+    gStagePassed.store(0UZ);
+    gCountedSamples.store(0UZ);
+    gFreeRunningSamples.store(0UZ);
+
+    gr::Graph              flow;
+    const gr::property_map chainSettings{{"disconnect_on_done", disconnectOnDone}};
+    auto&                  source     = flow.emplaceBlock<Source>(chainSettings);
+    auto&                  stage      = flow.emplaceBlock<EndingStage>(chainSettings);
+    auto&                  sink       = flow.emplaceBlock<FreeSink>(chainSettings);
+    auto&                  keptSource = flow.emplaceBlock<Source>();
+    auto&                  keptSink   = flow.emplaceBlock<Sink>();
+    expect(flow.connect<"out", "in">(source, stage).has_value());
+    expect(flow.connect<"out", "in">(stage, sink).has_value());
+    expect(flow.connect<"out", "in">(keptSource, keptSink).has_value());
+    const std::string sinkName{sink.unique_name};
+    const std::string stageName{stage.unique_name};
+    const auto*       stageBlock = &stage;
+    const auto*       sinkBlock  = &sink;
+
+    TestScheduler scheduler;
+    expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+    gr::MsgPortOut toScheduler;
+    gr::MsgPortIn  fromScheduler;
+    expect(fatal(toScheduler.connect(scheduler.msgIn).has_value()));
+    expect(fatal(scheduler.msgOut.connect(fromScheduler).has_value()));
+    expect(scheduler.changeStateTo(INITIALISED).has_value());
+    expect(scheduler.changeStateTo(RUNNING).has_value());
+    expect(fatal(awaitCondition([stageBlock, sinkBlock] { return stageBlock->state() == STOPPED && sinkBlock->state() == STOPPED; }))) << "the stage did not end, or the sink did not stop at its end";
+    const std::size_t nBeforeReplacement = gFreeRunningSamples.load();
+
+    sendMessage(toScheduler, gr::scheduler::property::kReplaceBlock, {{"uniqueName", stageName}, {"type", gr::meta::type_name<CountedTunable>()}});
+    const std::optional<gr::property_map> reply = awaitReplyData(fromScheduler, gr::scheduler::property::kBlockReplaced);
+    expect(fatal(reply.has_value())) << "the replacement was refused";
+    expect(std::ranges::contains(listedNames(*reply, "restartedBlocks"), sinkName)) << "the reply does not name the restarted sink";
+    if constexpr (disconnectOnDone) {
+        expect(awaitCondition([nBeforeReplacement] { return gCountedSamples.load() > 0UZ && gFreeRunningSamples.load() > nBeforeReplacement; })) << std::format("the replacement passed {} samples and the sink took {} after the replacement", gCountedSamples.load(), gFreeRunningSamples.load() - nBeforeReplacement);
+        expect(sinkBlock->state() == RUNNING);
+    } else {
+        expect(awaitCondition([sinkBlock] { return gCountedSamples.load() > 0UZ && sinkBlock->state() == STOPPED; })) << "the replacement passed no sample, or the sink did not stop again";
+        expect(eq(gFreeRunningSamples.load(), nBeforeReplacement)) << "the sink took a sample past the end-of-stream tag";
+    }
+
+    expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+    expect(awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
 }
 
 // Runs HeldSource -> HoldingStage -> HeldSink until the source has published its samples and the stage has passed its
@@ -2364,6 +2565,7 @@ const boost::ut::suite<"edits that give a block a reader or take its last one"> 
         const std::optional<gr::Message> rejoinedReply = qa_edit::takeReplyTo(fromScheduler, "rejoined");
         expect(fatal(rejoinedReply.has_value() && rejoinedReply->data.has_value())) << "the edge from the exported output was refused";
         expect(rejoinedReply->data->find("sourcesWithoutReader") == rejoinedReply->data->end()) << "the reply names the spare source, which keeps a reader";
+        expect(qa_edit::listedNames(*rejoinedReply->data, "restartedBlocks") == std::vector{interiorName}) << "the EmplaceEdge reply does not name the restarted interior source";
 
         gr::sendMessage<gr::message::Command::Set>(toScheduler, "", kRemoveEdge, qa_edit::removeEdgeRequest(subgraphName, secondSinkName), "removed");
         const std::optional<gr::Message> removedReply = qa_edit::takeReplyTo(fromScheduler, "removed");
@@ -2378,6 +2580,364 @@ const boost::ut::suite<"edits that give a block a reader or take its last one"> 
         const std::optional<gr::Message> sinkRemovedReply = qa_edit::takeReplyTo(fromScheduler, "sink removed");
         expect(fatal(sinkRemovedReply.has_value() && sinkRemovedReply->data.has_value())) << "the removal of the sink was refused";
         expect(qa_edit::listedNames(*sinkRemovedReply->data, "sourcesWithoutReader") == std::vector{interiorName}) << "the RemoveBlock reply does not name the interior source";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
+    };
+
+    "an edge emplaced in a multi-threaded run restarts its stopped source, and the reply names it"_test = [] { qa_edit::expectEmplacedEdgeRestartsStoppedSource<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>>(); };
+
+    "an edge emplaced in a single-threaded run restarts its stopped source, and the reply names it"_test = [] { qa_edit::expectEmplacedEdgeRestartsStoppedSource<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>>(); };
+
+#ifndef GR_TEST_WITHOUT_BLOCK_REGISTRY // replacement by name resolves the type through the registry
+    // the source stops without an end-of-stream tag, and the stage keeps waiting on its input
+    "a replacement restarts a stopped source at the other end of its edge, and the reply names it"_test = [] {
+        qa_edit::registerTestBlocks();
+        qa_edit::gSourcedSamples.store(0UZ);
+
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_edit::StoppableSource>();
+        auto&     stage  = flow.emplaceBlock<qa_edit::Tunable>();
+        auto&     sink   = flow.emplaceBlock<qa_edit::Sink>();
+        expect(flow.connect<"out", "in">(source, stage).has_value());
+        expect(flow.connect<"out", "in">(stage, sink).has_value());
+        const std::string sourceName{source.unique_name};
+        const std::string stageName{stage.unique_name};
+        const auto*       sourceBlock = &source;
+
+        qa_edit::TestScheduler scheduler;
+        expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(fatal(toScheduler.connect(scheduler.msgIn).has_value()));
+        expect(fatal(scheduler.msgOut.connect(fromScheduler).has_value()));
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(qa_edit::awaitCondition([] { return qa_edit::gSourcedSamples.load() > 0UZ; })) << "the source never ran";
+
+        gr::sendMessage<gr::message::Command::Set>(toScheduler, sourceName, qa_edit::kStopEndpoint, gr::property_map{});
+        expect(fatal(qa_edit::awaitCondition([sourceBlock] { return sourceBlock->state() == STOPPED; }))) << "the source did not stop";
+        const std::size_t nBeforeReplacement = qa_edit::gSourcedSamples.load();
+
+        qa_edit::sendMessage(toScheduler, kReplaceBlock, {{"uniqueName", stageName}, {"type", gr::meta::type_name<qa_edit::CountedTunable>()}});
+        const std::optional<gr::property_map> reply = qa_edit::awaitReplyData(fromScheduler, kBlockReplaced);
+        expect(fatal(reply.has_value())) << "the replacement was refused";
+        expect(qa_edit::listedNames(*reply, "restartedBlocks") == std::vector{sourceName}) << "the reply does not name the restarted source";
+        expect(qa_edit::awaitCondition([nBeforeReplacement] { return qa_edit::gSourcedSamples.load() > nBeforeReplacement; })) << "the stopped source never ran again";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
+    };
+
+    "a replacement of a stage that ended reconnects the sink that released its input, and samples reach it"_test = [] { qa_edit::expectSinkAfterEndedStageReplaced<true>(); };
+
+    "a sink that kept its input stops again at the stage's end-of-stream tag after the restart"_test = [] { qa_edit::expectSinkAfterEndedStageReplaced<false>(); };
+#endif
+
+    // the run's two job lists end at once, and the scheduler stays RUNNING with no worker left to restart a block
+    "a restart refused because every worker has left is listed with the reason"_test = [] {
+        constexpr std::string_view kPoolName = "qa_edit_two_threads";
+        gr::thread_pool::Manager::instance().replacePool(std::string(kPoolName), std::make_shared<gr::thread_pool::ThreadPoolWrapper>(std::make_unique<gr::thread_pool::BasicThreadPool>(kPoolName, gr::thread_pool::TaskType::CPU_BOUND, 2U, 2U), "CPU"));
+
+        gr::Graph flow;
+        auto&     ending      = flow.emplaceBlock<qa_edit::EndingSource>();
+        auto&     endingSink  = flow.emplaceBlock<qa_edit::Sink>();
+        auto&     spareEnding = flow.emplaceBlock<qa_edit::EndingSource>();
+        expect(flow.connect<"out", "in">(ending, endingSink).has_value());
+        const std::string endingSinkName{endingSink.unique_name};
+        const std::string spareEndingName{spareEnding.unique_name};
+
+        qa_edit::JobListProbe scheduler({{"poolName", std::string(kPoolName)}});
+        expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(fatal(toScheduler.connect(scheduler.msgIn).has_value()));
+        expect(fatal(scheduler.msgOut.connect(fromScheduler).has_value()));
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(fatal(qa_edit::awaitCondition([&scheduler] { return scheduler.nRunningJobs() == 0UZ; }))) << "the run's workers did not leave";
+        expect(fatal(scheduler.state() == RUNNING));
+
+        gr::sendMessage<gr::message::Command::Set>(toScheduler, scheduler.unique_name, kEmplaceEdge, qa_edit::edgeRequest(spareEndingName, endingSinkName, std::int32_t{0}), "late");
+        scheduler.processScheduledMessages();
+        const std::optional<gr::Message> reply = qa_edit::takeReplyTo(fromScheduler, "late");
+        expect(fatal(reply.has_value() && reply->data.has_value())) << "the edge was refused";
+        expect(qa_edit::listedNames(*reply->data, "restartedBlocks").empty()) << "the reply names a block restarted in a run that has no worker";
+        const auto  refusedEntry = reply->data->find("refusedRestarts");
+        const auto* refused      = refusedEntry != reply->data->end() ? refusedEntry->second.get_if<gr::property_map>() : nullptr;
+        expect(fatal(refused != nullptr)) << "the reply does not list the refused restarts";
+        for (const std::string& name : {spareEndingName, endingSinkName}) {
+            const auto entry = refused->find(std::pmr::string(name));
+            expect(entry != refused->end() && entry->second.value_or(std::string()).contains("next start")) << std::format("the reply does not list '{}' with the reason", name);
+        }
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
+    };
+
+    // A pool of two threads gives the level source a job list of its own. The source stops at its first call, and its
+    // worker leaves. A setting forwarded to it then waits at its message input until the restart
+    "a restarted block reads a message forwarded to it while it was stopped"_test = [] {
+        constexpr std::string_view kPoolName = "qa_edit_two_threads";
+        gr::thread_pool::Manager::instance().replacePool(std::string(kPoolName), std::make_shared<gr::thread_pool::ThreadPoolWrapper>(std::make_unique<gr::thread_pool::BasicThreadPool>(kPoolName, gr::thread_pool::TaskType::CPU_BOUND, 2U, 2U), "CPU"));
+        qa_edit::gLevel.store(0.0f);
+
+        gr::Graph flow;
+        auto&     level      = flow.emplaceBlock<qa_edit::LevelSource>();
+        auto&     keptSource = flow.emplaceBlock<qa_edit::Source>();
+        auto&     keptSink   = flow.emplaceBlock<qa_edit::FreeSink>();
+        expect(flow.connect<"out", "in">(keptSource, keptSink).has_value());
+        const std::string levelName{level.unique_name};
+        const std::string keptSinkName{keptSink.unique_name};
+        auto*             levelBlock = &level;
+
+        qa_edit::JobListProbe scheduler({{"poolName", std::string(kPoolName)}});
+        expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(fatal(toScheduler.connect(scheduler.msgIn).has_value()));
+        expect(fatal(scheduler.msgOut.connect(fromScheduler).has_value()));
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(fatal(eq(scheduler.nJobLists(), 2UZ))) << "the graph was not split into two job lists";
+        expect(fatal(qa_edit::awaitCondition([&scheduler, levelBlock] { return levelBlock->state() == STOPPED && scheduler.nRunningJobs() == 1UZ; }))) << "the level source did not stop, or its worker did not leave";
+
+        gr::sendMessage<gr::message::Command::Set>(toScheduler, levelName, gr::block::property::kSetting, {{"level", 2.0f}});
+        expect(fatal(qa_edit::awaitCondition([levelBlock] { return levelBlock->msgIn.available() > 0UZ; }))) << "the setting was not forwarded to the stopped source";
+
+        qa_edit::sendMessage(toScheduler, kEmplaceEdge, qa_edit::edgeRequest(levelName, keptSinkName, std::int32_t{0}));
+        const std::optional<gr::property_map> reply = qa_edit::awaitReplyData(fromScheduler, kEdgeEmplaced);
+        expect(fatal(reply.has_value())) << "the edge was refused";
+        expect(qa_edit::listedNames(*reply, "restartedBlocks") == std::vector{levelName}) << "the reply does not name the restarted source";
+        expect(qa_edit::awaitCondition([] { return qa_edit::gLevel.load() == 2.0f; })) << "the restarted source never read the setting";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
+    };
+
+    // the interior source has no reader until the edit and stops at its first call
+    "an edge from a subgraph's exported output restarts the stopped block behind the port"_test = [] {
+        qa_edit::gSourcedSamples.store(0UZ);
+
+        gr::Graph         flow;
+        auto              wrapper  = std::make_shared<gr::GraphWrapper<gr::Graph>>();
+        auto&             interior = wrapper->graph()->emplaceBlock<qa_edit::CountedSource>();
+        const std::string interiorName{interior.unique_name};
+        const auto*       interiorBlock = &interior;
+        const std::string subgraphName{flow.addBlock(wrapper)->uniqueName()};
+        expect(wrapper->exportPort(true, interior.unique_name, gr::PortDirection::OUTPUT, "out", "out").has_value());
+        const std::string sinkName{flow.emplaceBlock<qa_edit::FreeSink>().unique_name};
+
+        qa_edit::TestScheduler scheduler;
+        expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(fatal(toScheduler.connect(scheduler.msgIn).has_value()));
+        expect(fatal(scheduler.msgOut.connect(fromScheduler).has_value()));
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(fatal(qa_edit::awaitCondition([interiorBlock] { return interiorBlock->state() == STOPPED; }))) << "the interior source without a reader did not stop";
+        const std::size_t nBeforeEdge = qa_edit::gSourcedSamples.load();
+
+        qa_edit::sendMessage(toScheduler, kEmplaceEdge, qa_edit::edgeRequest(subgraphName, sinkName, std::int32_t{0}));
+        const std::optional<gr::property_map> reply = qa_edit::awaitReplyData(fromScheduler, kEdgeEmplaced);
+        expect(fatal(reply.has_value())) << "the edge was refused";
+        expect(qa_edit::listedNames(*reply, "restartedBlocks") == std::vector{interiorName}) << "the reply does not name the interior source";
+        expect(qa_edit::awaitCondition([nBeforeEdge] { return qa_edit::gSourcedSamples.load() > nBeforeEdge; })) << "the interior source never ran again";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
+    };
+
+#ifndef GR_TEST_WITHOUT_BLOCK_REGISTRY // replacement by name resolves the type through the registry
+    // The source ends, and the stage and the sink stop at its end-of-stream tag. A free-running pair keeps a worker of
+    // the run. The replacement of the stage connects the source's output to the replacement's input, and the source's
+    // start() then throws
+    "a refused restart releases the input that the edit connected to the refused block's output"_test = [] {
+        qa_edit::registerTestBlocks();
+
+        gr::Graph              flow;
+        const gr::property_map sourceSettings{{"disconnect_on_done", false}};
+        auto&                  source     = flow.emplaceBlock<qa_edit::OneRunSource>(sourceSettings);
+        auto&                  stage      = flow.emplaceBlock<qa_edit::Tunable>();
+        auto&                  sink       = flow.emplaceBlock<qa_edit::Sink>();
+        auto&                  keptSource = flow.emplaceBlock<qa_edit::Source>();
+        auto&                  keptSink   = flow.emplaceBlock<qa_edit::Sink>();
+        expect(flow.connect<"out", "in">(source, stage).has_value());
+        expect(flow.connect<"out", "in">(stage, sink).has_value());
+        expect(flow.connect<"out", "in">(keptSource, keptSink).has_value());
+        const std::string sourceName{source.unique_name};
+        const std::string stageName{stage.unique_name};
+        const std::string sinkName{sink.unique_name};
+        const auto*       sourceBlock = &source;
+        const auto*       stageBlock  = &stage;
+        const auto*       sinkBlock   = &sink;
+
+        qa_edit::TestScheduler scheduler;
+        expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(fatal(toScheduler.connect(scheduler.msgIn).has_value()));
+        expect(fatal(scheduler.msgOut.connect(fromScheduler).has_value()));
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(fatal(qa_edit::awaitCondition([sourceBlock, stageBlock, sinkBlock] { return sourceBlock->state() == STOPPED && stageBlock->state() == STOPPED && sinkBlock->state() == STOPPED && sourceBlock->out.nReaders() == 0UZ; }))) << "the chain did not stop at the source's end, or the stage kept its input";
+
+        qa_edit::sendMessage(toScheduler, kReplaceBlock, {{"uniqueName", stageName}, {"type", gr::meta::type_name<qa_edit::Tunable>()}});
+        const std::optional<gr::property_map> reply = qa_edit::awaitReplyData(fromScheduler, kBlockReplaced);
+        expect(fatal(reply.has_value())) << "the replacement was refused";
+        expect(qa_edit::listedNames(*reply, "restartedBlocks") == std::vector{sinkName}) << "the reply does not name the restarted sink";
+        const auto  refusedEntry = reply->find("refusedRestarts");
+        const auto* refused      = refusedEntry != reply->end() ? refusedEntry->second.get_if<gr::property_map>() : nullptr;
+        expect(fatal(refused != nullptr)) << "the reply does not list the refused restarts";
+        const auto sourceEntry = refused->find(std::pmr::string(sourceName));
+        expect(sourceEntry != refused->end() && sourceEntry->second.value_or(std::string()).contains(qa_edit::kSecondStart)) << "the reply does not list the source with its start() failure";
+        expect(eq(sourceBlock->out.nReaders(), 0UZ)) << "the replacement still reads the output of the source whose restart was refused";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
+    };
+#endif
+
+    // A pool of one thread gives the run one job list, and a free-running pair keeps its worker. The source has no
+    // reader and stops at its first call. The edge from the source to the spare sink restarts it, and its start() then
+    // throws. The free-running sink's count proves that the worker traversed its list after the edit
+    "a block whose start() throws on its restart is in no job list, and its work() is never called"_test = [] {
+        constexpr std::string_view kPoolName = "qa_edit_one_thread";
+        gr::thread_pool::Manager::instance().replacePool(std::string(kPoolName), std::make_shared<gr::thread_pool::ThreadPoolWrapper>(std::make_unique<gr::thread_pool::BasicThreadPool>(kPoolName, gr::thread_pool::TaskType::CPU_BOUND, 1U, 1U), "CPU"));
+        qa_edit::gOneRunSourceCalls.store(0UZ);
+        qa_edit::gFreeRunningSamples.store(0UZ);
+
+        gr::Graph flow;
+        auto&     source     = flow.emplaceBlock<qa_edit::OneRunSource>();
+        auto&     spareSink  = flow.emplaceBlock<qa_edit::Sink>();
+        auto&     keptSource = flow.emplaceBlock<qa_edit::Source>();
+        auto&     keptSink   = flow.emplaceBlock<qa_edit::FreeSink>();
+        expect(flow.connect<"out", "in">(keptSource, keptSink).has_value());
+        const std::string sourceName{source.unique_name};
+        const std::string spareSinkName{spareSink.unique_name};
+        const auto*       sourceBlock = &source;
+
+        qa_edit::JobListProbe scheduler({{"poolName", std::string(kPoolName)}});
+        expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(fatal(toScheduler.connect(scheduler.msgIn).has_value()));
+        expect(fatal(scheduler.msgOut.connect(fromScheduler).has_value()));
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(fatal(eq(scheduler.nJobLists(), 1UZ))) << "the run has more than one job list";
+        expect(fatal(qa_edit::awaitCondition([sourceBlock] { return sourceBlock->state() == STOPPED; }))) << "the source without a reader did not stop";
+        expect(fatal(scheduler.jobListOf(sourceName) == std::optional<std::size_t>{0UZ})) << "the stopped source left its job list";
+        const std::size_t nCallsBefore = qa_edit::gOneRunSourceCalls.load();
+
+        qa_edit::sendMessage(toScheduler, kEmplaceEdge, qa_edit::edgeRequest(sourceName, spareSinkName, std::int32_t{0}));
+        const std::optional<gr::property_map> reply = qa_edit::awaitReplyData(fromScheduler, kEdgeEmplaced);
+        expect(fatal(reply.has_value())) << "the edge was refused";
+        expect(qa_edit::listedNames(*reply, "restartedBlocks").empty()) << "the reply names the source as restarted";
+        const auto  refusedEntry = reply->find("refusedRestarts");
+        const auto* refused      = refusedEntry != reply->end() ? refusedEntry->second.get_if<gr::property_map>() : nullptr;
+        expect(fatal(refused != nullptr)) << "the reply does not list the refused restarts";
+        const auto sourceEntry = refused->find(std::pmr::string(sourceName));
+        expect(sourceEntry != refused->end() && sourceEntry->second.value_or(std::string()).contains(qa_edit::kSecondStart)) << "the reply does not list the source with its start() failure";
+
+        const std::size_t nFreeAfterReply = qa_edit::gFreeRunningSamples.load();
+        expect(fatal(qa_edit::awaitCondition([nFreeAfterReply] { return qa_edit::gFreeRunningSamples.load() > nFreeAfterReply; }))) << "the worker did not traverse its job list after the edit";
+        expect(!scheduler.jobListOf(sourceName).has_value()) << "the source whose restart was refused is in a job list";
+        expect(eq(qa_edit::gOneRunSourceCalls.load(), nCallsBefore)) << "the source whose restart was refused was called";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
+    };
+
+    // The source's restart is refused as in the case above, and the source has left its job list before its removal
+    "a removed block that no job list holds leaves the zombie list"_test = [] {
+        constexpr std::string_view kPoolName = "qa_edit_one_thread";
+        gr::thread_pool::Manager::instance().replacePool(std::string(kPoolName), std::make_shared<gr::thread_pool::ThreadPoolWrapper>(std::make_unique<gr::thread_pool::BasicThreadPool>(kPoolName, gr::thread_pool::TaskType::CPU_BOUND, 1U, 1U), "CPU"));
+        qa_edit::gFreeRunningSamples.store(0UZ);
+
+        gr::Graph flow;
+        auto&     source     = flow.emplaceBlock<qa_edit::OneRunSource>();
+        auto&     spareSink  = flow.emplaceBlock<qa_edit::Sink>();
+        auto&     keptSource = flow.emplaceBlock<qa_edit::Source>();
+        auto&     keptSink   = flow.emplaceBlock<qa_edit::FreeSink>();
+        expect(flow.connect<"out", "in">(keptSource, keptSink).has_value());
+        const std::string sourceName{source.unique_name};
+        const std::string spareSinkName{spareSink.unique_name};
+        const auto*       sourceBlock = &source;
+
+        qa_edit::JobListProbe scheduler({{"poolName", std::string(kPoolName)}});
+        expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(fatal(toScheduler.connect(scheduler.msgIn).has_value()));
+        expect(fatal(scheduler.msgOut.connect(fromScheduler).has_value()));
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(fatal(qa_edit::awaitCondition([sourceBlock] { return sourceBlock->state() == STOPPED; }))) << "the source without a reader did not stop";
+
+        qa_edit::sendMessage(toScheduler, kEmplaceEdge, qa_edit::edgeRequest(sourceName, spareSinkName, std::int32_t{0}));
+        expect(fatal(qa_edit::awaitReplyData(fromScheduler, kEdgeEmplaced).has_value())) << "the edge was refused";
+        const std::size_t nFreeAfterEdge = qa_edit::gFreeRunningSamples.load();
+        expect(fatal(qa_edit::awaitCondition([nFreeAfterEdge] { return qa_edit::gFreeRunningSamples.load() > nFreeAfterEdge; }))) << "the worker did not traverse its job list after the edit";
+        expect(fatal(!scheduler.jobListOf(sourceName).has_value())) << "the source whose restart was refused is in a job list";
+
+        qa_edit::sendMessage(toScheduler, kRemoveBlock, {{"uniqueName", sourceName}});
+        expect(fatal(qa_edit::awaitReplyData(fromScheduler, kBlockRemoved).has_value())) << "the removal was refused";
+        const std::size_t nFreeAfterRemoval = qa_edit::gFreeRunningSamples.load();
+        expect(fatal(qa_edit::awaitCondition([nFreeAfterRemoval] { return qa_edit::gFreeRunningSamples.load() > nFreeAfterRemoval; }))) << "the worker did not traverse its job list after the removal";
+        expect(eq(scheduler.nZombieBlocks(), 0UZ)) << "the removed block stays in the zombie list";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
+    };
+
+    // A pool of one thread gives the run one job list. The worker answers the inspection request and then reads the
+    // paused state. No work() call follows until the resume. The source therefore stays in REQUESTED_STOP until the
+    // edit
+    "an edge emplaced at a source in REQUESTED_STOP restarts the source, and the reply names it"_test = [] {
+        constexpr std::string_view kPoolName = "qa_edit_one_thread";
+        gr::thread_pool::Manager::instance().replacePool(std::string(kPoolName), std::make_shared<gr::thread_pool::ThreadPoolWrapper>(std::make_unique<gr::thread_pool::BasicThreadPool>(kPoolName, gr::thread_pool::TaskType::CPU_BOUND, 1U, 1U), "CPU"));
+        qa_edit::gSourcedSamples.store(0UZ);
+
+        gr::Graph flow;
+        auto&     source     = flow.emplaceBlock<qa_edit::CountedSource>();
+        auto&     firstSink  = flow.emplaceBlock<qa_edit::Sink>();
+        auto&     kept       = flow.emplaceBlock<qa_edit::Source>();
+        auto&     secondSink = flow.emplaceBlock<qa_edit::Sink>();
+        expect(flow.connect<"out", "in">(source, firstSink).has_value());
+        expect(flow.connect<"out", "in">(kept, secondSink).has_value());
+        const std::string sourceName{source.unique_name};
+        const std::string secondSinkName{secondSink.unique_name};
+        auto*             sourceBlock = &source;
+
+        qa_edit::JobListProbe scheduler({{"poolName", std::string(kPoolName)}});
+        expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(fatal(toScheduler.connect(scheduler.msgIn).has_value()));
+        expect(fatal(scheduler.msgOut.connect(fromScheduler).has_value()));
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(fatal(eq(scheduler.nJobLists(), 1UZ))) << "the run has more than one job list";
+        expect(fatal(qa_edit::awaitCondition([] { return qa_edit::gSourcedSamples.load() > 0UZ; }))) << "the source never ran";
+
+        expect(fatal(scheduler.changeStateTo(REQUESTED_PAUSE).has_value()));
+        expect(fatal(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == PAUSED; }))) << "the scheduler did not pause";
+        qa_edit::sendMessage(toScheduler, kSchedulerInspect, {});
+        expect(fatal(qa_edit::takeReply(fromScheduler, kSchedulerInspected))) << "the paused worker did not answer";
+        sourceBlock->requestStop();
+        expect(fatal(sourceBlock->state() == REQUESTED_STOP)) << "the source did not enter REQUESTED_STOP";
+
+        qa_edit::sendMessage(toScheduler, kEmplaceEdge, qa_edit::edgeRequest(sourceName, secondSinkName, std::int32_t{0}));
+        const std::optional<gr::property_map> reply = qa_edit::awaitReplyData(fromScheduler, kEdgeEmplaced);
+        expect(fatal(reply.has_value())) << "the edge was refused";
+        expect(qa_edit::listedNames(*reply, "restartedBlocks") == std::vector{sourceName}) << "the reply does not name the source in REQUESTED_STOP";
+        const std::size_t nBeforeResume = qa_edit::gSourcedSamples.load();
+
+        expect(fatal(scheduler.changeStateTo(RUNNING).has_value()));
+        expect(qa_edit::awaitCondition([nBeforeResume] { return qa_edit::gSourcedSamples.load() > nBeforeResume; })) << "the source never ran after the edit";
+        expect(sourceBlock->state() == RUNNING);
 
         expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
         expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
