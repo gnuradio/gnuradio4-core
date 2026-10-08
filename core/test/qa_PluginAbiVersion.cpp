@@ -187,7 +187,7 @@ const boost::ut::suite<"PluginAbiVersion"> pluginAbiVersionTests = [] {
 
         expect(that % loader.isSchedulerAvailable(kCurrentSchedulerKey)) << "a library of this ABI version offers its scheduler";
         expect(that % std::ranges::contains(loader.availableSchedulers(), std::string(kCurrentSchedulerKey)));
-        expect(gr::globalSchedulerRegistry().abiVersion(kCurrentSchedulerKey) == std::optional<std::uint8_t>{GR_PLUGIN_CURRENT_ABI_VERSION}) << "the registration recorded the version its library was built against";
+        expect(gr::globalSchedulerRegistry().abiVersion(kCurrentSchedulerKey) == std::optional<std::uint8_t>{std::uint8_t{GR_PLUGIN_CURRENT_ABI_VERSION}}) << "the registration recorded the version its library was built against";
 
         std::shared_ptr<SchedulerModel> scheduler = loader.instantiateScheduler(kCurrentSchedulerKey);
         expect(fatal(scheduler != nullptr)) << "the kept library's factory produced nothing";
@@ -237,7 +237,7 @@ const boost::ut::suite<"PluginAbiVersion"> pluginAbiVersionTests = [] {
         constexpr std::string_view kKey = "test::replaced_scheduler";
         SchedulerRegistry          registry;
         registry.insert(kKey, "", makeNoScheduler);
-        expect(registry.abiVersion(kKey) == std::optional<std::uint8_t>{GR_PLUGIN_CURRENT_ABI_VERSION}) << "the first registration recorded this version";
+        expect(registry.abiVersion(kKey) == std::optional<std::uint8_t>{std::uint8_t{GR_PLUGIN_CURRENT_ABI_VERSION}}) << "the first registration recorded this version";
 
         // replaces the factory and keeps the version, as a registry without versions does on a second registration
         // of the key
