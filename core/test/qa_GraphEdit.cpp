@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <expected>
 #include <format>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory_resource>
@@ -254,6 +255,153 @@ struct JobListProbe : TestScheduler {
         std::lock_guard lock(this->_executionOrderMutex);
         return !this->_executionOrder->empty() && std::ranges::any_of(this->_executionOrder->front(), [uniqueName](const std::shared_ptr<gr::BlockModel>& block) { return block->uniqueName() == uniqueName; });
     }
+
+    // the index of the job list that holds the named block
+    [[nodiscard]] std::optional<std::size_t> jobListOf(std::string_view uniqueName) {
+        std::lock_guard lock(this->_executionOrderMutex);
+        for (std::size_t i = 0UZ; i < this->_executionOrder->size(); ++i) {
+            if (std::ranges::any_of((*this->_executionOrder)[i], [uniqueName](const std::shared_ptr<gr::BlockModel>& block) { return block->uniqueName() == uniqueName; })) {
+                return i;
+            }
+        }
+        return std::nullopt;
+    }
+};
+
+inline std::atomic<std::size_t> gCountedSamples{0UZ};
+
+// a Tunable that counts the samples it passes in gCountedSamples
+struct CountedTunable : gr::Block<CountedTunable> {
+    gr::PortIn<float>  in;
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(CountedTunable, in, out);
+
+    [[nodiscard]] float processOne(float value) noexcept {
+        gCountedSamples.fetch_add(1UZ, std::memory_order_relaxed);
+        return value;
+    }
+};
+
+inline std::atomic<std::size_t> gHeldPublished{0UZ};
+inline std::atomic<std::size_t> gHeldPassed{0UZ};
+inline std::atomic<bool>        gSinkReleased{false};
+inline std::atomic<std::size_t> gSinkReceived{0UZ};
+
+// publishes kSamples samples, counted in gHeldPublished, and then nothing, without ending its stream
+struct HeldSource : gr::Block<HeldSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(HeldSource, out);
+
+    static constexpr std::size_t kSamples = 64UZ;
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        const std::size_t nPublish = std::min(outSpan.size(), kSamples - gHeldPublished.load());
+        for (std::size_t i = 0UZ; i < nPublish; ++i) {
+            outSpan[i] = 1.0f;
+        }
+        outSpan.publish(nPublish);
+        gHeldPublished.fetch_add(nPublish);
+        return gr::work::Status::OK;
+    }
+};
+
+// passes its first kPassed samples, counted in gHeldPassed, and keeps every later one at its input
+struct HoldingStage : gr::Block<HoldingStage> {
+    gr::PortIn<float>  in;
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(HoldingStage, in, out);
+
+    static constexpr std::size_t kPassed = 16UZ;
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& inSpan, gr::OutputSpanLike auto& outSpan) {
+        const std::size_t nPass = std::min({inSpan.size(), outSpan.size(), kPassed - gHeldPassed.load()});
+        for (std::size_t i = 0UZ; i < nPass; ++i) {
+            outSpan[i] = inSpan[i];
+        }
+        std::ignore = inSpan.consume(nPass);
+        outSpan.publish(nPass);
+        gHeldPassed.fetch_add(nPass);
+        return gr::work::Status::OK;
+    }
+};
+
+// takes no sample until gSinkReleased is set, then counts every sample it takes in gSinkReceived
+struct HeldSink : gr::Block<HeldSink> {
+    gr::PortIn<float> in;
+
+    GR_MAKE_REFLECTABLE(HeldSink, in);
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& inSpan) {
+        const std::size_t nTake = gSinkReleased.load() ? inSpan.size() : 0UZ;
+        gSinkReceived.fetch_add(nTake);
+        std::ignore = inSpan.consume(nTake);
+        return gr::work::Status::OK;
+    }
+};
+
+inline std::atomic<std::size_t> gFreeRunningSamples{0UZ};
+inline std::atomic<std::size_t> gSamplesDuringStop{0UZ};
+inline std::atomic<bool>        gStopProbed{false};
+
+// counts every sample it takes in gFreeRunningSamples
+struct FreeSink : gr::Block<FreeSink> {
+    gr::PortIn<float> in;
+
+    GR_MAKE_REFLECTABLE(FreeSink, in);
+
+    void processOne(float) { gFreeRunningSamples.fetch_add(1UZ, std::memory_order_relaxed); }
+};
+
+// its stop() hook watches gFreeRunningSamples for 100 ms or until the first change, and stores the change in
+// gSamplesDuringStop
+struct StopProbe : gr::Block<StopProbe> {
+    gr::PortOut<float, gr::Async, gr::Optional> out;
+
+    GR_MAKE_REFLECTABLE(StopProbe, out);
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        outSpan.publish(0UZ);
+        return gr::work::Status::OK;
+    }
+
+    void stop() {
+        const std::size_t before = gFreeRunningSamples.load();
+        for (std::size_t i = 0UZ; i < 100UZ && gFreeRunningSamples.load() == before; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        gSamplesDuringStop.store(gFreeRunningSamples.load() - before);
+        gStopProbed.store(true);
+    }
+};
+
+// reads the state of the scheduler under test. A case sets it while its scheduler lives
+inline std::function<gr::lifecycle::State()> gSchedulerState;
+inline std::atomic<bool>                     gRacingEntered{false};
+
+// a Tunable whose settingsChanged() reports that it has begun in gRacingEntered and returns once gSchedulerState reads a
+// stopping scheduler. The scheduler applies the settings while it builds the block as a replacement
+struct RacingStage : gr::Block<RacingStage> {
+    gr::PortIn<float>  in;
+    gr::PortOut<float> out;
+
+    gr::Annotated<float, "gain"> gain = 1.0f;
+
+    GR_MAKE_REFLECTABLE(RacingStage, in, out, gain);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
+
+    void settingsChanged(const gr::property_map&, const gr::property_map&) {
+        if (!gSchedulerState) {
+            return;
+        }
+        gRacingEntered.store(true);
+        for (std::size_t i = 0UZ; i < 3000UZ && !gr::lifecycle::isShuttingDown(gSchedulerState()); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
 };
 
 void registerTestBlocks() {
@@ -263,6 +411,8 @@ void registerTestBlocks() {
         std::ignore = gr::globalBlockRegistry().insert<Sink>();
         std::ignore = gr::globalBlockRegistry().insert<Ticker>();
         std::ignore = gr::globalBlockRegistry().insert<ConstructionCounter>();
+        std::ignore = gr::globalBlockRegistry().insert<CountedTunable>();
+        std::ignore = gr::globalBlockRegistry().insert<RacingStage>();
         return true;
     }();
     std::ignore = registered;
@@ -538,6 +688,67 @@ void expectRepliesUnder(TScheduler& scheduler, std::string_view replyEndpoint, s
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     return std::nullopt;
+}
+
+// the job list index and the unique name that a BlockReplaced reply names, each empty when the reply lacks it
+struct ReplacementRecord {
+    std::optional<std::size_t> jobList;
+    std::string                uniqueName;
+};
+
+[[nodiscard]] ReplacementRecord replacementRecord(const gr::property_map& reply) {
+    ReplacementRecord record;
+    if (const auto it = reply.find("jobList"); it != reply.end()) {
+        if (const auto* index = it->second.get_if<gr::Size_t>(); index != nullptr) {
+            record.jobList = static_cast<std::size_t>(*index);
+        }
+    }
+    if (const auto it = reply.find(std::pmr::string(gr::serialization_fields::BLOCK_UNIQUE_NAME)); it != reply.end()) {
+        record.uniqueName = it->second.value_or(std::string());
+    }
+    return record;
+}
+
+// Runs HeldSource -> HoldingStage -> HeldSink until the source has published its samples and the stage has passed its
+// share, which the sink holds. The case then replaces the stage with a Tunable and releases the sink. Every sample
+// reaches the sink once: the replacement passes the samples queued at its input, and the sink reads those queued at
+// its output
+template<typename TScheduler>
+void expectQueuedSamplesPassReplacement() {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+    registerTestBlocks();
+    gHeldPublished.store(0UZ);
+    gHeldPassed.store(0UZ);
+    gSinkReleased.store(false);
+    gSinkReceived.store(0UZ);
+
+    gr::Graph flow;
+    auto&     source = flow.emplaceBlock<HeldSource>();
+    auto&     stage  = flow.emplaceBlock<HoldingStage>();
+    auto&     sink   = flow.emplaceBlock<HeldSink>();
+    expect(flow.connect<"out", "in">(source, stage).has_value());
+    expect(flow.connect<"out", "in">(stage, sink).has_value());
+    const std::string stageName{stage.unique_name};
+
+    TScheduler scheduler;
+    expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+    gr::MsgPortOut toScheduler;
+    gr::MsgPortIn  fromScheduler;
+    expect(fatal(toScheduler.connect(scheduler.msgIn).has_value()));
+    expect(fatal(scheduler.msgOut.connect(fromScheduler).has_value()));
+
+    std::thread runner([&scheduler] { std::ignore = scheduler.runAndWait(); }); // a single-threaded run executes on the thread that starts it
+    expect(awaitCondition([] { return gHeldPublished.load() == HeldSource::kSamples && gHeldPassed.load() == HoldingStage::kPassed; })) << "the stage did not hold samples at both its ports";
+
+    sendMessage(toScheduler, gr::scheduler::property::kReplaceBlock, {{"uniqueName", stageName}, {"type", gr::meta::type_name<Tunable>()}});
+    expect(awaitReplyData(fromScheduler, gr::scheduler::property::kBlockReplaced).has_value()) << "the replacement was refused";
+    gSinkReleased.store(true);
+    expect(awaitCondition([] { return gSinkReceived.load() == HeldSource::kSamples; })) << std::format("the sink received {} of {} samples", gSinkReceived.load(), HeldSource::kSamples);
+
+    expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+    runner.join();
+    expect(eq(gSinkReceived.load(), HeldSource::kSamples)) << "the sink received a sample twice";
 }
 
 } // namespace qa_edit
@@ -1759,6 +1970,174 @@ const boost::ut::suite<"edit replies"> editReplyTests = [] {
 
         expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
         expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
+    };
+};
+
+const boost::ut::suite<"a replacement in a running graph"> runningReplacementTests = [] {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+    using namespace gr::scheduler::property;
+
+    "a replacement in a multi-threaded run passes on the samples queued at its ports"_test = [] { qa_edit::expectQueuedSamplesPassReplacement<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>>(); };
+
+    "a replacement in a single-threaded run passes on the samples queued at its ports"_test = [] { qa_edit::expectQueuedSamplesPassReplacement<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>>(); };
+
+    "a replacement in a single-threaded blocking run passes on the samples queued at its ports"_test = [] { qa_edit::expectQueuedSamplesPassReplacement<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking>>(); };
+
+    // a pool of three threads splits the three blocks into three job lists
+    "a replacement joins the job list of the block it replaces, and the reply names that job list"_test = [] {
+        constexpr std::string_view kPoolName = "qa_edit_three_threads";
+        gr::thread_pool::Manager::instance().replacePool(std::string(kPoolName), std::make_shared<gr::thread_pool::ThreadPoolWrapper>(std::make_unique<gr::thread_pool::BasicThreadPool>(kPoolName, gr::thread_pool::TaskType::CPU_BOUND, 3U, 3U), "CPU"));
+        qa_edit::registerTestBlocks();
+        qa_edit::gCountedSamples.store(0UZ);
+
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_edit::Source>();
+        auto&     stage  = flow.emplaceBlock<qa_edit::Tunable>();
+        auto&     sink   = flow.emplaceBlock<qa_edit::Sink>();
+        expect(flow.connect<"out", "in">(source, stage).has_value());
+        expect(flow.connect<"out", "in">(stage, sink).has_value());
+        const std::string stageName{stage.unique_name};
+
+        qa_edit::JobListProbe scheduler({{"poolName", std::string(kPoolName)}});
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(toScheduler.connect(scheduler.msgIn).has_value());
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(eq(scheduler.nJobLists(), 3UZ)) << "the graph was not split into three job lists";
+        const std::optional<std::size_t> heldBy = scheduler.jobListOf(stageName);
+        expect(heldBy.has_value()) << "no job list holds the stage";
+
+        qa_edit::sendMessage(toScheduler, kReplaceBlock, {{"uniqueName", stageName}, {"type", gr::meta::type_name<qa_edit::CountedTunable>()}});
+        const std::optional<gr::property_map> reply = qa_edit::awaitReplyData(fromScheduler, kBlockReplaced);
+        expect(reply.has_value()) << "the replacement was refused";
+        const qa_edit::ReplacementRecord record = reply.has_value() ? qa_edit::replacementRecord(*reply) : qa_edit::ReplacementRecord{};
+        expect(record.jobList.has_value() && record.jobList == heldBy) << "the reply does not name the job list of the replaced block";
+        expect(qa_edit::awaitCondition([&scheduler, &record, &heldBy] { return scheduler.jobListOf(record.uniqueName) == heldBy; })) << "the replacement runs in another job list";
+        expect(qa_edit::awaitCondition([] { return qa_edit::gCountedSamples.load() > 0UZ; })) << "the replacement never ran";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
+    };
+
+    "a replacement inside a subgraph of a running graph runs"_test = [] {
+        qa_edit::registerTestBlocks();
+        qa_edit::gCountedSamples.store(0UZ);
+
+        gr::Graph flow;
+        auto      wrapper = std::make_shared<gr::GraphWrapper<gr::Graph>>();
+        auto&     inner   = *wrapper->graph();
+        auto&     source  = inner.emplaceBlock<qa_edit::Source>();
+        auto&     stage   = inner.emplaceBlock<qa_edit::Tunable>();
+        auto&     sink    = inner.emplaceBlock<qa_edit::Sink>();
+        expect(inner.connect<"out", "in">(source, stage).has_value());
+        expect(inner.connect<"out", "in">(stage, sink).has_value());
+        const std::string stageName{stage.unique_name};
+        const std::string subgraphName{flow.addBlock(wrapper)->uniqueName()};
+
+        qa_edit::TestScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(toScheduler.connect(scheduler.msgIn).has_value());
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+
+        qa_edit::sendMessage(toScheduler, kReplaceBlock, {{"uniqueName", stageName}, {"type", gr::meta::type_name<qa_edit::CountedTunable>()}, {"_targetGraph", subgraphName}});
+        expect(qa_edit::awaitReplyData(fromScheduler, kBlockReplaced).has_value()) << "the replacement was refused";
+        expect(qa_edit::awaitCondition([] { return qa_edit::gCountedSamples.load() > 0UZ; })) << "the replacement in the subgraph never ran";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
+    };
+
+    // A pool of two threads splits the five blocks into two job lists, and each holds a free-running source and sink.
+    // Whichever worker handles the replacement, the other one works a free-running pair unless it is held
+    "a replaced block stops while no block of the run is inside work()"_test = [] {
+        constexpr std::string_view kPoolName = "qa_edit_two_threads";
+        gr::thread_pool::Manager::instance().replacePool(std::string(kPoolName), std::make_shared<gr::thread_pool::ThreadPoolWrapper>(std::make_unique<gr::thread_pool::BasicThreadPool>(kPoolName, gr::thread_pool::TaskType::CPU_BOUND, 2U, 2U), "CPU"));
+        qa_edit::registerTestBlocks();
+        qa_edit::gFreeRunningSamples.store(0UZ);
+        qa_edit::gSamplesDuringStop.store(0UZ);
+        qa_edit::gStopProbed.store(false);
+
+        gr::Graph flow;
+        auto&     firstSource  = flow.emplaceBlock<qa_edit::Source>();
+        auto&     firstSink    = flow.emplaceBlock<qa_edit::FreeSink>();
+        auto&     secondSource = flow.emplaceBlock<qa_edit::Source>();
+        auto&     secondSink   = flow.emplaceBlock<qa_edit::FreeSink>();
+        auto&     probe        = flow.emplaceBlock<qa_edit::StopProbe>();
+        expect(flow.connect<"out", "in">(firstSource, firstSink).has_value());
+        expect(flow.connect<"out", "in">(secondSource, secondSink).has_value());
+        const std::string probeName{probe.unique_name};
+
+        qa_edit::JobListProbe scheduler({{"poolName", std::string(kPoolName)}});
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(toScheduler.connect(scheduler.msgIn).has_value());
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(eq(scheduler.nJobLists(), 2UZ)) << "the graph was not split into two job lists";
+        expect(qa_edit::awaitCondition([] { return qa_edit::gFreeRunningSamples.load() > 0UZ; })) << "the free-running sinks never ran";
+
+        qa_edit::sendMessage(toScheduler, kReplaceBlock, {{"uniqueName", probeName}, {"type", gr::meta::type_name<qa_edit::Ticker>()}});
+        expect(qa_edit::awaitReplyData(fromScheduler, kBlockReplaced).has_value()) << "the replacement was refused";
+        expect(qa_edit::awaitCondition([] { return qa_edit::gStopProbed.load(); })) << "the replaced block's stop() hook never ran";
+        expect(eq(qa_edit::gSamplesDuringStop.load(), 0UZ)) << "another block worked while the replaced block stopped";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
+    };
+
+    // the replacement's settingsChanged() holds the edit until the stop has begun
+    "a stop that begins during a replacement leaves the replacement out of the run"_test = [] {
+        qa_edit::registerTestBlocks();
+        qa_edit::gRacingEntered.store(false);
+        {
+            gr::Graph flow;
+            auto&     source = flow.emplaceBlock<qa_edit::Source>();
+            auto&     stage  = flow.emplaceBlock<qa_edit::Tunable>();
+            auto&     sink   = flow.emplaceBlock<qa_edit::Sink>();
+            expect(flow.connect<"out", "in">(source, stage).has_value());
+            expect(flow.connect<"out", "in">(stage, sink).has_value());
+            const std::string stageName{stage.unique_name};
+
+            qa_edit::TestScheduler scheduler;
+            expect(scheduler.exchange(std::move(flow)).has_value());
+            gr::MsgPortOut toScheduler;
+            gr::MsgPortIn  fromScheduler;
+            expect(toScheduler.connect(scheduler.msgIn).has_value());
+            expect(scheduler.msgOut.connect(fromScheduler).has_value());
+            qa_edit::gSchedulerState = [&scheduler] { return scheduler.state(); };
+
+            expect(scheduler.changeStateTo(INITIALISED).has_value());
+            expect(scheduler.changeStateTo(RUNNING).has_value());
+
+            qa_edit::sendMessage(toScheduler, kReplaceBlock, {{"uniqueName", stageName}, {"type", gr::meta::type_name<qa_edit::RacingStage>()}, {"properties", gr::property_map{{"gain", 2.0f}}}});
+            expect(qa_edit::awaitCondition([] { return qa_edit::gRacingEntered.load(); })) << "the replacement's settings were never applied";
+            expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+
+            const std::optional<gr::property_map> reply = qa_edit::awaitReplyData(fromScheduler, kBlockReplaced);
+            expect(reply.has_value()) << "the replacement was refused";
+            const qa_edit::ReplacementRecord record = reply.has_value() ? qa_edit::replacementRecord(*reply) : qa_edit::ReplacementRecord{};
+            expect(!record.jobList.has_value()) << "the replacement joined a run whose stop had begun";
+            expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
+            for (const std::shared_ptr<gr::BlockModel>& block : scheduler.graph().blocks()) {
+                if (block->uniqueName() == record.uniqueName) {
+                    expect(block->state() != RUNNING) << "the stop left the replacement running";
+                }
+            }
+        }
+        qa_edit::gSchedulerState = nullptr;
     };
 };
 #endif
