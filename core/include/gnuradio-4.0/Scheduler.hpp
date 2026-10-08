@@ -146,7 +146,7 @@ protected:
     std::shared_ptr<gr::Sequence> _nRunningJobs = std::make_shared<gr::Sequence>();
     std::recursive_mutex          _executionOrderMutex; // only used when modifying and copying the graph->local job list
     std::shared_ptr<JobLists>     _executionOrder = std::make_shared<JobLists>();
-    std::mutex                    _childLifecycleMutex; // serializes the sweeps of start(), stop() and a graph replacement; a worker never takes it to count itself
+    std::mutex                    _childLifecycleMutex; // serializes the sweeps of start(), stop() and a block replacement; a worker never takes it to count itself
     std::mutex                    _workersInLoopMutex;  // guards _nWorkersInLoop; no block's stop() hook runs under it
     std::size_t                   _nWorkersInLoop{0UZ}; // workers inside poolWorker(); only these workers call a block's work()
     // advanced by everything that ends a park and is not work (see wakeWorkers() and registerWake()). The rings in
@@ -1984,7 +1984,7 @@ protected:
         advanceRunGeneration();
         wakeWorkers();
         {
-            std::lock_guard childLock(_childLifecycleMutex); // serialized against start()'s sweep and a graph replacement
+            std::lock_guard childLock(_childLifecycleMutex); // serialized against start()'s sweep and a block replacement
             // a block that blocks in work() ends its wait in its stop() hook, and that hook runs first. The other blocks
             // and the sub-schedulers stop once each other worker's work() call has returned or waits in a request it
             // made. The stop() hook of a block that does not block runs during its own work() call only when that call
@@ -2662,52 +2662,15 @@ protected:
         _zombieBlocks.push_back(std::move(block));
     }
 
-    // Moves all blocks into the zombie list
-    // Useful for bulk operations such as "set grc yaml" message
-    // the stop() hook of each block that blocks in work(), in this graph and in its transparent subgraphs, runs first
-    // and ends that block's wait. The sub-schedulers then stop while no worker of this scheduler is inside work(). The
-    // other blocks stop while no worker of this scheduler or of a sub-scheduler is inside work(). The replacement takes
-    // _childLifecycleMutex, the lock of the sweeps of start() and stop(), once no worker of this scheduler is inside
-    // work(), and holds it to its end. A stop made inside a work() call of this scheduler then never waits for the
-    // replacement's lock while the replacement waits for that call.
-    void makeAllZombies() {
-        graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) {
-            if (block->blockCategory() != ScheduledBlockGroup && block->isBlocking()) {
-                stopChild(*block, "makeAllZombies");
-            }
-        });
-        requestWorkQuiescence();
-        std::vector<std::shared_ptr<BlockModel>> subSchedulers;
-        on_scope_exit                            releaseQuiescence = [this, &subSchedulers] { releaseWorkQuiescenceAll(subSchedulers); };
-        std::lock_guard                          childLock(_childLifecycleMutex);
-        graph::forEachBlock<TransparentBlockGroup>(*_graph, [](auto& block) {
-            if (block->blockCategory() == ScheduledBlockGroup && lifecycle::isActive(block->state())) {
-                if (auto* schedulerModel = dynamic_cast<SchedulerModel*>(block.get())) {
-                    schedulerModel->stop();
-                }
-            }
-        });
-        subSchedulers = requestSubSchedulerWorkQuiescence();
-        graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) {
-            if (block->blockCategory() != ScheduledBlockGroup) {
-                stopChild(*block, "makeAllZombies");
-            }
-        });
-        std::lock_guard guard(_zombieBlocksMutex);
-
-        for (auto& block : this->_graph->blocks()) {
-            stopChild(*block, "makeAllZombies");
-            _zombieBlocks.push_back(std::move(block));
-        }
-
-        this->_graph->clear();
-    }
-
     std::optional<Message> propertyCallbackGraphGRC([[maybe_unused]] std::string_view propertyName, Message message) {
         assert(propertyName == scheduler::property::kGraphGRC);
         return replyAfter(std::move(message), scheduler::property::kGraphGRC, &SchedulerBase::graphGrcByMessage);
     }
 
+    // A Set swaps the graph through exchange(). A refused swap is the reply's error and leaves the graph and the run as
+    // they were. exchange() returns the retired graph after the workers of the run have left, and the graph and its
+    // blocks are destroyed before the reply. A swap deferred to the last worker of the run destroys the retired graph
+    // in that worker
     std::expected<property_map, Error> graphGrcByMessage(const Message& message) {
         auto& pluginLoader = gr::globalPluginLoader();
         if (message.cmd == message::Command::Get) {
@@ -2721,15 +2684,10 @@ protected:
             try {
                 auto newGraph = gr::loadGrc(pluginLoader, yamlContent);
 
-                if (auto allowed = swapAllowedFromThisThread(); !allowed) { // before the current blocks are retired
-                    return std::unexpected(allowed.error());
-                }
-                makeAllZombies();
-
                 const auto originalState = this->state();
 
-                if (auto result = this->exchange(std::move(newGraph)); !result) {
-                    return std::unexpected(result.error());
+                if (auto retired = this->exchange(std::move(newGraph)); !retired) {
+                    return std::unexpected(retired.error());
                 }
 
                 return property_map{{"originalSchedulerState", static_cast<int>(originalState)}};
