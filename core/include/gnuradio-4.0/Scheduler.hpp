@@ -152,8 +152,7 @@ protected:
     std::vector<std::shared_ptr<BlockModel>> _zombieBlocks;
 
     // the stage of the latest run. awaiting: no run has begun since construction or since the scheduler was last
-    // initialized. starting: RUNNING is published and start() has not returned. started: start() has returned, or an
-    // awaited run ended without a start.
+    // initialized. starting: RUNNING is published and start() has not returned. started: start() has returned.
     enum class RunPhase { awaiting, starting, started };
 
     // The run record. Every field is written under _runMutex. A worker reads the generation without the lock.
@@ -282,14 +281,6 @@ protected:
         gr::atomic_ref(_run.generation).fetch_add(1UZ);
     }
 
-    // a run that was awaited and ended without one: the next runAndWait() runs the graph
-    void endAwaitedRun() {
-        std::lock_guard guard(_runMutex);
-        if (_run.phase == RunPhase::awaiting) {
-            _run.phase = RunPhase::started;
-        }
-    }
-
     // The run executes on the caller's thread inside start(). The scheduler refuses a swap from another thread from the
     // moment the state reads RUNNING until start() returns. The job count rises only partway through start(). After
     // start() has returned, the swap proceeds. The thread that applies a swap requested on the scheduler's worker
@@ -323,12 +314,10 @@ protected:
         }
         if (runGeneration() != ownStopGeneration) {
             this->emitErrorMessageIfAny("restoreRun() -> REQUESTED_STOP", this->changeStateTo(REQUESTED_STOP));
-            endAwaitedRun();
             return {};
         }
         if (auto result = this->changeStateTo(RUNNING); !result) {
             if (lifecycle::isShuttingDown(this->state())) { // a stop claimed the transition first
-                endAwaitedRun();
                 return {};
             }
             return std::unexpected(result.error());
@@ -919,11 +908,6 @@ public:
         using enum lifecycle::State;
         [[maybe_unused]] const auto pe = this->_profilerHandler->startCompleteEvent("scheduler_base.runAndWait");
 
-        // a stop that arrives while no run has begun belongs to the run this call would start. No run loop observes
-        // it, and the reinitialization below would erase the STOPPED it produced. This call honors it in place of the
-        // run and counts as that run on the way out
-        on_scope_exit endAwaited = [this] { endAwaitedRun(); };
-
         auto settleStopped = [this]() -> std::expected<void, Error> {
             if (this->state() == RUNNING) {
                 if (auto e = this->changeStateTo(REQUESTED_STOP); !e) {
@@ -941,13 +925,9 @@ public:
         };
 
         processScheduledMessages(); // make sure initial subscriptions are processed
-        const bool runAwaited = [this] {
-            std::lock_guard guard(_runMutex);
-            return _run.phase == RunPhase::awaiting;
-        }();
-        if (lifecycle::isShuttingDown(this->state()) && runAwaited) {
-            return settleStopped();
-        }
+        // a stop that completes before this call leaves the scheduler STOPPED. runAndWait() initializes it again and
+        // runs it, as it does after an earlier run that ended STOPPED or ERROR. A stop that lands after this point
+        // claims the move to RUNNING or stops the run.
         if (this->state() == STOPPED || this->state() == ERROR) {
             if (auto e = this->changeStateTo(INITIALISED); !e) {
                 this->emitErrorMessage("runAndWait() -> LifecycleState", e.error());
