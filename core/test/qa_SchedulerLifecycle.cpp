@@ -1518,7 +1518,7 @@ const boost::ut::suite<"a start that cannot complete"> failedStartTests = [] {
         auto inner = std::make_shared<gr::SchedulerWrapper<qa_sched::TestScheduler>>();
         inner->setGraph(std::move(innerFlow));
 
-        inner->start();
+        expect(inner->start().has_value()) << "the start is accepted before it runs on the sub-scheduler's thread";
         expect(inner->_schedulerThread.joinable()) << "the sub-scheduler did not start its thread";
         if (inner->_schedulerThread.joinable()) {
             inner->_schedulerThread.join(); // the start runs on this thread and has ended with it
@@ -1711,6 +1711,121 @@ const boost::ut::suite<"a start that cannot complete"> failedStartTests = [] {
             expect(reason->message.find("IncompatiblePorts") != std::string::npos) << "the error must say why the edge did not connect: " << reason->message;
         }
         expect(eq(int16Sink._nReceived, 0UZ));
+    };
+};
+
+const boost::ut::suite<"a scheduler started on its own thread"> ownThreadStartTests = [] {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    "a stopped scheduler started on its own thread runs again"_test = [] {
+        qa_sched::gObservedSamples.store(0UZ, std::memory_order_relaxed);
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::EndlessSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::ObservedSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        gr::SchedulerWrapper<qa_sched::TestScheduler> wrapper;
+        wrapper.setGraph(std::move(flow));
+
+        expect(wrapper.start().has_value());
+        expect(qa_sched::awaitObservedSamplesAbove(0UZ)) << "the first start did not run the graph";
+        wrapper.stop();
+        wrapper.blockRef().waitDone(); // the count holds still once the first run's workers have left
+        expect(wrapper.blockRef().state() == STOPPED);
+
+        const std::size_t nFirstRun = qa_sched::gObservedSamples.load(std::memory_order_relaxed);
+        expect(wrapper.start().has_value()) << "a stopped scheduler must accept a start";
+        expect(qa_sched::awaitObservedSamplesAbove(nFirstRun)) << "the second start did not run the graph";
+        expect(wrapper.blockRef().state() == RUNNING);
+        wrapper.stop();
+    };
+
+    "a scheduler whose start failed on its own thread starts again once its block can start"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::PluggableSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        gr::SchedulerWrapper<qa_sched::TestScheduler> wrapper;
+        wrapper.setGraph(std::move(flow));
+
+        expect(wrapper.start().has_value()) << "the start fails on the scheduler's thread, after it was accepted";
+        if (wrapper._schedulerThread.joinable()) {
+            wrapper._schedulerThread.join(); // the start runs on this thread and has ended with it
+        }
+        expect(wrapper.blockRef().state() == ERROR) << "the first start could not complete";
+
+        source._pluggedIn = true;
+        expect(wrapper.start().has_value()) << "a scheduler in ERROR must accept a start";
+        if (wrapper._schedulerThread.joinable()) {
+            wrapper._schedulerThread.join(); // under multiThreaded the start returns once the workers are counted
+        }
+        wrapper.blockRef().waitDone(); // the workers end once the bounded stream has passed
+        expect(ge(sink._nReceived, qa_sched::kSamplesBeforeTerminal)) << "the stream must pass once the source can start";
+        wrapper.stop();
+    };
+
+    "a start of a running scheduler succeeds, reports nothing and leaves the run going"_test = [] {
+        gr::SchedulerWrapper<qa_sched::TestScheduler> wrapper;
+        wrapper.setGraph(qa_sched::makeEndlessGraph());
+        gr::MsgPortIn fromScheduler;
+        expect(wrapper.blockRef().msgOut.connect(fromScheduler).has_value());
+
+        expect(wrapper.start().has_value());
+        expect(qa_sched::awaitCondition([&wrapper] { return wrapper.blockRef().workerStarted(); })) << "the first start did not run the graph";
+        expect(wrapper.start().has_value()) << "a start of a running scheduler must succeed";
+        expect(wrapper.blockRef().state() == RUNNING) << "the second start must leave the run going";
+
+        std::vector<std::string> errors;
+        auto                     messages = fromScheduler.streamReader().get();
+        for (const gr::Message& message : messages) {
+            if (!message.data.has_value()) {
+                errors.push_back(std::format("{}: {}", message.endpoint, message.data.error().message));
+            }
+        }
+        std::ignore = messages.consume(messages.size());
+        expect(errors.empty()) << std::format("a start of a running scheduler must report nothing: {}", errors);
+        wrapper.stop();
+    };
+
+    // a paused scheduler cannot reach RUNNING through a start. It refuses the start.
+    "a sub-scheduler that refuses its start fails its parent's start with the refusal"_test = [] {
+        qa_sched::gObservedSamples.store(0UZ, std::memory_order_relaxed);
+        gr::Graph innerFlow;
+        auto&     innerSource = innerFlow.emplaceBlock<qa_sched::EndlessSource>();
+        auto&     innerSink   = innerFlow.emplaceBlock<qa_sched::ObservedSink>();
+        expect(innerFlow.connect<"out", "in">(innerSource, innerSink).has_value());
+
+        auto inner = std::make_shared<gr::SchedulerWrapper<qa_sched::TestScheduler>>();
+        inner->setGraph(std::move(innerFlow));
+        expect(inner->start().has_value());
+        expect(qa_sched::awaitObservedSamplesAbove(0UZ)) << "the sub-scheduler did not run on its own";
+        expect(inner->blockRef().changeStateTo(REQUESTED_PAUSE).has_value());
+        expect(qa_sched::awaitCondition([&inner] { return inner->blockRef().state() == PAUSED; })) << "the sub-scheduler did not pause";
+
+        gr::Graph                             flow       = qa_sched::makeEndlessGraph();
+        const std::shared_ptr<gr::BlockModel> innerBlock = flow.addBlock(gr::SchedulerModel::asBlockModelPtr(inner));
+        const std::string                     innerName(innerBlock->uniqueName());
+
+        qa_sched::TestScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        std::ignore = scheduler.changeStateTo(RUNNING); // the start's outcome is read from the state
+
+        expect(qa_sched::awaitCondition([&scheduler] { return !gr::lifecycle::isActive(scheduler.state()); }, qa_sched::kRunBound)) << "a parent whose sub-scheduler refused its start still reads active";
+        expect(scheduler.state() == ERROR) << "a sub-scheduler's refusal must end its parent's start in ERROR";
+
+        const std::optional<gr::Error> reason = scheduler.startError();
+        expect(reason.has_value()) << "the parent must keep the refusal";
+        if (reason.has_value()) {
+            expect(reason->message.find(innerName) != std::string::npos) << "the refusal must name the sub-scheduler: " << reason->message;
+            expect(reason->message.find("PAUSED") != std::string::npos) << "the refusal must name the state that cannot start: " << reason->message;
+        }
+        if (gr::lifecycle::isActive(scheduler.state())) {
+            scheduler.requestStop();
+        }
+        inner->stop();
     };
 };
 

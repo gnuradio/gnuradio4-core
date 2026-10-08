@@ -50,8 +50,9 @@
 // version's interface reaches the wrong function. A plugin's port also shares its stream ring and its tag store with a
 // port of the host, and the layout of `gr::Tag`, the tag store's element, crosses the boundary with them. The host's
 // scheduler reads the `msgIn` and `msgOut` ports of a plugin's block through typed pointers, and the layout of a port
-// crosses the boundary too.
-#define GR_PLUGIN_CURRENT_ABI_VERSION 8
+// crosses the boundary too. `SchedulerModel::start()` returns the refusal of a start as a `std::expected`, and a host
+// reads it from a plugin's scheduler.
+#define GR_PLUGIN_CURRENT_ABI_VERSION 9
 
 namespace gr {
 

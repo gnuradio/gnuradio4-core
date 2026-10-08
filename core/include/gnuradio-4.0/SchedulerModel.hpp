@@ -42,8 +42,11 @@ public:
         return std::shared_ptr<BlockModel>(ptr, ptr->asBlockModel());
     }
 
-    virtual void start() = 0;
-    virtual void stop()  = 0;
+    // starts the scheduler on a thread of its own. A stopped or failed scheduler is initialized again first, and a
+    // running one stays as it is. The error says why the start is refused. A start that fails on the scheduler's
+    // thread ends it in ERROR.
+    [[nodiscard]] virtual std::expected<void, Error> start() = 0;
+    virtual void                                     stop()  = 0;
 
     // an adopted scheduler shares its parent's processing pool, so its start reports what keeps it from running
     // instead of leaving a worker queued behind the threads the parent holds
@@ -103,7 +106,7 @@ public:
 
     BlockModel* asBlockModel() final { return static_cast<BlockModel*>(this); }
 
-    void start() override { std::ignore = startOnOwnThread(false); }
+    [[nodiscard]] std::expected<void, Error> start() override { return startOnOwnThread(false); }
 
     std::expected<void, Error> startAdopted() override { return startOnOwnThread(true); }
 
@@ -133,18 +136,24 @@ public:
 
 private:
     std::expected<void, Error> startOnOwnThread(bool requireWorkerCapacity) {
+        using enum gr::lifecycle::State;
         auto& sched = this->blockRef();
+
+        if (sched.state() == RUNNING) {
+            return {};
+        }
 
         if (_schedulerThread.joinable()) { // a previous run may have finished without a stop()
             _schedulerThread.join();
         }
 
-        if (sched.state() == gr::lifecycle::State::IDLE) {
-            std::ignore = sched.changeStateTo(gr::lifecycle::State::INITIALISED);
+        if (const gr::lifecycle::State state = sched.state(); state == IDLE || state == STOPPED || state == ERROR) {
+            if (auto initialized = sched.changeStateTo(INITIALISED); !initialized.has_value()) {
+                return initialized;
+            }
         }
 
-        if (sched.state() != gr::lifecycle::State::INITIALISED) {
-            sched.emitErrorMessage("SchedulerWrapper::start()", std::format("sub-scheduler '{}' is {}, not INITIALISED -- not started", sched.unique_name, gr::meta::enumName(sched.state()).value_or("")));
+        if (sched.state() != INITIALISED) {
             return std::unexpected(Error(std::format("sub-scheduler '{}' is {} and cannot be started", sched.unique_name, gr::meta::enumName(sched.state()).value_or(""))));
         }
 
@@ -162,8 +171,8 @@ private:
         _schedulerThread = std::thread([&sched] {
             // runs the scheduler's start(). Under a single-threaded policy start() returns when the run ends, and under
             // the others once the workers are queued
-            if (!sched.changeStateTo(gr::lifecycle::State::RUNNING)) {
-                std::ignore = sched.changeStateTo(gr::lifecycle::State::ERROR);
+            if (!sched.changeStateTo(RUNNING)) {
+                sched.emitErrorMessageIfAny("SchedulerWrapper::start() -> ERROR", sched.changeStateTo(ERROR));
             }
         });
         return {};

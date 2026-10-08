@@ -1251,11 +1251,18 @@ protected:
             graph::forEachBlock<TransparentBlockGroup>(*_graph, [this, &firstChildError, &startedSubSchedulers](auto& block) { //
                 if (block->blockCategory() == ScheduledBlockGroup) {
                     // We don't simply move to RUNNING, as schedulers block. This code path
-                    // uses a separate thread.
+                    // uses a separate thread. A sub-scheduler that cannot reach RUNNING refuses the start, and the
+                    // refusal fails this start as a child's error does.
                     auto* schedulerModel = dynamic_cast<SchedulerModel*>(block.get());
                     if (schedulerModel) {
-                        schedulerModel->start();
-                        startedSubSchedulers.push_back(block);
+                        if (std::expected<void, Error> started = schedulerModel->start(); started.has_value()) {
+                            startedSubSchedulers.push_back(block);
+                        } else {
+                            this->emitErrorMessage("start()", started.error());
+                            if (!firstChildError.has_value()) {
+                                firstChildError = std::move(started.error());
+                            }
+                        }
                     } else {
                         throw gr::exception(std::format("ScheduledBlockGroup is not a SchedulerModel {}", block->uniqueName()));
                     }
@@ -1904,9 +1911,6 @@ protected:
         if (schedulerModel == nullptr) {
             this->emitErrorMessage("adoptBlock", std::format("ScheduledBlockGroup is not a SchedulerModel {}", newBlock->uniqueName()));
             return;
-        }
-        if (newBlock->state() == STOPPED) {
-            this->emitErrorMessageIfAny("adoptBlock -> INITIALISED", newBlock->changeStateTo(INITIALISED));
         }
         if (auto started = schedulerModel->startAdopted(); !started.has_value()) {
             this->emitErrorMessageIfAny("adoptBlock", started);
