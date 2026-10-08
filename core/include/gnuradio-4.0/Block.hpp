@@ -1217,7 +1217,7 @@ public:
         }
     }
 
-    void publishSamples(std::size_t nSamples, auto& outputSpanTuple) noexcept {
+    void publishSamples([[maybe_unused]] std::size_t nSamples, [[maybe_unused]] auto& outputSpanTuple) noexcept {
         if constexpr (traits::block::stream_output_ports<Derived>::size > 0) {
             for_each_writer_span(
                 [nSamples]<typename Out>(Out& out) {
@@ -1241,7 +1241,7 @@ public:
         }
     }
 
-    bool consumeReaders(std::size_t nSamples, auto& consumableSpanTuple) {
+    bool consumeReaders([[maybe_unused]] std::size_t nSamples, [[maybe_unused]] auto& consumableSpanTuple) {
         bool success = true;
         if constexpr (traits::block::stream_input_ports<Derived>::size > 0) {
             for_each_reader_span(
@@ -2827,10 +2827,10 @@ void checkBlockContracts() {
         []<std::size_t... Idxs>(std::index_sequence<Idxs...>) {
             (
                 [] {
-                    using MemberType           = refl::data_member_type<TDecayedBlock, Idxs>;
-                    using RawType              = std::remove_cvref_t<MemberType>;
-                    using Type                 = std::remove_cvref_t<unwrap_if_wrapped_t<RawType>>;
-                    constexpr bool isAnnotated = !std::is_same_v<RawType, Type>;
+                    using MemberType                            = refl::data_member_type<TDecayedBlock, Idxs>;
+                    using RawType                               = std::remove_cvref_t<MemberType>;
+                    using Type                                  = std::remove_cvref_t<unwrap_if_wrapped_t<RawType>>;
+                    [[maybe_unused]] constexpr bool isAnnotated = !std::is_same_v<RawType, Type>;
                     // N.B. this function is compile-time ready but static_assert does not allow for configurable error
                     // messages
                     if constexpr (!gr::settings::isReadableMember<Type>() && !traits::port::AnyPort<Type>) {
