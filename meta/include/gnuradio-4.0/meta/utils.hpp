@@ -113,7 +113,7 @@ struct print_types;
 #define GR_TRAP() std::abort()
 #endif
 
-#if HAVE_SOURCE_LOCATION
+#if defined(HAVE_SOURCE_LOCATION) && HAVE_SOURCE_LOCATION
 GR_ALWAYS_INLINE constexpr void precondition(bool cond, const std::source_location loc = std::source_location::current()) {
     if consteval {
         if (not cond) {
