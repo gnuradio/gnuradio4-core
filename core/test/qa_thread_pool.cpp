@@ -11,6 +11,7 @@
 #include <optional>
 #include <semaphore>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -461,6 +462,109 @@ const boost::ut::suite<"gr::thread_pool GR4 default"> defaultThreadPool = [] {
         expect(eq(held.workers.size(), 4UZ)) << "a task did not start";
         for (const HeldWorkers::Worker& worker : held.workers) {
             expect(isStripe(worker.mask)) << std::format("worker {} runs on '{}', which is neither stripe", worker.name, bits(worker.mask));
+        }
+    };
+
+    "ThreadPool: a pool whose live worker refuses a scheduling policy keeps its earlier policy and still takes a mask and grows"_test = [] {
+        using namespace gr::thread_pool;
+
+        const std::optional<TwoCpuMask> mask = twoCpuMask(2UZ);
+        if (!mask) {
+            boost::ut::log << "skipped: the calling thread may run on fewer than two CPUs";
+            return;
+        }
+
+        // Every process is refused priority 1 under the default policy. The pool holds one live worker when the
+        // policy is set.
+        HeldWorkers     held;
+        BasicThreadPool pool("RefusedPolicyTest", TaskType::IO_BOUND, 1U, 2U);
+        pool.setAffinityMask(mask->stripes[0]);
+
+        expect(throws<std::system_error>([&pool] { pool.setThreadSchedulingPolicy(thread::Policy::OTHER, 1); })) << "the refused policy was not reported";
+        expect(pool.getSchedulingPolicy() == thread::Policy::OTHER && pool.getSchedulingPriority() == 0) << std::format("the pool keeps policy {} priority {}", pool.getSchedulingPolicy(), pool.getSchedulingPriority());
+        expect(nothrow([&pool, &mask] { pool.setAffinityMask(mask->stripes[1]); })) << "setAffinityMask() failed after the refusal";
+        const std::string refusal = held.hold(pool, 2UZ);
+        held.releaseAll();
+
+        expect(refusal.empty()) << std::format("a worker was refused: {}", refusal);
+        expect(eq(held.workers.size(), 2UZ)) << "a task did not start";
+        for (const HeldWorkers::Worker& worker : held.workers) {
+            expect(worker.mask == mask->stripes[1]) << std::format("worker {} runs on '{}', expected '{}'", worker.name, bits(worker.mask), bits(mask->stripes[1]));
+        }
+    };
+
+    "ThreadPool: a worker that refuses the pool's scheduling policy as it starts runs on the pool's mask, and the pool keeps its earlier policy and grows"_test = [] {
+        using namespace gr::thread_pool;
+
+        const std::optional<TwoCpuMask> mask = twoCpuMask(2UZ);
+        if (!mask) {
+            boost::ut::log << "skipped: the calling thread may run on fewer than two CPUs";
+            return;
+        }
+
+        // The pool holds no worker when the policy is set, and its first worker refuses the policy as it starts. That
+        // worker stays in the pool and takes the next task. Two held tasks then make the pool start a second worker.
+        HeldWorkers     held;
+        BasicThreadPool pool("RefusedAtStartTest", TaskType::IO_BOUND, 0U, 2U);
+        pool.setAffinityMask(mask->stripes[0]);
+        pool.setThreadSchedulingPolicy(thread::Policy::OTHER, 1);
+
+        expect(throws<std::system_error>([&pool] { pool.execute([] {}); })) << "the refused policy was not reported";
+        expect(pool.getSchedulingPolicy() == thread::Policy::OTHER && pool.getSchedulingPriority() == 0) << std::format("the pool keeps policy {} priority {}", pool.getSchedulingPolicy(), pool.getSchedulingPriority());
+        const std::vector<bool> startMask = pool.execute([] { return thread::getThreadAffinity(); }).get();
+        expect(nothrow([&pool, &mask] { pool.setAffinityMask(mask->stripes[1]); })) << "setAffinityMask() failed after the refusal";
+        const std::string refusal = held.hold(pool, 2UZ);
+        held.releaseAll();
+
+        expect(startMask == mask->stripes[0]) << std::format("the worker started on '{}', expected '{}'", bits(startMask), bits(mask->stripes[0]));
+        expect(refusal.empty()) << std::format("the second worker was refused: {}", refusal);
+        expect(eq(held.workers.size(), 2UZ)) << "a task did not start";
+        for (const HeldWorkers::Worker& worker : held.workers) {
+            expect(worker.mask == mask->stripes[1]) << std::format("worker {} runs on '{}', expected '{}'", worker.name, bits(worker.mask), bits(mask->stripes[1]));
+        }
+    };
+
+    "ThreadPool: a mask that one worker refuses leaves the pool's mask and every worker's mask as they were"_test = [] {
+        using namespace gr::thread_pool;
+
+        const std::vector<bool>         callerMask = thread::getThreadAffinity();
+        const std::optional<TwoCpuMask> mask       = twoCpuMask(2UZ);
+        if (!mask) {
+            boost::ut::log << "skipped: the calling thread may run on fewer than two CPUs";
+            return;
+        }
+
+        // A CPU-bound pool of two workers splits the refused mask into two stripes. The first stripe holds a CPU of the
+        // calling thread. The second holds only CPU 1000, and a worker refuses it on a machine with at most 1000 CPUs.
+        // Worker 0 takes the first stripe before worker 1 refuses the second. The pool is given the refused mask once
+        // without a mask of its own and once after it takes the two stripes of the calling thread's CPUs.
+        std::vector<bool> refusedMask = mask->stripes[0];
+        refusedMask.resize(1001UZ, false);
+        refusedMask[1000UZ] = true;
+        HeldWorkers     firstRound;
+        HeldWorkers     secondRound;
+        BasicThreadPool pool("RefusedMask", TaskType::CPU_BOUND, 2U, 2U);
+        pool.waitUntilInitialised();
+
+        expect(throws<std::system_error>([&pool, &refusedMask] { pool.setAffinityMask(refusedMask); })) << "the first refused mask was not reported";
+        const std::vector<bool> firstStoredMask = pool.getAffinityMask();
+        const std::string       firstRefusal    = firstRound.hold(pool, 2UZ);
+        firstRound.releaseAll();
+        expect(nothrow([&pool, &mask] { pool.setAffinityMask(mask->pool); })) << "setAffinityMask() failed after the refusal";
+        expect(throws<std::system_error>([&pool, &refusedMask] { pool.setAffinityMask(refusedMask); })) << "the second refused mask was not reported";
+        const std::vector<bool> secondStoredMask = pool.getAffinityMask();
+        const std::string       secondRefusal    = secondRound.hold(pool, 2UZ);
+        secondRound.releaseAll();
+
+        expect(firstStoredMask.empty()) << std::format("the pool without a mask keeps '{}'", bits(firstStoredMask));
+        expect(secondStoredMask == mask->pool) << std::format("the pool keeps '{}', expected '{}'", bits(secondStoredMask), bits(mask->pool));
+        expect(firstRefusal.empty() && secondRefusal.empty()) << std::format("a task was refused: {}{}", firstRefusal, secondRefusal);
+        for (std::size_t worker = 0UZ; worker < 2UZ; ++worker) {
+            const std::string       name       = std::format("RefusedMask#{}", worker);
+            const std::vector<bool> firstMask  = firstRound.maskOf(name);
+            const std::vector<bool> secondMask = secondRound.maskOf(name);
+            expect(firstMask == callerMask) << std::format("without a mask, worker {} runs on '{}', expected '{}'", worker, bits(firstMask), bits(callerMask));
+            expect(secondMask == mask->stripes[worker]) << std::format("on the two stripes, worker {} runs on '{}', expected '{}'", worker, bits(secondMask), bits(mask->stripes[worker]));
         }
     };
 #endif

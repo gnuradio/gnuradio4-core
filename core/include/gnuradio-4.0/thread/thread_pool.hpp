@@ -13,6 +13,7 @@
 #include <list>
 #include <map>
 #include <mutex>
+#include <ranges>
 #include <span>
 #include <string>
 #include <thread>
@@ -361,8 +362,10 @@ class BasicThreadPool {
     std::map<std::size_t, std::thread> _threads; // the worker threads by index
 
     std::vector<bool> _affinityMask;
-    thread::Policy    _schedulingPolicy   = thread::Policy::OTHER;
-    int               _schedulingPriority = 0;
+    thread::Policy    _schedulingPolicy           = thread::Policy::OTHER;
+    int               _schedulingPriority         = 0;
+    thread::Policy    _acceptedSchedulingPolicy   = thread::Policy::OTHER; // the policy a worker last took
+    int               _acceptedSchedulingPriority = 0;
 
     const std::string     _poolName;
     const TaskType        _taskType;
@@ -440,7 +443,20 @@ public:
 
     void setAffinityMask(const std::vector<bool>& threadAffinityMask) {
         cleanupFinishedThreads();
-        updateThreadConstraints([this, &threadAffinityMask] { _affinityMask = threadAffinityMask; });
+        std::scoped_lock                         threadListLock(_threadListMutex);
+        const std::vector<bool>                  acceptedMask = std::exchange(_affinityMask, threadAffinityMask);
+        std::map<std::size_t, std::vector<bool>> earlierWorkerMasks;
+        try {
+            updateLiveWorkers(
+                [this, &earlierWorkerMasks](const std::size_t threadID, std::thread& thread) {
+                    earlierWorkerMasks[threadID] = thread::getThreadAffinity(thread);
+                    setWorkerAffinity(threadID, thread);
+                },
+                [&earlierWorkerMasks](const std::size_t threadID, std::thread& thread) { thread::setThreadAffinity(earlierWorkerMasks.at(threadID), thread); });
+        } catch (...) {
+            _affinityMask = acceptedMask;
+            throw;
+        }
     }
 
     [[nodiscard]] thread::Policy getSchedulingPolicy() const {
@@ -455,10 +471,18 @@ public:
 
     void setThreadSchedulingPolicy(const thread::Policy schedulingPolicy = thread::Policy::OTHER, const int schedulingPriority = 0) {
         cleanupFinishedThreads();
-        updateThreadConstraints([this, schedulingPolicy, schedulingPriority] {
-            _schedulingPolicy   = schedulingPolicy;
-            _schedulingPriority = schedulingPriority;
-        });
+        std::scoped_lock threadListLock(_threadListMutex);
+        _schedulingPolicy   = schedulingPolicy;
+        _schedulingPriority = schedulingPriority;
+        try {
+            const std::size_t nWorkersSet = updateLiveWorkers([this](std::size_t /*threadID*/, std::thread& thread) { setWorkerScheduling(thread); }, [this](std::size_t /*threadID*/, std::thread& thread) { thread::setThreadSchedulingParameter(_acceptedSchedulingPolicy, _acceptedSchedulingPriority, thread); });
+            if (nWorkersSet > 0UZ) {
+                acceptSchedulingPolicy();
+            }
+        } catch (...) {
+            restoreAcceptedSchedulingPolicy();
+            throw;
+        }
     }
 
     // Queues the task for a worker of the pool. When the idle workers are no more than the tasks queued ahead and the
@@ -536,38 +560,72 @@ private:
         // std::erase_if(_threads, [](auto &thread) { return !thread.joinable(); });
     }
 
-    // Stores the new mask or scheduling policy under _threadListMutex, then sets the name, scheduling and affinity of
-    // every live worker. The workers that left at their keep-alive are joined first. The others are set under
-    // _waitMutex, where no worker decides to leave. A worker that left after the join keeps its record and is skipped.
-    // During shutdown a worker leaves without a record, and no worker is set.
-    void updateThreadConstraints(std::invocable auto storeConstraints) {
-        std::scoped_lock threadListLock(_threadListMutex);
-        storeConstraints();
+    // The caller holds _threadListMutex and has stored a new mask or scheduling policy. The workers that left at their
+    // keep-alive are joined first. applyToWorker() then sets the new value on every live worker under _waitMutex, where
+    // no worker decides to leave. A worker that left after the join keeps its record and is skipped. During shutdown a
+    // worker leaves without a record, and no worker is set. When a live worker refuses the new value, restoreWorker()
+    // sets each live worker set before it back to its earlier value, and the refusal reaches the caller. The caller
+    // then stores its earlier value again. Returns the number of live workers set.
+    std::size_t updateLiveWorkers(std::invocable<std::size_t, std::thread&> auto applyToWorker, std::invocable<std::size_t, std::thread&> auto restoreWorker) {
         std::unique_lock waitLock(_waitMutex, std::defer_lock);
         joinDepartedThreads(waitLock);
         waitLock.lock();
         if (isShutdown()) {
-            return;
+            return 0UZ;
         }
-        for (auto& [threadID, thread] : _threads) {
-            if (std::ranges::find(_departedThreads, thread.get_id()) == _departedThreads.end()) {
-                updateThreadConstraints(threadID, thread);
+        auto        liveWorkers = _threads | std::views::filter([this](const auto& entry) { return std::ranges::find(_departedThreads, entry.second.get_id()) == _departedThreads.end(); });
+        std::size_t nWorkersSet = 0UZ;
+        try {
+            for (auto& [threadID, thread] : liveWorkers) {
+                applyToWorker(threadID, thread);
+                ++nWorkersSet;
             }
+        } catch (...) {
+            for (auto& [threadID, thread] : liveWorkers | std::views::take(nWorkersSet)) {
+                restoreWorker(threadID, thread);
+            }
+            throw;
         }
+        return nWorkersSet;
     }
 
-    void updateThreadConstraints(const std::size_t threadID, std::thread& thread) const {
-        thread::setThreadName(std::format("{}#{}", _poolName, threadID), thread);
-        thread::setThreadSchedulingParameter(_schedulingPolicy, _schedulingPriority, thread);
-        if (!_affinityMask.empty()) {
-            if (_taskType == TaskType::IO_BOUND) {
-                thread::setThreadAffinity(_affinityMask, thread);
-                return;
-            }
-            const std::vector<bool> affinityMask = distributeThreadAffinityAcrossCores(_affinityMask, threadID);
-            thread::setThreadAffinity(affinityMask, thread);
-        }
+    // The policy that a worker takes becomes the pool's accepted policy. A policy set while the pool holds no live worker
+    // is stored unchecked. The first worker that refuses it makes the pool store the accepted policy again. The caller
+    // holds _threadListMutex.
+    void acceptSchedulingPolicy() {
+        _acceptedSchedulingPolicy   = _schedulingPolicy;
+        _acceptedSchedulingPriority = _schedulingPriority;
     }
+
+    void restoreAcceptedSchedulingPolicy() {
+        _schedulingPolicy   = _acceptedSchedulingPolicy;
+        _schedulingPriority = _acceptedSchedulingPriority;
+    }
+
+    // A new worker gets its name, its mask or its stripe of the mask, and the scheduling policy, in that order. A
+    // worker that refuses the policy still runs on that mask. That worker then takes the accepted policy, the pool
+    // stores that policy again, and the refusal reaches the caller.
+    void updateThreadConstraints(const std::size_t threadID, std::thread& thread) {
+        thread::setThreadName(std::format("{}#{}", _poolName, threadID), thread);
+        setWorkerAffinity(threadID, thread);
+        try {
+            setWorkerScheduling(thread);
+        } catch (...) {
+            restoreAcceptedSchedulingPolicy();
+            setWorkerScheduling(thread);
+            throw;
+        }
+        acceptSchedulingPolicy();
+    }
+
+    void setWorkerAffinity(const std::size_t threadID, std::thread& thread) const {
+        if (_affinityMask.empty()) {
+            return;
+        }
+        thread::setThreadAffinity(_taskType == TaskType::IO_BOUND ? _affinityMask : distributeThreadAffinityAcrossCores(_affinityMask, threadID), thread);
+    }
+
+    void setWorkerScheduling(std::thread& thread) const { thread::setThreadSchedulingParameter(_schedulingPolicy, _schedulingPriority, thread); }
 
     // The stripe count is the smaller of minThreads() and the CPUs in the mask, at least one. Worker threadID runs on
     // stripe threadID modulo that count.
@@ -642,8 +700,8 @@ private:
     // The new worker takes the lowest index that no thread in _threads holds. Its name and its stripe of the affinity
     // mask follow that index. A worker that leaves after the records are taken is joined by the next addWorker() or
     // the destructor. A refusal undoes the reservation: the process-wide limit (std::out_of_range), a thread count
-    // that cannot be read and a thread the system refuses (std::system_error). A worker whose name or scheduling
-    // cannot be set stays in the pool, and the exception reaches the caller.
+    // that cannot be read and a thread the system refuses (std::system_error). A worker whose name, mask or scheduling
+    // policy cannot be set stays in the pool, and the exception reaches the caller.
     // The join runs under _threadListMutex. No other worker starts while a departed thread still runs. A
     // thread-local destructor of a departed worker therefore must not call a member of its own pool that takes
     // _threadListMutex: execute(), numThreadsHeld(), requestShutdown(), and the getters and setters of the mask and the
