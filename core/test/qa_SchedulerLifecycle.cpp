@@ -430,6 +430,13 @@ struct ReleasedSource : gr::Block<ReleasedSource> {
     GR_MAKE_REFLECTABLE(ReleasedSource, out);
 
     std::atomic<std::size_t>* _nReleased = nullptr;
+    std::atomic<std::size_t>  _nWorkCalls{0UZ};
+
+    // counts every call, the calls that publish nothing included
+    gr::work::Result work(std::size_t requestedWork = std::numeric_limits<std::size_t>::max()) noexcept {
+        _nWorkCalls.fetch_add(1UZ, std::memory_order_relaxed);
+        return gr::Block<ReleasedSource>::work(requestedWork);
+    }
 
     gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
         if (outSpan.size() == 0UZ || _nReleased == nullptr || _nReleased->load(std::memory_order_acquire) == 0UZ) {
@@ -929,13 +936,142 @@ struct NamedPool {
 
 [[nodiscard]] NamedPool<gr::thread_pool::TaskExecutor> twoThreadPool() { return fixedPool(kOccupiedPoolName, 2U); }
 
+using PoolParkingScheduler    = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreadedBlocking>;
+using PoolParkingBreadthFirst = gr::scheduler::BreadthFirst<gr::scheduler::ExecutionPolicy::multiThreadedBlocking>;
+using PoolParkingDepthFirst   = gr::scheduler::DepthFirst<gr::scheduler::ExecutionPolicy::multiThreadedBlocking>;
+
+constexpr std::string_view kParkingPoolName = "qa_parking_cpu";
+constexpr std::size_t      kFiniteSamples   = 1UZ << 16;
+
+// The chain and release cases' sources wait inside work() for the test's signal. Their worker therefore never parks.
+// The test signals them without advancing the progress sequence. The first wake that a parked worker can receive comes
+// from the source's publication.
+
+// waits inside work() until `_open` reads true, then publishes the values 0 to kFiniteSamples - 1 and ends the stream
+struct GatedFiniteSource : gr::Block<GatedFiniteSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(GatedFiniteSource, out);
+
+    const std::atomic<bool>* _open     = nullptr;
+    std::size_t              _nEmitted = 0UZ;
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        if (_open == nullptr || !awaitCondition([this] { return _open->load(std::memory_order_acquire); })) {
+            outSpan.publish(0UZ);
+            return gr::work::Status::INSUFFICIENT_INPUT_ITEMS;
+        }
+        if (_nEmitted >= kFiniteSamples) {
+            outSpan.publish(0UZ);
+            return gr::work::Status::DONE;
+        }
+        const std::size_t nPublish = std::min(outSpan.size(), kFiniteSamples - _nEmitted);
+        for (std::size_t i = 0UZ; i < nPublish; ++i) {
+            outSpan[i] = static_cast<float>(_nEmitted + i);
+        }
+        _nEmitted += nPublish;
+        outSpan.publish(nPublish);
+        return gr::work::Status::OK;
+    }
+};
+
+// waits inside work() until a release arrives or `_holding` reads false, and publishes one sample for each release
+struct HeldSource : gr::Block<HeldSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(HeldSource, out);
+
+    std::atomic<std::size_t>* _nReleased = nullptr;
+    const std::atomic<bool>*  _holding   = nullptr;
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        const bool released = _nReleased != nullptr && _holding != nullptr && awaitCondition([this] { return _nReleased->load(std::memory_order_acquire) > 0UZ || !_holding->load(std::memory_order_acquire); });
+        if (outSpan.size() == 0UZ || !released || _nReleased->load(std::memory_order_acquire) == 0UZ) {
+            outSpan.publish(0UZ);
+            return gr::work::Status::INSUFFICIENT_INPUT_ITEMS;
+        }
+        _nReleased->fetch_sub(1UZ, std::memory_order_acq_rel);
+        outSpan[0UZ] = 1.0f;
+        outSpan.publish(1UZ);
+        return gr::work::Status::OK;
+    }
+};
+
+// counts the work() calls of its worker, the calls that find no sample included
+struct PassThrough : gr::Block<PassThrough> {
+    gr::PortIn<float>  in;
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(PassThrough, in, out);
+
+    std::atomic<std::size_t> _nWorkCalls{0UZ};
+
+    gr::work::Result work(std::size_t requestedWork = std::numeric_limits<std::size_t>::max()) noexcept {
+        _nWorkCalls.fetch_add(1UZ, std::memory_order_relaxed);
+        return gr::Block<PassThrough>::work(requestedWork);
+    }
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
+};
+
+// counts the work() calls of its worker, the calls that find no sample included
+struct CallCountingSink : gr::Block<CallCountingSink> {
+    gr::PortIn<float> in;
+
+    GR_MAKE_REFLECTABLE(CallCountingSink, in);
+
+    std::atomic<std::size_t> _nWorkCalls{0UZ};
+
+    gr::work::Result work(std::size_t requestedWork = std::numeric_limits<std::size_t>::max()) noexcept {
+        _nWorkCalls.fetch_add(1UZ, std::memory_order_relaxed);
+        return gr::Block<CallCountingSink>::work(requestedWork);
+    }
+
+    void processOne(float) {}
+};
+
+// counts the samples that arrive in the order GatedFiniteSource numbers them
+struct OrderedSink : gr::Block<OrderedSink> {
+    gr::PortIn<float> in;
+
+    GR_MAKE_REFLECTABLE(OrderedSink, in);
+
+    std::size_t _nInOrder = 0UZ;
+
+    void processOne(float value) {
+        if (value == static_cast<float>(_nInOrder)) {
+            ++_nInOrder;
+        }
+    }
+};
+
+// records when work() first calls it and publishes nothing. Its output needs no reader.
+struct FirstCallSource : gr::Block<FirstCallSource> {
+    gr::PortOut<float, gr::Async, gr::Optional> out;
+
+    GR_MAKE_REFLECTABLE(FirstCallSource, out);
+
+    std::atomic<bool>                     _called{false};
+    std::chrono::steady_clock::time_point _firstCallAt{};
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        if (!_called.load(std::memory_order_relaxed)) {
+            _firstCallAt = std::chrono::steady_clock::now();
+            _called.store(true, std::memory_order_release);
+        }
+        outSpan.publish(0UZ);
+        return gr::work::Status::OK;
+    }
+};
+
 // true once `count` threads wait on the graph's progress sequence
 template<typename TScheduler>
 [[nodiscard]] bool awaitParkedWorkers(const TScheduler& scheduler, std::size_t count) {
     return awaitCondition([&scheduler, count] { return scheduler.graph().progress().nTimedWaiters() == count; });
 }
 
-// reads the scheduler's wake count
+// reads the scheduler's wake count and whether a work quiescence is requested. The pool cases also read the count of
+// workers that have not left their loop, and hand a block to a job list from the test's thread
 template<typename TScheduler>
 struct ParkingProbe : TScheduler {
     using TScheduler::TScheduler;
@@ -943,9 +1079,31 @@ struct ParkingProbe : TScheduler {
     [[nodiscard]] const gr::Sequence* wakeSequence() const { return this->_wake.get(); }
 
     [[nodiscard]] bool workQuiescenceRequested() { return gr::atomic_ref(this->_nWorkQuiescenceRequests).load_acquire() > 0UZ; }
+
+    [[nodiscard]] std::size_t nRunningJobs() const { return this->_nRunningJobs->value(); }
+
+    // adds a block to a job list of the running graph, as an EmplaceBlock message does once the block is emplaced
+    void adopt(const std::shared_ptr<gr::BlockModel>& block) { this->adoptBlock(block); }
+
+    // true once every worker has taken the blocks queued for its job list
+    [[nodiscard]] bool adoptionQueuesEmpty() {
+        std::lock_guard guard(this->_adoptionBlocksMutex);
+        return std::ranges::all_of(this->_adoptionBlocks, [](const auto& queued) { return queued.empty(); });
+    }
+
+    // queues a block for job list `runnerID` and closes that list, as the list's worker does when it leaves its loop
+    // with the block still queued
+    void queueAndClose(std::size_t runnerID, const std::shared_ptr<gr::BlockModel>& block) {
+        {
+            std::lock_guard guard(this->_adoptionBlocksMutex);
+            this->_adoptionBlocks.at(runnerID).push_back(block);
+        }
+        this->closeAdoptionList(runnerID);
+    }
 };
 
-using BlockingProbe = ParkingProbe<BlockingScheduler>;
+using BlockingProbe    = ParkingProbe<BlockingScheduler>;
+using PoolParkingProbe = ParkingProbe<PoolParkingScheduler>;
 
 // publishes a message into msgIn from a thread exempt from the scheduler's wake, as a worker's thread publishes. No
 // parked worker returns on that publication. The calling thread then runs the scheduler's message service until msgIn
@@ -960,6 +1118,42 @@ void serveOnCallingThread(TProbe& scheduler, TSend send) {
         return scheduler.msgIn.streamReader().available() == 0UZ;
     });
 }
+
+// records when its msgIn first delivers a message with the endpoint "stamp"
+struct MessageStampSink : gr::Block<MessageStampSink> {
+    gr::PortIn<float> in;
+
+    GR_MAKE_REFLECTABLE(MessageStampSink, in);
+
+    std::atomic<bool>                     _stamped{false};
+    std::chrono::steady_clock::time_point _stampedAt{};
+
+    void processOne(float) {}
+
+    void processMessages(const gr::MsgPortInBuiltin&, std::span<const gr::Message> messages) {
+        if (!_stamped.load(std::memory_order_relaxed) && std::ranges::any_of(messages, [](const gr::Message& message) { return message.endpoint == "stamp"; })) {
+            _stampedAt = std::chrono::steady_clock::now();
+            _stamped.store(true, std::memory_order_release);
+        }
+    }
+};
+
+// records when a parent's worker first calls its work(). Its own workers call its blocks and never call it
+struct CalledSubScheduler : gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> {
+    using Base = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>;
+    using Base::Base;
+
+    std::atomic<bool>                     _called{false};
+    std::chrono::steady_clock::time_point _firstCallAt{};
+
+    gr::work::Result work(std::size_t requestedWork = std::numeric_limits<std::size_t>::max()) noexcept {
+        if (!_called.load(std::memory_order_relaxed)) {
+            _firstCallAt = std::chrono::steady_clock::now();
+            _called.store(true, std::memory_order_release);
+        }
+        return Base::work(requestedWork);
+    }
+};
 
 // a blocking source whose first work() call waits for a release. With `_releaseInPause` its pause() hook releases the
 // call and waits up to kSweepParkBound for a worker to park on `_progress`. The worker's passes after the release then
@@ -1014,6 +1208,18 @@ struct BlockingSink : gr::Block<BlockingSink> {
 
     void processOne(float) {}
 };
+
+// true once a message to `endpoint` arrives within `bound`. Every message read is consumed.
+[[nodiscard]] bool awaitReply(gr::MsgPortIn& port, std::string_view endpoint, std::chrono::milliseconds bound) {
+    return awaitCondition(
+        [&port, endpoint] {
+            auto       messages = port.streamReader().get();
+            const bool found    = std::ranges::any_of(messages, [endpoint](const gr::Message& message) { return message.endpoint == endpoint; });
+            std::ignore         = messages.consume(messages.size());
+            return found;
+        },
+        bound);
+}
 
 constexpr std::string_view kDeferringPoolName = "qa_deferring_cpu";
 
@@ -4327,11 +4533,313 @@ const boost::ut::suite<"workers that park"> parkingWorkerTests = [] {
     using namespace boost::ut;
     using enum gr::lifecycle::State;
 
-    // A park lasts up to kParkTimeout. An edit or a pause must reach a parked worker within kPromptBound, a tenth of the
-    // park. The watchdog's period lies beyond it.
+    // Every pool case runs on a pool of its own with a thread for each job list the case needs. The default CPU pool
+    // follows the host's core count and may hold fewer.
+    constexpr std::uint32_t kParkingThreads = 4U;
+
+    // A park lasts up to kParkTimeout. A worker that returns within kWakeBound, a third of the park, was therefore
+    // woken. A message, an edit, a handoff or a pause must reach a parked worker within kPromptBound, a tenth of the
+    // park. The watchdog's period lies beyond both.
     constexpr auto         kParkTimeout = std::chrono::milliseconds(3000);
+    constexpr auto         kWakeBound   = kParkTimeout / 3;
     constexpr auto         kPromptBound = kParkTimeout / 10;
     const gr::property_map parkingSettings{{"timeout_ms", static_cast<gr::Size_t>(kParkTimeout.count())}, {"watchdog_timeout", gr::Size_t(60'000)}};
+    const gr::property_map poolParkingSettings{{"timeout_ms", static_cast<gr::Size_t>(kParkTimeout.count())}, {"watchdog_timeout", gr::Size_t(60'000)}, {"poolName", std::string(qa_sched::kParkingPoolName)}};
+
+    // Each block of the chain gets a job list of its own. The three workers downstream of the source park while the
+    // source's worker waits inside work() for the gate. The test opens the gate without a progress notify. The source's
+    // publication is then the only wake the parked workers can receive before their parks time out.
+    auto deliversEverySample = [&]<typename TScheduler>(std::string_view schedulerName) {
+        auto              pool = qa_sched::fixedPool(qa_sched::kParkingPoolName, kParkingThreads);
+        std::atomic<bool> open{false};
+
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::GatedFiniteSource>();
+        auto&     first  = flow.emplaceBlock<qa_sched::PassThrough>();
+        auto&     second = flow.emplaceBlock<qa_sched::PassThrough>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::OrderedSink>();
+        source._open     = &open;
+        expect(flow.connect<"out", "in">(source, first).has_value());
+        expect(flow.connect<"out", "in">(first, second).has_value());
+        expect(flow.connect<"out", "in">(second, sink).has_value());
+
+        TScheduler scheduler(poolParkingSettings);
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        bool       allParked = false;
+        const bool completed = qa_sched::runAndWaitWithin(scheduler, kWakeBound, [&] {
+            allParked = qa_sched::awaitParkedWorkers(scheduler, std::size_t{kParkingThreads} - 1UZ);
+            open.store(true, std::memory_order_release);
+        });
+        expect(eq(scheduler.jobs()->size(), std::size_t{kParkingThreads})) << schedulerName << "one job list per block";
+        expect(allParked) << schedulerName << "the three workers downstream of the source did not all park";
+        expect(completed) << schedulerName << "the finite graph waited for a park to time out";
+        expect(eq(sink._nInOrder, qa_sched::kFiniteSamples)) << schedulerName << "samples delivered in order";
+    };
+
+    "a chain of parked workers delivers every sample under multiThreadedBlocking on Simple"_test       = [&] { deliversEverySample.operator()<qa_sched::PoolParkingScheduler>("Simple"); };
+    "a chain of parked workers delivers every sample under multiThreadedBlocking on BreadthFirst"_test = [&] { deliversEverySample.operator()<qa_sched::PoolParkingBreadthFirst>("BreadthFirst"); };
+    "a chain of parked workers delivers every sample under multiThreadedBlocking on DepthFirst"_test   = [&] { deliversEverySample.operator()<qa_sched::PoolParkingDepthFirst>("DepthFirst"); };
+
+    // A pool worker at the idle back-off's longest sleep calls its blocks every few hundred microseconds. A parked
+    // one calls them only when the progress sequence moves, a wake arrives or the park times out, and none of these
+    // happens here.
+    "an idle pool worker parks and calls no work while nothing moves"_test = [&] {
+        auto                     pool = qa_sched::fixedPool(qa_sched::kParkingPoolName, kParkingThreads);
+        std::atomic<std::size_t> nReleased{0UZ};
+
+        gr::Graph flow;
+        auto&     source  = flow.emplaceBlock<qa_sched::ReleasedSource>();
+        auto&     sink    = flow.emplaceBlock<qa_sched::CountingSink>();
+        source._nReleased = &nReleased;
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        qa_sched::PoolParkingScheduler scheduler(poolParkingSettings);
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        constexpr auto kQuietInterval = std::chrono::milliseconds(100);
+        bool           allParked      = false;
+        std::size_t    nCallsParked   = 0UZ;
+        std::size_t    nCallsLater    = 0UZ;
+        const bool     completed      = qa_sched::runAndWaitWithin(scheduler, qa_sched::kEventBound, [&] {
+            allParked    = qa_sched::awaitParkedWorkers(scheduler, 2UZ);
+            nCallsParked = source._nWorkCalls.load(std::memory_order_relaxed);
+            std::this_thread::sleep_for(kQuietInterval);
+            nCallsLater = source._nWorkCalls.load(std::memory_order_relaxed);
+            scheduler.requestStop();
+        });
+        expect(completed);
+        expect(eq(scheduler.jobs()->size(), 2UZ)) << "source and sink on two workers";
+        expect(allParked) << "both workers park while nothing moves";
+        expect(gt(nCallsParked, 0UZ)) << "the source ran before its worker parked";
+        expect(eq(nCallsLater, nCallsParked)) << std::format("the parked source's worker called work() {} times in {} ms", nCallsLater - nCallsParked, kQuietInterval.count());
+        expect(eq(sink._nReceived, 0UZ));
+    };
+
+    "a stop while every pool worker is parked returns before any park times out"_test = [&] {
+        auto                     pool = qa_sched::fixedPool(qa_sched::kParkingPoolName, kParkingThreads);
+        std::atomic<std::size_t> nReleased{0UZ};
+
+        gr::Graph flow;
+        auto&     source  = flow.emplaceBlock<qa_sched::ReleasedSource>();
+        auto&     middle  = flow.emplaceBlock<qa_sched::PassThrough>();
+        auto&     sink    = flow.emplaceBlock<qa_sched::CountingSink>();
+        source._nReleased = &nReleased;
+        expect(flow.connect<"out", "in">(source, middle).has_value());
+        expect(flow.connect<"out", "in">(middle, sink).has_value());
+
+        qa_sched::PoolParkingScheduler scheduler(poolParkingSettings);
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        bool       allParked = false;
+        const bool stopped   = qa_sched::runAndWaitWithin(scheduler, kWakeBound, [&] {
+            allParked = qa_sched::awaitParkedWorkers(scheduler, 3UZ);
+            scheduler.requestStop();
+        });
+        expect(eq(scheduler.jobs()->size(), 3UZ)) << "one job list per block";
+        expect(allParked) << "the three workers did not all park";
+        expect(stopped) << "a parked worker held the run after the stop";
+        expect(eq(sink._nReceived, 0UZ));
+    };
+
+    // The source's worker waits inside work() for a release while the sink's worker parks. The test releases a
+    // sample without a progress notify. The source's publication must wake the sink's worker, since no park times out
+    // within kWakeBound.
+    "a source that resumes while the sink's pool worker is parked has its samples at the sink before the park times out"_test = [&] {
+        auto                     pool = qa_sched::fixedPool(qa_sched::kParkingPoolName, kParkingThreads);
+        std::atomic<std::size_t> nReleased{0UZ};
+        std::atomic<bool>        holding{true};
+
+        gr::Graph flow;
+        auto&     source  = flow.emplaceBlock<qa_sched::HeldSource>();
+        auto&     sink    = flow.emplaceBlock<qa_sched::CountingSink>();
+        source._nReleased = &nReleased;
+        source._holding   = &holding;
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        qa_sched::PoolParkingScheduler scheduler(poolParkingSettings);
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        constexpr std::size_t kRounds   = 3UZ;
+        std::size_t           nArrived  = 0UZ;
+        bool                  allParked = true;
+        std::string           misses;
+        const bool            completed = qa_sched::runAndWaitWithin(scheduler, qa_sched::kEventBound, [&] {
+            for (std::size_t round = 1UZ; round <= kRounds; ++round) {
+                allParked = allParked && qa_sched::awaitParkedWorkers(scheduler, 1UZ);
+                nReleased.fetch_add(1UZ, std::memory_order_acq_rel);
+                if (qa_sched::awaitCondition([&sink, round] { return gr::atomic_ref(sink._nReceived).load_acquire() == round; }, kWakeBound)) {
+                    ++nArrived;
+                } else {
+                    misses += std::format(" round {}: {} samples at the sink, {} releases unpublished, {} workers parked;", round, gr::atomic_ref(sink._nReceived).load_acquire(), nReleased.load(), scheduler.graph().progress().nTimedWaiters());
+                }
+            }
+            holding.store(false, std::memory_order_release);
+            scheduler.requestStop();
+        });
+        expect(completed);
+        expect(allParked) << "the sink's worker parks before each release";
+        expect(eq(scheduler.jobs()->size(), 2UZ)) << "source and sink on two workers";
+        expect(eq(nArrived, kRounds)) << "a released sample waited for a park to time out:" << misses;
+    };
+
+    // The first job list ends at once, and its worker leaves. A request to the scheduler then arrives from the test's
+    // thread while the two remaining workers are parked. Its publication into msgIn wakes them, a worker answers, and
+    // both workers park again.
+    "a request sent while the remaining pool workers are parked is answered within a tenth of the park, and the workers park again"_test = [&] {
+        auto                     pool = qa_sched::fixedPool(qa_sched::kParkingPoolName, kParkingThreads);
+        std::atomic<std::size_t> nReleased{0UZ};
+
+        gr::Graph flow;
+        auto&     ending     = flow.emplaceBlock<qa_sched::DoneSource>();
+        auto&     endingSink = flow.emplaceBlock<qa_sched::CountingSink>();
+        auto&     source     = flow.emplaceBlock<qa_sched::ReleasedSource>();
+        auto&     sink       = flow.emplaceBlock<qa_sched::CountingSink>();
+        source._nReleased    = &nReleased;
+        expect(flow.connect<"out", "in">(ending, endingSink).has_value());
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+        const std::string endingName{ending.unique_name};
+
+        qa_sched::PoolParkingProbe scheduler(poolParkingSettings);
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(toScheduler.connect(scheduler.msgIn).has_value());
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+
+        bool       firstListEnded  = false;
+        bool       remainingParked = false;
+        bool       answered        = false;
+        bool       parkedAgain     = false;
+        double     answerMs        = 0.0;
+        const bool completed       = qa_sched::runAndWaitWithin(scheduler, qa_sched::kEventBound, [&] {
+            firstListEnded    = qa_sched::awaitCondition([&scheduler] { return scheduler.nRunningJobs() == 2UZ; });
+            remainingParked   = qa_sched::awaitParkedWorkers(scheduler, 2UZ);
+            const auto sentAt = std::chrono::steady_clock::now();
+            gr::sendMessage<gr::message::Command::Set>(toScheduler, "", gr::scheduler::property::kSchedulerInspect, gr::property_map{});
+            answered    = qa_sched::awaitReply(fromScheduler, gr::scheduler::property::kSchedulerInspected, kWakeBound);
+            answerMs    = qa_sched::Millis(std::chrono::steady_clock::now() - sentAt).count();
+            parkedAgain = qa_sched::awaitParkedWorkers(scheduler, 2UZ);
+            scheduler.requestStop();
+        });
+        std::println("request to a pool of parked workers (timeout_ms {}): answered after {:.2f} ms", kParkTimeout.count(), answerMs);
+        expect(completed);
+        expect(fatal(eq(scheduler.jobs()->size(), 4UZ))) << "one job list per block";
+        expect(std::ranges::any_of(scheduler.jobs()->front(), [&endingName](const std::shared_ptr<gr::BlockModel>& block) { return block->uniqueName() == endingName; })) << "the ending source is not in the first job list";
+        expect(firstListEnded) << "two workers did not leave";
+        expect(remainingParked) << "the two remaining workers did not park";
+        expect(answered) << "no worker answered the request";
+        expect(lt(answerMs, static_cast<double>(kPromptBound.count()))) << std::format("the answer waited {:.1f} ms of a {} ms park", answerMs, kParkTimeout.count());
+        expect(parkedAgain) << "the remaining workers did not park again after the answer";
+    };
+
+    // A source and a sink on two job lists park both workers. The test's thread then hands a block to a job list, the
+    // way an EmplaceBlock message does or a worker that leaves its loop with the block still queued for its list. The
+    // block comes from a graph of its own, and its calls move nothing. The hand-over is then the only wake the parked
+    // worker that owns it can receive.
+    auto handedBlockRuns = [&](bool viaLeavingWorker) {
+        auto                     pool = qa_sched::fixedPool(qa_sched::kParkingPoolName, kParkingThreads);
+        std::atomic<std::size_t> nReleased{0UZ};
+
+        gr::Graph                       holder;
+        auto&                           handed      = holder.emplaceBlock<qa_sched::FirstCallSource>();
+        std::shared_ptr<gr::BlockModel> handedModel = holder.blocks().front();
+        gr::Graph                       flow;
+        auto&                           source = flow.emplaceBlock<qa_sched::ReleasedSource>();
+        auto&                           sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        source._nReleased                      = &nReleased;
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        qa_sched::PoolParkingProbe scheduler(poolParkingSettings);
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        bool       allParked = false;
+        bool       ran       = false;
+        double     delayMs   = 0.0;
+        const bool completed = qa_sched::runAndWaitWithin(scheduler, qa_sched::kEventBound, [&] {
+            allParked         = qa_sched::awaitParkedWorkers(scheduler, 2UZ);
+            const auto handAt = std::chrono::steady_clock::now();
+            if (viaLeavingWorker) {
+                expect(handedModel->changeStateTo(INITIALISED).has_value());
+                expect(handedModel->changeStateTo(RUNNING).has_value());
+                scheduler.queueAndClose(0UZ, handedModel);
+            } else {
+                scheduler.adopt(handedModel);
+            }
+            ran     = qa_sched::awaitCondition([&handed] { return handed._called.load(std::memory_order_acquire); });
+            delayMs = ran ? qa_sched::Millis(handed._firstCallAt - handAt).count() : 0.0;
+            scheduler.requestStop();
+        });
+        expect(handedModel->changeStateTo(REQUESTED_STOP).has_value());
+        expect(handedModel->changeStateTo(STOPPED).has_value());
+
+        std::println("block handed to a parked pool worker {} (timeout_ms {}): first call after {:.2f} ms", viaLeavingWorker ? "by a closing job list" : "by adoption", kParkTimeout.count(), delayMs);
+        expect(completed);
+        expect(eq(scheduler.jobs()->size(), 2UZ)) << "source and sink on two workers";
+        expect(allParked) << "both workers park while nothing moves";
+        expect(ran) << "the handed block was never called";
+        expect(lt(delayMs, static_cast<double>(kPromptBound.count()))) << std::format("the handed block waited {:.1f} ms of a {} ms park", delayMs, kParkTimeout.count());
+    };
+
+    "a block adopted while every pool worker is parked runs within a tenth of the park"_test                 = [&] { handedBlockRuns(false); };
+    "a block that a leaving worker hands to a parked worker's job list runs within a tenth of the park"_test = [&] { handedBlockRuns(true); };
+
+    // A parent's edit holds the work quiescence of each scheduler in its graph. The test's thread holds it here. A block
+    // adopted meanwhile wakes the parked workers. The worker that owns the block takes it into its job list, calls no
+    // work() while the quiescence holds, and parks again. The end of the quiescence is then the only wake that can lead
+    // to the block's first call before the park times out.
+    auto adoptedUnderQuiescenceRuns = [&]<typename TProbe>(std::string_view policyName, const gr::property_map& settings, std::size_t nWorkers) {
+        std::atomic<std::size_t> nReleased{0UZ};
+
+        gr::Graph                       holder;
+        auto&                           handed      = holder.emplaceBlock<qa_sched::FirstCallSource>();
+        std::shared_ptr<gr::BlockModel> handedModel = holder.blocks().front();
+        gr::Graph                       flow;
+        auto&                           source = flow.emplaceBlock<qa_sched::ReleasedSource>();
+        auto&                           sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        source._nReleased                      = &nReleased;
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        TProbe scheduler(settings);
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        bool                  allParked       = false;
+        bool                  taken           = false;
+        bool                  parkedAgain     = false;
+        bool                  calledWhileHeld = false;
+        std::optional<double> delayMs;
+        const bool            completed = qa_sched::runAndWaitWithin(scheduler, qa_sched::kEventBound, [&] {
+            allParked = qa_sched::awaitParkedWorkers(scheduler, nWorkers);
+            scheduler.requestWorkQuiescence();
+            scheduler.adopt(handedModel);
+            taken                 = qa_sched::awaitCondition([&scheduler] { return scheduler.adoptionQueuesEmpty(); });
+            parkedAgain           = qa_sched::awaitParkedWorkers(scheduler, nWorkers);
+            calledWhileHeld       = handed._called.load(std::memory_order_acquire);
+            const auto releasedAt = std::chrono::steady_clock::now();
+            scheduler.releaseWorkQuiescence();
+            if (qa_sched::awaitCondition([&handed] { return handed._called.load(std::memory_order_acquire); })) {
+                delayMs = qa_sched::Millis(handed._firstCallAt - releasedAt).count();
+            }
+            scheduler.requestStop();
+        });
+        expect(handedModel->changeStateTo(REQUESTED_STOP).has_value());
+        expect(handedModel->changeStateTo(STOPPED).has_value());
+
+        std::println("block adopted under a held work quiescence, {} (timeout_ms {}): {}", policyName, kParkTimeout.count(), delayMs.has_value() ? std::format("first call {:.2f} ms after the release", *delayMs) : std::string("never called"));
+        expect(completed) << policyName;
+        expect(allParked) << policyName << "the workers did not all park";
+        expect(taken) << policyName << "no worker took the adopted block";
+        expect(parkedAgain) << policyName << "the woken worker did not park again";
+        expect(!calledWhileHeld) << policyName << "the adopted block ran while the quiescence held";
+        expect(lt(delayMs.value_or(static_cast<double>(kParkTimeout.count())), static_cast<double>(kPromptBound.count()))) << policyName << "the end of the quiescence left the worker parked";
+    };
+
+    "a block adopted during a held work quiescence runs within a tenth of the park after the quiescence ends under singleThreadedBlocking"_test = [&] { adoptedUnderQuiescenceRuns.operator()<qa_sched::BlockingProbe>("singleThreadedBlocking", parkingSettings, 1UZ); };
+    "a block adopted during a held work quiescence runs within a tenth of the park after the quiescence ends under multiThreadedBlocking"_test  = [&] {
+        auto pool = qa_sched::fixedPool(qa_sched::kParkingPoolName, kParkingThreads);
+        adoptedUnderQuiescenceRuns.operator()<qa_sched::PoolParkingProbe>("multiThreadedBlocking", poolParkingSettings, 2UZ);
+    };
 
     // The test's thread runs the scheduler's message service, and the message reaches msgIn without a wake (see
     // serveOnCallingThread()). The handler's own wake is then the only one the parked worker that owns the affected
@@ -4363,7 +4871,62 @@ const boost::ut::suite<"workers that park"> parkingWorkerTests = [] {
         expect(delayMs.has_value()) << what << "the block did not respond";
         expect(lt(delayMs.value_or(static_cast<double>(kParkTimeout.count())), static_cast<double>(kPromptBound.count()))) << what << std::format("waited of a {} ms park", kParkTimeout.count());
     };
+    auto poolRespondsAfterServe = [&](std::string_view what, gr::Graph flow, std::size_t nWorkers, auto serve, auto respondedAt) {
+        auto pool = qa_sched::fixedPool(qa_sched::kParkingPoolName, kParkingThreads);
+        respondsAfterServe.operator()<qa_sched::PoolParkingProbe>(what, poolParkingSettings, std::move(flow), nWorkers, serve, respondedAt);
+    };
     auto stoppedAt = [](const gr::BlockModel* block) -> std::optional<std::chrono::steady_clock::time_point> { return block != nullptr && block->state() == STOPPED ? std::optional(std::chrono::steady_clock::now()) : std::nullopt; };
+
+    "a message forwarded to a block from a thread that runs none of the pool's blocks reaches it within a tenth of the park"_test = [&] {
+        gr::Graph         flow;
+        auto&             source = flow.emplaceBlock<qa_sched::ReleasedSource>();
+        auto&             sink   = flow.emplaceBlock<qa_sched::MessageStampSink>();
+        const std::string sinkName(sink.unique_name);
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+        poolRespondsAfterServe(
+            "message forwarded to a block", std::move(flow), 2UZ, //
+            [&](qa_sched::PoolParkingProbe& scheduler, gr::MsgPortOut& toScheduler) { qa_sched::serveOnCallingThread(scheduler, [&] { gr::sendMessage<gr::message::Command::Set>(toScheduler, sinkName, "stamp", gr::property_map{}); }); }, [&sink](auto&) { return sink._stamped.load(std::memory_order_acquire) ? std::optional(sink._stampedAt) : std::nullopt; });
+    };
+
+    // a source whose output loses its last reader requests its stop in its next work() call
+    "a source whose only edge a message removes stops within a tenth of the park"_test = [&] {
+        gr::Graph             flow;
+        auto&                 source = flow.emplaceBlock<qa_sched::ReleasedSource>();
+        auto&                 sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        const std::string     sourceName(source.unique_name);
+        const gr::BlockModel* sourceModel = flow.blocks().front().get();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+        poolRespondsAfterServe(
+            "source whose only edge is removed", std::move(flow), 2UZ, //
+            [&](qa_sched::PoolParkingProbe& scheduler, gr::MsgPortOut& toScheduler) {
+                using namespace gr::serialization_fields;
+                qa_sched::serveOnCallingThread(scheduler, [&] { gr::sendMessage<gr::message::Command::Set>(toScheduler, scheduler.unique_name, gr::scheduler::property::kRemoveEdge, gr::property_map{{std::pmr::string(EDGE_SOURCE_BLOCK), sourceName}, {std::pmr::string(EDGE_SOURCE_PORT), std::string("out")}}); });
+            },
+            [&](auto&) { return stoppedAt(sourceModel); });
+    };
+
+    // the edge from the second source to the first sink displaces the first source's only edge
+    "a source whose only edge an emplaced edge displaces stops within a tenth of the park"_test = [&] {
+        gr::Graph             flow;
+        auto&                 first      = flow.emplaceBlock<qa_sched::ReleasedSource>();
+        auto&                 firstSink  = flow.emplaceBlock<qa_sched::CountingSink>();
+        auto&                 second     = flow.emplaceBlock<qa_sched::ReleasedSource>();
+        auto&                 secondSink = flow.emplaceBlock<qa_sched::CountingSink>();
+        const gr::BlockModel* firstModel = flow.blocks().front().get();
+        const std::string     secondName(second.unique_name);
+        const std::string     firstSinkName(firstSink.unique_name);
+        expect(flow.connect<"out", "in">(first, firstSink).has_value());
+        expect(flow.connect<"out", "in">(second, secondSink).has_value());
+        poolRespondsAfterServe(
+            "source whose only edge is displaced", std::move(flow), 4UZ, //
+            [&](qa_sched::PoolParkingProbe& scheduler, gr::MsgPortOut& toScheduler) {
+                using namespace gr::serialization_fields;
+                const gr::property_map edge{{std::pmr::string(EDGE_SOURCE_BLOCK), secondName}, {std::pmr::string(EDGE_SOURCE_PORT), std::string("out")}, {std::pmr::string(EDGE_DESTINATION_BLOCK), firstSinkName}, {std::pmr::string(EDGE_DESTINATION_PORT), std::string("in")}, //
+                    {std::pmr::string(EDGE_MIN_BUFFER_SIZE), gr::undefined_Size}, {std::pmr::string(EDGE_WEIGHT), std::int32_t{0}}, {std::pmr::string(EDGE_NAME), std::string("displacing")}};
+                qa_sched::serveOnCallingThread(scheduler, [&] { gr::sendMessage<gr::message::Command::Set>(toScheduler, scheduler.unique_name, gr::scheduler::property::kEmplaceEdge, edge); });
+            },
+            [&](auto&) { return stoppedAt(firstModel); });
+    };
 
     // the removed sink reaches STOPPED in its own worker's next work() call (see BlockingSink)
     auto removedBlockStops = [&]<typename TProbe>(std::string_view what, const gr::property_map& settings, std::size_t nWorkers) {
@@ -4378,7 +4941,50 @@ const boost::ut::suite<"workers that park"> parkingWorkerTests = [] {
             [&](TProbe& scheduler, gr::MsgPortOut& toScheduler) { qa_sched::serveOnCallingThread(scheduler, [&] { gr::sendMessage<gr::message::Command::Set>(toScheduler, scheduler.unique_name, gr::scheduler::property::kRemoveBlock, gr::property_map{{"uniqueName", sinkName}}); }); }, [&](auto&) { return stoppedAt(sinkModel.get()); });
     };
 
+    "a block that a message removes stops within a tenth of the park"_test = [&] {
+        auto pool = qa_sched::fixedPool(qa_sched::kParkingPoolName, kParkingThreads);
+        removedBlockStops.operator()<qa_sched::PoolParkingProbe>("removed block", poolParkingSettings, 2UZ);
+    };
     "a block that a message served on another thread removes from a parked singleThreadedBlocking run stops within a tenth of the park"_test = [&] { removedBlockStops.operator()<qa_sched::BlockingProbe>("removed block, singleThreadedBlocking", parkingSettings, 1UZ); };
+
+    // the scheduler starts the added scheduler on a pool of its own and queues it for a job list. The added
+    // scheduler's graph moves nothing. The queueing is then the only wake
+    "a sub-scheduler adopted while every pool worker is parked is called within a tenth of the park"_test = [&] {
+        auto      innerPool = qa_sched::fixedPool(qa_sched::kAdoptionPoolName, 2U);
+        gr::Graph innerFlow;
+        auto&     innerSource = innerFlow.emplaceBlock<qa_sched::ReleasedSource>();
+        auto&     innerSink   = innerFlow.emplaceBlock<qa_sched::CountingSink>();
+        expect(innerFlow.connect<"out", "in">(innerSource, innerSink).has_value());
+        auto inner = std::make_shared<gr::SchedulerWrapper<qa_sched::CalledSubScheduler>>(gr::property_map{{"poolName", std::string(qa_sched::kAdoptionPoolName)}, {"watchdog_timeout", gr::Size_t(60'000)}});
+        inner->setGraph(std::move(innerFlow));
+        const std::shared_ptr<gr::BlockModel> innerBlock = gr::SchedulerModel::asBlockModelPtr(inner);
+
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::ReleasedSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+        poolRespondsAfterServe(
+            "sub-scheduler adopted", std::move(flow), 2UZ, //
+            [&](qa_sched::PoolParkingProbe& scheduler, gr::MsgPortOut&) { scheduler.adopt(innerBlock); }, [&inner](auto&) { return inner->blockRef()._called.load(std::memory_order_acquire) ? std::optional(inner->blockRef()._firstCallAt) : std::nullopt; });
+        inner->stop();
+    };
+
+    // The graph's plugin loader creates the replacement from the global registry. The replaced sink reaches STOPPED in
+    // its own worker's next work() call (see BlockingSink).
+    "a block that a message replaces stops within a tenth of the park"_test = [&] {
+        std::ignore = gr::globalBlockRegistry().insert<qa_sched::CountingSink>();
+        const std::string replacementType(gr::meta::type_name<qa_sched::CountingSink>());
+
+        gr::Graph                       flow;
+        auto&                           source = flow.emplaceBlock<qa_sched::ReleasedSource>();
+        auto&                           sink   = flow.emplaceBlock<qa_sched::BlockingSink>();
+        const std::string               sinkName(sink.unique_name);
+        std::shared_ptr<gr::BlockModel> sinkModel = flow.blocks().back();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+        poolRespondsAfterServe(
+            "replaced block", std::move(flow), 2UZ, //
+            [&](qa_sched::PoolParkingProbe& scheduler, gr::MsgPortOut& toScheduler) { qa_sched::serveOnCallingThread(scheduler, [&] { gr::sendMessage<gr::message::Command::Set>(toScheduler, scheduler.unique_name, gr::scheduler::property::kReplaceBlock, gr::property_map{{"uniqueName", sinkName}, {"type", replacementType}}); }); }, [&](auto&) { return stoppedAt(sinkModel.get()); });
+    };
 
     // The source's first work() call holds the run's one worker until the pause reaches the source's pause() hook, or,
     // with `spansPause`, until pause() waits for the work() calls in progress. The scheduler reads REQUESTED_PAUSE before
@@ -4420,6 +5026,98 @@ const boost::ut::suite<"workers that park"> parkingWorkerTests = [] {
 
     "a singleThreadedBlocking worker does not park while a pause sweeps the blocks"_test                              = [&] { pauseParksNoWorker.operator()<qa_sched::BlockingProbe>("singleThreadedBlocking, released in the sweep", false, parkingSettings); };
     "a singleThreadedBlocking worker whose work() call spans the start of a pause does not park after the pause"_test = [&] { pauseParksNoWorker.operator()<qa_sched::BlockingProbe>("singleThreadedBlocking, work() spanning the start of the pause", true, parkingSettings); };
+    // no pool worker parks in the sweep or within a tenth of the park after PAUSED
+    "no pool worker parks while a pause sweeps the blocks under multiThreadedBlocking"_test = [&] {
+        auto pool = qa_sched::fixedPool(qa_sched::kParkingPoolName, 1U);
+        pauseParksNoWorker.operator()<qa_sched::PoolParkingProbe>("multiThreadedBlocking, released in the sweep", false, poolParkingSettings);
+    };
+    "a pool worker whose work() call spans the start of a pause does not park after the pause under multiThreadedBlocking"_test = [&] {
+        auto pool = qa_sched::fixedPool(qa_sched::kParkingPoolName, 1U);
+        pauseParksNoWorker.operator()<qa_sched::PoolParkingProbe>("multiThreadedBlocking, work() spanning the start of the pause", true, poolParkingSettings);
+    };
+
+    // Each block of a chain has a worker of its own, and the sink has a heartbeat subscriber. The sink's worker
+    // publishes a heartbeat in each of its message passes, and a later message pass forwards it. Nothing advances the
+    // progress sequence. A parked worker returns only when its park times out and then calls its one block once. The
+    // subscription restarts the idle back-off of the worker that reads it. The idle window opens once every worker has
+    // parked, and it is wall-clock time.
+    auto heartbeatLeavesPoolParked = [&](std::uint32_t nThreads) {
+        constexpr auto           kShortPark  = std::chrono::milliseconds(200);
+        constexpr auto           kIdleWindow = std::chrono::milliseconds(600);
+        const std::size_t        callBound   = 4UZ * nThreads * static_cast<std::size_t>(kIdleWindow / kShortPark); // four times one call per worker and park
+        auto                     pool        = qa_sched::fixedPool(qa_sched::kParkingPoolName, nThreads);
+        std::atomic<std::size_t> nReleased{0UZ};
+
+        gr::Graph                           flow;
+        auto&                               source = flow.emplaceBlock<qa_sched::ReleasedSource>();
+        auto&                               sink   = flow.emplaceBlock<qa_sched::CallCountingSink>();
+        std::vector<qa_sched::PassThrough*> middle;
+        for (std::uint32_t i = 2U; i < nThreads; ++i) {
+            middle.push_back(std::addressof(flow.emplaceBlock<qa_sched::PassThrough>()));
+        }
+        source._nReleased = &nReleased;
+        if (middle.empty()) {
+            expect(flow.connect<"out", "in">(source, sink).has_value());
+        } else {
+            expect(flow.connect<"out", "in">(source, *middle.front()).has_value());
+            for (std::size_t i = 1UZ; i < middle.size(); ++i) {
+                expect(flow.connect<"out", "in">(*middle[i - 1UZ], *middle[i]).has_value());
+            }
+            expect(flow.connect<"out", "in">(*middle.back(), sink).has_value());
+        }
+        const std::string sinkName(sink.unique_name);
+        auto              chainWorkCalls = [&source, &sink, &middle] {
+            std::size_t sum = source._nWorkCalls.load(std::memory_order_relaxed) + sink._nWorkCalls.load(std::memory_order_relaxed);
+            for (const qa_sched::PassThrough* block : middle) {
+                sum += block->_nWorkCalls.load(std::memory_order_relaxed);
+            }
+            return sum;
+        };
+
+        gr::property_map settings = poolParkingSettings;
+        settings.insert_or_assign("timeout_ms", static_cast<gr::Size_t>(kShortPark.count()));
+        qa_sched::PoolParkingScheduler scheduler(settings);
+        gr::MsgPortOut                 toScheduler;
+        gr::MsgPortIn                  fromScheduler;
+        expect(toScheduler.connect(scheduler.msgIn).has_value());
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        bool        heartbeatArrived = false;
+        bool        allParked        = false;
+        std::size_t calls            = 0UZ;
+        std::size_t heartbeats       = 0UZ;
+        std::size_t nSamples         = 0UZ;
+        std::size_t nParkedSamples   = 0UZ;
+        const bool  completed        = qa_sched::runAndWaitWithin(scheduler, qa_sched::kEventBound, [&] {
+            gr::sendMessage<gr::message::Command::Subscribe>(toScheduler, sinkName, gr::block::property::kHeartbeat, gr::property_map{}, "heartbeat-client");
+            heartbeatArrived = qa_sched::awaitCondition([&] { return qa_sched::takeHeartbeats(fromScheduler) > 0UZ; });
+            allParked        = qa_sched::awaitParkedWorkers(scheduler, std::size_t{nThreads});
+            std::ignore      = qa_sched::takeHeartbeats(fromScheduler); // the window counts only its own heartbeats
+
+            const std::size_t callsBefore = chainWorkCalls();
+            const auto        windowEnd   = std::chrono::steady_clock::now() + kIdleWindow;
+            while (std::chrono::steady_clock::now() < windowEnd) {
+                ++nSamples;
+                nParkedSamples += scheduler.graph().progress().nTimedWaiters() == nThreads ? 1UZ : 0UZ;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            calls      = chainWorkCalls() - callsBefore;
+            heartbeats = qa_sched::takeHeartbeats(fromScheduler);
+            scheduler.requestStop();
+        });
+
+        std::println("parked pool of {} workers with a heartbeat subscriber over {} ms (timeout_ms {}): {} work() calls of the chain, bound {}, {} heartbeats, every worker parked in {} of {} samples", nThreads, kIdleWindow.count(), kShortPark.count(), calls, callBound, heartbeats, nParkedSamples, nSamples);
+        expect(completed);
+        expect(eq(scheduler.jobs()->size(), std::size_t{nThreads})) << "one job list per block";
+        expect(heartbeatArrived) << "no heartbeat reached the subscriber";
+        expect(allParked) << "the workers did not all park after the first heartbeat";
+        expect(gt(heartbeats, 0UZ)) << "the heartbeats stopped during the idle window";
+        expect(lt(calls, callBound)) << std::format("{} work() calls of the chain in {} ms idle: a worker did not park", calls, kIdleWindow.count());
+    };
+
+    "a heartbeat subscriber on a parked multiThreadedBlocking run of two workers leaves the run parked"_test  = [&] { heartbeatLeavesPoolParked(2U); };
+    "a heartbeat subscriber on a parked multiThreadedBlocking run of four workers leaves the run parked"_test = [&] { heartbeatLeavesPoolParked(4U); };
 
     // The source ends its stream behind items that the relay never takes. The relay then drains, and it ends after a
     // bound of calls in which nothing it waits on moved. Nothing else moves. A worker parked between those calls would
@@ -4450,7 +5148,7 @@ const boost::ut::suite<"workers that park"> parkingWorkerTests = [] {
 
     "a block that never takes its remainder ends the graph under multiThreaded"_test                         = [&] { untakenRemainderEnds.operator()<qa_sched::TestScheduler>("multiThreaded"); };
     "a block that never takes its remainder keeps its worker from parking under singleThreadedBlocking"_test = [&] { untakenRemainderEnds.operator()<qa_sched::BlockingScheduler>("singleThreadedBlocking"); };
-    "a block that never takes its remainder keeps its worker from parking under multiThreadedBlocking"_test  = [&] { untakenRemainderEnds.operator()<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreadedBlocking>>("multiThreadedBlocking"); };
+    "a block that never takes its remainder keeps its worker from parking under multiThreadedBlocking"_test  = [&] { untakenRemainderEnds.operator()<qa_sched::PoolParkingScheduler>("multiThreadedBlocking"); };
 };
 
 namespace qa_sched {
