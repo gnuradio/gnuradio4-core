@@ -70,7 +70,9 @@ add_block_library(doc_probe_library doc_probe_library)
 # A single load of that directory reaches every outcome of the loader's version checks for plugins.
 function(add_abi_probe_plugin PLUGIN_NAME)
   add_library(${PLUGIN_NAME} MODULE ${PLUGIN_NAME}.cpp)
-  target_compile_options(${PLUGIN_NAME} PRIVATE -Wall)
+  if(NOT MSVC) # existing /W4 setting from general GR compilation applies here for msvc
+    target_compile_options(${PLUGIN_NAME} PRIVATE -Wall)
+  endif()
   target_include_directories(${PLUGIN_NAME} PUBLIC ${CMAKE_BINARY_DIR}/include)
   target_link_libraries(${PLUGIN_NAME} PUBLIC gnuradio-options gnuradio-core gnuradio-plugin)
   set_target_properties(${PLUGIN_NAME} PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${TESTS_BINARY_PATH}/plugin_abi)
