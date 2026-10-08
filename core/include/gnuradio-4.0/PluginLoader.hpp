@@ -24,6 +24,8 @@
 #include <dlfcn.h>
 
 #include "Plugin.hpp"
+
+#include <gnuradio-4.0/SharedState.hpp>
 #endif
 
 #include <gnuradio-4.0/Profiler.hpp>
@@ -258,6 +260,7 @@ private:
     plugin_create_function_t  _create_fn  = nullptr;
     plugin_destroy_function_t _destroy_fn = nullptr;
     gr_plugin_base*           _instance   = nullptr;
+    bool                      _keepMapped = false;
 
     std::string _status;
 
@@ -272,7 +275,7 @@ private:
     void release() {
         releaseInstance();
 
-        if (_dl_handle) {
+        if (_dl_handle && !_keepMapped) {
             dlclose(_dl_handle);
             _dl_handle = nullptr;
         }
@@ -294,6 +297,17 @@ public:
             // the linker's reason: a missing library, a versioned name the installation lacks, an undefined symbol
             const char* reason = dlerror();
             _status            = reason == nullptr ? "Failed to load the plugin file" : std::format("Failed to load the plugin file: {}", reason);
+            return;
+        }
+
+        // A library in the process's record of refusals is refused with the recorded reason, and the handler prints the
+        // recorded warning again. Its static initializers ran at its first load and do not run again.
+        if (std::optional<detail::RefusedLibrary> refusal = detail::refusedLibrary(_dl_handle); refusal.has_value()) {
+            if (!refusal->warning.empty()) {
+                std::println(stderr, "{}", refusal->warning);
+            }
+            _status    = std::move(refusal->reason);
+            _dl_handle = nullptr;
             return;
         }
 
@@ -320,12 +334,12 @@ public:
         }
 
         if (const std::uint8_t pluginAbiVersion = _instance->abiVersion(); pluginAbiVersion != GR_PLUGIN_CURRENT_ABI_VERSION) {
-            // A refused plugin is unmapped here rather than at the end of the load, so that it cannot be taken
-            // afterwards for one of the shared objects that register blocks without carrying a plugin interface,
-            // which the load keeps mapped.
-            _status = std::format("plugin ABI version {} does not match the host's plugin ABI version {}", pluginAbiVersion, GR_PLUGIN_CURRENT_ABI_VERSION);
-            std::println("warning: plugin {} not loaded: {}", plugin_file, _status);
-            release();
+            // A refused plugin gives up its handle here rather than at the end of the load. The load then cannot take
+            // it for one of the shared objects that register blocks without carrying a plugin interface.
+            std::string reason  = std::format("plugin ABI version {} does not match the host's plugin ABI version {}", pluginAbiVersion, GR_PLUGIN_CURRENT_ABI_VERSION);
+            std::string warning = std::format("warning: plugin {} not loaded: {}", plugin_file, reason);
+            std::println("{}", warning);
+            refuse(std::move(reason), std::move(warning));
             return;
         }
     }
@@ -333,7 +347,7 @@ public:
     PluginHandler(const PluginHandler& other)            = delete;
     PluginHandler& operator=(const PluginHandler& other) = delete;
 
-    PluginHandler(PluginHandler&& other) noexcept : _dl_handle(std::exchange(other._dl_handle, nullptr)), _create_fn(std::exchange(other._create_fn, nullptr)), _destroy_fn(std::exchange(other._destroy_fn, nullptr)), _instance(std::exchange(other._instance, nullptr)) {}
+    PluginHandler(PluginHandler&& other) noexcept : _dl_handle(std::exchange(other._dl_handle, nullptr)), _create_fn(std::exchange(other._create_fn, nullptr)), _destroy_fn(std::exchange(other._destroy_fn, nullptr)), _instance(std::exchange(other._instance, nullptr)), _keepMapped(std::exchange(other._keepMapped, false)) {}
 
     PluginHandler& operator=(PluginHandler&& other) noexcept {
         auto tmp = std::move(other);
@@ -341,6 +355,7 @@ public:
         std::swap(_create_fn, tmp._create_fn);
         std::swap(_destroy_fn, tmp._destroy_fn);
         std::swap(_instance, tmp._instance);
+        std::swap(_keepMapped, tmp._keepMapped);
         return *this;
     }
 
@@ -348,16 +363,37 @@ public:
 
     explicit operator bool() const { return _instance; }
 
-    /// whether the library is mapped, which it is even when it is not a plugin
+    /// whether this handler holds the library's handle
     [[nodiscard]] bool isLoaded() const noexcept { return _dl_handle != nullptr; }
 
     /**
      * @brief Gives up the unload: the library stays mapped for the lifetime of the process.
      *
      * A library whose static initializers registered blocks or schedulers leaves factory pointers into its own
-     * code in the registries, and those outlive every handle to it.
+     * code in the registries, and those outlive every handle to it. A plugin that a loader admits is kept the same way:
+     * the blocks, schedulers, pools, tasks and compute providers that its code builds can outlive the loader.
      */
-    void keepMapped() noexcept { _dl_handle = nullptr; }
+    void keepMapped() noexcept { _keepMapped = true; }
+
+    /**
+     * @brief Refuses the library for the whole process: the handle is given up without the unload, the library stays
+     * mapped for the lifetime of the process, and isLoaded() is false.
+     *
+     * Every file that the loader opens and does not keep is left this way. The static initializers of such a file may
+     * have registered a pool or a compute provider that points into its code, and neither the pool manager nor the
+     * compute registry removes an entry. A later dlopen of the file returns the same handle, and the file's static
+     * initializers do not run again. The process records the handle with the reason and the warning the caller
+     * printed, which is empty when it printed none. Every later handler of that handle refuses it with the same reason
+     * and prints the same warning.
+     */
+    void refuse(std::string reason, std::string warning = {}) {
+        _status = std::move(reason);
+        releaseInstance();
+        if (_dl_handle) {
+            detail::recordRefusedLibrary(_dl_handle, {.reason = _status, .warning = std::move(warning)});
+            _dl_handle = nullptr;
+        }
+    }
 
     [[nodiscard]] const std::string& status() const { return _status; }
 
@@ -372,8 +408,8 @@ public:
      * It carries no `gr_plugin_make`; its entries reach the registries from static initializers, and it is kept
      * mapped for the lifetime of the process because those entries point into its code. A shared object that
      * registered a scheduler at another plugin ABI version, or at none, is refused instead. The loader drops its
-     * entries, closes it and reports it among the failed plugins. A plugin whose load registered such a scheduler is
-     * refused the same way.
+     * entries and its handle and reports it among the failed plugins, and the file stays mapped. A plugin whose load
+     * registered such a scheduler is refused the same way.
      */
     struct BlockLibrary {
         std::string file;
@@ -407,8 +443,8 @@ private:
      * @brief Sets the entries of the registries a load can reach aside while one file loads, and puts them back after.
      *
      * The registries then hold exactly what the file registered, a replaced key included, whichever copy of the
-     * registry code inserted it. `restore(false)` drops those entries, which a file closed after its load requires,
-     * because they point into its code.
+     * registry code inserted it. `restore(false)` drops those entries, and a file the loader refuses offers none of
+     * them.
      */
     class SetAsideRegistrations {
         std::vector<std::pair<BlockRegistry*, BlockRegistry::Entries>>         _blocks;
@@ -516,10 +552,13 @@ public:
                 if (PluginHandler handler(fileString); handler) {
                     if (std::optional<std::string> mismatch = registrations.schedulerAbiMismatch(); mismatch.has_value()) {
                         registrations.restore(false);
-                        std::println(stderr, "warning: plugin {} not loaded: {}", fileString, *mismatch);
-                        _failedPlugins[fileString] = std::move(*mismatch);
+                        std::string warning = std::format("warning: plugin {} not loaded: {}", fileString, *mismatch);
+                        std::println(stderr, "{}", warning);
+                        handler.refuse(std::move(*mismatch), std::move(warning));
+                        _failedPlugins[fileString] = handler.status();
                         continue;
                     }
+                    handler.keepMapped();
 
                     for (std::string_view blockName : handler->availableBlocks()) {
                         _pluginForBlockName.emplace(std::string(blockName), handler.operator->());
@@ -540,14 +579,17 @@ public:
                     if (handler.isLoaded() && (blockRegistrations != 0UZ || schedulerRegistrations != 0UZ)) {
                         if (std::optional<std::string> mismatch = registrations.schedulerAbiMismatch(); mismatch.has_value()) {
                             registrations.restore(false);
-                            std::println(stderr, "warning: library {} not loaded: {}", fileString, *mismatch);
-                            _failedPlugins[fileString] = std::move(*mismatch);
+                            std::string warning = std::format("warning: library {} not loaded: {}", fileString, *mismatch);
+                            std::println(stderr, "{}", warning);
+                            handler.refuse(std::move(*mismatch), std::move(warning));
+                            _failedPlugins[fileString] = handler.status();
                         } else {
                             registrations.restore(true);
                             handler.keepMapped();
                             _blockLibraries.push_back({.file = fileString, .nBlockRegistrations = blockRegistrations, .nSchedulerRegistrations = schedulerRegistrations});
                         }
                     } else {
+                        handler.refuse(handler.status());
                         _failedPlugins[fileString] = handler.status();
                     }
                 }

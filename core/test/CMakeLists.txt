@@ -215,6 +215,11 @@ if(GR_ENABLE_BLOCK_REGISTRY AND INTERNAL_ENABLE_BLOCK_PLUGINS)
     bad_plugin)
 
   add_app_test(qa_PluginRegistration)
+  add_dependencies(
+    qa_PluginRegistration
+    abi_probe_plugin
+    abi_probe_plugin_v1
+    abi_probe_plugin_foreign_scheduler)
 
   add_app_test(qa_PluginBlockLibrary)
   add_dependencies(
