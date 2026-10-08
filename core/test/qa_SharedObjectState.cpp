@@ -15,6 +15,7 @@
 
 #include <gnuradio-4.0/Block.hpp>
 #include <gnuradio-4.0/BlockRegistry.hpp>
+#include <gnuradio-4.0/CircularBuffer.hpp>
 #include <gnuradio-4.0/ComputeDomain.hpp>
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/Message.hpp>
@@ -129,6 +130,18 @@ const boost::ut::suite<"values shared with a shared object"> sharedObjectStateTe
         expect(scheduler->_pool.get() == programPool.get()) << "the scheduler holds a default pool other than the program's";
         expect(lt(nThreadsAfter, nThreadsBefore + programPool->minThreads())) << "creating the scheduler started a second default pool";
         expect(gt(nTasksRunning, nTasksBefore)) << "the program's default pool did not run the scheduler's workers";
+    };
+
+    // The program and the shared object both read the default double-mapped memory resource. The two allocators over it
+    // compare equal
+    "a shared object's default double-mapped resource is the program's"_test = [] {
+        expect(fatal(loadCrossObjectLibrary())) << "the shared object did not load";
+        const std::shared_ptr<gr::BlockModel> block = gr::globalBlockRegistry().create(kLibraryProbe, gr::property_map{});
+        expect(fatal(block != nullptr)) << "the shared object's probe was not created";
+        const std::pmr::polymorphic_allocator<float> libraryAllocator(libraryProbe(block).defaultResource);
+        const std::pmr::polymorphic_allocator<float> programAllocator = gr::double_mapped_memory_resource::allocator<float>();
+        expect(libraryProbe(block).defaultResource == gr::double_mapped_memory_resource::defaultAllocator()) << "the shared object's code holds a default resource of its own";
+        expect(libraryAllocator == programAllocator) << "the default allocators of the shared object and the program compare unequal";
     };
 
     // The program registers a compute provider, and the shared object's code resolves the provider's domain

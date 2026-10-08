@@ -1,6 +1,7 @@
 #include <mutex>
 #include <unordered_map>
 
+#include <gnuradio-4.0/CircularBuffer.hpp>
 #include <gnuradio-4.0/ComputeDomain.hpp>
 #include <gnuradio-4.0/SharedState.hpp>
 #include <gnuradio-4.0/thread/thread_pool.hpp>
@@ -63,6 +64,11 @@ std::size_t& drainingCalls() noexcept {
 ComputeRegistry& computeRegistry() {
     static ComputeRegistry registry;
     return registry;
+}
+
+double_mapped_memory_resource* defaultDoubleMappedResource() {
+    static double_mapped_memory_resource resource;
+    return &resource;
 }
 
 } // namespace gr::detail

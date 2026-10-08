@@ -15,6 +15,7 @@
 namespace gr {
 class ComputeRegistry;
 class Sequence;
+class double_mapped_memory_resource;
 } // namespace gr
 
 namespace gr::message {
@@ -54,6 +55,9 @@ GNURADIO_EXPORT std::size_t& drainingCalls() noexcept;
 // the registry that ComputeRegistry::instance() returns. A provider runs the code of the shared object that defines it,
 // and that object must stay mapped while the provider is registered.
 GNURADIO_EXPORT ComputeRegistry& computeRegistry();
+
+// the resource that double_mapped_memory_resource::defaultAllocator() returns
+GNURADIO_EXPORT double_mapped_memory_resource* defaultDoubleMappedResource();
 
 } // namespace gr::detail
 
