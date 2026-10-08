@@ -465,11 +465,13 @@ concept PortDescription = requires {
     typename T::value_type;
     typename T::NameT;
     typename T::Required;
-    { auto(T::kIsDynamicCollection) } -> std::same_as<bool>;
-    { auto(T::kIsStaticCollection) } -> std::same_as<bool>;
-    { auto(T::kPartOfTuple) } -> std::same_as<bool>;
-    { auto(T::kIsInput) } -> std::same_as<bool>;
-    { auto(T::kIsOutput) } -> std::same_as<bool>;
+    // N.B. spelled as nested requirements rather than `{ auto(T::kFoo) } -> std::same_as<bool>`
+    // because MSVC cannot parse the `auto(x)` decay-copy inside a compound requirement.
+    requires std::same_as<std::decay_t<decltype(T::kIsDynamicCollection)>, bool>;
+    requires std::same_as<std::decay_t<decltype(T::kIsStaticCollection)>, bool>;
+    requires std::same_as<std::decay_t<decltype(T::kPartOfTuple)>, bool>;
+    requires std::same_as<std::decay_t<decltype(T::kIsInput)>, bool>;
+    requires std::same_as<std::decay_t<decltype(T::kIsOutput)>, bool>;
 };
 } // namespace detail
 
@@ -994,43 +996,54 @@ public:
         _hasRings.store(true, std::memory_order_release);
     }
 
-    [[nodiscard]] constexpr const ReaderType& streamReader() const noexcept {
-        static_assert(!kIsOutput, "streamReader() not applicable for outputs (yet)");
+    // N.B. constrained rather than static_assert'ed: the body is ill-formed for the wrong direction,
+    // and MSVC instantiates member bodies eagerly enough to trip over it. A constraint also lets
+    // `requires { port.streamWriter(); }` answer false instead of hard-erroring.
+    [[nodiscard]] constexpr const ReaderType& streamReader() const noexcept
+    requires(!kIsOutput)
+    {
         return ioHandler();
     }
 
-    [[nodiscard]] constexpr ReaderType& streamReader() noexcept {
-        static_assert(!kIsOutput, "streamReader() not applicable for outputs (yet)");
+    [[nodiscard]] constexpr ReaderType& streamReader() noexcept
+    requires(!kIsOutput)
+    {
         return ioHandler();
     }
 
-    [[nodiscard]] constexpr const WriterType& streamWriter() const noexcept {
-        static_assert(!kIsInput, "streamWriter() not applicable for inputs (yet)");
+    [[nodiscard]] constexpr const WriterType& streamWriter() const noexcept
+    requires(!kIsInput)
+    {
         return ioHandler();
     }
 
-    [[nodiscard]] constexpr WriterType& streamWriter() noexcept {
-        static_assert(!kIsInput, "streamWriter() not applicable for inputs (yet)");
+    [[nodiscard]] constexpr WriterType& streamWriter() noexcept
+    requires(!kIsInput)
+    {
         return ioHandler();
     }
 
-    [[nodiscard]] constexpr const TagReaderType& tagReader() const noexcept {
-        static_assert(!kIsOutput, "tagReader() not applicable for outputs (yet)");
+    [[nodiscard]] constexpr const TagReaderType& tagReader() const noexcept
+    requires(!kIsOutput)
+    {
         return tagIoHandler();
     }
 
-    [[nodiscard]] constexpr TagReaderType& tagReader() noexcept {
-        static_assert(!kIsOutput, "tagReader() not applicable for outputs (yet)");
+    [[nodiscard]] constexpr TagReaderType& tagReader() noexcept
+    requires(!kIsOutput)
+    {
         return tagIoHandler();
     }
 
-    [[nodiscard]] constexpr const TagWriterType& tagWriter() const noexcept {
-        static_assert(!kIsInput, "tagWriter() not applicable for inputs (yet)");
+    [[nodiscard]] constexpr const TagWriterType& tagWriter() const noexcept
+    requires(!kIsInput)
+    {
         return tagIoHandler();
     }
 
-    [[nodiscard]] constexpr TagWriterType& tagWriter() noexcept {
-        static_assert(!kIsInput, "tagWriter() not applicable for inputs (yet)");
+    [[nodiscard]] constexpr TagWriterType& tagWriter() noexcept
+    requires(!kIsInput)
+    {
         return tagIoHandler();
     }
 
