@@ -24,10 +24,12 @@ namespace gr {
  *
  * A key names the one block or subgraph that carries it as its `unique_name` or its `name`. A key no block carries, a
  * key two blocks carry and two keys for one block are refused before any block is made. A key the block does not
- * declare is refused after the block is constructed and before it joins the graph. The entry's map replaces those keys
- * of the block's `parameters`. Every block is constructed with the merged parameters, and its settings load the same
- * map. Its constructor, `settingsChanged()` and `start()` see the given values. A port count such as `n_inputs` sizes
- * the ports before the connections are made.
+ * declare, given or in the file's `parameters`, is refused after the block is constructed and before it joins the graph.
+ * A key of a `ctx_parameters` entry that names none of the block's readable members is refused the same way. A key the
+ * block does not declare belongs under the entry's `meta_information`. The entry's map replaces those keys of the
+ * block's `parameters`. Every block is constructed with the merged parameters, and its settings load the same map. Its
+ * constructor, `settingsChanged()` and `start()` see the given values. A port count such as `n_inputs` sizes the ports
+ * before the connections are made.
  */
 using BlockSettings = std::map<std::string, property_map, std::less<>>;
 
@@ -229,14 +231,12 @@ inline std::vector<const property_map*> resolveBlockSettings(const Tensor<pmt::V
     return settingsByPosition;
 }
 
-/// Throws for a key of `overrides` the block does not declare. The settings map would otherwise keep that key as meta
-/// information and apply nothing.
-inline void checkDeclared(const BlockModel& block, std::string_view blockName, const property_map& overrides) {
-    const std::set<std::string>& declared = block.settings().writableMembers();
-    for (const auto& [key, value] : overrides) {
+/// Throws for a key of `parameters` that `declared` does not hold, naming the nearest declared keys.
+inline void checkDeclared(const std::set<std::string>& declared, std::string_view blockName, std::string_view typeName, const property_map& parameters) {
+    for (const auto& [key, value] : parameters) {
         const std::string_view name(key.data(), key.size());
         if (!declared.contains(std::string(name))) {
-            throw gr::exception(std::format("block '{}' of type '{}' declares no setting named '{}'; the nearest are {}", blockName, block.typeName(), name, closestNames(name, declared)));
+            throw gr::exception(std::format("block '{}' of type '{}' declares no setting named '{}'; the nearest are {}", blockName, typeName, name, closestNames(name, declared)));
         }
     }
 }
@@ -275,6 +275,8 @@ inline void loadEntrySettings(BlockModel& block, const property_map& grcBlock, c
             throw gr::exception(std::format("Unable to create block '{}' of type '{}': ctx_parameters is not a list", identity.name, identity.type));
         }
 
+        // a context's keys are checked against the readable members. The writer stores every readable member there.
+        const std::set<std::string> readable = block.settings().readableMembers();
         for (const auto& ctxPmt : *parametersCtx) {
             const auto ctxPar = checked_access_ptr<const property_map, false>{ctxPmt.get_if<property_map>()};
             if (ctxPar == nullptr) {
@@ -288,6 +290,7 @@ inline void loadEntrySettings(BlockModel& block, const property_map& grcBlock, c
                 throw gr::exception(std::format("Unable to create block '{}' of type '{}': a ctx_parameters entry needs a context, a context_time and a parameters map", identity.name, identity.type));
             }
 
+            checkDeclared(readable, identity.name, block.typeName(), *ctxParameters);
             block.settings().loadParametersFromPropertyMap(*ctxParameters, SettingsCtx{*ctxTime, ctxName});
         }
     }
@@ -426,12 +429,9 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
             currentBlock = std::make_shared<GraphWrapper<gr::Graph>>(gr::Graph(loader, parameters));
         }
 
-        // the settings take the map once, below. Settings::init() would apply the constructor's copy again and refuse
-        // a key of the file the block does not declare.
+        // the settings take the map once, below, and Settings::init() does not apply the constructor's copy again
         currentBlock->settings().setInitBlockParameters({});
-        if (given != nullptr) {
-            checkDeclared(*currentBlock, blockName, *given);
-        }
+        checkDeclared(currentBlock->settings().writableMembers(), blockName, currentBlock->typeName(), parameters);
 
         currentBlock->setName(blockName);
         loadEntrySettings(*currentBlock, grcBlock, parameters, identity);

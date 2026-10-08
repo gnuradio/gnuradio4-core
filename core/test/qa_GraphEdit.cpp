@@ -1237,6 +1237,13 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(eq(refused.namesAfter, refused.namesBefore)) << "the refused subgraph is in the graph";
     };
 
+    "a subgraph emplaced from yaml with an inner key its block does not declare gets an error and stays out of the graph"_test = [] {
+        qa_edit::registerTestBlocks();
+        const qa_edit::RefusedEmplacement refused = qa_edit::emplaceRefusedYaml(std::format("id: SUBGRAPH\nparameters:\n  name: group\ngraph:\n  blocks:\n    - id: {}\n      parameters:\n        name: stage\n        gian: !!float32 0.25\n", gr::meta::type_name<qa_edit::LimitedGain>()), gr::scheduler::property::kBlockEmplaced);
+        expect(refused.refusal.contains("declares no setting named 'gian'") && refused.refusal.contains("'gain'")) << "the reply names the nearest key, got: " << refused.refusal;
+        expect(eq(refused.namesAfter, refused.namesBefore)) << "the refused subgraph is in the graph";
+    };
+
     "a subgraph emplaced by name inherits its parent's plugin loader"_test = [] {
         gr::BlockRegistry     localRegistry;
         gr::SchedulerRegistry localSchedulers;

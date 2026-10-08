@@ -2642,7 +2642,7 @@ protected:
             if (checkedBlock) {
                 const auto             nameIt    = blockProperties.find("name");
                 const std::string_view blockName = nameIt != blockProperties.end() ? nameIt->second.value_or(checkedBlock->name()) : checkedBlock->name();
-                gr::detail::checkDeclared(*checkedBlock, blockName, blockProperties);
+                gr::detail::checkDeclared(checkedBlock->settings().writableMembers(), blockName, checkedBlock->typeName(), blockProperties);
             }
         }
 

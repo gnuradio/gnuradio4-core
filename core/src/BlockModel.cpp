@@ -35,10 +35,10 @@ void serializeSettings(const std::shared_ptr<BlockModel>& block, property_map& r
     // Serialization must not change the graph it serializes, so the staged parameters are read rather
     // than committed: the dump carries what the block would use, and the block keeps them staged.
     //
-    // Only writable members go in. A block's readable members are a superset, and a reader files what
-    // it cannot set as meta_information instead, so writing the rest corrupts the block that reads it
-    // back: unique_name is the identity of the block the dump was written from, and input_chunk_size,
-    // output_chunk_size and stride are constants of a block that is not declared Resampling<>/Stride<>.
+    // Only writable members go in. A block's readable members are a superset, and a reader refuses a
+    // key it cannot set: unique_name is the identity of the block the dump was written from, and
+    // input_chunk_size, output_chunk_size and stride are constants of a block that is not declared
+    // Resampling<>/Stride<>.
     const std::set<std::string>& writable = block->settings().writableMembers();
     property_map                 activeParameters;
     auto                         insertWritable = [&writable, &activeParameters](const property_map& source) {

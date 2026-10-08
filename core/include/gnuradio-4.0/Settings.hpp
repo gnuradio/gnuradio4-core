@@ -818,6 +818,9 @@ struct SettingsBase {
      */
     [[nodiscard]] virtual const std::set<std::string>& writableMembers() const = 0;
 
+    /// the member names get() reports and a stored context holds: the writable members and the read-only ones
+    [[nodiscard]] virtual std::set<std::string> readableMembers() const = 0;
+
     [[nodiscard]] virtual std::set<std::string> autoUpdateParameters(SettingsCtx ctx = {}) noexcept = 0;
 
     // N.B. by reference: fixed once the block runs, and read on the per-work() tag-forwarding
@@ -898,6 +901,7 @@ public:
     std::uint64_t expiry_time{std::numeric_limits<std::uint64_t>::max()};
 
     [[nodiscard]] const std::set<std::string>& writableMembers() const override;
+    [[nodiscard]] std::set<std::string>        readableMembers() const override;
 
     [[nodiscard]] bool changed() const noexcept override;
     void               setChanged(bool b) noexcept override;
