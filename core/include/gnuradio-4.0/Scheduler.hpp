@@ -2233,6 +2233,86 @@ protected:
         }
     }
 
+    // calls the predicate on each port of the collection and returns true at the first port it accepts
+    template<typename TPredicate>
+    [[nodiscard]] static bool anyPort(BlockModel::DynamicPorts& ports, TPredicate predicate) {
+        return std::ranges::any_of(ports, [&predicate](BlockModel::DynamicPortOrCollection& portOrCollection) {
+            if (auto* port = std::get_if<DynamicPort>(&portOrCollection)) {
+                return predicate(*port);
+            }
+            return std::ranges::any_of(std::get<BlockModel::NamedPortCollection>(portOrCollection).ports, predicate);
+        });
+    }
+
+    // true for a stream output that is not optional; a block whose disconnect_on_done setting is true stops when no such
+    // output has a reader
+    [[nodiscard]] static bool isMandatoryStreamOutput(const DynamicPort& port) {
+        const port::BitMask mask = port.portMaskInfo();
+        return port::isStream(mask) && !port::any(mask, port::BitMask::Optional);
+    }
+
+    // the block that holds the port. A port that a block group exports resolves to the block inside the group that holds
+    // it, through every level of nesting
+    [[nodiscard]] static std::shared_ptr<BlockModel> portHolder(std::shared_ptr<BlockModel> block, const DynamicPort& port, PortDirection direction) {
+        auto holdsPort = [&port, direction](const std::shared_ptr<BlockModel>& child) { return anyPort(direction == PortDirection::INPUT ? child->dynamicInputPorts() : child->dynamicOutputPorts(), [&port](const DynamicPort& childPort) { return childPort == port; }); };
+        while (block->blockCategory() == block::Category::TransparentBlockGroup) {
+            const std::span<std::shared_ptr<BlockModel>> children = block->blocks();
+            const auto                                   holder   = std::ranges::find_if(children, holdsPort);
+            if (holder == children.end()) {
+                break;
+            }
+            block = *holder;
+        }
+        return block;
+    }
+
+    // the blocks that hold the edge's source and destination ports, as portHolder() resolves them
+    [[nodiscard]] static std::pair<std::shared_ptr<BlockModel>, std::shared_ptr<BlockModel>> edgeEndpoints(const Edge& edge) {
+        std::shared_ptr<BlockModel> source      = edge.sourceBlock();
+        std::shared_ptr<BlockModel> destination = edge.destinationBlock();
+        if (const auto output = source->dynamicOutputPort(edge.sourcePortDefinition()); output.has_value()) {
+            source = portHolder(source, *output.value(), PortDirection::OUTPUT);
+        }
+        if (const auto input = destination->dynamicInputPort(edge.destinationPortDefinition()); input.has_value()) {
+            destination = portHolder(destination, *input.value(), PortDirection::INPUT);
+        }
+        return {std::move(source), std::move(destination)};
+    }
+
+    // The unique names of the given sources that the edit leaves without a reader. Each source is the block that holds
+    // the output, as portHolder() resolves it. A source is named when it has a mandatory stream output and no edge leaves
+    // one, in the scheduler's graph or in a block group inside it. An edge from a port that a block group exports counts
+    // for the block inside the group that holds the port. The stop rule of disconnect_on_done reads the same condition
+    // from the ports.
+    [[nodiscard]] Tensor<pmt::Value> sourcesWithoutReader(std::span<const std::shared_ptr<BlockModel>> sources) const {
+        Tensor<pmt::Value>             names;
+        std::vector<const BlockModel*> checked;
+        for (const std::shared_ptr<BlockModel>& source : sources) {
+            if (std::ranges::contains(checked, source.get())) {
+                continue;
+            }
+            checked.push_back(source.get());
+            bool read = false;
+            graph::forEachEdge<block::Category::TransparentBlockGroup>(*_graph, [&source, &read](const Edge& edge) {
+                const auto output = edge.sourceBlock()->dynamicOutputPort(edge.sourcePortDefinition());
+                if (output.has_value() && isMandatoryStreamOutput(*output.value()) && portHolder(edge.sourceBlock(), *output.value(), PortDirection::OUTPUT) == source) {
+                    read = true;
+                }
+            });
+            if (!read && anyPort(source->dynamicOutputPorts(), isMandatoryStreamOutput)) {
+                names.push_back(pmt::Value(std::string(source->uniqueName())));
+            }
+        }
+        return names;
+    }
+
+    // adds "sourcesWithoutReader" to the reply when the list names a source
+    static void addSourcesWithoutReader(property_map& replyData, Tensor<pmt::Value> names) {
+        if (!names.empty()) {
+            replyData["sourcesWithoutReader"] = std::move(names);
+        }
+    }
+
     // The reply to a request that edits the graph. It keeps the request's clientRequestID, takes the reply endpoint and
     // the Final command, and carries the data that the edit returns or the reason the edit was refused. An exception that
     // leaves the edit is the reason.
@@ -2392,6 +2472,8 @@ protected:
         return replyAfter(std::move(message), scheduler::property::kBlockRemoved, &SchedulerBase::removeBlockByMessage);
     }
 
+    // The BlockRemoved reply lists under "sourcesWithoutReader" the sources upstream of the removed block that the removal
+    // leaves without a reader, by the check of sourcesWithoutReader()
     std::expected<property_map, Error> removeBlockByMessage(const Message& message) {
         property_map messageData = message.data.value();
         const auto   uniqueName  = messageData.at("uniqueName").value_or(std::string_view{});
@@ -2407,12 +2489,19 @@ protected:
 
         messageData["_targetGraph"] = targetGraph->unique_name.value();
         {
-            WorkQuiescenceGuard quiescence(this); // _blocks is traversed by every worker and by forEachBlock
+            WorkQuiescenceGuard                      quiescence(this); // _blocks is traversed by every worker and by forEachBlock
+            std::vector<std::shared_ptr<BlockModel>> upstreamSources;
+            for (const Edge& edge : targetGraph->edges()) {
+                if (edge.destinationBlock()->uniqueName() == uniqueName && edge.sourceBlock()->uniqueName() != uniqueName) {
+                    upstreamSources.push_back(edgeEndpoints(edge).first);
+                }
+            }
             if (auto removedBlock = targetGraph->removeBlockByName(uniqueName); removedBlock.has_value()) {
                 makeZombie(std::move(*removedBlock));
             } else {
                 return std::unexpected(removedBlock.error());
             }
+            addSourcesWithoutReader(messageData, sourcesWithoutReader(upstreamSources));
         }
 
         return messageData;
@@ -2423,6 +2512,9 @@ protected:
         return replyAfter(std::move(message), scheduler::property::kEdgeRemoved, &SchedulerBase::removeEdgeByMessage);
     }
 
+    // The EdgeRemoved reply carries "nEdgesRemoved". It lists the source under "sourcesWithoutReader" when the removal
+    // leaves it without a reader, by the check of sourcesWithoutReader(). A named block that holds the output stops at its
+    // next work() call when its disconnect_on_done setting is true.
     std::expected<property_map, Error> removeEdgeByMessage(const Message& message) {
         property_map messageData = message.data.value();
         const auto   sourceBlock = messageData.at(std::pmr::string(gr::serialization_fields::EDGE_SOURCE_BLOCK)).value_or(std::string_view{});
@@ -2449,6 +2541,13 @@ protected:
             } else {
                 return std::unexpected(result.error());
             }
+            const auto source = std::ranges::find_if(targetGraph->blocks(), [sourceBlock](const std::shared_ptr<BlockModel>& block) { return block->uniqueName() == sourceBlock; });
+            if (source != targetGraph->blocks().end()) {
+                if (const auto output = (*source)->dynamicOutputPort(sourcePort); output.has_value()) {
+                    const std::array holder{portHolder(*source, *output.value(), PortDirection::OUTPUT)};
+                    addSourcesWithoutReader(messageData, sourcesWithoutReader(holder));
+                }
+            }
         }
 
         return messageData;
@@ -2459,8 +2558,9 @@ protected:
         return replyAfter(std::move(message), scheduler::property::kEdgeEmplaced, &SchedulerBase::emplaceEdgeByMessage);
     }
 
-    // the EdgeEmplaced reply lists the edges the new one displaced under "displacedEdges", keyed by index as in a
-    // GraphInspect reply
+    // The EdgeEmplaced reply lists the edges the new one displaced under "displacedEdges", keyed by index as in a
+    // GraphInspect reply, and the displaced sources left without a reader under "sourcesWithoutReader", by the check of
+    // sourcesWithoutReader().
     std::expected<property_map, Error> emplaceEdgeByMessage(const Message& message) {
         property_map messageData      = message.data.value();
         const auto   sourceBlock      = messageData.at(std::pmr::string(gr::serialization_fields::EDGE_SOURCE_BLOCK)).value_or(std::string_view{});
@@ -2489,11 +2589,14 @@ protected:
             WorkQuiescenceGuard quiescence(this);
             const std::size_t   effectiveMinBufferSize = (*minBufferSize == gr::undefined_Size) ? gr::undefined_size : static_cast<std::size_t>(*minBufferSize);
             if (auto result = targetGraph->emplaceEdge(sourceBlock, std::string(sourcePort), destinationBlock, std::string(destinationPort), effectiveMinBufferSize, *weight, edgeName); result.has_value()) {
-                property_map displacedEdges;
+                property_map                             displacedEdges;
+                std::vector<std::shared_ptr<BlockModel>> displacedSources;
                 for (std::size_t index = 0UZ; index < result->size(); ++index) {
                     displacedEdges[convert_string_domain(std::to_string(index))] = serializeEdge((*result)[index]);
+                    displacedSources.push_back(edgeEndpoints((*result)[index]).first);
                 }
                 messageData["displacedEdges"] = std::move(displacedEdges);
+                addSourcesWithoutReader(messageData, sourcesWithoutReader(displacedSources));
             } else {
                 return std::unexpected(result.error());
             }
