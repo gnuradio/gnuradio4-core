@@ -8,10 +8,12 @@
 #include <mutex>
 #include <queue>
 #include <set>
+#include <span>
 #include <string>
 #include <system_error>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/Graph_yaml_importer.hpp>
@@ -140,7 +142,7 @@ protected:
     std::shared_ptr<gr::Sequence> _nRunningJobs = std::make_shared<gr::Sequence>();
     std::recursive_mutex          _executionOrderMutex; // only used when modifying and copying the graph->local job list
     std::shared_ptr<JobLists>     _executionOrder = std::make_shared<JobLists>();
-    std::mutex                    _childLifecycleMutex; // serializes start()'s and stop()'s sweeps; a worker never takes it to count itself
+    std::mutex                    _childLifecycleMutex; // serializes the sweeps of start(), stop() and a graph replacement; a worker never takes it to count itself
     std::mutex                    _workersInLoopMutex;  // guards _nWorkersInLoop; no block's stop() hook runs under it
     std::size_t                   _nWorkersInLoop{0UZ}; // workers inside poolWorker(); only these workers call a block's work()
     // advanced by everything that ends a park and is not work (see wakeWorkers() and registerWake()). The rings in
@@ -200,8 +202,9 @@ protected:
 
     std::atomic_flag _processingScheduledMessages;
     // separate cache lines: every worker reads the flag and updates the counter on each iteration
-    alignas(gr::kCacheLine) bool _workQuiescenceRequested{false};
+    alignas(gr::kCacheLine) std::size_t _nWorkQuiescenceRequests{0UZ}; // a worker enters work() only while it reads zero
     alignas(gr::kCacheLine) std::size_t _nWorkersInWork{0};
+    std::size_t _nInWorkRequests{0UZ}; // stop(), pause() and resume() calls that wait for quiescence from inside a work() call of this scheduler
     // counted by the dispatch, immediately before the call into poolWorker(), so that a scheduler which supplies its
     // own worker is counted as well; a worker the pool has only queued is not counted
     std::size_t _nWorkersStarted{0};
@@ -438,16 +441,21 @@ public:
     // whether an idle worker parks on the graph's progress sequence until work or a wake ends the park
     [[nodiscard]] static constexpr bool parksIdleWorkers() { return executionPolicy() == ExecutionPolicy::singleThreadedBlocking; }
 
-    // seq_cst: this store and the worker's _nWorkersInWork increment must not sink below the load that follows them
-    void requestWorkQuiescence() {
-        gr::atomic_ref(_workQuiescenceRequested).store_seq_cst(true);
-        while (gr::atomic_ref(_nWorkersInWork).load_acquire() > 0) {
-            std::this_thread::yield();
-        }
-    }
+    // waits until no worker is inside work(), and keeps every worker out of work() until releaseWorkQuiescence(). The
+    // requests of several callers add up, and each caller releases its own. A request made inside a work() call of this
+    // scheduler never returns.
+    void requestWorkQuiescence() { awaitWorkQuiescence(false); }
+
+    // requests work quiescence as requestWorkQuiescence() does, and waits for the work() calls of every worker except
+    // a call of this scheduler on the calling thread. That call returns only after the request. stop(), pause() and
+    // resume() request it, and resume() requests it of each sub-scheduler as well. Requests made inside the calls of
+    // two workers cannot each wait for the other's call. Graph edits wait for every call. The thread records only the
+    // innermost scheduler whose work() call it runs. A request made inside a work() call of another scheduler that
+    // runs inline in a work() call of this one waits for the outer call and never returns.
+    void requestQuiescenceOfOtherWork() { awaitWorkQuiescence(workingScheduler() == static_cast<const void*>(this)); }
 
     void releaseWorkQuiescence() {
-        gr::atomic_ref(_workQuiescenceRequested).store_release(false);
+        gr::atomic_ref(_nWorkQuiescenceRequests).fetch_sub(1UZ);
         wakeParkedWorkers();
     }
 
@@ -505,32 +513,46 @@ public:
         return {};
     }
 
-    void requestWorkQuiescenceAll() {
+    // requests the work quiescence of this scheduler and of each sub-scheduler in its graph. The result lists the
+    // sub-schedulers to pass to releaseWorkQuiescenceAll(), which releases those requests whatever the graph holds by then.
+    [[nodiscard]] std::vector<std::shared_ptr<BlockModel>> requestWorkQuiescenceAll() {
         requestWorkQuiescence();
-        graph::forEachBlock<TransparentBlockGroup>(*_graph, [](auto& block) {
-            if (block->blockCategory() == block::Category::ScheduledBlockGroup) {
-                if (auto* sm = dynamic_cast<SchedulerModel*>(block.get())) {
-                    sm->requestWorkQuiescence();
-                }
-            }
-        });
+        return requestSubSchedulerWorkQuiescence();
     }
 
-    void releaseWorkQuiescenceAll() {
-        graph::forEachBlock<TransparentBlockGroup>(*_graph, [](auto& block) {
+    // requests the work quiescence of each sub-scheduler in the graph and lists them for releaseWorkQuiescenceAll().
+    // With otherWorkOnly, each request is a requestQuiescenceOfOtherWork() of that sub-scheduler.
+    [[nodiscard]] std::vector<std::shared_ptr<BlockModel>> requestSubSchedulerWorkQuiescence(bool otherWorkOnly = false) {
+        std::vector<std::shared_ptr<BlockModel>> subSchedulers;
+        graph::forEachBlock<TransparentBlockGroup>(*_graph, [&subSchedulers, otherWorkOnly](auto& block) {
             if (block->blockCategory() == block::Category::ScheduledBlockGroup) {
                 if (auto* sm = dynamic_cast<SchedulerModel*>(block.get())) {
-                    sm->releaseWorkQuiescence();
+                    if (otherWorkOnly) {
+                        sm->requestQuiescenceOfOtherWork();
+                    } else {
+                        sm->requestWorkQuiescence();
+                    }
+                    subSchedulers.push_back(block);
                 }
             }
         });
+        return subSchedulers;
+    }
+
+    void releaseWorkQuiescenceAll(std::span<const std::shared_ptr<BlockModel>> subSchedulers) {
+        for (const std::shared_ptr<BlockModel>& block : subSchedulers) {
+            if (auto* sm = dynamic_cast<SchedulerModel*>(block.get())) {
+                sm->releaseWorkQuiescence();
+            }
+        }
         releaseWorkQuiescence();
     }
 
     struct WorkQuiescenceGuard {
-        SchedulerBase* _scheduler;
-        explicit WorkQuiescenceGuard(SchedulerBase* s) : _scheduler(s) { _scheduler->requestWorkQuiescenceAll(); }
-        ~WorkQuiescenceGuard() { _scheduler->releaseWorkQuiescenceAll(); }
+        SchedulerBase*                           _scheduler;
+        std::vector<std::shared_ptr<BlockModel>> _subSchedulers;
+        explicit WorkQuiescenceGuard(SchedulerBase* s) : _scheduler(s), _subSchedulers(s->requestWorkQuiescenceAll()) {}
+        ~WorkQuiescenceGuard() { _scheduler->releaseWorkQuiescenceAll(_subSchedulers); }
         WorkQuiescenceGuard(const WorkQuiescenceGuard&)            = delete;
         WorkQuiescenceGuard& operator=(const WorkQuiescenceGuard&) = delete;
     };
@@ -1010,9 +1032,9 @@ protected:
     // A worker meets an ERROR from a block's work() or from a child's error that no msgOut reader takes. The block or
     // child is recorded for runAndWait() unless an earlier one was, and a message on msgOut names it. While the worker's
     // run is current, the scheduler moves to ERROR after that message. A scheduler that runs this one and reads ERROR
-    // then finds the message. Otherwise a stop retired the run while the worker met the error. stop() publishes STOPPED
-    // without waiting for the worker, and the state stays STOPPED. A restart or a graph swap that follows the stop
-    // proceeds. runAndWait() returns the error.
+    // then finds the message. Otherwise a stop retired the run while the worker met the error. stop() waits for the
+    // worker's work() call but not for this report, and the state stays STOPPED. A restart or a graph swap that follows
+    // the stop proceeds. runAndWait() returns the error.
     void failRun(std::string_view blockName, std::size_t generation, std::string_view what) {
         {
             std::lock_guard guard(_runEndingBlockMutex);
@@ -1025,7 +1047,7 @@ protected:
         report.cmd         = message::Command::Notify;
         report.serviceName = this->unique_name;
         report.endpoint    = runIsCurrent ? "error in the run" : "error after the stop";
-        report.data        = std::unexpected(Error{std::format("block '{}' {}{}", blockName, what, runIsCurrent ? "" : " after the stop reached it")});
+        report.data        = std::unexpected(Error{std::format("block '{}' {}{}", blockName, what, runIsCurrent ? "" : " during the stop")});
         publishOnOwnWriter(std::move(report));
         if (runIsCurrent) {
             this->emitErrorMessageIfAny("LifecycleState (ERROR)", this->changeStateTo(lifecycle::State::ERROR));
@@ -1141,6 +1163,26 @@ protected:
 #endif
         advanceEnclosingProgress(exportedBlockMoved, !unfinishedBlocksExist);
         return {max_work_items, performedWorkAllBlocks, unfinishedBlocksExist ? work::Status::OK : work::Status::DONE};
+    }
+
+    // makes one traversal of the blocks as a work() call of this scheduler. stop(), pause(), resume() and graph edits
+    // wait for such a call. A stop(), pause() or resume() made inside it does not wait for it. A scheduler that supplies
+    // its own poolWorker() makes each traversal through this helper. While a request for work quiescence is in force, the
+    // helper calls no block and returns no result.
+    std::optional<work::Result> traverseBlockListAsWork(const std::vector<std::shared_ptr<BlockModel>>& blocks) {
+        if (gr::atomic_ref(_nWorkQuiescenceRequests).load_acquire() > 0UZ) {
+            std::this_thread::yield();
+            return std::nullopt;
+        }
+        std::ignore             = gr::atomic_ref(_nWorkersInWork).fetch_add_seq_cst(1UZ);
+        on_scope_exit leaveWork = [this] { gr::atomic_ref(_nWorkersInWork).fetch_sub(1UZ); };
+        if (gr::atomic_ref(_nWorkQuiescenceRequests).load_acquire() > 0UZ) {
+            return std::nullopt;
+        }
+        const void*&  threadWorkingScheduler = workingScheduler();
+        const void*   outerWorkingScheduler  = std::exchange(threadWorkingScheduler, static_cast<const void*>(this));
+        on_scope_exit restoreWorking         = [&threadWorkingScheduler, outerWorkingScheduler] { threadWorkingScheduler = outerWorkingScheduler; };
+        return traverseBlockListOnce(blocks);
     }
 
     void init() {
@@ -1511,6 +1553,7 @@ protected:
         std::size_t           idleIterations     = 0UZ;
         std::size_t           msgToCount         = 0UZ;
         auto                  activeState        = this->state();
+
         do {
             [[maybe_unused]] auto pe = profiler_handler->startCompleteEvent("scheduler_base.work");
             if constexpr (parksIdleWorkers()) {
@@ -1562,26 +1605,17 @@ protected:
             }
 
             if (activeState == RUNNING) {
-                if (gr::atomic_ref(_workQuiescenceRequested).load_acquire()) {
-                    std::this_thread::yield();
-                } else {
-                    std::ignore = gr::atomic_ref(_nWorkersInWork).fetch_add_seq_cst(1UZ);
-                    if (gr::atomic_ref(_workQuiescenceRequested).load_acquire()) {
-                        gr::atomic_ref(_nWorkersInWork).fetch_sub(1UZ);
-                    } else {
-                        gr::work::Result result = traverseBlockListOnce(localBlockList);
-                        gr::atomic_ref(_nWorkersInWork).fetch_sub(1UZ);
-                        if (result.status == work::Status::DONE) {
-                            break; // nothing happened -> shutdown this worker
-                        } else if (result.status == work::Status::ERROR) {
-                            failRun(runEndingBlock().value_or(""), generation, "returned ERROR");
-                            break;
-                        }
-                        idleIterations = result.performed_work > 0UZ ? 0UZ : idleIterations + 1UZ;
-                        applyIdleBackoff(idleIterations);
-                        if (idleIterations > kIdleSpinIterations) {
-                            msgToCount = 0UZ; // re-read lifecycle state every backoff period, bounding stop latency
-                        }
+                if (const std::optional<work::Result> result = traverseBlockListAsWork(localBlockList); result.has_value()) {
+                    if (result->status == work::Status::DONE) {
+                        break; // nothing happened -> shutdown this worker
+                    } else if (result->status == work::Status::ERROR) {
+                        failRun(runEndingBlock().value_or(""), generation, "returned ERROR");
+                        break;
+                    }
+                    idleIterations = result->performed_work > 0UZ ? 0UZ : idleIterations + 1UZ;
+                    applyIdleBackoff(idleIterations);
+                    if (idleIterations > kIdleSpinIterations) {
+                        msgToCount = 0UZ; // re-read lifecycle state every backoff period, bounding stop latency
                     }
                 }
             } else {                                    // PAUSED or any other non-RUNNING state
@@ -1822,6 +1856,24 @@ protected:
         });
     }
 
+    // adds a request for work quiescence and waits until no worker is inside work(). A request made from inside a work()
+    // call of this scheduler counts in _nInWorkRequests while it waits, and its wait ends once each call inside work()
+    // belongs to a counted request. seq_cst: these increments and the worker's _nWorkersInWork increment must not sink
+    // below the loads that follow them
+    void awaitWorkQuiescence(bool fromOwnWork) {
+        if (fromOwnWork) {
+            std::ignore = gr::atomic_ref(_nInWorkRequests).fetch_add_seq_cst(1UZ);
+        }
+        std::ignore              = gr::atomic_ref(_nWorkQuiescenceRequests).fetch_add_seq_cst(1UZ);
+        const auto nCallsAllowed = [this, fromOwnWork] { return fromOwnWork ? gr::atomic_ref(_nInWorkRequests).load_acquire() : 0UZ; };
+        while (gr::atomic_ref(_nWorkersInWork).load_acquire() > nCallsAllowed()) {
+            std::this_thread::yield();
+        }
+        if (fromOwnWork) {
+            gr::atomic_ref(_nInWorkRequests).fetch_sub(1UZ);
+        }
+    }
+
     // asks an active child to stop, then settles a child that reads REQUESTED_STOP. A non-blocking child moves to
     // STOPPED at once. A blocking child moves to STOPPED here only while no worker is inside poolWorker(). Otherwise its
     // own next work() call or the last worker to leave settles it. A child that never started, or that has stopped or
@@ -1851,7 +1903,18 @@ protected:
         advanceRunGeneration();
         wakeWorkers();
         {
-            std::lock_guard childLock(_childLifecycleMutex); // serialized against start()'s sweep
+            std::lock_guard childLock(_childLifecycleMutex); // serialized against start()'s sweep and a graph replacement
+            // a block that blocks in work() ends its wait in its stop() hook, and that hook runs first. The other blocks
+            // and the sub-schedulers stop once each other worker's work() call has returned or waits in a request it
+            // made. The stop() hook of a block that does not block runs during its own work() call only when that call
+            // made the stop.
+            graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) {
+                if (block->blockCategory() != ScheduledBlockGroup && block->isBlocking()) {
+                    stopChild(*block, "forEachBlock -> stop() -> LifecycleState");
+                }
+            });
+            requestQuiescenceOfOtherWork();
+            on_scope_exit releaseQuiescence = [this] { releaseWorkQuiescence(); };
             graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) {
                 if (block->blockCategory() == ScheduledBlockGroup) {
                     auto* schedulerModel = dynamic_cast<SchedulerModel*>(block.get());
@@ -1874,16 +1937,39 @@ protected:
         }
     }
 
+    // a block that blocks in work() ends its wait in its pause() hook, and that hook runs first. Such a block settles in
+    // PAUSED when a worker calls it before the resume or the stop. The other blocks pause while no other worker is inside
+    // work(). The pause() hook of a block that does not block runs during its own work() call only when that call made
+    // the pause. A stop or a resume can overtake the pause and move the blocks and the scheduler on first. pause() makes
+    // each move only while the scheduler still reads REQUESTED_PAUSE. A refused move is reported only when the
+    // scheduler reads REQUESTED_PAUSE after the refusal.
     void pause() {
         using enum lifecycle::State;
+        const auto moveWhilePausing = [this](auto& target, lifecycle::State next) {
+            if (this->state() != REQUESTED_PAUSE) {
+                return;
+            }
+            if (std::expected<void, Error> moved = target.changeStateTo(next); !moved.has_value() && this->state() == REQUESTED_PAUSE) {
+                this->emitErrorMessage("pause() -> LifecycleState", std::move(moved.error()));
+            }
+        };
         wakeWorkers();
-        graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) {
-            this->emitErrorMessageIfAny("pause() -> LifecycleState", block->changeStateTo(REQUESTED_PAUSE));
-            if (!block->isBlocking()) { // N.B. no other thread/constraint to consider before shutting down
-                this->emitErrorMessageIfAny("pause() -> LifecycleState", block->changeStateTo(PAUSED));
+        graph::forEachBlock<TransparentBlockGroup>(*_graph, [&moveWhilePausing](auto& block) {
+            if (block->isBlocking()) {
+                moveWhilePausing(*block, REQUESTED_PAUSE);
             }
         });
-        this->emitErrorMessageIfAny("pause() -> LifecycleState", this->changeStateTo(PAUSED));
+        {
+            requestQuiescenceOfOtherWork();
+            on_scope_exit releaseQuiescence = [this] { releaseWorkQuiescence(); };
+            graph::forEachBlock<TransparentBlockGroup>(*_graph, [&moveWhilePausing](auto& block) {
+                if (!block->isBlocking()) {
+                    moveWhilePausing(*block, REQUESTED_PAUSE);
+                    moveWhilePausing(*block, PAUSED);
+                }
+            });
+        }
+        moveWhilePausing(*this, PAUSED);
         if constexpr (requires(Derived& d) { d.customPause(); }) {
             static_cast<Derived*>(this)->customPause();
         }
@@ -1892,16 +1978,18 @@ protected:
     void resume() {
         using enum lifecycle::State;
         wakeWorkers();
-        std::vector<Edge> unconnected;
         {
-            WorkQuiescenceGuard quiescence(this);
-            unconnected = connectPendingEdges();
-        }
-        if (!unconnected.empty()) {
-            Error reason = unconnectedEdgesError(unconnected);
-            this->emitErrorMessage("resume()", reason);
-            failStart(std::move(reason));
-            return;
+            requestQuiescenceOfOtherWork();
+            const std::vector<std::shared_ptr<BlockModel>> subSchedulers = requestSubSchedulerWorkQuiescence(true);
+
+            on_scope_exit releaseQuiescence = [this, &subSchedulers] { releaseWorkQuiescenceAll(subSchedulers); };
+            // a resume that cannot connect an edge stops the blocks while no other worker is inside work()
+            if (const std::vector<Edge> unconnected = connectPendingEdges(); !unconnected.empty()) {
+                Error reason = unconnectedEdgesError(unconnected);
+                this->emitErrorMessage("resume()", reason);
+                failStart(std::move(reason));
+                return;
+            }
         }
         graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) { this->emitErrorMessageIfAny("resume() -> LifecycleState", block->changeStateTo(RUNNING)); });
         wakeWorkers(); // a worker that parked before the blocks reached RUNNING calls them now
@@ -2408,7 +2496,35 @@ protected:
 
     // Moves all blocks into the zombie list
     // Useful for bulk operations such as "set grc yaml" message
+    // the stop() hook of each block that blocks in work(), in this graph and in its transparent subgraphs, runs first
+    // and ends that block's wait. The sub-schedulers then stop while no worker of this scheduler is inside work(). The
+    // other blocks stop while no worker of this scheduler or of a sub-scheduler is inside work(). The replacement takes
+    // _childLifecycleMutex, the lock of the sweeps of start() and stop(), once no worker of this scheduler is inside
+    // work(), and holds it to its end. A stop made inside a work() call of this scheduler then never waits for the
+    // replacement's lock while the replacement waits for that call.
     void makeAllZombies() {
+        graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) {
+            if (block->blockCategory() != ScheduledBlockGroup && block->isBlocking()) {
+                stopChild(*block, "makeAllZombies");
+            }
+        });
+        requestWorkQuiescence();
+        std::vector<std::shared_ptr<BlockModel>> subSchedulers;
+        on_scope_exit                            releaseQuiescence = [this, &subSchedulers] { releaseWorkQuiescenceAll(subSchedulers); };
+        std::lock_guard                          childLock(_childLifecycleMutex);
+        graph::forEachBlock<TransparentBlockGroup>(*_graph, [](auto& block) {
+            if (block->blockCategory() == ScheduledBlockGroup && lifecycle::isActive(block->state())) {
+                if (auto* schedulerModel = dynamic_cast<SchedulerModel*>(block.get())) {
+                    schedulerModel->stop();
+                }
+            }
+        });
+        subSchedulers = requestSubSchedulerWorkQuiescence();
+        graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) {
+            if (block->blockCategory() != ScheduledBlockGroup) {
+                stopChild(*block, "makeAllZombies");
+            }
+        });
         std::lock_guard guard(_zombieBlocksMutex);
 
         for (auto& block : this->_graph->blocks()) {

@@ -40,6 +40,11 @@ std::size_t& activeWorkerGeneration() noexcept {
     return generation;
 }
 
+const void*& workingScheduler() noexcept {
+    thread_local const void* scheduler = nullptr;
+    return scheduler;
+}
+
 const void*& applyingScheduler() noexcept {
     thread_local const void* scheduler = nullptr;
     return scheduler;

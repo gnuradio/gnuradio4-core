@@ -44,6 +44,9 @@ GNURADIO_EXPORT const void*& activeSchedulerWorker() noexcept;
 // the run generation of the worker that activeSchedulerWorker() names
 GNURADIO_EXPORT std::size_t& activeWorkerGeneration() noexcept;
 
+// identifies the scheduler whose worker is inside a work() call on this thread
+GNURADIO_EXPORT const void*& workingScheduler() noexcept;
+
 // identifies the scheduler whose deferred swap or restart this thread applies after its worker has left. The thread
 // returns to its pool once the next run is dispatched.
 GNURADIO_EXPORT const void*& applyingScheduler() noexcept;
