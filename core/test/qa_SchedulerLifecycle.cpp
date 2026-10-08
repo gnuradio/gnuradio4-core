@@ -64,6 +64,17 @@ struct CountingSink : gr::Block<CountingSink> {
     void processOne(float) { _nReceived++; }
 };
 
+// takes int16 samples. An edge recorded by port names from a float output reaches this input and cannot connect.
+struct Int16Sink : gr::Block<Int16Sink> {
+    gr::PortIn<std::int16_t> in;
+
+    GR_MAKE_REFLECTABLE(Int16Sink, in);
+
+    std::size_t _nReceived = 0UZ;
+
+    void processOne(std::int16_t) { _nReceived++; }
+};
+
 constexpr std::size_t kSamplesBeforeTerminal = 32UZ;
 
 // returns DONE without an external stop request, so finaliseIO() must route the DONE path through REQUESTED_STOP
@@ -759,15 +770,19 @@ template<typename TPredicate>
 }
 
 // runAndWait() on its own thread with a deadline, so a stop that fails to take fails the assertion
-// instead of hanging ctest; `duringStartup` runs on the caller's thread the moment the runner exists
+// instead of hanging ctest; `duringStartup` runs on the caller's thread the moment the runner exists. A given
+// `result` receives what runAndWait() returned
 template<typename TScheduler, typename TDuringStartup>
-[[nodiscard]] bool runAndWaitWithin(TScheduler& scheduler, std::chrono::milliseconds bound, TDuringStartup duringStartup) {
+[[nodiscard]] bool runAndWaitWithin(TScheduler& scheduler, std::chrono::milliseconds bound, TDuringStartup duringStartup, std::expected<void, gr::Error>* result = nullptr) {
     std::mutex              mutex;
     std::condition_variable finished;
     bool                    returned = false;
 
-    std::thread runner([&scheduler, &mutex, &finished, &returned] {
-        std::ignore = scheduler.runAndWait();
+    std::thread runner([&scheduler, &mutex, &finished, &returned, result] {
+        std::expected<void, gr::Error> outcome = scheduler.runAndWait();
+        if (result != nullptr) {
+            *result = std::move(outcome);
+        }
         {
             std::lock_guard lock(mutex);
             returned = true;
@@ -1614,6 +1629,64 @@ const boost::ut::suite<"a start that cannot complete"> failedStartTests = [] {
 
         expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
         expect(qa_sched::awaitState(scheduler, STOPPED)) << "the second run did not stop";
+    };
+
+    "a graph whose edge cannot connect fails runAndWait with the edge's reason"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::EndingSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::Int16Sink>();
+        expect(flow.connect(source, gr::PortDefinition{"out"}, sink, gr::PortDefinition{"in"}).has_value()) << "an edge given by port names is recorded before its types are compared";
+
+        qa_sched::SerialScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        std::expected<void, gr::Error> result;
+        expect(qa_sched::runAndWaitWithin(scheduler, qa_sched::kEventBound, [] {}, &result)) << "a run whose edge did not connect never ended";
+        expect(!result.has_value()) << "a run whose edge did not connect must not report success";
+        expect(scheduler.state() == ERROR) << "a start whose edge did not connect must end the scheduler in ERROR";
+        if (!result.has_value()) {
+            const std::string& reason = result.error().message;
+            expect(reason.find(std::string(source.unique_name)) != std::string::npos) << "the error must name the edge's source: " << reason;
+            expect(reason.find(std::string(sink.unique_name)) != std::string::npos) << "the error must name the edge's destination: " << reason;
+            expect(reason.find("IncompatiblePorts") != std::string::npos) << "the error must say why the edge did not connect: " << reason;
+        }
+        expect(eq(sink._nReceived, 0UZ));
+    };
+
+    // the test records the edge while the run is paused. The resume tries to connect it.
+    "a resume whose new edge cannot connect ends the run in ERROR with the edge's reason"_test = [] {
+        qa_sched::gObservedSamples.store(0UZ, std::memory_order_relaxed);
+        gr::Graph flow;
+        auto&     source    = flow.emplaceBlock<qa_sched::EndlessSource>();
+        auto&     sink      = flow.emplaceBlock<qa_sched::ObservedSink>();
+        auto&     int16Sink = flow.emplaceBlock<qa_sched::Int16Sink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        qa_sched::TestScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        std::expected<void, gr::Error> result;
+        const bool                     ended = qa_sched::runAndWaitWithin(
+            scheduler, qa_sched::kEventBound,
+            [&] {
+                expect(qa_sched::awaitObservedSamplesAbove(0UZ)) << "the run moved no samples";
+                expect(scheduler.changeStateTo(REQUESTED_PAUSE).has_value());
+                expect(qa_sched::awaitState(scheduler, PAUSED)) << "the scheduler did not pause";
+                expect(scheduler.graph().connect(source, gr::PortDefinition{"out"}, int16Sink, gr::PortDefinition{"in"}).has_value()) << "an edge given by port names is recorded before its types are compared";
+                std::ignore = scheduler.changeStateTo(RUNNING);
+            },
+            &result);
+        expect(ended) << "a run whose new edge did not connect at the resume never ended";
+        expect(!result.has_value()) << "a run whose new edge did not connect must not report success";
+        expect(scheduler.state() == ERROR) << "a resume whose edge did not connect must end the scheduler in ERROR";
+        const std::optional<gr::Error> reason = scheduler.startError();
+        expect(reason.has_value()) << "startError() must keep why the resume failed";
+        if (reason.has_value()) {
+            expect(reason->message.find(std::string(source.unique_name)) != std::string::npos) << "the error must name the edge's source: " << reason->message;
+            expect(reason->message.find(std::string(int16Sink.unique_name)) != std::string::npos) << "the error must name the edge's destination: " << reason->message;
+            expect(reason->message.find("IncompatiblePorts") != std::string::npos) << "the error must say why the edge did not connect: " << reason->message;
+        }
+        expect(eq(int16Sink._nReceived, 0UZ));
     };
 };
 
