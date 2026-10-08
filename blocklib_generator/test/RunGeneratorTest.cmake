@@ -114,11 +114,21 @@ function(
   LEFT
   RIGHT
   WHAT)
-  execute_process(COMMAND ${CMAKE_COMMAND} -E compare_files "${LEFT}" "${RIGHT}" RESULT_VARIABLE _differs)
-  if(NOT
-     _differs
-     EQUAL
-     0)
+  # Compares content, not bytes: what these fixtures pin is the text a generator emits, not the
+  # line endings of the host that wrote it.
+  file(READ "${LEFT}" _left_text)
+  file(READ "${RIGHT}" _right_text)
+  string(
+    REPLACE "\r\n"
+            "\n"
+            _left_text
+            "${_left_text}")
+  string(
+    REPLACE "\r\n"
+            "\n"
+            _right_text
+            "${_right_text}")
+  if(NOT _left_text STREQUAL _right_text)
     message(FATAL_ERROR "${WHAT}: ${LEFT} and ${RIGHT} differ")
   endif()
 endfunction()
