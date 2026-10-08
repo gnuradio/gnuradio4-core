@@ -13,8 +13,9 @@
 // reads and writes the same values. A per-thread value has one copy per thread for the whole program.
 
 namespace gr {
+class ComputeRegistry;
 class Sequence;
-}
+} // namespace gr
 
 namespace gr::message {
 
@@ -49,6 +50,10 @@ GNURADIO_EXPORT std::size_t& handledMessageSpans() noexcept;
 // the work() calls on the calling thread to a block that drains an asynchronous input. Such a block ends after a bound
 // of calls in which nothing it waits on moved.
 GNURADIO_EXPORT std::size_t& drainingCalls() noexcept;
+
+// the registry that ComputeRegistry::instance() returns. A provider runs the code of the shared object that defines it,
+// and that object must stay mapped while the provider is registered.
+GNURADIO_EXPORT ComputeRegistry& computeRegistry();
 
 } // namespace gr::detail
 
