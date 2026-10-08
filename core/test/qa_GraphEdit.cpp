@@ -1689,7 +1689,7 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
                 expect(connectTyped()) << order << ": the typed edge was not accepted";
             }
 
-            gr::scheduler::Simple scheduler;
+            gr::scheduler::Simple<> scheduler;
             expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
 
             std::thread runner([&scheduler] { std::ignore = scheduler.runAndWait(); });

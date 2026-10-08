@@ -308,7 +308,7 @@ const boost::ut::suite<"settings concurrency"> settingsConcurrencyTests = [] {
     };
 
     "a float32 rate tag crosses a double-typed block and reaches a float sink"_test = [] {
-        gr::scheduler::Simple        scheduler;
+        gr::scheduler::Simple<>      scheduler;
         qa_settings::WideRateBlock*  wideBlock = nullptr;
         qa_settings::NarrowRateSink* sink      = nullptr;
         {
@@ -330,7 +330,7 @@ const boost::ut::suite<"settings concurrency"> settingsConcurrencyTests = [] {
     };
 
     "a default-tag value the graph cannot convert does not stop the graph"_test = [] {
-        gr::scheduler::Simple        scheduler;
+        gr::scheduler::Simple<>      scheduler;
         qa_settings::NarrowRateSink* sink = nullptr;
         {
             gr::Graph flow;
