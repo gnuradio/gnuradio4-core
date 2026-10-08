@@ -2286,11 +2286,13 @@ public:
         using enum gr::work::Status;
         using TOutputTypes = traits::block::stream_output_port_types<Derived>;
 
+        if (this->state() == lifecycle::State::REQUESTED_PAUSE) {
+            // fails only when another thread moves the block on first, to a stop, a resume or an error. The block then
+            // follows that state, and a stop settles below.
+            std::ignore = this->changeStateTo(lifecycle::State::PAUSED);
+        }
         if (this->state() == lifecycle::State::REQUESTED_STOP) {
             emitErrorMessageIfAny("workInternal(): REQUESTED_STOP -> STOPPED", this->changeStateTo(lifecycle::State::STOPPED));
-        }
-        if (this->state() == lifecycle::State::REQUESTED_PAUSE) {
-            emitErrorMessageIfAny("workInternal(): REQUESTED_PAUSE -> PAUSED", this->changeStateTo(lifecycle::State::PAUSED));
         }
         if constexpr (TOutputTypes::size.value > 0UZ) {
             if (disconnect_on_done && hasNoDownStreamConnectedChildren()) {
