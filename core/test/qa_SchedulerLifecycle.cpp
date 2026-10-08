@@ -596,8 +596,9 @@ struct ParentCountingSink : gr::Block<ParentCountingSink> {
 
 // adoptBlock is the scheduler's entry point for a block added to an already running graph. A message handler calls it
 // on a worker inside processScheduledMessages(), which also forwards the children's messages to msgOut. The test calls
-// it from its own thread. The wrapper holds the same flag as processScheduledMessages(). A report of adoptBlock() and
-// a worker's forwarding then never use msgOut's single writer at once
+// it from its own thread and reports a refused adoption on msgOut under "adoptBlock", as a reply carries it. The
+// wrapper holds the same flag as processScheduledMessages(). That report and a worker's forwarding then never use
+// msgOut's single writer at once
 struct AdoptingScheduler : TestScheduler {
     using TestScheduler::TestScheduler;
 
@@ -605,7 +606,9 @@ struct AdoptingScheduler : TestScheduler {
         while (std::atomic_flag_test_and_set_explicit(&this->_processingScheduledMessages, std::memory_order_acquire)) {
             std::this_thread::yield();
         }
-        TestScheduler::adoptBlock(newBlock);
+        if (auto adopted = TestScheduler::adoptBlock(newBlock); !adopted) {
+            this->emitErrorMessage("adoptBlock", adopted.error());
+        }
         std::atomic_flag_clear_explicit(&this->_processingScheduledMessages, std::memory_order_release);
     }
 
@@ -1083,7 +1086,10 @@ struct ParkingProbe : TScheduler {
     [[nodiscard]] std::size_t nRunningJobs() const { return this->_nRunningJobs->value(); }
 
     // adds a block to a job list of the running graph, as an EmplaceBlock message does once the block is emplaced
-    void adopt(const std::shared_ptr<gr::BlockModel>& block) { this->adoptBlock(block); }
+    void adopt(const std::shared_ptr<gr::BlockModel>& block) {
+        const auto adopted = this->adoptBlock(block);
+        boost::ut::expect(adopted.has_value() && adopted->has_value()) << std::format("'{}' joined no job list of the running graph", block->uniqueName());
+    }
 
     // true once every worker has taken the blocks queued for its job list
     [[nodiscard]] bool adoptionQueuesEmpty() {
