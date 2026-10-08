@@ -224,7 +224,7 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
         outOfLimits.insert(outOfLimits.end(), {"--set", "first.gain=2", "--show", "first"});
 
         const Result refusedByLimits = run(outOfLimits);
-        expect(refusedByLimits.output.contains("Failed to validate field 'gain' with value '2.000000'")) << refusedByLimits.output;
+        expect(refusedByLimits.output.contains("block 'first' refuses gain = 2: outside the limits [0, 1]")) << refusedByLimits.output;
         expect(!refusedByLimits.output.contains("first: gain = 2")) << "the block keeps a value inside its limits" << refusedByLimits.output;
 
         std::vector<std::string> refusedBySettingsChanged = startChainRun();

@@ -542,8 +542,15 @@ void CtxSettingsBase::init() {
 
     storeDefaults();
 
-    if (const property_map failed = set(_initBlockParameters); !failed.empty()) {
-        throw gr::exception(std::format("settings could not be applied: {}", failed));
+    // a refusal names the block by the name the constructor's map gives. The apply assigns that name later.
+    const auto             nameIt      = _initBlockParameters.find("name");
+    const std::string_view initialName = nameIt != _initBlockParameters.end() ? nameIt->second.value_or(std::string_view{}) : std::string_view{};
+    const property_map     notSet      = [this, initialName] {
+        std::lock_guard lg(_mutex);
+        return setImpl(_initBlockParameters, {}, initialName);
+    }();
+    if (!notSet.empty()) {
+        throw gr::exception(std::format("settings could not be applied: {}", notSet));
     }
 
     if (const auto failed = activateContext(); failed == std::nullopt) {
@@ -556,7 +563,7 @@ property_map CtxSettingsBase::set(const property_map& parameters, SettingsCtx ct
     return setImpl(parameters, ctx);
 }
 
-property_map CtxSettingsBase::setImpl(const property_map& parameters, SettingsCtx ctx) {
+property_map CtxSettingsBase::setImpl(const property_map& parameters, SettingsCtx ctx, std::string_view blockName) {
     const settings::BlockHooks& hooks = _descriptor->hooks;
 
     property_map ret;
@@ -569,10 +576,8 @@ property_map CtxSettingsBase::setImpl(const property_map& parameters, SettingsCt
 #endif
         // initialize with empty property_map when best match parameters not found
         property_map newParameters = getBestMatchStoredParameters(ctx).value_or(_defaultParameters);
-        if (!_autoUpdateParameters.contains(ctx)) {
-            _autoUpdateParameters[ctx] = getBestMatchAutoUpdateParameters(ctx).value_or(_descriptor->writableMembers);
-        }
-        auto& currentAutoUpdateParameters = _autoUpdateParameters[ctx];
+        // the context keeps its keys that follow tags until every value of the map is taken
+        std::set<std::string> currentAutoUpdateParameters = _autoUpdateParameters.contains(ctx) ? _autoUpdateParameters.at(ctx) : getBestMatchAutoUpdateParameters(ctx).value_or(_descriptor->writableMembers);
 
         for (const auto& [key, value] : parameters) {
             if (value.is_monostate()) {
@@ -584,6 +589,9 @@ property_map CtxSettingsBase::setImpl(const property_map& parameters, SettingsCt
                 if (auto error = it->second->setParameter(key, value, newParameters)) {
                     throw gr::exception(*error);
                 }
+                if (it->second->refuseByLimits != nullptr && it->second->refuseByLimits(key, value).has_value()) {
+                    throw gr::exception(describeRefusal(key, value, blockName));
+                }
                 // Remove from auto-update set if present
                 if (auto autoIt = currentAutoUpdateParameters.find(std::string(key)); autoIt != currentAutoUpdateParameters.end()) {
                     currentAutoUpdateParameters.erase(autoIt);
@@ -592,6 +600,7 @@ property_map CtxSettingsBase::setImpl(const property_map& parameters, SettingsCt
                 ret.insert_or_assign(key, value);
             }
         }
+        _autoUpdateParameters[ctx] = std::move(currentAutoUpdateParameters);
         addStoredParameters(newParameters, ctx);
         removeExpiredStoredParameters();
     }
@@ -834,6 +843,19 @@ void CtxSettingsBase::storeCurrentParameters(property_map& parameters) {
     for (const settings::MemberDescriptor* member : _descriptor->readableMembers) {
         member->readParameter(member->address(_block), member->name, parameters);
     }
+}
+
+std::string CtxSettingsBase::describeRefusal(std::string_view key, const pmt::Value& value, std::string_view blockName) const {
+    std::string reason = "the value does not convert to the setting's type";
+    if (const auto it = _descriptor->writableByName.find(key); it != _descriptor->writableByName.end() && it->second->refuseByLimits != nullptr) {
+        if (std::optional<std::string> limits = it->second->refuseByLimits(key, value)) {
+            reason = std::move(*limits);
+        }
+    }
+    if (blockName.empty() && _descriptor->hooks.blockName != nullptr) {
+        blockName = _descriptor->hooks.blockName(_block);
+    }
+    return std::format("block '{}' refuses {} = {}: {}", blockName, key, value, reason);
 }
 
 void CtxSettingsBase::loadParametersFromPropertyMap(const property_map& parameters, SettingsCtx ctx) {

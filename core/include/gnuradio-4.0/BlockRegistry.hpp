@@ -42,8 +42,9 @@
 #define GR_REGISTER_BLOCK(...) /* Marker macro for parse_registrations */
 
 // The version of the plugin interface, raised by every change to the layout of a type that crosses the plugin
-// boundary: `gr_plugin_base` itself, and the `BlockModel` and `SchedulerModel` interfaces whose objects a plugin or a
-// registry factory hands back. A plugin records the version it was compiled against. A registry entry records the
+// boundary: `gr_plugin_base` itself, the `BlockModel` and `SchedulerModel` interfaces whose objects a plugin or a
+// registry factory hands back, and a block's settings: the `SettingsBase` interface and the `settings::BlockDescriptor`
+// table behind it. A plugin records the version it was compiled against. A registry entry records the
 // version of the code that calls `insert()`, so a block entry added through `insertBlockFactory()` records the
 // version of core. A host loads only a plugin whose version equals its own. The host also reads the version of each
 // scheduler a shared object registers, and keeps a scheduler only at its own version. A virtual call through another
@@ -52,7 +53,7 @@
 // scheduler reads the `msgIn` and `msgOut` ports of a plugin's block through typed pointers, and the layout of a port
 // crosses the boundary too. `SchedulerModel::start()` returns the refusal of a start as a `std::expected`, and a host
 // reads it from a plugin's scheduler.
-#define GR_PLUGIN_CURRENT_ABI_VERSION 9
+#define GR_PLUGIN_CURRENT_ABI_VERSION 10
 
 namespace gr {
 

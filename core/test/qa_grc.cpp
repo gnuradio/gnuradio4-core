@@ -1210,4 +1210,35 @@ const boost::ut::suite<"GRC subgraph settings"> grcSubgraphSettingsTests = [] {
     };
 };
 
+/**
+ * A graph file fails to load when a block refuses a key it does not declare or a value outside a setting's limits.
+ */
+const boost::ut::suite<"GRC load refusals"> grcRefusalTests = [] {
+    using namespace boost::ut;
+    using namespace gr;
+    using namespace qa_grc;
+
+    auto reportOf = [](std::string_view yaml) {
+        try {
+            std::ignore = gr::loadGrc(gr::globalPluginLoader(), yaml);
+        } catch (const gr::exception& e) {
+            return e.message;
+        }
+        return std::string{};
+    };
+
+    "a file value outside a setting's limits fails the load naming the block, the key, the value and the limit"_test = [&reportOf] {
+        registerTestBlocks();
+        const std::string report = reportOf(R"yaml(blocks:
+  - id: qa::SumInputs
+    parameters:
+      name: sum
+      n_inputs: 9
+)yaml");
+        expect(report.contains("block 'sum'")) << report;
+        expect(report.contains("n_inputs = 9")) << report;
+        expect(report.contains("[1, 8]")) << report;
+    };
+};
+
 int main() { /* tests are run by the ut suite */ }

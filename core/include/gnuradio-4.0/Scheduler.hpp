@@ -2634,27 +2634,22 @@ protected:
             }
         }
 
-        // For the YAML path, settings from the serialised block definition are applied
-        // via loadParametersFromPropertyMap after emplacement
-        const bool   isYamlPath   = messageData.contains("yaml");
-        property_map yamlSettings = isYamlPath ? std::exchange(blockProperties, {}) : property_map{};
+        // the keys of a block from YAML are checked as the graph loader checks them. init() throws for a value set()
+        // refuses, before the block joins the graph
+        std::shared_ptr<BlockModel> checkedBlock;
+        if (messageData.contains("yaml")) {
+            checkedBlock = targetGraph->_pluginLoader->instantiate(blockType, blockProperties);
+            if (checkedBlock) {
+                const auto             nameIt    = blockProperties.find("name");
+                const std::string_view blockName = nameIt != blockProperties.end() ? nameIt->second.value_or(checkedBlock->name()) : checkedBlock->name();
+                gr::detail::checkDeclared(*checkedBlock, blockName, blockProperties);
+            }
+        }
 
         const std::shared_ptr<BlockModel>& newBlock = [&]() -> const std::shared_ptr<BlockModel>& {
             WorkQuiescenceGuard quiescence(this); // _blocks is traversed by every worker and by forEachBlock
-            return targetGraph->emplaceBlock(blockType, blockProperties);
+            return checkedBlock ? targetGraph->addBlock(std::move(checkedBlock)) : targetGraph->emplaceBlock(blockType, blockProperties);
         }();
-
-        if (isYamlPath && !yamlSettings.empty()) {
-            newBlock->settings().loadParametersFromPropertyMap(yamlSettings);
-            // loadParametersFromPropertyMap() only stores; without activating the context nothing is ever
-            // staged and the block keeps its constructor defaults (Graph_yaml_importer does this itself)
-            if (newBlock->settings().activateContext() == std::nullopt) {
-                this->emitErrorMessage("propertyCallbackEmplaceBlock", std::format("could not activate the loaded settings context of '{}'", newBlock->uniqueName()));
-            }
-            // and applying them is what makes the block report them: it is not connected or adopted yet, so
-            // this is the same point in its life at which Graph::addBlock() applies a constructor's settings
-            std::ignore = newBlock->settings().applyStagedParameters();
-        }
 
         auto adopted = adoptBlock(newBlock);
         if (!adopted) {

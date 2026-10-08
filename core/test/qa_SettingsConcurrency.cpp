@@ -258,7 +258,7 @@ const boost::ut::suite<"settings concurrency"> settingsConcurrencyTests = [] {
         qa_settings::ValidatingBlock block;
         block.init(std::make_shared<gr::Sequence>());
 
-        std::ignore                                  = block.settings().set({{"gain", 99.0f}, {"sample_rate", 48000.0f}});
+        std::ignore                                  = block.settings().setStaged({{"gain", 99.0f}, {"sample_rate", 48000.0f}});
         std::ignore                                  = block.settings().activateContext();
         const gr::ApplyStagedParametersResult result = block.settings().applyStagedParameters();
 
