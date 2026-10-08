@@ -64,7 +64,10 @@ public:
     [[nodiscard]] virtual std::optional<Error> startError() const = 0;
 
     virtual void requestWorkQuiescence() = 0;
-    virtual void releaseWorkQuiescence() = 0;
+    // requests work quiescence as requestWorkQuiescence() does, and does not wait for a work() call of this scheduler on
+    // the calling thread
+    virtual void requestQuiescenceOfOtherWork() = 0;
+    virtual void releaseWorkQuiescence()        = 0;
 };
 
 // A scheduler that holds a nested scheduler and exports its ports hands it the progress sequences of the graphs beyond
@@ -127,6 +130,7 @@ public:
     [[nodiscard]] std::optional<Error> startError() const override { return this->blockRef().startError(); }
 
     void requestWorkQuiescence() override { this->blockRef().requestWorkQuiescence(); }
+    void requestQuiescenceOfOtherWork() override { this->blockRef().requestQuiescenceOfOtherWork(); }
     void releaseWorkQuiescence() override { this->blockRef().releaseWorkQuiescence(); }
 
     void stop() override {

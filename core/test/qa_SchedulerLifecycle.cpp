@@ -606,8 +606,8 @@ struct OwnWorkerScheduler : gr::scheduler::SchedulerBase<OwnWorkerScheduler, gr:
         }
 
         while (gr::lifecycle::isActive(this->state()) && gr::atomic_ref(this->_run.generation).load_acquire() == generation) {
-            const gr::work::Result result = this->traverseBlockListOnce(localBlockList);
-            if (result.status == gr::work::Status::DONE || result.status == gr::work::Status::ERROR) {
+            const std::optional<gr::work::Result> result = this->traverseBlockListAsWork(localBlockList);
+            if (result.has_value() && (result->status == gr::work::Status::DONE || result->status == gr::work::Status::ERROR)) {
                 return;
             }
         }
@@ -876,6 +876,8 @@ struct ParkingProbe : TScheduler {
     using TScheduler::TScheduler;
 
     [[nodiscard]] const gr::Sequence* wakeSequence() const { return this->_wake.get(); }
+
+    [[nodiscard]] bool workQuiescenceRequested() { return gr::atomic_ref(this->_nWorkQuiescenceRequests).load_acquire() > 0UZ; }
 };
 
 using BlockingProbe = ParkingProbe<BlockingScheduler>;
@@ -896,8 +898,9 @@ void serveOnCallingThread(TProbe& scheduler, TSend send) {
 
 // a blocking source whose first work() call waits for a release. With `_releaseInPause` its pause() hook releases the
 // call and waits up to kSweepParkBound for a worker to park on `_progress`. The worker's passes after the release then
-// fall inside the pause's sweep, before the scheduler publishes PAUSED. Without it the test releases the call after
-// pause() returns, and the call spans the whole pause
+// fall inside the pause's sweep, before the scheduler publishes PAUSED. Without it the call returns once
+// `_pauseWaits()` holds, while pause() waits for the work() calls in progress. The call then spans the start of the
+// pause
 struct PauseProbeSource : gr::Block<PauseProbeSource> {
     gr::PortOut<float> out;
 
@@ -905,18 +908,19 @@ struct PauseProbeSource : gr::Block<PauseProbeSource> {
 
     static constexpr auto kSweepParkBound = std::chrono::milliseconds(100);
 
-    const gr::Sequence* _progress       = nullptr;
-    bool                _releaseInPause = true;
-    std::atomic<bool>   _inside{false};
-    std::atomic<bool>   _released{false};
-    std::atomic<bool>   _parkedInSweep{false};
+    const gr::Sequence*   _progress       = nullptr;
+    bool                  _releaseInPause = true;
+    std::function<bool()> _pauseWaits;
+    std::atomic<bool>     _inside{false};
+    std::atomic<bool>     _released{false};
+    std::atomic<bool>     _parkedInSweep{false};
 
     [[nodiscard]] constexpr bool isBlocking() const noexcept { return true; }
 
     gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
         if (!_released.load(std::memory_order_acquire)) {
             _inside.store(true, std::memory_order_release);
-            std::ignore = awaitCondition([this] { return _released.load(std::memory_order_acquire); });
+            std::ignore = awaitCondition([this] { return _released.load(std::memory_order_acquire) || (_pauseWaits && _pauseWaits()); });
         }
         outSpan.publish(0UZ);
         return gr::work::Status::OK;
@@ -1022,18 +1026,31 @@ constexpr std::string_view kFlushFailure = "the device could not flush its last 
 constexpr std::string_view kReadFailure  = "the device could not deliver its last sample";
 constexpr std::string_view kRunFailure   = "the device stopped delivering samples";
 
-// waits inside work() until the stop has moved the block to `stopState`, records that state, and then holds until the
-// test releases the failure. A stop that never arrives leaves the recorded state at IDLE and the case fails on it
-inline void awaitStopInsideWork(const auto& block, gr::lifecycle::State stopState) {
+// the run generation of the scheduler under test, which a stop advances before it reaches any block
+inline std::function<std::size_t()> gRunGeneration;
+
+template<typename TScheduler>
+struct GenerationProbe : TScheduler {
+    using TScheduler::TScheduler;
+
+    [[nodiscard]] std::size_t generation() { return gr::atomic_ref(this->_run.generation).load_acquire(); }
+};
+
+// waits inside work() until the stop reaches the block, records the block's state, and then holds until the test
+// releases the failure. A blocking block's stop() hook moves it to REQUESTED_STOP during the call. A block that does not
+// block sees the stop begin as a new run generation, and its stop() hook runs once the call has returned. A stop that
+// never arrives leaves the recorded state at IDLE and the case fails on it
+inline void awaitStopInsideWork(const auto& block, bool blocking) {
     gInsideWork.store(true, std::memory_order_release);
-    if (awaitCondition([&block, stopState] { return block.state() == stopState; })) {
-        gStateAtFailure.store(stopState, std::memory_order_release);
+    const std::size_t run = gRunGeneration();
+    if (awaitCondition([&block, blocking, run] { return blocking ? block.state() == gr::lifecycle::State::REQUESTED_STOP : gRunGeneration() != run; })) {
+        gStateAtFailure.store(block.state(), std::memory_order_release);
     }
     std::ignore = awaitCondition([] { return gFailureReleased.load(std::memory_order_acquire); });
 }
 
 // a device that cannot flush on its way down. The processBulk() call that the stop reaches reports the failure and
-// returns ERROR. A blocking source reads REQUESTED_STOP at that point, a non-blocking source STOPPED
+// returns ERROR. A blocking source reads REQUESTED_STOP at that point, a non-blocking source RUNNING
 template<bool kBlocking>
 struct FlushFailingSource : gr::Block<FlushFailingSource<kBlocking>> {
     gr::PortOut<float> out;
@@ -1044,7 +1061,7 @@ struct FlushFailingSource : gr::Block<FlushFailingSource<kBlocking>> {
 
     gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
         outSpan.publish(0UZ);
-        awaitStopInsideWork(*this, kBlocking ? gr::lifecycle::State::REQUESTED_STOP : gr::lifecycle::State::STOPPED);
+        awaitStopInsideWork(*this, kBlocking);
         this->emitErrorMessage("processBulk", kFlushFailure);
         return gr::work::Status::ERROR;
     }
@@ -1086,7 +1103,7 @@ struct ReadFailingSource : gr::Block<ReadFailingSource> {
     GR_MAKE_REFLECTABLE(ReadFailingSource, out);
 
     [[nodiscard]] float processOne() const {
-        awaitStopInsideWork(*this, gr::lifecycle::State::STOPPED);
+        awaitStopInsideWork(*this, false);
         throw gr::exception(kReadFailure);
     }
 };
@@ -1098,7 +1115,8 @@ struct StopInsideWorkResult {
 
 // runs the graph on its own thread and requests the stop once a block is inside its work() call
 template<typename TScheduler>
-[[nodiscard]] StopInsideWorkResult runAndStopInsideWork(TScheduler& scheduler) {
+[[nodiscard]] StopInsideWorkResult runAndStopInsideWork(GenerationProbe<TScheduler>& scheduler) {
+    gRunGeneration = [&scheduler] { return scheduler.generation(); };
     gInsideWork.store(false, std::memory_order_release);
     gStateAtFailure.store(gr::lifecycle::State::IDLE, std::memory_order_release);
     std::expected<void, gr::Error> outcome;
@@ -1139,12 +1157,12 @@ void expectErrorAfterStopFailsRun(gr::lifecycle::State expectedStateAtFailure, s
     auto&     sink   = flow.emplaceBlock<CountingSink>();
     expect(flow.connect<"out", "in">(source, sink).has_value());
 
-    TScheduler    scheduler;
-    gr::MsgPortIn fromScheduler;
+    GenerationProbe<TScheduler> scheduler;
+    gr::MsgPortIn               fromScheduler;
     expect(scheduler.msgOut.connect(fromScheduler).has_value());
     expect(scheduler.exchange(std::move(flow)).has_value());
 
-    const auto [entered, outcome] = runAndStopInsideWork(scheduler);
+    const auto [entered, outcome] = runAndStopInsideWork<TScheduler>(scheduler);
     expect(entered) << "the source never entered its work() call";
     expect(gStateAtFailure.load(std::memory_order_acquire) == expectedStateAtFailure) << "the stop had not reached the source when it failed";
     expect(!outcome.has_value()) << "a run whose block failed while stopping is reported as a clean stop";
@@ -1414,9 +1432,9 @@ const boost::ut::suite<"a block error while the scheduler stops"> errorWhileStop
     using namespace boost::ut;
     using enum gr::lifecycle::State;
 
-    "a processBulk() ERROR after the stop reached a non-blocking block fails the run"_test = [] {
-        qa_sched::expectErrorAfterStopFailsRun<qa_sched::SerialScheduler, qa_sched::FlushFailingSource<false>>(STOPPED, qa_sched::kFlushFailure);
-        qa_sched::expectErrorAfterStopFailsRun<qa_sched::BlockingScheduler, qa_sched::FlushFailingSource<false>>(STOPPED, qa_sched::kFlushFailure);
+    "a processBulk() ERROR of a non-blocking block in the call the stop waits for fails the run"_test = [] {
+        qa_sched::expectErrorAfterStopFailsRun<qa_sched::SerialScheduler, qa_sched::FlushFailingSource<false>>(RUNNING, qa_sched::kFlushFailure);
+        qa_sched::expectErrorAfterStopFailsRun<qa_sched::BlockingScheduler, qa_sched::FlushFailingSource<false>>(RUNNING, qa_sched::kFlushFailure);
     };
 
     "a processBulk() ERROR after the stop reached a blocking block fails the run"_test = [] {
@@ -1424,9 +1442,9 @@ const boost::ut::suite<"a block error while the scheduler stops"> errorWhileStop
         qa_sched::expectErrorAfterStopFailsRun<qa_sched::BlockingScheduler, qa_sched::FlushFailingSource<true>>(REQUESTED_STOP, qa_sched::kFlushFailure);
     };
 
-    "a processOne() that throws after the stop reached the block fails the run"_test = [] {
-        qa_sched::expectErrorAfterStopFailsRun<qa_sched::SerialScheduler, qa_sched::ReadFailingSource>(STOPPED, qa_sched::kReadFailure);
-        qa_sched::expectErrorAfterStopFailsRun<qa_sched::BlockingScheduler, qa_sched::ReadFailingSource>(STOPPED, qa_sched::kReadFailure);
+    "a processOne() that throws in the call the stop waits for fails the run"_test = [] {
+        qa_sched::expectErrorAfterStopFailsRun<qa_sched::SerialScheduler, qa_sched::ReadFailingSource>(RUNNING, qa_sched::kReadFailure);
+        qa_sched::expectErrorAfterStopFailsRun<qa_sched::BlockingScheduler, qa_sched::ReadFailingSource>(RUNNING, qa_sched::kReadFailure);
     };
 
     "a processBulk() ERROR before any stop ends the run in ERROR"_test = [] {
@@ -1439,32 +1457,32 @@ const boost::ut::suite<"a block error while the scheduler stops"> errorWhileStop
         qa_sched::expectErrorWhileRunningEndsRun<qa_sched::BlockingScheduler, qa_sched::SelfStoppingFailingSource>(REQUESTED_STOP);
     };
 
-    "a failing call that returns after the stop leaves the scheduler STOPPED and free to restart"_test = [] {
+    "a failing call that the stop waits for leaves the scheduler STOPPED and free to restart"_test = [] {
         gr::Graph flow;
         auto&     source = flow.emplaceBlock<qa_sched::FlushFailingSource<false>>();
         auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
         expect(flow.connect<"out", "in">(source, sink).has_value());
 
-        qa_sched::TestScheduler scheduler;
-        gr::MsgPortIn           fromScheduler;
+        qa_sched::GenerationProbe<qa_sched::TestScheduler> scheduler;
+        gr::MsgPortIn                                      fromScheduler;
         expect(scheduler.msgOut.connect(fromScheduler).has_value());
         expect(scheduler.exchange(std::move(flow)).has_value());
 
+        qa_sched::gRunGeneration = [&scheduler] { return scheduler.generation(); };
         qa_sched::gInsideWork.store(false, std::memory_order_release);
         qa_sched::gStateAtFailure.store(IDLE, std::memory_order_release);
-        qa_sched::gFailureReleased.store(false, std::memory_order_release);
+        qa_sched::gFailureReleased.store(true, std::memory_order_release);
         expect(scheduler.changeStateTo(INITIALISED).has_value());
         expect(scheduler.changeStateTo(RUNNING).has_value());
         expect(qa_sched::awaitCondition([] { return qa_sched::gInsideWork.load(std::memory_order_acquire); })) << "the source never entered its work() call";
 
         expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
-        expect(scheduler.state() == STOPPED) << "the stop returns with the scheduler STOPPED while the failing call still runs";
-        expect(qa_sched::awaitCondition([] { return qa_sched::gStateAtFailure.load(std::memory_order_acquire) == STOPPED; })) << "the stop did not reach the source";
+        expect(scheduler.state() == STOPPED) << "the stop returns with the scheduler STOPPED";
+        expect(qa_sched::gStateAtFailure.load(std::memory_order_acquire) == RUNNING) << "the stop returned before the failing call that began before it";
 
-        qa_sched::gFailureReleased.store(true, std::memory_order_release);
         qa_sched::ErrorReports reports;
         expect(qa_sched::awaitCondition([&] { return (reports.take(fromScheduler), reports.has(scheduler.unique_name, source.unique_name)); })) << "the scheduler did not report the block that failed after the stop";
-        expect(scheduler.state() == STOPPED) << "the failing call that returns after the stop must not move the scheduler out of STOPPED";
+        expect(scheduler.state() == STOPPED) << "the failing call that the stop waited for must not move the scheduler out of STOPPED";
 
         qa_sched::gInsideWork.store(false, std::memory_order_release);
         expect(scheduler.changeStateTo(INITIALISED).has_value()) << "the restart after the stop is refused";
@@ -1481,11 +1499,12 @@ const boost::ut::suite<"a block error while the scheduler stops"> errorWhileStop
         expect(flow.connect<"out", "in">(source, sink).has_value());
         const std::string failingName(source.unique_name);
 
-        qa_sched::TestScheduler scheduler;
-        gr::MsgPortIn           fromScheduler;
+        qa_sched::GenerationProbe<qa_sched::TestScheduler> scheduler;
+        gr::MsgPortIn                                      fromScheduler;
         expect(scheduler.msgOut.connect(fromScheduler).has_value());
         expect(scheduler.exchange(std::move(flow)).has_value());
 
+        qa_sched::gRunGeneration = [&scheduler] { return scheduler.generation(); };
         qa_sched::gInsideWork.store(false, std::memory_order_release);
         qa_sched::gStateAtFailure.store(IDLE, std::memory_order_release);
         qa_sched::gObservedSamples.store(0UZ, std::memory_order_relaxed);
@@ -1500,13 +1519,225 @@ const boost::ut::suite<"a block error while the scheduler stops"> errorWhileStop
 
         const auto swapped = scheduler.exchange(std::move(next));
         expect(swapped.has_value()) << "the swap is refused because a block of the old graph failed while stopping";
-        expect(qa_sched::gStateAtFailure.load(std::memory_order_acquire) == STOPPED) << "the swap's stop had not reached the source when it failed";
+        expect(qa_sched::gStateAtFailure.load(std::memory_order_acquire) == RUNNING) << "the swap's stop had not begun when the source failed";
         expect(qa_sched::awaitCondition([] { return qa_sched::gObservedSamples.load(std::memory_order_relaxed) > 0UZ; })) << "the swapped-in graph does not run";
 
         qa_sched::ErrorReports reports;
         expect(qa_sched::awaitCondition([&] { return (reports.take(fromScheduler), reports.has(scheduler.unique_name, failingName)); })) << "the scheduler did not report the block that failed while stopping";
         expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
         expect(qa_sched::awaitState(scheduler, STOPPED)) << "the swapped-in graph did not stop";
+    };
+};
+
+namespace qa_sched {
+
+constexpr auto             kStageWait         = std::chrono::milliseconds(2000);
+constexpr std::string_view kHookOrderPoolName = "qa_hook_order_cpu";
+
+// shared by the eight blocks of a chain whose fourth block blocks in work(). The blocking stage waits in processOne()
+// until its stop() or pause() hook runs, at most kStageWait. The source holds one work() call that it makes while the
+// stage waits, until the stage's hook has run. Each block that does not block counts the stop() and pause() hooks that
+// ran while it was inside processOne() or processBulk().
+struct HookOrderProbe {
+    std::mutex                         mutex;
+    std::condition_variable            changed;
+    bool                               stageWaits    = false;
+    bool                               stageHookRan  = false;
+    bool                               stageTimedOut = false; // the stage's wait ended at kStageWait
+    bool                               sourceHeld    = false;
+    std::array<std::atomic<bool>, 8UZ> inWork{};
+    std::atomic<std::size_t>           nHooksDuringWork{0UZ};
+
+    void hookRan(std::size_t index) {
+        if (inWork[index].load(std::memory_order_acquire)) {
+            nHooksDuringWork.fetch_add(1UZ, std::memory_order_relaxed);
+        }
+    }
+
+    void endStageWait() {
+        {
+            std::lock_guard lock(mutex);
+            stageHookRan = true;
+        }
+        changed.notify_all();
+    }
+
+    void stageWait() {
+        std::unique_lock lock(mutex);
+        if (stageHookRan || stageTimedOut) {
+            return;
+        }
+        stageWaits    = true;
+        stageTimedOut = !changed.wait_for(lock, kStageWait, [this] { return stageHookRan; });
+    }
+
+    void holdSourceWhileStageWaits() {
+        std::unique_lock lock(mutex);
+        if (!stageWaits || stageHookRan || sourceHeld) {
+            return;
+        }
+        sourceHeld  = true;
+        std::ignore = changed.wait_for(lock, kStageWait, [this] { return stageHookRan; });
+    }
+
+    [[nodiscard]] bool stageWaiting(bool withSourceHeld) {
+        std::lock_guard lock(mutex);
+        return stageWaits && !stageHookRan && (sourceHeld || !withSourceHeld);
+    }
+};
+
+// one sample per work() call
+struct HookOrderSource : gr::Block<HookOrderSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(HookOrderSource, out);
+
+    HookOrderProbe* _probe = nullptr;
+
+    void stop() { _probe->hookRan(0UZ); }
+    void pause() { _probe->hookRan(0UZ); }
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        if (outSpan.size() == 0UZ) {
+            outSpan.publish(0UZ);
+            return gr::work::Status::INSUFFICIENT_OUTPUT_ITEMS;
+        }
+        _probe->inWork[0UZ].store(true, std::memory_order_release);
+        _probe->holdSourceWhileStageWaits();
+        outSpan[0UZ] = 1.0f;
+        outSpan.publish(1UZ);
+        _probe->inWork[0UZ].store(false, std::memory_order_release);
+        return gr::work::Status::OK;
+    }
+};
+
+template<bool kBlocking>
+struct HookOrderStage : gr::Block<HookOrderStage<kBlocking>> {
+    gr::PortIn<float>  in;
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(HookOrderStage, in, out);
+
+    HookOrderProbe* _probe = nullptr;
+    std::size_t     _index = 0UZ;
+
+    [[nodiscard]] constexpr bool isBlocking() const noexcept { return kBlocking; }
+
+    void stop() { onHook(); }
+    void pause() { onHook(); }
+
+    [[nodiscard]] float processOne(float sample) const {
+        if constexpr (kBlocking) {
+            _probe->stageWait();
+        } else {
+            _probe->inWork[_index].store(true, std::memory_order_release);
+            _probe->inWork[_index].store(false, std::memory_order_release);
+        }
+        return sample;
+    }
+
+    void onHook() const {
+        if constexpr (kBlocking) {
+            _probe->endStageWait();
+        } else {
+            _probe->hookRan(_index);
+        }
+    }
+};
+
+struct HookOrderSink : gr::Block<HookOrderSink> {
+    gr::PortIn<float> in;
+
+    GR_MAKE_REFLECTABLE(HookOrderSink, in);
+
+    HookOrderProbe* _probe = nullptr;
+
+    void stop() { _probe->hookRan(7UZ); }
+    void pause() { _probe->hookRan(7UZ); }
+
+    void processOne(float) const {
+        _probe->inWork[7UZ].store(true, std::memory_order_release);
+        _probe->inWork[7UZ].store(false, std::memory_order_release);
+    }
+};
+
+// runs the chain source, two stages, the blocking stage, three stages and the sink under TScheduler, and sends
+// `request` while the blocking stage waits. Under multiThreaded every block has a worker of its own, and the source is
+// inside a held work() call when the request arrives. A pause is followed by a stop that ends the run.
+template<typename TScheduler>
+void expectBlockingHooksFirst(gr::lifecycle::State request) {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+    constexpr bool kWorkerPerBlock = TScheduler::executionPolicy() == gr::scheduler::ExecutionPolicy::multiThreaded;
+
+    auto           pool = fixedPool(kHookOrderPoolName, 8U);
+    HookOrderProbe probe;
+    gr::Graph      flow;
+    auto&          source   = flow.emplaceBlock<HookOrderSource>();
+    auto&          first    = flow.emplaceBlock<HookOrderStage<false>>();
+    auto&          second   = flow.emplaceBlock<HookOrderStage<false>>();
+    auto&          blocking = flow.emplaceBlock<HookOrderStage<true>>();
+    auto&          fourth   = flow.emplaceBlock<HookOrderStage<false>>();
+    auto&          fifth    = flow.emplaceBlock<HookOrderStage<false>>();
+    auto&          sixth    = flow.emplaceBlock<HookOrderStage<false>>();
+    auto&          sink     = flow.emplaceBlock<HookOrderSink>();
+    source._probe           = &probe;
+    sink._probe             = &probe;
+    blocking._probe         = &probe;
+    blocking._index         = 3UZ;
+    for (auto [stage, index] : {std::pair{&first, 1UZ}, std::pair{&second, 2UZ}, std::pair{&fourth, 4UZ}, std::pair{&fifth, 5UZ}, std::pair{&sixth, 6UZ}}) {
+        stage->_probe = &probe;
+        stage->_index = index;
+    }
+    expect(flow.connect<"out", "in">(source, first).has_value());
+    expect(flow.connect<"out", "in">(first, second).has_value());
+    expect(flow.connect<"out", "in">(second, blocking).has_value());
+    expect(flow.connect<"out", "in">(blocking, fourth).has_value());
+    expect(flow.connect<"out", "in">(fourth, fifth).has_value());
+    expect(flow.connect<"out", "in">(fifth, sixth).has_value());
+    expect(flow.connect<"out", "in">(sixth, sink).has_value());
+
+    TScheduler scheduler({{"poolName", std::string(kHookOrderPoolName)}});
+    expect(scheduler.exchange(std::move(flow)).has_value());
+
+    std::chrono::microseconds      requestTime{0};
+    std::expected<void, gr::Error> result;
+    const bool                     ended = runAndWaitWithin(
+        scheduler, kEventBound,
+        [&] {
+            expect(awaitCondition([&probe] { return probe.stageWaiting(kWorkerPerBlock); })) << "the blocking stage did not wait, or the source made no work() call during the wait";
+            const auto requested = std::chrono::steady_clock::now();
+            expect(scheduler.changeStateTo(request).has_value());
+            requestTime = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - requested);
+            if (request == REQUESTED_PAUSE) {
+                expect(awaitCondition([&scheduler] { return scheduler.state() == PAUSED; })) << "the scheduler did not pause";
+                expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+            }
+        },
+        &result);
+    expect(ended) << "the run did not end on the stop";
+    expect(result.has_value()) << std::format("a stopped run must succeed, and the run under {} failed: {}", gr::meta::enumName(TScheduler::executionPolicy()).value_or(""), result.has_value() ? std::string() : result.error().message);
+    expect(lt(requestTime.count(), std::chrono::microseconds(kStageWait).count() / 10)) << "the request must not wait out the blocking stage's wait";
+    expect(!probe.stageTimedOut) << "the blocking stage's hook must end its wait";
+    expect(eq(probe.nHooksDuringWork.load(), 0UZ)) << "a hook of a block that does not block ran during its own work() call";
+}
+
+} // namespace qa_sched
+
+const boost::ut::suite<"the order of a stop or a pause"> hookOrderTests = [] {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    "a stop ends a blocking block's wait first and stops the other blocks between their work() calls"_test = [] {
+        qa_sched::expectBlockingHooksFirst<qa_sched::TestScheduler>(REQUESTED_STOP);
+        qa_sched::expectBlockingHooksFirst<qa_sched::SerialScheduler>(REQUESTED_STOP);
+        qa_sched::expectBlockingHooksFirst<qa_sched::BlockingScheduler>(REQUESTED_STOP);
+    };
+
+    "a pause ends a blocking block's wait first and pauses the other blocks between their work() calls"_test = [] {
+        qa_sched::expectBlockingHooksFirst<qa_sched::TestScheduler>(REQUESTED_PAUSE);
+        qa_sched::expectBlockingHooksFirst<qa_sched::SerialScheduler>(REQUESTED_PAUSE);
+        qa_sched::expectBlockingHooksFirst<qa_sched::BlockingScheduler>(REQUESTED_PAUSE);
     };
 };
 
@@ -3852,11 +4083,11 @@ const boost::ut::suite<"workers that park"> parkingWorkerTests = [] {
     "a block that a message served on another thread removes from a parked singleThreadedBlocking run stops within a tenth of the park"_test = [&] { removedBlockStops.operator()<qa_sched::BlockingProbe>("removed block, singleThreadedBlocking", parkingSettings, 1UZ); };
 
     // The source's first work() call holds the run's one worker until the pause reaches the source's pause() hook, or,
-    // with `spansPause`, until pause() has returned. The scheduler reads REQUESTED_PAUSE before pause() runs. A
-    // single-threaded worker reads the state in a message pass once per process_stream_to_message_ratio passes. Its
-    // park falls due a few passes after the release, before its next message pass. The state read at the park keeps it
-    // from parking on the RUNNING it read before the pause: in the sweep, where the hook would see the park, and after
-    // PAUSED, where no wake follows.
+    // with `spansPause`, until pause() waits for the work() calls in progress. The scheduler reads REQUESTED_PAUSE before
+    // pause() runs. A single-threaded worker reads the state in a message pass once per process_stream_to_message_ratio
+    // passes. Its park falls due a few passes after the release, before its next message pass. The state read at the
+    // park keeps it from parking on the RUNNING it read before the pause: in the sweep, where the hook would see the
+    // park, and after PAUSED, where no wake follows.
     auto pauseParksNoWorker = [&]<typename TScheduler>(std::string_view caseName, bool spansPause, const gr::property_map& settings) {
         gr::Graph flow;
         auto&     source = flow.emplaceBlock<qa_sched::PauseProbeSource>();
@@ -3867,6 +4098,9 @@ const boost::ut::suite<"workers that park"> parkingWorkerTests = [] {
         TScheduler scheduler(settings);
         expect(scheduler.exchange(std::move(flow)).has_value());
         source._progress = std::addressof(scheduler.graph().progress());
+        if (spansPause) {
+            source._pauseWaits = [&scheduler] { return scheduler.state() == REQUESTED_PAUSE && scheduler.workQuiescenceRequested(); };
+        }
 
         bool       paused           = false;
         bool       parkedAfterPause = false;
@@ -3886,8 +4120,8 @@ const boost::ut::suite<"workers that park"> parkingWorkerTests = [] {
         expect(!parkedAfterPause) << caseName << "a worker parked after the scheduler read PAUSED";
     };
 
-    "a singleThreadedBlocking worker does not park while a pause sweeps the blocks"_test                 = [&] { pauseParksNoWorker.operator()<qa_sched::BlockingScheduler>("singleThreadedBlocking, released in the sweep", false, parkingSettings); };
-    "a singleThreadedBlocking worker whose work() call spans a pause does not park after the pause"_test = [&] { pauseParksNoWorker.operator()<qa_sched::BlockingScheduler>("singleThreadedBlocking, work() spanning the pause", true, parkingSettings); };
+    "a singleThreadedBlocking worker does not park while a pause sweeps the blocks"_test                              = [&] { pauseParksNoWorker.operator()<qa_sched::BlockingProbe>("singleThreadedBlocking, released in the sweep", false, parkingSettings); };
+    "a singleThreadedBlocking worker whose work() call spans the start of a pause does not park after the pause"_test = [&] { pauseParksNoWorker.operator()<qa_sched::BlockingProbe>("singleThreadedBlocking, work() spanning the start of the pause", true, parkingSettings); };
 
     // The source ends its stream behind items that the relay never takes. The relay then drains, and it ends after a
     // bound of calls in which nothing it waits on moved. Nothing else moves. A worker parked between those calls would
@@ -5048,6 +5282,894 @@ const boost::ut::suite<"a message output that nothing drains"> undrainedOutputTe
         expect(eq(gr::message::droppedMessageCount().load() - nBefore, nDropped)) << "the program did not count the drops of the shared object's sink";
     };
 #endif
+};
+
+namespace qa_sched {
+
+constexpr std::string_view kOwnRequestPoolName = "qa_own_request_cpu";
+
+template<typename TScheduler>
+struct WorkQuiescenceProbe : TScheduler {
+    using TScheduler::TScheduler;
+
+    [[nodiscard]] std::size_t nWorkQuiescenceRequests() { return gr::atomic_ref(this->_nWorkQuiescenceRequests).load_acquire(); }
+
+    [[nodiscard]] bool workQuiescenceRequested() { return nWorkQuiescenceRequests() > 0UZ; }
+
+    // a request for work quiescence is in force while a counted work() call is open
+    [[nodiscard]] bool requestWaitsForWork() { return workQuiescenceRequested() && gr::atomic_ref(this->_nWorkersInWork).load_acquire() > 0UZ; }
+};
+
+// shared by a source, a stage and a sink. The stage sends a request to its own scheduler from inside its first
+// processOne() call. With holdSource, the source first enters a work() call that it holds until the scheduler requests
+// work quiescence, at most kStageWait. The source and the sink count the stop() and pause() hooks that ran while they
+// were inside processOne() or processBulk().
+struct OwnRequestProbe {
+    std::function<bool()>              request;
+    std::function<bool()>              workQuiescenceRequested;
+    bool                               holdSource = false;
+    std::atomic<bool>                  stageWaits{false};
+    std::atomic<bool>                  sourceHeld{false};
+    std::atomic<bool>                  requestAccepted{false};
+    std::atomic<bool>                  requestReturned{false};
+    std::array<std::atomic<bool>, 3UZ> inWork{};
+    std::atomic<std::size_t>           nHooksDuringWork{0UZ};
+
+    void hookRan(std::size_t index) {
+        if (inWork[index].load(std::memory_order_acquire)) {
+            nHooksDuringWork.fetch_add(1UZ, std::memory_order_relaxed);
+        }
+    }
+};
+
+// one sample per work() call
+struct OwnRequestSource : gr::Block<OwnRequestSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(OwnRequestSource, out);
+
+    OwnRequestProbe* _probe = nullptr;
+
+    void stop() { _probe->hookRan(0UZ); }
+    void pause() { _probe->hookRan(0UZ); }
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        if (outSpan.size() == 0UZ) {
+            outSpan.publish(0UZ);
+            return gr::work::Status::INSUFFICIENT_OUTPUT_ITEMS;
+        }
+        _probe->inWork[0UZ].store(true, std::memory_order_release);
+        if (_probe->holdSource && _probe->stageWaits.load(std::memory_order_acquire) && !_probe->sourceHeld.exchange(true, std::memory_order_acq_rel)) {
+            std::ignore = awaitCondition(_probe->workQuiescenceRequested, kStageWait);
+        }
+        outSpan[0UZ] = 1.0f;
+        outSpan.publish(1UZ);
+        _probe->inWork[0UZ].store(false, std::memory_order_release);
+        return gr::work::Status::OK;
+    }
+};
+
+struct OwnRequestStage : gr::Block<OwnRequestStage> {
+    gr::PortIn<float>  in;
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(OwnRequestStage, in, out);
+
+    OwnRequestProbe* _probe = nullptr;
+
+    [[nodiscard]] float processOne(float sample) {
+        if (!_probe->stageWaits.exchange(true, std::memory_order_acq_rel)) {
+            if (_probe->holdSource) {
+                std::ignore = awaitCondition([this] { return _probe->sourceHeld.load(std::memory_order_acquire); }, kStageWait);
+            }
+            _probe->requestAccepted.store(_probe->request(), std::memory_order_release);
+            _probe->requestReturned.store(true, std::memory_order_release);
+        }
+        return sample;
+    }
+};
+
+struct OwnRequestSink : gr::Block<OwnRequestSink> {
+    gr::PortIn<float> in;
+
+    GR_MAKE_REFLECTABLE(OwnRequestSink, in);
+
+    OwnRequestProbe* _probe = nullptr;
+
+    void stop() { _probe->hookRan(2UZ); }
+    void pause() { _probe->hookRan(2UZ); }
+
+    void processOne(float) const {
+        _probe->inWork[2UZ].store(true, std::memory_order_release);
+        _probe->inWork[2UZ].store(false, std::memory_order_release);
+    }
+};
+
+// runs source, stage and sink under TScheduler, and the stage sends `request` to the scheduler from inside its own
+// processOne() call. Under multiThreaded the source holds a work() call of its own worker when the request arrives. A
+// pause is followed by a stop from the test's thread. A scheduler whose request or run does not return is leaked with
+// its probe. The case then fails instead of hanging.
+template<typename TScheduler>
+void expectRequestFromOwnWorkReturns(gr::lifecycle::State request) {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+    constexpr bool kWorkerPerBlock = TScheduler::executionPolicy() == gr::scheduler::ExecutionPolicy::multiThreaded;
+
+    auto pool         = fixedPool(kOwnRequestPoolName, 4U);
+    auto probe        = std::make_unique<OwnRequestProbe>();
+    probe->holdSource = kWorkerPerBlock;
+    gr::Graph flow;
+    auto&     source = flow.emplaceBlock<OwnRequestSource>();
+    auto&     stage  = flow.emplaceBlock<OwnRequestStage>();
+    auto&     sink   = flow.emplaceBlock<OwnRequestSink>();
+    source._probe    = probe.get();
+    stage._probe     = probe.get();
+    sink._probe      = probe.get();
+    expect(flow.connect<"out", "in">(source, stage).has_value());
+    expect(flow.connect<"out", "in">(stage, sink).has_value());
+
+    auto scheduler = std::make_unique<WorkQuiescenceProbe<TScheduler>>(gr::property_map{{"poolName", std::string(kOwnRequestPoolName)}});
+    expect(scheduler->exchange(std::move(flow)).has_value());
+    WorkQuiescenceProbe<TScheduler>* raw = scheduler.get();
+    probe->request                       = [raw, request] { return raw->changeStateTo(request).has_value(); };
+    probe->workQuiescenceRequested       = [raw] { return raw->workQuiescenceRequested(); };
+
+    auto        runnerDone = std::make_shared<std::atomic<bool>>(false);
+    auto        result     = std::make_shared<std::expected<void, gr::Error>>();
+    std::thread runner([raw, runnerDone, result] {
+        *result = raw->runAndWait();
+        runnerDone->store(true, std::memory_order_release);
+    });
+
+    const bool returned = awaitCondition([&probe] { return probe->requestReturned.load(std::memory_order_acquire); });
+    expect(returned) << "the request made inside a work() call waited for that call";
+    if (returned && request == REQUESTED_PAUSE) {
+        expect(raw->state() == PAUSED) << "the scheduler did not pause";
+        expect(raw->changeStateTo(REQUESTED_STOP).has_value());
+    }
+    const bool ended = returned && awaitCondition([&runnerDone] { return runnerDone->load(std::memory_order_acquire); });
+    expect(ended) << "the run did not end";
+    if (!ended) {
+        runner.detach();
+        std::ignore = scheduler.release();
+        std::ignore = probe.release();
+        return;
+    }
+    runner.join();
+    expect(probe->requestAccepted.load(std::memory_order_acquire)) << "the scheduler refused the request";
+    expect(result->has_value()) << "a stopped run must succeed";
+    expect(raw->state() == STOPPED) << "the run must end STOPPED";
+    expect(probe->sourceHeld.load(std::memory_order_acquire) == kWorkerPerBlock) << "the source made no work() call while the stage waited";
+    expect(eq(probe->nHooksDuringWork.load(), 0UZ)) << "a hook of another block ran during its own work() call";
+}
+
+constexpr std::string_view kRequestPairPoolName = "qa_request_pair_cpu";
+
+// shared by two sources on workers of their own. Each source makes its request to the scheduler from inside its first
+// work() call. The second source enters that call and waits there until the scheduler reads secondAwaits. The first
+// source makes its request once the second is inside its call. A source without a request returns from the call.
+struct RequestPairProbe {
+    std::array<std::function<bool()>, 2UZ> request;
+    std::function<gr::lifecycle::State()>  schedulerState;
+    gr::lifecycle::State                   secondAwaits = gr::lifecycle::State::REQUESTED_PAUSE;
+    std::array<std::atomic<bool>, 2UZ>     inWork{};
+    std::array<std::atomic<bool>, 2UZ>     requestAccepted{};
+    std::array<std::atomic<bool>, 2UZ>     requestReturned{};
+};
+
+struct PairRequestSource : gr::Block<PairRequestSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(PairRequestSource, out);
+
+    RequestPairProbe* _probe     = nullptr;
+    std::size_t       _slot      = 0UZ;
+    bool              _requested = false;
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        if (outSpan.size() == 0UZ) {
+            outSpan.publish(0UZ);
+            return gr::work::Status::INSUFFICIENT_OUTPUT_ITEMS;
+        }
+        if (!_requested && _probe->request[_slot]) {
+            _requested = true;
+            _probe->inWork[_slot].store(true, std::memory_order_release);
+            const bool mayRequest = _slot == 0UZ ? awaitCondition([this] { return _probe->inWork[1UZ].load(std::memory_order_acquire); }) //
+                                                 : awaitCondition([this] { return _probe->schedulerState() == _probe->secondAwaits; });
+            if (mayRequest) {
+                _probe->requestAccepted[_slot].store(_probe->request[_slot](), std::memory_order_release);
+            }
+            _probe->requestReturned[_slot].store(true, std::memory_order_release);
+        }
+        outSpan[0UZ] = 1.0f;
+        outSpan.publish(1UZ);
+        return gr::work::Status::OK;
+    }
+};
+
+// runs two PairRequestSources, each feeding a CountingSink, under multiThreaded with a pool thread for each block. The
+// first request comes from the first source's work() call, or with firstFromTestThread from a thread of the test once
+// the second source is inside its call. The test's thread stops a run that the requests left active. A scheduler or a
+// thread whose request or run does not return is leaked with the probe. The case then fails instead of hanging. A
+// pause that a stop or a resume overtakes reports no error, and after a resume the scheduler and every block read
+// RUNNING.
+void expectRequestPairReturns(gr::lifecycle::State firstRequest, gr::lifecycle::State secondRequest, bool firstFromTestThread) {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    auto      pool  = fixedPool(kRequestPairPoolName, 4U);
+    auto      probe = std::make_unique<RequestPairProbe>();
+    gr::Graph flow;
+    for (std::size_t slot : {0UZ, 1UZ}) {
+        auto& source  = flow.emplaceBlock<PairRequestSource>();
+        auto& sink    = flow.emplaceBlock<CountingSink>();
+        source._probe = probe.get();
+        source._slot  = slot;
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+    }
+
+    auto scheduler     = std::make_unique<TestScheduler>(gr::property_map{{"poolName", std::string(kRequestPairPoolName)}});
+    auto fromScheduler = std::make_unique<gr::MsgPortIn>();
+    expect(scheduler->msgOut.connect(*fromScheduler).has_value());
+    expect(scheduler->exchange(std::move(flow)).has_value());
+    TestScheduler* raw    = scheduler.get();
+    probe->schedulerState = [raw] { return raw->state(); };
+    probe->request[1UZ]   = [raw, secondRequest] { return raw->changeStateTo(secondRequest).has_value(); };
+    if (!firstFromTestThread) {
+        probe->request[0UZ] = [raw, firstRequest] { return raw->changeStateTo(firstRequest).has_value(); };
+    }
+
+    auto        runnerDone = std::make_shared<std::atomic<bool>>(false);
+    auto        result     = std::make_shared<std::expected<void, gr::Error>>();
+    std::thread runner([raw, runnerDone, result] {
+        *result = raw->runAndWait();
+        runnerDone->store(true, std::memory_order_release);
+    });
+    std::thread requester;
+    if (firstFromTestThread) {
+        RequestPairProbe* rawProbe = probe.get();
+        requester                  = std::thread([raw, rawProbe, firstRequest] {
+            if (awaitCondition([rawProbe] { return rawProbe->inWork[1UZ].load(std::memory_order_acquire); })) {
+                rawProbe->requestAccepted[0UZ].store(raw->changeStateTo(firstRequest).has_value(), std::memory_order_release);
+            }
+            rawProbe->requestReturned[0UZ].store(true, std::memory_order_release);
+        });
+    }
+
+    const bool returned = awaitCondition([&probe] { return probe->requestReturned[0UZ].load(std::memory_order_acquire) && probe->requestReturned[1UZ].load(std::memory_order_acquire); });
+    expect(returned) << "a request made while the other waited did not return";
+    if (returned && secondRequest == RUNNING) {
+        expect(raw->state() == RUNNING) << "the resume must leave the scheduler RUNNING";
+        expect(std::ranges::all_of(raw->blocks(), [](const auto& block) { return block->state() == RUNNING; })) << "the resume must leave every block RUNNING";
+    }
+    if (returned && !gr::lifecycle::isShuttingDown(raw->state())) {
+        expect(raw->changeStateTo(REQUESTED_STOP).has_value());
+    }
+    const bool ended = returned && awaitCondition([&runnerDone] { return runnerDone->load(std::memory_order_acquire); });
+    expect(ended) << "the run did not end";
+    if (!ended) {
+        runner.detach();
+        if (requester.joinable()) {
+            requester.detach();
+        }
+        std::ignore = scheduler.release();
+        std::ignore = fromScheduler.release();
+        std::ignore = probe.release();
+        return;
+    }
+    runner.join();
+    if (requester.joinable()) {
+        requester.join();
+    }
+    expect(probe->requestAccepted[0UZ].load(std::memory_order_acquire)) << "the scheduler refused the first request";
+    expect(probe->requestAccepted[1UZ].load(std::memory_order_acquire)) << "the scheduler refused the second request";
+    expect(result->has_value()) << "a stopped run must succeed";
+    expect(raw->state() == STOPPED) << "the run must end STOPPED";
+    ErrorReports reports;
+    reports.take(*fromScheduler);
+    expect(reports.errors.empty()) << std::format("the pause that the {} overtook reported its refused moves as errors", gr::meta::enumName(secondRequest).value_or(""));
+}
+
+constexpr std::string_view kHeldWorkPoolName = "qa_held_work_cpu";
+
+// shared by a HeldWorkGate and the HeldWorkSource that feeds it. The source holds one work() call while mayHold()
+// allows it, until endHold() reads true or the source's stop() hook runs, at most kStageWait. The gate comes first in the graph, and a sweep reaches it before the source. The gate's first stop() hook waits until the
+// source holds its call or the scheduler requests work quiescence, at most kStageWait. A sweep that does not wait for
+// the held call then runs the source's stop() hook during that call.
+struct HeldWorkProbe {
+    std::function<bool()>    workQuiescenceRequested;
+    std::function<bool()>    endHold;
+    std::function<bool()>    mayHold;
+    std::atomic<bool>        held{false};
+    std::atomic<bool>        inWork{false};
+    std::atomic<bool>        gateWaited{false};
+    std::atomic<std::size_t> nGateSamples{0UZ};
+    std::atomic<std::size_t> nSourceHooks{0UZ};
+    std::atomic<std::size_t> nHooksDuringWork{0UZ};
+};
+
+// one sample per work() call
+struct HeldWorkSource : gr::Block<HeldWorkSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(HeldWorkSource, out);
+
+    HeldWorkProbe* _probe = nullptr;
+
+    void stop() {
+        if (_probe->inWork.load(std::memory_order_acquire)) {
+            _probe->nHooksDuringWork.fetch_add(1UZ, std::memory_order_relaxed);
+        }
+        _probe->nSourceHooks.fetch_add(1UZ, std::memory_order_release);
+    }
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        if (outSpan.size() == 0UZ) {
+            outSpan.publish(0UZ);
+            return gr::work::Status::INSUFFICIENT_OUTPUT_ITEMS;
+        }
+        if (_probe->mayHold() && !_probe->held.exchange(true, std::memory_order_acq_rel)) {
+            _probe->inWork.store(true, std::memory_order_release);
+            std::ignore = awaitCondition([this] { return _probe->endHold() || _probe->nSourceHooks.load(std::memory_order_acquire) > 0UZ; }, kStageWait);
+            _probe->inWork.store(false, std::memory_order_release);
+        }
+        outSpan[0UZ] = 1.0f;
+        outSpan.publish(1UZ);
+        return gr::work::Status::OK;
+    }
+};
+
+struct HeldWorkGate : gr::Block<HeldWorkGate> {
+    gr::PortIn<float> in;
+
+    GR_MAKE_REFLECTABLE(HeldWorkGate, in);
+
+    HeldWorkProbe* _probe = nullptr;
+
+    void stop() {
+        if (!_probe->gateWaited.exchange(true, std::memory_order_acq_rel)) {
+            std::ignore = awaitCondition([this] { return _probe->inWork.load(std::memory_order_acquire) || _probe->workQuiescenceRequested(); }, kStageWait);
+        }
+    }
+
+    void processOne(float) { _probe->nGateSamples.fetch_add(1UZ, std::memory_order_relaxed); }
+};
+
+// the sweep that stops the HeldWorkSource
+enum class HeldWorkSweep {
+    graphReplacement, // a graph replacement by message retires the running graph
+    failedResume,     // a resume finds an edge that cannot connect and fails
+    stop,             // a stop from the test's thread
+};
+
+// runs a HeldWorkGate, the HeldWorkSource that feeds it and an Int16Sink under TScheduler, and runs `sweep` while the
+// source can hold a work() call. A failed resume follows a pause, during which the test records an edge from the
+// source to the Int16Sink by port names. The source then holds only a call made during the resume. A scheduler whose
+// run does not end is leaked with its probe. The case then fails instead of hanging.
+template<typename TScheduler>
+void expectSweepWaitsForHeldWork(HeldWorkSweep sweep) {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    auto      pool  = fixedPool(kHeldWorkPoolName, 4U);
+    auto      probe = std::make_unique<HeldWorkProbe>();
+    gr::Graph flow;
+    auto&     gate      = flow.emplaceBlock<HeldWorkGate>();
+    auto&     source    = flow.emplaceBlock<HeldWorkSource>();
+    auto&     int16Sink = flow.emplaceBlock<Int16Sink>();
+    gate._probe         = probe.get();
+    source._probe       = probe.get();
+    expect(flow.connect<"out", "in">(source, gate).has_value());
+
+    auto scheduler   = std::make_unique<WorkQuiescenceProbe<TScheduler>>(gr::property_map{{"poolName", std::string(kHeldWorkPoolName)}});
+    auto toScheduler = std::make_unique<gr::MsgPortOut>();
+    expect(toScheduler->connect(scheduler->msgIn).has_value());
+    expect(scheduler->exchange(std::move(flow)).has_value());
+    WorkQuiescenceProbe<TScheduler>* raw   = scheduler.get();
+    auto                             armed = std::make_shared<std::atomic<bool>>(sweep != HeldWorkSweep::failedResume);
+    probe->workQuiescenceRequested         = [raw] { return raw->workQuiescenceRequested(); };
+    probe->endHold                         = [raw] { return raw->requestWaitsForWork(); };
+    probe->mayHold                         = [raw, armed] { return armed->load(std::memory_order_acquire) && raw->state() == RUNNING; };
+
+    auto        runnerDone = std::make_shared<std::atomic<bool>>(false);
+    std::thread runner([raw, runnerDone] {
+        std::ignore = raw->runAndWait();
+        runnerDone->store(true, std::memory_order_release);
+    });
+
+    if (sweep == HeldWorkSweep::failedResume) {
+        expect(awaitCondition([&probe] { return probe->nGateSamples.load(std::memory_order_relaxed) > 0UZ; })) << "the run moved no samples";
+        expect(raw->changeStateTo(REQUESTED_PAUSE).has_value());
+        expect(awaitCondition([raw] { return raw->state() == PAUSED; })) << "the scheduler did not pause";
+        expect(raw->graph().connect(source, gr::PortDefinition{"out"}, int16Sink, gr::PortDefinition{"in"}).has_value());
+        armed->store(true, std::memory_order_release);
+        std::ignore = raw->changeStateTo(RUNNING);
+        expect(raw->state() == ERROR) << "a resume whose edge did not connect must end the scheduler in ERROR";
+    } else {
+        expect(awaitCondition([&probe] { return probe->inWork.load(std::memory_order_acquire); })) << "the source did not hold a work() call";
+        if (sweep == HeldWorkSweep::graphReplacement) {
+            gr::sendMessage<gr::message::Command::Set>(*toScheduler, raw->unique_name, gr::scheduler::property::kGraphGRC, gr::property_map{{"value", gr::saveGrc(gr::globalPluginLoader(), gr::Graph{})}}, "replace");
+        } else {
+            expect(raw->changeStateTo(REQUESTED_STOP).has_value());
+        }
+    }
+    expect(awaitCondition([&probe] { return probe->nSourceHooks.load(std::memory_order_acquire) > 0UZ; })) << "the sweep did not reach the source";
+    if (gr::lifecycle::isActive(raw->state())) {
+        std::ignore = raw->changeStateTo(REQUESTED_STOP);
+    }
+    const bool ended = awaitCondition([&runnerDone] { return runnerDone->load(std::memory_order_acquire); });
+    expect(ended) << "the run did not end";
+    if (!ended) {
+        runner.detach();
+        std::ignore = scheduler.release();
+        std::ignore = toScheduler.release();
+        std::ignore = probe.release();
+        return;
+    }
+    runner.join();
+    expect(eq(probe->nHooksDuringWork.load(), 0UZ)) << "the sweep ran the source's stop() hook during its held work() call";
+}
+
+constexpr std::string_view kSubResumePoolName      = "qa_sub_resume_cpu";
+constexpr std::string_view kSubResumeInnerPoolName = "qa_sub_resume_inner_cpu";
+
+// shared by a ParentResumeSource inside a sub-scheduler and the test. The source waits in its first work() call until
+// the parent reads REQUESTED_PAUSE, at most kEventBound, and then resumes the parent from inside that call.
+struct ParentResumeProbe {
+    std::function<bool()> parentPausing;
+    std::function<bool()> resumeParent;
+    std::atomic<bool>     entered{false};
+    std::atomic<bool>     resumeAccepted{false};
+    std::atomic<bool>     resumeReturned{false};
+};
+
+// one sample per work() call
+struct ParentResumeSource : gr::Block<ParentResumeSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(ParentResumeSource, out);
+
+    ParentResumeProbe* _probe = nullptr;
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        if (outSpan.size() == 0UZ) {
+            outSpan.publish(0UZ);
+            return gr::work::Status::INSUFFICIENT_OUTPUT_ITEMS;
+        }
+        if (!_probe->entered.exchange(true, std::memory_order_acq_rel)) {
+            if (awaitCondition(_probe->parentPausing)) {
+                _probe->resumeAccepted.store(_probe->resumeParent(), std::memory_order_release);
+            }
+            _probe->resumeReturned.store(true, std::memory_order_release);
+        }
+        outSpan[0UZ] = 1.0f;
+        outSpan.publish(1UZ);
+        return gr::work::Status::OK;
+    }
+};
+
+// runs a HeldWorkSource and a CountingSink beside a sub-scheduler, under TestScheduler. In the sub-scheduler a
+// ParentResumeSource feeds a CountingSink. The test's thread pauses the parent while the HeldWorkSource holds a work()
+// call, and that call holds until the parent's resume adds its request to the pause's. The pause waits for the call.
+// The parent reads REQUESTED_PAUSE before the pause reaches the sub-scheduler, and the ParentResumeSource resumes the
+// parent from inside the sub-scheduler's work() call. A scheduler or a thread whose request or run does not return is
+// leaked with the probes. The case then fails instead of hanging.
+void expectResumeFromSubSchedulerWorkReturns() {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    auto pool        = fixedPool(kSubResumePoolName, 4U);
+    auto innerPool   = fixedPool(kSubResumeInnerPoolName, 3U);
+    auto heldProbe   = std::make_unique<HeldWorkProbe>();
+    auto resumeProbe = std::make_unique<ParentResumeProbe>();
+
+    gr::Graph innerFlow;
+    auto&     innerSource = innerFlow.emplaceBlock<ParentResumeSource>();
+    auto&     innerSink   = innerFlow.emplaceBlock<CountingSink>();
+    innerSource._probe    = resumeProbe.get();
+    expect(innerFlow.connect<"out", "in">(innerSource, innerSink).has_value());
+    auto inner = std::make_shared<gr::SchedulerWrapper<TestScheduler>>(gr::property_map{{"poolName", std::string(kSubResumeInnerPoolName)}});
+    inner->setGraph(std::move(innerFlow));
+
+    gr::Graph flow;
+    auto&     source = flow.emplaceBlock<HeldWorkSource>();
+    auto&     sink   = flow.emplaceBlock<CountingSink>();
+    source._probe    = heldProbe.get();
+    expect(flow.connect<"out", "in">(source, sink).has_value());
+    std::ignore = flow.addBlock(gr::SchedulerModel::asBlockModelPtr(inner));
+
+    auto scheduler     = std::make_unique<WorkQuiescenceProbe<TestScheduler>>(gr::property_map{{"poolName", std::string(kSubResumePoolName)}});
+    auto fromScheduler = std::make_unique<gr::MsgPortIn>();
+    expect(scheduler->msgOut.connect(*fromScheduler).has_value());
+    expect(scheduler->exchange(std::move(flow)).has_value());
+    WorkQuiescenceProbe<TestScheduler>* raw = scheduler.get();
+    heldProbe->workQuiescenceRequested      = [raw] { return raw->workQuiescenceRequested(); };
+    heldProbe->endHold                      = [raw] { return raw->nWorkQuiescenceRequests() >= 2UZ; };
+    heldProbe->mayHold                      = [raw] { return raw->state() == RUNNING; };
+    resumeProbe->parentPausing              = [raw] { return raw->state() == REQUESTED_PAUSE; };
+    resumeProbe->resumeParent               = [raw] { return raw->changeStateTo(RUNNING).has_value(); };
+
+    auto        runnerDone = std::make_shared<std::atomic<bool>>(false);
+    auto        result     = std::make_shared<std::expected<void, gr::Error>>();
+    std::thread runner([raw, runnerDone, result] {
+        *result = raw->runAndWait();
+        runnerDone->store(true, std::memory_order_release);
+    });
+
+    expect(awaitCondition([&heldProbe, &resumeProbe] { return heldProbe->inWork.load(std::memory_order_acquire) && resumeProbe->entered.load(std::memory_order_acquire); })) << "the parent's source held no work() call, or the sub-scheduler's source made none";
+    auto        pauseReturned = std::make_shared<std::atomic<bool>>(false);
+    std::thread pauser([raw, pauseReturned] {
+        std::ignore = raw->changeStateTo(REQUESTED_PAUSE);
+        pauseReturned->store(true, std::memory_order_release);
+    });
+
+    const bool returned = awaitCondition([&resumeProbe, &pauseReturned] { return resumeProbe->resumeReturned.load(std::memory_order_acquire) && pauseReturned->load(std::memory_order_acquire); });
+    expect(returned) << "the resume made inside the sub-scheduler's work() call, or the pause it overtook, did not return";
+    if (returned) {
+        expect(resumeProbe->resumeAccepted.load(std::memory_order_acquire)) << "the parent refused the resume";
+        expect(raw->state() == RUNNING) << "the resume must leave the parent RUNNING";
+        expect(inner->blockRef().state() == RUNNING) << "the sub-scheduler must stay RUNNING";
+        expect(raw->changeStateTo(REQUESTED_STOP).has_value());
+    }
+    const bool ended = returned && awaitCondition([&runnerDone] { return runnerDone->load(std::memory_order_acquire); });
+    expect(ended) << "the run did not end";
+    if (!ended) {
+        runner.detach();
+        pauser.detach();
+        std::ignore = scheduler.release();
+        std::ignore = fromScheduler.release();
+        std::ignore = heldProbe.release();
+        std::ignore = resumeProbe.release();
+        return;
+    }
+    runner.join();
+    pauser.join();
+    expect(result->has_value()) << "a stopped run must succeed";
+    expect(raw->state() == STOPPED) << "the run must end STOPPED";
+    ErrorReports reports;
+    reports.take(*fromScheduler);
+    expect(reports.errors.empty()) << "the pause that the resume overtook reported its refused moves as errors";
+}
+
+constexpr std::string_view kNestedBlockingPoolName      = "qa_nested_blocking_cpu";
+constexpr std::string_view kNestedBlockingInnerPoolName = "qa_nested_blocking_inner_cpu";
+
+// shared by two StopAwaitingSources, one in each slot
+struct StopAwaitProbe {
+    std::array<std::atomic<bool>, 2UZ> waiting{};
+    std::array<std::atomic<bool>, 2UZ> stopped{};
+    std::array<std::atomic<bool>, 2UZ> endedByHook{};
+    std::array<std::atomic<bool>, 2UZ> waitEnded{};
+};
+
+// a device that blocks in work() until its stop() hook runs. The first work() call waits for the hook, at most
+// kStageWait, and records whether the hook ended the wait. One sample per work() call
+struct StopAwaitingSource : gr::Block<StopAwaitingSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(StopAwaitingSource, out);
+
+    StopAwaitProbe* _probe = nullptr;
+    std::size_t     _slot  = 0UZ;
+
+    [[nodiscard]] constexpr bool isBlocking() const noexcept { return true; }
+
+    void stop() { _probe->stopped[_slot].store(true, std::memory_order_release); }
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        if (outSpan.size() == 0UZ) {
+            outSpan.publish(0UZ);
+            return gr::work::Status::INSUFFICIENT_OUTPUT_ITEMS;
+        }
+        if (!_probe->waiting[_slot].exchange(true, std::memory_order_acq_rel)) {
+            const bool byHook = awaitCondition([this] { return _probe->stopped[_slot].load(std::memory_order_acquire); }, kStageWait);
+            _probe->endedByHook[_slot].store(byHook, std::memory_order_release);
+            _probe->waitEnded[_slot].store(true, std::memory_order_release);
+        }
+        outSpan[0UZ] = 1.0f;
+        outSpan.publish(1UZ);
+        return gr::work::Status::OK;
+    }
+};
+
+// runs a StopAwaitingSource inside a transparent subgraph and one inside a sub-scheduler, each feeding a CountingSink,
+// under TestScheduler. Once both wait in work(), a message replaces the graph. A scheduler whose run does not end is
+// leaked with its probe. The case then fails instead of hanging.
+void expectGraphReplacementStopsNestedBlockingBlocks() {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    auto pool      = fixedPool(kNestedBlockingPoolName, 4U);
+    auto innerPool = fixedPool(kNestedBlockingInnerPoolName, 3U);
+    auto probe     = std::make_unique<StopAwaitProbe>();
+
+    auto  subgraph        = std::make_shared<gr::GraphWrapper<gr::Graph>>();
+    auto& subgraphSource  = subgraph->graph()->emplaceBlock<StopAwaitingSource>();
+    auto& subgraphSink    = subgraph->graph()->emplaceBlock<CountingSink>();
+    subgraphSource._probe = probe.get();
+    subgraphSource._slot  = 0UZ;
+    expect(subgraph->graph()->connect<"out", "in">(subgraphSource, subgraphSink).has_value());
+
+    gr::Graph innerFlow;
+    auto&     innerSource = innerFlow.emplaceBlock<StopAwaitingSource>();
+    auto&     innerSink   = innerFlow.emplaceBlock<CountingSink>();
+    innerSource._probe    = probe.get();
+    innerSource._slot     = 1UZ;
+    expect(innerFlow.connect<"out", "in">(innerSource, innerSink).has_value());
+    auto inner = std::make_shared<gr::SchedulerWrapper<TestScheduler>>(gr::property_map{{"poolName", std::string(kNestedBlockingInnerPoolName)}});
+    inner->setGraph(std::move(innerFlow));
+
+    gr::Graph flow;
+    std::ignore = flow.addBlock(subgraph);
+    std::ignore = flow.addBlock(gr::SchedulerModel::asBlockModelPtr(inner));
+
+    auto scheduler   = std::make_unique<TestScheduler>(gr::property_map{{"poolName", std::string(kNestedBlockingPoolName)}});
+    auto toScheduler = std::make_unique<gr::MsgPortOut>();
+    expect(toScheduler->connect(scheduler->msgIn).has_value());
+    expect(scheduler->exchange(std::move(flow)).has_value());
+    TestScheduler* raw = scheduler.get();
+
+    auto        runnerDone = std::make_shared<std::atomic<bool>>(false);
+    std::thread runner([raw, runnerDone] {
+        std::ignore = raw->runAndWait();
+        runnerDone->store(true, std::memory_order_release);
+    });
+
+    expect(awaitCondition([&probe] { return probe->waiting[0UZ].load(std::memory_order_acquire) && probe->waiting[1UZ].load(std::memory_order_acquire); })) << "a blocking source made no work() call";
+    gr::sendMessage<gr::message::Command::Set>(*toScheduler, raw->unique_name, gr::scheduler::property::kGraphGRC, gr::property_map{{"value", gr::saveGrc(gr::globalPluginLoader(), gr::Graph{})}}, "replace");
+    expect(awaitCondition([&probe] { return probe->waitEnded[0UZ].load(std::memory_order_acquire) && probe->waitEnded[1UZ].load(std::memory_order_acquire); })) << "a blocking source did not end its wait in work()";
+    expect(probe->endedByHook[0UZ].load(std::memory_order_acquire)) << "the graph replacement did not stop the blocking source inside the transparent subgraph during its wait in work()";
+    expect(probe->endedByHook[1UZ].load(std::memory_order_acquire)) << "the graph replacement did not stop the blocking source inside the sub-scheduler during its wait in work()";
+    if (gr::lifecycle::isActive(raw->state())) {
+        std::ignore = raw->changeStateTo(REQUESTED_STOP);
+    }
+    const bool ended = awaitCondition([&runnerDone] { return runnerDone->load(std::memory_order_acquire); });
+    expect(ended) << "the run did not end";
+    if (!ended) {
+        runner.detach();
+        std::ignore = scheduler.release();
+        std::ignore = toScheduler.release();
+        std::ignore = probe.release();
+        return;
+    }
+    runner.join();
+}
+
+constexpr std::string_view kRetiredSubgraphPoolName = "qa_retired_subgraph_cpu";
+
+// records the first run of a StopRecordingSource's stop() hook and whether the subgraph that holds the source was
+// still alive then
+struct RetiredSubgraphProbe {
+    std::weak_ptr<gr::BlockModel> subgraph;
+    std::atomic<bool>             worked{false};
+    std::atomic<bool>             hookEntered{false};
+    std::atomic<bool>             subgraphAlive{false};
+    std::atomic<bool>             hookRan{false};
+};
+
+// a source that does not block in work(). One sample per processOne() call
+struct StopRecordingSource : gr::Block<StopRecordingSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(StopRecordingSource, out);
+
+    RetiredSubgraphProbe* _probe = nullptr;
+
+    void stop() {
+        if (!_probe->hookEntered.exchange(true, std::memory_order_acq_rel)) {
+            _probe->subgraphAlive.store(!_probe->subgraph.expired(), std::memory_order_release);
+            _probe->hookRan.store(true, std::memory_order_release);
+        }
+    }
+
+    [[nodiscard]] float processOne() noexcept {
+        _probe->worked.store(true, std::memory_order_release);
+        return 1.0f;
+    }
+};
+
+// runs a StopRecordingSource and a CountingSink inside a transparent subgraph under TestScheduler and replaces the
+// graph by message once the source has run. The scheduler holds the only references to the subgraph. A scheduler whose
+// run does not end is leaked with its probe. The case then fails instead of hanging.
+void expectGraphReplacementStopsSubgraphBlockBeforeDestruction() {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    auto pool  = fixedPool(kRetiredSubgraphPoolName, 2U);
+    auto probe = std::make_unique<RetiredSubgraphProbe>();
+
+    auto  subgraph        = std::make_shared<gr::GraphWrapper<gr::Graph>>();
+    auto& subgraphSource  = subgraph->graph()->emplaceBlock<StopRecordingSource>();
+    auto& subgraphSink    = subgraph->graph()->emplaceBlock<CountingSink>();
+    subgraphSource._probe = probe.get();
+    expect(subgraph->graph()->connect<"out", "in">(subgraphSource, subgraphSink).has_value());
+    probe->subgraph = subgraph;
+
+    gr::Graph flow;
+    std::ignore = flow.addBlock(subgraph);
+    subgraph.reset();
+
+    auto scheduler   = std::make_unique<TestScheduler>(gr::property_map{{"poolName", std::string(kRetiredSubgraphPoolName)}});
+    auto toScheduler = std::make_unique<gr::MsgPortOut>();
+    expect(toScheduler->connect(scheduler->msgIn).has_value());
+    expect(scheduler->exchange(std::move(flow)).has_value());
+    TestScheduler* raw = scheduler.get();
+
+    auto        runnerDone = std::make_shared<std::atomic<bool>>(false);
+    std::thread runner([raw, runnerDone] {
+        std::ignore = raw->runAndWait();
+        runnerDone->store(true, std::memory_order_release);
+    });
+
+    expect(awaitCondition([&probe] { return probe->worked.load(std::memory_order_acquire); })) << "the source inside the transparent subgraph made no work() call";
+    expect(!probe->subgraph.expired()) << "the running graph does not hold the subgraph";
+    expect(!probe->hookRan.load(std::memory_order_acquire)) << "the source's stop() hook ran before the graph replacement";
+    gr::sendMessage<gr::message::Command::Set>(*toScheduler, raw->unique_name, gr::scheduler::property::kGraphGRC, gr::property_map{{"value", gr::saveGrc(gr::globalPluginLoader(), gr::Graph{})}}, "replace");
+    expect(awaitCondition([&probe] { return probe->hookRan.load(std::memory_order_acquire); })) << "the graph replacement did not run the stop() hook of the source inside the transparent subgraph";
+    expect(probe->subgraphAlive.load(std::memory_order_acquire)) << "the source's stop() hook ran only once the retired subgraph was destroyed";
+    if (gr::lifecycle::isActive(raw->state())) {
+        std::ignore = raw->changeStateTo(REQUESTED_STOP);
+    }
+    const bool ended = awaitCondition([&runnerDone] { return runnerDone->load(std::memory_order_acquire); });
+    expect(ended) << "the run did not end";
+    if (!ended) {
+        runner.detach();
+        std::ignore = scheduler.release();
+        std::ignore = toScheduler.release();
+        std::ignore = probe.release();
+        return;
+    }
+    runner.join();
+}
+
+constexpr std::string_view kInWorkStopPoolName = "qa_in_work_stop_cpu";
+
+// shared by an InWorkStopSource and the case that runs it
+struct InWorkStopProbe {
+    std::function<bool()> mayStop;
+    std::function<void()> stop;
+    std::atomic<bool>     inWork{false};
+    std::atomic<bool>     stopMade{false};
+    std::atomic<bool>     stopReturned{false};
+};
+
+// one sample per work() call. The first call waits until mayStop() holds, at most kStageWait, and then makes the stop
+struct InWorkStopSource : gr::Block<InWorkStopSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(InWorkStopSource, out);
+
+    InWorkStopProbe* _probe = nullptr;
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        if (outSpan.size() == 0UZ) {
+            outSpan.publish(0UZ);
+            return gr::work::Status::INSUFFICIENT_OUTPUT_ITEMS;
+        }
+        if (!_probe->inWork.exchange(true, std::memory_order_acq_rel)) {
+            const bool mayStop = awaitCondition(_probe->mayStop, kStageWait);
+            _probe->stopMade.store(mayStop, std::memory_order_release);
+            if (mayStop) {
+                _probe->stop();
+            }
+            _probe->stopReturned.store(true, std::memory_order_release);
+        }
+        outSpan[0UZ] = 1.0f;
+        outSpan.publish(1UZ);
+        return gr::work::Status::OK;
+    }
+};
+
+// runs an InWorkStopSource and a CountingSink under TestScheduler. A message replaces the graph once the source is
+// inside its call. The source requests a stop once the replacement has requested work quiescence. A scheduler or a
+// thread whose request or run does not return is leaked with the probe. The case then fails instead of hanging.
+void expectInWorkStopDuringGraphReplacementReturns() {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    auto      pool  = fixedPool(kInWorkStopPoolName, 4U);
+    auto      probe = std::make_unique<InWorkStopProbe>();
+    gr::Graph flow;
+    auto&     source = flow.emplaceBlock<InWorkStopSource>();
+    auto&     sink   = flow.emplaceBlock<CountingSink>();
+    source._probe    = probe.get();
+    expect(flow.connect<"out", "in">(source, sink).has_value());
+
+    auto scheduler   = std::make_unique<WorkQuiescenceProbe<TestScheduler>>(gr::property_map{{"poolName", std::string(kInWorkStopPoolName)}});
+    auto toScheduler = std::make_unique<gr::MsgPortOut>();
+    expect(toScheduler->connect(scheduler->msgIn).has_value());
+    expect(scheduler->exchange(std::move(flow)).has_value());
+    WorkQuiescenceProbe<TestScheduler>* raw = scheduler.get();
+    probe->mayStop                          = [raw] { return raw->workQuiescenceRequested(); };
+    probe->stop                             = [raw] { std::ignore = raw->changeStateTo(REQUESTED_STOP); };
+
+    auto        runnerDone = std::make_shared<std::atomic<bool>>(false);
+    std::thread runner([raw, runnerDone] {
+        std::ignore = raw->runAndWait();
+        runnerDone->store(true, std::memory_order_release);
+    });
+
+    expect(awaitCondition([&probe] { return probe->inWork.load(std::memory_order_acquire); })) << "the source made no work() call";
+    gr::sendMessage<gr::message::Command::Set>(*toScheduler, raw->unique_name, gr::scheduler::property::kGraphGRC, gr::property_map{{"value", gr::saveGrc(gr::globalPluginLoader(), gr::Graph{})}}, "replace");
+
+    const bool returned = awaitCondition([&probe] { return probe->stopReturned.load(std::memory_order_acquire); });
+    expect(returned) << "the stop made inside the work() call did not return";
+    expect(probe->stopMade.load(std::memory_order_acquire)) << "the source made no stop: no request held the scheduler during its work() call";
+    if (returned && gr::lifecycle::isActive(raw->state())) {
+        std::ignore = raw->changeStateTo(REQUESTED_STOP);
+    }
+    const bool ended = returned && awaitCondition([&runnerDone] { return runnerDone->load(std::memory_order_acquire); });
+    expect(ended) << "the run did not end";
+    if (!ended) {
+        runner.detach();
+        std::ignore = scheduler.release();
+        std::ignore = toScheduler.release();
+        std::ignore = probe.release();
+        return;
+    }
+    runner.join();
+    expect(raw->state() == STOPPED) << "the run must end STOPPED";
+}
+
+} // namespace qa_sched
+
+const boost::ut::suite<"a stop or a pause from inside work()"> ownRequestTests = [] {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    "a stop made inside a work() call waits for the other workers' calls and not for its own"_test = [] {
+        qa_sched::expectRequestFromOwnWorkReturns<qa_sched::TestScheduler>(REQUESTED_STOP);
+        qa_sched::expectRequestFromOwnWorkReturns<qa_sched::SerialScheduler>(REQUESTED_STOP);
+    };
+
+    "a pause made inside a work() call waits for the other workers' calls and not for its own"_test = [] {
+        qa_sched::expectRequestFromOwnWorkReturns<qa_sched::TestScheduler>(REQUESTED_PAUSE);
+        qa_sched::expectRequestFromOwnWorkReturns<qa_sched::SerialScheduler>(REQUESTED_PAUSE);
+    };
+
+    "a pause and a stop made inside the work() calls of two workers both return, and the pause reports no error"_test = [] { //
+        qa_sched::expectRequestPairReturns(REQUESTED_PAUSE, REQUESTED_STOP, false);
+    };
+
+    "a resume made inside a work() call during a pause from another thread returns, and the pause returns after it"_test = [] { //
+        qa_sched::expectRequestPairReturns(REQUESTED_PAUSE, RUNNING, true);
+    };
+
+    "a resume that overtakes a pause made inside another worker's work() call leaves the run RUNNING, and the pause reports no error"_test = [] { //
+        qa_sched::expectRequestPairReturns(REQUESTED_PAUSE, RUNNING, false);
+    };
+
+    "a resume made inside a sub-scheduler's work() call during the parent's pause returns, and the pause reports no error"_test = [] { //
+        qa_sched::expectResumeFromSubSchedulerWorkReturns();
+    };
+};
+
+const boost::ut::suite<"a block whose work() call holds while a sweep stops it"> heldWorkTests = [] {
+    using namespace boost::ut;
+
+    "a graph replacement by message stops the running graph's blocks between their work() calls"_test = [] { //
+        qa_sched::expectSweepWaitsForHeldWork<qa_sched::TestScheduler>(qa_sched::HeldWorkSweep::graphReplacement);
+    };
+
+    "a resume whose edge cannot connect stops the blocks between their work() calls"_test = [] { //
+        qa_sched::expectSweepWaitsForHeldWork<qa_sched::TestScheduler>(qa_sched::HeldWorkSweep::failedResume);
+    };
+
+    "a stop reaches a block between the work() calls of a scheduler's own worker"_test = [] { //
+        qa_sched::expectSweepWaitsForHeldWork<qa_sched::OwnWorkerScheduler>(qa_sched::HeldWorkSweep::stop);
+    };
+
+    "a graph replacement by message stops a blocking block inside a transparent subgraph and one inside a sub-scheduler during their waits in work()"_test = [] { //
+        qa_sched::expectGraphReplacementStopsNestedBlockingBlocks();
+    };
+
+    "a graph replacement by message stops a non-blocking block inside a transparent subgraph before the retired graph is destroyed"_test = [] { //
+        qa_sched::expectGraphReplacementStopsSubgraphBlockBeforeDestruction();
+    };
+
+    "a stop made inside a work() call while a graph replacement by message waits for that call returns, and the run ends"_test = [] { //
+        qa_sched::expectInWorkStopDuringGraphReplacementReturns();
+    };
 };
 
 int main() { /* tests are statically registered */ }
