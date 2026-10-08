@@ -1442,6 +1442,7 @@ protected:
 
         [[maybe_unused]] auto currentProgress    = this->_graph->progress().value();
         [[maybe_unused]] auto currentWake        = _wake->value();
+        [[maybe_unused]] auto currentDraining    = gr::detail::drainingCalls();
         std::size_t           inactiveCycleCount = 0UZ;
         std::size_t           idleIterations     = 0UZ;
         std::size_t           msgToCount         = 0UZ;
@@ -1452,6 +1453,7 @@ protected:
                 // optionally tracking progress and block if there is none
                 currentProgress = progress->value();
                 currentWake     = _wake->value();
+                currentDraining = gr::detail::drainingCalls();
             }
 
             // Process messages either when the ratio gate opens, or immediately when any entry-point port has
@@ -1535,11 +1537,16 @@ protected:
                 }
 
                 currentProgress = progressAfter;
+                // A block that drains an asynchronous input ends after a bound of calls in which nothing it waits on
+                // moved. A parked worker would make one such call per park. The worker therefore does not park after
+                // a pass in which it called a block that is draining an asynchronous input.
+                const bool calledDrainingBlock = gr::detail::drainingCalls() != currentDraining;
+
                 // parking in a non-RUNNING state would delay the worker's next state read by up to timeout_ms, and a
                 // worker of a stopped run leaves instead. activeState can come from a message pass before a pause. The
                 // worker therefore reads the state again. A pause publishes REQUESTED_PAUSE before its wake. A worker
                 // that still reads RUNNING here read _wake before that wake, and the wake ends its park.
-                if (activeState == RUNNING && inactiveCycleCount > timeout_inactivity_count && gr::atomic_ref(_run.generation).load_acquire() == generation && this->state() == RUNNING) {
+                if (activeState == RUNNING && inactiveCycleCount > timeout_inactivity_count && !calledDrainingBlock && gr::atomic_ref(_run.generation).load_acquire() == generation && this->state() == RUNNING) {
                     // allow a scheduler process to wait on progress before retrying (N.B. intended to save CPU/battery power)
                     // work, or a wake since the top of this pass, ends the park. A wake does not count as progress
                     waitUntilChanged(*progress, currentProgress, *_wake, currentWake, timeout_ms);
