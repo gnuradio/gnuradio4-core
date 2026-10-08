@@ -27,6 +27,8 @@ function(
       -DEXPECTED=${GR_TOOLS_TEST_ASSETS}/nested_graph.${FORMAT}.expected -P
       ${CMAKE_CURRENT_SOURCE_DIR}/compare_generated.cmake)
   set_tests_properties(${TEST_NAME} PROPERTIES TIMEOUT 60)
+  # the script runs the tool, which loads core's shared libraries
+  gr_test_add_dll_directories(${TEST_NAME})
 endfunction()
 
 add_pinned_document_test(qa_GraphDocPinnedMarkdown md file)
@@ -40,6 +42,7 @@ function(add_option_handling_tests TOOL_TARGET)
   add_test(NAME qa_${TOOL_TARGET}_unknown_option COMMAND ${TOOL_TARGET} --no-such-option)
   add_test(NAME qa_${TOOL_TARGET}_missing_value COMMAND ${TOOL_TARGET} --format)
   set_tests_properties(qa_${TOOL_TARGET}_unknown_option qa_${TOOL_TARGET}_missing_value PROPERTIES WILL_FAIL TRUE)
+  gr_test_add_dll_directories(qa_${TOOL_TARGET}_help qa_${TOOL_TARGET}_unknown_option qa_${TOOL_TARGET}_missing_value)
 endfunction()
 
 add_option_handling_tests(graphdoc)
