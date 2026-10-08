@@ -40,6 +40,18 @@ struct Tunable : gr::Block<Tunable> {
     [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
 };
 
+// a gain the block takes between 0 and 1
+struct LimitedGain : gr::Block<LimitedGain> {
+    gr::PortIn<float>  in;
+    gr::PortOut<float> out;
+
+    gr::Annotated<float, "gain", gr::Limits<0.f, 1.f>> gain = 0.5f;
+
+    GR_MAKE_REFLECTABLE(LimitedGain, in, out, gain);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
+};
+
 struct Source : gr::Block<Source> {
     gr::PortOut<float> out;
 
@@ -612,6 +624,7 @@ struct RacingStage : gr::Block<RacingStage> {
 void registerTestBlocks() {
     static const bool registered = [] {
         std::ignore = gr::globalBlockRegistry().insert<Tunable>();
+        std::ignore = gr::globalBlockRegistry().insert<LimitedGain>();
         std::ignore = gr::globalBlockRegistry().insert<Source>();
         std::ignore = gr::globalBlockRegistry().insert<Sink>();
         std::ignore = gr::globalBlockRegistry().insert<Ticker>();
@@ -722,6 +735,41 @@ void sendMessage(gr::MsgPortOut& port, std::string_view endpoint, gr::property_m
         names += std::format("{}{}", names.empty() ? "" : ", ", block->uniqueName());
     }
     return names;
+}
+
+struct RefusedEmplacement {
+    std::string refusal;
+    std::string namesBefore;
+    std::string namesAfter;
+};
+
+// sends an EmplaceBlock carrying `blockYaml` to a running scheduler and reads its error reply on `replyEndpoint` and the
+// graph's blocks
+[[nodiscard]] RefusedEmplacement emplaceRefusedYaml(const std::string& blockYaml, std::string_view replyEndpoint = gr::scheduler::property::kBlockEmplaced) {
+    using enum gr::lifecycle::State;
+    TestScheduler scheduler;
+    {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<Source>();
+        auto&     sink   = flow.emplaceBlock<Sink>();
+        std::ignore      = flow.connect<"out", "in">(source, sink);
+        std::ignore      = scheduler.exchange(std::move(flow));
+    }
+    RefusedEmplacement result;
+    result.namesBefore = blockNames(scheduler.graph());
+
+    gr::MsgPortOut toScheduler;
+    gr::MsgPortIn  fromScheduler;
+    std::ignore = toScheduler.connect(scheduler.msgIn);
+    std::ignore = scheduler.msgOut.connect(fromScheduler);
+    sendMessage(toScheduler, gr::scheduler::property::kEmplaceBlock, {{"yaml", blockYaml}});
+
+    std::ignore       = scheduler.changeStateTo(INITIALISED);
+    std::ignore       = scheduler.changeStateTo(RUNNING);
+    result.refusal    = awaitError(fromScheduler, replyEndpoint);
+    result.namesAfter = blockNames(scheduler.graph());
+    std::ignore       = scheduler.changeStateTo(REQUESTED_STOP);
+    return result;
 }
 
 // the message of the gr::exception that emplace throws, empty when it returns
@@ -1166,6 +1214,27 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(eq(gain->value_or(0.0f), 4.5f)) << "the emplaced block kept its constructor default instead of the serialized value";
 
         expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+    };
+
+    "a block emplaced from yaml with a value its setting refuses gets an error and stays out of the graph"_test = [] {
+        qa_edit::registerTestBlocks();
+        const qa_edit::RefusedEmplacement refused = qa_edit::emplaceRefusedYaml(std::format("id: {}\nparameters:\n  name: stage\n  gain: !!float32 2\n", gr::meta::type_name<qa_edit::LimitedGain>()));
+        expect(refused.refusal.contains("block 'stage'") && refused.refusal.contains("[0, 1]")) << "the reply carries the refusal, got: " << refused.refusal;
+        expect(eq(refused.namesAfter, refused.namesBefore)) << "the refused block is in the graph";
+    };
+
+    "a block emplaced from yaml with a key it does not declare gets an error naming the nearest key"_test = [] {
+        qa_edit::registerTestBlocks();
+        const qa_edit::RefusedEmplacement refused = qa_edit::emplaceRefusedYaml(std::format("id: {}\nparameters:\n  name: stage\n  gian: !!float32 0.25\n", gr::meta::type_name<qa_edit::LimitedGain>()));
+        expect(refused.refusal.contains("declares no setting named 'gian'") && refused.refusal.contains("'gain'")) << "the reply names the nearest key, got: " << refused.refusal;
+        expect(eq(refused.namesAfter, refused.namesBefore)) << "the refused block is in the graph";
+    };
+
+    "a subgraph emplaced from yaml with an inner value its setting refuses gets an error and stays out of the graph"_test = [] {
+        qa_edit::registerTestBlocks();
+        const qa_edit::RefusedEmplacement refused = qa_edit::emplaceRefusedYaml(std::format("id: SUBGRAPH\nparameters:\n  name: group\ngraph:\n  blocks:\n    - id: {}\n      parameters:\n        name: stage\n        gain: !!float32 2\n", gr::meta::type_name<qa_edit::LimitedGain>()), gr::scheduler::property::kBlockEmplaced);
+        expect(refused.refusal.contains("block 'stage'") && refused.refusal.contains("[0, 1]")) << "the reply carries the refusal, got: " << refused.refusal;
+        expect(eq(refused.namesAfter, refused.namesBefore)) << "the refused subgraph is in the graph";
     };
 
     "a subgraph emplaced by name inherits its parent's plugin loader"_test = [] {

@@ -448,12 +448,13 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
             }
         }
         restoreMetaInformation(*currentBlock);
+        // a subgraph loads its blocks before it joins the graph. A refused inner block leaves the graph as it was.
+        if (isSubgraph) {
+            loadGraph(currentBlock);
+        }
 
         const std::shared_ptr<BlockModel>& added = resultGraph.addBlock(std::move(currentBlock));
         createdBlocks.add(blockUniqueName, blockName, added);
-        if (isSubgraph) {
-            loadGraph(added);
-        }
     } // for blocks
 
     Tensor<pmt::Value> connections;

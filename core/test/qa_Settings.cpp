@@ -1040,4 +1040,89 @@ const boost::ut::suite<"a block copies its own members into its settings"> copyT
     };
 };
 
+namespace qa_refusals {
+
+using namespace gr;
+
+/// a gain the block takes between 0 and 1
+struct LimitedGain : Block<LimitedGain> {
+    PortIn<float>  in{};
+    PortOut<float> out{};
+
+    Annotated<float, "gain", Limits<0.f, 1.f>> gain = 0.5f;
+
+    GR_MAKE_REFLECTABLE(LimitedGain, in, out, gain);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
+};
+
+[[nodiscard]] std::string setRefusal(SettingsBase& settings, const property_map& parameters, SettingsCtx ctx = {}) {
+    try {
+        std::ignore = settings.set(parameters, ctx);
+    } catch (const gr::exception& e) {
+        return e.message;
+    }
+    return {};
+}
+
+} // namespace qa_refusals
+
+const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
+    using namespace boost::ut;
+    using namespace qa_refusals;
+
+    "a value outside the limits is refused by set(), naming the block, the key, the value and the limit"_test = [] {
+        LimitedGain block{property_map{{"name", std::string("gain_stage")}}};
+        block.init(std::make_shared<gr::Sequence>());
+
+        const std::string refusal = setRefusal(block.settings(), {{"gain", 2.0f}});
+        expect(refusal.contains("block 'gain_stage'")) << refusal;
+        expect(refusal.contains("gain = 2")) << refusal;
+        expect(refusal.contains("[0, 1]")) << refusal;
+
+        std::ignore = block.settings().activateContext();
+        std::ignore = block.settings().applyStagedParameters();
+        expect(eq(block.gain.value, 0.5f)) << "the refused value does not reach the member";
+    };
+
+    "a refused set() leaves the keys that follow tags as they were"_test = [] {
+        LimitedGain block{property_map{{"name", std::string("gain_stage")}}};
+        block.init(std::make_shared<gr::Sequence>());
+        const auto        now = gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now());
+        const SettingsCtx night{now, "night"};
+        expect(setRefusal(block.settings(), {{"gain", 0.25f}}, night).empty());
+        const std::set<std::string> following = block.settings().autoUpdateParameters(night);
+        const gr::Size_t            nSets     = block.settings().getNAutoUpdateParameters();
+        expect(fatal(following.contains("disconnect_on_done") && following.contains("compute_domain") && following.contains("name")));
+
+        const property_map refused{{"disconnect_on_done", false}, {"compute_domain", std::string("default_cpu")}, {"name", std::string("renamed")}, {"gain", 2.0f}};
+        expect(setRefusal(block.settings(), refused, night).contains("[0, 1]"));
+        expect(setRefusal(block.settings(), refused, SettingsCtx{now + 1U, "dawn"}).contains("[0, 1]"));
+        expect(block.settings().autoUpdateParameters(night) == following) << "a refused map changes which keys follow tags";
+        expect(eq(block.settings().getNAutoUpdateParameters(), nSets)) << "a refused map leaves a set for a context it never stored";
+    };
+
+    "a refused set() that renames the block names it by the name it keeps"_test = [] {
+        LimitedGain block{property_map{{"name", std::string("gain_stage")}}};
+        block.init(std::make_shared<gr::Sequence>());
+
+        const std::string refusal = setRefusal(block.settings(), {{"name", std::string("renamed")}, {"gain", 2.0f}});
+        expect(refusal.contains("block 'gain_stage'")) << refusal;
+        expect(!refusal.contains("renamed")) << "the refusal names the block by a name it never takes" << refusal;
+    };
+
+    "a block constructed with a value outside the limits does not join the graph"_test = [] {
+        gr::Graph   flow;
+        std::string refusal;
+        try {
+            std::ignore = flow.emplaceBlock<LimitedGain>({{"name", std::string("stage")}, {"gain", 2.0f}});
+        } catch (const gr::exception& e) {
+            refusal = e.message;
+        }
+        expect(refusal.contains("block 'stage'")) << "the refusal names the block by the name the map gives" << refusal;
+        expect(refusal.contains("[0, 1]")) << refusal;
+        expect(flow.blocks().empty()) << "the refused block is in the graph";
+    };
+};
+
 int main() { /* not needed by the UT framework */ }

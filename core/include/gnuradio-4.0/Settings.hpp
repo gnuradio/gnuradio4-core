@@ -414,6 +414,7 @@ struct MemberDescriptor {
     using StagedApplier     = bool (*)(void* member, std::string_view key, const pmt::Value& stagedValue, property_map& appliedParameters, property_map& stagedForCallback, bool hasSettingsChangedCallback);
     using ParameterReader   = void (*)(const void* member, std::string_view key, property_map& parameters);
     using TypeNameReader    = std::string (*)();
+    using LimitsCheck       = std::optional<std::string> (*)(std::string_view key, const pmt::Value& value);
 
     std::string_view name{};
 
@@ -424,6 +425,9 @@ struct MemberDescriptor {
     AutoUpdateHandler autoUpdate{nullptr};
     StagedApplier     applyStaged{nullptr};
     ParameterReader   readParameter{nullptr};
+
+    /// set for a writable member with `Limits<>`: the reason when the value converts and the limits refuse it
+    LimitsCheck refuseByLimits{nullptr};
 
     bool             isAnnotated{false};
     std::string_view description{};
@@ -443,6 +447,7 @@ struct MemberDescriptor {
 struct BlockHooks {
     using MetaInformationAccessor = property_map& (*)(void* block);
     using DescriptionReader       = std::string_view (*)(const void* block);
+    using NameReader              = std::string_view (*)(const void* block);
     using SettingsChangedInvoker  = void (*)(void* block, property_map& oldSettings, property_map& newSettings, property_map& forwardSettings);
     using ResetInvoker            = void (*)(void* block);
     using ChunkRatioReader        = bool (*)(const void* block, float& ratio);
@@ -453,6 +458,7 @@ struct BlockHooks {
 
     MetaInformationAccessor metaInformation{nullptr};
     DescriptionReader       blockDescription{nullptr};
+    NameReader              blockName{nullptr};
     SettingsChangedInvoker  settingsChanged{nullptr};
     ResetInvoker            reset{nullptr};
     ChunkRatioReader        chunkRatio{nullptr};
@@ -507,6 +513,29 @@ bool applyStagedMember(void* memberPointer, std::string_view key, const pmt::Val
     }
 }
 
+/// the reason a refusal gives for a value the limits refuse
+template<typename TLimit>
+std::string describeLimits() {
+    constexpr bool kHasValidator = !std::is_null_pointer_v<std::remove_cv_t<decltype(TLimit::ValidatorFunc)>>;
+    if constexpr (TLimit::MinRange == TLimit::MaxRange) {
+        return "refused by its validator";
+    } else if constexpr (kHasValidator) {
+        return std::format("outside the limits [{}, {}] or refused by its validator", TLimit::MinRange, TLimit::MaxRange);
+    } else {
+        return std::format("outside the limits [{}, {}]", TLimit::MinRange, TLimit::MaxRange);
+    }
+}
+
+template<typename RawType, typename Type>
+std::optional<std::string> refuseByLimits(std::string_view key, const pmt::Value& value) {
+    using Limit                                      = typename RawType::LimitType;
+    const std::expected<Type, std::string> converted = settings::convertParameter<Type>(key, value);
+    if (!converted || Limit::validate(static_cast<typename Limit::ValueType>(*converted))) {
+        return std::nullopt;
+    }
+    return describeLimits<Limit>();
+}
+
 template<typename RawType, typename Type>
 void readMember(const void* memberPointer, std::string_view key, property_map& parameters) {
     const auto     keyPmr = std::pmr::string(key);
@@ -533,6 +562,11 @@ property_map& blockMetaInformation(void* block) {
 template<typename TBlock>
 std::string_view readBlockDescription(const void* block) {
     return detail::unwrap_decorated_reference(static_cast<const TBlock*>(block)->description);
+}
+
+template<typename TBlock>
+std::string_view readBlockName(const void* block) {
+    return detail::unwrap_decorated_reference(static_cast<const TBlock*>(block)->name);
 }
 
 template<typename TBlock>
@@ -599,6 +633,11 @@ inline constexpr auto kMemberDescriptors = [] {
                 entry.setParameter = &detail::setParameterImpl<Type>;
                 entry.autoUpdate   = &detail::autoUpdateImpl<Type>;
                 entry.applyStaged  = &detail::applyStagedMember<RawType, Type>;
+                if constexpr (AnnotatedType<RawType>) {
+                    if constexpr (!std::is_same_v<typename RawType::LimitType, EmptyLimit>) {
+                        entry.refuseByLimits = &detail::refuseByLimits<RawType, Type>;
+                    }
+                }
             }
             if constexpr (AnnotatedType<RawType>) {
                 entry.isAnnotated   = true;
@@ -633,6 +672,11 @@ template<typename TBlock>
         if constexpr (requires(TBlock block) { block.description; }) {
             hooks.blockDescription = &detail::readBlockDescription<TBlock>;
         }
+    }
+    if constexpr (requires(const TBlock& block) {
+                      { detail::unwrap_decorated_reference(block.name) } -> std::convertible_to<std::string_view>;
+                  }) {
+        hooks.blockName = &detail::readBlockName<TBlock>;
     }
     if constexpr (HasSettingsChangedCallback<TBlock>) {
         hooks.settingsChanged = &detail::invokeSettingsChanged<TBlock>;
@@ -687,6 +731,8 @@ struct SettingsBase {
     /**
      * @brief Add new key-value pairs to stored parameters.
      * N.B. settings become staged after calling activateContext(), and after executing 'applyStagedParameters()' settings are applied (usually done early on in the 'Block::work()' function)
+     * Throws for a value that does not convert to the member's type. Throws for a value outside the limits, with a
+     * message that names the block, the key, the value and the limits.
      * @return key-value pairs that could not be set
      */
     [[nodiscard]] virtual property_map set(const property_map& parameters, SettingsCtx ctx = {}) = 0;
@@ -910,7 +956,8 @@ public:
 
 protected:
     // *Impl bodies run without taking _mutex, for callers that already hold it
-    [[nodiscard]] property_map setImpl(const property_map& parameters, SettingsCtx ctx);
+    // a refusal names the block by `blockName`, or by its own name when that is empty
+    [[nodiscard]] property_map setImpl(const property_map& parameters, SettingsCtx ctx, std::string_view blockName = {});
     [[nodiscard]] property_map setStagedImpl(const property_map& parameters);
     void                       resetDefaultsImpl();
     // reentrantLock is null when a caller already holds _mutex and cannot have it released underneath it
@@ -930,6 +977,7 @@ protected:
     [[nodiscard]] std::optional<std::string>           contextInTag(const Tag& tag) const;
     [[nodiscard]] std::optional<std::uint64_t>         triggeredTimeInTag(const Tag& tag) const;
     [[nodiscard]] std::optional<SettingsCtx>           createSettingsCtxFromTag(const Tag& tag) const;
+    [[nodiscard]] std::string                          describeRefusal(std::string_view key, const pmt::Value& value, std::string_view blockName = {}) const;
 }; // class CtxSettingsBase
 
 /**
