@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <new>
+#include <optional>
 
 #include <gnuradio-4.0/meta/Attributes.hpp>
 #include <gnuradio-4.0/meta/CacheLineSize.hpp>
