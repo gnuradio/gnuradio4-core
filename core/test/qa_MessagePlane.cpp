@@ -154,7 +154,7 @@ const boost::ut::suite<"message plane back-pressure"> messagePlaneTests = [] {
         const gr::Size_t  nMessages = 10000U; // > the 4096-slot shared _fromChildMessagePort
         const std::size_t nBefore   = message::droppedMessageCount().load(std::memory_order_relaxed);
 
-        gr::scheduler::Simple sched;
+        gr::scheduler::Simple<> sched;
         expect(sched.exchange(qa_msg::makeFloodGraph(nMessages)).has_value());
         expect(sched.runAndWait().has_value());
 
@@ -164,7 +164,7 @@ const boost::ut::suite<"message plane back-pressure"> messagePlaneTests = [] {
     "a subscriber that never consumes must not wedge the scheduler"_test = [] {
         const gr::Size_t nMessages = 10000U;
 
-        gr::scheduler::Simple sched;
+        gr::scheduler::Simple<> sched;
         expect(sched.exchange(qa_msg::makeFloodGraph(nMessages)).has_value());
 
         MsgPortIn stalledSubscriber;
@@ -202,7 +202,7 @@ const boost::ut::suite<"a block error that ends the run"> blockErrorRunTests = [
         expect(flow.connect<"out", "in">(source, sink).has_value());
         const std::string sourceName(source.unique_name);
 
-        gr::scheduler::Simple sched;
+        gr::scheduler::Simple<> sched;
         expect(sched.exchange(std::move(flow)).has_value());
 
         const std::expected<void, Error> result = sched.runAndWait();
@@ -220,8 +220,8 @@ const boost::ut::suite<"a block error that ends the run"> blockErrorRunTests = [
         expect(flow.connect<"out", "in">(source, sink).has_value());
         const std::string sourceName(source.unique_name);
 
-        gr::scheduler::Simple sched;
-        MsgPortIn             subscriber;
+        gr::scheduler::Simple<> sched;
+        MsgPortIn               subscriber;
         expect(sched.msgOut.connect(subscriber).has_value());
         expect(sched.exchange(std::move(flow)).has_value());
 
@@ -240,8 +240,8 @@ const boost::ut::suite<"a block error that ends the run"> blockErrorRunTests = [
         auto&     sink   = flow.emplaceBlock<qa_msg::NullSink>();
         expect(flow.connect<"out", "in">(source, sink).has_value());
 
-        gr::scheduler::Simple sched;
-        MsgPortIn             subscriber;
+        gr::scheduler::Simple<> sched;
+        MsgPortIn               subscriber;
         expect(sched.msgOut.connect(subscriber).has_value());
         expect(sched.exchange(std::move(flow)).has_value());
 
@@ -264,8 +264,8 @@ const boost::ut::suite<"a block error that ends the run"> blockErrorRunTests = [
             const std::string reporterName(reporter.unique_name);
             const std::string failingName(failing.unique_name);
 
-            gr::scheduler::Simple sched;
-            MsgPortIn             subscriber;
+            gr::scheduler::Simple<> sched;
+            MsgPortIn               subscriber;
             expect(sched.msgOut.connect(subscriber).has_value());
             expect(sched.exchange(std::move(flow)).has_value());
 
