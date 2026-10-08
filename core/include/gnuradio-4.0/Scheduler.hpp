@@ -146,7 +146,7 @@ protected:
     std::shared_ptr<gr::Sequence> _nRunningJobs = std::make_shared<gr::Sequence>();
     std::recursive_mutex          _executionOrderMutex; // only used when modifying and copying the graph->local job list
     std::shared_ptr<JobLists>     _executionOrder = std::make_shared<JobLists>();
-    std::mutex                    _childLifecycleMutex; // serializes the sweeps of start(), stop() and a block replacement; a worker never takes it to count itself
+    std::mutex                    _childLifecycleMutex; // serializes the sweeps of start() and stop() and the ReplaceBlock and EmplaceEdge edits; a worker never takes it to count itself
     std::mutex                    _workersInLoopMutex;  // guards _nWorkersInLoop; no block's stop() hook runs under it
     std::size_t                   _nWorkersInLoop{0UZ}; // workers inside poolWorker(); only these workers call a block's work()
     // advanced by everything that ends a park and is not work (see wakeWorkers() and registerWake()). The rings in
@@ -193,7 +193,9 @@ protected:
     std::mutex _adoptionBlocksMutex;
     // fixed-sized vector indexed by runnerId. Cheaper than a map.
     std::vector<std::vector<std::shared_ptr<BlockModel>>> _adoptionBlocks;
-    std::vector<bool>                                     _adoptionListClosed; // the job list's worker has left its loop
+    std::vector<bool>                                     _adoptionListClosed;    // the job list's worker has left its loop
+    std::vector<std::shared_ptr<BlockModel>>              _withdrawnBlocks;       // blocks that leave every job list of this run
+    std::size_t                                           _nWithdrawnBlocks{0UZ}; // the size of _withdrawnBlocks, read without the lock
 
     MsgPortOutForChildren                     _toChildMessagePort;
     MsgPortInFromChildren                     _fromChildMessagePort;
@@ -1229,11 +1231,17 @@ protected:
         return {max_work_items, performedWorkAllBlocks, unfinishedBlocksExist ? work::Status::OK : work::Status::DONE};
     }
 
-    // makes one traversal of the blocks as a work() call of this scheduler. stop(), pause(), resume() and graph edits
-    // wait for such a call. A stop(), pause() or resume() made inside it does not wait for it. A scheduler that supplies
-    // its own poolWorker() makes each traversal through this helper. While a request for work quiescence is in force, the
-    // helper calls no block and returns no result.
+    // makes one traversal of the blocks through callAsWork(). A scheduler that supplies its own poolWorker() makes each
+    // traversal through this helper.
     std::optional<work::Result> traverseBlockListAsWork(const std::vector<std::shared_ptr<BlockModel>>& blocks) {
+        return callAsWork([this, &blocks] { return traverseBlockListOnce(blocks); });
+    }
+
+    // makes the call as a work() call of this scheduler and returns its result. stop(), pause(), resume() and graph edits
+    // wait for such a call. A stop(), pause() or resume() made inside it does not wait for it. While a request for work
+    // quiescence is in force, the helper makes no call and returns no result.
+    template<std::invocable TCall>
+    std::optional<work::Result> callAsWork(TCall&& call) {
         if (gr::atomic_ref(_nWorkQuiescenceRequests).load_acquire() > 0UZ) {
             std::this_thread::yield();
             return std::nullopt;
@@ -1246,7 +1254,7 @@ protected:
         const void*&  threadWorkingScheduler = workingScheduler();
         const void*   outerWorkingScheduler  = std::exchange(threadWorkingScheduler, static_cast<const void*>(this));
         on_scope_exit restoreWorking         = [&threadWorkingScheduler, outerWorkingScheduler] { threadWorkingScheduler = outerWorkingScheduler; };
-        return traverseBlockListOnce(blocks);
+        return std::forward<TCall>(call)();
     }
 
     void init() {
@@ -1437,9 +1445,11 @@ protected:
             return;
         }
 
-        { // every job list of this run takes adopted blocks until its worker leaves its loop
+        { // every job list of this run takes adopted blocks until its worker leaves its loop, and no block is withdrawn
             std::lock_guard guard(_adoptionBlocksMutex);
             _adoptionListClosed.assign(_adoptionBlocks.size(), false);
+            _withdrawnBlocks.clear();
+            gr::atomic_ref(_nWithdrawnBlocks).store_release(0UZ);
         }
 
         assert(_executionOrder != nullptr && !_executionOrder->empty());
@@ -1595,6 +1605,7 @@ protected:
         [[maybe_unused]] auto profiler_handler = _profiler.forThisThread();
 
         std::vector<std::shared_ptr<BlockModel>> localBlockList;
+        std::size_t                              nWithdrawnSeen = 0UZ;
         {
             assert(jobList->size() > runnerID);
             std::lock_guard                          lock(_executionOrderMutex);
@@ -1676,7 +1687,13 @@ protected:
             }
 
             if (activeState == RUNNING) {
-                if (const std::optional<work::Result> result = traverseBlockListAsWork(localBlockList); result.has_value()) {
+                const std::optional<work::Result> result = callAsWork([this, &localBlockList, &nWithdrawnSeen] {
+                    if (gr::atomic_ref(_nWithdrawnBlocks).load_acquire() != nWithdrawnSeen) {
+                        nWithdrawnSeen = dropWithdrawnBlocks(localBlockList);
+                    }
+                    return traverseBlockListOnce(localBlockList);
+                });
+                if (result.has_value()) {
                     if (result->status == work::Status::DONE) {
                         // a block queued for this job list, such as the replacement of the block that ended last,
                         // keeps the worker in its loop
@@ -1984,7 +2001,7 @@ protected:
         advanceRunGeneration();
         wakeWorkers();
         {
-            std::lock_guard childLock(_childLifecycleMutex); // serialized against start()'s sweep and a block replacement
+            std::lock_guard childLock(_childLifecycleMutex); // serialized against start()'s sweep and the ReplaceBlock and EmplaceEdge edits
             // a block that blocks in work() ends its wait in its stop() hook, and that hook runs first. The other blocks
             // and the sub-schedulers stop once each other worker's work() call has returned or waits in a request it
             // made. The stop() hook of a block that does not block runs during its own work() call only when that call
@@ -2155,6 +2172,18 @@ protected:
         return std::nullopt;
     }
 
+    // true when a job list holds the block. A single-threaded run holds _executionOrderMutex on its worker for the
+    // whole run. A caller on another thread during such a run cannot read the job lists and gets true
+    [[nodiscard]] bool jobListHolds(const std::shared_ptr<BlockModel>& block) {
+        std::unique_lock lock(_executionOrderMutex, std::defer_lock);
+        if constexpr (executionPolicy() == ExecutionPolicy::multiThreaded) {
+            lock.lock();
+        } else if (!lock.try_lock()) {
+            return true;
+        }
+        return std::ranges::any_of(*_executionOrder, [&block](const std::vector<std::shared_ptr<BlockModel>>& jobList) { return std::ranges::contains(jobList, block); });
+    }
+
     // queues the block for a job list whose worker remains: the preferred job list while its worker remains, otherwise
     // one chosen by the block's address. Returns the index of that job list, or none when every worker has left
     [[nodiscard]] std::optional<std::size_t> queueForAdoption(const std::shared_ptr<BlockModel>& newBlock, std::optional<std::size_t> preferredJobList = std::nullopt) {
@@ -2178,59 +2207,70 @@ protected:
         return jobList;
     }
 
-    // Connects the block's message ports. While a run is active, the block joins a job list whose worker remains, the
-    // preferred one while its worker remains, and moves to RUNNING. Returns the index of that job list, none when no run
-    // is active, or the reason the run does not take the block. A refused block stays in the graph and runs from the
-    // next start.
+    // Connects the block's message ports and calls joinRun(). Returns what joinRun() returns.
     [[nodiscard]] std::expected<std::optional<std::size_t>, Error> adoptBlock(const std::shared_ptr<BlockModel>& newBlock, std::optional<std::size_t> preferredJobList = std::nullopt) {
-        using enum lifecycle::State;
         if (const auto connectResult = _toChildMessagePort.connect(*newBlock->msgIn); !connectResult.has_value()) {
             this->emitErrorMessage("connectBlockMessagePorts()", std::format("Failed to connect scheduler input message port to child '{}'", newBlock->uniqueName()));
         }
         auto toSchedulerBuffer = _fromChildMessagePort.buffer();
         newBlock->msgOut->setBuffer(toSchedulerBuffer.streamBuffer, toSchedulerBuffer.tagBuffer);
+        return joinRun(newBlock, preferredJobList);
+    }
 
+    // While a run is active, the block moves to RUNNING and then joins a job list whose worker remains, the preferred one
+    // while its worker remains. Returns the index of that job list, none when no run is active, or the reason the run
+    // does not take the block. A refused block stays in the graph and runs from the next start. A block whose lifecycle
+    // hook fails joins no job list. A block that started after every worker left stops again.
+    [[nodiscard]] std::expected<std::optional<std::size_t>, Error> joinRun(const std::shared_ptr<BlockModel>& block, std::optional<std::size_t> preferredJobList) {
+        using enum lifecycle::State;
         if (!lifecycle::isActive(this->state())) {
             return std::nullopt;
         }
-        auto noWorkerLeft = [&newBlock] { return Error(std::format("every worker of the run has left. '{}' runs from the next start", newBlock->uniqueName())); };
+        auto noWorkerLeft = [&block] { return Error(std::format("every worker of the run has left. '{}' runs from the next start", block->uniqueName())); };
 
-        if (newBlock->blockCategory() == ScheduledBlockGroup) {
+        if (block->blockCategory() == ScheduledBlockGroup) {
             // the scheduler starts an added scheduler and then queues it. The worker that takes it calls into it, and its
             // init() runs inside the start
             if (!hasOpenAdoptionList()) {
                 return std::unexpected(noWorkerLeft());
             }
-            if (auto started = startAdoptedScheduler(newBlock); !started) {
+            if (auto started = startAdoptedScheduler(block); !started) {
                 return std::unexpected(started.error());
             }
-            const std::optional<std::size_t> jobList = queueForAdoption(newBlock, preferredJobList);
+            const std::optional<std::size_t> jobList = queueForAdoption(block, preferredJobList);
             if (!jobList.has_value()) {
                 return std::unexpected(noWorkerLeft());
             }
             wakeParkedWorkers();
             return jobList;
         }
-        const std::optional<std::size_t> jobList = queueForAdoption(newBlock, preferredJobList);
-        if (!jobList.has_value()) {
+        if (!hasOpenAdoptionList()) {
             return std::unexpected(noWorkerLeft());
         }
 
-        switch (newBlock->state()) {
+        switch (block->state()) {
         case STOPPED:
         case IDLE:
-            if (auto initialized = newBlock->changeStateTo(INITIALISED); !initialized) {
+            if (auto initialized = block->changeStateTo(INITIALISED); !initialized) {
                 return std::unexpected(initialized.error());
             }
             [[fallthrough]];
         case INITIALISED:
-            if (auto running = newBlock->changeStateTo(RUNNING); !running) {
+            if (auto running = block->changeStateTo(RUNNING); !running) {
                 return std::unexpected(running.error());
             }
-            wakeParkedWorkers();
-            return jobList;
-        default: return std::unexpected(Error(std::format("block '{}' is {} and cannot join the run", newBlock->uniqueName(), gr::meta::enumName(newBlock->state()).value_or(""))));
+            break;
+        default: return std::unexpected(Error(std::format("block '{}' is {} and cannot join the run", block->uniqueName(), gr::meta::enumName(block->state()).value_or(""))));
         }
+
+        const std::optional<std::size_t> jobList = queueForAdoption(block, preferredJobList);
+        if (!jobList.has_value()) {
+            this->emitErrorMessageIfAny("joinRun() -> REQUESTED_STOP", block->changeStateTo(REQUESTED_STOP));
+            this->emitErrorMessageIfAny("joinRun() -> STOPPED", block->changeStateTo(STOPPED));
+            return std::unexpected(noWorkerLeft());
+        }
+        wakeParkedWorkers();
+        return jobList;
     }
 
     // calls the predicate on each port of the collection and returns true at the first port it accepts
@@ -2311,6 +2351,143 @@ protected:
         if (!names.empty()) {
             replyData["sourcesWithoutReader"] = std::move(names);
         }
+    }
+
+    // true for a block that is STOPPED or in REQUESTED_STOP. A block in REQUESTED_STOP moves to STOPPED at its next
+    // work() call, whatever readers it has
+    [[nodiscard]] static bool isStoppedOrStopping(const BlockModel& block) {
+        const lifecycle::State state = block.state();
+        return state == lifecycle::State::STOPPED || state == lifecycle::State::REQUESTED_STOP;
+    }
+
+    // a block at an end of an edge that an edit adds or takes over, STOPPED or in REQUESTED_STOP, and the job list that
+    // holds it
+    struct StoppedEndpoint {
+        std::shared_ptr<BlockModel> block;
+        std::optional<std::size_t>  jobList;
+    };
+
+    // reads the job lists. The caller calls it before it takes the sweep lock
+    [[nodiscard]] std::vector<StoppedEndpoint> stoppedEndpoints(std::span<const std::shared_ptr<BlockModel>> endpoints) {
+        std::vector<StoppedEndpoint> stopped;
+        for (const std::shared_ptr<BlockModel>& block : endpoints) {
+            const bool listed = std::ranges::any_of(stopped, [&block](const StoppedEndpoint& endpoint) { return endpoint.block == block; });
+            if (!listed && isStoppedOrStopping(*block)) {
+                stopped.push_back({block, jobListHolding(block->uniqueName())});
+            }
+        }
+        return stopped;
+    }
+
+    // the unique names of the blocks that an edit restarted, the reason for each restart refused, keyed by unique name,
+    // and the reason that an edge of the joining block cannot be connected again
+    struct Restarts {
+        Tensor<pmt::Value>   restarted;
+        property_map         refused;
+        std::optional<Error> joiningFailure;
+    };
+
+    // Restarts each endpoint that is still STOPPED or in REQUESTED_STOP while a run is active. A block in REQUESTED_STOP
+    // moves to STOPPED here first, since no worker calls it inside the quiescence. That transition runs no hook. The
+    // block first gets back the stream inputs that its stop released. An edge at the block whose stream input has no
+    // writer is connected again when the block at its other end runs or restarts here. A block that is STOPPED or in
+    // REQUESTED_STOP and does not restart here takes no such edge. The edges at the joining block, a replacement that
+    // takes over released ports, are connected again the same way. A new reader starts at the ring's write position. The
+    // block then joins the run through joinRun(), preferring the job list that holds it. A source that ended runs again
+    // from its start(). The block keeps its message ports, and a message forwarded to it while it was stopped stays
+    // queued for it. A block that cannot be connected again or that the run refuses does not restart. The inputs
+    // connected here for its edges, at either end, are released, and "refused" gives the reason. A refused block
+    // that a failed lifecycle hook left in ERROR leaves every job list through withdrawFromRun(). An edge of the
+    // joining block that cannot be connected again sets "joiningFailure". The caller holds the edit's quiescence and the
+    // sweep lock. A start or a stop since the endpoints were read changes the generation, and this call then restarts
+    // none.
+    [[nodiscard]] Restarts restartStoppedEndpoints(std::span<const StoppedEndpoint> stopped, std::size_t generation, const std::shared_ptr<BlockModel>& joining = nullptr) {
+        using enum lifecycle::State;
+        Restarts result;
+        if (!lifecycle::isActive(this->state()) || runGeneration() != generation) {
+            return result;
+        }
+        std::vector<std::shared_ptr<BlockModel>> restarting;
+        for (const StoppedEndpoint& endpoint : stopped) {
+            if (endpoint.block->state() == REQUESTED_STOP) {
+                this->emitErrorMessageIfAny("restartStoppedEndpoints() -> STOPPED", endpoint.block->changeStateTo(STOPPED));
+            }
+            if (endpoint.block->state() == STOPPED) {
+                restarting.push_back(endpoint.block);
+            }
+        }
+        std::vector<std::shared_ptr<BlockModel>> reconnecting = restarting;
+        if (joining) {
+            reconnecting.push_back(joining);
+        }
+        auto isReconnecting = [&reconnecting](const std::shared_ptr<BlockModel>& block) { return std::ranges::contains(reconnecting, block); };
+        auto runsAfterEdit  = [&isReconnecting](const std::shared_ptr<BlockModel>& block) { return isReconnecting(block) || !isStoppedOrStopping(*block); };
+
+        struct ConnectedInput {
+            std::shared_ptr<BlockModel> source;
+            std::shared_ptr<BlockModel> destination;
+            DynamicPort*                input;
+        };
+        std::vector<ConnectedInput>                                      connectedInputs;
+        std::vector<std::pair<std::shared_ptr<BlockModel>, std::string>> failedBlocks;
+        graph::forEachEdge<block::Category::TransparentBlockGroup>(*_graph, [&](const Edge& edge) {
+            const auto output = edge.sourceBlock()->dynamicOutputPort(edge.sourcePortDefinition());
+            const auto input  = edge.destinationBlock()->dynamicInputPort(edge.destinationPortDefinition());
+            if (!output.has_value() || !input.has_value() || !port::isStream(input.value()->portMaskInfo()) || input.value()->isConnected()) {
+                return;
+            }
+            const auto [source, destination] = edgeEndpoints(edge);
+            if (!(isReconnecting(source) || isReconnecting(destination)) || !runsAfterEdit(source) || !runsAfterEdit(destination)) {
+                return;
+            }
+            if (auto connected = output.value()->connect(*input.value()); connected.has_value()) {
+                connectedInputs.push_back({source, destination, input.value()});
+            } else if (std::ranges::contains(restarting, destination) || std::ranges::contains(restarting, source)) {
+                failedBlocks.emplace_back(std::ranges::contains(restarting, destination) ? destination : source, connected.error().message);
+            } else if (!result.joiningFailure.has_value()) {
+                result.joiningFailure = Error(std::format("'{}' cannot be connected again: {}", joining->uniqueName(), connected.error().message));
+            }
+        });
+
+        for (const StoppedEndpoint& endpoint : stopped) {
+            if (!std::ranges::contains(restarting, endpoint.block)) {
+                continue;
+            }
+            const auto failed = std::ranges::find(failedBlocks, endpoint.block, &std::pair<std::shared_ptr<BlockModel>, std::string>::first);
+            const auto joined = [&] -> std::expected<std::optional<std::size_t>, Error> {
+                if (failed != failedBlocks.end()) {
+                    return std::unexpected(Error(std::format("'{}' cannot be connected again: {}", endpoint.block->uniqueName(), failed->second)));
+                }
+                return joinRun(endpoint.block, endpoint.jobList);
+            }();
+            if (joined.has_value() && joined->has_value()) {
+                result.restarted.push_back(pmt::Value(std::string(endpoint.block->uniqueName())));
+                continue;
+            }
+            for (const ConnectedInput& connected : connectedInputs) {
+                if (connected.source == endpoint.block || connected.destination == endpoint.block) {
+                    std::ignore = connected.input->disconnect();
+                }
+            }
+            if (endpoint.block->state() != STOPPED) {
+                withdrawFromRun(endpoint.block);
+            }
+            result.refused[std::pmr::string(endpoint.block->uniqueName())] = joined.has_value() ? std::string("no run is active") : joined.error().message;
+        }
+        return result;
+    }
+
+    // records the block for every worker of the run, which takes it out of its list before its next traversal
+    void withdrawFromRun(const std::shared_ptr<BlockModel>& block) {
+        std::lock_guard guard(_adoptionBlocksMutex);
+        _withdrawnBlocks.push_back(block);
+        gr::atomic_ref(_nWithdrawnBlocks).store_release(_withdrawnBlocks.size());
+    }
+
+    // adds "restartedBlocks" and "refusedRestarts" to the reply
+    static void addRestarts(property_map& replyData, Restarts restarts) {
+        replyData["restartedBlocks"] = std::move(restarts.restarted);
+        replyData["refusedRestarts"] = std::move(restarts.refused);
     }
 
     // The reply to a request that edits the graph. It keeps the request's clientRequestID, takes the reply endpoint and
@@ -2560,7 +2737,10 @@ protected:
 
     // The EdgeEmplaced reply lists the edges the new one displaced under "displacedEdges", keyed by index as in a
     // GraphInspect reply, and the displaced sources left without a reader under "sourcesWithoutReader", by the check of
-    // sourcesWithoutReader().
+    // sourcesWithoutReader(). While a run is active, a block in STOPPED or REQUESTED_STOP that holds a port of the new
+    // edge runs again through restartStoppedEndpoints(). A port that a block group exports resolves to the block inside
+    // the group. The reply lists the unique names of the blocks restarted under "restartedBlocks" and the reason for
+    // each restart refused under "refusedRestarts".
     std::expected<property_map, Error> emplaceEdgeByMessage(const Message& message) {
         property_map messageData      = message.data.value();
         const auto   sourceBlock      = messageData.at(std::pmr::string(gr::serialization_fields::EDGE_SOURCE_BLOCK)).value_or(std::string_view{});
@@ -2587,6 +2767,7 @@ protected:
         messageData["_targetGraph"] = targetGraph->unique_name.value();
         {
             WorkQuiescenceGuard quiescence(this);
+            const std::size_t   generation             = runGeneration();
             const std::size_t   effectiveMinBufferSize = (*minBufferSize == gr::undefined_Size) ? gr::undefined_size : static_cast<std::size_t>(*minBufferSize);
             if (auto result = targetGraph->emplaceEdge(sourceBlock, std::string(sourcePort), destinationBlock, std::string(destinationPort), effectiveMinBufferSize, *weight, edgeName); result.has_value()) {
                 property_map                             displacedEdges;
@@ -2600,6 +2781,11 @@ protected:
             } else {
                 return std::unexpected(result.error());
             }
+            const auto [source, destination] = edgeEndpoints(targetGraph->edges().back());
+            const std::array                   endpoints{source, destination};
+            const std::vector<StoppedEndpoint> stopped = stoppedEndpoints(endpoints);
+            std::lock_guard                    childLock(_childLifecycleMutex);
+            addRestarts(messageData, restartStoppedEndpoints(stopped, generation));
         }
 
         return messageData;
@@ -2715,8 +2901,26 @@ protected:
         return true;
     }
 
-    // moves the blocks queued for this job list into the worker's list and records them in the job list, where a later
-    // replacement of one of them finds it. Returns the number of blocks moved
+    // takes the withdrawn blocks out of the worker's list and out of every job list. Returns the number of blocks
+    // withdrawn in this run. The worker counts as inside work() during the call. No edit runs meanwhile
+    std::size_t dropWithdrawnBlocks(std::vector<std::shared_ptr<BlockModel>>& localBlockList) {
+        const std::vector<std::shared_ptr<BlockModel>> withdrawn = [this] {
+            std::lock_guard guard(_adoptionBlocksMutex);
+            return _withdrawnBlocks;
+        }();
+        std::lock_guard lock(_executionOrderMutex); // never taken under the adoption lock
+        for (const std::shared_ptr<BlockModel>& block : withdrawn) {
+            std::erase(localBlockList, block);
+            for (std::vector<std::shared_ptr<BlockModel>>& jobList : *_executionOrder) {
+                std::erase(jobList, block);
+            }
+        }
+        return withdrawn.size();
+    }
+
+    // moves the blocks queued for this job list into the worker's list and records them in this job list alone, where a
+    // later replacement or restart of one of them finds it. A restarted block that the worker already holds is not
+    // added again. Returns the number of blocks taken from the queue
     std::size_t adoptBlocks(std::size_t runnerID, std::vector<std::shared_ptr<BlockModel>>& localBlockList) {
         std::vector<std::shared_ptr<BlockModel>> newBlocks;
         {
@@ -2729,10 +2933,22 @@ protected:
         if (newBlocks.empty()) {
             return 0UZ;
         }
-        localBlockList.insert(localBlockList.end(), newBlocks.begin(), newBlocks.end());
         std::lock_guard lock(_executionOrderMutex); // never taken under the adoption lock
-        if (runnerID < _executionOrder->size()) {
-            std::ranges::copy(newBlocks, std::back_inserter((*_executionOrder)[runnerID]));
+        for (const std::shared_ptr<BlockModel>& block : newBlocks) {
+            if (std::ranges::find(localBlockList, block) == localBlockList.end()) {
+                localBlockList.push_back(block);
+            }
+            if (runnerID >= _executionOrder->size()) {
+                continue;
+            }
+            for (std::size_t i = 0UZ; i < _executionOrder->size(); ++i) {
+                if (i != runnerID) {
+                    std::erase((*_executionOrder)[i], block);
+                }
+            }
+            if (std::ranges::find((*_executionOrder)[runnerID], block) == (*_executionOrder)[runnerID].end()) {
+                (*_executionOrder)[runnerID].push_back(block);
+            }
         }
         return newBlocks.size();
     }
@@ -2743,10 +2959,13 @@ protected:
       - Stops the block through stopChild() if it is still running or paused.
       - Removes the block from adoption lists (to handle edge cases such as Add Block → Remove Block).
       - Adds it to the zombie list.
+      - Drops a block that is not active and that no job list holds. No worker reaches such a block to delete it. A
+        worker that still holds it in its own list keeps it until that worker drops it.
 
       The block will be physically deleted by cleanupZombieBlocks() when it reaches a safe state.
     */
     void makeZombie(std::shared_ptr<BlockModel> block) {
+        const bool active = lifecycle::isActive(block->state());
         stopChild(*block, "makeZombie");
 
         {
@@ -2761,6 +2980,9 @@ protected:
             }
         }
 
+        if (!active && !jobListHolds(block)) {
+            return;
+        }
         std::lock_guard guard(_zombieBlocksMutex);
         _zombieBlocks.push_back(std::move(block));
     }
@@ -2856,8 +3078,13 @@ protected:
     // The replacement takes the replaced block's place while no worker is inside a work() call, and the replaced block
     // stops inside that quiescence. While a run is active, the replacement joins the job list that held the replaced
     // block. The edit holds the lock of stop()'s sweep. A stop that has begun when the edit decides leaves the
-    // replacement out of the run, and the sweep then stops the replacement. The BlockReplaced reply carries the
-    // replacement as the graph serializes it and "jobList", the index of the job list it joined
+    // replacement out of the run, and the sweep then stops the replacement. A block in STOPPED or REQUESTED_STOP that
+    // holds the port at the other end of an edge that the replacement takes over runs again through
+    // restartStoppedEndpoints(). The inputs that the replaced block released and the replacement took over are
+    // connected again the same way. An edge of the replacement that cannot be connected again is the reply's error. The
+    // BlockReplaced reply carries the replacement as the graph serializes it, "jobList", the index of the job list it
+    // joined, "restartedBlocks", the unique names of the blocks restarted, and "refusedRestarts", the reason for each
+    // restart refused
     std::expected<property_map, Error> replaceBlockByMessage(const Message& message) {
         const auto& messageData = message.data.value();
         const auto  uniqueName  = messageData.at("uniqueName").value_or(std::string_view{});
@@ -2886,17 +3113,31 @@ protected:
 
         std::shared_ptr<BlockModel>                      newBlock;
         std::expected<std::optional<std::size_t>, Error> adopted;
+        Restarts                                         restarts;
         {
-            WorkQuiescenceGuard              quiescence(this); // _blocks is traversed by every worker and by forEachBlock
-            const std::size_t                generation = runGeneration();
-            const std::optional<std::size_t> heldBy     = jobListHolding(uniqueName);
-            std::shared_ptr<BlockModel>      oldBlock;
+            WorkQuiescenceGuard                      quiescence(this); // _blocks is traversed by every worker and by forEachBlock
+            const std::size_t                        generation = runGeneration();
+            const std::optional<std::size_t>         heldBy     = jobListHolding(uniqueName);
+            std::vector<std::shared_ptr<BlockModel>> neighbors;
+            for (const Edge& edge : targetGraph->edges()) {
+                const bool fromReplaced = edge.sourceBlock()->uniqueName() == uniqueName;
+                const bool toReplaced   = edge.destinationBlock()->uniqueName() == uniqueName;
+                if (fromReplaced != toReplaced) {
+                    const auto [source, destination] = edgeEndpoints(edge);
+                    neighbors.push_back(fromReplaced ? destination : source);
+                }
+            }
+            const std::vector<StoppedEndpoint> stopped = stoppedEndpoints(neighbors);
+            std::shared_ptr<BlockModel>        oldBlock;
             {
                 std::lock_guard childLock(_childLifecycleMutex);
                 auto [replaced, replacement] = targetGraph->replaceBlock(uniqueName, type, properties);
                 oldBlock                     = std::move(replaced);
                 newBlock                     = std::move(replacement);
                 adopted                      = adoptBlock(newBlock, runGeneration() == generation ? heldBy : std::nullopt);
+                if (adopted) {
+                    restarts = restartStoppedEndpoints(stopped, generation, newBlock);
+                }
             }
             // outside the sweep lock: cleanupZombieBlocks() takes _executionOrderMutex under the zombie lock, and start()
             // takes the sweep lock under _executionOrderMutex
@@ -2905,10 +3146,14 @@ protected:
         if (!adopted) {
             return std::unexpected(adopted.error());
         }
+        if (restarts.joiningFailure.has_value()) {
+            return std::unexpected(*restarts.joiningFailure);
+        }
 
         auto replyData                       = serializeBlock(gr::globalPluginLoader(), newBlock, BlockSerializationFlags::All);
         replyData["_targetGraph"]            = targetGraph->unique_name.value();
         replyData["replacedBlockUniqueName"] = uniqueName;
+        addRestarts(replyData, std::move(restarts));
         addJobList(replyData, *adopted);
         return replyData;
     }
