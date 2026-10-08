@@ -53,6 +53,7 @@ struct MinimalSettings : gr::SettingsBase {
     [[nodiscard]] gr::property_map activeParameters() const noexcept override { return {}; }
 
     [[nodiscard]] const std::set<std::string>& writableMembers() const override { return _keys; }
+    [[nodiscard]] std::set<std::string>        readableMembers() const override { return _keys; }
     [[nodiscard]] std::set<std::string>        autoUpdateParameters(gr::SettingsCtx) noexcept override { return {}; }
     [[nodiscard]] const std::set<std::string>& autoForwardParameters() const noexcept override { return _keys; }
     void                                       addAutoForwardParameters(std::set<std::string> parameterKeys) override { _keys.merge(parameterKeys); }

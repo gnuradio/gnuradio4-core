@@ -1005,15 +1005,17 @@ connections:
 
         const auto loaded = gr::loadGrc(loader, R"yaml(blocks:
   - id: qa::ConstructionRecorder
+    meta_information:
+      unread: a value the block does not declare
     parameters:
       name: given
       gain: 3.0
-      unread: a key the block does not declare
   - id: qa::ConstructionRecorder
+    meta_information:
+      unread: a value the block does not declare
     parameters:
       name: from-file
       gain: 3.0
-      unread: a key the block does not declare
 )yaml",
             gr::BlockSettings{{"given", {{"gain", 5.0f}}}});
         expect(eq(loaded->blocks().size(), 2UZ));
@@ -1022,10 +1024,10 @@ connections:
             const std::shared_ptr<BlockModel>& fromFile = loaded->blocks()[1];
             expect(recorderOf(given).gainAtConstruction == std::optional(5.0f)) << "the constructor reads the given value";
             expect(eq(recorderOf(given).gain.value, 5.0f)) << "the settings hold the given value";
-            expect(given->metaInformation().contains("unread")) << "a key of the file the block does not declare stays meta information";
+            expect(given->metaInformation().contains("unread")) << "the entry's meta_information reaches the block";
             expect(recorderOf(fromFile).gainAtConstruction == std::optional(3.0f)) << "a block without an entry is constructed with the file's parameters";
             expect(eq(recorderOf(fromFile).gain.value, 3.0f));
-            expect(fromFile->metaInformation().contains("unread")) << "a key of the file the block does not declare stays meta information";
+            expect(fromFile->metaInformation().contains("unread")) << "the entry's meta_information reaches the block";
         }
 
         const auto alone = gr::loadGrc(loader, R"yaml(blocks:
@@ -1071,10 +1073,11 @@ const boost::ut::suite<"GRC subgraph settings"> grcSubgraphSettingsTests = [] {
     static constexpr std::string_view kGroup = R"yaml(blocks:
   - id: SUBGRAPH
     unique_name: the-group
+    meta_information:
+      unread: a value the subgraph does not declare
     parameters:
       name: group
       disconnect_on_done: false
-      unread: a key the subgraph does not declare
     ctx_parameters:
       - context: night
         time: !!uint64 5
@@ -1118,7 +1121,7 @@ const boost::ut::suite<"GRC subgraph settings"> grcSubgraphSettingsTests = [] {
 
         expect(eq(std::string(group.name()), std::string("group")));
         expect(group.settings().get().at("disconnect_on_done") == pmt::Value(false)) << "the file's value must replace the default";
-        expect(group.metaInformation().contains("unread")) << "a key the subgraph does not declare stays meta information";
+        expect(group.metaInformation().contains("unread")) << "the entry's meta_information reaches the subgraph";
         expect(storedInContext(group, "night", "disconnect_on_done") == std::optional(pmt::Value(true))) << "the context's value must be stored";
         expect(fatal(group.graph() != nullptr));
         expect(eq(group.graph()->blocks().size(), 1UZ)) << "the interior loads beside the settings";
@@ -1238,6 +1241,48 @@ const boost::ut::suite<"GRC load refusals"> grcRefusalTests = [] {
         expect(report.contains("block 'sum'")) << report;
         expect(report.contains("n_inputs = 9")) << report;
         expect(report.contains("[1, 8]")) << report;
+    };
+
+    "a file's misspelled parameter fails the load naming the nearest key"_test = [&reportOf] {
+        registerTestBlocks();
+        const std::string report = reportOf(R"yaml(blocks:
+  - id: qa::SumInputs
+    parameters:
+      name: sum
+      n_input: 3
+)yaml");
+        expect(report.contains("block 'sum'")) << report;
+        expect(report.contains("declares no setting named 'n_input'")) << report;
+        expect(report.contains("'n_inputs'")) << "the nearest key is offered" << report;
+    };
+
+    "a misspelled key in a ctx_parameters entry fails the load naming the nearest key"_test = [&reportOf] {
+        registerTestBlocks();
+        const std::string report = reportOf(R"yaml(blocks:
+  - id: qa::SumInputs
+    parameters:
+      name: sum
+    ctx_parameters:
+      - context: night
+        time: !!uint64 5
+        parameters:
+          n_input: 3
+)yaml");
+        expect(report.contains("block 'sum'")) << report;
+        expect(report.contains("declares no setting named 'n_input'")) << report;
+        expect(report.contains("'n_inputs'")) << "the nearest key is offered" << report;
+
+        const std::string readOnly = reportOf(R"yaml(blocks:
+  - id: qa::SumInputs
+    parameters:
+      name: sum
+    ctx_parameters:
+      - context: night
+        time: !!uint64 5
+        parameters:
+          input_chunk_size: 1
+)yaml");
+        expect(readOnly.empty()) << "a read-only member the writer stores in a context loads" << readOnly;
     };
 };
 

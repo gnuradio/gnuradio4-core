@@ -44,6 +44,14 @@ CtxSettingsBase::CtxSettingsBase(void* block, const settings::BlockDescriptor& d
 
 const std::set<std::string>& CtxSettingsBase::writableMembers() const { return _descriptor->writableMembers; }
 
+std::set<std::string> CtxSettingsBase::readableMembers() const {
+    std::set<std::string> names;
+    for (const settings::MemberDescriptor* member : _descriptor->readableMembers) {
+        names.emplace(member->name);
+    }
+    return names;
+}
+
 bool CtxSettingsBase::changed() const noexcept { return gr::atomic_ref(_changed).load_acquire(); }
 void CtxSettingsBase::setChanged(bool b) noexcept { gr::atomic_ref(_changed).store_release(b); }
 
