@@ -800,6 +800,88 @@ struct NamedPool {
 
 [[nodiscard]] NamedPool<gr::thread_pool::TaskExecutor> twoThreadPool() { return fixedPool(kOccupiedPoolName, 2U); }
 
+// true once `count` threads wait on the graph's progress sequence
+template<typename TScheduler>
+[[nodiscard]] bool awaitParkedWorkers(const TScheduler& scheduler, std::size_t count) {
+    return awaitCondition([&scheduler, count] { return scheduler.graph().progress().nTimedWaiters() == count; });
+}
+
+// reads the scheduler's wake count
+template<typename TScheduler>
+struct ParkingProbe : TScheduler {
+    using TScheduler::TScheduler;
+
+    [[nodiscard]] const gr::Sequence* wakeSequence() const { return this->_wake.get(); }
+};
+
+using BlockingProbe = ParkingProbe<BlockingScheduler>;
+
+// publishes a message into msgIn from a thread exempt from the scheduler's wake, as a worker's thread publishes. No
+// parked worker returns on that publication. The calling thread then runs the scheduler's message service until msgIn
+// is empty, as a parent scheduler's worker runs a nested scheduler's. That thread runs none of the run's blocks
+template<typename TProbe, typename TSend>
+void serveOnCallingThread(TProbe& scheduler, TSend send) {
+    const gr::Sequence* previousExempt = std::exchange(gr::detail::publishWakeExempt(), scheduler.wakeSequence());
+    send();
+    gr::detail::publishWakeExempt() = previousExempt;
+    std::ignore                     = awaitCondition([&scheduler] {
+        scheduler.processScheduledMessages();
+        return scheduler.msgIn.streamReader().available() == 0UZ;
+    });
+}
+
+// a blocking source whose first work() call waits for a release. With `_releaseInPause` its pause() hook releases the
+// call and waits up to kSweepParkBound for a worker to park on `_progress`. The worker's passes after the release then
+// fall inside the pause's sweep, before the scheduler publishes PAUSED. Without it the test releases the call after
+// pause() returns, and the call spans the whole pause
+struct PauseProbeSource : gr::Block<PauseProbeSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(PauseProbeSource, out);
+
+    static constexpr auto kSweepParkBound = std::chrono::milliseconds(100);
+
+    const gr::Sequence* _progress       = nullptr;
+    bool                _releaseInPause = true;
+    std::atomic<bool>   _inside{false};
+    std::atomic<bool>   _released{false};
+    std::atomic<bool>   _parkedInSweep{false};
+
+    [[nodiscard]] constexpr bool isBlocking() const noexcept { return true; }
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        if (!_released.load(std::memory_order_acquire)) {
+            _inside.store(true, std::memory_order_release);
+            std::ignore = awaitCondition([this] { return _released.load(std::memory_order_acquire); });
+        }
+        outSpan.publish(0UZ);
+        return gr::work::Status::OK;
+    }
+
+    void release() { _released.store(true, std::memory_order_release); }
+
+    void pause() {
+        if (!_releaseInPause) {
+            return;
+        }
+        release();
+        const bool parked = _progress != nullptr && awaitCondition([this] { return _progress->nTimedWaiters() > 0U; }, kSweepParkBound);
+        _parkedInSweep.store(parked, std::memory_order_release);
+    }
+};
+
+// a sink that reports itself blocking. While a worker of its run is inside the scheduler's loop, a removal or a
+// replacement leaves the sink in REQUESTED_STOP until its own next work() call moves it to STOPPED
+struct BlockingSink : gr::Block<BlockingSink> {
+    gr::PortIn<float> in;
+
+    GR_MAKE_REFLECTABLE(BlockingSink, in);
+
+    [[nodiscard]] constexpr bool isBlocking() const noexcept { return true; }
+
+    void processOne(float) {}
+};
+
 constexpr std::string_view kDeferringPoolName = "qa_deferring_cpu";
 
 // a growable pool whose execute() returns before a thread takes the task. It holds every task until release() hands
@@ -3324,6 +3406,102 @@ const boost::ut::suite<"a message to a parked run"> parkedMessageTests = [] {
         const auto [reported, nPolls] = qa_sched::stallReportedWhilePolling(true);
         expect(reported) << std::format("{} requests to a block hid the stalled graph from the watchdog", nPolls);
     };
+};
+
+const boost::ut::suite<"workers that park"> parkingWorkerTests = [] {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    // A park lasts up to kParkTimeout. An edit or a pause must reach a parked worker within kPromptBound, a tenth of the
+    // park. The watchdog's period lies beyond it.
+    constexpr auto         kParkTimeout = std::chrono::milliseconds(3000);
+    constexpr auto         kPromptBound = kParkTimeout / 10;
+    const gr::property_map parkingSettings{{"timeout_ms", static_cast<gr::Size_t>(kParkTimeout.count())}, {"watchdog_timeout", gr::Size_t(60'000)}};
+
+    // The test's thread runs the scheduler's message service, and the message reaches msgIn without a wake (see
+    // serveOnCallingThread()). The handler's own wake is then the only one the parked worker that owns the affected
+    // block can receive before its park times out. Each case times the block's response from the serve.
+    auto respondsAfterServe = [&]<typename TProbe>(std::string_view what, const gr::property_map& settings, gr::Graph flow, std::size_t nWorkers, auto serve, auto respondedAt) {
+        TProbe         scheduler(settings);
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(toScheduler.connect(scheduler.msgIn).has_value());
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        bool                  allParked = false;
+        std::optional<double> delayMs;
+        const bool            completed = qa_sched::runAndWaitWithin(scheduler, qa_sched::kEventBound, [&] {
+            allParked           = qa_sched::awaitParkedWorkers(scheduler, nWorkers);
+            const auto servedAt = std::chrono::steady_clock::now();
+            serve(scheduler, toScheduler);
+            std::optional<std::chrono::steady_clock::time_point> at;
+            if (qa_sched::awaitCondition([&] { return (at = respondedAt(scheduler)).has_value(); })) {
+                delayMs = qa_sched::Millis(*at - servedAt).count();
+            }
+            scheduler.requestStop();
+        });
+        std::println("{} on a parked run (timeout_ms {}): {}", what, kParkTimeout.count(), delayMs.has_value() ? std::format("after {:.2f} ms", *delayMs) : std::string("no response"));
+        expect(completed) << what;
+        expect(eq(scheduler.jobs()->size(), nWorkers)) << what << "one job list per block";
+        expect(allParked) << what << "the workers did not all park";
+        expect(delayMs.has_value()) << what << "the block did not respond";
+        expect(lt(delayMs.value_or(static_cast<double>(kParkTimeout.count())), static_cast<double>(kPromptBound.count()))) << what << std::format("waited of a {} ms park", kParkTimeout.count());
+    };
+    auto stoppedAt = [](const gr::BlockModel* block) -> std::optional<std::chrono::steady_clock::time_point> { return block != nullptr && block->state() == STOPPED ? std::optional(std::chrono::steady_clock::now()) : std::nullopt; };
+
+    // the removed sink reaches STOPPED in its own worker's next work() call (see BlockingSink)
+    auto removedBlockStops = [&]<typename TProbe>(std::string_view what, const gr::property_map& settings, std::size_t nWorkers) {
+        gr::Graph                       flow;
+        auto&                           source = flow.emplaceBlock<qa_sched::ReleasedSource>();
+        auto&                           sink   = flow.emplaceBlock<qa_sched::BlockingSink>();
+        const std::string               sinkName(sink.unique_name);
+        std::shared_ptr<gr::BlockModel> sinkModel = flow.blocks().back();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+        respondsAfterServe.operator()<TProbe>(
+            what, settings, std::move(flow), nWorkers, //
+            [&](TProbe& scheduler, gr::MsgPortOut& toScheduler) { qa_sched::serveOnCallingThread(scheduler, [&] { gr::sendMessage<gr::message::Command::Set>(toScheduler, scheduler.unique_name, gr::scheduler::property::kRemoveBlock, gr::property_map{{"uniqueName", sinkName}}); }); }, [&](auto&) { return stoppedAt(sinkModel.get()); });
+    };
+
+    "a block that a message served on another thread removes from a parked singleThreadedBlocking run stops within a tenth of the park"_test = [&] { removedBlockStops.operator()<qa_sched::BlockingProbe>("removed block, singleThreadedBlocking", parkingSettings, 1UZ); };
+
+    // The source's first work() call holds the run's one worker until the pause reaches the source's pause() hook, or,
+    // with `spansPause`, until pause() has returned. The scheduler reads REQUESTED_PAUSE before pause() runs. A
+    // single-threaded worker reads the state in a message pass once per process_stream_to_message_ratio passes. Its
+    // park falls due a few passes after the release, before its next message pass. The state read at the park keeps it
+    // from parking on the RUNNING it read before the pause: in the sweep, where the hook would see the park, and after
+    // PAUSED, where no wake follows.
+    auto pauseParksNoWorker = [&]<typename TScheduler>(std::string_view caseName, bool spansPause, const gr::property_map& settings) {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::PauseProbeSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+        source._releaseInPause = !spansPause;
+
+        TScheduler scheduler(settings);
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        source._progress = std::addressof(scheduler.graph().progress());
+
+        bool       paused           = false;
+        bool       parkedAfterPause = false;
+        const bool completed        = qa_sched::runAndWaitWithin(scheduler, qa_sched::kEventBound, [&] {
+            std::ignore = qa_sched::awaitCondition([&source] { return source._inside.load(std::memory_order_acquire); });
+            expect(scheduler.changeStateTo(REQUESTED_PAUSE).has_value());
+            paused = scheduler.state() == PAUSED;
+            source.release();
+            parkedAfterPause = qa_sched::awaitCondition([&scheduler] { return scheduler.graph().progress().nTimedWaiters() > 0U; }, kPromptBound);
+            scheduler.requestStop();
+        });
+        const bool parkedInSweep    = source._parkedInSweep.load(std::memory_order_acquire);
+        std::println("pause, {} (timeout_ms {}): parked during the sweep {}, parked within {} ms of PAUSED {}", caseName, kParkTimeout.count(), parkedInSweep, kPromptBound.count(), parkedAfterPause);
+        expect(completed) << caseName;
+        expect(paused) << caseName << "the pause did not publish PAUSED";
+        expect(!parkedInSweep) << caseName << "a worker parked while the pause swept the blocks";
+        expect(!parkedAfterPause) << caseName << "a worker parked after the scheduler read PAUSED";
+    };
+
+    "a singleThreadedBlocking worker does not park while a pause sweeps the blocks"_test                 = [&] { pauseParksNoWorker.operator()<qa_sched::BlockingScheduler>("singleThreadedBlocking, released in the sweep", false, parkingSettings); };
+    "a singleThreadedBlocking worker whose work() call spans a pause does not park after the pause"_test = [&] { pauseParksNoWorker.operator()<qa_sched::BlockingScheduler>("singleThreadedBlocking, work() spanning the pause", true, parkingSettings); };
 };
 
 namespace qa_sched {

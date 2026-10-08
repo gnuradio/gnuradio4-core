@@ -85,6 +85,9 @@ public:
         return waitForChange(deadline, [this, oldValue, &other, otherOldValue] { return hasLeft(oldValue) || other.hasLeft(otherOldValue); });
     }
 
+    // the threads waiting in waitUntil()
+    [[nodiscard]] std::uint32_t nTimedWaiters() const noexcept { return gr::atomic_ref(_nTimedWaiters).load_acquire(); }
+
     void notify_all() noexcept {
         gr::atomic_ref(_fieldsValue).notify_all();
         if (gr::atomic_ref(_nTimedWaiters).load_acquire() != 0U) [[unlikely]] {
