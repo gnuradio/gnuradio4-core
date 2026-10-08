@@ -482,11 +482,15 @@ namespace detail {
 template<template<typename...> typename OtherTypelist, typename... Args>
 meta::typelist<Args...> to_typelist_helper(OtherTypelist<Args...>*);
 
+// Yields T whatever the index. Deliberately a class template: an alias template is substituted
+// before the pack is expanded, which would leave no pack in the pattern to expand.
 template<typename T, size_t>
-using repeat_type_for_index = T;
+struct repeat_type_for_index {
+    using type = T;
+};
 
 template<typename T, size_t... Is>
-meta::typelist<repeat_type_for_index<T, Is>...> array_to_typelist_helper(std::index_sequence<Is...>);
+meta::typelist<typename repeat_type_for_index<T, Is>::type...> array_to_typelist_helper(std::index_sequence<Is...>);
 
 template<template<typename, size_t> typename ArrayLike, typename T, size_t N>
 decltype(array_to_typelist_helper<T>(std::make_index_sequence<N>())) to_typelist_helper(ArrayLike<T, N>*);
