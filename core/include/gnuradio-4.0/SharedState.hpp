@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 
@@ -70,5 +71,25 @@ GNURADIO_EXPORT const void*& applyingScheduler() noexcept;
 GNURADIO_EXPORT const void*& exchangingScheduler() noexcept;
 
 } // namespace gr::scheduler
+
+namespace gr::thread_pool {
+class Manager;
+}
+
+namespace gr::thread_pool::detail {
+
+// the thread pool manager that Manager::instance() returns, constructed with its default pools on the first call
+GNURADIO_EXPORT Manager& threadPoolManager();
+
+// the threads that the program's BasicThreadPool instances have started and not yet joined
+GNURADIO_EXPORT std::atomic_size_t& globalThreadCount() noexcept;
+
+// the number in the name of the next BasicThreadPool constructed without a name
+GNURADIO_EXPORT std::atomic<std::uint64_t>& globalPoolId() noexcept;
+
+// the id of the latest task that a BasicThreadPool queued
+GNURADIO_EXPORT std::atomic<std::uint64_t>& taskID() noexcept;
+
+} // namespace gr::thread_pool::detail
 
 #endif // GNURADIO_SHARED_STATE_HPP

@@ -24,6 +24,7 @@
 #include <mach/mach.h>
 #endif
 
+#include "../SharedState.hpp"
 #include "../WaitStrategy.hpp"
 #include "thread_affinity.hpp"
 
@@ -334,11 +335,8 @@ std::size_t getTotalThreadCount(); // forward declaration
 class BasicThreadPool {
     using Task      = thread_pool::detail::Task;
     using TaskQueue = thread_pool::detail::TaskQueue;
-    static std::atomic_size_t    _globalThreadCount;
-    static std::atomic<uint64_t> _globalPoolId;
-    static std::atomic<uint64_t> _taskID;
 
-    static std::string generateName() { return std::format("BasicThreadPool#{}", _globalPoolId.fetch_add(1)); }
+    static std::string generateName() { return std::format("BasicThreadPool#{}", detail::globalPoolId().fetch_add(1)); }
 
     std::atomic_bool _initialised = ATOMIC_FLAG_INIT;
     std::atomic_bool _shutdown    = false;
@@ -373,8 +371,6 @@ class BasicThreadPool {
     const TaskType        _taskType;
     std::atomic<uint32_t> _minThreads;
     std::atomic<uint32_t> _maxThreads;
-
-    friend std::size_t gr::thread_pool::getTotalThreadCount();
 
 public:
     std::chrono::microseconds sleepDuration     = std::chrono::milliseconds(1);
@@ -655,8 +651,9 @@ private:
 
     // A worker that has left stays joinable until it is joined. Under Emscripten such a thread keeps its web worker
     // until then. The pool joins the workers that left before it creates another. The pool then holds at most
-    // maxThreads() threads. A thread stays in _globalThreadCount until it is joined. The caller holds _threadListMutex,
-    // and waitLock is released. The records are taken under _waitMutex and the threads are joined without it.
+    // maxThreads() threads. A thread stays in detail::globalThreadCount() until it is joined. The caller holds
+    // _threadListMutex, and waitLock is released. The records are taken under _waitMutex and the threads are joined
+    // without it.
     void joinDepartedThreads(std::unique_lock<std::mutex>& waitLock) {
         // a leaving worker records itself without allocating
         std::vector<std::thread::id> departedThreads;
@@ -673,7 +670,7 @@ private:
                 return false;
             }
             thread.join();
-            _globalThreadCount.fetch_sub(1UZ, std::memory_order_relaxed);
+            detail::globalThreadCount().fetch_sub(1UZ, std::memory_order_relaxed);
             return true;
         });
     }
@@ -693,7 +690,7 @@ private:
             }
             for (auto& [threadID, thread] : threads) {
                 thread.join();
-                _globalThreadCount.fetch_sub(1UZ, std::memory_order_relaxed);
+                detail::globalThreadCount().fetch_sub(1UZ, std::memory_order_relaxed);
             }
         }
     }
@@ -726,7 +723,7 @@ private:
             --_numReserved;
             _workerCreationDone.notify_all();
         };
-        _globalThreadCount.fetch_add(1UZ, std::memory_order_relaxed);
+        detail::globalThreadCount().fetch_add(1UZ, std::memory_order_relaxed);
         std::thread* newThread = nullptr;
         std::size_t  threadIdx = 0UZ;
         try {
@@ -740,7 +737,7 @@ private:
             }
             newThread = &_threads.try_emplace(threadIdx, &BasicThreadPool::worker, this, threadIdx).first->second;
         } catch (...) {
-            _globalThreadCount.fetch_sub(1UZ, std::memory_order_relaxed);
+            detail::globalThreadCount().fetch_sub(1UZ, std::memory_order_relaxed);
             relock();
             --_numIdleWorkers;
             _numThreads.fetch_sub(1UZ, std::memory_order_acq_rel);
@@ -764,13 +761,13 @@ private:
         auto extracted = _recycledTasks.pop();
         if (extracted.empty()) {
             if constexpr (sizeof...(A) == 0) {
-                extracted.push_front(Task{.id = _taskID.fetch_add(1U) + 1U, .func = std::forward<F>(f)});
+                extracted.push_front(Task{.id = detail::taskID().fetch_add(1U) + 1U, .func = std::forward<F>(f)});
             } else {
-                extracted.push_front(Task{.id = _taskID.fetch_add(1U) + 1U, .func = std::bind_front(std::forward<F>(f), std::forward<A>(args)...)});
+                extracted.push_front(Task{.id = detail::taskID().fetch_add(1U) + 1U, .func = std::bind_front(std::forward<F>(f), std::forward<A>(args)...)});
             }
         } else {
             auto& task = extracted.front();
-            task.id    = _taskID.fetch_add(1U) + 1U;
+            task.id    = detail::taskID().fetch_add(1U) + 1U;
             if constexpr (sizeof...(A) == 0) {
                 task.func = std::forward<F>(f);
             } else {
@@ -876,9 +873,6 @@ private:
     }
 };
 
-inline std::atomic_size_t    BasicThreadPool::_globalThreadCount = 0UZ;
-inline std::atomic<uint64_t> BasicThreadPool::_globalPoolId      = 0U;
-inline std::atomic<uint64_t> BasicThreadPool::_taskID            = 0U;
 static_assert(ThreadPool<BasicThreadPool>);
 
 inline std::size_t getTotalThreadCount() {
@@ -894,13 +888,13 @@ inline std::size_t getTotalThreadCount() {
     const bool        isBrowser         = EM_ASM_INT({ return (typeof window !== 'undefined' && typeof window.document !== 'undefined') ? 1 : 0; });
     // clang-format on
     if (isNode) {
-        return BasicThreadPool::_globalThreadCount.load(std::memory_order_relaxed); // nodejs doesn't limit the threads to the PTHREAD_POOL_SIZE as browser do
+        return detail::globalThreadCount().load(std::memory_order_relaxed); // nodejs doesn't limit the threads to the PTHREAD_POOL_SIZE as browser do
     } else if (isBrowser) {
-        return std::max(nTreadsWASM, BasicThreadPool::_globalThreadCount.load(std::memory_order_relaxed));
+        return std::max(nTreadsWASM, detail::globalThreadCount().load(std::memory_order_relaxed));
     }
-    return BasicThreadPool::_globalThreadCount.load(std::memory_order_relaxed);
+    return detail::globalThreadCount().load(std::memory_order_relaxed);
 #else
-    return BasicThreadPool::_globalThreadCount.load(std::memory_order_relaxed);
+    return detail::globalThreadCount().load(std::memory_order_relaxed);
 #endif
 #elif defined(__linux__)
     std::ifstream status{"/proc/self/status"};
@@ -923,9 +917,9 @@ inline std::size_t getTotalThreadCount() {
         vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(threadList), threadCount * sizeof(thread_act_t));
         return static_cast<std::size_t>(threadCount);
     }
-    return BasicThreadPool::_globalThreadCount.load(std::memory_order_relaxed);
+    return detail::globalThreadCount().load(std::memory_order_relaxed);
 #else
-    return BasicThreadPool::_globalThreadCount.load(std::memory_order_relaxed);
+    return detail::globalThreadCount().load(std::memory_order_relaxed);
 #endif
 }
 
@@ -1060,6 +1054,15 @@ inline ThreadSplit computeDefaultThreadSplit(std::size_t threadLimit = gr::threa
  *  <li> Internally, the registry uses <code>std::shared_ptr</code> to allow safe concurrent access and reference counting
  *  <li> The manager’s <code>get()</code> returns a shared reference; pools remain valid while in use
  *  <li> Registration and replacement are synchronised via <code>std::mutex</code>
+ *  <li> The program holds one manager. The library gnuradio-shared-state constructs it on the first call to
+ *       <code>instance()</code>, and code from every shared object of the program reaches the same manager and pools.
+ *  <li> The library's code builds the default pools, and their threads run the library's code between tasks. Unloading
+ *       a shared object leaves the pools and their threads in place.
+ *  <li> A task runs the code of the shared object that built its callable, and that object must stay mapped until the
+ *       task ends. A pool runs the code of the shared object that built it, and that object must stay mapped until the
+ *       pool is destroyed.
+ *  <li> At exit the manager is destroyed in the reverse order of construction among the program's static objects. A
+ *       pool joins its threads when the manager and every other holder have released it.
  * </ul>
  *
  * <h3>Helper methods</h3>
@@ -1090,11 +1093,10 @@ class Manager {
         registerPool(std::string(kDefaultIoPoolId), std::move(io));
     }
 
+    friend Manager& detail::threadPoolManager();
+
 public:
-    static Manager& instance() {
-        static Manager singleton;
-        return singleton;
-    }
+    static Manager& instance() { return detail::threadPoolManager(); }
 
     void registerPool(std::string name, std::shared_ptr<TaskExecutor> pool) {
         std::scoped_lock lock(_mutex);

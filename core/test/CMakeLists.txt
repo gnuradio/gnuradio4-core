@@ -207,6 +207,10 @@ if(GR_ENABLE_BLOCK_REGISTRY AND INTERNAL_ENABLE_BLOCK_PLUGINS)
   add_dependencies(qa_SchedulerLifecycle cross_object_library)
   target_compile_definitions(qa_SchedulerLifecycle PRIVATE GR_TEST_WITH_BLOCK_LIBRARY)
 
+  # the cases compare the values that a shared object's code reads with the program's
+  add_ut_test(qa_SharedObjectState)
+  add_dependencies(qa_SharedObjectState cross_object_library)
+
   add_dependencies(
     qa_SubGraphAssets
     GoodBasePlugin
