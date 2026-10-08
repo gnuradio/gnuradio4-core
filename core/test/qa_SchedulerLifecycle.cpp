@@ -1863,6 +1863,62 @@ const boost::ut::suite<"a scheduler started on its own thread"> ownThreadStartTe
     };
 };
 
+const boost::ut::suite<"settings staged on a scheduler"> stagedSchedulerSettingsTests = [] {
+    using namespace boost::ut;
+
+    // under singleThreadedBlocking the worker parks after every pass without progress. The timeout_ms given to the
+    // constructor outlasts the run bound, and the timeout_ms staged after the construction does not. Opening the gate
+    // moves no sequence. The run ends in time only if its parks last the staged timeout_ms.
+    "a timeout_ms staged after the construction rules the next run"_test = [] {
+        qa_sched::gSourceGate.store(false, std::memory_order_release);
+        qa_sched::gGatedSourceCalls.store(0UZ, std::memory_order_release);
+
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::GatedSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        qa_sched::BlockingScheduler scheduler({{"timeout_ms", gr::Size_t(60'000)}, {"timeout_inactivity_count", gr::Size_t(0)}, {"watchdog_timeout", gr::Size_t(60'000)}});
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(scheduler.settings().setStaged({{"timeout_ms", gr::Size_t(25)}}).empty()) << "the scheduler must stage timeout_ms";
+
+        const bool completed = qa_sched::runAndWaitWithin(scheduler, qa_sched::kEventBound, [] {
+            for (std::size_t seen = qa_sched::gGatedSourceCalls.load(std::memory_order_acquire); seen == 0UZ; seen = qa_sched::gGatedSourceCalls.load(std::memory_order_acquire)) {
+                qa_sched::gGatedSourceCalls.wait(seen);
+            }
+            qa_sched::gSourceGate.store(true, std::memory_order_release);
+        });
+        expect(completed) << "the run parked for the timeout_ms given to the constructor";
+        expect(eq(scheduler.timeout_ms.value, gr::Size_t(25))) << "the staged timeout_ms must be in force";
+        expect(eq(sink._nReceived, qa_sched::kSamplesBeforeTerminal));
+    };
+
+    // the scheduler sizes its job lists on its pool when it initializes. A pool staged after that sizes the lists of the
+    // run that the next start begins
+    "a pool staged on an initialized scheduler sizes the next run's job lists"_test = [] {
+        constexpr std::string_view kInitialPoolName = "qa_initial_cpu";
+        constexpr std::string_view kStagedPoolName  = "qa_staged_cpu";
+        auto                       initialPool      = qa_sched::fixedPool(kInitialPoolName, 2U);
+        auto                       stagedPool       = qa_sched::fixedPool(kStagedPoolName, 1U);
+
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::DoneSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        qa_sched::TestScheduler scheduler({{"poolName", std::string(kInitialPoolName)}});
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(scheduler.changeStateTo(gr::lifecycle::State::INITIALISED).has_value());
+        expect(eq(scheduler.jobs()->size(), 2UZ)) << "the pool of two threads must size a job list for each of the two blocks";
+        expect(scheduler.settings().setStaged({{"poolName", std::string(kStagedPoolName)}}).empty()) << "the scheduler must stage poolName";
+
+        expect(qa_sched::runAndWaitWithin(scheduler, qa_sched::kEventBound)) << "the run on the staged pool did not end";
+        expect(eq(std::string(scheduler.poolName.value), std::string(kStagedPoolName))) << "the staged poolName must be in force";
+        expect(eq(scheduler.jobs()->size(), 1UZ)) << "the job lists must be sized on the staged pool's one thread";
+        expect(eq(sink._nReceived, qa_sched::kSamplesBeforeTerminal));
+    };
+};
+
 const boost::ut::suite<"a scheduler that supplies its own worker"> ownWorkerTests = [] {
     using namespace boost::ut;
     using enum gr::lifecycle::State;

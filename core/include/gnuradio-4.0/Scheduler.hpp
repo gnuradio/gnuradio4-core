@@ -136,6 +136,7 @@ protected:
     TProfiler                     _profiler{};
     ProfileHandle                 _profilerHandler{_profiler.forThisThread()};
     std::shared_ptr<TaskExecutor> _pool{gr::thread_pool::Manager::instance().defaultCpuPool()};
+    const TaskExecutor*           _jobListsPool = nullptr; // the pool the job lists were last sized on
     std::shared_ptr<gr::Sequence> _nRunningJobs = std::make_shared<gr::Sequence>();
     std::recursive_mutex          _executionOrderMutex; // only used when modifying and copying the graph->local job list
     std::shared_ptr<JobLists>     _executionOrder = std::make_shared<JobLists>();
@@ -470,6 +471,24 @@ public:
     // that runs the start writes it before it publishes ERROR. Read it once the state reads ERROR or while no start is
     // in progress. A read during a start races with that write.
     [[nodiscard]] std::optional<Error> startError() const { return _startError; }
+
+    // applies the settings staged since they were last applied. A setting that refuses its staged value keeps its
+    // value, and the error names the scheduler and each refused key.
+    [[nodiscard]] std::expected<void, Error> applyStagedSettings() {
+        if (!this->settings().changed()) {
+            return {};
+        }
+        const ApplyStagedParametersResult applied = this->settings().applyStagedParameters();
+        if (applied.failedParameters.empty()) {
+            return {};
+        }
+        std::string refusedKeys;
+        for (const auto& [key, value] : applied.failedParameters) {
+            refusedKeys += refusedKeys.empty() ? "" : ", ";
+            refusedKeys += key;
+        }
+        return std::unexpected(Error(std::format("scheduler '{}' refused the staged settings {}", this->unique_name, refusedKeys)));
+    }
 
     // ends a start whose move to RUNNING returned an error on a thread that is not one of this scheduler's workers. The
     // error goes out on msgOut through a writer of the caller's own and is kept for startError(). The scheduler then
@@ -1153,6 +1172,7 @@ protected:
         if constexpr (requires(Derived& d) { d.customInit(); }) {
             static_cast<Derived*>(this)->customInit();
         }
+        _jobListsPool = _pool.get();
     }
 
     // re-entering INITIALISED must rebuild the same execution state that init() builds, because the graph
@@ -1173,6 +1193,7 @@ protected:
         } else if constexpr (requires(Derived& d) { d.customInit(); }) {
             static_cast<Derived*>(this)->customInit();
         }
+        _jobListsPool = _pool.get();
     }
 
     // ends a start or a resume that cannot complete. The children that did start are stopped. The reason is kept for
@@ -1229,6 +1250,20 @@ protected:
         waitDone();
         gr::atomic_ref(_nWorkersStarted).store_release(0UZ);
         _startError.reset();
+
+        // the settings staged since the scheduler initialized take effect before the run's job lists are fixed. A pool
+        // other than the one the lists were sized on sizes them again
+        if (std::expected<void, Error> applied = applyStagedSettings(); !applied.has_value()) {
+            this->emitErrorMessage("start()", applied.error());
+            failStart(std::move(applied.error()));
+            return;
+        }
+        if constexpr (requires(Derived& d) { d.customInit(); }) {
+            if (_pool.get() != _jobListsPool) {
+                static_cast<Derived*>(this)->customInit();
+                _jobListsPool = _pool.get();
+            }
+        }
 
         disconnectAllEdges();
         if (const std::vector<Edge> unconnected = connectPendingEdges(); !unconnected.empty()) {
