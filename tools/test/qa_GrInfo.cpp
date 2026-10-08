@@ -328,7 +328,7 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         expect(eq(schedulers.exitCode, 0)) << schedulers.output;
         expect(schedulers.output.contains("gr::scheduler")) << "the family of core's schedulers" << schedulers.output;
         expect(schedulers.output.contains("this-program")) << "the keys the program registers itself" << schedulers.output;
-        for (const std::string_view policy : {"<singleThreaded>", "<multiThreaded>", "<singleThreadedBlocking>"}) {
+        for (const std::string_view policy : {"<singleThreaded>", "<multiThreaded>", "<singleThreadedBlocking>", "<multiThreadedBlocking>"}) {
             expect(schedulers.output.contains(policy)) << "one key per execution policy" << policy << schedulers.output;
         }
         expect(schedulers.output.contains("GoodMathScheduler")) << "the scheduler a plugin registers" << schedulers.output;

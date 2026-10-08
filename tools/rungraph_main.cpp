@@ -64,10 +64,11 @@ of this installation, which is always searched. A directory named twice is searc
 rungraph registers core's Simple scheduler under one key per execution policy:
 gr::scheduler::Simple<singleThreaded> runs every block on one thread,
 gr::scheduler::Simple<multiThreaded> spreads the blocks over the threads of the processing pool,
-and gr::scheduler::Simple<singleThreadedBlocking> runs on one thread and sleeps while no block
-makes progress. A plugin or a block library in the searched directories may register more, and
-grinfo schedulers lists them all. A key the registry does not hold is refused with the list of
-the keys it holds.
+gr::scheduler::Simple<singleThreadedBlocking> runs on one thread and sleeps while no block
+makes progress, and gr::scheduler::Simple<multiThreadedBlocking> spreads the blocks over the
+pool's threads, each of which sleeps while its own blocks make no progress. A plugin or a block
+library in the searched directories may register more, and grinfo schedulers lists them all. A
+key the registry does not hold is refused with the list of the keys it holds.
 
 A settings map holds what the last refresh put there, so the settings --show prints are read
 after the run has ended and the block has been asked to refresh them: a counter a block keeps

@@ -4450,6 +4450,7 @@ const boost::ut::suite<"workers that park"> parkingWorkerTests = [] {
 
     "a block that never takes its remainder ends the graph under multiThreaded"_test                         = [&] { untakenRemainderEnds.operator()<qa_sched::TestScheduler>("multiThreaded"); };
     "a block that never takes its remainder keeps its worker from parking under singleThreadedBlocking"_test = [&] { untakenRemainderEnds.operator()<qa_sched::BlockingScheduler>("singleThreadedBlocking"); };
+    "a block that never takes its remainder keeps its worker from parking under multiThreadedBlocking"_test  = [&] { untakenRemainderEnds.operator()<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreadedBlocking>>("multiThreadedBlocking"); };
 };
 
 namespace qa_sched {
