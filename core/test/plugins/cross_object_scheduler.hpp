@@ -11,15 +11,19 @@
 namespace gr::testing {
 
 /**
- * @brief A single-threaded scheduler whose swap check any caller can run.
+ * @brief A single-threaded scheduler that lets any caller run its swap check and read its pool and thread pool manager.
  *
  * A shared object and the program that loads it both compile this type, and each holds its own copy of the type's
  * code. The object registers it, so an instance from the registry runs its workers with the object's code.
  */
 struct CrossObjectScheduler : gr::scheduler::SchedulerBase<CrossObjectScheduler, gr::scheduler::ExecutionPolicy::singleThreaded> {
     using Base = gr::scheduler::SchedulerBase<CrossObjectScheduler, gr::scheduler::ExecutionPolicy::singleThreaded>;
+    using Base::_pool;
     using Base::Base;
     using Base::swapAllowedFromThisThread;
+
+    // the thread pool manager that the constructing code reaches
+    const gr::thread_pool::Manager* manager = &gr::thread_pool::Manager::instance();
 
     void customInit() {
         const gr::Graph flatGraph = gr::graph::flatten(*this->_graph);

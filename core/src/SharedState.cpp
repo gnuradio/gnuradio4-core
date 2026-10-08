@@ -2,6 +2,7 @@
 #include <unordered_map>
 
 #include <gnuradio-4.0/SharedState.hpp>
+#include <gnuradio-4.0/thread/thread_pool.hpp>
 
 namespace gr::message {
 
@@ -88,3 +89,27 @@ const void*& exchangingScheduler() noexcept {
 }
 
 } // namespace gr::scheduler
+
+namespace gr::thread_pool::detail {
+
+Manager& threadPoolManager() {
+    static Manager manager;
+    return manager;
+}
+
+std::atomic_size_t& globalThreadCount() noexcept {
+    static std::atomic_size_t nThreads{0UZ};
+    return nThreads;
+}
+
+std::atomic<std::uint64_t>& globalPoolId() noexcept {
+    static std::atomic<std::uint64_t> poolId{0U};
+    return poolId;
+}
+
+std::atomic<std::uint64_t>& taskID() noexcept {
+    static std::atomic<std::uint64_t> id{0U};
+    return id;
+}
+
+} // namespace gr::thread_pool::detail

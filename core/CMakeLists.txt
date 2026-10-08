@@ -27,7 +27,7 @@ target_link_libraries(
          vir)
 
 # the values that gnuradio-4.0/SharedState.hpp declares, one copy that every shared object of a program shares. The
-# library links no other core library, and gnuradio-core links it
+# library compiles the core headers that build those values and links no compiled core library. gnuradio-core links it
 if(EMSCRIPTEN)
   add_library(gnuradio-shared-state STATIC src/SharedState.cpp)
 else()
@@ -35,7 +35,7 @@ else()
 endif()
 add_library(gnuradio4::gnuradio-shared-state ALIAS gnuradio-shared-state)
 target_include_directories(gnuradio-shared-state PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include/)
-target_link_libraries(gnuradio-shared-state PRIVATE gnuradio-options)
+target_link_libraries(gnuradio-shared-state PRIVATE gnuradio-options gnuradio-meta magic_enum)
 if(WIN32)
   target_compile_definitions(gnuradio-shared-state PRIVATE BUILDING_MYPLUGIN)
 endif()

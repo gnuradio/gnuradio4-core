@@ -8,10 +8,11 @@
 #include "cross_object_scheduler.hpp"
 
 /**
- * @brief A shared object whose blocks and scheduler run beside the code of the program that loads it.
+ * @brief A shared object whose blocks and schedulers run beside the code of the program that loads it.
  *
- * Its blocks handle messages and publish on a scheduler's worker with code from this object. Its scheduler runs
- * workers with code from this object.
+ * Its blocks handle messages and publish on a scheduler's worker with code from this object. Its two schedulers run
+ * workers with code from this object, the single-threaded one on the calling thread and the multi-threaded one on a
+ * thread pool.
  */
 namespace gr::testing {
 
@@ -48,5 +49,9 @@ const bool registeredSink [[maybe_unused]]   = gr::globalBlockRegistry().insert<
 std::unique_ptr<gr::SchedulerModel> makeCrossObjectScheduler(gr::property_map parameters) { return std::make_unique<gr::SchedulerWrapper<CrossObjectScheduler>>(std::move(parameters)); }
 
 const bool registeredScheduler [[maybe_unused]] = gr::globalSchedulerRegistry().insert("test::cross_object_scheduler", "", makeCrossObjectScheduler);
+
+std::unique_ptr<gr::SchedulerModel> makeMultiThreadedScheduler(gr::property_map parameters) { return std::make_unique<gr::SchedulerWrapper<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>>>(std::move(parameters)); }
+
+const bool registeredMultiThreaded [[maybe_unused]] = gr::globalSchedulerRegistry().insert("test::cross_object_multi_threaded", "", makeMultiThreadedScheduler);
 
 } // namespace gr::testing
