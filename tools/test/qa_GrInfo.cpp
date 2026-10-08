@@ -54,6 +54,15 @@ constexpr auto closePipe = pclose;
 [[nodiscard]] inline std::string forShell(const std::string& command) { return command; }
 #endif
 
+/// The file name a MODULE library is built under, with the platform's prefix and suffix.
+[[nodiscard]] inline std::string moduleFileName(std::string_view stem) {
+#ifdef _WIN32
+    return std::format("{}.dll", stem);
+#else
+    return std::format("lib{}.so", stem);
+#endif
+}
+
 struct Result {
     int         exitCode = -1;
     std::string output; // what the run wrote to the collected streams, in the order it wrote it
@@ -461,8 +470,8 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
     "a library is listed by its own name under the directory that held it"_test = [] {
         const Result version = run(overTestDirectories({"version"}));
         expect(eq(version.exitCode, 0)) << version.output;
-        expect(version.output.contains("\n    libblock_library.so")) << "the file by its name alone, indented under its directory" << version.output;
-        expect(eq(occurrences(version.output, GR_TOOLS_TEST_BLOCK_LIBRARY "/libblock_library.so"), 0UZ)) << "and not by a path repeated on every line" << version.output;
+        expect(version.output.contains(std::format("\n    {}", moduleFileName("block_library")))) << "the file by its name alone, indented under its directory" << version.output;
+        expect(eq(occurrences(version.output, std::string(GR_TOOLS_TEST_BLOCK_LIBRARY "/") + moduleFileName("block_library")), 0UZ)) << "and not by a path repeated on every line" << version.output;
     };
 
     "version --json is one document carrying the shape a reader relies on"_test = [] {
@@ -606,10 +615,10 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
     "schedulers lists a shared object's scheduler of this ABI version and not one of an earlier version or none"_test = [] {
         const Result schedulers = run(overSchedulerLibraries({"schedulers"}));
         expect(eq(schedulers.exitCode, 0)) << schedulers.output;
-        expect(schedulers.output.contains("libscheduler_library.so (block-library, 1 keys)")) << "the kept library and its scheduler" << schedulers.output;
+        expect(schedulers.output.contains(std::format("{} (block-library, 1 keys)", moduleFileName("scheduler_library")))) << "the kept library and its scheduler" << schedulers.output;
         expect(schedulers.output.contains("\n      library_scheduler\n")) << "the scheduler under its family" << schedulers.output;
         expect(!schedulers.output.contains("libscheduler_library_v1.so (")) << "the refused library heads no listing" << schedulers.output;
-        expect(!schedulers.output.contains("libscheduler_library_unversioned.so (")) << "the refused library heads no listing" << schedulers.output;
+        expect(!schedulers.output.contains(std::format("{} (", moduleFileName("scheduler_library_unversioned")))) << "the refused library heads no listing" << schedulers.output;
         expect(eq(occurrences(schedulers.output, "library_scheduler_v1"), 1UZ)) << "its key appears in the loader's warning alone" << schedulers.output;
 
         const Result version = run(overSchedulerLibraries({"version", "--json"}), Streams::standardOutput);

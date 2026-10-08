@@ -43,6 +43,15 @@ constexpr auto closePipe = pclose;
 [[nodiscard]] inline std::string forShell(const std::string& command) { return command; }
 #endif
 
+/// The file name a MODULE library is built under, with the platform's prefix and suffix.
+[[nodiscard]] inline std::string moduleFileName(std::string_view stem) {
+#ifdef _WIN32
+    return std::format("{}.dll", stem);
+#else
+    return std::format("lib{}.so", stem);
+#endif
+}
+
 struct Result {
     int         exitCode = -1;
     std::string output; // standard output and standard error together, in the order the run wrote them
@@ -364,7 +373,7 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
         expect(ran.output.contains("the graph ended on its own")) << ran.output;
         expect(ran.output.contains("source: event_count = 1000")) << ran.output;
         expect(ran.output.contains("libscheduler_library_v1.so did not load: scheduler test::library_scheduler_v1 has plugin ABI version 1, which does not match the host's plugin ABI version")) << "the refusal is reported as a failed plugin is" << ran.output;
-        expect(ran.output.contains("libscheduler_library_unversioned.so did not load: scheduler test::library_scheduler_unversioned carries no plugin ABI version")) << "the refusal is reported as a failed plugin is" << ran.output;
+        expect(ran.output.contains(std::format("{} did not load: scheduler test::library_scheduler_unversioned carries no plugin ABI version", moduleFileName("scheduler_library_unversioned")))) << "the refusal is reported as a failed plugin is" << ran.output;
 
         const Result refused = run({"--graph", "unread.yaml", "--plugin-dir", GR_TOOLS_TEST_SCHEDULER_LIBRARY, "--scheduler", "test::library_scheduler_v1"});
         expect(eq(refused.exitCode, 2)) << refused.output;
