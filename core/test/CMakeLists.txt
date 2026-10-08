@@ -24,6 +24,7 @@ set(_CORE_TESTS
     qa_Value
     qa_ValueHelper
     qa_BlockDiagnostics
+    qa_BlockMerging
     qa_BlockMessages
     qa_BlockRegistration
     qa_ComputeDomain
