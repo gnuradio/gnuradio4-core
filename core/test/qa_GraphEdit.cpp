@@ -6,7 +6,6 @@
 #include <bit>
 #include <chrono>
 #include <cstddef>
-#include <cstdio>
 #include <expected>
 #include <format>
 #include <functional>
@@ -19,8 +18,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-
-#include <unistd.h>
 
 #include <gnuradio-4.0/BlockRegistry.hpp>
 #include <gnuradio-4.0/CircularBuffer.hpp>
@@ -437,39 +434,6 @@ void registerTestBlocks() {
     }();
     std::ignore = registered;
 }
-
-// stdout redirected into an anonymous file while this lives, so a case can read what the graph reported
-struct StdoutCapture {
-    std::FILE* _file    = std::tmpfile();
-    int        _savedFd = -1;
-
-    StdoutCapture() {
-        std::fflush(stdout);
-        _savedFd = ::dup(STDOUT_FILENO);
-        ::dup2(::fileno(_file), STDOUT_FILENO);
-    }
-
-    StdoutCapture(const StdoutCapture&)            = delete;
-    StdoutCapture& operator=(const StdoutCapture&) = delete;
-
-    ~StdoutCapture() {
-        std::fflush(stdout);
-        ::dup2(_savedFd, STDOUT_FILENO);
-        ::close(_savedFd);
-        std::fclose(_file);
-    }
-
-    // pread leaves the offset alone, which stdout shares through dup2
-    [[nodiscard]] std::string text() const {
-        std::fflush(stdout);
-        std::string           captured;
-        std::array<char, 512> chunk{};
-        for (ssize_t nRead = ::pread(::fileno(_file), chunk.data(), chunk.size(), 0); nRead > 0; nRead = ::pread(::fileno(_file), chunk.data(), chunk.size(), static_cast<off_t>(captured.size()))) {
-            captured.append(chunk.data(), static_cast<std::size_t>(nRead));
-        }
-        return captured;
-    }
-};
 
 // formats a port as the edge formatter prints it; the '/' keeps one block name from matching inside a longer one
 [[nodiscard]] std::string portOf(std::string_view blockName, std::string_view port) { return std::format("{}/{}", blockName, port); }
@@ -1356,7 +1320,7 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(eq(kept.in.streamReader().available(), kWritten)) << "the kept consumer does not see the source's samples";
     };
 
-    "an edge recorded into a taken input and removed again leaves the source's connected sibling its buffer"_test = [] {
+    "an edge refused at a taken input leaves the source's connected sibling its buffer, and so does one added there and removed again"_test = [] {
         constexpr std::size_t kUnread = 16UZ;
 
         gr::Graph flow;
@@ -1373,18 +1337,23 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         }
         expect(fatal(eq(sibling.in.streamReader().available(), kUnread)));
 
-        {
-            qa_edit::StdoutCapture capture; // the replacement report
-            expect(flow.connect<"out", "in">(second, taken).has_value());
-        }
-        expect(fatal(eq(first.out.nReaders(), 1UZ))) << "the recorded edge rewired the taken input before the next start";
+        expect(!flow.connect<"out", "in">(second, taken).has_value()) << "an edge into the taken input was accepted";
+        expect(fatal(eq(flow.edges().size(), 2UZ))) << "the refused edge changed the listed edges";
+        expect(eq(first.out.nReaders(), 1UZ)) << "the refused edge took the taken input from its source";
+        expect(eq(second.out.nReaders(), 1UZ)) << "the refused edge connected a reader";
+        expect(eq(sibling.in.streamReader().available(), kUnread)) << "the refused edge cost the connected sibling its unread samples";
+
+        // addEdge() runs no check on an input that an edge takes, and the added record waits for the next start
+        expect(fatal(flow.addEdge(gr::Edge(qa_edit::blockModel(flow, second.unique_name), "out", qa_edit::blockModel(flow, taken.unique_name), "in", gr::undefined_size, 0, "added")).has_value()));
+        expect(fatal(eq(first.out.nReaders(), 1UZ))) << "the added edge rewired the taken input before the next start";
 
         const auto nRemoved = flow.removeEdgeBySourcePort(second.unique_name, "out", taken.unique_name, "in");
         expect(fatal(nRemoved.has_value())) << "the removal was refused: " << (nRemoved.has_value() ? std::string{} : nRemoved.error().message);
         expect(eq(*nRemoved, 1UZ));
-        expect(fatal(eq(flow.edges().size(), 1UZ)));
-        expect(eq(flow.edges()[0].destinationBlock()->uniqueName(), std::string_view(sibling.unique_name))) << "the wrong edge was removed";
-        expect(flow.edges()[0].state() == gr::Edge::EdgeState::Connected);
+        expect(fatal(eq(flow.edges().size(), 2UZ)));
+        expect(std::ranges::none_of(flow.edges(), [&](const gr::Edge& edge) { return edge.sourceBlock()->uniqueName() == second.unique_name && edge.destinationBlock()->uniqueName() == taken.unique_name; })) << "the wrong edge was removed";
+        expect(std::ranges::all_of(flow.edges(), [](const gr::Edge& edge) { return edge.state() == gr::Edge::EdgeState::Connected; }));
+        expect(eq(first.out.nReaders(), 1UZ)) << "the taken input lost its source";
         expect(eq(second.out.nReaders(), 1UZ));
         expect(eq(sibling.in.streamReader().available(), kUnread)) << "the connected sibling was given a new buffer and lost its unread samples";
     };
@@ -1596,42 +1565,24 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(eq(edgeBufferSizeFor(83886080.0), kMaxEdgeBufferSize)) << "the upper knee is the ceiling over the seconds";
     };
 
-    "a second edge into a taken stream input replaces the first"_test = [] {
-        using namespace gr::serialization_fields;
-
+    "a second edge into a taken stream input is refused and the refusal names both edges"_test = [] {
         gr::Graph flow;
         auto&     first  = flow.emplaceBlock<qa_edit::Source>({{"name", std::string("first")}});
         auto&     second = flow.emplaceBlock<qa_edit::Source>({{"name", std::string("second")}});
         auto&     sink   = flow.emplaceBlock<qa_edit::Sink>();
         expect(flow.connect<"out", "in">(first, sink).has_value());
 
-        bool        connected = false;
-        std::string reported;
-        {
-            qa_edit::StdoutCapture capture;
-            // the typed connect names the input by index and this one names it by name
-            connected = flow.connect(second, gr::PortDefinition("out"), sink, gr::PortDefinition("in")).has_value();
-            reported  = capture.text();
-        }
-        expect(connected);
+        // the typed connect names the input by index and this one names it by name
+        const std::expected<void, gr::Error> refused = flow.connect(second, gr::PortDefinition("out"), sink, gr::PortDefinition("in"));
+        expect(fatal(!refused.has_value())) << "the second edge into the input was accepted";
+        const std::string& reason = refused.error().message;
+        expect(reason.contains(qa_edit::portOf("first", "0")) && reason.contains(qa_edit::portOf("second", "out"))) << "the refusal must name both edges: " << reason;
 
-        expect(fatal(eq(flow.edges().size(), 1UZ))) << "the displaced edge stayed listed";
-        expect(eq(flow.edges()[0].sourceBlock()->uniqueName(), std::string_view(second.unique_name))) << "the earlier edge was kept instead of the later one";
-        expect(reported.contains(qa_edit::portOf("first", "0")) && reported.contains(qa_edit::portOf("second", "out"))) << "the replacement must name both edges, reported: " << reported;
-
+        expect(fatal(eq(flow.edges().size(), 1UZ))) << "the refused edge was listed";
+        expect(eq(flow.edges()[0].sourceBlock()->uniqueName(), std::string_view(first.unique_name))) << "the refusal removed the listed edge";
         expect(flow.connectPendingEdges());
-        expect(flow.edges()[0].state() == gr::Edge::EdgeState::Connected);
-        expect(eq(first.out.nReaders(), 0UZ)) << "the displaced source still feeds the input";
-        expect(eq(second.out.nReaders(), 1UZ)) << "the listed edge carries no data";
-
-        const std::optional<gr::Message> inspected = flow.propertyCallbackGraphInspect(gr::graph::property::kGraphInspect, {});
-        expect(fatal(inspected.has_value() && inspected->data.has_value()));
-        const auto* inspectedEdges = inspected->data->at(std::pmr::string(BLOCK_EDGES)).get_if<gr::property_map>();
-        expect(fatal(inspectedEdges != nullptr));
-        expect(fatal(eq(inspectedEdges->size(), 1UZ))) << "the inspect reply lists an edge the graph does not carry";
-        const auto* inspectedEdge = inspectedEdges->begin()->second.get_if<gr::property_map>();
-        expect(fatal(inspectedEdge != nullptr));
-        expect(eq(inspectedEdge->at(std::pmr::string(EDGE_SOURCE_BLOCK)).value_or(std::string_view{}), std::string_view(second.unique_name))) << "the inspect reply names the displaced source";
+        expect(eq(first.out.nReaders(), 1UZ)) << "the listed edge carries no data";
+        expect(eq(second.out.nReaders(), 0UZ)) << "the refused source feeds the input";
     };
 
     "a second edge into a taken message input is refused and the refusal names both edges"_test = [] {
@@ -1672,24 +1623,17 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(scheduler.changeStateTo(INITIALISED).has_value());
         expect(scheduler.changeStateTo(RUNNING).has_value());
 
-        std::optional<gr::property_map> reply;
-        std::string                     reported;
-        {
-            qa_edit::StdoutCapture capture;
-            qa_edit::sendMessage(toScheduler, gr::scheduler::property::kEmplaceEdge,
-                {{std::pmr::string(EDGE_SOURCE_BLOCK), std::string(second.unique_name)}, {std::pmr::string(EDGE_SOURCE_PORT), std::string("out")},           //
-                    {std::pmr::string(EDGE_DESTINATION_BLOCK), std::string(sink.unique_name)}, {std::pmr::string(EDGE_DESTINATION_PORT), std::string("in")}, //
-                    {std::pmr::string(EDGE_MIN_BUFFER_SIZE), gr::undefined_Size}, {std::pmr::string(EDGE_WEIGHT), std::int32_t{0}},                          //
-                    {std::pmr::string(EDGE_NAME), std::string("replacement")}});
-            reply    = qa_edit::awaitReplyData(fromScheduler, gr::scheduler::property::kEdgeEmplaced);
-            reported = capture.text();
-        }
+        qa_edit::sendMessage(toScheduler, gr::scheduler::property::kEmplaceEdge,
+            {{std::pmr::string(EDGE_SOURCE_BLOCK), std::string(second.unique_name)}, {std::pmr::string(EDGE_SOURCE_PORT), std::string("out")},           //
+                {std::pmr::string(EDGE_DESTINATION_BLOCK), std::string(sink.unique_name)}, {std::pmr::string(EDGE_DESTINATION_PORT), std::string("in")}, //
+                {std::pmr::string(EDGE_MIN_BUFFER_SIZE), gr::undefined_Size}, {std::pmr::string(EDGE_WEIGHT), std::int32_t{0}},                          //
+                {std::pmr::string(EDGE_NAME), std::string("replacement")}});
+        const std::optional<gr::property_map> reply = qa_edit::awaitReplyData(fromScheduler, gr::scheduler::property::kEdgeEmplaced);
         expect(fatal(reply.has_value())) << "the edge was never emplaced";
 
         const std::span<const gr::Edge> edges = scheduler.graph().edges();
         expect(fatal(eq(edges.size(), 1UZ))) << "the displaced edge stayed listed";
         expect(eq(edges[0].sourceBlock()->uniqueName(), std::string_view(second.unique_name))) << "the earlier edge was kept instead of the emplaced one";
-        expect(reported.contains(qa_edit::portOf("first", "0")) && reported.contains(qa_edit::portOf("second", "out"))) << "the replacement must name both edges, reported: " << reported;
 
         const auto* displaced = reply->contains(std::pmr::string("displacedEdges")) ? reply->at(std::pmr::string("displacedEdges")).get_if<gr::property_map>() : nullptr;
         expect(fatal(displaced != nullptr)) << "the reply does not list the displaced edges";
@@ -1759,19 +1703,12 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         const auto removed = flow.removeEdgeBySourcePort(first.unique_name, "out", sink.unique_name, "in");
         expect(fatal(removed.has_value())) << "the edge could not be removed: " << (removed.has_value() ? std::string{} : removed.error().message);
 
-        std::expected<std::vector<gr::Edge>, gr::Error> emplaced;
-        std::string                                     reported;
-        {
-            qa_edit::StdoutCapture capture;
-            emplaced = flow.emplaceEdge(second.unique_name, "out", sink.unique_name, "in", gr::undefined_size, 0, "rewired");
-            reported = capture.text();
-        }
+        const std::expected<std::vector<gr::Edge>, gr::Error> emplaced = flow.emplaceEdge(second.unique_name, "out", sink.unique_name, "in", gr::undefined_size, 0, "rewired");
         expect(fatal(emplaced.has_value())) << "the edge could not be emplaced: " << (emplaced.has_value() ? std::string{} : emplaced.error().message);
         expect(emplaced->empty()) << "a free input returned a displaced edge";
 
         expect(fatal(eq(flow.edges().size(), 1UZ))) << "the rewire left a different number of edges";
         expect(eq(flow.edges()[0].sourceBlock()->uniqueName(), std::string_view(second.unique_name))) << "the rewired edge is not the one listed";
-        expect(!reported.contains(qa_edit::portOf("second", "out"))) << "a free input reported a replacement: " << reported;
         expect(eq(first.out.nReaders(), 0UZ)) << "the removed source still feeds the input";
         expect(eq(second.out.nReaders(), 1UZ)) << "the rewired source does not feed the input";
     };
