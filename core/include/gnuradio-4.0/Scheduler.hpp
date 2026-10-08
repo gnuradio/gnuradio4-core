@@ -9,7 +9,7 @@
 #include <queue>
 #include <set>
 #include <string>
-
+#include <system_error>
 #include <thread>
 #include <utility>
 
@@ -1475,6 +1475,15 @@ protected:
         };
         on_scope_exit closeAdoption = [this, runnerID] { closeAdoptionList(runnerID); };
 
+        // a single-threaded run works on the thread that called runAndWait(). The worker names the thread while it runs
+        // and restores the previous name before it releases its count.
+        const std::string previousThreadName = gr::thread_pool::thread::getThreadName();
+        on_scope_exit     restoreThreadName  = [&previousThreadName] {
+            try {
+                gr::thread_pool::thread::setThreadName(previousThreadName);
+            } catch (const std::system_error&) { // a thread that cannot be renamed keeps the worker's name
+            }
+        };
         gr::thread_pool::thread::setThreadName(std::format("pW{}-{}", runnerID, gr::meta::shorten_type_name(this->unique_name)));
 
         [[maybe_unused]] auto profiler_handler = _profiler.forThisThread();
