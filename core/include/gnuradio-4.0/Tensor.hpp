@@ -2,6 +2,7 @@
 #define GNURADIO_TENSOR_HPP
 
 #include <gnuradio-4.0/PmtCollections.hpp>
+#include <gnuradio-4.0/meta/Attributes.hpp>
 
 #include <algorithm>
 #include <cassert>
@@ -30,7 +31,7 @@ inline constexpr tensor_data_tag    data_from{};
 
 namespace detail {
 template<std::size_t... Ex>
-inline constexpr bool all_static_v = (sizeof...(Ex) > 0) && ((Ex != std::dynamic_extent) && ...);
+inline constexpr bool all_static_v = (sizeof...(Ex) != 0UZ) && ((Ex != std::dynamic_extent) && ...);
 
 #ifndef GR_TENSOR_MAX_RANK
 inline constexpr std::size_t kMaxRank = 8UZ;
@@ -169,10 +170,7 @@ struct TensorBase {
         constexpr static std::array<std::size_t, rank> extents{Ex...};
         constexpr static std::array<std::size_t, rank> strides = [] {
             std::array<std::size_t, rank> strides_{};
-            if (rank == 0UZ) {
-                return strides_;
-            }
-            std::size_t stride = 1UZ;
+            std::size_t                   stride = 1UZ;
             for (std::size_t i = rank; i-- > 0UZ;) {
                 strides_[i] = stride;
                 stride *= extents[i];
@@ -193,8 +191,8 @@ struct TensorBase {
         std::array<std::size_t, detail::kMaxRank> strides{};
     };
 
-    using extents_store_t = std::conditional_t<detail::all_static_v<Ex...>, static_extents_store, std::conditional_t<(sizeof...(Ex) > 0UZ), semi_static_extents_store, dynamic_extents_store>>;
-    [[no_unique_address]] extents_store_t _metaInfo{}; // this is suppressed for statically defined extents
+    using extents_store_t = std::conditional_t<detail::all_static_v<Ex...>, static_extents_store, std::conditional_t<(sizeof...(Ex) != 0UZ), semi_static_extents_store, dynamic_extents_store>>;
+    GR_NO_UNIQUE_ADDRESS extents_store_t _metaInfo{}; // this is suppressed for statically defined extents
 
     using container_type = std::conditional_t<detail::all_static_v<Ex...> && managed, std::array<element_type, (Ex * ... * 1UZ)>, gr::pmr::vector<element_type, managed>>;
     container_type _data{};

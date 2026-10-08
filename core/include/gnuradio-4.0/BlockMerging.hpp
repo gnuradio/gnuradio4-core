@@ -1,6 +1,7 @@
 #ifndef GNURADIO_BLOCK_MERGING_HPP
 #define GNURADIO_BLOCK_MERGING_HPP
 
+#include <gnuradio-4.0/meta/Attributes.hpp>
 #include <gnuradio-4.0/meta/simd.hpp>
 
 #include <gnuradio-4.0/Block.hpp>
@@ -695,7 +696,7 @@ public:
     mutable Feedback                   _feedback;
     mutable FeedbackConnectionPortType _state{};
 
-    [[no_unique_address]] mutable std::conditional_t<std::is_same_v<void, Monitor>, detail::Empty, Monitor> _monitor;
+    GR_NO_UNIQUE_ADDRESS mutable std::conditional_t<std::is_same_v<void, Monitor>, detail::Empty, Monitor> _monitor;
 
     FeedbackMergeBase(const FeedbackMergeBase&)            = delete;
     FeedbackMergeBase& operator=(const FeedbackMergeBase&) = delete;
