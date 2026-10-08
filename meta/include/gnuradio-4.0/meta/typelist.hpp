@@ -388,7 +388,7 @@ struct typelist {
     }
 
     template<std::size_t I>
-    using at = detail::at_impl<I, Ts...>::type;
+    using at = typename detail::at_impl<I, Ts...>::type;
 
     template<typename... Heads>
     using prepend = typelist<Heads..., Ts...>;
@@ -427,9 +427,9 @@ struct typelist {
     };
 
     template<typename DefaultType>
-    using safe_head_default = typename safe_head_impl<(sizeof...(Ts) > 0), DefaultType, this_t>::type;
+    using safe_head_default = typename safe_head_impl<(sizeof...(Ts) != 0UZ), DefaultType, this_t>::type;
 
-    using safe_head = typename safe_head_impl<(sizeof...(Ts) > 0), void, this_t>::type;
+    using safe_head = typename safe_head_impl<(sizeof...(Ts) != 0UZ), void, this_t>::type;
 
     template<typename Matcher = typename this_t::safe_head>
     constexpr static bool all_same = ((std::is_same_v<Matcher, Ts> && ...));
