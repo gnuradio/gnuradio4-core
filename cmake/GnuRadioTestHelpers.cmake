@@ -87,8 +87,6 @@ function(setup_test_no_asan TEST_NAME)
             gnuradio-blocklib-core
             ut
             ${GR_TEST_HELPER_LIBRARIES})
-  # gnuradio-core's Graph/BlockModel/PluginLoader reference gr_plugin_base's out-of-line destructor, which is only
-  # defined in gnuradio-plugin. Tests that reach that code need it on the link line.
   if(TARGET gnuradio-plugin)
     target_link_libraries(${TEST_NAME} PRIVATE gnuradio-plugin)
   endif()
