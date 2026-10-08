@@ -1775,6 +1775,16 @@ public:
         for_each_writer_span([&tagData](auto& outSpan) { outSpan.publishEoSTag(tagData, static_cast<std::size_t>(outSpan.nRequestedSamplesToPublish())); }, outputSpanTuple);
     }
 
+    // the state machine's transition. A block that starts counts no drain stall of an earlier run, and a block that
+    // resumes keeps its count
+    [[nodiscard]] std::expected<void, Error> changeStateTo(lifecycle::State newState, const std::source_location location = std::source_location::current()) {
+        if (newState == lifecycle::State::RUNNING && this->state() == lifecycle::State::INITIALISED) {
+            _nDrainStalls = 0UZ;
+            _drainMark    = DrainWatermark{};
+        }
+        return lifecycle::StateMachine<Derived>::changeStateTo(newState, location);
+    }
+
     constexpr void requestStop() noexcept { emitErrorMessageIfAny("requestStop()", this->changeStateTo(lifecycle::State::REQUESTED_STOP)); }
 
     [[nodiscard]] constexpr std::pmr::polymorphic_allocator<> allocator() const noexcept { return std::pmr::polymorphic_allocator<>{_allocResource}; }
