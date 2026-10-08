@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <expected>
 #include <format>
+#include <limits>
 #include <map>
 #include <memory_resource>
 #include <mutex>
@@ -370,6 +371,21 @@ template<typename TPredicate>
     return satisfied();
 }
 
+// publishes nSamples samples of value 1 on an output port
+void publishOnes(gr::PortOut<float>& port, std::size_t nSamples) {
+    auto span = port.streamWriter().reserve(nSamples);
+    std::ranges::fill(span, 1.0f);
+    span.publish(nSamples);
+}
+
+// takes a block from the state its graph left it in to RUNNING. A case can then call its work()
+void startForWork(gr::BlockModel& block) {
+    if (block.state() == gr::lifecycle::State::IDLE) {
+        std::ignore = block.changeStateTo(gr::lifecycle::State::INITIALISED);
+    }
+    std::ignore = block.changeStateTo(gr::lifecycle::State::RUNNING);
+}
+
 void sendMessage(gr::MsgPortOut& port, std::string_view endpoint, gr::property_map data) { gr::sendMessage<gr::message::Command::Set>(port, "", endpoint, std::move(data)); }
 
 // the unique names of the graph's blocks in insertion order, comma separated
@@ -670,6 +686,95 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(refused.contains("'gain'")) << "the refusal must reach the caller as thrown, got: " << refused;
         expect(eq(flow.blocks().size(), nBlocksBefore)) << "the block stayed in the graph after throwing: " << refused;
         expect(eq(qa_edit::blockNames(flow), namesBefore)) << "the graph holds other blocks after throwing: " << refused;
+    };
+
+    "a replacement takes over the samples queued at the ports of the block it replaces"_test = [] {
+        constexpr std::size_t kQueuedAtInput  = 5UZ;
+        constexpr std::size_t kQueuedAtOutput = 3UZ;
+        qa_edit::registerTestBlocks();
+
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_edit::Source>();
+        auto&     stage  = flow.emplaceBlock<qa_edit::Tunable>();
+        auto&     sink   = flow.emplaceBlock<qa_edit::Sink>();
+        expect(flow.connect<"out", "in">(source, stage).has_value());
+        expect(flow.connect<"out", "in">(stage, sink).has_value());
+        expect(fatal(flow.connectPendingEdges())) << "the graph did not connect";
+        qa_edit::publishOnes(source.out, kQueuedAtInput);
+        qa_edit::publishOnes(stage.out, kQueuedAtOutput);
+        const std::shared_ptr<gr::BlockModel> sinkModel = flow.blocks()[2UZ];
+
+        auto [oldBlock, newBlock] = flow.replaceBlock(stage.unique_name, gr::meta::type_name<qa_edit::Tunable>(), {{"gain", 2.0f}});
+        expect(fatal(newBlock != nullptr));
+        expect(flow.blocks()[1UZ] == newBlock) << "the replacement does not hold the place of the replaced block";
+        expect(!stage.in.isConnected()) << "the replaced block still reads the source's ring";
+        expect(!stage.out.isConnected()) << "the sink still reads the replaced block's ring";
+        for (const gr::Edge& edge : flow.edges()) {
+            expect(edge.sourceBlock() != oldBlock && edge.destinationBlock() != oldBlock) << std::format("{}", edge) << ": the edge names the replaced block";
+            expect(edge._sourcePort == edge.sourceBlock()->dynamicOutputPort("out").value()) << std::format("{}", edge) << ": the edge names another source port";
+            expect(edge._destinationPort == edge.destinationBlock()->dynamicInputPort("in").value()) << std::format("{}", edge) << ": the edge names another destination port";
+        }
+
+        oldBlock.reset();
+        qa_edit::startForWork(*newBlock);
+        qa_edit::startForWork(*sinkModel);
+        std::ignore = newBlock->work(std::numeric_limits<std::size_t>::max());
+        std::ignore = sinkModel->work(std::numeric_limits<std::size_t>::max());
+        expect(eq(sink._nReceived, kQueuedAtInput + kQueuedAtOutput)) << "the sink did not receive the samples queued at the replaced block's ports";
+    };
+
+    "a port takes the rings of a port that has not built its own and of one that has"_test = [] {
+        constexpr std::size_t kQueued = 5UZ;
+
+        gr::PortOut<float> source;
+        gr::PortIn<float>  queued;
+        gr::PortIn<float>  unbuilt;
+        gr::PortIn<float>  built;
+        gr::DynamicPort    sourcePort(source, gr::DynamicPort::non_owned_reference_tag{});
+        gr::DynamicPort    queuedPort(queued, gr::DynamicPort::non_owned_reference_tag{});
+        gr::DynamicPort    unbuiltPort(unbuilt, gr::DynamicPort::non_owned_reference_tag{});
+        gr::DynamicPort    builtPort(built, gr::DynamicPort::non_owned_reference_tag{});
+        expect(fatal(sourcePort.connect(queuedPort).has_value()));
+        qa_edit::publishOnes(source, kQueued);
+        expect(fatal(eq(built.streamReader().available(), 0UZ))); // the reader handed out builds the default rings
+
+        const auto intoUnbuilt = queuedPort.checkHandlerExchange(unbuiltPort);
+        expect(fatal(intoUnbuilt.has_value())) << "refused for a port without rings: " << (intoUnbuilt.has_value() ? std::string{} : intoUnbuilt.error().message);
+        queuedPort.exchangeHandlers(unbuiltPort);
+        expect(fatal(unbuilt.isConnected())) << "the port without rings did not take the connected ring";
+        expect(eq(unbuilt.streamReader().available(), kQueued)) << "the queued samples did not move";
+        expect(!queued.isConnected()) << "the port that gave up its rings still reads the source";
+        expect(eq(source.nReaders(), 1UZ)) << "the exchange changed the source's readers";
+
+        const auto intoBuilt = unbuiltPort.checkHandlerExchange(builtPort);
+        expect(fatal(intoBuilt.has_value())) << "refused for a port with rings: " << (intoBuilt.has_value() ? std::string{} : intoBuilt.error().message);
+        unbuiltPort.exchangeHandlers(builtPort);
+        expect(fatal(built.isConnected())) << "the port with its own rings did not take the connected ring";
+        expect(eq(built.streamReader().available(), kQueued)) << "the queued samples did not move";
+        expect(eq(unbuilt.streamReader().available(), 0UZ)) << "the port that gave up the connected ring kept its samples";
+        expect(eq(source.nReaders(), 1UZ)) << "the exchange changed the source's readers";
+    };
+
+    "a replacement that lacks a port of the replaced block is refused and the graph is unchanged"_test = [] {
+        constexpr std::size_t kQueuedAtInput = 5UZ;
+        qa_edit::registerTestBlocks();
+
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_edit::Source>();
+        auto&     stage  = flow.emplaceBlock<qa_edit::Tunable>();
+        auto&     sink   = flow.emplaceBlock<qa_edit::Sink>();
+        expect(flow.connect<"out", "in">(source, stage).has_value());
+        expect(flow.connect<"out", "in">(stage, sink).has_value());
+        expect(fatal(flow.connectPendingEdges())) << "the graph did not connect";
+        qa_edit::publishOnes(source.out, kQueuedAtInput);
+        const std::string namesBefore = qa_edit::blockNames(flow);
+
+        const std::string refused = qa_edit::refusal([&] { std::ignore = flow.replaceBlock(stage.unique_name, gr::meta::type_name<qa_edit::Source>(), {}); });
+        expect(!refused.empty()) << "a replacement without an input port was accepted";
+        expect(eq(qa_edit::blockNames(flow), namesBefore)) << "a refused replacement changed the blocks: " << refused;
+        expect(eq(flow.edges()[0UZ].destinationBlock()->uniqueName(), std::string_view(stage.unique_name))) << "a refused replacement repointed an edge";
+        expect(eq(stage.in.streamReader().available(), kQueuedAtInput)) << "a refused replacement moved the queued samples";
+        expect(eq(sink.in.nWriters(), 1UZ)) << "a refused replacement moved the sink's ring";
     };
 #endif
 

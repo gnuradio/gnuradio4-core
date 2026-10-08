@@ -556,6 +556,7 @@ private:
         [[nodiscard]] constexpr std::pmr::memory_resource* resource() const noexcept { return _buffer->_allocator.resource(); }
         [[nodiscard]] constexpr bool                       isPublishRequested() const noexcept { return _nRequestedSamplesToPublish != kNotPublished; }
         [[nodiscard]] constexpr std::size_t                nRequestedSamplesToPublish() const noexcept { return _nRequestedSamplesToPublish == kNotPublished ? 0UZ : _nRequestedSamplesToPublish; };
+        [[nodiscard]] constexpr bool                       hasOutstandingSpans() const noexcept { return _instanceCount != 0UZ; }
 
     private:
         constexpr void checkIfCanReserveAndAbortIfNeeded() const noexcept {
@@ -777,6 +778,7 @@ private:
         [[nodiscard]] constexpr std::size_t nSamplesConsumed() const noexcept { return _nSamplesConsumed; };
         [[nodiscard]] constexpr bool        isConsumeRequested() const noexcept { return _nRequestedSamplesToConsume != std::numeric_limits<std::size_t>::max(); }
         [[nodiscard]] constexpr std::size_t nRequestedSamplesToConsume() const noexcept { return _nRequestedSamplesToConsume; }
+        [[nodiscard]] constexpr bool        hasOutstandingSpans() const noexcept { return _instanceCount != 0UZ; }
 
         template<SpanReleasePolicy policy = SpanReleasePolicy::ProcessNone>
         [[nodiscard]] constexpr auto get(const std::size_t nRequested = std::numeric_limits<std::size_t>::max()) noexcept -> ReaderSpan<U, policy> {

@@ -12,6 +12,8 @@
 #include <set>
 #include <span>
 #include <thread>
+#include <typeinfo>
+#include <utility>
 #include <variant>
 
 #include <gnuradio-4.0/PmtTypeHelpers.hpp>
@@ -1241,10 +1243,57 @@ private:
 
     std::unique_ptr<model> _accessor;
 
+    // The stream and tag handlers of a port hold its ring, its read or write position and its tags. A port without
+    // rings holds no handlers, and an exchange moves the handlers or their absence together with the port's flag
+    // that its rings are built. A null type means that the port offers no handlers to exchange.
+    struct Handlers {
+        void*                 stream                  = nullptr;
+        void*                 tags                    = nullptr;
+        std::atomic<bool>*    hasRings                = nullptr;
+        const std::type_info* type                    = nullptr;
+        bool                  spansInUse              = false; // a span of either handler is outstanding
+        void (*exchange)(Handlers, Handlers) noexcept = nullptr;
+    };
+
+    // A wrapper offers its handlers through this interface and not through model. The layout of model stays as it is.
+    // A wrapper compiled without the interface offers no handlers.
+    struct HandlerAccess {
+        virtual ~HandlerAccess()                           = default;
+        [[nodiscard]] virtual Handlers handlers() noexcept = 0;
+    };
+
+    [[nodiscard]] Handlers handlers() noexcept {
+        auto* access = dynamic_cast<HandlerAccess*>(_accessor.get());
+        return access != nullptr ? access->handlers() : Handlers{};
+    }
+
     template<PortLike T, bool owning>
-    class PortWrapper final : public model {
+    class PortWrapper final : public model, public HandlerAccess {
         using TPortType = std::decay_t<T>;
         std::conditional_t<owning, TPortType, TPortType&> _value;
+
+        [[nodiscard]] Handlers handlers() noexcept override {
+            if constexpr (requires {
+                              { _value._ioHandler->hasOutstandingSpans() } noexcept;
+                              { _value._tagIoHandler->hasOutstandingSpans() } noexcept;
+                              { _value.hasRings() } noexcept;
+                          }) {
+                using Stream = std::remove_reference_t<decltype(_value._ioHandler)>;
+                using Tags   = std::remove_reference_t<decltype(_value._tagIoHandler)>;
+                if constexpr (std::is_nothrow_swappable_v<Stream> && std::is_nothrow_swappable_v<Tags>) {
+                    const bool spansInUse = _value.hasRings() && (_value._ioHandler->hasOutstandingSpans() || _value._tagIoHandler->hasOutstandingSpans());
+                    return {std::addressof(_value._ioHandler), std::addressof(_value._tagIoHandler), std::addressof(_value._hasRings), &typeid(std::pair<Stream, Tags>), spansInUse, //
+                        [](Handlers first, Handlers second) noexcept {
+                            std::swap(*static_cast<Stream*>(first.stream), *static_cast<Stream*>(second.stream));
+                            std::swap(*static_cast<Tags*>(first.tags), *static_cast<Tags*>(second.tags));
+                            const bool firstHasRings = first.hasRings->load(std::memory_order_acquire);
+                            first.hasRings->store(second.hasRings->load(std::memory_order_acquire), std::memory_order_release);
+                            second.hasRings->store(firstHasRings, std::memory_order_release);
+                        }};
+                }
+            }
+            return {};
+        }
 
         [[nodiscard]] InternalPortBuffers writerHandlerInternal() noexcept { return _value.writerHandlerInternal(); };
 
@@ -1399,6 +1448,26 @@ public:
     [[nodiscard]] std::expected<void, Error> disconnect() { return _accessor->disconnect(); }
 
     [[nodiscard]] std::expected<void, Error> connect(DynamicPort& dst_port) { return _accessor->connect(dst_port); }
+
+    // Two ports can exchange their handlers when both hold handlers of one type and neither has a span outstanding.
+    [[nodiscard]] std::expected<void, Error> checkHandlerExchange(DynamicPort& other) {
+        const Handlers own   = handlers();
+        const Handlers their = other.handlers();
+        if (own.type == nullptr || their.type == nullptr || *own.type != *their.type) {
+            return std::unexpected(Error(std::format("port {} ({}) cannot take the buffers of port {} ({})", other.metaInfo.name, other.typeName(), metaInfo.name, typeName())));
+        }
+        if (own.spansInUse || their.spansInUse) {
+            return std::unexpected(Error(std::format("port {} or port {} has a span outstanding", metaInfo.name, other.metaInfo.name)));
+        }
+        return {};
+    }
+
+    // Each port takes the other's ring, read or write position and tags. The readers on an output's ring keep their
+    // positions. checkHandlerExchange() must have succeeded for the pair.
+    void exchangeHandlers(DynamicPort& other) noexcept {
+        const Handlers own = handlers();
+        own.exchange(own, other.handlers());
+    }
 };
 
 template<PortLike T, bool owning>
