@@ -256,7 +256,7 @@ const boost::ut::suite<"BasicTriggerNameCtxMatcher"> triggerTest = [] {
     // process, which is what a terminating pointer read would do
     "a state map carrying the wrong types is refused, not fatal"_test = [] {
         using enum gr::trigger::MatchResult;
-        constexpr auto filter = "[alarm/room1, alarm/room3]";
+        static constexpr auto filter = "[alarm/room1, alarm/room3]";
 
         // the criteria already stored, so the matcher keeps the values below instead of rebuilding them
         property_map state{{"filter", std::string(filter)}, {"startDefined", 42}, {"stopDefined", 42}, {"triggerActive", 42}, //
