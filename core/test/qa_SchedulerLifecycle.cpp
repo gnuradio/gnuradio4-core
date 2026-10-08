@@ -1994,6 +1994,29 @@ const boost::ut::suite<"settings staged on a scheduler"> stagedSchedulerSettings
     };
 };
 
+const boost::ut::suite<"the calling thread's name"> callerThreadNameTests = [] {
+    using namespace boost::ut;
+
+    "a single-threaded run leaves the calling thread's name as it found it"_test = [] {
+        const std::string originalName = gr::thread_pool::thread::getThreadName();
+        gr::thread_pool::thread::setThreadName("qa-caller");
+        const std::string nameBeforeRun = gr::thread_pool::thread::getThreadName();
+
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::DoneSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        qa_sched::SerialScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(scheduler.runAndWait().has_value());
+
+        const std::string nameAfterRun = gr::thread_pool::thread::getThreadName();
+        gr::thread_pool::thread::setThreadName(originalName);
+        expect(eq(nameAfterRun, nameBeforeRun)) << "the run on the calling thread must leave its name as it found it";
+    };
+};
+
 const boost::ut::suite<"a scheduler that supplies its own worker"> ownWorkerTests = [] {
     using namespace boost::ut;
     using enum gr::lifecycle::State;
