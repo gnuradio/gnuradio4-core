@@ -72,13 +72,26 @@ function(
   set(_stream "")
   foreach(_name IN LISTS _produced)
     file(READ "${_generated}/${_name}" _text)
+    # a generator records the path it was invoked with, in either separator form; normalise both
+    file(TO_NATIVE_PATH "${_generator}" _generator_native)
     string(
       REPLACE "${_generator}"
               "GENERATOR"
               _text
               "${_text}")
     string(
+      REPLACE "${_generator_native}"
+              "GENERATOR"
+              _text
+              "${_text}")
+    file(TO_NATIVE_PATH "${HEADER}" _header_native)
+    string(
       REPLACE "${HEADER}"
+              "FIXTURE"
+              _text
+              "${_text}")
+    string(
+      REPLACE "${_header_native}"
               "FIXTURE"
               _text
               "${_text}")
