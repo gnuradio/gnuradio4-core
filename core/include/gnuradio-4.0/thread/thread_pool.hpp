@@ -343,9 +343,9 @@ class BasicThreadPool {
     std::atomic_bool _shutdown    = false;
 
     // Workers wait, take a task and leave under _waitMutex. execute() queues a task and decides to add a worker under
-    // it. setAffinityMask() and setThreadSchedulingPolicy() set the live workers under it. The lock order is
-    // _threadListMutex, then _waitMutex. A thread holding _waitMutex never waits for _threadListMutex, and every hold
-    // of _waitMutex is short.
+    // it. setAffinityMask() and setThreadSchedulingPolicy() set the live workers under it. _threadListMutex guards the
+    // worker threads, the affinity mask and the scheduling policy. The lock order is _threadListMutex, then
+    // _waitMutex. A thread holding _waitMutex never waits for _threadListMutex, and every hold of _waitMutex is short.
     std::mutex                   _waitMutex;
     std::condition_variable      _condition;
     std::size_t                  _numIdleWorkers  = 0U; // workers without a task, guarded by _waitMutex
@@ -433,24 +433,32 @@ public:
 
     [[nodiscard]] bool isShutdown() const { return _shutdown; }
 
-    [[nodiscard]] std::vector<bool> getAffinityMask() const { return _affinityMask; }
-
-    void setAffinityMask(const std::vector<bool>& threadAffinityMask) {
-        _affinityMask.clear();
-        std::copy(threadAffinityMask.begin(), threadAffinityMask.end(), std::back_inserter(_affinityMask));
-        cleanupFinishedThreads();
-        updateThreadConstraints();
+    [[nodiscard]] std::vector<bool> getAffinityMask() const {
+        std::scoped_lock lock(_threadListMutex);
+        return _affinityMask;
     }
 
-    [[nodiscard]] auto getSchedulingPolicy() const { return _schedulingPolicy; }
+    void setAffinityMask(const std::vector<bool>& threadAffinityMask) {
+        cleanupFinishedThreads();
+        updateThreadConstraints([this, &threadAffinityMask] { _affinityMask = threadAffinityMask; });
+    }
 
-    [[nodiscard]] auto getSchedulingPriority() const { return _schedulingPriority; }
+    [[nodiscard]] thread::Policy getSchedulingPolicy() const {
+        std::scoped_lock lock(_threadListMutex);
+        return _schedulingPolicy;
+    }
+
+    [[nodiscard]] int getSchedulingPriority() const {
+        std::scoped_lock lock(_threadListMutex);
+        return _schedulingPriority;
+    }
 
     void setThreadSchedulingPolicy(const thread::Policy schedulingPolicy = thread::Policy::OTHER, const int schedulingPriority = 0) {
-        _schedulingPolicy   = schedulingPolicy;
-        _schedulingPriority = schedulingPriority;
         cleanupFinishedThreads();
-        updateThreadConstraints();
+        updateThreadConstraints([this, schedulingPolicy, schedulingPriority] {
+            _schedulingPolicy   = schedulingPolicy;
+            _schedulingPriority = schedulingPriority;
+        });
     }
 
     // Queues the task for a worker of the pool. When the idle workers are no more than the tasks queued ahead and the
@@ -463,8 +471,9 @@ public:
     requires(std::is_same_v<R, void>)
     void execute(Callable&& func, Args&&... args, const std::source_location& location = std::source_location::current()) {
         if constexpr (cpuID >= 0) {
-            if (cpuID >= _affinityMask.size() || (!_affinityMask[cpuID])) {
-                throw std::invalid_argument(std::format("pool({}): requested cpuID {} incompatible with set affinity mask({}): [{}]", poolName(), cpuID, _affinityMask.size(), gr::join(_affinityMask, ", ")));
+            const std::vector<bool> affinityMask = getAffinityMask();
+            if (cpuID >= affinityMask.size() || (!affinityMask[cpuID])) {
+                throw std::invalid_argument(std::format("pool({}): requested cpuID {} incompatible with set affinity mask({}): [{}]", poolName(), cpuID, affinityMask.size(), gr::join(affinityMask, ", ")));
             }
         }
         TaskQueue::TaskContainer task = createTask<taskName, priority, cpuID>(std::forward<decltype(func)>(func), std::forward<decltype(func)>(args)...);
@@ -490,11 +499,12 @@ public:
     requires(!std::is_same_v<R, void>)
     [[nodiscard]] std::future<R> execute(Callable&& func, Args&&... funcArgs) {
         if constexpr (cpuID >= 0) {
-            if (cpuID >= _affinityMask.size() || (!_affinityMask[cpuID])) {
+            const std::vector<bool> affinityMask = getAffinityMask();
+            if (cpuID >= affinityMask.size() || (!affinityMask[cpuID])) {
 #ifdef _LIBCPP_VERSION
-                throw std::invalid_argument(std::format("pool({}): cpuID {} is out of range [0,{}] or incompatible with set affinity mask", poolName(), cpuID, _affinityMask.size()));
+                throw std::invalid_argument(std::format("pool({}): cpuID {} is out of range [0,{}] or incompatible with set affinity mask", poolName(), cpuID, affinityMask.size()));
 #else
-                throw std::invalid_argument(std::format("pool({}): cpuID {} is out of range [0,{}] or incompatible with set affinity mask [{}]", poolName(), cpuID, _affinityMask.size(), _affinityMask));
+                throw std::invalid_argument(std::format("pool({}): cpuID {} is out of range [0,{}] or incompatible with set affinity mask [{}]", poolName(), cpuID, affinityMask.size(), affinityMask));
 #endif
             }
         }
@@ -526,11 +536,13 @@ private:
         // std::erase_if(_threads, [](auto &thread) { return !thread.joinable(); });
     }
 
-    // Sets the name, scheduling and affinity of every live worker. The workers that left at their keep-alive are
-    // joined first. The others are set under _waitMutex, where no worker decides to leave. A worker that left after
-    // the join keeps its record and is skipped. During shutdown a worker leaves without a record, and no worker is set.
-    void updateThreadConstraints() {
+    // Stores the new mask or scheduling policy under _threadListMutex, then sets the name, scheduling and affinity of
+    // every live worker. The workers that left at their keep-alive are joined first. The others are set under
+    // _waitMutex, where no worker decides to leave. A worker that left after the join keeps its record and is skipped.
+    // During shutdown a worker leaves without a record, and no worker is set.
+    void updateThreadConstraints(std::invocable auto storeConstraints) {
         std::scoped_lock threadListLock(_threadListMutex);
+        storeConstraints();
         std::unique_lock waitLock(_waitMutex, std::defer_lock);
         joinDepartedThreads(waitLock);
         waitLock.lock();
@@ -633,9 +645,10 @@ private:
     // that cannot be read and a thread the system refuses (std::system_error). A worker whose name or scheduling
     // cannot be set stays in the pool, and the exception reaches the caller.
     // The join runs under _threadListMutex. No other worker starts while a departed thread still runs. A
-    // thread-local destructor of a departed worker therefore must not call execute() on its own pool. That call can
-    // wait for _threadListMutex while addWorker(), setAffinityMask() or setThreadSchedulingPolicy() holds it and joins
-    // the calling thread.
+    // thread-local destructor of a departed worker therefore must not call a member of its own pool that takes
+    // _threadListMutex: execute(), numThreadsHeld(), requestShutdown(), and the getters and setters of the mask and the
+    // scheduling policy. Such a call can wait for _threadListMutex while addWorker(), setAffinityMask() or
+    // setThreadSchedulingPolicy() holds it and joins the calling thread.
     void addWorker(std::unique_lock<std::mutex>& waitLock, std::source_location location) {
         _numThreads.fetch_add(1UZ, std::memory_order_acq_rel);
         ++_numIdleWorkers;

@@ -404,6 +404,65 @@ const boost::ut::suite<"gr::thread_pool GR4 default"> defaultThreadPool = [] {
         expect(workerMask == mask->pool) << std::format("the remaining worker runs on '{}', expected '{}'", bits(workerMask), bits(mask->pool));
         expect(thread::getThreadAffinity() == callerMask) << "the calling thread's mask changed";
     };
+
+    "ThreadPool: readers and new workers see only the masks and policies that another thread sets"_test = [] {
+        using namespace gr::thread_pool;
+
+        const std::optional<TwoCpuMask> mask = twoCpuMask(2UZ);
+        if (!mask) {
+            boost::ut::log << "skipped: the calling thread may run on fewer than two CPUs";
+            return;
+        }
+
+        // One thread sets the two stripes in turn, each followed by the default scheduling policy. Meanwhile the
+        // calling thread reads the pool's mask and policy and makes the pool start four workers. An IO-bound worker
+        // runs on the whole mask. Each worker therefore runs on one of the stripes.
+        constexpr std::size_t kRounds = 200UZ;
+        constexpr std::size_t kReads  = 100UZ;
+        HeldWorkers           held;
+        BasicThreadPool       pool("ConcurrentMaskTest", TaskType::IO_BOUND, 0U, 4U);
+        pool.setAffinityMask(mask->stripes[0]);
+        std::atomic<bool> setterDone{false};
+        std::string       setterFailure;
+        std::jthread      setter([&pool, &mask, &setterDone, &setterFailure] {
+            try {
+                for (std::size_t round = 0UZ; round < kRounds; ++round) {
+                    pool.setAffinityMask(mask->stripes[round % mask->stripes.size()]);
+                    pool.setThreadSchedulingPolicy(thread::Policy::OTHER, 0);
+                    std::this_thread::yield();
+                }
+            } catch (const std::exception& e) {
+                setterFailure = e.what();
+            }
+            setterDone = true;
+        });
+
+        const auto  isStripe    = [&mask](const std::vector<bool>& candidate) { return std::ranges::find(mask->stripes, candidate) != mask->stripes.end(); };
+        std::size_t nReads      = 0UZ;
+        std::size_t nUnsetReads = 0UZ;
+        const auto  readBack    = [&] {
+            const bool setValues = isStripe(pool.getAffinityMask()) && pool.getSchedulingPolicy() == thread::Policy::OTHER && pool.getSchedulingPriority() == 0;
+            nUnsetReads += setValues ? 0UZ : 1UZ;
+            ++nReads;
+        };
+        for (std::size_t read = 0UZ; read < kReads; ++read) {
+            readBack();
+        }
+        const std::string refusal = held.hold(pool, 4UZ);
+        while (!setterDone) {
+            readBack();
+        }
+        setter.join();
+        held.releaseAll();
+
+        expect(setterFailure.empty()) << std::format("setting the mask or the policy failed: {}", setterFailure);
+        expect(refusal.empty()) << std::format("a worker was refused: {}", refusal);
+        expect(eq(nUnsetReads, 0UZ)) << std::format("{} of {} reads returned a mask or a policy that no call set", nUnsetReads, nReads);
+        expect(eq(held.workers.size(), 4UZ)) << "a task did not start";
+        for (const HeldWorkers::Worker& worker : held.workers) {
+            expect(isStripe(worker.mask)) << std::format("worker {} runs on '{}', which is neither stripe", worker.name, bits(worker.mask));
+        }
+    };
 #endif
 
     "ThreadPool: CPU affinity rejection"_test = [] {
