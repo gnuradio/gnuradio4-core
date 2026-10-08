@@ -207,6 +207,19 @@ using MergedBlockBase = std::conditional_t<(memberForwardsEveryKey<TMembers>() &
     typename MergedBlockBaseOf<TComposed, typename JoinedDroppedTagKeys<typename MemberDroppedTagKeys<TMembers>::type...>::type>::type, //
     typename MergedBlockBaseOf<TComposed, typename JoinedDroppedTagKeys<typename MemberDroppedTagKeys<TMembers>::type...>::type, FilteredTagPropagation>::type>;
 
+/// common SIMD width of a pack of `meta::any_simd` inputs (they all share one width by construction);
+/// 0 -- i.e. the native width -- for any other pack.
+/// N.B. hoisted out of the `processOne` return type below, where MSVC ICEs on a comma fold. It has to
+/// stay total (hence the `if constexpr`): MSVC forms that return type before checking the constraints.
+template<typename... Ts>
+[[nodiscard]] constexpr std::size_t simdWidth() noexcept {
+    if constexpr ((meta::any_simd<Ts> && ...)) {
+        return (0UZ, ..., Ts::size());
+    } else {
+        return 0UZ;
+    }
+}
+
 } // namespace detail
 
 /**
@@ -302,7 +315,7 @@ public:
 
     template<meta::any_simd... Ts>
     requires traits::block::can_processOne_simd<Left> and traits::block::can_processOne_simd<Right>
-    constexpr meta::simdize<ReturnType, (0, ..., Ts::size())> processOne(const Ts&... inputs) const {
+    constexpr meta::simdize<ReturnType, detail::simdWidth<Ts...>()> processOne(const Ts&... inputs) const {
         static_assert(traits::block::stream_output_port_types<Left>::size == 1, "TODO: SIMD for multiple output ports not implemented yet");
         return apply_right<InId, traits::block::stream_input_port_types<Right>::size() - InId - 1>(std::tie(inputs...), apply_left<traits::block::stream_input_port_types<Left>::size()>(std::tie(inputs...)));
     }
