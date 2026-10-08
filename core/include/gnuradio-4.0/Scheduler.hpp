@@ -1678,7 +1678,12 @@ protected:
             if (activeState == RUNNING) {
                 if (const std::optional<work::Result> result = traverseBlockListAsWork(localBlockList); result.has_value()) {
                     if (result->status == work::Status::DONE) {
-                        break; // nothing happened -> shutdown this worker
+                        // a block queued for this job list, such as the replacement of the block that ended last,
+                        // keeps the worker in its loop
+                        cleanupZombieBlocks(localBlockList);
+                        if (adoptBlocks(runnerID, localBlockList) == 0UZ && closeAdoptionListIfEmpty(runnerID)) {
+                            break; // nothing happened -> shutdown this worker
+                        }
                     } else if (result->status == work::Status::ERROR) {
                         failRun(runEndingBlock().value_or(""), generation, "returned ERROR");
                         break;
@@ -2136,13 +2141,32 @@ protected:
         return false;
     }
 
-    // queues the block for a job list whose worker remains. Returns the index of that job list, or none when every
-    // worker has left
-    [[nodiscard]] std::optional<std::size_t> queueForAdoption(const std::shared_ptr<BlockModel>& newBlock) {
-        std::lock_guard          guard(_adoptionBlocksMutex);
+    // the index of the job list that holds the named block. A single-threaded run holds _executionOrderMutex on its
+    // worker for the whole run and has one job list. Only a multi-threaded scheduler looks
+    [[nodiscard]] std::optional<std::size_t> jobListHolding(std::string_view uniqueName) {
+        if constexpr (executionPolicy() == ExecutionPolicy::multiThreaded) {
+            std::lock_guard lock(_executionOrderMutex);
+            for (std::size_t i = 0UZ; i < _executionOrder->size(); ++i) {
+                if (std::ranges::any_of((*_executionOrder)[i], [uniqueName](const std::shared_ptr<BlockModel>& block) { return block->uniqueName() == uniqueName; })) {
+                    return i;
+                }
+            }
+        }
+        return std::nullopt;
+    }
+
+    // queues the block for a job list whose worker remains: the preferred job list while its worker remains, otherwise
+    // one chosen by the block's address. Returns the index of that job list, or none when every worker has left
+    [[nodiscard]] std::optional<std::size_t> queueForAdoption(const std::shared_ptr<BlockModel>& newBlock, std::optional<std::size_t> preferredJobList = std::nullopt) {
+        std::lock_guard guard(_adoptionBlocksMutex);
+        auto            isOpen = [this](std::size_t i) { return i >= _adoptionListClosed.size() || !_adoptionListClosed[i]; };
+        if (preferredJobList.has_value() && *preferredJobList < _adoptionBlocks.size() && isOpen(*preferredJobList)) {
+            _adoptionBlocks[*preferredJobList].push_back(newBlock);
+            return preferredJobList;
+        }
         std::vector<std::size_t> openLists;
         for (std::size_t i = 0UZ; i < _adoptionBlocks.size(); ++i) {
-            if (i >= _adoptionListClosed.size() || !_adoptionListClosed[i]) {
+            if (isOpen(i)) {
                 openLists.push_back(i);
             }
         }
@@ -2154,10 +2178,11 @@ protected:
         return jobList;
     }
 
-    // Connects the block's message ports. While a run is active, the block joins a job list whose worker remains and
-    // moves to RUNNING. Returns the index of that job list, none when no run is active, or the reason the run does not
-    // take the block. A refused block stays in the graph and runs from the next start.
-    [[nodiscard]] std::expected<std::optional<std::size_t>, Error> adoptBlock(const std::shared_ptr<BlockModel>& newBlock) {
+    // Connects the block's message ports. While a run is active, the block joins a job list whose worker remains, the
+    // preferred one while its worker remains, and moves to RUNNING. Returns the index of that job list, none when no run
+    // is active, or the reason the run does not take the block. A refused block stays in the graph and runs from the
+    // next start.
+    [[nodiscard]] std::expected<std::optional<std::size_t>, Error> adoptBlock(const std::shared_ptr<BlockModel>& newBlock, std::optional<std::size_t> preferredJobList = std::nullopt) {
         using enum lifecycle::State;
         if (const auto connectResult = _toChildMessagePort.connect(*newBlock->msgIn); !connectResult.has_value()) {
             this->emitErrorMessage("connectBlockMessagePorts()", std::format("Failed to connect scheduler input message port to child '{}'", newBlock->uniqueName()));
@@ -2179,14 +2204,14 @@ protected:
             if (auto started = startAdoptedScheduler(newBlock); !started) {
                 return std::unexpected(started.error());
             }
-            const std::optional<std::size_t> jobList = queueForAdoption(newBlock);
+            const std::optional<std::size_t> jobList = queueForAdoption(newBlock, preferredJobList);
             if (!jobList.has_value()) {
                 return std::unexpected(noWorkerLeft());
             }
             wakeParkedWorkers();
             return jobList;
         }
-        const std::optional<std::size_t> jobList = queueForAdoption(newBlock);
+        const std::optional<std::size_t> jobList = queueForAdoption(newBlock, preferredJobList);
         if (!jobList.has_value()) {
             return std::unexpected(noWorkerLeft());
         }
@@ -2574,17 +2599,39 @@ protected:
         }
     }
 
-    void adoptBlocks(std::size_t runnerID, std::vector<std::shared_ptr<BlockModel>>& localBlockList) {
+    // a worker whose blocks are done leaves only when nothing is queued for its job list. Returns whether it closed the
+    // job list, which then takes no further block
+    [[nodiscard]] bool closeAdoptionListIfEmpty(std::size_t runnerID) {
         std::lock_guard guard(_adoptionBlocksMutex);
-
-        if (runnerID >= _adoptionBlocks.size()) {
-            return; // scheduler was reinitialized with fewer batches; this runner has no pending blocks
+        if (runnerID < _adoptionBlocks.size() && !_adoptionBlocks[runnerID].empty()) {
+            return false;
         }
-        auto& newBlocks = _adoptionBlocks[runnerID];
+        if (runnerID < _adoptionListClosed.size()) {
+            _adoptionListClosed[runnerID] = true;
+        }
+        return true;
+    }
 
-        localBlockList.reserve(localBlockList.size() + newBlocks.size());
+    // moves the blocks queued for this job list into the worker's list and records them in the job list, where a later
+    // replacement of one of them finds it. Returns the number of blocks moved
+    std::size_t adoptBlocks(std::size_t runnerID, std::vector<std::shared_ptr<BlockModel>>& localBlockList) {
+        std::vector<std::shared_ptr<BlockModel>> newBlocks;
+        {
+            std::lock_guard guard(_adoptionBlocksMutex);
+            if (runnerID >= _adoptionBlocks.size()) {
+                return 0UZ; // scheduler was reinitialized with fewer batches; this runner has no pending blocks
+            }
+            newBlocks.swap(_adoptionBlocks[runnerID]);
+        }
+        if (newBlocks.empty()) {
+            return 0UZ;
+        }
         localBlockList.insert(localBlockList.end(), newBlocks.begin(), newBlocks.end());
-        newBlocks.clear();
+        std::lock_guard lock(_executionOrderMutex); // never taken under the adoption lock
+        if (runnerID < _executionOrder->size()) {
+            std::ranges::copy(newBlocks, std::back_inserter((*_executionOrder)[runnerID]));
+        }
+        return newBlocks.size();
     }
 
     /*
@@ -2745,7 +2792,11 @@ protected:
         return replyAfter(std::move(message), scheduler::property::kBlockReplaced, &SchedulerBase::replaceBlockByMessage);
     }
 
-    // the BlockReplaced reply carries the replacement as the graph serializes it
+    // The replacement takes the replaced block's place while no worker is inside a work() call, and the replaced block
+    // stops inside that quiescence. While a run is active, the replacement joins the job list that held the replaced
+    // block. The edit holds the lock of stop()'s sweep. A stop that has begun when the edit decides leaves the
+    // replacement out of the run, and the sweep then stops the replacement. The BlockReplaced reply carries the
+    // replacement as the graph serializes it and "jobList", the index of the job list it joined
     std::expected<property_map, Error> replaceBlockByMessage(const Message& message) {
         const auto& messageData = message.data.value();
         const auto  uniqueName  = messageData.at("uniqueName").value_or(std::string_view{});
@@ -2772,16 +2823,32 @@ protected:
             return std::unexpected(Error{std::format("No target graph for the message {}", message)});
         }
 
-        auto [oldBlock, newBlockRaw] = [&] {
-            WorkQuiescenceGuard quiescence(this); // _blocks is traversed by every worker and by forEachBlock
-            return targetGraph->replaceBlock(uniqueName, type, properties);
-        }();
-        makeZombie(std::move(oldBlock));
-        wakeParkedWorkers();
+        std::shared_ptr<BlockModel>                      newBlock;
+        std::expected<std::optional<std::size_t>, Error> adopted;
+        {
+            WorkQuiescenceGuard              quiescence(this); // _blocks is traversed by every worker and by forEachBlock
+            const std::size_t                generation = runGeneration();
+            const std::optional<std::size_t> heldBy     = jobListHolding(uniqueName);
+            std::shared_ptr<BlockModel>      oldBlock;
+            {
+                std::lock_guard childLock(_childLifecycleMutex);
+                auto [replaced, replacement] = targetGraph->replaceBlock(uniqueName, type, properties);
+                oldBlock                     = std::move(replaced);
+                newBlock                     = std::move(replacement);
+                adopted                      = adoptBlock(newBlock, runGeneration() == generation ? heldBy : std::nullopt);
+            }
+            // outside the sweep lock: cleanupZombieBlocks() takes _executionOrderMutex under the zombie lock, and start()
+            // takes the sweep lock under _executionOrderMutex
+            makeZombie(std::move(oldBlock));
+        }
+        if (!adopted) {
+            return std::unexpected(adopted.error());
+        }
 
-        auto replyData                       = serializeBlock(gr::globalPluginLoader(), newBlockRaw, BlockSerializationFlags::All);
+        auto replyData                       = serializeBlock(gr::globalPluginLoader(), newBlock, BlockSerializationFlags::All);
         replyData["_targetGraph"]            = targetGraph->unique_name.value();
         replyData["replacedBlockUniqueName"] = uniqueName;
+        addJobList(replyData, *adopted);
         return replyData;
     }
 };
