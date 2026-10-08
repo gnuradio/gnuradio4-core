@@ -235,6 +235,25 @@ const boost::ut::suite<"end-of-stream drain"> drainTests = [] {
         expect(relay.state() == STOPPED);
     };
 
+    "a restarted block counts its drain stalls from zero"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_drain::BurstSource>();
+        auto&     relay  = flow.emplaceBlock<qa_drain::StuckRelay>();
+        auto&     sink   = flow.emplaceBlock<qa_drain::CountingSink>();
+        expect(flow.connect<"out", "in">(source, relay).has_value());
+        expect(flow.connect<"out", "in">(relay, sink).has_value());
+
+        qa_drain::SerialScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(qa_drain::runWithin(scheduler, std::chrono::duration_cast<std::chrono::milliseconds>(qa_drain::kRunBound))) << "the first run did not end";
+        const std::size_t nCallsFirstRun = relay._nCalls;
+        expect(relay.state() == STOPPED) << "the first run did not end the block";
+
+        expect(qa_drain::runWithin(scheduler, std::chrono::duration_cast<std::chrono::milliseconds>(qa_drain::kRunBound))) << "the second run did not end";
+        expect(eq(relay._nCalls - nCallsFirstRun, nCallsFirstRun)) << "the second run ended the block on the first run's stall count";
+        expect(relay.state() == STOPPED);
+    };
+
     "an input minimum published from processBulk governs the next call and ends the stream"_test = [] {
         gr::Graph flow;
         auto&     source = flow.emplaceBlock<qa_drain::BurstSource>();
