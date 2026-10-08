@@ -31,6 +31,7 @@ inline void registerSchedulers(gr::SchedulerRegistry& registry) {
     registry.insert(kDefaultScheduler, "", makeScheduler<Simple<ExecutionPolicy::singleThreaded>>);
     registry.insert("gr::scheduler::Simple<multiThreaded>", "", makeScheduler<Simple<ExecutionPolicy::multiThreaded>>);
     registry.insert("gr::scheduler::Simple<singleThreadedBlocking>", "", makeScheduler<Simple<ExecutionPolicy::singleThreadedBlocking>>);
+    registry.insert("gr::scheduler::Simple<multiThreadedBlocking>", "", makeScheduler<Simple<ExecutionPolicy::multiThreadedBlocking>>);
 }
 
 } // namespace gr::tools

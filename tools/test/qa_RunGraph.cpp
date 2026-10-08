@@ -93,7 +93,7 @@ constexpr std::string_view kUnnamedResourceFile{GR_TOOLS_TEST_ASSETS "/unnamed_r
 #endif
 
 // the schedulers rungraph registers itself, one per execution policy of core's Simple scheduler
-constexpr std::array<std::string_view, 3UZ> kOwnSchedulers{"gr::scheduler::Simple<singleThreaded>", "gr::scheduler::Simple<multiThreaded>", "gr::scheduler::Simple<singleThreadedBlocking>"};
+constexpr std::array<std::string_view, 4UZ> kOwnSchedulers{"gr::scheduler::Simple<singleThreaded>", "gr::scheduler::Simple<multiThreaded>", "gr::scheduler::Simple<singleThreadedBlocking>", "gr::scheduler::Simple<multiThreadedBlocking>"};
 
 } // namespace qa_rungraph
 
