@@ -187,7 +187,7 @@ template<class T, bool strictCheck = false, typename From>
             if constexpr (digitsS <= digitsT) {
                 return static_cast<T>(srcValue); // always safe
             } else {                             // range check
-                if (static_cast<std::int64_t>(srcValue) >= std::numeric_limits<T>::lowest() && static_cast<std::int64_t>(srcValue) <= std::numeric_limits<T>::max()) {
+                if (static_cast<std::int64_t>(srcValue) >= static_cast<std::int64_t>(std::numeric_limits<T>::lowest()) && static_cast<std::int64_t>(srcValue) <= static_cast<std::int64_t>(std::numeric_limits<T>::max())) {
                     return static_cast<T>(srcValue);
                 }
                 return std::unexpected(std::format("out-of-range integer conversion: {} not in [{}..{}]", srcValue, std::numeric_limits<T>::lowest(), std::numeric_limits<T>::max()));

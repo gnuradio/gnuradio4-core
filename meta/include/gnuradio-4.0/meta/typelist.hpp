@@ -378,7 +378,7 @@ struct typelist {
     using apply = Other<Ts...>;
 
     template<class F, std::size_t... Is, typename... LeadingArguments>
-    static constexpr void for_each_impl(F&& f, std::index_sequence<Is...>, LeadingArguments&&... args) {
+    static constexpr void for_each_impl([[maybe_unused]] F&& f, std::index_sequence<Is...>, [[maybe_unused]] LeadingArguments&&... args) {
         (f(std::forward<LeadingArguments>(args)..., std::integral_constant<std::size_t, Is>{}, static_cast<Ts*>(nullptr)), ...);
     }
 
