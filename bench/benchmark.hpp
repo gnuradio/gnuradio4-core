@@ -2,6 +2,7 @@
 #define GNURADIO_BENCHMARK_HPP
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -9,6 +10,7 @@
 #include <format>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <print>
@@ -44,6 +46,28 @@ namespace benchmark {
 #define SIMD_REG
 #endif
 
+namespace detail {
+/**
+ * Compiler barrier for toolchains without GNU inline asm (MSVC has none on x64): touch the object
+ * through a volatile lvalue, then fence. Unlike a `const volatile T` copy this works for types that
+ * are not trivially copyable i.e std::string.
+ */
+BENCHMARK_ALWAYS_INLINE void keepInMemory(const void* address) noexcept {
+    (void)*static_cast<const volatile char*>(address);
+    std::atomic_signal_fence(std::memory_order_acq_rel);
+}
+
+/**
+ * As keepInMemory, and additionally marks the object written, matching the read-write operand the
+ * GNU path declares. Writing the byte back leaves the value unchanged.
+ */
+BENCHMARK_ALWAYS_INLINE void keepInMemoryModified(void* address) noexcept {
+    volatile char* byte = static_cast<volatile char*>(address);
+    *byte               = *byte;
+    std::atomic_signal_fence(std::memory_order_acq_rel);
+}
+} // namespace detail
+
 /**
  * Tell the compiler that all arguments to this function are read and modified in the most
  * efficient way possible. This may force a value to memory, but generally tries to avoid doing so.
@@ -57,8 +81,7 @@ BENCHMARK_ALWAYS_INLINE void fake_modify(T& x, Ts&... more) {
         asm volatile("" : "+g,m"(x));
     }
 #else
-    const volatile T y = x;
-    x                  = y;
+    detail::keepInMemoryModified(std::addressof(x));
 #endif
     (fake_modify(more), ...);
 }
@@ -79,7 +102,7 @@ BENCHMARK_ALWAYS_INLINE void fake_read(const T& x, const Ts&... more) {
         asm volatile("" ::"g,m"(x));
     }
 #else
-    const volatile T y = x;
+    detail::keepInMemory(std::addressof(x));
 #endif
     if constexpr (sizeof...(Ts) > 0) {
         fake_read(more...);
@@ -97,8 +120,7 @@ BENCHMARK_ALWAYS_INLINE void force_to_memory(T& x, Ts&... more) {
     // NOLINTNEXTLINE(hicpp-no-assembler)
     asm volatile("" : "+m"(x));
 #else
-    const volatile T y = x;
-    x                  = y;
+    detail::keepInMemoryModified(std::addressof(x));
 #endif
     if constexpr (sizeof...(Ts) > 0) {
         force_to_memory(more...);
@@ -115,7 +137,7 @@ BENCHMARK_ALWAYS_INLINE void force_store(const T& x, const Ts&... more) {
     // NOLINTNEXTLINE(hicpp-no-assembler)
     asm volatile("" ::"m"(x));
 #else
-    const volatile T y = x;
+    detail::keepInMemory(std::addressof(x));
 #endif
     if constexpr (sizeof...(Ts) > 0) {
         force_store(more...);
@@ -775,7 +797,7 @@ public:
             const auto        ns                  = stop_iter[N_ITERATIONS - 1] - start;
             const long double duration_s          = 1e-9L * static_cast<long double>(ns.count());
 
-            const auto add_statistics = [&]<typename T>(ResultMap& map, const T& time_diff) {
+            const auto add_statistics = [&]<typename T>(ResultMap& map, [[maybe_unused]] const T& time_diff) {
                 if constexpr (N_ITERATIONS != 1) {
                     const auto [min, mean, stddev, median, max] = utils::compute_statistics(time_diff);
                     map.try_emplace("min", min, "s", _precision);
@@ -1010,6 +1032,6 @@ public:
 } // namespace cfg
 
 template<>
-inline auto boost::ut::cfg<boost::ut::override> = ut::runner<cfg::reporter<printer>>{};
+inline auto boost::ut::cfg<boost::ut::override> = boost::ut::runner<::cfg::reporter<boost::ut::printer>>{};
 
 #endif // GNURADIO_BENCHMARK_HPP
