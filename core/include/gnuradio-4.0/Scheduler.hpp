@@ -466,7 +466,7 @@ public:
     // the progress sequences of the graphs beyond the holder that can read or write this scheduler's exported rings
     void setOuterProgress(std::vector<std::shared_ptr<gr::Sequence>> outerProgress) { _outerProgress = std::move(outerProgress); }
 
-    // why the latest start could not complete and left the scheduler in ERROR. The next start clears it. The thread
+    // why the latest start or resume could not complete and left the scheduler in ERROR. The next start clears it. The thread
     // that runs the start writes it before it publishes ERROR. Read it once the state reads ERROR or while no start is
     // in progress. A read during a start races with that write.
     [[nodiscard]] std::optional<Error> startError() const { return _startError; }
@@ -1029,7 +1029,10 @@ protected:
         });
     }
 
-    bool connectPendingEdges() {
+    // connects the pending edges of the graph and of its transparent subgraphs and primes the feedback loops. The
+    // result lists the edges that did not connect: a port that does not exist, two ports of different types, or a
+    // connection that the source port refused
+    [[nodiscard]] std::vector<Edge> connectPendingEdges() {
         auto primeFeedbackPorts = [&](const gr::Graph& graph) {
             std::vector<graph::FeedbackLoop> feedbackLoops = gr::graph::detectFeedbackLoops(graph);
             for (auto& loop : feedbackLoops) {
@@ -1043,17 +1046,34 @@ protected:
             }
         };
 
-        bool result = _graph->connectPendingEdges();
-        graph::forEachBlock<TransparentBlockGroup>(*_graph, [&result](auto& block) {
+        _graph->connectPendingEdges();
+        graph::forEachBlock<TransparentBlockGroup>(*_graph, [](auto& block) {
             if (block->blockCategory() == TransparentBlockGroup) {
                 auto* graph = static_cast<GraphWrapper<gr::Graph>*>(block.get());
-                result      = graph->blockRef().connectPendingEdges() && result;
+                graph->blockRef().connectPendingEdges();
             }
         });
         // priming writes into the buffer of a connected edge. It runs once, after every transparent group's edges are
         // connected, and the flattened graph holds each loop inside a group.
         primeFeedbackPorts(gr::graph::flatten(*_graph)); // need to flatten graph due to potential loops from within the subgraph to blocks in the parents.
-        return result;
+
+        std::vector<Edge> unconnected;
+        graph::forEachEdge<TransparentBlockGroup>(*_graph, [&unconnected](const Edge& edge) {
+            using enum Edge::EdgeState;
+            if (edge.state() == ErrorConnecting || edge.state() == PortNotFound || edge.state() == IncompatiblePorts) {
+                unconnected.push_back(edge);
+            }
+        });
+        return unconnected;
+    }
+
+    // names each edge with its blocks, its ports and the state that kept it from connecting
+    [[nodiscard]] static Error unconnectedEdgesError(const std::vector<Edge>& unconnected) {
+        std::string edges;
+        for (const Edge& edge : unconnected) {
+            edges += std::format("{}{:l}", edges.empty() ? "" : "; ", edge);
+        }
+        return Error(std::format("edges could not be connected: {}", edges));
     }
 
     // idle worker backoff: hot spin, then yield, then a sleep doubling up to kMaxIdleSleep
@@ -1141,9 +1161,10 @@ protected:
         }
     }
 
-    // ends a start that cannot complete. The children that did start are stopped. The reason is kept for
-    // startError() and runAndWait(). The scheduler enters ERROR, which only a reset leaves. The caller returns without
-    // spawning a worker, and no run loop then exists to settle the state later.
+    // ends a start or a resume that cannot complete. The children that did start are stopped. The reason is kept for
+    // startError() and runAndWait(). The scheduler enters ERROR, which only a reset leaves, and its stop() retires the
+    // workers of a resumed run. A start returns without spawning a worker, and no run loop then exists to settle the
+    // state later.
     void failStart(Error reason) {
         _startError = std::move(reason);
         graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) {
@@ -1201,8 +1222,11 @@ protected:
         _startError.reset();
 
         disconnectAllEdges();
-        if (auto result = connectPendingEdges(); !result) {
-            this->emitErrorMessage("start()", "Failed to connect blocks in graph");
+        if (const std::vector<Edge> unconnected = connectPendingEdges(); !unconnected.empty()) {
+            Error reason = unconnectedEdgesError(unconnected);
+            this->emitErrorMessage("start()", reason);
+            failStart(std::move(reason));
+            return;
         }
         if (this->state() == IDLE) {
             if (auto result = this->changeStateTo(INITIALISED); !result) { // Need to go to INITIALISED first
@@ -1814,12 +1838,16 @@ protected:
     void resume() {
         using enum lifecycle::State;
         wakeWorkers();
+        std::vector<Edge> unconnected;
         {
             WorkQuiescenceGuard quiescence(this);
-            auto                result = connectPendingEdges();
-            if (!result) {
-                this->emitErrorMessage("init()", "Failed to connect blocks in graph");
-            }
+            unconnected = connectPendingEdges();
+        }
+        if (!unconnected.empty()) {
+            Error reason = unconnectedEdgesError(unconnected);
+            this->emitErrorMessage("resume()", reason);
+            failStart(std::move(reason));
+            return;
         }
         graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) { this->emitErrorMessageIfAny("resume() -> LifecycleState", block->changeStateTo(RUNNING)); });
         wakeWorkers(); // a worker that parked before the blocks reached RUNNING calls them now
