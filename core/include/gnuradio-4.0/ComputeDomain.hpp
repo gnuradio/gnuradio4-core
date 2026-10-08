@@ -11,6 +11,8 @@
 #include <string_view>
 #include <unordered_map>
 
+#include <gnuradio-4.0/SharedState.hpp>
+
 namespace gr {
 
 enum class Access : std::uint8_t { HostOnly, Shared, DeviceOnly };
@@ -119,10 +121,7 @@ class ComputeRegistry {
     std::unordered_map<std::string, ProviderFn, KeyHash, KeyEq> _providers;
 
 public:
-    static ComputeRegistry& instance() {
-        static ComputeRegistry r;
-        return r;
-    }
+    static ComputeRegistry& instance() { return detail::computeRegistry(); }
 
     void register_provider(std::string_view backend, ProviderFn fn) {
         std::scoped_lock lk(_mtx);

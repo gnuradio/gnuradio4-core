@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstddef>
 #include <memory>
+#include <memory_resource>
 #include <print>
 #include <string>
 #include <string_view>
@@ -14,6 +15,7 @@
 
 #include <gnuradio-4.0/Block.hpp>
 #include <gnuradio-4.0/BlockRegistry.hpp>
+#include <gnuradio-4.0/ComputeDomain.hpp>
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/Message.hpp>
 #include <gnuradio-4.0/PluginLoader.hpp>
@@ -22,6 +24,7 @@
 #include <gnuradio-4.0/thread/thread_pool.hpp>
 
 #include "build_configure.hpp"
+#include "plugins/cross_object_probe.hpp"
 #include "plugins/cross_object_scheduler.hpp"
 
 // The test loads a shared object that compiles the core's headers with code of its own, as a plugin or a block library
@@ -29,6 +32,7 @@
 
 namespace qa_shared_object_state {
 
+constexpr std::string_view kLibraryProbe         = "test::cross_object_probe";
 constexpr std::string_view kLibraryScheduler     = "test::cross_object_scheduler";
 constexpr std::string_view kLibraryMultiThreaded = "test::cross_object_multi_threaded";
 
@@ -38,7 +42,7 @@ constexpr std::string_view kLibraryMultiThreaded = "test::cross_object_multi_thr
     static const bool loaded = [] {
         const std::vector<std::string> directories{std::string(TESTS_BINARY_PATH) + "/cross_object_library"};
         gr::PluginLoader               loader(gr::globalBlockRegistry(), gr::globalSchedulerRegistry(), directories);
-        return gr::globalSchedulerRegistry().contains(kLibraryScheduler) && gr::globalSchedulerRegistry().contains(kLibraryMultiThreaded);
+        return gr::globalBlockRegistry().contains(kLibraryProbe) && gr::globalSchedulerRegistry().contains(kLibraryScheduler) && gr::globalSchedulerRegistry().contains(kLibraryMultiThreaded);
     }();
     return loaded;
 }
@@ -54,6 +58,8 @@ template<typename TPredicate>
     }
     return true;
 }
+
+[[nodiscard]] gr::testing::CrossObjectProbe& libraryProbe(const std::shared_ptr<gr::BlockModel>& block) { return *static_cast<gr::testing::CrossObjectProbe*>(block->raw()); }
 
 std::atomic<std::size_t> gTickCalls{0UZ};
 
@@ -123,6 +129,16 @@ const boost::ut::suite<"values shared with a shared object"> sharedObjectStateTe
         expect(scheduler->_pool.get() == programPool.get()) << "the scheduler holds a default pool other than the program's";
         expect(lt(nThreadsAfter, nThreadsBefore + programPool->minThreads())) << "creating the scheduler started a second default pool";
         expect(gt(nTasksRunning, nTasksBefore)) << "the program's default pool did not run the scheduler's workers";
+    };
+
+    // The program registers a compute provider, and the shared object's code resolves the provider's domain
+    "a compute provider that the program registers resolves in a shared object's code"_test = [] {
+        expect(fatal(loadCrossObjectLibrary())) << "the shared object did not load";
+        gr::ComputeRegistry::instance().register_provider(gr::testing::kCrossObjectDomain.backend, [](const gr::ComputeDomain&, void*) { return std::pmr::null_memory_resource(); });
+        expect(gr::ComputeRegistry::instance().tryResolve(gr::testing::kCrossObjectDomain) == std::pmr::null_memory_resource()) << "the program did not resolve its own provider";
+        const std::shared_ptr<gr::BlockModel> block = gr::globalBlockRegistry().create(kLibraryProbe, gr::property_map{});
+        expect(fatal(block != nullptr)) << "the shared object's probe was not created";
+        expect(libraryProbe(block).providerResource == std::pmr::null_memory_resource()) << "the shared object's code did not find the program's provider";
     };
 };
 

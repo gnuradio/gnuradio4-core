@@ -1,6 +1,7 @@
 #include <mutex>
 #include <unordered_map>
 
+#include <gnuradio-4.0/ComputeDomain.hpp>
 #include <gnuradio-4.0/SharedState.hpp>
 #include <gnuradio-4.0/thread/thread_pool.hpp>
 
@@ -57,6 +58,11 @@ std::size_t& handledMessageSpans() noexcept {
 std::size_t& drainingCalls() noexcept {
     thread_local std::size_t nCalls = 0UZ;
     return nCalls;
+}
+
+ComputeRegistry& computeRegistry() {
+    static ComputeRegistry registry;
+    return registry;
 }
 
 } // namespace gr::detail

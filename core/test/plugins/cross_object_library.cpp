@@ -5,6 +5,7 @@
 #include <gnuradio-4.0/BlockRegistry.hpp>
 #include <gnuradio-4.0/SchedulerModel.hpp>
 
+#include "cross_object_probe.hpp"
 #include "cross_object_scheduler.hpp"
 
 /**
@@ -12,7 +13,7 @@
  *
  * Its blocks handle messages and publish on a scheduler's worker with code from this object. Its two schedulers run
  * workers with code from this object, the single-threaded one on the calling thread and the multi-threaded one on a
- * thread pool.
+ * thread pool. Its probe block holds the program-wide values that this object's code reads.
  */
 namespace gr::testing {
 
@@ -45,6 +46,7 @@ struct LibraryQuietSink : gr::Block<LibraryQuietSink> {
 
 const bool registeredSource [[maybe_unused]] = gr::globalBlockRegistry().insert<LibrarySilentSource>("=test::library_silent_source");
 const bool registeredSink [[maybe_unused]]   = gr::globalBlockRegistry().insert<LibraryQuietSink>("=test::library_quiet_sink");
+const bool registeredProbe [[maybe_unused]]  = gr::globalBlockRegistry().insert<CrossObjectProbe>("=test::cross_object_probe");
 
 std::unique_ptr<gr::SchedulerModel> makeCrossObjectScheduler(gr::property_map parameters) { return std::make_unique<gr::SchedulerWrapper<CrossObjectScheduler>>(std::move(parameters)); }
 
