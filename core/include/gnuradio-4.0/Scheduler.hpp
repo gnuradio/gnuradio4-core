@@ -2106,25 +2106,24 @@ protected:
 
     // a sub-scheduler's RUNNING transition runs its whole loop, so it starts through the threaded wrapper rather than
     // on the thread that adopts it, and only an executing worker shows that its pool had a thread for it. A start that
-    // cannot complete ends the sub-scheduler in ERROR without a worker, and the report carries its startError().
-    void startAdoptedScheduler(const std::shared_ptr<BlockModel>& newBlock) {
+    // cannot complete ends the sub-scheduler in ERROR without a worker, and the returned error carries its startError().
+    [[nodiscard]] std::expected<void, Error> startAdoptedScheduler(const std::shared_ptr<BlockModel>& newBlock) {
         using enum lifecycle::State;
         auto* schedulerModel = dynamic_cast<SchedulerModel*>(newBlock.get());
         if (schedulerModel == nullptr) {
-            this->emitErrorMessage("adoptBlock", std::format("ScheduledBlockGroup is not a SchedulerModel {}", newBlock->uniqueName()));
-            return;
+            return std::unexpected(Error(std::format("ScheduledBlockGroup is not a SchedulerModel {}", newBlock->uniqueName())));
         }
         if (auto started = schedulerModel->startAdopted(); !started.has_value()) {
-            this->emitErrorMessageIfAny("adoptBlock", started);
-            return;
+            return started;
         }
 
         switch (awaitSubSchedulerStart(*newBlock, *schedulerModel)) {
-        case SubSchedulerStart::failed: this->emitErrorMessage("adoptBlock", std::format("adopted sub-scheduler '{}' could not start: {}", newBlock->uniqueName(), subSchedulerStartFailure(*schedulerModel))); break;
-        case SubSchedulerStart::noWorkerInTime: this->emitErrorMessage("adoptBlock", std::format("no worker of adopted sub-scheduler '{}' began executing", newBlock->uniqueName())); break;
+        case SubSchedulerStart::failed: return std::unexpected(Error(std::format("adopted sub-scheduler '{}' could not start: {}", newBlock->uniqueName(), subSchedulerStartFailure(*schedulerModel))));
+        case SubSchedulerStart::noWorkerInTime: return std::unexpected(Error(std::format("no worker of adopted sub-scheduler '{}' began executing", newBlock->uniqueName())));
         case SubSchedulerStart::workerRunning:
         case SubSchedulerStart::stopped: break;
         }
+        return {};
     }
 
     [[nodiscard]] bool hasOpenAdoptionList() {
@@ -2137,8 +2136,9 @@ protected:
         return false;
     }
 
-    // queues the block for a job list whose worker remains. Returns false when every worker has left
-    [[nodiscard]] bool queueForAdoption(const std::shared_ptr<BlockModel>& newBlock) {
+    // queues the block for a job list whose worker remains. Returns the index of that job list, or none when every
+    // worker has left
+    [[nodiscard]] std::optional<std::size_t> queueForAdoption(const std::shared_ptr<BlockModel>& newBlock) {
         std::lock_guard          guard(_adoptionBlocksMutex);
         std::vector<std::size_t> openLists;
         for (std::size_t i = 0UZ; i < _adoptionBlocks.size(); ++i) {
@@ -2147,13 +2147,17 @@ protected:
             }
         }
         if (openLists.empty()) {
-            return false;
+            return std::nullopt;
         }
-        _adoptionBlocks[openLists[std::hash<BlockModel*>{}(newBlock.get()) % openLists.size()]].push_back(newBlock);
-        return true;
+        const std::size_t jobList = openLists[std::hash<BlockModel*>{}(newBlock.get()) % openLists.size()];
+        _adoptionBlocks[jobList].push_back(newBlock);
+        return jobList;
     }
 
-    void adoptBlock(const std::shared_ptr<BlockModel>& newBlock) {
+    // Connects the block's message ports. While a run is active, the block joins a job list whose worker remains and
+    // moves to RUNNING. Returns the index of that job list, none when no run is active, or the reason the run does not
+    // take the block. A refused block stays in the graph and runs from the next start.
+    [[nodiscard]] std::expected<std::optional<std::size_t>, Error> adoptBlock(const std::shared_ptr<BlockModel>& newBlock) {
         using enum lifecycle::State;
         if (const auto connectResult = _toChildMessagePort.connect(*newBlock->msgIn); !connectResult.has_value()) {
             this->emitErrorMessage("connectBlockMessagePorts()", std::format("Failed to connect scheduler input message port to child '{}'", newBlock->uniqueName()));
@@ -2162,50 +2166,89 @@ protected:
         newBlock->msgOut->setBuffer(toSchedulerBuffer.streamBuffer, toSchedulerBuffer.tagBuffer);
 
         if (!lifecycle::isActive(this->state())) {
-            return;
+            return std::nullopt;
         }
+        auto noWorkerLeft = [&newBlock] { return Error(std::format("every worker of the run has left. '{}' runs from the next start", newBlock->uniqueName())); };
 
         if (newBlock->blockCategory() == ScheduledBlockGroup) {
             // the scheduler starts an added scheduler and then queues it. The worker that takes it calls into it, and its
             // init() runs inside the start
-            if (hasOpenAdoptionList()) {
-                startAdoptedScheduler(newBlock);
-                if (queueForAdoption(newBlock)) {
-                    wakeParkedWorkers();
-                }
+            if (!hasOpenAdoptionList()) {
+                return std::unexpected(noWorkerLeft());
             }
-            return;
+            if (auto started = startAdoptedScheduler(newBlock); !started) {
+                return std::unexpected(started.error());
+            }
+            const std::optional<std::size_t> jobList = queueForAdoption(newBlock);
+            if (!jobList.has_value()) {
+                return std::unexpected(noWorkerLeft());
+            }
+            wakeParkedWorkers();
+            return jobList;
         }
-        if (!queueForAdoption(newBlock)) {
-            return;
+        const std::optional<std::size_t> jobList = queueForAdoption(newBlock);
+        if (!jobList.has_value()) {
+            return std::unexpected(noWorkerLeft());
         }
 
         switch (newBlock->state()) {
         case STOPPED:
-        case IDLE: //
-            this->emitErrorMessageIfAny("adoptBlock -> INITIALIZED", newBlock->changeStateTo(INITIALISED));
-            this->emitErrorMessageIfAny("adoptBlock -> INITIALIZED", newBlock->changeStateTo(RUNNING));
-            break;
-        case INITIALISED: //
-            this->emitErrorMessageIfAny("adoptBlock -> INITIALIZED", newBlock->changeStateTo(RUNNING));
-            break;
-        default: this->emitErrorMessage("propertyCallbackEmplaceBlock", std::format("Unexpected block state during emplacement: {}", gr::meta::enumName(newBlock->state()).value_or("")));
+        case IDLE:
+            if (auto initialized = newBlock->changeStateTo(INITIALISED); !initialized) {
+                return std::unexpected(initialized.error());
+            }
+            [[fallthrough]];
+        case INITIALISED:
+            if (auto running = newBlock->changeStateTo(RUNNING); !running) {
+                return std::unexpected(running.error());
+            }
+            wakeParkedWorkers();
+            return jobList;
+        default: return std::unexpected(Error(std::format("block '{}' is {} and cannot join the run", newBlock->uniqueName(), gr::meta::enumName(newBlock->state()).value_or(""))));
         }
-        wakeParkedWorkers();
+    }
+
+    // The reply to a request that edits the graph. It keeps the request's clientRequestID, takes the reply endpoint and
+    // the Final command, and carries the data that the edit returns or the reason the edit was refused. An exception that
+    // leaves the edit is the reason.
+    using GraphEdit = std::expected<property_map, Error> (SchedulerBase::*)(const Message&);
+    Message replyAfter(Message request, std::string_view replyEndpoint, GraphEdit edit) {
+        std::expected<property_map, Error> result;
+        try {
+            result = (this->*edit)(request);
+        } catch (const gr::exception& e) {
+            result = std::unexpected(Error(e));
+        } catch (const std::exception& e) {
+            result = std::unexpected(Error(e));
+        } catch (...) {
+            result = std::unexpected(Error(std::format("unknown exception in '{}' while handling {}", this->unique_name, request.endpoint)));
+        }
+        request.cmd      = message::Command::Final;
+        request.endpoint = replyEndpoint;
+        request.data     = std::move(result);
+        return request;
+    }
+
+    // a block adopted into a running job list adds "jobList", the index of that job list, to its reply
+    static void addJobList(property_map& replyData, std::optional<std::size_t> jobList) {
+        if (jobList.has_value()) {
+            replyData["jobList"] = static_cast<gr::Size_t>(*jobList);
+        }
     }
 
     std::optional<Message> propertyCallbackEmplaceBlock([[maybe_unused]] std::string_view propertyName, Message message) {
-        using enum lifecycle::State;
         assert(propertyName == scheduler::property::kEmplaceBlock);
+        return replyAfter(std::move(message), scheduler::property::kBlockEmplaced, &SchedulerBase::emplaceBlockByMessage);
+    }
+
+    // the BlockEmplaced reply carries the block as the graph serializes it
+    std::expected<property_map, Error> emplaceBlockByMessage(const Message& message) {
         using namespace std::string_literals;
         const auto& messageData = message.data.value();
 
-        message.endpoint = scheduler::property::kBlockEmplaced;
-
         auto* targetGraph = findTargetSubGraph(messageData);
         if (targetGraph == nullptr) {
-            message.data = std::unexpected(Error{std::format("No target graph for the message {}", message)});
-            return message;
+            return std::unexpected(Error{std::format("No target graph for the message {}", message)});
         }
 
         std::string  blockType;
@@ -2215,21 +2258,18 @@ protected:
             // YAML path: create block from a serialised block definition string
             const auto yamlStr = yamlIt->second.value_or(std::string_view{});
             if (yamlStr.empty()) {
-                message.data = std::unexpected(Error{"yaml field is empty"s});
-                return message;
+                return std::unexpected(Error{"yaml field is empty"s});
             }
             auto parsed = pmt::yaml::deserialize(yamlStr);
             if (!parsed) {
-                message.data = std::unexpected(Error{std::format("Could not parse yaml: {}", parsed.error().message)});
-                return message;
+                return std::unexpected(Error{std::format("Could not parse yaml: {}", parsed.error().message)});
             }
 
             if (auto idIt = parsed->find("id"); idIt != parsed->end()) {
                 blockType = std::string(idIt->second.value_or(std::string_view{}));
             }
             if (blockType.empty()) {
-                message.data = std::unexpected(Error{"yaml block definition is missing id field"s});
-                return message;
+                return std::unexpected(Error{"yaml block definition is missing id field"s});
             }
 
             if (blockType == "SUBGRAPH") {
@@ -2241,26 +2281,32 @@ protected:
 
                 const std::size_t blocksBefore = targetGraph->blocks().size();
                 try {
+                    WorkQuiescenceGuard quiescence(this); // the load adds the subgraph to _blocks
                     detail::loadGraphFromMap(gr::globalPluginLoader(), *targetGraph, std::move(graphMap));
                 } catch (const std::exception& e) {
-                    message.data = std::unexpected(Error{std::format("Failed to create subgraph from yaml: {}", e.what())});
-                    return message;
+                    return std::unexpected(Error{std::format("Failed to create subgraph from yaml: {}", e.what())});
                 }
 
                 const auto& blocks = targetGraph->blocks();
                 if (blocks.size() <= blocksBefore) {
-                    message.data = std::unexpected(Error{"No block was added from yaml"s});
-                    return message;
+                    return std::unexpected(Error{"No block was added from yaml"s});
                 }
 
+                std::optional<std::size_t> jobList;
                 for (std::size_t i = blocksBefore; i < blocks.size(); ++i) {
-                    adoptBlock(blocks[i]);
+                    auto adopted = adoptBlock(blocks[i]);
+                    if (!adopted) {
+                        return std::unexpected(adopted.error());
+                    }
+                    if (i == blocksBefore) {
+                        jobList = *adopted;
+                    }
                 }
 
                 auto replyData            = serializeBlock(gr::globalPluginLoader(), blocks[blocksBefore], BlockSerializationFlags::All);
                 replyData["_targetGraph"] = targetGraph->unique_name.value();
-                this->emitMessage(scheduler::property::kBlockEmplaced, std::move(replyData));
-                return {};
+                addJobList(replyData, jobList);
+                return replyData;
             }
 
             // Normal block from YAML: read parameters, stripping auto-generated system fields
@@ -2274,8 +2320,7 @@ protected:
             // Non-YAML path: read type and properties directly from the message
             blockType = std::string(messageData.at("type").value_or(std::string_view{}));
             if (blockType.empty()) {
-                message.data = std::unexpected(Error{std::format("No type specified for the message {}", message)});
-                return message;
+                return std::unexpected(Error{std::format("No type specified for the message {}", message)});
             }
             if (auto it = messageData.find("properties"); it != messageData.end()) {
                 if (const auto* result = it->second.get_if<property_map>()) {
@@ -2306,33 +2351,33 @@ protected:
             std::ignore = newBlock->settings().applyStagedParameters();
         }
 
-        adoptBlock(newBlock);
+        auto adopted = adoptBlock(newBlock);
+        if (!adopted) {
+            return std::unexpected(adopted.error());
+        }
 
         auto replyData            = serializeBlock(gr::globalPluginLoader(), newBlock, BlockSerializationFlags::All);
         replyData["_targetGraph"] = targetGraph->unique_name.value();
-        this->emitMessage(scheduler::property::kBlockEmplaced, std::move(replyData));
-
-        // Message is sent as a reaction to emplaceBlock, no need for a separate one
-        return {};
+        addJobList(replyData, *adopted);
+        return replyData;
     }
 
     std::optional<Message> propertyCallbackRemoveBlock([[maybe_unused]] std::string_view propertyName, Message message) {
         assert(propertyName == scheduler::property::kRemoveBlock);
-        using namespace std::string_literals;
-        auto&      messageData = message.data.value();
-        const auto uniqueName  = messageData.at("uniqueName").value_or(std::string_view{});
-        if (uniqueName.empty()) {
-            message.data = std::unexpected(Error{std::format("No uniqueName in the message {}", message)});
-            return message;
-        }
+        return replyAfter(std::move(message), scheduler::property::kBlockRemoved, &SchedulerBase::removeBlockByMessage);
+    }
 
-        message.endpoint = scheduler::property::kBlockRemoved;
+    std::expected<property_map, Error> removeBlockByMessage(const Message& message) {
+        property_map messageData = message.data.value();
+        const auto   uniqueName  = messageData.at("uniqueName").value_or(std::string_view{});
+        if (uniqueName.empty()) {
+            return std::unexpected(Error{std::format("No uniqueName in the message {}", message)});
+        }
 
         auto* targetGraph = findTargetSubGraph(messageData);
 
         if (targetGraph == nullptr) {
-            message.data = std::unexpected(Error{std::format("No target graph for the message {}", message)});
-            return message;
+            return std::unexpected(Error{std::format("No target graph for the message {}", message)});
         }
 
         messageData["_targetGraph"] = targetGraph->unique_name.value();
@@ -2341,31 +2386,30 @@ protected:
             if (auto removedBlock = targetGraph->removeBlockByName(uniqueName); removedBlock.has_value()) {
                 makeZombie(std::move(*removedBlock));
             } else {
-                message.data = std::unexpected(removedBlock.error());
+                return std::unexpected(removedBlock.error());
             }
         }
 
-        return {message};
+        return messageData;
     }
 
     std::optional<Message> propertyCallbackRemoveEdge([[maybe_unused]] std::string_view propertyName, Message message) {
         assert(propertyName == scheduler::property::kRemoveEdge);
-        using namespace std::string_literals;
-        auto&      messageData = message.data.value();
-        const auto sourceBlock = messageData.at(std::pmr::string(gr::serialization_fields::EDGE_SOURCE_BLOCK)).value_or(std::string_view{});
-        const auto sourcePort  = messageData.at(std::pmr::string(gr::serialization_fields::EDGE_SOURCE_PORT)).value_or(std::string_view{});
-        if (sourceBlock.empty() || sourcePort.empty()) {
-            message.data = std::unexpected(Error{std::format("No source definition for the message {}", message)});
-            return message;
-        }
+        return replyAfter(std::move(message), scheduler::property::kEdgeRemoved, &SchedulerBase::removeEdgeByMessage);
+    }
 
-        message.endpoint = scheduler::property::kEdgeRemoved;
+    std::expected<property_map, Error> removeEdgeByMessage(const Message& message) {
+        property_map messageData = message.data.value();
+        const auto   sourceBlock = messageData.at(std::pmr::string(gr::serialization_fields::EDGE_SOURCE_BLOCK)).value_or(std::string_view{});
+        const auto   sourcePort  = messageData.at(std::pmr::string(gr::serialization_fields::EDGE_SOURCE_PORT)).value_or(std::string_view{});
+        if (sourceBlock.empty() || sourcePort.empty()) {
+            return std::unexpected(Error{std::format("No source definition for the message {}", message)});
+        }
 
         auto* targetGraph = findTargetSubGraph(messageData);
 
         if (targetGraph == nullptr) {
-            message.data = std::unexpected(Error{std::format("No target graph for the message {}", message)});
-            return message;
+            return std::unexpected(Error{std::format("No target graph for the message {}", message)});
         }
 
         // optional: restrict the removal to a single edge of a fan-out
@@ -2378,23 +2422,26 @@ protected:
             if (auto result = targetGraph->removeEdgeBySourcePort(sourceBlock, sourcePort, destinationBlock, destinationPort); result.has_value()) {
                 messageData["nEdgesRemoved"] = static_cast<gr::Size_t>(*result);
             } else {
-                message.data = std::unexpected(result.error());
+                return std::unexpected(result.error());
             }
         }
 
-        return message;
+        return messageData;
+    }
+
+    std::optional<Message> propertyCallbackEmplaceEdge([[maybe_unused]] std::string_view propertyName, Message message) {
+        assert(propertyName == scheduler::property::kEmplaceEdge);
+        return replyAfter(std::move(message), scheduler::property::kEdgeEmplaced, &SchedulerBase::emplaceEdgeByMessage);
     }
 
     // the EdgeEmplaced reply lists the edges the new one displaced under "displacedEdges", keyed by index as in a
     // GraphInspect reply
-    std::optional<Message> propertyCallbackEmplaceEdge([[maybe_unused]] std::string_view propertyName, Message message) {
-        assert(propertyName == scheduler::property::kEmplaceEdge);
-        using namespace std::string_literals;
-        auto&      messageData      = message.data.value();
-        const auto sourceBlock      = messageData.at(std::pmr::string(gr::serialization_fields::EDGE_SOURCE_BLOCK)).value_or(std::string_view{});
-        const auto sourcePort       = messageData.at(std::pmr::string(gr::serialization_fields::EDGE_SOURCE_PORT)).value_or(std::string_view{});
-        const auto destinationBlock = messageData.at(std::pmr::string(gr::serialization_fields::EDGE_DESTINATION_BLOCK)).value_or(std::string_view{});
-        const auto destinationPort  = messageData.at(std::pmr::string(gr::serialization_fields::EDGE_DESTINATION_PORT)).value_or(std::string_view{});
+    std::expected<property_map, Error> emplaceEdgeByMessage(const Message& message) {
+        property_map messageData      = message.data.value();
+        const auto   sourceBlock      = messageData.at(std::pmr::string(gr::serialization_fields::EDGE_SOURCE_BLOCK)).value_or(std::string_view{});
+        const auto   sourcePort       = messageData.at(std::pmr::string(gr::serialization_fields::EDGE_SOURCE_PORT)).value_or(std::string_view{});
+        const auto   destinationBlock = messageData.at(std::pmr::string(gr::serialization_fields::EDGE_DESTINATION_BLOCK)).value_or(std::string_view{});
+        const auto   destinationPort  = messageData.at(std::pmr::string(gr::serialization_fields::EDGE_DESTINATION_PORT)).value_or(std::string_view{});
         // checked_access_ptr terminates on a null unless not_null is turned off, so the
         // non-terminating form is what keeps the incompleteness report below reachable: a message
         // whose buffer size or weight is of the wrong type is a sender's input and is refused as one
@@ -2403,17 +2450,13 @@ protected:
         const auto                  edgeName      = messageData.at(std::pmr::string(gr::serialization_fields::EDGE_NAME)).value_or(std::string_view{});
 
         if (sourceBlock.empty() || sourcePort.empty() || destinationBlock.empty() || destinationPort.empty() || minBufferSize == nullptr || weight == nullptr || edgeName.empty()) {
-            message.data = std::unexpected(Error{std::format("Message is incomplete {}", message)});
-            return message;
+            return std::unexpected(Error{std::format("Message is incomplete {}", message)});
         }
-
-        message.endpoint = scheduler::property::kEdgeEmplaced;
 
         auto* targetGraph = findTargetSubGraph(messageData);
 
         if (targetGraph == nullptr) {
-            message.data = std::unexpected(Error{std::format("No target graph for the message {}", message)});
-            return message;
+            return std::unexpected(Error{std::format("No target graph for the message {}", message)});
         }
 
         messageData["_targetGraph"] = targetGraph->unique_name.value();
@@ -2427,11 +2470,11 @@ protected:
                 }
                 messageData["displacedEdges"] = std::move(displacedEdges);
             } else {
-                message.data = std::unexpected(result.error());
+                return std::unexpected(result.error());
             }
         }
 
-        return message;
+        return messageData;
     }
 
     /*
@@ -2614,45 +2657,40 @@ protected:
     }
 
     std::optional<Message> propertyCallbackGraphGRC([[maybe_unused]] std::string_view propertyName, Message message) {
-        using enum lifecycle::State;
         assert(propertyName == scheduler::property::kGraphGRC);
+        return replyAfter(std::move(message), scheduler::property::kGraphGRC, &SchedulerBase::graphGrcByMessage);
+    }
 
+    std::expected<property_map, Error> graphGrcByMessage(const Message& message) {
         auto& pluginLoader = gr::globalPluginLoader();
         if (message.cmd == message::Command::Get) {
-            message.data = property_map{{"value", gr::saveGrc(pluginLoader, *_graph)}};
+            return property_map{{"value", gr::saveGrc(pluginLoader, *_graph)}};
         } else if (message.cmd == message::Command::Set) {
             const auto& messageData = message.data.value();
             auto        yamlContent = messageData.at("value").value_or(std::string_view{});
             if (yamlContent.empty()) {
-                message.data = std::unexpected(Error{std::format("Yaml content not found")});
-            } else {
-                try {
-                    auto newGraph = gr::loadGrc(pluginLoader, yamlContent);
-
-                    if (auto allowed = swapAllowedFromThisThread(); !allowed) { // before the current blocks are retired
-                        message.data = std::unexpected(allowed.error());
-                        return message;
-                    }
-                    makeAllZombies();
-
-                    const auto originalState = this->state();
-
-                    if (auto result = this->exchange(std::move(newGraph)); !result) {
-                        this->emitErrorMessage("propertyCallbackGraphGRC", "Failed to exchange graph");
-                        return {};
-                    }
-
-                    message.data = property_map{{"originalSchedulerState", static_cast<int>(originalState)}};
-                } catch (const std::exception& e) {
-                    message.data = std::unexpected(Error{std::format("Error parsing YAML: {}", e.what())});
-                }
+                return std::unexpected(Error{std::format("Yaml content not found")});
             }
+            try {
+                auto newGraph = gr::loadGrc(pluginLoader, yamlContent);
 
-        } else {
-            throw gr::exception(std::format("Unexpected command type {}", message.cmd));
+                if (auto allowed = swapAllowedFromThisThread(); !allowed) { // before the current blocks are retired
+                    return std::unexpected(allowed.error());
+                }
+                makeAllZombies();
+
+                const auto originalState = this->state();
+
+                if (auto result = this->exchange(std::move(newGraph)); !result) {
+                    return std::unexpected(result.error());
+                }
+
+                return property_map{{"originalSchedulerState", static_cast<int>(originalState)}};
+            } catch (const std::exception& e) {
+                return std::unexpected(Error{std::format("Error parsing YAML: {}", e.what())});
+            }
         }
-
-        return message;
+        throw gr::exception(std::format("Unexpected command type {}", message.cmd));
     }
 
     std::optional<Message> propertyCallbackSchedulerInspect([[maybe_unused]] std::string_view propertyName, Message message) {
@@ -2704,13 +2742,16 @@ protected:
 
     std::optional<Message> propertyCallbackReplaceBlock([[maybe_unused]] std::string_view propertyName, Message message) {
         assert(propertyName == scheduler::property::kReplaceBlock);
-        using namespace std::string_literals;
+        return replyAfter(std::move(message), scheduler::property::kBlockReplaced, &SchedulerBase::replaceBlockByMessage);
+    }
+
+    // the BlockReplaced reply carries the replacement as the graph serializes it
+    std::expected<property_map, Error> replaceBlockByMessage(const Message& message) {
         const auto& messageData = message.data.value();
         const auto  uniqueName  = messageData.at("uniqueName").value_or(std::string_view{});
         const auto  type        = messageData.at("type").value_or(std::string_view{});
         if (uniqueName.empty() || type.empty()) {
-            message.data = std::unexpected(Error{std::format("No uniqueName or type in the message {}", message)});
-            return message;
+            return std::unexpected(Error{std::format("No uniqueName or type in the message {}", message)});
         }
         const property_map& properties = [&] {
             if (auto it = messageData.find("properties"); it != messageData.end()) {
@@ -2728,8 +2769,7 @@ protected:
         auto* targetGraph = findTargetSubGraph(messageData);
 
         if (targetGraph == nullptr) {
-            message.data = std::unexpected(Error{std::format("No target graph for the message {}", message)});
-            return message;
+            return std::unexpected(Error{std::format("No target graph for the message {}", message)});
         }
 
         auto [oldBlock, newBlockRaw] = [&] {
@@ -2739,14 +2779,10 @@ protected:
         makeZombie(std::move(oldBlock));
         wakeParkedWorkers();
 
-        std::optional<Message> result = gr::Message{};
-        result->endpoint              = scheduler::property::kBlockReplaced;
-        result->data                  = serializeBlock(gr::globalPluginLoader(), newBlockRaw, BlockSerializationFlags::All);
-
-        (*result->data)["_targetGraph"]            = targetGraph->unique_name.value();
-        (*result->data)["replacedBlockUniqueName"] = uniqueName;
-
-        return result;
+        auto replyData                       = serializeBlock(gr::globalPluginLoader(), newBlockRaw, BlockSerializationFlags::All);
+        replyData["_targetGraph"]            = targetGraph->unique_name.value();
+        replyData["replacedBlockUniqueName"] = uniqueName;
+        return replyData;
     }
 };
 

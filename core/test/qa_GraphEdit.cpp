@@ -9,9 +9,11 @@
 #include <cstdio>
 #include <expected>
 #include <format>
+#include <map>
 #include <memory_resource>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -172,6 +174,49 @@ struct LateErrorSource : gr::Block<LateErrorSource> {
     }
 };
 
+inline std::atomic<std::size_t> gConstructions{0UZ};
+
+// counts each instance it constructs in gConstructions. Its one output is optional and asynchronous
+struct ConstructionCounter : gr::Block<ConstructionCounter> {
+    gr::PortOut<float, gr::Async, gr::Optional> out;
+
+    GR_MAKE_REFLECTABLE(ConstructionCounter, out);
+
+    explicit ConstructionCounter(gr::property_map initParameters = {}) : gr::Block<ConstructionCounter>(std::move(initParameters)) { gConstructions.fetch_add(1UZ); }
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        outSpan.publish(0UZ);
+        return gr::work::Status::OK;
+    }
+};
+
+inline std::atomic<bool>        gHoldRequested{false};
+inline std::atomic<bool>        gHoldEntered{false};
+inline std::atomic<bool>        gHoldEnded{false};
+inline std::atomic<std::size_t> gConstructionsDuringHold{0UZ};
+
+// Its first work() call after gHoldRequested is set reports gHoldEntered. The call watches gConstructions for 100 ms or
+// until the first change, stores the change in gConstructionsDuringHold and reports gHoldEnded
+struct HoldingProbe : gr::Block<HoldingProbe> {
+    gr::PortOut<float, gr::Async, gr::Optional> out;
+
+    GR_MAKE_REFLECTABLE(HoldingProbe, out);
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        if (gHoldRequested.exchange(false)) {
+            const std::size_t before = gConstructions.load();
+            gHoldEntered.store(true);
+            for (std::size_t i = 0UZ; i < 100UZ && gConstructions.load() == before; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            gConstructionsDuringHold.store(gConstructions.load() - before);
+            gHoldEnded.store(true);
+        }
+        outSpan.publish(0UZ);
+        return gr::work::Status::OK;
+    }
+};
+
 inline std::atomic<std::size_t> gWorkingTickers{0UZ};
 
 // counts itself once in gWorkingTickers at its first work() call. Its one output is optional and stays unconnected. The
@@ -216,6 +261,7 @@ void registerTestBlocks() {
         std::ignore = gr::globalBlockRegistry().insert<Source>();
         std::ignore = gr::globalBlockRegistry().insert<Sink>();
         std::ignore = gr::globalBlockRegistry().insert<Ticker>();
+        std::ignore = gr::globalBlockRegistry().insert<ConstructionCounter>();
         return true;
     }();
     std::ignore = registered;
@@ -387,6 +433,97 @@ template<typename TScheduler, typename TDone>
     return reached;
 }
 
+// the unique names of a chain: a source feeding a Tunable stage feeding a sink, and a second sink without an edge
+struct ChainNames {
+    std::string source;
+    std::string stage;
+    std::string sink;
+    std::string spareSink;
+};
+
+// gives the scheduler the chain and returns the names of its blocks
+template<typename TScheduler>
+[[nodiscard]] ChainNames exchangeChain(TScheduler& scheduler) {
+    gr::Graph flow;
+    auto&     source    = flow.emplaceBlock<Source>();
+    auto&     stage     = flow.emplaceBlock<Tunable>();
+    auto&     sink      = flow.emplaceBlock<Sink>();
+    auto&     spareSink = flow.emplaceBlock<Sink>();
+    boost::ut::expect(flow.connect<"out", "in">(source, stage).has_value());
+    boost::ut::expect(flow.connect<"out", "in">(stage, sink).has_value());
+    ChainNames names{std::string(source.unique_name), std::string(stage.unique_name), std::string(sink.unique_name), std::string(spareSink.unique_name)};
+    boost::ut::expect(boost::ut::fatal(scheduler.exchange(std::move(flow)).has_value()));
+    return names;
+}
+
+// the data of an EmplaceEdge request
+[[nodiscard]] gr::property_map edgeRequest(std::string_view sourceBlock, std::string_view destinationBlock, gr::pmt::Value weight) {
+    using namespace gr::serialization_fields;
+    return {{std::pmr::string(EDGE_SOURCE_BLOCK), std::string(sourceBlock)}, {std::pmr::string(EDGE_SOURCE_PORT), std::string("out")}, //
+        {std::pmr::string(EDGE_DESTINATION_BLOCK), std::string(destinationBlock)}, {std::pmr::string(EDGE_DESTINATION_PORT), std::string("in")}, {std::pmr::string(EDGE_MIN_BUFFER_SIZE), gr::undefined_Size}, {std::pmr::string(EDGE_WEIGHT), std::move(weight)}, {std::pmr::string(EDGE_NAME), std::string("requested")}};
+}
+
+// a request to the scheduler with the clientRequestID it carries, and whether the scheduler carries out the edit
+struct EditRequest {
+    std::string          id;
+    std::string_view     endpoint;
+    gr::property_map     data;
+    bool                 succeeds = false;
+    gr::message::Command cmd      = gr::message::Command::Set;
+};
+
+// sends every request to a scheduler that is not running and handles them on this thread. Each request must have one
+// answer: Final, under replyEndpoint, with the request's clientRequestID, and with data when the edit succeeds or an
+// error when the scheduler refuses it
+template<typename TScheduler>
+void expectRepliesUnder(TScheduler& scheduler, std::string_view replyEndpoint, std::span<const EditRequest> requests) {
+    using namespace boost::ut;
+    gr::MsgPortOut toScheduler;
+    gr::MsgPortIn  fromScheduler;
+    expect(fatal(toScheduler.connect(scheduler.msgIn).has_value()));
+    expect(fatal(scheduler.msgOut.connect(fromScheduler).has_value()));
+
+    for (const EditRequest& request : requests) {
+        if (request.cmd == gr::message::Command::Get) {
+            gr::sendMessage<gr::message::Command::Get>(toScheduler, scheduler.unique_name, request.endpoint, request.data, request.id);
+        } else {
+            gr::sendMessage<gr::message::Command::Set>(toScheduler, scheduler.unique_name, request.endpoint, request.data, request.id);
+        }
+    }
+    scheduler.processScheduledMessages();
+
+    auto replies = fromScheduler.streamReader().get();
+    for (const EditRequest& request : requests) {
+        auto answersRequest = [&request](const gr::Message& reply) { return reply.clientRequestID == request.id; };
+        expect(eq(static_cast<std::size_t>(std::ranges::count_if(replies, answersRequest)), 1UZ)) << std::format("'{}': the number of replies with the request's id", request.id);
+        const auto reply = std::ranges::find_if(replies, answersRequest);
+        if (reply == replies.end()) {
+            continue;
+        }
+        expect(reply->cmd == gr::message::Command::Final) << std::format("'{}': the reply is not Final", request.id);
+        expect(eq(reply->endpoint, std::string(replyEndpoint))) << std::format("'{}': the reply's endpoint", request.id);
+        expect(eq(reply->data.has_value(), request.succeeds)) << std::format("'{}': {}", request.id, reply->data.has_value() ? std::string("the refusal was answered with data") : reply->data.error().message);
+    }
+    std::ignore = replies.consume(replies.size());
+}
+
+// the reply that carries the clientRequestID, if one arrives. Consumes every message it reads
+[[nodiscard]] std::optional<gr::Message> takeReplyTo(gr::MsgPortIn& port, std::string_view clientRequestID) {
+    for (std::size_t i = 0UZ; i < 3000UZ; ++i) {
+        auto                       messages = port.streamReader().get();
+        std::optional<gr::Message> reply;
+        if (const auto it = std::ranges::find_if(messages, [clientRequestID](const gr::Message& message) { return message.clientRequestID == clientRequestID; }); it != messages.end()) {
+            reply = *it;
+        }
+        std::ignore = messages.consume(messages.size());
+        if (reply.has_value()) {
+            return reply;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return std::nullopt;
+}
+
 } // namespace qa_edit
 
 const boost::ut::suite<"graph editing"> graphEditTests = [] {
@@ -456,6 +593,47 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
 
         auto& toReplace = flow.emplaceBlock<qa_edit::Source>();
         expect(nothrow([&] { std::ignore = flow.replaceBlock(toReplace.unique_name, canaryType, {}); })) << "replaceBlock must consult the graph's own loader";
+    };
+
+    // A pool of two threads gives the run two job lists. The probe holds one work() call in the first list, and the
+    // worker of the second list handles the request meanwhile
+    "a subgraph emplaced from yaml in a running graph loads while no block of the run is inside work()"_test = [] {
+        constexpr std::string_view kPoolName = "qa_edit_two_threads";
+        gr::thread_pool::Manager::instance().replacePool(std::string(kPoolName), std::make_shared<gr::thread_pool::ThreadPoolWrapper>(std::make_unique<gr::thread_pool::BasicThreadPool>(kPoolName, gr::thread_pool::TaskType::CPU_BOUND, 2U, 2U), "CPU"));
+        qa_edit::registerTestBlocks();
+        qa_edit::gHoldRequested.store(false);
+        qa_edit::gHoldEntered.store(false);
+        qa_edit::gHoldEnded.store(false);
+        qa_edit::gConstructionsDuringHold.store(0UZ);
+
+        gr::Graph flow;
+        auto&     probe  = flow.emplaceBlock<qa_edit::HoldingProbe>();
+        auto&     source = flow.emplaceBlock<qa_edit::Source>();
+        auto&     sink   = flow.emplaceBlock<qa_edit::Sink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+        const std::string probeName{probe.unique_name};
+
+        qa_edit::JobListProbe scheduler({{"poolName", std::string(kPoolName)}});
+        expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(fatal(toScheduler.connect(scheduler.msgIn).has_value()));
+        expect(fatal(scheduler.msgOut.connect(fromScheduler).has_value()));
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(fatal(eq(scheduler.nJobLists(), 2UZ))) << "the graph was not split into two job lists";
+        expect(fatal(scheduler.firstJobListHolds(probeName))) << "the probe is not in the first job list";
+
+        qa_edit::gHoldRequested.store(true);
+        expect(fatal(qa_edit::awaitCondition([] { return qa_edit::gHoldEntered.load(); }))) << "the probe never held a work() call";
+        const std::string subgraphYaml = std::format("id: SUBGRAPH\nparameters:\n  name: group\ngraph:\n  blocks:\n    - id: {}\n      parameters:\n        name: inner\n", gr::meta::type_name<qa_edit::ConstructionCounter>());
+        qa_edit::sendMessage(toScheduler, gr::scheduler::property::kEmplaceBlock, {{"yaml", subgraphYaml}});
+        expect(qa_edit::awaitReplyData(fromScheduler, gr::scheduler::property::kBlockEmplaced).has_value()) << "the subgraph was refused";
+        expect(fatal(qa_edit::awaitCondition([] { return qa_edit::gHoldEnded.load(); }))) << "the probe's held call never returned";
+        expect(eq(qa_edit::gConstructionsDuringHold.load(), 0UZ)) << "the subgraph loaded while the probe was inside work()";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
     };
 
     "a block emplaced by name with a setting it does not declare stays out of the graph"_test = [] {
@@ -998,7 +1176,7 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(scheduler.changeStateTo(INITIALISED).has_value());
         expect(scheduler.changeStateTo(RUNNING).has_value());
 
-        const std::string reported = qa_edit::awaitError(fromScheduler, gr::scheduler::property::kEmplaceEdge);
+        const std::string reported = qa_edit::awaitError(fromScheduler, gr::scheduler::property::kEdgeEmplaced);
         expect(!reported.empty()) << "a weight of the wrong type must be reported, not end the process";
 
         expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
@@ -1355,5 +1533,129 @@ const boost::ut::suite<"messages after a job list ends"> laterMessageTests = [] 
     };
 #endif
 };
+
+#ifndef GR_TEST_WITHOUT_BLOCK_REGISTRY // emplacement and replacement by name resolve the type through the registry
+const boost::ut::suite<"edit replies"> editReplyTests = [] {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+    using namespace gr::scheduler::property;
+    using qa_edit::EditRequest;
+
+    "an EmplaceBlock request is answered under BlockEmplaced with its id"_test = [] {
+        qa_edit::registerTestBlocks();
+        qa_edit::TestScheduler scheduler;
+        std::ignore = qa_edit::exchangeChain(scheduler);
+        const std::string tunable{gr::meta::type_name<qa_edit::Tunable>()};
+
+        const std::array requests{EditRequest{"emplaced", kEmplaceBlock, {{"type", tunable}}, true}, //
+            EditRequest{"empty type", kEmplaceBlock, {{"type", std::string()}}},                     //
+            EditRequest{"no type", kEmplaceBlock, {}},                                               //
+            EditRequest{"unknown type", kEmplaceBlock, {{"type", std::string("qa_edit::Absent")}}},  //
+            EditRequest{"empty yaml", kEmplaceBlock, {{"yaml", std::string()}}},                     //
+            EditRequest{"no target graph", kEmplaceBlock, {{"type", tunable}, {"_targetGraph", std::string("absent")}}}};
+        qa_edit::expectRepliesUnder(scheduler, kBlockEmplaced, requests);
+    };
+
+    "a RemoveBlock request is answered under BlockRemoved with its id"_test = [] {
+        qa_edit::registerTestBlocks();
+        qa_edit::TestScheduler    scheduler;
+        const qa_edit::ChainNames chain = qa_edit::exchangeChain(scheduler);
+
+        const std::array requests{EditRequest{"empty name", kRemoveBlock, {{"uniqueName", std::string()}}}, //
+            EditRequest{"no name", kRemoveBlock, {}},                                                       //
+            EditRequest{"absent block", kRemoveBlock, {{"uniqueName", std::string("absent")}}},             //
+            EditRequest{"removed", kRemoveBlock, {{"uniqueName", chain.spareSink}}, true}};
+        qa_edit::expectRepliesUnder(scheduler, kBlockRemoved, requests);
+    };
+
+    "a RemoveEdge request is answered under EdgeRemoved with its id"_test = [] {
+        using namespace gr::serialization_fields;
+        qa_edit::registerTestBlocks();
+        qa_edit::TestScheduler    scheduler;
+        const qa_edit::ChainNames chain = qa_edit::exchangeChain(scheduler);
+        expect(fatal(scheduler.graph().connectPendingEdges())) << "the chain did not connect"; // an edge is removed from its connected ports
+
+        const std::array requests{EditRequest{"empty source", kRemoveEdge, {{std::pmr::string(EDGE_SOURCE_BLOCK), std::string()}, {std::pmr::string(EDGE_SOURCE_PORT), std::string()}}}, //
+            EditRequest{"no source", kRemoveEdge, {}},                                                                                                                                   //
+            EditRequest{"absent edge", kRemoveEdge, {{std::pmr::string(EDGE_SOURCE_BLOCK), chain.source}, {std::pmr::string(EDGE_SOURCE_PORT), std::string("out")}, {std::pmr::string(EDGE_DESTINATION_BLOCK), std::string("absent")}, {std::pmr::string(EDGE_DESTINATION_PORT), std::string("in")}}}, EditRequest{"removed", kRemoveEdge, {{std::pmr::string(EDGE_SOURCE_BLOCK), chain.source}, {std::pmr::string(EDGE_SOURCE_PORT), std::string("out")}}, true}};
+        qa_edit::expectRepliesUnder(scheduler, kEdgeRemoved, requests);
+    };
+
+    "an EmplaceEdge request is answered under EdgeEmplaced with its id"_test = [] {
+        qa_edit::registerTestBlocks();
+        qa_edit::TestScheduler    scheduler;
+        const qa_edit::ChainNames chain = qa_edit::exchangeChain(scheduler);
+
+        const std::array requests{EditRequest{"incomplete", kEmplaceEdge, {}},                                                    //
+            EditRequest{"wrong weight", kEmplaceEdge, qa_edit::edgeRequest(chain.source, chain.spareSink, std::string("heavy"))}, //
+            EditRequest{"absent source", kEmplaceEdge, qa_edit::edgeRequest("absent", chain.spareSink, std::int32_t{0})},         //
+            EditRequest{"emplaced", kEmplaceEdge, qa_edit::edgeRequest(chain.source, chain.spareSink, std::int32_t{0}), true}};
+        qa_edit::expectRepliesUnder(scheduler, kEdgeEmplaced, requests);
+    };
+
+    "a ReplaceBlock request is answered under BlockReplaced with its id"_test = [] {
+        qa_edit::registerTestBlocks();
+        qa_edit::TestScheduler    scheduler;
+        const qa_edit::ChainNames chain = qa_edit::exchangeChain(scheduler);
+        const std::string         tunable{gr::meta::type_name<qa_edit::Tunable>()};
+
+        const std::array requests{EditRequest{"empty name", kReplaceBlock, {{"uniqueName", std::string()}, {"type", tunable}}}, //
+            EditRequest{"no type", kReplaceBlock, {{"uniqueName", chain.stage}}},                                               //
+            EditRequest{"absent block", kReplaceBlock, {{"uniqueName", std::string("absent")}, {"type", tunable}}},             //
+            EditRequest{"replaced", kReplaceBlock, {{"uniqueName", chain.stage}, {"type", tunable}}, true}};
+        qa_edit::expectRepliesUnder(scheduler, kBlockReplaced, requests);
+    };
+
+    "a GraphGRC request is answered under GraphGRC with its id"_test = [] {
+        qa_edit::registerTestBlocks();
+        qa_edit::TestScheduler scheduler;
+        std::ignore = qa_edit::exchangeChain(scheduler);
+
+        const std::array requests{EditRequest{"read", kGraphGRC, {}, true, gr::message::Command::Get}, //
+            EditRequest{"empty yaml", kGraphGRC, {{"value", std::string()}}},                          //
+            EditRequest{"no yaml", kGraphGRC, {}},                                                     //
+            EditRequest{"exchanged", kGraphGRC, {{"value", gr::saveGrc(gr::globalPluginLoader(), gr::Graph{})}}, true}};
+        qa_edit::expectRepliesUnder(scheduler, kGraphGRC, requests);
+    };
+
+    // the run's two job lists end at once, and the scheduler stays RUNNING with no worker left to take the block
+    "a block emplaced after every worker of the run has left is answered with the reason"_test = [] {
+        constexpr std::string_view kPoolName = "qa_edit_two_threads";
+        gr::thread_pool::Manager::instance().replacePool(std::string(kPoolName), std::make_shared<gr::thread_pool::ThreadPoolWrapper>(std::make_unique<gr::thread_pool::BasicThreadPool>(kPoolName, gr::thread_pool::TaskType::CPU_BOUND, 2U, 2U), "CPU"));
+        qa_edit::registerTestBlocks();
+        qa_edit::gWorkingTickers.store(0UZ);
+
+        gr::Graph flow;
+        auto&     ending     = flow.emplaceBlock<qa_edit::EndingSource>();
+        auto&     endingSink = flow.emplaceBlock<qa_edit::Sink>();
+        expect(flow.connect<"out", "in">(ending, endingSink).has_value());
+
+        qa_edit::JobListProbe scheduler({{"poolName", std::string(kPoolName)}});
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(toScheduler.connect(scheduler.msgIn).has_value());
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(fatal(qa_edit::awaitCondition([&scheduler] { return scheduler.nRunningJobs() == 0UZ; }))) << "the run's workers did not leave";
+        expect(fatal(scheduler.state() == RUNNING));
+
+        gr::sendMessage<gr::message::Command::Set>(toScheduler, scheduler.unique_name, kEmplaceBlock, {{"type", gr::meta::type_name<qa_edit::Ticker>()}}, "late");
+        scheduler.processScheduledMessages();
+        const std::optional<gr::Message> reply = qa_edit::takeReplyTo(fromScheduler, "late");
+        expect(fatal(reply.has_value())) << "the request got no reply with its id";
+        expect(eq(reply->endpoint, std::string(kBlockEmplaced)));
+        expect(fatal(!reply->data.has_value())) << "the reply says the block joined a run that has no worker";
+        expect(reply->data.error().message.contains("next start")) << "the reply does not say when the block runs: " << reply->data.error().message;
+        expect(eq(qa_edit::gWorkingTickers.load(), 0UZ));
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
+    };
+};
+#endif
 
 int main() { /* tests are statically registered */ }
