@@ -150,7 +150,8 @@ struct Edge {
     [[nodiscard]] const property_map& uiConstraints() const { return *_uiConstraints; }
 
     [[nodiscard]] bool hasSameSourcePort(const Edge& other) const;
-    [[nodiscard]] bool hasSameStreamInput(const Edge& other) const;
+    [[nodiscard]] bool hasSameInput(const Edge& other, PortType type) const;
+    [[nodiscard]] bool hasSameStreamInput(const Edge& other) const { return hasSameInput(other, PortType::STREAM); }
 
     constexpr bool operator==(const Edge& other) const noexcept {
         return sourceBlock() == other.sourceBlock()                                                       //
@@ -592,16 +593,20 @@ inline bool Edge::hasSameSourcePort(const Edge& other) const {
     return port.has_value() && otherPort.has_value() && *port.value() == *otherPort.value();
 }
 
-// true when both edges end at one stream input of one block; the input may be named by index in one edge and by name
-// in the other, so both definitions are resolved. Edges in two graphs are not compared: an edge into a subgraph's
-// exported input and an edge into the interior port it wraps both stay listed
-inline bool Edge::hasSameStreamInput(const Edge& other) const {
+// true when both edges end at one input of one block and the input is of the given port type, which PortType::ANY
+// matches always. The input may be named by index in one edge and by name in the other. Both definitions are
+// resolved. Edges in two graphs are not compared: an edge into a subgraph's exported input and an edge into the
+// interior port it wraps both stay listed
+inline bool Edge::hasSameInput(const Edge& other, PortType type) const {
     if (!_destinationBlock || _destinationBlock != other._destinationBlock) {
         return false;
     }
     const auto input      = _destinationBlock->dynamicInputPort(_destinationPortDefinition);
     const auto otherInput = _destinationBlock->dynamicInputPort(other._destinationPortDefinition);
-    return input.has_value() && otherInput.has_value() && input.value() == otherInput.value() && port::decodePortType(input.value()->portMaskInfo()) == PortType::STREAM;
+    if (!input.has_value() || !otherInput.has_value() || input.value() != otherInput.value()) {
+        return false;
+    }
+    return type == PortType::ANY || port::decodePortType(input.value()->portMaskInfo()) == type;
 }
 
 namespace serialization_fields {
