@@ -2074,7 +2074,7 @@ public:
     gr::work::Status invokeBulkDispatch(Fn&& fn, TIn& inputReaderTuple, TOut& outputReaderTuple) {
         auto tempInputSpanStorage = std::apply(
             []<typename... PortReader>(PortReader&... args) {
-                return std::tuple{([](auto& a) {
+                return std::tuple{([]([[maybe_unused]] auto& a) {
                     if constexpr (gr::meta::array_or_vector_type<PortReader>) {
                         return std::span{a.data(), a.size()};
                     } else {
@@ -2086,7 +2086,7 @@ public:
 
         auto tempOutputSpanStorage = std::apply(
             []<typename... PortReader>(PortReader&... args) {
-                return std::tuple{([](auto& a) {
+                return std::tuple{([]([[maybe_unused]] auto& a) {
                     if constexpr (gr::meta::array_or_vector_type<std::remove_cvref_t<decltype(a)>>) {
                         return std::span{a.data(), a.size()};
                     } else {
