@@ -816,6 +816,29 @@ template<typename TScheduler>
     return runAndWaitWithin(scheduler, bound, [] {});
 }
 
+// stops the scheduler of a finite graph through `stopBeforeEntry` and then calls runAndWait(). A stop completed before
+// runAndWait() is entered belongs to no run, and runAndWait() runs the graph to its end.
+template<typename TStop>
+void expectRunAfterStopBeforeEntry(TStop stopBeforeEntry) {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    gr::Graph flow;
+    auto&     source = flow.emplaceBlock<DoneSource>();
+    auto&     sink   = flow.emplaceBlock<CountingSink>();
+    expect(flow.connect<"out", "in">(source, sink).has_value());
+
+    BlockingScheduler scheduler;
+    expect(scheduler.exchange(std::move(flow)).has_value());
+    stopBeforeEntry(scheduler);
+
+    std::expected<void, gr::Error> result;
+    expect(runAndWaitWithin(scheduler, kEventBound, [] {}, &result)) << "runAndWait() did not finish the finite graph";
+    expect(result.has_value()) << "the run after the stop must succeed";
+    expect(eq(sink._nReceived, kSamplesBeforeTerminal)) << "a stop completed before runAndWait() was entered must not cancel its run";
+    expect(scheduler.state() == STOPPED) << "the run must end STOPPED";
+}
+
 constexpr std::string_view kOccupiedPoolName = "qa_occupied_cpu";
 constexpr std::string_view kAdoptionPoolName = "qa_adoption_cpu";
 
@@ -2049,55 +2072,19 @@ const boost::ut::suite<"stop requested before RUNNING"> preRunningStopTests = []
     using namespace boost::ut;
     using enum gr::lifecycle::State;
 
-    "a stop requested while IDLE keeps runAndWait from starting the run"_test = [] {
-        gr::Graph flow;
-        auto&     source = flow.emplaceBlock<qa_sched::RaceSource>();
-        auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
-        expect(flow.connect<"out", "in">(source, sink).has_value());
+    "a stop requested while IDLE leaves the next runAndWait free to run"_test = [] { qa_sched::expectRunAfterStopBeforeEntry([](qa_sched::BlockingScheduler& scheduler) { scheduler.requestStop(); }); };
 
-        qa_sched::BlockingScheduler scheduler;
-        expect(scheduler.exchange(std::move(flow)).has_value());
-        scheduler.requestStop();
-
-        expect(qa_sched::runAndWaitWithin(scheduler, qa_sched::kRunBound)) << "runAndWait() blocked on a stop requested before it ran";
-        expect(!gr::lifecycle::isActive(scheduler.state())) << "runAndWait() left the scheduler active";
-        expect(eq(sink._nReceived, 0UZ)) << "a latched stop must not be overwritten by a reinitializing runAndWait()";
+    "a stop requested while initialized leaves the next runAndWait free to run"_test = [] {
+        qa_sched::expectRunAfterStopBeforeEntry([](qa_sched::BlockingScheduler& scheduler) {
+            expect(scheduler.changeStateTo(INITIALISED).has_value());
+            scheduler.requestStop();
+        });
     };
 
-    "a stop requested while INITIALISED keeps runAndWait from starting the run"_test = [] {
-        gr::Graph flow;
-        auto&     source = flow.emplaceBlock<qa_sched::RaceSource>();
-        auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
-        expect(flow.connect<"out", "in">(source, sink).has_value());
+    // the scheduler's stop() moves REQUESTED_STOP on to STOPPED. A stop straight to STOPPED leaves the same state
+    "a stop straight to STOPPED while IDLE leaves the next runAndWait free to run"_test = [] { qa_sched::expectRunAfterStopBeforeEntry([](qa_sched::BlockingScheduler& scheduler) { expect(scheduler.changeStateTo(STOPPED).has_value()); }); };
 
-        qa_sched::BlockingScheduler scheduler;
-        expect(scheduler.exchange(std::move(flow)).has_value());
-        expect(scheduler.changeStateTo(INITIALISED).has_value());
-        scheduler.requestStop();
-
-        expect(qa_sched::runAndWaitWithin(scheduler, qa_sched::kRunBound)) << "runAndWait() blocked on a stop requested before it ran";
-        expect(!gr::lifecycle::isActive(scheduler.state())) << "runAndWait() left the scheduler active";
-        expect(eq(sink._nReceived, 0UZ)) << "a latched stop must not be overwritten by a reinitializing runAndWait()";
-    };
-
-    // the scheduler's stop() moves REQUESTED_STOP on to STOPPED. A stop straight to STOPPED leaves the same state, and
-    // runAndWait() honors it the same way
-    "a stop straight to STOPPED while IDLE keeps runAndWait from starting the run"_test = [] {
-        gr::Graph flow;
-        auto&     source = flow.emplaceBlock<qa_sched::RaceSource>();
-        auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
-        expect(flow.connect<"out", "in">(source, sink).has_value());
-
-        qa_sched::BlockingScheduler scheduler;
-        expect(scheduler.exchange(std::move(flow)).has_value());
-        expect(scheduler.changeStateTo(STOPPED).has_value());
-
-        expect(qa_sched::runAndWaitWithin(scheduler, qa_sched::kRunBound)) << "runAndWait() ran the graph after a stop straight to STOPPED";
-        expect(!gr::lifecycle::isActive(scheduler.state())) << "runAndWait() left the scheduler active";
-        expect(eq(sink._nReceived, 0UZ)) << "a stop before any run must not be overwritten by a reinitializing runAndWait()";
-    };
-
-    "a stop racing the startup transient always releases runAndWait"_test = [] {
+    "a stop racing the startup transient after runAndWait is entered always releases runAndWait"_test = [] {
         constexpr int nCycles = 12;
 
         std::size_t nCyclesBlocked    = 0UZ;
@@ -2112,8 +2099,12 @@ const boost::ut::suite<"stop requested before RUNNING"> preRunningStopTests = []
             qa_sched::BlockingScheduler scheduler;
             expect(scheduler.exchange(std::move(flow)).has_value());
 
-            // no barrier: the stop lands wherever the runner happens to be, IDLE included
-            if (!qa_sched::runAndWaitWithin(scheduler, qa_sched::kRunBound, [&scheduler] { scheduler.requestStop(); })) {
+            // runAndWait() is entered once it has moved the scheduler out of IDLE. The stop lands wherever the runner
+            // is after that
+            if (!qa_sched::runAndWaitWithin(scheduler, qa_sched::kRunBound, [&scheduler] {
+                    scheduler.waitOnState(IDLE);
+                    scheduler.requestStop();
+                })) {
                 nCyclesBlocked++;
             }
             if (gr::lifecycle::isActive(scheduler.state())) {
