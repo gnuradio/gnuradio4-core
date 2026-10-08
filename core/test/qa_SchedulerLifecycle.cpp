@@ -1653,6 +1653,30 @@ const boost::ut::suite<"a start that cannot complete"> failedStartTests = [] {
         expect(eq(sink._nReceived, 0UZ));
     };
 
+    "a start that one block refuses reaches a runAndWait caller as one error"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_sched::ThrowingStartSource>();
+        auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        qa_sched::SerialScheduler scheduler;
+        gr::MsgPortIn             fromScheduler;
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(!scheduler.runAndWait().has_value());
+
+        std::vector<std::string> errors;
+        auto                     messages = fromScheduler.streamReader().get();
+        for (const gr::Message& message : messages) {
+            if (!message.data.has_value()) {
+                errors.push_back(std::format("{}: {}", message.endpoint, message.data.error().message));
+            }
+        }
+        std::ignore = messages.consume(messages.size());
+        expect(eq(errors.size(), 1UZ)) << std::format("the caller received {} errors: {}", errors.size(), errors);
+        expect(!errors.empty() && errors.front().find("the device refused to open") != std::string::npos) << "the one error must carry the start's reason";
+    };
+
     // the test records the edge while the run is paused. The resume tries to connect it.
     "a resume whose new edge cannot connect ends the run in ERROR with the edge's reason"_test = [] {
         qa_sched::gObservedSamples.store(0UZ, std::memory_order_relaxed);
@@ -2223,7 +2247,7 @@ const boost::ut::suite<"a blocking block reaches STOPPED when its scheduler stop
         expect(qa_sched::awaitState(scheduler, STOPPED)) << "the restarted scheduler did not stop";
     };
 
-    "a blocking block stopped after a reset stops with the scheduler and runs after a restart"_test = [] {
+    "a blocking block that no run started since a reset stays initialized at a stop and runs after a restart"_test = [] {
         gr::Graph flow;
         auto&     source = flow.emplaceBlock<qa_sched::BlockingSource>();
         auto&     sink   = flow.emplaceBlock<qa_sched::StoppingSink>();
@@ -2244,7 +2268,7 @@ const boost::ut::suite<"a blocking block reaches STOPPED when its scheduler stop
         expect(source.state() == INITIALISED) << "the reset must reinitialize the source";
         expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
         expect(qa_sched::awaitState(scheduler, STOPPED)) << "the scheduler did not stop after the reset";
-        expect(source.state() == STOPPED) << "a blocking block that no run has started since the reset must stop with the scheduler";
+        expect(source.state() == INITIALISED) << "a blocking block that no run has started since the reset must stay initialized";
 
         expect(scheduler.changeStateTo(INITIALISED).has_value());
         expect(scheduler.changeStateTo(RUNNING).has_value());
