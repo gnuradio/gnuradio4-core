@@ -414,6 +414,21 @@ const boost::ut::suite<"segmented tag store"> _tagStoreTests = [] {
         static_assert(kSlowChunk / kGraphTagStride >= 4UZ * kSlotsPerSegment);
     };
 
+    "a finite run leaves no dropped tag on the sink's input, whose end-of-stream marker stays unread"_test = [] {
+        Graph flow;
+        auto& source = flow.emplaceBlock<TaggingSource>();
+        auto& sink   = flow.emplaceBlock<CheckingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        gr::scheduler::Simple<> scheduler{};
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(scheduler.runAndWait().has_value());
+
+        expect(eq(sink.samples, kGraphSamples)) << "the sink reads the whole stream";
+        expect(eq(sink.tags, kGraphSamples / kGraphTagStride)) << "the sink reads every tag";
+        expect(eq(sink.in.nTagsDropped, 0UZ)) << "releasing the input at the end of the run drops no tag";
+    };
+
     "readers that attach while the writer frees segments read only live tags at their positions"_test = [] {
         constexpr std::size_t kSlots = 8UZ * kSlotsPerSegment;
         constexpr std::size_t kTags  = 65536UZ;

@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <complex>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -724,8 +725,10 @@ struct Port {
 public:
     // Post-run drop accounting. Every tag this port refused for lack of tag store space is counted
     // here, whether it was refused on the direct path or inside a reservation whose own counter is
-    // discarded with the span. An end-of-stream marker that cannot be published is not counted
-    // here: it is a terminal failure rather than a dropped annotation, and has its own counter.
+    // discarded with the span. An input also counts here the tags it had not read when disconnect()
+    // or a new connection releases its tag reader, except the end-of-stream marker. An end-of-stream
+    // marker that cannot be published is not counted here: it is a terminal failure rather than a
+    // dropped annotation, and has its own counter.
     std::size_t nTagsDropped{0UZ};
     std::size_t nEoSTagsLost{0UZ}; // end-of-stream markers this port could not publish
 
@@ -748,6 +751,18 @@ private:
     Tag                              _cachedTag{}; // todo: for now this is only used in the output ports
 
     [[nodiscard]] bool hasRings() const noexcept { return _hasRings.load(std::memory_order_acquire); }
+
+    // called with _ringsMutex held, before an input releases its tag reader; the end-of-stream marker is not a drop
+    void countUnreadTagsAsDropped() noexcept
+    requires(kIsInput)
+    {
+        if (!_tagIoHandler.has_value() || _tagIoHandler->available() == 0UZ) {
+            return;
+        }
+        auto       unread           = _tagIoHandler->get();
+        const auto isEndOfStreamTag = [](const Tag& tag) { return tag.map.contains(static_cast<std::pmr::string>(gr::tag::END_OF_STREAM)); };
+        nTagsDropped += static_cast<std::size_t>(std::ranges::count_if(unread, std::not_fn(isEndOfStreamTag)));
+    }
 
     void buildDefaultRings() const {
         std::lock_guard lock(_ringsMutex);
@@ -954,6 +969,7 @@ public:
     void setBuffer(gr::BufferLike auto streamBuffer, gr::BufferLike auto tagBuffer) noexcept {
         std::lock_guard lock(_ringsMutex);
         if constexpr (kIsInput) {
+            countUnreadTagsAsDropped();
             _ioHandler    = streamBuffer.new_reader();
             _tagIoHandler = tagBuffer.new_reader();
         } else {
@@ -1023,6 +1039,9 @@ public:
             return std::unexpected(Error("port not connected"));
         }
         std::lock_guard lock(_ringsMutex);
+        if constexpr (kIsInput) {
+            countUnreadTagsAsDropped();
+        }
         _hasRings.store(false, std::memory_order_relaxed);
         _ioHandler.reset();
         _tagIoHandler.reset();
