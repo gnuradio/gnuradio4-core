@@ -582,29 +582,37 @@ public:
         return result;
     }
 
-    std::shared_ptr<gr::BlockModel> instantiate(std::string_view name, const property_map& params = property_map{}) {
+    /// Instantiates `name` and keeps the reason a YAML definition refuses. The block is null when no
+    /// block, plugin or definition is registered under `name`. An error carries the reason the
+    /// definition gave. A block constructor that throws propagates its exception.
+    std::expected<std::shared_ptr<gr::BlockModel>, gr::Error> instantiateOrError(std::string_view name, const property_map& params = property_map{}) {
         // Try to create a node from the global registry
         if (auto result = _registry->create(name, params)) {
-            return result;
+            return std::shared_ptr<gr::BlockModel>(std::move(result));
         }
 
         if (auto* plugin = pluginForBlockName(name); plugin != nullptr) {
-            return plugin->createBlock(name, params);
+            return std::shared_ptr<gr::BlockModel>(plugin->createBlock(name, params));
         }
 
         if (const auto def = _yamlRegistry.definitionForBlockName(name)) {
-            auto result = detail::instantiateBlockFromYamlDefinition(*this, *def);
-            if (!result) {
-                std::print("Error: YAML block instantiation failed for '{}': {} ({})\n", name, result.error().message, result.error().srcLoc());
-                return {};
-            }
-            return *result;
+            return detail::instantiateBlockFromYamlDefinition(*this, *def);
         }
 
         // a miss is an ordinary probe result (block, scheduler and YAML lookups are tried in
-        // sequence): the null return is the signal, and the caller that treats it as terminal
+        // sequence): the null value is the signal, and the caller that treats it as terminal
         // reports it together with what was requested
-        return {};
+        return std::shared_ptr<gr::BlockModel>{};
+    }
+
+    /// Calls instantiateOrError(), prints a definition's refusal and returns null for it.
+    std::shared_ptr<gr::BlockModel> instantiate(std::string_view name, const property_map& params = property_map{}) {
+        auto result = instantiateOrError(name, params);
+        if (!result) {
+            std::print("Error: YAML block instantiation failed for '{}': {} ({})\n", name, result.error().message, result.error().srcLoc());
+            return {};
+        }
+        return *result;
     }
 
     std::shared_ptr<gr::SchedulerModel> instantiateScheduler(std::string_view name, const property_map& params = property_map{}) {
@@ -665,21 +673,27 @@ public:
     auto availableBlocks() const { return _registry->keys(); }
     auto availableSchedulers() const { return _schedulerRegistry->keys(); }
 
-    std::shared_ptr<gr::BlockModel> instantiate(std::string_view name, const property_map& params = {}) {
+    /// see the non-WASM PluginLoader::instantiateOrError
+    std::expected<std::shared_ptr<gr::BlockModel>, gr::Error> instantiateOrError(std::string_view name, const property_map& params = {}) {
         if (auto result = _registry->create(name, params)) {
-            return result;
+            return std::shared_ptr<gr::BlockModel>(std::move(result));
         }
 
         if (const auto def = _yamlRegistry.definitionForBlockName(name)) {
-            auto result = detail::instantiateBlockFromYamlDefinition(*this, *def);
-            if (!result) {
-                std::print("Error: YAML block instantiation failed for '{}': {} ({})\n", name, result.error().message, result.error().srcLoc());
-                return nullptr;
-            }
-            return *result;
+            return detail::instantiateBlockFromYamlDefinition(*this, *def);
         }
 
-        return nullptr;
+        return std::shared_ptr<gr::BlockModel>{};
+    }
+
+    /// see the non-WASM PluginLoader::instantiate
+    std::shared_ptr<gr::BlockModel> instantiate(std::string_view name, const property_map& params = {}) {
+        auto result = instantiateOrError(name, params);
+        if (!result) {
+            std::print("Error: YAML block instantiation failed for '{}': {} ({})\n", name, result.error().message, result.error().srcLoc());
+            return nullptr;
+        }
+        return *result;
     }
 
     std::shared_ptr<gr::SchedulerModel> instantiateScheduler(std::string_view name, const property_map& params = {}) {

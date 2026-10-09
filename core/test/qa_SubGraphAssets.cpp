@@ -242,6 +242,43 @@ const boost::ut::suite AssetsLoadingTests = [] {
         std::filesystem::remove_all(root);
     };
 
+    // a definitions root holding `RefusingDefinition`, whose one block has a type no registry holds
+    static const auto writeRefusingDefinitionRoot = [] {
+        const auto root = std::filesystem::temp_directory_path() / "gr4_qa_refusing_definition";
+        std::filesystem::remove_all(root);
+        std::filesystem::create_directories(root);
+        std::ofstream index(root / "index.yaml");
+        index << "assets:\n  - file: refusing.yaml\n    created: \"2024-01-01-00:00:00\"\n    modified: \"2024-01-15-10:00:00\"\n    block_type: RefusingDefinition\n";
+        std::ofstream asset(root / "refusing.yaml");
+        asset << "definition_metadata:\n  block_type: RefusingDefinition\nblocks:\n  - id: qa::NoSuchBlockIsRegistered\n    parameters:\n      name: inner\n";
+        return root;
+    };
+
+    "instantiateOrError: a definition that cannot be built refuses with its reason"_test = [] {
+        const auto root   = writeRefusingDefinitionRoot();
+        auto       loader = makeLoader({root.string()});
+
+        const auto made = loader.instantiateOrError("RefusingDefinition");
+        expect(!made.has_value()) << "a definition that cannot be built is a refusal, not a miss";
+        if (!made.has_value()) {
+            expect(made.error().message.contains("qa::NoSuchBlockIsRegistered")) << made.error().message;
+        }
+
+        std::filesystem::remove_all(root);
+    };
+
+    "instantiateOrError: a name nothing registers is a null block, and instantiate returns null for both"_test = [] {
+        const auto root   = writeRefusingDefinitionRoot();
+        auto       loader = makeLoader({root.string()});
+
+        const auto missed = loader.instantiateOrError("NothingRegistersThisName");
+        expect(missed.has_value() && *missed == nullptr) << "a miss is a null block, not a refusal";
+        expect(loader.instantiate("NothingRegistersThisName") == nullptr);
+        expect(loader.instantiate("RefusingDefinition") == nullptr);
+
+        std::filesystem::remove_all(root);
+    };
+
     // ── remote tests (server started by CMake fixture) ────────────────────────
 
 #endif
