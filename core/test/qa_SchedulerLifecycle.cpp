@@ -705,13 +705,27 @@ template<typename TScheduler>
 constexpr std::string_view kOccupiedPoolName = "qa_occupied_cpu";
 constexpr std::string_view kAdoptionPoolName = "qa_adoption_cpu";
 
-[[nodiscard]] std::shared_ptr<gr::thread_pool::TaskExecutor> fixedPool(std::string_view name, std::uint32_t nThreads) {
-    auto pool = std::make_shared<gr::thread_pool::ThreadPoolWrapper>(std::make_unique<gr::thread_pool::BasicThreadPool>(name, gr::thread_pool::TaskType::CPU_BOUND, nThreads, nThreads), "CPU");
-    gr::thread_pool::Manager::instance().replacePool(std::string(name), pool);
-    return pool;
-}
+// a pool that the manager holds under its name while the case runs. At the end of the case the name resolves to the
+// default CPU pool, and the pool's threads end once no scheduler holds the pool. A WebAssembly build runs a fixed number
+// of threads in the whole program. A case therefore keeps its threads only while it runs.
+template<typename TPool>
+struct NamedPool {
+    std::string            name;
+    std::shared_ptr<TPool> pool;
 
-[[nodiscard]] std::shared_ptr<gr::thread_pool::TaskExecutor> twoThreadPool() { return fixedPool(kOccupiedPoolName, 2U); }
+    NamedPool(std::string_view poolName, std::shared_ptr<TPool> namedPool) : name(poolName), pool(std::move(namedPool)) { gr::thread_pool::Manager::instance().replacePool(name, pool); }
+    NamedPool(const NamedPool&)            = delete;
+    NamedPool& operator=(const NamedPool&) = delete;
+    ~NamedPool() { gr::thread_pool::Manager::instance().replacePool(name, gr::thread_pool::Manager::defaultCpuPool()); }
+
+    TPool& operator*() const { return *pool; }
+    TPool* operator->() const { return pool.get(); }
+};
+
+// a pool of fixed size, held under its name while the case runs
+[[nodiscard]] NamedPool<gr::thread_pool::TaskExecutor> fixedPool(std::string_view name, std::uint32_t nThreads) { return {name, std::make_shared<gr::thread_pool::ThreadPoolWrapper>(std::make_unique<gr::thread_pool::BasicThreadPool>(name, gr::thread_pool::TaskType::CPU_BOUND, nThreads, nThreads), "CPU")}; }
+
+[[nodiscard]] NamedPool<gr::thread_pool::TaskExecutor> twoThreadPool() { return fixedPool(kOccupiedPoolName, 2U); }
 
 void startAndPause(TestScheduler& scheduler) {
     using namespace boost::ut;
