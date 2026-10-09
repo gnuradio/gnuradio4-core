@@ -5,6 +5,7 @@
 #include <chrono>
 #include <concepts>
 #include <format>
+#include <initializer_list>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -894,6 +895,13 @@ public:
     [[nodiscard]] ApplyStagedParametersResult applyStagedParameters() override;
 
     void updateActiveParameters() noexcept override;
+
+    /// copies the named members into the map that `get()` returns and returns the number of members copied.
+    /// A block calls this on the thread that writes those members, for example from its work function. The other
+    /// members keep the values the map last took for them. A key that names no readable member copies nothing.
+    /// The next applied change notifies the subscribers to the settings. A call from the block's `reset()`, or from
+    /// `settingsChanged()` during a reset to defaults, never returns, because the settings hold their lock there.
+    std::size_t updateActiveParameters(std::initializer_list<std::string_view> keys) noexcept;
 
     void loadParametersFromPropertyMap(const property_map& parameters, SettingsCtx ctx = {}) override;
 

@@ -1,6 +1,7 @@
 #include <gnuradio-4.0/LifeCycle.hpp>
 #include <gnuradio-4.0/Settings.hpp>
 
+#include <algorithm>
 #include <cstdio>
 #include <print>
 #include <utility>
@@ -809,6 +810,21 @@ void CtxSettingsBase::updateActiveParametersImpl() noexcept {
     for (const settings::MemberDescriptor* member : _descriptor->readableMembers) {
         member->readParameter(member->address(_block), member->name, _activeParameters);
     }
+}
+
+std::size_t CtxSettingsBase::updateActiveParameters(std::initializer_list<std::string_view> keys) noexcept {
+    if (!_descriptor->hooks.reflectable) {
+        return 0UZ;
+    }
+    std::lock_guard lg(_mutex);
+    std::size_t     nCopied = 0UZ;
+    for (const settings::MemberDescriptor* member : _descriptor->readableMembers) {
+        if (std::ranges::contains(keys, member->name)) {
+            member->readParameter(member->address(_block), member->name, _activeParameters);
+            nCopied++;
+        }
+    }
+    return nCopied;
 }
 
 void CtxSettingsBase::storeCurrentParameters(property_map& parameters) {

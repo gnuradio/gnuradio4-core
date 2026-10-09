@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <complex>
 #include <cstddef>
@@ -13,6 +14,7 @@
 #include <ranges>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <gnuradio-4.0/Block.hpp>
@@ -320,6 +322,134 @@ struct TapsRecordingBlock : Block<TapsRecordingBlock> {
     const auto text = it->second.value_or(std::string_view{});
     return text.data() != nullptr ? std::string(text) : std::string{};
 }
+
+template<typename T>
+[[nodiscard]] std::optional<T> valueAt(const property_map& map, std::string_view key) {
+    const auto it = map.find(key);
+    if (it == map.end()) {
+        return std::nullopt;
+    }
+    const T* value = it->second.get_if<T>();
+    return value != nullptr ? std::optional<T>(*value) : std::nullopt;
+}
+
+struct OnesSource : Block<OnesSource> {
+    PortOut<float> out{};
+
+    GR_MAKE_REFLECTABLE(OnesSource, out);
+
+    [[nodiscard]] constexpr float processOne() const noexcept { return 1.0f; }
+};
+
+struct DiscardSink : Block<DiscardSink> {
+    PortIn<float> in{};
+
+    GR_MAKE_REFLECTABLE(DiscardSink, in);
+
+    void processOne(float) noexcept {}
+};
+
+/// passes its input on scaled. The work function counts the samples in n_seen and copies that member into its settings
+/// after each call. Nothing in the block writes or copies n_foreign. Every member carries an initializer of its own, as
+/// above.
+struct CopyingCounter : Block<CopyingCounter> {
+    PortIn<float>  in{};
+    PortOut<float> out{};
+
+    Annotated<float, "output scale">        scale     = 1.0f;
+    Annotated<gr::Size_t, "samples passed"> n_seen    = 0U;
+    Annotated<gr::Size_t, "external count"> n_foreign = 0U;
+
+    GR_MAKE_REFLECTABLE(CopyingCounter, in, out, scale, n_seen, n_foreign);
+
+    std::atomic<std::size_t>* nCopies = nullptr;
+
+    work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
+        std::ranges::transform(inSpan, outSpan.begin(), [this](float value) { return value * scale.value; });
+        n_seen.value += static_cast<gr::Size_t>(inSpan.size());
+        this->updateActiveParameters({"n_seen"});
+        if (nCopies != nullptr && !inSpan.empty()) {
+            nCopies->fetch_add(1UZ, std::memory_order_release);
+        }
+        return work::Status::OK;
+    }
+};
+
+/// runs a CopyingCounter between a source and a sink on a scheduler in a thread of its own, and keeps every message
+/// the scheduler sends out
+struct RunningCounter {
+    std::atomic<std::size_t> nCopies{0UZ};
+    gr::scheduler::Simple<>  scheduler{};
+    gr::MsgPortOut           toScheduler{};
+    gr::MsgPortIn            fromScheduler{};
+    std::vector<gr::Message> received{};
+    CopyingCounter*          counter = nullptr;
+    std::string              counterName{};
+    std::thread              runner{};
+
+    RunningCounter() {
+        using namespace boost::ut;
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<OnesSource>();
+        auto&     block  = flow.emplaceBlock<CopyingCounter>();
+        auto&     sink   = flow.emplaceBlock<DiscardSink>();
+        block.nCopies    = &nCopies;
+        counter          = &block;
+        counterName      = std::string(block.unique_name);
+        expect(flow.connect<"out", "in">(source, block).has_value());
+        expect(flow.connect<"out", "in">(block, sink).has_value());
+        expect(toScheduler.connect(scheduler.msgIn).has_value());
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        runner = std::thread([this] { std::ignore = scheduler.runAndWait(); });
+    }
+
+    RunningCounter(const RunningCounter&)            = delete;
+    RunningCounter& operator=(const RunningCounter&) = delete;
+
+    ~RunningCounter() {
+        scheduler.requestStop();
+        runner.join();
+    }
+
+    template<typename TCondition>
+    [[nodiscard]] static bool awaitTrue(TCondition satisfied) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!satisfied()) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool awaitCopies(std::size_t nFurther) {
+        const std::size_t target = nCopies.load(std::memory_order_acquire) + nFurther;
+        return awaitTrue([this, target] { return nCopies.load(std::memory_order_acquire) >= target; });
+    }
+
+    /// the first message received so far or later that carries the client request id and data
+    [[nodiscard]] std::optional<property_map> awaitData(std::string_view clientRequestID) {
+        std::optional<property_map> data;
+        std::ignore = awaitTrue([this, clientRequestID, &data] {
+            ReaderSpanLike auto messages = fromScheduler.streamReader().get<SpanReleasePolicy::ProcessAll>();
+            received.insert(received.end(), messages.begin(), messages.end());
+            std::ignore   = messages.consume(messages.size());
+            const auto it = std::ranges::find_if(received, [clientRequestID](const gr::Message& message) { return message.clientRequestID == clientRequestID && message.data.has_value(); });
+            if (it != received.end()) {
+                data = *it->data;
+            }
+            return data.has_value();
+        });
+        return data;
+    }
+
+    [[nodiscard]] std::optional<property_map> readSettings() {
+        gr::sendMessage<gr::message::Command::Get>(toScheduler, counterName, gr::block::property::kSetting, property_map{}, "read");
+        return awaitData("read");
+    }
+};
 
 struct RateStreamResult {
     std::size_t nSettingsChanged;
@@ -840,6 +970,73 @@ const boost::ut::suite<"settings"> _settings = [] {
         std::ignore = block.settings().applyStagedParameters();
 
         expect(eq(block.fft_size.value, gr::Size_t(2048))) << "the refused text does not reach the member";
+    };
+};
+
+const boost::ut::suite<"a block copies its own members into its settings"> copyTests = [] {
+    using namespace boost::ut;
+    using namespace qa_settings;
+
+    "the call copies the named members and returns their number"_test = [] {
+        CopyingCounter block;
+        block.init(std::make_shared<gr::Sequence>());
+        block.n_seen.value    = 5U;
+        block.n_foreign.value = 7U;
+
+        expect(eq(block.updateActiveParameters({"n_seen", "scale"}), 2UZ)) << "each named member counts once";
+
+        const property_map copied = block.settings().get();
+        expect(eq(valueAt<gr::Size_t>(copied, "n_seen").value_or(0U), gr::Size_t(5))) << "the named member reaches the map";
+        expect(eq(valueAt<gr::Size_t>(copied, "n_foreign").value_or(1U), gr::Size_t(0))) << "a member not named keeps the applied value";
+    };
+
+    "a misspelled key copies nothing and the call returns 0"_test = [] {
+        CopyingCounter block;
+        block.init(std::make_shared<gr::Sequence>());
+        block.n_seen.value = 5U;
+
+        expect(eq(block.updateActiveParameters({"n_sen"}), 0UZ)) << "the count includes a key no member carries";
+
+        const property_map copied = block.settings().get();
+        expect(eq(valueAt<gr::Size_t>(copied, "n_seen").value_or(1U), gr::Size_t(0))) << "the member the key misses keeps the applied value";
+        expect(copied.find(std::string_view("n_sen")) == copied.end()) << "a key no member carries adds nothing";
+    };
+
+    "a Get reads the value the block copied from its work function"_test = [] {
+        RunningCounter run;
+        expect(fatal(run.awaitCopies(1UZ))) << "the counter never passed a sample";
+
+        const std::optional<property_map> settings = run.readSettings();
+
+        expect(fatal(settings.has_value())) << "the Get got no reply";
+        expect(gt(valueAt<gr::Size_t>(*settings, "n_seen").value_or(0U), gr::Size_t(0))) << "the Get reads the declared default, not the copied member";
+    };
+
+    "a member written on another thread and never copied reads the last applied value"_test = [] {
+        RunningCounter run;
+        expect(fatal(run.awaitCopies(1UZ))) << "the counter never passed a sample";
+        run.counter->n_foreign.value = 7U;
+
+        const std::optional<property_map> settings = run.readSettings();
+
+        expect(fatal(settings.has_value())) << "the Get got no reply";
+        expect(eq(valueAt<gr::Size_t>(*settings, "n_foreign").value_or(1U), gr::Size_t(0))) << "a Get copied a member the block did not name";
+        expect(gt(valueAt<gr::Size_t>(*settings, "n_seen").value_or(0U), gr::Size_t(0))) << "the same reply carries the copied member";
+    };
+
+    "a subscriber hears of the next applied change and of no copy before it"_test = [] {
+        RunningCounter run;
+        gr::sendMessage<gr::message::Command::Subscribe>(run.toScheduler, run.counterName, gr::block::property::kSetting, property_map{}, "watch");
+        // the block handles its messages in order, so the reply to this Get comes after the subscription stands
+        expect(fatal(run.readSettings().has_value())) << "the Get got no reply";
+        expect(fatal(run.awaitCopies(1UZ))) << "the counter copied nothing after the subscription";
+
+        gr::sendMessage<gr::message::Command::Set>(run.toScheduler, run.counterName, gr::block::property::kSetting, property_map{{"scale", 2.0f}}, "set");
+        const std::optional<property_map> notice = run.awaitData("watch");
+
+        expect(fatal(notice.has_value())) << "the subscriber heard nothing of the applied change";
+        expect(eq(valueAt<float>(*notice, "scale").value_or(1.0f), 2.0f)) << "the first notice does not carry the applied scale";
+        expect(gt(valueAt<gr::Size_t>(*notice, "n_seen").value_or(0U), gr::Size_t(0))) << "the notice carries the member's value";
     };
 };
 

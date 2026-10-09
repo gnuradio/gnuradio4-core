@@ -1072,6 +1072,10 @@ public:
     void setSettings(const CtxSettings<Derived>& settings) { _settings.assignFrom(settings); }
     void setSettings(CtxSettings<Derived>&& settings) { _settings.assignFrom(std::move(settings)); }
 
+    /// copies the named members into the map that `settings().get()` returns and returns the number of members
+    /// copied, under the rules of `CtxSettingsBase::updateActiveParameters(keys)`
+    std::size_t updateActiveParameters(std::initializer_list<std::string_view> keys) noexcept { return _settings.updateActiveParameters(keys); }
+
     template<std::size_t Index, typename Self>
     friend constexpr auto& inputPort(Self* self) noexcept;
 

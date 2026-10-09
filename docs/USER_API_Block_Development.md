@@ -220,6 +220,11 @@ them up only when that context is activated, so on a live graph the call reports
 nothing. To retune a running block use `settings().setStaged(params)`, which the block applies at the
 top of its next `work()` call.
 
+A block that assigns a reflected member while it runs makes the new value readable with
+`this->updateActiveParameters({"key", ...})`, which copies the named members into the map that
+`settings().get()` and a settings `Get` message return. The block calls it on the thread that writes
+those members, for example at the end of its work function.
+
 ## Processing functions
 
 Implement exactly one: `processOne`, `processBulk`, or — for full control —
