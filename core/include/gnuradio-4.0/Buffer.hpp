@@ -5,6 +5,7 @@
 #include <bit>
 #include <concepts>
 #include <cstdint>
+#include <ranges>
 #include <span>
 #include <type_traits>
 
@@ -74,6 +75,13 @@ concept ReaderSpanLike = std::ranges::contiguous_range<T> && ConstSpanLike<T> &&
 
 template<typename T>
 concept WriterSpanLike = std::ranges::contiguous_range<T> && std::ranges::output_range<T, std::remove_cvref_t<typename T::value_type>> && SpanLike<T> && requires(T& s) { s.publish(0UZ); };
+
+// a reader or writer span whose slots are random-access and need not be contiguous in memory
+template<typename T>
+concept RandomAccessReaderSpanLike = std::ranges::random_access_range<T> && std::ranges::sized_range<T> && requires(T& s) { s.consume(0); };
+
+template<typename T>
+concept RandomAccessWriterSpanLike = std::ranges::random_access_range<T> && std::ranges::sized_range<T> && std::ranges::output_range<T, std::remove_cvref_t<typename T::value_type>> && requires(T& s) { s.publish(0UZ); };
 
 template<class T>
 concept BufferReaderLike = requires(T /*const*/ t, const std::size_t nItems) {
