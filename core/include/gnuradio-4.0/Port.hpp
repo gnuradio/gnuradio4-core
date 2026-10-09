@@ -361,7 +361,7 @@ struct Async {};
  * - Access to Tags:
  *   - Using `tags()`: Returns a `range::view` of all input tags. Indices are relative to the first sample in the span and can be negative for unconsumed tags.
  *   - Using `tags(untilLocalIndex)`: Returns a `range::view` of input tags up to `untilLocalIndex` (exclusively). Indices are relative to the first sample in the span and can be negative for unconsumed tags.
- *   - Using `rawTags`: Provides direct access to the underlying `ReaderSpan<Tag>` for advanced manipulation.
+ *   - Using `rawTags`: Provides direct access to the underlying random-access `ReaderSpan<Tag>` for advanced manipulation.
  * - Consuming Tags: By default, tags associated with samples up to and including the first sample are consumed. One can manually consume tags up to a specific sample index using `consumeTags(streamSampleIndex)`.
  */
 template<typename T>
@@ -370,7 +370,7 @@ concept InputSpanLike = std::ranges::contiguous_range<T> && ConstSpanLike<T> && 
     { span.isConnected } -> std::convertible_to<bool>;
     { span.isSync } -> std::convertible_to<bool>;
     { span.rawTags };
-    requires ReaderSpanLike<std::remove_cvref_t<decltype(span.rawTags)>> && std::same_as<gr::Tag, std::ranges::range_value_t<decltype(span.rawTags)>>;
+    requires RandomAccessReaderSpanLike<std::remove_cvref_t<decltype(span.rawTags)>> && std::same_as<gr::Tag, std::ranges::range_value_t<decltype(span.rawTags)>>;
     { span.tags() } -> std::ranges::range;
     { span.tags(n) } -> std::ranges::range;
     { span.consumeTags(n) };
@@ -398,7 +398,7 @@ concept OutputSpanLike = std::ranges::contiguous_range<T> && std::ranges::output
     span.publish(0UZ);
     { span.isConnected } -> std::convertible_to<bool>;
     { span.isSync } -> std::convertible_to<bool>;
-    requires WriterSpanLike<std::remove_cvref_t<decltype(span.tags)>>;
+    requires RandomAccessWriterSpanLike<std::remove_cvref_t<decltype(span.tags)>>;
     { *span.tags.begin() } -> std::same_as<gr::Tag&>;
     { span.publishTag(tagData, tagOffset) } -> std::same_as<void>;
 };
@@ -1087,7 +1087,7 @@ public:
             // two reserved, one published: the ring's last free slot is held back for the
             // end-of-stream marker exactly as the reservation's last slot is, so a tag flood
             // cannot take the space the stream's ending needs
-            WriterSpanLike auto outTags = tagWriter().tryReserve(2UZ);
+            RandomAccessWriterSpanLike auto outTags = tagWriter().tryReserve(2UZ);
             if (!outTags.empty()) {
                 outTags[0].index = streamWriter().position() + tagOffset;
                 outTags[0].map   = std::forward<TPropertyMap>(tagData);
@@ -1115,7 +1115,7 @@ public:
         if (!isConnected()) {
             return;
         }
-        WriterSpanLike auto outTags = tagWriter().tryReserve(1UZ);
+        RandomAccessWriterSpanLike auto outTags = tagWriter().tryReserve(1UZ);
         if (!outTags.empty()) {
             outTags[0].index = streamWriter().position() + tagOffset;
             outTags[0].map   = std::forward<TPropertyMap>(tagData);
@@ -1409,7 +1409,7 @@ inline constexpr std::optional<std::size_t> nSamplesToNextTagConditional(PortLik
     if (!port.isConnected()) {
         return std::nullopt;
     }
-    ReaderSpanLike auto tagData = port.tagReader().get();
+    RandomAccessReaderSpanLike auto tagData = port.tagReader().get();
     if (tagData.empty()) [[likely]] {
         return std::nullopt; // default: no tags in sight
     }

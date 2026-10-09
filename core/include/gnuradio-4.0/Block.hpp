@@ -1868,7 +1868,7 @@ public:
             if (!port.isConnected()) {
                 return;
             }
-            ReaderSpanLike auto tagData = port.tagReader().get();
+            RandomAccessReaderSpanLike auto tagData = port.tagReader().get();
             if (tagData.empty()) [[likely]] {
                 hasInputStillToCome = true;
                 return;
