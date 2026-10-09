@@ -349,7 +349,9 @@ class BasicThreadPool {
     // _waitMutex. A thread holding _waitMutex never waits for _threadListMutex, and every hold of _waitMutex is short.
     std::mutex                   _waitMutex;
     std::condition_variable      _condition;
+    std::condition_variable      _workerCreationDone;
     std::size_t                  _numIdleWorkers  = 0U; // workers without a task, guarded by _waitMutex
+    std::size_t                  _numReserved     = 0U; // workers reserved and not yet created or refused, guarded by _waitMutex
     std::atomic_size_t           _numTaskedQueued = 0U; // cache for _taskQueue.size()
     std::atomic_size_t           _numTasksRunning = 0U;
     std::atomic_size_t           _numTasksFailed  = 0U;
@@ -489,8 +491,9 @@ public:
     // pool holds fewer than maxThreads() workers, execute() adds a worker. If the worker cannot be added, at the
     // process-wide thread limit (std::out_of_range), because the thread count cannot be read (std::runtime_error) or
     // because the system refuses a new thread (std::system_error), the exception reaches the caller and nothing is
-    // queued. A queued task waits for a busy worker only when the pool holds maxThreads() workers, or when another
-    // submitter adds the last of them and that worker is then refused.
+    // queued. A submitter that finds the idle workers no more than the tasks queued ahead, in a pool of maxThreads()
+    // workers one of which is still being created, waits in execute() until that creation succeeds or is refused, and
+    // then decides again. A queued task waits for a busy worker only when the pool holds maxThreads() workers.
     template<const detail::basic_fixed_string taskName = "", uint32_t priority = 0, int32_t cpuID = -1, std::invocable Callable, typename... Args, typename R = gr::meta::invoke_result_t<Callable, Args...>>
     requires(std::is_same_v<R, void>)
     void execute(Callable&& func, Args&&... args, const std::source_location& location = std::source_location::current()) {
@@ -503,10 +506,11 @@ public:
         TaskQueue::TaskContainer task = createTask<taskName, priority, cpuID>(std::forward<decltype(func)>(func), std::forward<decltype(func)>(args)...);
 
         std::unique_lock lock(_waitMutex);
-        const bool       needsWorker = _numIdleWorkers <= numTasksQueued() && numThreads() < maxThreads();
         // The queued count includes the task from here on. A worker that sees it stays.
         _numTaskedQueued.fetch_add(1U);
-        if (needsWorker) {
+        const auto lacksIdleWorker = [this] { return _numIdleWorkers < numTasksQueued(); };
+        _workerCreationDone.wait(lock, [&] { return _numReserved == 0UZ || !lacksIdleWorker() || numThreads() < maxThreads(); });
+        if (lacksIdleWorker() && numThreads() < maxThreads()) {
             try {
                 addWorker(lock, location);
             } catch (...) {
@@ -701,7 +705,9 @@ private:
     // mask follow that index. A worker that leaves after the records are taken is joined by the next addWorker() or
     // the destructor. A refusal undoes the reservation: the process-wide limit (std::out_of_range), a thread count
     // that cannot be read and a thread the system refuses (std::system_error). A worker whose name, mask or scheduling
-    // policy cannot be set stays in the pool, and the exception reaches the caller.
+    // policy cannot be set stays in the pool, and the exception reaches the caller. _numReserved counts the reservation
+    // until addWorker() holds waitLock again with the thread created or refused. execute() waits on _workerCreationDone
+    // for that outcome.
     // The join runs under _threadListMutex. No other worker starts while a departed thread still runs. A
     // thread-local destructor of a departed worker therefore must not call a member of its own pool that takes
     // _threadListMutex: execute(), numThreadsHeld(), requestShutdown(), and the getters and setters of the mask and the
@@ -710,12 +716,15 @@ private:
     void addWorker(std::unique_lock<std::mutex>& waitLock, std::source_location location) {
         _numThreads.fetch_add(1UZ, std::memory_order_acq_rel);
         ++_numIdleWorkers;
+        ++_numReserved;
         waitLock.unlock();
 
         std::unique_lock threadListLock(_threadListMutex);
         const auto       relock = [&] {
             threadListLock.unlock();
             waitLock.lock();
+            --_numReserved;
+            _workerCreationDone.notify_all();
         };
         _globalThreadCount.fetch_add(1UZ, std::memory_order_relaxed);
         std::thread* newThread = nullptr;
