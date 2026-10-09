@@ -47,6 +47,7 @@ set(_CORE_TESTS
     qa_SettingsConcurrency
     qa_SettingsTable
     qa_TagForwarding
+    qa_TagStore
     qa_UnfilteredTagPropagation
     qa_Tensor
     qa_TriggerMatcher
