@@ -318,6 +318,35 @@ const boost::ut::suite<"Port"> _portTests = [] { // NOSONAR (N.B. lambda size)
         std::ignore = tagReader.get<SpanReleasePolicy::ProcessAll>();
     };
 
+    "an input counts the tags it had not read when it is disconnected or connected anew"_test = [] {
+        PortOut<int> out;
+        PortIn<int>  in;
+        expect(out.resizeBuffer(16UZ).has_value());
+        expect(out.connect(in).has_value());
+        auto publishTagged = [&out](std::size_t nTags) {
+            auto span = out.tryReserve<SpanReleasePolicy::ProcessAll>(nTags);
+            for (std::size_t i = 0UZ; i < nTags; ++i) {
+                span.publishTag(propMap({{"n", static_cast<int>(i)}}), i);
+            }
+            std::iota(span.begin(), span.end(), 0);
+            span.publish(nTags);
+        };
+
+        publishTagged(3UZ);
+        expect(eq(in.tagReader().available(), 3UZ)) << "three tags wait for the input";
+        expect(in.disconnect().has_value());
+        expect(eq(in.nTagsDropped, 3UZ)) << "disconnect() counts the tags the input had not read";
+        expect(eq(out.nTagsDropped, 0UZ)) << "the output published every tag";
+
+        expect(out.connect(in).has_value());
+        expect(eq(in.nTagsDropped, 3UZ)) << "a connection that replaces no reader counts nothing";
+        publishTagged(2UZ);
+        PortOut<int> other;
+        expect(other.resizeBuffer(16UZ).has_value());
+        expect(other.connect(in).has_value());
+        expect(eq(in.nTagsDropped, 5UZ)) << "a new connection counts the tags the replaced reader had not read";
+    };
+
     // Only the consumer frees ring space, so a downstream that has stopped consuming is the one
     // case the reservation cannot cover. Waiting here would block a scheduler thread on work that
     // may never arrive, possibly work scheduled to its own pool, so the marker is reported lost
