@@ -178,6 +178,7 @@ if(GR_ENABLE_BLOCK_REGISTRY AND INTERNAL_ENABLE_BLOCK_PLUGINS)
     abi_probe_plugin
     abi_probe_plugin_v1
     abi_probe_plugin_foreign_scheduler
+    abi_probe_plugin_previous
     scheduler_library
     scheduler_library_v1
     scheduler_library_unversioned)
