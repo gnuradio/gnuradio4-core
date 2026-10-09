@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdio>
+#include <filesystem>
 #include <format>
 #include <fstream>
 #include <sstream>
@@ -144,10 +145,10 @@ struct Run {
     std::string output; // standard output and standard error together, in the order the run wrote them
 };
 
-/// Writes `yaml` to a file of the test's own and describes it with the built program. A refusal is
-/// the status the command exits with and the line it prints, and a test reads neither from inside
-/// this process.
-[[nodiscard]] Run describe(std::string_view fileName, std::string_view yaml) {
+/// Writes `yaml` to a file of the test's own and describes it with the built program, with
+/// `options` ahead of the file. A refusal is the status the command exits with and the line it
+/// prints, and a test reads neither from inside this process.
+[[nodiscard]] Run describe(std::string_view fileName, std::string_view yaml, std::string_view options = {}) {
     const std::string path = std::format("{}/{}", GR_TOOLS_TEST_SCRATCH, fileName);
     {
         std::ofstream file(path, std::ios::binary);
@@ -155,7 +156,7 @@ struct Run {
     }
 
     Run               result;
-    const std::string command = std::format("\"{}\" --format md \"{}\" 2>&1", GR_TOOLS_GRAPHDOC, path);
+    const std::string command = std::format("\"{}\" --format md {} \"{}\" 2>&1", GR_TOOLS_GRAPHDOC, options, path);
     std::FILE*        pipe    = openPipe(command.c_str(), "r");
     if (pipe == nullptr) {
         return result;
@@ -171,6 +172,22 @@ struct Run {
     result.exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 #endif
     return result;
+}
+
+/// `output` without the lines a Debug build prints to standard output for every `gr::exception` it
+/// constructs. Building a YAML definition throws one when the definition names a block type no
+/// registry holds.
+[[nodiscard]] std::string withoutThrowDiagnostics(std::string_view output) {
+    std::string kept;
+    for (std::size_t begin = 0UZ; begin < output.size();) {
+        const std::size_t newline = output.find('\n', begin);
+        const std::size_t end     = newline == std::string_view::npos ? output.size() : newline + 1UZ;
+        if (const std::string_view line = output.substr(begin, end - begin); !line.starts_with("Exception thrown: ")) {
+            kept.append(line);
+        }
+        begin = end;
+    }
+    return kept;
 }
 
 struct Refusal {
@@ -618,6 +635,29 @@ const boost::ut::suite<"GraphDoc"> graphDocTests = [] {
         expect(!verdict.accepted && verdict.message.contains("Unable to create block of type 'qa::NoSuchBlockIsRegistered'")) << "the importer refuses the type the tool does not check" << verdict.message;
 #endif
     };
+
+#ifdef GR_ENABLE_BLOCK_REGISTRY
+    "graphdoc's output holds the document alone when a definition refuses"_test = [] {
+        const std::filesystem::path root = std::filesystem::path(GR_TOOLS_TEST_SCRATCH) / "refusing_definition_root";
+        std::filesystem::create_directories(root);
+        {
+            std::ofstream index(root / "index.yaml");
+            index << "assets:\n  - file: refusing.yaml\n    created: \"2024-01-01-00:00:00\"\n    modified: \"2024-01-15-10:00:00\"\n    block_type: RefusingDefinition\n";
+            std::ofstream asset(root / "refusing.yaml");
+            asset << "definition_metadata:\n  block_type: RefusingDefinition\nblocks:\n  - id: qa::NoSuchBlockIsRegistered\n    parameters:\n      name: inner\n";
+        }
+        constexpr std::string_view kNamesDefinition = "blocks:\n"
+                                                      "  - id: RefusingDefinition\n    parameters:\n      name: first\n"
+                                                      "  - id: RefusingDefinition\n    parameters:\n      name: second\n"
+                                                      "connections:\n"
+                                                      "  - [first, out, second, in]\n";
+
+        const Run withDefinition = describe("refusing_definition.yaml", kNamesDefinition, std::format("--plugin-dir \"{}\"", root.string()));
+        const Run withoutRoot    = describe("refusing_definition.yaml", kNamesDefinition);
+        expect(eq(withDefinition.exitCode, 0)) << withDefinition.output;
+        expect(eq(withoutThrowDiagnostics(withDefinition.output), withoutRoot.output)) << "the lookup of the connection's source prints nothing beside the document";
+    };
+#endif
 
     "exported_ports is read inside a subgraph and left uninterpreted at the top level"_test = [] {
         const Run root = describe("root_exported_ports.yaml", kRootExportedPorts);

@@ -113,7 +113,9 @@ private:
 
         std::shared_ptr<BlockModel> instance;
         try {
-            instance = _loader.instantiate(blockKey, {});
+            if (const auto made = _loader.instantiateOrError(blockKey, {}); made.has_value()) {
+                instance = *made;
+            }
         } catch (...) {
             instance = nullptr; // a factory that throws leaves every connection out of it blank
         }
