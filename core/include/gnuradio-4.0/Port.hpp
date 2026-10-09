@@ -19,6 +19,7 @@
 #include "CircularBuffer.hpp"
 #include "DataSet.hpp"
 #include "Message.hpp"
+#include "SegmentedBuffer.hpp"
 #include "Tag.hpp"
 #include "annotated.hpp"
 
@@ -320,7 +321,7 @@ struct DefaultStreamBuffer : StreamBufferType<gr::CircularBuffer<T>> {};
 
 struct DefaultMessageBuffer : StreamBufferType<gr::CircularBuffer<Message, std::dynamic_extent, gr::ProducerType::Multi>> {};
 
-struct DefaultTagBuffer : TagBufferType<gr::CircularBuffer<Tag>> {};
+struct DefaultTagBuffer : TagBufferType<gr::SegmentedBuffer<Tag>> {};
 
 static_assert(is_stream_buffer_attribute<DefaultStreamBuffer<int>>::value);
 static_assert(is_stream_buffer_attribute<DefaultMessageBuffer>::value);
@@ -507,7 +508,7 @@ struct Port {
 
     static constexpr bool        kIsArithmeticLikeValueType = gr::arithmetic_sample_like<T> && sizeof(T) <= 16UZ;
     static constexpr std::size_t kDefaultBufferSize         = 4096UZ; // TODO: limit initial max buffer size based on kIsArithmeticLikeValueType
-    /// largest number of tag ring slots of an output port, besides the end-of-stream slot
+    /// largest number of tag slots of an output port, besides the end-of-stream slot
     static constexpr std::size_t kMaxTagBufferSize = 65536UZ;
 
     // constexpr members:
@@ -732,7 +733,7 @@ struct Port {
     static_assert(OutputSpanLike<OutputSpan<gr::SpanReleasePolicy::ProcessAll, WriterSpanReservePolicy::Reserve>>);
 
 public:
-    // Post-run drop accounting. Every tag this port refused for lack of ring space is counted
+    // Post-run drop accounting. Every tag this port refused for lack of tag store space is counted
     // here, whether it was refused on the direct path or inside a reservation whose own counter is
     // discarded with the span. An end-of-stream marker that cannot be published is not counted
     // here: it is a terminal failure rather than a dropped annotation, and has its own counter.
@@ -790,16 +791,17 @@ private:
         }
     }
 
-    // The tag ring is allocated one slot beyond the requested size. Every ordinary publish path
+    // The tag store holds one slot beyond the requested size. Every ordinary publish path
     // stops one slot short, which reserves that slot for the end-of-stream marker. Taking the slot
-    // out of the requested size would reduce the port's usable tag capacity by one; the extra
-    // element costs nothing unless the requested size already falls on a page-rounding boundary.
+    // out of the requested size would reduce the port's usable tag capacity by one.
     static constexpr std::size_t kTagRingReserve = 1UZ;
 
-    // The tag ring has one slot per requested stream sample, up to kMaxTagBufferSize slots, plus
-    // kTagRingReserve. The cap keeps the tag ring of a deep stream ring at a fixed size. A tag that
-    // finds the ring full is dropped and counted in nTagsDropped. Beyond the cap, the ring fills once
-    // more than kMaxTagBufferSize tags wait for the reader.
+    // The tag store has one slot per requested stream sample, up to kMaxTagBufferSize slots, plus
+    // kTagRingReserve. It allocates its slots in segments as tags are written and frees a segment
+    // once every reader has passed it, so its memory follows the tags waiting on the edge. An edge
+    // that carries no tag allocates no slot. A tag that finds the store full is dropped and counted
+    // in nTagsDropped. Beyond the cap, the store fills once more than kMaxTagBufferSize tags wait
+    // for the reader.
     [[nodiscard]] static constexpr std::size_t tagRingSize(std::size_t streamBufferSize) noexcept { return std::min(streamBufferSize, kMaxTagBufferSize) + kTagRingReserve; }
 
     [[nodiscard]] constexpr auto newTagIoHandler(std::size_t bufferSize = kDefaultBufferSize) const noexcept {
@@ -1084,7 +1086,7 @@ public:
     requires(kIsOutput)
     {
         if (isConnected()) {
-            // two reserved, one published: the ring's last free slot is held back for the
+            // two reserved, one published: the store's last free slot is held back for the
             // end-of-stream marker exactly as the reservation's last slot is, so a tag flood
             // cannot take the space the stream's ending needs
             RandomAccessWriterSpanLike auto outTags = tagWriter().tryReserve(2UZ);
@@ -1095,17 +1097,17 @@ public:
             } else {
                 ++nTagsDropped;
                 if (nTagsDropped == 1UZ) { // as above: the first drop is news, the next half million are a number
-                    std::println(stderr, "gr::Port: tag ring full, dropping tag at offset {}; further drops on this port are counted in nTagsDropped", tagOffset);
+                    std::println(stderr, "gr::Port: tag store full, dropping tag at offset {}; further drops on this port are counted in nTagsDropped", tagOffset);
                 }
             }
         }
     }
 
     // Publishes the end-of-stream marker without waiting. The reserved slot is available because
-    // every ordinary publish path stops one slot short of the ring's end and the ring carries
+    // every ordinary publish path stops one slot short of the store's end and the store carries
     // kTagRingReserve slots beyond its nominal size, so tag traffic from this port cannot consume
     // it. The reservation does not cover a downstream that has stopped consuming, since only the
-    // consumer frees ring space. Waiting here would block a scheduler thread, possibly on work
+    // consumer frees store space. Waiting here would block a scheduler thread, possibly on work
     // scheduled to its own pool, so a marker that cannot be published is reported and counted as a
     // terminal failure instead.
     template<PropertyMapType TPropertyMap>
@@ -1123,7 +1125,7 @@ public:
             return;
         }
         ++nEoSTagsLost;
-        std::println(stderr, "gr::Port: tag ring full and unconsumed, the end-of-stream tag at offset {} could not be published; downstream will not observe the end of the stream", tagOffset);
+        std::println(stderr, "gr::Port: tag store full and unconsumed, the end-of-stream tag at offset {} could not be published; downstream will not observe the end of the stream", tagOffset);
     }
 
 private:

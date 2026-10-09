@@ -344,8 +344,8 @@ const boost::ut::suite<"Port"> _portTests = [] { // NOSONAR (N.B. lambda size)
         std::ignore = tagReader.get<SpanReleasePolicy::ProcessAll>();
     };
 
-    // A deep edge's tag ring has as many slots, and allocates as many bytes, as a ring at the cap.
-    "a deep edge's tag ring stops at the cap"_test = [] {
+    // A deep edge's tag store has as many slots as a store at the cap, and allocates as many bytes when it is full.
+    "a deep edge's tag store stops at the cap"_test = [] {
         using T                     = std::complex<float>;
         constexpr std::size_t kCap  = PortOut<T>::kMaxTagBufferSize;
         constexpr std::size_t kDeep = 4194304UZ;
@@ -361,9 +361,20 @@ const boost::ut::suite<"Port"> _portTests = [] { // NOSONAR (N.B. lambda size)
 
         const std::size_t deepSlots = deep.buffer().tagBuffer.size();
         const std::size_t capSlots  = atCap.buffer().tagBuffer.size();
-        expect(gt(capSlots, kCap)) << std::format("a tag ring at the cap holds {} slots, short of one tag per sample", capSlots);
-        expect(eq(deepSlots, capSlots)) << std::format("the deep edge's tag ring has {} slots against {} at the cap", deepSlots, capSlots);
-        expect(eq(deepTags.allocated, capTags.allocated)) << std::format("the deep edge's tag ring allocates {} bytes against {} at the cap", deepTags.allocated, capTags.allocated);
+        expect(gt(capSlots, kCap)) << std::format("a tag store at the cap holds {} slots, short of one tag per sample", capSlots);
+        expect(eq(deepSlots, capSlots)) << std::format("the deep edge's tag store has {} slots against {} at the cap", deepSlots, capSlots);
+
+        auto deepReader    = deep.buffer().streamBuffer.new_reader();
+        auto deepTagReader = deep.buffer().tagBuffer.new_reader(); // never consumes
+        auto capReader     = atCap.buffer().streamBuffer.new_reader();
+        auto capTagReader  = atCap.buffer().tagBuffer.new_reader(); // never consumes
+        for (std::size_t i = 0UZ; i < deepSlots; ++i) {
+            deep.publishTag(propMap({{"n", static_cast<int>(i)}}), 0UZ);
+            atCap.publishTag(propMap({{"n", static_cast<int>(i)}}), 0UZ);
+        }
+        expect(eq(deepTagReader.available(), capTagReader.available())) << "both stores hold the same number of tags when full";
+        expect(eq(deep.nTagsDropped, atCap.nTagsDropped));
+        expect(eq(deepTags.allocated, capTags.allocated)) << std::format("the deep edge's full tag store allocates {} bytes against {} at the cap", deepTags.allocated, capTags.allocated);
         expect(lt(deepTags.allocated, deep.bufferSize() * sizeof(T))) << std::format("the deep edge's tags take {} bytes, more than its {} bytes of samples", deepTags.allocated, deep.bufferSize() * sizeof(T));
     };
 
@@ -1020,6 +1031,8 @@ const boost::ut::suite<"PMR resource forwarding"> _pmr = [] { // NOSONAR (N.B. l
         PortOut<float>   out;
 
         expect(out.resizeBuffer(4096UZ, nullptr, &tagTracker).has_value());
+        auto reader = out.buffer().streamBuffer.new_reader(); // the tag store allocates at the first tag, which needs a connected port
+        out.publishTag(property_map{{"k", 1}}, 0UZ);
         expect(gt(tagTracker._allocCount.load(), 0UZ)) << "tag resource should have been used";
     };
 
@@ -1029,6 +1042,8 @@ const boost::ut::suite<"PMR resource forwarding"> _pmr = [] { // NOSONAR (N.B. l
         PortOut<float>   out;
 
         expect(out.resizeBuffer(4096UZ, &dataTracker, &tagTracker).has_value());
+        auto reader = out.buffer().streamBuffer.new_reader();
+        out.publishTag(property_map{{"k", 1}}, 0UZ);
         expect(gt(dataTracker._allocCount.load(), 0UZ)) << "data resource should have been used";
         expect(gt(tagTracker._allocCount.load(), 0UZ)) << "tag resource should have been used";
     };
