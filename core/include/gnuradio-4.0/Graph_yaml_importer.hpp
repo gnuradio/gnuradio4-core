@@ -409,7 +409,11 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
 
         std::shared_ptr<BlockModel> currentBlock;
         if (!isSubgraph) {
-            currentBlock = loader.instantiate(blockType, parameters);
+            const auto instantiated = loader.instantiateOrError(blockType, parameters);
+            if (!instantiated.has_value()) {
+                throw gr::exception(std::format("Unable to create block '{}' of type '{}': {}", blockName, blockType, instantiated.error().message));
+            }
+            currentBlock = *instantiated;
             if (!currentBlock) {
                 throw gr::exception(std::format("Unable to create block of type '{}'", blockType));
             }

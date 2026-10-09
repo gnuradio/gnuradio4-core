@@ -279,6 +279,22 @@ const boost::ut::suite AssetsLoadingTests = [] {
         std::filesystem::remove_all(root);
     };
 
+    "loadGrc: a block whose definition refuses is reported with the definition's reason"_test = [] {
+        const auto root   = writeRefusingDefinitionRoot();
+        auto       loader = makeLoader({root.string()});
+
+        std::string message;
+        try {
+            [[maybe_unused]] const auto graph = gr::loadGrc(loader, "blocks:\n  - id: RefusingDefinition\n    parameters:\n      name: refused\n");
+        } catch (const gr::exception& refusal) {
+            message = refusal.message;
+        }
+        expect(message.contains("'refused'") && message.contains("'RefusingDefinition'")) << "the block and its type" << message;
+        expect(message.contains("qa::NoSuchBlockIsRegistered")) << "the reason the definition gave" << message;
+
+        std::filesystem::remove_all(root);
+    };
+
     // ── remote tests (server started by CMake fixture) ────────────────────────
 
 #endif
