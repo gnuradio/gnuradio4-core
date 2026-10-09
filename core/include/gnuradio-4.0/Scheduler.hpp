@@ -369,13 +369,14 @@ protected:
     // A worker that runs a reset from a message, and a thread that applies a deferred swap or restart, hold their
     // thread only until the next run is dispatched. That thread counts as free. A task the pool has queued and no
     // thread has taken yet counts as a held thread, whatever its length: a worker of a scheduler that started a moment
-    // earlier holds its thread for the run, and a short task of another component counts the same.
+    // earlier holds its thread for the run, and a short task of another component counts the same. An empty graph gets
+    // one job list, as under a single-threaded policy. Its worker handles the scheduler's messages and ends the run.
     [[nodiscard]] std::size_t nJobLists(std::size_t nBlocks) const {
         const std::size_t nThreads = static_cast<std::size_t>(_pool->maxThreads());
         const std::size_t nOwn     = isOnOwnWorkerThread() || applyingScheduler() == static_cast<const void*>(this) ? 1UZ : 0UZ;
         const std::size_t nRunning = _pool->numTasksRunning() + _pool->numTasksQueued();
         const std::size_t nBusy    = std::min(nRunning - std::min(nRunning, nOwn), nThreads);
-        return std::min(std::max(nThreads - nBusy, 1UZ), nBlocks);
+        return std::min(std::max(nThreads - nBusy, 1UZ), std::max(nBlocks, 1UZ));
     }
 
     // waits until every worker count except the caller's own is released. A lifecycle command sent as a message can

@@ -2419,6 +2419,18 @@ const boost::ut::suite<"job lists sized to the free pool threads"> jobListSizing
         expect(ge(sink._nReceived, qa_sched::kSamplesBeforeTerminal)) << "the sink must run for the stream to end";
     };
 
+    // an empty graph gets one job list, as under a single-threaded policy. Its worker finds no block to run and ends the run
+    "a multi-threaded scheduler runs an empty graph to its end"_test = [] {
+        using enum gr::lifecycle::State;
+        qa_sched::TestScheduler scheduler;
+        expect(scheduler.exchange(gr::Graph{}).has_value());
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(eq(scheduler.jobs()->size(), 1UZ)) << "an empty graph must get one job list";
+
+        expect(qa_sched::runAndWaitWithin(scheduler, qa_sched::kEventBound)) << "the run of an empty graph did not end";
+        expect(scheduler.state() == STOPPED) << "the run of an empty graph must end STOPPED";
+    };
+
     // the first scheduler's workers are queued and no thread has taken them when the second scheduler builds its job
     // lists. The second claims only the threads the first one's workers leave
     "a second scheduler started at once on a growable pool builds no more job lists than the free threads"_test = [] {
