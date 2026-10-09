@@ -2,6 +2,8 @@
 
 #include <gnuradio-4.0/thread/thread_pool.hpp>
 
+#include <thread>
+
 #if defined(__linux__) && !defined(__EMSCRIPTEN__)
 #include <sys/resource.h>
 #endif
@@ -44,6 +46,19 @@ struct LimitFillers {
         for (std::thread& thread : threads) {
             thread.join();
         }
+    }
+};
+
+// A worker's thread-local object whose destructor holds the thread's exit until released. The pool joins a worker that
+// left before it creates the next one, and that creation stays held after its reservation and before the limit check.
+struct HeldThreadExit {
+    static inline std::atomic<bool> entered{false};
+    static inline std::atomic<bool> release{false};
+
+    ~HeldThreadExit() {
+        entered = true;
+        entered.notify_all();
+        release.wait(false);
     }
 };
 
@@ -140,6 +155,63 @@ const boost::ut::suite<"gr::thread_pool global thread limit"> threadLimitTests =
         releaseFirst.notify_all();
         runAndWait(pool);
         expect(!refusedRan.load()) << "the refused task never runs";
+    });
+
+    limitTest("ThreadPool: a task submitted while the pool's last worker is being created and then refused is refused too", [] {
+        BasicThreadPool pool("LimitCreatingTest", TaskType::IO_BOUND, 0U, 1U);
+        pool.keepAliveDuration = std::chrono::milliseconds(1);
+        pool.execute([] { [[maybe_unused]] thread_local HeldThreadExit heldExit; });
+        HeldThreadExit::entered.wait(false);
+        expect(eq(pool.numThreads(), 0UZ)) << "the worker has left and its exit is held";
+
+        std::atomic<bool> dependentDone{false};
+        std::atomic<bool> reservingRefused{false};
+        std::thread       reserving([&] {
+            try {
+                pool.execute([] {});
+            } catch (const std::out_of_range&) {
+                reservingRefused = true;
+            }
+            dependentDone.wait(false); // the thread stays counted until the dependent submitter is done
+        });
+        // the reserving submitter holds the only worker slot and waits to join the worker that left
+        while (pool.numThreads() == 0UZ) {
+            std::this_thread::yield();
+        }
+
+        std::atomic<bool> dependentRefused{false};
+        std::atomic<bool> dependentRan{false};
+        std::thread       dependent([&] {
+            try {
+                pool.execute([&dependentRan] { dependentRan = true; });
+            } catch (const std::out_of_range&) {
+                dependentRefused = true;
+            }
+            dependentDone = true;
+            dependentDone.notify_all();
+        });
+        // the dependent submitter has counted its task and found the pool at its maximum
+        while (pool.numTasksQueued() < 2UZ) {
+            std::this_thread::yield();
+        }
+
+        {
+            LimitFillers fillers;
+            // one more filler takes the place of the worker that left once the pool joins it
+            fillers.threads.emplace_back([&fillers] { fillers.release.wait(false); });
+            HeldThreadExit::release = true;
+            HeldThreadExit::release.notify_all();
+            dependent.join();
+            reserving.join();
+
+            expect(reservingRefused.load()) << "the reserving submitter learns that its worker was refused";
+            expect(dependentRefused.load()) << "the dependent submitter learns that no worker can run its task";
+            expect(eq(pool.numThreads(), 0UZ));
+            expect(eq(pool.numTasksQueued(), 0UZ)) << "no accepted task waits in a pool without a worker";
+        }
+
+        runAndWait(pool);
+        expect(!dependentRan.load()) << "the refused task never runs";
     });
 };
 
