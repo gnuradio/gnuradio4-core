@@ -70,6 +70,14 @@ add_abi_probe_plugin(abi_probe_plugin)
 add_abi_probe_plugin(abi_probe_plugin_v1)
 add_abi_probe_plugin(abi_probe_plugin_foreign_scheduler)
 
+# The probe that records the version below the one this core implements, in a directory of its own. It is built from
+# this core's headers like the other probes. A host at another version refuses it.
+add_abi_probe_plugin(abi_probe_plugin_previous)
+set_target_properties(abi_probe_plugin_previous PROPERTIES LIBRARY_OUTPUT_DIRECTORY
+                                                           ${TESTS_BINARY_PATH}/plugin_abi_previous)
+target_compile_definitions(abi_probe_plugin_previous
+                           PRIVATE ABI_PROBE_PLUGIN_ABI_VERSION=GR_PLUGIN_CURRENT_ABI_VERSION-1)
+
 # One shared object that registers a scheduler without being a plugin. It is built at the plugin ABI version this core
 # implements, at version 1 and without a version. The three builds share a directory of their own. A load of that
 # directory keeps the first and refuses the other two.

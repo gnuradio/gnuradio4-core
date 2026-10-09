@@ -27,15 +27,17 @@
  * A plugin records the plugin ABI version it was compiled against and a host implements exactly one of them. Two of
  * the plugins in the directory below differ in nothing else, so one load of that directory shows what each of them
  * gets, and shows it before anything asks either of them for a block. The third is at the host's version and
- * registers a scheduler at another one when it loads. The three shared objects that register a scheduler without
- * being plugins differ in the same way. Their registrations record a version, or none.
+ * registers a scheduler at another one when it loads. A fourth plugin records the version below the host's and has a
+ * directory of its own. The three shared objects that register a scheduler without being plugins differ in the same
+ * way as the first two. Their registrations record a version, or none.
  */
 namespace qa_plugin_abi_version {
 
 using namespace gr;
 
-constexpr std::string_view kCurrentKey = "test::abi_probe";
-constexpr std::string_view kEarlierKey = "test::abi_probe_v1";
+constexpr std::string_view kCurrentKey  = "test::abi_probe";
+constexpr std::string_view kEarlierKey  = "test::abi_probe_v1";
+constexpr std::string_view kPreviousKey = "test::abi_probe_previous";
 
 constexpr std::string_view kCurrentSchedulerKey     = "test::library_scheduler";
 constexpr std::string_view kEarlierSchedulerKey     = "test::library_scheduler_v1";
@@ -44,9 +46,14 @@ constexpr std::string_view kForeignSchedulerKey     = "test::plugin_foreign_sche
 
 constexpr std::uint8_t kEarlierAbiVersion = 1;
 
+// the version below the host's, which the probe in a directory of its own records
+constexpr std::uint8_t kPreviousAbiVersion = GR_PLUGIN_CURRENT_ABI_VERSION - 1;
+
 constexpr gr::Size_t kTerminalCount = 1000U;
 
 [[nodiscard]] std::string abiPluginDirectory() { return std::string(TESTS_BINARY_PATH) + "/plugin_abi"; }
+
+[[nodiscard]] std::string previousPluginDirectory() { return std::string(TESTS_BINARY_PATH) + "/plugin_abi_previous"; }
 
 [[nodiscard]] std::string schedulerLibraryDirectory() { return std::string(TESTS_BINARY_PATH) + "/scheduler_library"; }
 
@@ -131,6 +138,24 @@ const boost::ut::suite<"PluginAbiVersion"> pluginAbiVersionTests = [] {
         std::shared_ptr<BlockModel> block = loader.instantiate(kCurrentKey);
         expect(fatal(block != nullptr)) << "the accepted plugin's factory produced nothing";
         expect(eq(std::string(block->typeName()), std::string("gr::testing::AbiProbe")));
+    };
+
+    "a plugin that records the previous ABI version is refused"_test = [] {
+        BlockRegistry                  registry;
+        SchedulerRegistry              schedulerRegistry;
+        const std::vector<std::string> directories{previousPluginDirectory()};
+        PluginLoader                   loader(registry, schedulerRegistry, directories);
+
+        const auto refused = std::ranges::find_if(loader.failedPlugins(), [](const auto& entry) { return entry.first.contains("abi_probe_plugin_previous"); });
+        expect(fatal(refused != loader.failedPlugins().end())) << "the plugin of the previous version has to be reported as a failure";
+        expect(eq(refused->second, std::format("plugin ABI version {} does not match the host's plugin ABI version {}", kPreviousAbiVersion, GR_PLUGIN_CURRENT_ABI_VERSION))) << "the reason names both versions";
+
+        expect(that % loader.plugins().empty()) << "the loader holds no plugin of the previous version";
+        expect(that % !loader.isBlockAvailable(kPreviousKey)) << "a refused plugin offers no block";
+        expect(loader.instantiate(kPreviousKey) == nullptr) << "a refused plugin's block cannot be created";
+        expect(that % !registry.contains(kPreviousKey));
+        expect(that % !gr::globalBlockRegistry().contains(kPreviousKey));
+        expect(that % loader.blockLibraries().empty()) << "a refused plugin is not taken up again as a shared object of blocks";
     };
 
     "a shared object whose scheduler records an earlier ABI version or none is refused and closed, one of this version runs"_test = [] {

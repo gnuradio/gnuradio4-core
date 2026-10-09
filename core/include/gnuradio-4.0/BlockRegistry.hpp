@@ -48,8 +48,10 @@
 // version of core. A host loads only a plugin whose version equals its own. The host also reads the version of each
 // scheduler a shared object registers, and keeps a scheduler only at its own version. A virtual call through another
 // version's interface reaches the wrong function. A plugin's port also shares its stream ring and its tag ring with a
-// port of the host, and the layout of `gr::Tag`, the tag ring's element, crosses the boundary with them.
-#define GR_PLUGIN_CURRENT_ABI_VERSION 6
+// port of the host, and the layout of `gr::Tag`, the tag ring's element, crosses the boundary with them. The host's
+// scheduler reads the `msgIn` and `msgOut` ports of a plugin's block through typed pointers, and the layout of a port
+// crosses the boundary too.
+#define GR_PLUGIN_CURRENT_ABI_VERSION 7
 
 namespace gr {
 
