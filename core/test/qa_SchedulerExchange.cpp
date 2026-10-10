@@ -302,7 +302,7 @@ struct PendingExchangeProbe : gr::scheduler::SchedulerBase<PendingExchangeProbe,
 
     void customInit() {
         const gr::Graph   flatGraph = gr::graph::flatten(*this->_graph);
-        const std::size_t nBatches  = this->nJobLists(flatGraph.blocks().size());
+        const std::size_t nBatches  = this->nJobLists(gr::scheduler::detail::countWorkingBlocks(flatGraph.blocks()));
         std::lock_guard   lock(this->_executionOrderMutex);
         std::lock_guard   guard(this->_adoptionBlocksMutex);
         this->_adoptionBlocks.assign(nBatches, {});

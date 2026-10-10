@@ -181,6 +181,7 @@ protected:
     RunRecord                      _run;
     std::optional<PendingExchange> _pendingExchange;
     std::size_t                    _nDeferredExchanges{0UZ}; // claimed swaps and restarts still running outside the job count
+    std::size_t                    _nSwapsOfActiveRun{0UZ};  // swaps by exchange() of an active run, from before its stop until the restored run is counted
     bool                           _exchangeClaimed{false};  // held by exchange() while it swaps the graph of an inactive scheduler
     std::optional<Error>           _startError;              // written by failStart(), cleared when a start begins
 
@@ -201,6 +202,12 @@ protected:
     std::optional<std::string>                _runEndingBlock; // the first block that ended the run since the latest start (see failRun())
 
     std::atomic_flag _processingScheduledMessages;
+    // A pass that moves samples, here or in a sub-scheduler's graph, sets _graphMoved. The holder's call to this
+    // scheduler clears it. A pass writes the flag only while it reads false. A scheduler without a holder therefore
+    // writes it once. A pass in which a sub-scheduler's graph moved advances _nNestedGraphMoves. The watchdog reads
+    // each advance as progress.
+    alignas(gr::kCacheLine) bool _graphMoved{false};
+    std::size_t _nNestedGraphMoves{0UZ};
     // separate cache lines: every worker reads the flag and updates the counter on each iteration
     alignas(gr::kCacheLine) std::size_t _nWorkQuiescenceRequests{0UZ}; // a worker enters work() only while it reads zero
     alignas(gr::kCacheLine) std::size_t _nWorkersInWork{0};
@@ -369,8 +376,10 @@ protected:
     // A worker that runs a reset from a message, and a thread that applies a deferred swap or restart, hold their
     // thread only until the next run is dispatched. That thread counts as free. A task the pool has queued and no
     // thread has taken yet counts as a held thread, whatever its length: a worker of a scheduler that started a moment
-    // earlier holds its thread for the run, and a short task of another component counts the same. An empty graph gets
-    // one job list, as under a single-threaded policy. Its worker handles the scheduler's messages and ends the run.
+    // earlier holds its thread for the run, and a short task of another component counts the same. nBlocks counts the
+    // blocks that do work of their own. A graph without such a block gets one job list, as under a single-threaded
+    // policy. Its worker handles the scheduler's messages and runs until each sub-scheduler of the graph has ended its
+    // run.
     [[nodiscard]] std::size_t nJobLists(std::size_t nBlocks) const {
         const std::size_t nThreads = static_cast<std::size_t>(_pool->maxThreads());
         const std::size_t nOwn     = isOnOwnWorkerThread() || applyingScheduler() == static_cast<const void*>(this) ? 1UZ : 0UZ;
@@ -461,6 +470,23 @@ public:
     }
 
     [[nodiscard]] bool workerStarted() noexcept { return gr::atomic_ref(_nWorkersStarted).load_acquire() > 0UZ; }
+
+    // whether the latest run goes on. It goes on while an active scheduler has not yet dispatched a worker, while a
+    // worker holds its count, while a claimed swap or restart runs outside the count, and while a swap from another
+    // thread stops the run, swaps the graph and restores the run. A run whose workers have all left has ended, whatever
+    // the state reads. A claim is counted before its worker releases its count, and a swap is counted before it stops
+    // the run. A restart counts its workers before the claim or the swap ends. The job count is therefore read before
+    // and after the claims and the swaps.
+    [[nodiscard]] bool runInProgress() noexcept {
+        if (lifecycle::isActive(this->state()) && !workerStarted()) {
+            return true;
+        }
+        return _nRunningJobs->value() != 0UZ || gr::atomic_ref(_nDeferredExchanges).load_acquire() != 0UZ || gr::atomic_ref(_nSwapsOfActiveRun).load_acquire() != 0UZ || _nRunningJobs->value() != 0UZ;
+    }
+
+    // whether a pass moved samples, here or in a sub-scheduler's graph, since the previous call. The holder of this
+    // scheduler calls it.
+    [[nodiscard]] bool takeGraphMoved() noexcept { return gr::atomic_ref(_graphMoved).load_relaxed() && gr::atomic_ref(_graphMoved).exchange(false); }
 
     // the progress sequences of the graphs beyond the holder that can read or write this scheduler's exported rings
     void setOuterProgress(std::vector<std::shared_ptr<gr::Sequence>> outerProgress) { _outerProgress = std::move(outerProgress); }
@@ -686,8 +712,18 @@ public:
             return std::unexpected(Error(std::format("exchange(): the scheduler '{}' changed from {} to {} before the swap; the graph is unchanged", this->unique_name, gr::meta::enumName(oldState).value_or(""), gr::meta::enumName(observed).value_or(""))));
         }
 
+        const bool stopsRun = lifecycle::isActive(oldState);
+        if (stopsRun) {
+            gr::atomic_ref(_nSwapsOfActiveRun).fetch_add(1UZ);
+        }
+        on_scope_exit releaseRun = [this, stopsRun] {
+            if (stopsRun) {
+                gr::atomic_ref(_nSwapsOfActiveRun).fetch_sub(1UZ);
+            }
+        };
+
         std::size_t ownGeneration = 0UZ;
-        if (lifecycle::isActive(oldState)) {       // need to stop running scheduler
+        if (stopsRun) {                            // need to stop running scheduler
             ownGeneration = runGeneration() + 1UZ; // the stop below advances the generation once
             if (auto result = this->changeStateTo(REQUESTED_STOP); !result) {
                 return std::unexpected(result.error());
@@ -1135,11 +1171,19 @@ protected:
         std::size_t       performedWorkAllBlocks = 0UZ;
         bool              unfinishedBlocksExist  = false; // i.e. at least one block returned OK, INSUFFICIENT_INPUT_ITEMS, or INSUFFICIENT_OUTPU_ITEMS
         bool              exportedBlockMoved     = false;
+        bool              nestedGraphMoved       = false;
         for (auto& currentBlock : blocks) {
             const auto [requested_work, performed_work, status] = currentBlock->work(requestedWorkAllBlocks);
-            performedWorkAllBlocks += performed_work;
-            if (performed_work > 0UZ && !exportedBlockMoved && isExported(*currentBlock)) {
-                exportedBlockMoved = true;
+            const block::Category category                      = currentBlock->blockCategory();
+            // a sub-scheduler reports work when its own graph moved samples since the previous call. That work is
+            // progress for the watchdog only. The idle backoff and the park count the work of this graph's blocks.
+            if (category == block::Category::ScheduledBlockGroup) {
+                nestedGraphMoved = nestedGraphMoved || performed_work > 0UZ;
+            } else {
+                performedWorkAllBlocks += performed_work;
+                if (performed_work > 0UZ && !exportedBlockMoved && isExported(*currentBlock)) {
+                    exportedBlockMoved = true;
+                }
             }
 
             if (status == work::Status::ERROR) {
@@ -1155,7 +1199,12 @@ protected:
             // condition unreachable and runAndWait() never returns. The children are in this same list and are
             // what termination is decided on. The group stays in the list because it also has to drain its
             // message port.
-            if (status != work::Status::DONE && currentBlock->blockCategory() == block::Category::NormalBlock) {
+            // A transparent group's OK does not count. A sub-scheduler's work() reports OK while its own run goes on
+            // and DONE once that run has ended. Its OK counts as unfinished work, and an ERROR of the sub-scheduler
+            // before its run ends fails this run. A worker whose other blocks have ended keeps calling the
+            // sub-scheduler until that run ends. It sleeps at most kMaxIdleSleep between the calls, and under the
+            // blocking policy it parks for at most timeout_ms.
+            if (status != work::Status::DONE && category != block::Category::TransparentBlockGroup) {
                 unfinishedBlocksExist = true;
             }
         }
@@ -1163,6 +1212,12 @@ protected:
         std::this_thread::sleep_for(std::chrono::microseconds(10u)); // workaround for incomplete std::atomic implementation (at least it seems for nodejs)
 #endif
         advanceEnclosingProgress(exportedBlockMoved, !unfinishedBlocksExist);
+        if (nestedGraphMoved) {
+            gr::atomic_ref(_nNestedGraphMoves).fetch_add(1UZ);
+        }
+        if ((performedWorkAllBlocks > 0UZ || nestedGraphMoved) && !gr::atomic_ref(_graphMoved).load_relaxed()) {
+            gr::atomic_ref(_graphMoved).store_release(true);
+        }
         return {max_work_items, performedWorkAllBlocks, unfinishedBlocksExist ? work::Status::OK : work::Status::DONE};
     }
 
@@ -1739,7 +1794,9 @@ protected:
             return; // abort watchdog: retired, scheduler inactive, or jobs already finished.
         }
 
-        std::size_t lastProgress  = _graph->_progress->value();
+        // a period in which a sub-scheduler's graph moved samples counts as progress
+        const auto  progressValue = [this] { return _graph->_progress->value() + gr::atomic_ref(_nNestedGraphMoves).load_acquire(); };
+        std::size_t lastProgress  = progressValue();
         std::size_t nWarnings     = 0;
         bool        stallReported = false; // one report per stall; progress or a state other than RUNNING re-arms it
         do {
@@ -1749,7 +1806,7 @@ protected:
             }
             // a period without progress wakes the parked workers, which then call every block again. The wake follows the
             // state read and leaves the progress sequence unchanged.
-            std::size_t currentProgress = _graph->_progress->value();
+            std::size_t currentProgress = progressValue();
             if ((_nRunningJobs->value() > 0UZ) && (currentProgress == lastProgress)) {
                 if (this->state() != lifecycle::State::RUNNING) { // only a RUNNING graph is expected to make progress
                     nWarnings     = 0UZ;
@@ -2674,16 +2731,27 @@ protected:
 };
 
 namespace detail {
-// contiguous slices keep chain neighbors on the same worker
+[[nodiscard]] inline bool worksOnItsOwn(const std::shared_ptr<BlockModel>& block) { return block->blockCategory() == block::Category::NormalBlock; }
+
+// a block group's work() moves no samples. Every other block does work of its own
+[[nodiscard]] inline std::size_t countWorkingBlocks(std::span<const std::shared_ptr<BlockModel>> blocks) { return static_cast<std::size_t>(std::ranges::count_if(blocks, worksOnItsOwn)); }
+
+// contiguous slices keep chain neighbors on the same worker. The slices divide the blocks that do work of their own. A
+// block group joins the slice of the next such block, or the last slice. A block group takes no job list and no worker
+// of its own.
 inline JobLists batchBlocks(std::span<const std::shared_ptr<BlockModel>> blocks, std::size_t n_batches) {
-    JobLists result;
-    result.reserve(n_batches);
-    const std::size_t nBlocks = blocks.size();
-    for (std::size_t batch = 0UZ; batch < n_batches; ++batch) {
-        const std::size_t first = batch * nBlocks / n_batches;
-        const std::size_t last  = (batch + 1UZ) * nBlocks / n_batches;
-        const auto        slice = blocks.subspan(first, last - first);
-        result.emplace_back(slice.begin(), slice.end());
+    JobLists result(n_batches);
+    if (n_batches == 0UZ) {
+        return result;
+    }
+    const std::size_t nWorking       = std::max(countWorkingBlocks(blocks), 1UZ);
+    std::size_t       nWorkingBefore = 0UZ;
+    for (const std::shared_ptr<BlockModel>& block : blocks) {
+        const std::size_t ordinal = std::min(nWorkingBefore, nWorking - 1UZ);
+        result[((ordinal + 1UZ) * n_batches - 1UZ) / nWorking].push_back(block);
+        if (worksOnItsOwn(block)) {
+            ++nWorkingBefore;
+        }
     }
     return result;
 }
@@ -2711,7 +2779,7 @@ struct Simple : SchedulerBase<Simple<execution, TProfiler>, execution, TProfiler
 
         // generate job list
         const gr::Graph   flatGraph = graph::flatten(*this->_graph);
-        const std::size_t nBlocks   = flatGraph.blocks().size();
+        const std::size_t nBlocks   = detail::countWorkingBlocks(flatGraph.blocks());
 
         std::size_t n_batches = 1UZ;
         switch (this->executionPolicy()) {
@@ -2801,7 +2869,7 @@ detecting cycles and blocks which can be reached from several source blocks.)"">
             }
         }
 
-        const std::size_t n_batches = (execution == ExecutionPolicy::multiThreaded) ? this->nJobLists(blockList.size()) : 1UZ;
+        const std::size_t n_batches = (execution == ExecutionPolicy::multiThreaded) ? this->nJobLists(detail::countWorkingBlocks(blockList)) : 1UZ;
 
         std::lock_guard lock(this->_executionOrderMutex);
         std::lock_guard guard(this->_adoptionBlocksMutex);
@@ -2874,7 +2942,7 @@ struct DepthFirst : SchedulerBase<DepthFirst<execution, TProfiler>, execution, T
             }
         }
 
-        const std::size_t n_batches = (execution == ExecutionPolicy::multiThreaded) ? this->nJobLists(blockList.size()) : 1UZ;
+        const std::size_t n_batches = (execution == ExecutionPolicy::multiThreaded) ? this->nJobLists(detail::countWorkingBlocks(blockList)) : 1UZ;
 
         std::lock_guard lock(this->_executionOrderMutex);
         std::lock_guard guard(this->_adoptionBlocksMutex);
