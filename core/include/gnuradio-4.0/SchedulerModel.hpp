@@ -119,12 +119,21 @@ public:
     [[nodiscard]] bool workerStarted() override { return this->blockRef().workerStarted(); }
 
     // a scheduler whose start or run ended in ERROR on its own thread or on its workers returns ERROR to the scheduler
-    // that runs it. That run fails as it does for a block's ERROR.
+    // that runs it. That run fails as it does for a block's ERROR. The call returns DONE once the scheduler's run has
+    // ended, and OK while it goes on. A worker that fails publishes ERROR before it releases its count. The call
+    // therefore reads the run before the state. An OK call reports one unit of work when the scheduler's graph moved
+    // samples since the previous call, and none otherwise.
     [[nodiscard]] work::Result work(std::size_t requestedWork = undefined_size) override {
+        const bool runGoesOn = this->blockRef().runInProgress();
         if (this->blockRef().state() == gr::lifecycle::State::ERROR) {
             return {requestedWork, 0UZ, work::Status::ERROR};
         }
-        return GraphWrapper<TScheduler, gr::Graph>::work(requestedWork);
+        if (!runGoesOn) {
+            return {requestedWork, 0UZ, work::Status::DONE};
+        }
+        work::Result result   = GraphWrapper<TScheduler, gr::Graph>::work(requestedWork);
+        result.performed_work = this->blockRef().takeGraphMoved() ? 1UZ : 0UZ;
+        return result;
     }
 
     [[nodiscard]] std::optional<Error> startError() const override { return this->blockRef().startError(); }

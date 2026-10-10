@@ -140,6 +140,20 @@ struct FailingSource : gr::Block<FailingSource> {
     }
 };
 
+// publishes nothing and returns ERROR once its gate is open
+struct GatedFailingSource : gr::Block<GatedFailingSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(GatedFailingSource, out);
+
+    const std::atomic<bool>* _gate = nullptr;
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        outSpan.publish(0UZ);
+        return _gate != nullptr && _gate->load(std::memory_order_acquire) ? gr::work::Status::ERROR : gr::work::Status::OK;
+    }
+};
+
 // a source whose device is absent: start() throws, so the block lands in ERROR before one sample moves
 struct ThrowingStartSource : gr::Block<ThrowingStartSource> {
     gr::PortOut<float> out;
@@ -507,6 +521,20 @@ using TestScheduler     = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::
 using SerialScheduler   = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>;
 using BlockingScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking>;
 
+// a sub-scheduler that counts the work() calls of the scheduler that runs it once each call has returned
+template<typename TScheduler>
+struct CountedSchedulerWrapper : gr::SchedulerWrapper<TScheduler> {
+    std::atomic<std::size_t> _nReturnedWorkCalls{0UZ};
+
+    [[nodiscard]] gr::work::Result work(std::size_t requestedWork = gr::undefined_size) override {
+        const gr::work::Result result = gr::SchedulerWrapper<TScheduler>::work(requestedWork);
+        _nReturnedWorkCalls.fetch_add(1UZ, std::memory_order_release);
+        return result;
+    }
+};
+
+using CountedSubScheduler = CountedSchedulerWrapper<SerialScheduler>;
+
 // samples the adopted sub-scheduler's graph has moved, observed from outside its thread
 inline std::atomic<std::size_t> gSubSchedulerSamples{0UZ};
 
@@ -715,11 +743,12 @@ struct PoolProbe : TScheduler {
 struct StallReports {
     std::size_t count       = 0UZ;
     std::size_t lastPeriods = 0UZ; // stalled periods the latest report names
+    std::string serviceName{};     // when set, only the reports of the scheduler of this name count
 
     void take(gr::MsgPortIn& port) {
         auto messages = port.streamReader().get();
         for (const gr::Message& message : messages) {
-            if (message.endpoint == "watchdog" && message.cmd == gr::message::Command::Notify && message.data.has_value()) {
+            if (message.endpoint == "watchdog" && message.cmd == gr::message::Command::Notify && message.data.has_value() && (serviceName.empty() || message.serviceName == serviceName)) {
                 ++count;
                 lastPeriods = message.data->at("stalled_periods").value_or<gr::Size_t>(0U);
             }
@@ -747,6 +776,42 @@ struct StallReports {
     expect(flow.connect<"out", "in">(source, sink).has_value());
     return flow;
 }
+
+// a single-threaded sub-scheduler whose source returns ERROR once the gate is open
+struct GatedSubScheduler {
+    std::shared_ptr<CountedSubScheduler> scheduler;
+    std::string                          failingName; // the unique name of the source that fails
+};
+
+[[nodiscard]] GatedSubScheduler makeGatedSubScheduler(const std::atomic<bool>& gate) {
+    using namespace boost::ut;
+
+    gr::Graph flow;
+    auto&     source = flow.emplaceBlock<GatedFailingSource>();
+    auto&     sink   = flow.emplaceBlock<CountingSink>();
+    expect(flow.connect<"out", "in">(source, sink).has_value());
+    source._gate = &gate;
+    GatedSubScheduler gated{std::make_shared<CountedSubScheduler>(), std::string(source.unique_name)};
+    gated.scheduler->setGraph(std::move(flow));
+    return gated;
+}
+
+// the parent's run ended within its bound in ERROR, with an error that names the sub-scheduler and its failing source
+void expectFailedBySubScheduler(const TestScheduler& parent, bool ended, const std::expected<void, gr::Error>& result, std::string_view innerName, std::string_view failingName, gr::lifecycle::State innerState) {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    expect(ended) << "the parent ran on after its sub-scheduler failed";
+    expect(!result.has_value()) << "a sub-scheduler that failed while it ran must fail its parent's run";
+    if (!result.has_value()) {
+        expect(result.error().message.find(innerName) != std::string::npos) << "the error must name the sub-scheduler: " << result.error().message;
+        expect(result.error().message.find(failingName) != std::string::npos) << "the error must carry the sub-scheduler's reason: " << result.error().message;
+    }
+    expect(parent.state() == ERROR) << "the parent's run must end in ERROR";
+    expect(innerState == ERROR) << "the sub-scheduler's run must end in ERROR";
+}
+
+void expectFailedBySubScheduler(const TestScheduler& parent, bool ended, const std::expected<void, gr::Error>& result, std::string_view innerName, const GatedSubScheduler& inner) { expectFailedBySubScheduler(parent, ended, result, innerName, inner.failingName, inner.scheduler->blockRef().state()); }
 
 [[nodiscard]] bool awaitState(const TestScheduler& scheduler, gr::lifecycle::State expected) {
     for (std::size_t i = 0UZ; i < 2000UZ; ++i) {
@@ -2123,6 +2188,138 @@ const boost::ut::suite<"a scheduler started on its own thread"> ownThreadStartTe
         expect(inner->blockRef().state() == ERROR) << "the sub-scheduler's run must end in ERROR";
         inner->stop();
     };
+
+    // the parent's pool has a thread for each block of its graph. The sub-scheduler shares a job list with a block that
+    // works, and its source fails only after a call of the parent to the sub-scheduler has returned
+    "a sub-scheduler that fails after its parent's first call to it fails its parent's run"_test = [] {
+        constexpr std::string_view kParentPoolName = "qa_late_failure_cpu";
+        auto                       pool            = qa_sched::fixedPool(kParentPoolName, 3U);
+
+        std::atomic<bool>                 failureGate{false};
+        const qa_sched::GatedSubScheduler inner = qa_sched::makeGatedSubScheduler(failureGate);
+
+        gr::Graph                             flow       = qa_sched::makeEndlessGraph();
+        const std::shared_ptr<gr::BlockModel> innerBlock = flow.addBlock(gr::SchedulerModel::asBlockModelPtr(inner.scheduler));
+        const std::string                     innerName(innerBlock->uniqueName());
+
+        qa_sched::TestScheduler scheduler({{"poolName", std::string(kParentPoolName)}});
+        gr::MsgPortIn           fromScheduler;
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+
+        const auto                                     holdsSubScheduler = [&innerName](const std::vector<std::shared_ptr<gr::BlockModel>>& jobList) { return std::ranges::any_of(jobList, [&innerName](const std::shared_ptr<gr::BlockModel>& block) { return block->uniqueName() == innerName; }); };
+        const auto                                     worksOnItsOwn     = [](const std::shared_ptr<gr::BlockModel>& block) { return block->blockCategory() == gr::block::Category::NormalBlock; };
+        const std::shared_ptr<gr::scheduler::JobLists> jobLists          = scheduler.jobs();
+        const auto                                     ownList           = std::ranges::find_if(*jobLists, holdsSubScheduler);
+        expect(ownList != jobLists->end()) << "a job list must hold the sub-scheduler";
+        if (ownList != jobLists->end()) {
+            expect(std::ranges::any_of(*ownList, worksOnItsOwn)) << "the sub-scheduler's job list must hold a block that works";
+        }
+
+        std::size_t                    nReturnedBeforeFailure = 0UZ;
+        std::expected<void, gr::Error> result;
+        const bool                     ended = qa_sched::runAndWaitWithin(
+            scheduler, qa_sched::kEventBound,
+            [&inner, &failureGate, &nReturnedBeforeFailure] {
+                std::ignore            = qa_sched::awaitCondition([&inner] { return inner.scheduler->_nReturnedWorkCalls.load(std::memory_order_acquire) > 0UZ; });
+                nReturnedBeforeFailure = inner.scheduler->_nReturnedWorkCalls.load(std::memory_order_acquire);
+                failureGate.store(true, std::memory_order_release);
+            },
+            &result);
+        expect(gt(nReturnedBeforeFailure, 0UZ)) << "a call of the parent to the sub-scheduler must return before its source fails";
+        qa_sched::expectFailedBySubScheduler(scheduler, ended, result, innerName, inner);
+        inner.scheduler->stop();
+    };
+
+    // the parent's pool has two threads, and its job lists hold an endless chain and a finite chain. The sub-scheduler
+    // shares its job list with the finite chain, and its source fails only after that chain has ended
+    "a sub-scheduler that fails after the other blocks of its job list end fails its parent's run"_test = [] {
+        constexpr std::string_view kParentPoolName = "qa_ended_list_cpu";
+        auto                       pool            = qa_sched::fixedPool(kParentPoolName, 2U);
+
+        std::atomic<bool>                 failureGate{false};
+        const qa_sched::GatedSubScheduler inner = qa_sched::makeGatedSubScheduler(failureGate);
+
+        gr::Graph                             flow       = qa_sched::makeEndlessGraph();
+        const std::shared_ptr<gr::BlockModel> innerBlock = flow.addBlock(gr::SchedulerModel::asBlockModelPtr(inner.scheduler));
+        const std::string                     innerName(innerBlock->uniqueName());
+        auto&                                 finiteSource = flow.emplaceBlock<qa_sched::DoneSource>();
+        auto&                                 finiteSink   = flow.emplaceBlock<qa_sched::CountingSink>();
+        expect(flow.connect<"out", "in">(finiteSource, finiteSink).has_value());
+        const std::array<std::string_view, 3UZ> finiteListNames{innerName, finiteSource.unique_name, finiteSink.unique_name};
+
+        qa_sched::TestScheduler scheduler({{"poolName", std::string(kParentPoolName)}});
+        gr::MsgPortIn           fromScheduler;
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+
+        const std::shared_ptr<gr::scheduler::JobLists> jobLists  = scheduler.jobs();
+        const auto                                     blockName = [](const std::shared_ptr<gr::BlockModel>& block) { return block->uniqueName(); };
+        expect(eq(jobLists->size(), 2UZ)) << "the parent must have a job list for each thread of its pool";
+        expect(!jobLists->empty() && std::ranges::equal(jobLists->back(), finiteListNames, std::ranges::equal_to{}, blockName)) << "the sub-scheduler must share its job list with the finite chain alone";
+
+        std::expected<void, gr::Error> result;
+        const bool                     ended = qa_sched::runAndWaitWithin(
+            scheduler, qa_sched::kEventBound,
+            [&finiteSink, &failureGate] {
+                expect(qa_sched::awaitCondition([&finiteSink] { return finiteSink.state() == STOPPED; })) << "the finite chain must end";
+                failureGate.store(true, std::memory_order_release);
+            },
+            &result);
+        expect(eq(finiteSink._nReceived, qa_sched::kSamplesBeforeTerminal)) << "the finite chain must deliver each of its samples";
+        qa_sched::expectFailedBySubScheduler(scheduler, ended, result, innerName, inner);
+        inner.scheduler->stop();
+    };
+
+    // the parent's graph holds the sub-scheduler alone. The sub-scheduler's source fails only after a call of the parent
+    // to the sub-scheduler has returned
+    "a parent that holds only a sub-scheduler fails its run when the sub-scheduler fails"_test = [] {
+        std::atomic<bool>                 failureGate{false};
+        const qa_sched::GatedSubScheduler inner = qa_sched::makeGatedSubScheduler(failureGate);
+
+        gr::Graph                             flow;
+        const std::shared_ptr<gr::BlockModel> innerBlock = flow.addBlock(gr::SchedulerModel::asBlockModelPtr(inner.scheduler));
+        const std::string                     innerName(innerBlock->uniqueName());
+
+        qa_sched::TestScheduler scheduler;
+        gr::MsgPortIn           fromScheduler;
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        std::expected<void, gr::Error> result;
+        const bool                     ended = qa_sched::runAndWaitWithin(
+            scheduler, qa_sched::kEventBound,
+            [&inner, &failureGate] {
+                expect(qa_sched::awaitCondition([&inner] { return inner.scheduler->_nReturnedWorkCalls.load(std::memory_order_acquire) > 0UZ; })) << "the parent must call the sub-scheduler";
+                failureGate.store(true, std::memory_order_release);
+            },
+            &result);
+        qa_sched::expectFailedBySubScheduler(scheduler, ended, result, innerName, inner);
+        inner.scheduler->stop();
+    };
+
+    "a parent that holds only a sub-scheduler ends its run when the sub-scheduler's graph ends"_test = [] {
+        gr::Graph innerFlow;
+        auto&     innerSource = innerFlow.emplaceBlock<qa_sched::DoneSource>();
+        auto&     innerSink   = innerFlow.emplaceBlock<qa_sched::CountingSink>();
+        expect(innerFlow.connect<"out", "in">(innerSource, innerSink).has_value());
+        auto inner = std::make_shared<gr::SchedulerWrapper<qa_sched::SerialScheduler>>();
+        inner->setGraph(std::move(innerFlow));
+
+        gr::Graph flow;
+        std::ignore = flow.addBlock(gr::SchedulerModel::asBlockModelPtr(inner));
+
+        qa_sched::TestScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        std::expected<void, gr::Error> result;
+        expect(qa_sched::runAndWaitWithin(scheduler, qa_sched::kEventBound, [] {}, &result)) << "the parent's run must end once the sub-scheduler's graph ends";
+        expect(result.has_value()) << "the parent's run must succeed";
+        expect(eq(innerSink._nReceived, qa_sched::kSamplesBeforeTerminal)) << "the parent's run must last until the sub-scheduler's graph ends";
+        inner->stop();
+    };
 };
 
 const boost::ut::suite<"the pool of a scheduler started on its own thread"> ownThreadPoolTests = [] {
@@ -3235,6 +3432,37 @@ const boost::ut::suite<"watchdog lifetime"> watchdogTests = [] {
     };
 };
 
+namespace qa_sched {
+
+// a parent graph of a finite chain and a single-threaded sub-scheduler. The sub-scheduler's source moves one sample for
+// each release
+struct ParentOfReleasedSubScheduler {
+    gr::Graph                                              flow;
+    CountingSink*                                          finiteSink = nullptr;
+    std::shared_ptr<gr::SchedulerWrapper<SerialScheduler>> inner      = std::make_shared<gr::SchedulerWrapper<SerialScheduler>>();
+};
+
+[[nodiscard]] ParentOfReleasedSubScheduler makeParentOfReleasedSubScheduler(std::atomic<std::size_t>& nReleased) {
+    using namespace boost::ut;
+
+    gr::Graph innerFlow;
+    auto&     innerSource = innerFlow.emplaceBlock<ReleasedSource>();
+    auto&     innerSink   = innerFlow.emplaceBlock<CountingSink>();
+    expect(innerFlow.connect<"out", "in">(innerSource, innerSink).has_value());
+    innerSource._nReleased = &nReleased;
+
+    ParentOfReleasedSubScheduler parent;
+    parent.inner->setGraph(std::move(innerFlow));
+    auto& finiteSource = parent.flow.emplaceBlock<DoneSource>();
+    auto& finiteSink   = parent.flow.emplaceBlock<CountingSink>();
+    expect(parent.flow.connect<"out", "in">(finiteSource, finiteSink).has_value());
+    parent.finiteSink = &finiteSink;
+    std::ignore       = parent.flow.addBlock(gr::SchedulerModel::asBlockModelPtr(parent.inner));
+    return parent;
+}
+
+} // namespace qa_sched
+
 const boost::ut::suite<"watchdog stall report"> watchdogStallTests = [] {
     using namespace boost::ut;
     using enum gr::lifecycle::State;
@@ -3351,6 +3579,64 @@ const boost::ut::suite<"watchdog stall report"> watchdogStallTests = [] {
 
         expect(parent.changeStateTo(REQUESTED_STOP).has_value());
         expect(qa_sched::awaitState(parent, STOPPED)) << "the parent did not stop";
+    };
+
+    // the parent's own chain ends, and a sub-scheduler then keeps its run going. The test releases one sample to the
+    // sub-scheduler's graph after each period that the parent's watchdog finds idle, which advances the parent's wake
+    // count. The sub-scheduler exports no port, so only its own graph moves
+    "a parent whose own blocks have ended reports no stall while its sub-scheduler's graph moves"_test = [] {
+        constexpr std::size_t kStalledPeriods = 4UZ;
+        constexpr std::size_t kReleases       = 3UZ * kStalledPeriods;
+
+        std::atomic<std::size_t>                     nReleased{0UZ};
+        qa_sched::ParentOfReleasedSubScheduler       parent = qa_sched::makeParentOfReleasedSubScheduler(nReleased);
+        qa_sched::WakeProbe<qa_sched::TestScheduler> scheduler({{"watchdog_timeout", gr::Size_t(20)}, {"timeout_inactivity_count", gr::Size_t(kStalledPeriods)}});
+        gr::MsgPortIn                                fromScheduler;
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+        expect(scheduler.exchange(std::move(parent.flow)).has_value());
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(qa_sched::awaitCondition([&parent] { return parent.finiteSink->state() == STOPPED; })) << "the parent's own chain must end";
+
+        qa_sched::StallReports reports{.serviceName = std::string(scheduler.unique_name)};
+        for (std::size_t release = 0UZ; release < kReleases; ++release) {
+            const std::size_t nWakes = scheduler.nWakes();
+            expect(qa_sched::awaitCondition([&scheduler, nWakes] { return scheduler.nWakes() > nWakes; })) << "the parent's watchdog stopped observing its graph";
+            nReleased.fetch_add(1UZ, std::memory_order_acq_rel);
+        }
+        expect(qa_sched::awaitCondition([&nReleased] { return nReleased.load(std::memory_order_acquire) == 0UZ; })) << "the sub-scheduler's graph must move each released sample";
+        reports.take(fromScheduler);
+        expect(eq(reports.count, 0UZ)) << "the parent reported a stall while its sub-scheduler's graph moved";
+
+        // no sample moves from here on, and the same watchdog reports the stall
+        expect(qa_sched::awaitCondition([&reports, &fromScheduler] { return (reports.take(fromScheduler), reports.count >= 1UZ); })) << "the parent did not report the stall once its sub-scheduler's graph stopped";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_sched::awaitState(scheduler, STOPPED)) << "the parent did not stop";
+        parent.inner->stop();
+    };
+
+    "a parent whose own blocks have ended reports the stall of its sub-scheduler's graph"_test = [] {
+        constexpr std::size_t kStalledPeriods = 2UZ;
+
+        std::atomic<std::size_t>                     nReleased{0UZ}; // never released: the sub-scheduler's graph stalls
+        qa_sched::ParentOfReleasedSubScheduler       parent = qa_sched::makeParentOfReleasedSubScheduler(nReleased);
+        qa_sched::WakeProbe<qa_sched::TestScheduler> scheduler({{"watchdog_timeout", gr::Size_t(10)}, {"timeout_inactivity_count", gr::Size_t(kStalledPeriods)}});
+        gr::MsgPortIn                                fromScheduler;
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+        expect(scheduler.exchange(std::move(parent.flow)).has_value());
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(qa_sched::awaitCondition([&parent] { return parent.finiteSink->state() == STOPPED; })) << "the parent's own chain must end";
+
+        qa_sched::StallReports reports{.serviceName = std::string(scheduler.unique_name)};
+        expect(qa_sched::awaitCondition([&reports, &fromScheduler] { return (reports.take(fromScheduler), reports.count >= 1UZ); })) << "the stall of the sub-scheduler's graph produced no report";
+        expect(eq(reports.lastPeriods, kStalledPeriods)) << "the report names the stalled periods";
+        expect(scheduler.state() == RUNNING) << "the sub-scheduler must keep the parent's run going";
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_sched::awaitState(scheduler, STOPPED)) << "the parent did not stop";
+        parent.inner->stop();
     };
 };
 
@@ -4998,6 +5284,75 @@ const boost::ut::suite<"a stop requested while exchange() stops a running graph"
             expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
         }
         expect(qa_sched::awaitState(scheduler, STOPPED));
+    };
+};
+
+const boost::ut::suite<"a sub-scheduler whose graph is swapped while it runs"> subSchedulerSwapTests = [] {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    // the parent's graph holds a multi-threaded sub-scheduler alone. A thread outside both schedulers swaps the
+    // sub-scheduler's graph. The old graph's stop() hook holds the swap after the sub-scheduler's workers have left. The
+    // source of the new graph fails at once
+    "a sub-scheduler whose graph another thread swaps keeps its parent's run going until it fails"_test = [] {
+        std::atomic<bool> stopEntered{false};
+        std::atomic<bool> stopReleased{false};
+
+        gr::Graph oldFlow;
+        auto&     held    = oldFlow.emplaceBlock<qa_sched::HeldStopSource>();
+        auto&     oldSink = oldFlow.emplaceBlock<qa_sched::CountingSink>();
+        expect(oldFlow.connect<"out", "in">(held, oldSink).has_value());
+        held._entered  = &stopEntered;
+        held._released = &stopReleased;
+
+        const std::atomic<bool> failureGate{true};
+        gr::Graph               newFlow;
+        auto&                   failingSource = newFlow.emplaceBlock<qa_sched::GatedFailingSource>();
+        auto&                   newSink       = newFlow.emplaceBlock<qa_sched::CountingSink>();
+        expect(newFlow.connect<"out", "in">(failingSource, newSink).has_value());
+        failingSource._gate = &failureGate;
+        const std::string failingName(failingSource.unique_name);
+
+        auto inner = std::make_shared<qa_sched::CountedSchedulerWrapper<qa_sched::TestScheduler>>();
+        inner->setGraph(std::move(oldFlow));
+
+        gr::Graph                             flow;
+        const std::shared_ptr<gr::BlockModel> innerBlock = flow.addBlock(gr::SchedulerModel::asBlockModelPtr(inner));
+        const std::string                     innerName(innerBlock->uniqueName());
+
+        qa_sched::TestScheduler scheduler;
+        gr::MsgPortIn           fromScheduler;
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+        expect(scheduler.exchange(std::move(flow)).has_value());
+
+        const auto                     nCalls = [&inner] { return inner->_nReturnedWorkCalls.load(std::memory_order_acquire); };
+        std::atomic<bool>              swapSucceeded{false};
+        bool                           calledDuringSwap = false;
+        std::thread                    swapper;
+        std::expected<void, gr::Error> result;
+        const bool                     ended = qa_sched::runAndWaitWithin(
+            scheduler, qa_sched::kEventBound,
+            [&] {
+                expect(qa_sched::awaitCondition([&nCalls] { return nCalls() > 0UZ; })) << "the parent must call the sub-scheduler";
+                swapper = std::thread([&inner, &newFlow, &swapSucceeded] { swapSucceeded.store(inner->blockRef().exchange(std::move(newFlow)).has_value()); });
+                expect(qa_sched::awaitCondition([&stopEntered] { return stopEntered.load(); })) << "the swap must stop the sub-scheduler's run";
+                expect(qa_sched::awaitCondition([&inner] { return !inner->blockRef().isProcessing(); })) << "the sub-scheduler's workers must leave for the swap";
+                // a parent worker that reads the run as ended returns from at most two more calls: one that began
+                // before the workers left, and the call that reports the end
+                const std::size_t nCallsBefore = nCalls();
+                std::ignore                    = qa_sched::awaitCondition([&] { return nCalls() >= nCallsBefore + 3UZ || scheduler.state() != RUNNING; });
+                calledDuringSwap               = scheduler.state() == RUNNING && nCalls() >= nCallsBefore + 3UZ;
+                stopReleased.store(true);
+                stopReleased.notify_all();
+            },
+            &result);
+        if (swapper.joinable()) {
+            swapper.join();
+        }
+        expect(calledDuringSwap) << "the parent must keep calling the sub-scheduler while its graph is swapped";
+        expect(swapSucceeded.load()) << "the swap failed";
+        qa_sched::expectFailedBySubScheduler(scheduler, ended, result, innerName, failingName, inner->blockRef().state());
+        inner->stop();
     };
 };
 
