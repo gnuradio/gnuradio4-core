@@ -1088,28 +1088,30 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
 };
 
 namespace qa_edit {
-// records the size of each allocation made through it while it is the default resource
+// records the size and alignment of each allocation made through it while it is the default resource
 struct SizeRecordingResource : std::pmr::memory_resource {
-    std::vector<std::size_t>   sizes;
-    std::pmr::memory_resource* previous = std::pmr::set_default_resource(this);
+    std::vector<std::pair<std::size_t, std::size_t>> allocations; // bytes, alignment
+    std::pmr::memory_resource*                       previous = std::pmr::set_default_resource(this);
 
-    SizeRecordingResource() { sizes.reserve(1024UZ); }
+    SizeRecordingResource() { allocations.reserve(1024UZ); }
     ~SizeRecordingResource() override { restore(); }
 
     void restore() { std::pmr::set_default_resource(previous); }
 
     void* do_allocate(std::size_t bytes, std::size_t alignment) override {
-        sizes.push_back(bytes);
+        allocations.emplace_back(bytes, alignment);
         return std::pmr::new_delete_resource()->allocate(bytes, alignment);
     }
     void do_deallocate(void* pointer, std::size_t bytes, std::size_t alignment) override { std::pmr::new_delete_resource()->deallocate(pointer, bytes, alignment); }
     bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override { return this == &other; }
 
-    // the heap rings a port of the default size holds: the message ring and the tag ring of either direction
+    // the heap rings a port of the default size holds: the message ring and the tag ring of either direction.
+    // Each ring is matched on its byte size and on its element's alignment, which the allocator passes. Size alone is
+    // not enough: under libc++ a default tag ring has the byte size of a heap float ring of 65536 samples.
     [[nodiscard]] std::size_t nDefaultRings() const {
-        constexpr std::size_t kSlots       = gr::MsgPortOut::kDefaultBufferSize;
-        const std::size_t     ringSizes[3] = {2UZ * kSlots * sizeof(gr::Message), 2UZ * kSlots * sizeof(gr::Tag), 2UZ * (kSlots + 1UZ) * sizeof(gr::Tag)};
-        return static_cast<std::size_t>(std::ranges::count_if(sizes, [&ringSizes](std::size_t size) { return std::ranges::find(ringSizes, size) != std::ranges::end(ringSizes); }));
+        constexpr std::size_t                     kSlots   = gr::MsgPortOut::kDefaultBufferSize;
+        const std::pair<std::size_t, std::size_t> rings[3] = {{2UZ * kSlots * sizeof(gr::Message), alignof(gr::Message)}, {2UZ * kSlots * sizeof(gr::Tag), alignof(gr::Tag)}, {2UZ * (kSlots + 1UZ) * sizeof(gr::Tag), alignof(gr::Tag)}};
+        return static_cast<std::size_t>(std::ranges::count_if(allocations, [&rings](const std::pair<std::size_t, std::size_t>& allocation) { return std::ranges::find(rings, allocation) != std::ranges::end(rings); }));
     }
 };
 } // namespace qa_edit
