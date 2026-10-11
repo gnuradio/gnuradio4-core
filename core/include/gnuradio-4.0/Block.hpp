@@ -1053,6 +1053,9 @@ public:
         _initError.reset();
         try {
             auto applyResult = settings().applyStagedParameters();
+            if (!applyResult.failedParameters.empty()) {
+                throw gr::exception(applyResult.refusal);
+            }
             if (!applyResult.appliedParameters.empty()) {
                 notifyListeners(block::property::kSetting, settings().get());
             }
@@ -1638,8 +1641,12 @@ public:
                 notifyListeners(block::property::kStagedSetting, appliedParametersMap);
             }
             notifyListeners(block::property::kSetting, settings().get());
-            if (!applyResult.failedParameters.empty()) {
-                emitMessage("applyChangedSettings() - rejected settings", applyResult.failedParameters);
+            if (!applyResult.untaggedRefusal.empty()) {
+                emitErrorMessage("applyChangedSettings() - rejected settings", applyResult.untaggedRefusal);
+            }
+            // a tag carries keys from any block upstream. The block reports a tag value it refuses in a plain message
+            if (!applyResult.tagRefusal.empty()) {
+                emitMessage("applyChangedSettings() - rejected settings", {{"error", applyResult.tagRefusal}});
             }
         });
 

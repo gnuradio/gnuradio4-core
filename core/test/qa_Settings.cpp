@@ -18,6 +18,7 @@
 #include <vector>
 
 #include <gnuradio-4.0/Block.hpp>
+#include <gnuradio-4.0/BlockMerging.hpp>
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/PmtTypeHelpers.hpp>
 #include <gnuradio-4.0/Scheduler.hpp>
@@ -1056,6 +1057,76 @@ struct LimitedGain : Block<LimitedGain> {
     [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
 };
 
+/// a gain the block takes between -1 and 1
+struct SignedGain : Block<SignedGain> {
+    PortIn<float>  in{};
+    PortOut<float> out{};
+
+    Annotated<float, "gain", Limits<-1.f, 1.f>> gain = 0.5f;
+
+    GR_MAKE_REFLECTABLE(SignedGain, in, out, gain);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
+};
+
+/// a gain whose default lies outside its limits, beside an offset without limits
+struct OutOfLimitsDefault : Block<OutOfLimitsDefault> {
+    PortIn<float>  in{};
+    PortOut<float> out{};
+
+    Annotated<float, "gain", Limits<0.f, 1.f>> gain   = 2.f;
+    float                                      offset = 0.f;
+
+    GR_MAKE_REFLECTABLE(OutOfLimitsDefault, in, out, gain, offset);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain + offset; }
+};
+
+/// a gain whose default lies outside its limits, with a reset() that counts its calls
+struct CountingReset : Block<CountingReset> {
+    PortIn<float>  in{};
+    PortOut<float> out{};
+
+    Annotated<float, "gain", Limits<0.f, 1.f>> gain = 2.f;
+
+    GR_MAKE_REFLECTABLE(CountingReset, in, out, gain);
+
+    std::size_t resets = 0;
+
+    void reset() { ++resets; }
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
+};
+
+/// a gain whose default lies inside its limits, with a reset() that counts its calls
+struct CountingResetWithinLimits : Block<CountingResetWithinLimits> {
+    PortIn<float>  in{};
+    PortOut<float> out{};
+
+    Annotated<float, "gain", Limits<0.f, 1.f>> gain = 0.5f;
+
+    GR_MAKE_REFLECTABLE(CountingResetWithinLimits, in, out, gain);
+
+    std::size_t resets = 0;
+
+    void reset() { ++resets; }
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
+};
+
+/// settings that put the reset key into the staged batch
+template<typename TBlock>
+struct ResetStagingSettings : CtxSettings<TBlock> {
+    using CtxSettings<TBlock>::CtxSettings;
+    using CtxSettings<TBlock>::_stagedParameters;
+    using CtxSettings<TBlock>::setChanged;
+
+    void stageResetDefaults() {
+        _stagedParameters.insert_or_assign(static_cast<std::pmr::string>(gr::tag::RESET_DEFAULTS), true);
+        setChanged(true);
+    }
+};
+
 [[nodiscard]] std::string setRefusal(SettingsBase& settings, const property_map& parameters, SettingsCtx ctx = {}) {
     try {
         std::ignore = settings.set(parameters, ctx);
@@ -1063,6 +1134,133 @@ struct LimitedGain : Block<LimitedGain> {
         return e.message;
     }
     return {};
+}
+
+/// a gain between 0 and 1 beside an offset between -1 and 1
+struct LimitedGainAndOffset : Block<LimitedGainAndOffset> {
+    PortIn<float>  in{};
+    PortOut<float> out{};
+
+    Annotated<float, "gain", Limits<0.f, 1.f>>    gain   = 0.5f;
+    Annotated<float, "offset", Limits<-1.f, 1.f>> offset = 0.f;
+
+    GR_MAKE_REFLECTABLE(LimitedGainAndOffset, in, out, gain, offset);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain + offset; }
+};
+
+/// publishes a fixed number of samples and puts `tag`, when it is not empty, on the first
+struct FiniteTagSource : Block<FiniteTagSource> {
+    PortOut<float> out{};
+
+    GR_MAKE_REFLECTABLE(FiniteTagSource, out);
+
+    property_map tag{};
+    std::size_t  nSamples = 1000UZ;
+    std::size_t  nEmitted = 0UZ;
+
+    work::Status processBulk(OutputSpanLike auto& outSpan) {
+        const std::size_t n = std::min(outSpan.size(), nSamples - nEmitted);
+        std::fill_n(outSpan.begin(), n, 1.0f);
+        if (nEmitted == 0UZ && n > 0UZ && !tag.empty()) {
+            outSpan.publishTag(tag, 0UZ);
+        }
+        nEmitted += n;
+        outSpan.publish(n);
+        return nEmitted == nSamples ? work::Status::DONE : work::Status::OK;
+    }
+};
+
+/// declares no tag policy and passes its input on
+struct UndeclaredPass : Block<UndeclaredPass> {
+    PortIn<float>  in{};
+    PortOut<float> out{};
+
+    GR_MAKE_REFLECTABLE(UndeclaredPass, in, out);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
+};
+
+/// a gain between 0 and 1 on a sink that counts its samples
+struct LimitedSink : Block<LimitedSink> {
+    PortIn<float> in{};
+
+    Annotated<float, "gain", Limits<0.f, 1.f>> gain = 0.5f;
+
+    GR_MAKE_REFLECTABLE(LimitedSink, in, gain);
+
+    std::size_t nReceived = 0UZ;
+
+    work::Status processBulk(std::span<const float> input) {
+        nReceived += input.size();
+        return work::Status::OK;
+    }
+};
+
+constexpr std::string_view kRejectedSettings = "applyChangedSettings() - rejected settings";
+
+/// the refusals a port received, the plain messages apart from the errors
+struct ReportedRefusals {
+    std::string plain;
+    std::string errors;
+};
+
+[[nodiscard]] ReportedRefusals readRefusals(gr::MsgPortIn& port) {
+    ReportedRefusals    reported;
+    ReaderSpanLike auto messages = port.streamReader().get<SpanReleasePolicy::ProcessAll>();
+    for (const gr::Message& message : messages) {
+        if (!message.data.has_value()) {
+            reported.errors += message.data.error().message;
+        } else if (message.endpoint == kRejectedSettings) {
+            const auto error = message.data->find("error");
+            reported.plain += error == message.data->end() ? std::string() : error->second.value_or(std::string());
+        }
+    }
+    std::ignore = messages.consume(messages.size());
+    return reported;
+}
+
+struct LimitedSinkRun {
+    std::expected<void, gr::Error> result;
+    float                          gain      = 0.f;
+    std::size_t                    nReceived = 0UZ;
+    std::size_t                    nSent     = 0UZ;
+    ReportedRefusals               reported{};
+};
+
+/// runs a source that tags its first sample with `tag` through a block that declares no tag policy into a LimitedSink.
+/// A Set message carries `set` to the sink when it is not empty. A reader takes the scheduler's messages when
+/// `readMessages` is true. With no reader a block's error ends the run.
+[[nodiscard]] LimitedSinkRun runIntoLimitedSink(const property_map& tag, const property_map& set, bool readMessages) {
+    using namespace boost::ut;
+    gr::Graph flow;
+    auto&     source = flow.emplaceBlock<FiniteTagSource>();
+    auto&     pass   = flow.emplaceBlock<UndeclaredPass>();
+    auto&     sink   = flow.emplaceBlock<LimitedSink>({{"name", std::string("limited_sink")}});
+    source.tag       = tag;
+    expect(flow.connect<"out", "in">(source, pass).has_value());
+    expect(flow.connect<"out", "in">(pass, sink).has_value());
+
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler;
+    gr::MsgPortOut                                                        toScheduler;
+    gr::MsgPortIn                                                         fromScheduler;
+    expect(toScheduler.connect(scheduler.msgIn).has_value());
+    if (readMessages) {
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+    }
+    if (!set.empty()) {
+        gr::sendMessage<gr::message::Command::Set>(toScheduler, sink.unique_name, gr::block::property::kSetting, set);
+    }
+    expect(scheduler.exchange(std::move(flow)).has_value());
+
+    LimitedSinkRun run{.result = scheduler.runAndWait()};
+    run.gain      = sink.gain.value;
+    run.nReceived = sink.nReceived;
+    run.nSent     = source.nSamples;
+    if (readMessages) {
+        run.reported = readRefusals(fromScheduler);
+    }
+    return run;
 }
 
 } // namespace qa_refusals
@@ -1122,6 +1320,215 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
         expect(refusal.contains("block 'stage'")) << "the refusal names the block by the name the map gives" << refusal;
         expect(refusal.contains("[0, 1]")) << refusal;
         expect(flow.blocks().empty()) << "the refused block is in the graph";
+    };
+
+    "a block whose staged initial value is refused fails its init with the refusal"_test = [] {
+        LimitedGain block{property_map{{"name", std::string("gain_stage")}}};
+        std::ignore = block.settings().setStaged({{"gain", 2.0f}});
+        block.init(std::make_shared<gr::Sequence>());
+
+        expect(block.state() == lifecycle::State::ERROR) << "the block reads initialized";
+        expect(fatal(block._initError.has_value())) << "the block keeps no init error";
+        expect(block._initError->message.contains("block 'gain_stage'")) << block._initError->message;
+        expect(block._initError->message.contains("[0, 1]")) << block._initError->message;
+    };
+
+    "a staged value refused at the apply reaches the message output with the refusal"_test = [] {
+        LimitedGain   block{property_map{{"name", std::string("gain_stage")}}};
+        gr::MsgPortIn fromBlock;
+        expect(block.msgOut.connect(fromBlock).has_value());
+        block.init(std::make_shared<gr::Sequence>());
+
+        std::ignore = block.settings().setStaged({{"gain", 2.0f}});
+        block.applyChangedSettings();
+
+        std::string         reported;
+        ReaderSpanLike auto messages = fromBlock.streamReader().get<SpanReleasePolicy::ProcessAll>();
+        for (const gr::Message& message : messages) {
+            if (!message.data.has_value()) {
+                reported += message.data.error().message;
+            }
+        }
+        std::ignore = messages.consume(messages.size());
+        expect(reported.contains("block 'gain_stage'")) << reported;
+        expect(reported.contains("gain = 2")) << reported;
+        expect(reported.contains("[0, 1]")) << reported;
+        expect(eq(block.gain.value, 0.5f)) << "the refused value does not reach the member";
+    };
+
+    "a tag value the limits refuse is reported in a plain message, and the run completes"_test = [] {
+        const property_map tag{{"gain", 2.0f}};
+
+        const LimitedSinkRun unread = runIntoLimitedSink(tag, {}, false);
+        expect(unread.result.has_value()) << "the refused tag value ends the run: " << (unread.result.has_value() ? std::string() : unread.result.error().message);
+        expect(eq(unread.gain, 0.5f)) << "the refused value reaches the member";
+        expect(eq(unread.nReceived, unread.nSent)) << "the sink misses samples";
+
+        const LimitedSinkRun read = runIntoLimitedSink(tag, {}, true);
+        expect(read.result.has_value());
+        expect(read.reported.plain.contains("block 'limited_sink' refuses gain = 2")) << "no plain message names the refusal, got: " << read.reported.plain;
+        expect(read.reported.plain.contains("[0, 1]")) << read.reported.plain;
+        expect(read.reported.errors.empty()) << "the refused tag value is reported as an error: " << read.reported.errors;
+    };
+
+    "a value a Set message stages and the limits refuse ends the run in the error"_test = [] {
+        const LimitedSinkRun run = runIntoLimitedSink({}, {{"gain", 2.0f}}, false);
+        expect(fatal(!run.result.has_value())) << "the run completes past the refused value";
+        expect(run.result.error().message.contains(kRejectedSettings)) << run.result.error().message;
+        expect(run.result.error().message.contains("block 'limited_sink' refuses gain = 2")) << run.result.error().message;
+        expect(eq(run.gain, 0.5f)) << "the refused value reaches the member";
+    };
+
+    "a batch with a tag value and a staged value the limits refuse reports each refusal by where it came from"_test = [] {
+        LimitedGainAndOffset block{property_map{{"name", std::string("pair_stage")}}};
+        gr::MsgPortIn        fromBlock;
+        expect(block.msgOut.connect(fromBlock).has_value());
+        block.init(std::make_shared<gr::Sequence>());
+
+        block.settings().autoUpdate(Tag{0UZ, property_map{{"gain", 2.0f}}});
+        std::ignore = block.settings().setStaged({{"offset", 5.0f}});
+        block.applyChangedSettings();
+
+        const ReportedRefusals reported = readRefusals(fromBlock);
+        expect(reported.errors.contains("block 'pair_stage' refuses offset = 5")) << "the error does not name the staged value, got: " << reported.errors;
+        expect(!reported.errors.contains("gain =")) << "the error names the tag value: " << reported.errors;
+        expect(reported.plain.contains("block 'pair_stage' refuses gain = 2")) << "the plain message does not name the tag value, got: " << reported.plain;
+        expect(!reported.plain.contains("offset =")) << "the plain message names the staged value: " << reported.plain;
+        expect(eq(block.gain.value, 0.5f) && eq(block.offset.value, 0.f)) << "a refused value reaches its member";
+    };
+
+    "a key a tag and setStaged() both stage is reported by the later of the two"_test = [] {
+        LimitedGain   block{property_map{{"name", std::string("gain_stage")}}};
+        gr::MsgPortIn fromBlock;
+        expect(block.msgOut.connect(fromBlock).has_value());
+        block.init(std::make_shared<gr::Sequence>());
+
+        block.settings().autoUpdate(Tag{0UZ, property_map{{"gain", 2.0f}}});
+        std::ignore = block.settings().setStaged({{"gain", 3.0f}});
+        block.applyChangedSettings();
+        const ReportedRefusals stagedLast = readRefusals(fromBlock);
+        expect(stagedLast.errors.contains("refuses gain = 3")) << stagedLast.errors;
+        expect(stagedLast.plain.empty()) << "a value setStaged() replaced is reported as a tag value: " << stagedLast.plain;
+
+        std::ignore = block.settings().setStaged({{"gain", 3.0f}});
+        block.settings().autoUpdate(Tag{0UZ, property_map{{"gain", 2.0f}}});
+        block.applyChangedSettings();
+        const ReportedRefusals taggedLast = readRefusals(fromBlock);
+        expect(taggedLast.plain.contains("refuses gain = 2")) << taggedLast.plain;
+        expect(taggedLast.errors.empty()) << "a value a tag replaced is reported as an error: " << taggedLast.errors;
+    };
+
+    "a scheduler constructed with an undeclared key is refused naming the nearest key"_test = [] {
+        std::string refusal;
+        try {
+            gr::scheduler::Simple<> scheduler({{"timeout_mss", gr::Size_t(5)}});
+        } catch (const gr::exception& e) {
+            refusal = e.message;
+        }
+        expect(refusal.contains("declares no setting named 'timeout_mss'")) << refusal;
+        expect(refusal.contains("'timeout_ms'")) << "the nearest key is offered" << refusal;
+    };
+
+    "a merged block given a value both its blocks refuse names both refusals"_test = [] {
+        std::string refusal;
+        try {
+            gr::Merge<LimitedGain, "out", SignedGain, "in"> merged{property_map{{"gain", 2.0f}}};
+        } catch (const gr::exception& e) {
+            refusal = e.message;
+        }
+        expect(refusal.contains("[0, 1]")) << "the first block's refusal is missing: " << refusal;
+        expect(refusal.contains("[-1, 1]")) << "the second block's refusal is missing: " << refusal;
+    };
+
+    "a merged block given a value its blocks cannot convert names every block that refuses it"_test = [] {
+        std::string refusal;
+        try {
+            gr::Merge<LimitedGain, "out", SignedGain, "in"> merged{property_map{{"gain", std::string("x")}}};
+        } catch (const gr::exception& e) {
+            refusal = e.message;
+        }
+        expect(refusal.contains("LimitedGain' refuses gain = ")) << "the first block's refusal is missing: " << refusal;
+        expect(refusal.contains("SignedGain' refuses gain = ")) << "the second block's refusal is missing: " << refusal;
+        expect(refusal.contains("the value does not convert to the setting's type")) << "the refusal gives another reason: " << refusal;
+    };
+
+    "a merged block given a name tells its blocks apart in a limits refusal"_test = [] {
+        std::string refusal;
+        try {
+            gr::Merge<LimitedGain, "out", SignedGain, "in"> merged{property_map{{"name", std::string("m")}, {"gain", 2.0f}}};
+        } catch (const gr::exception& e) {
+            refusal = e.message;
+        }
+        expect(refusal.contains("LimitedGain: block 'm' refuses gain = 2")) << "the first block's refusal is missing: " << refusal;
+        expect(refusal.contains("SignedGain: block 'm' refuses gain = 2")) << "the second block's refusal is missing: " << refusal;
+    };
+
+    "a merged block given a name tells its blocks apart in a conversion refusal"_test = [] {
+        std::string refusal;
+        try {
+            gr::Merge<LimitedGain, "out", SignedGain, "in"> merged{property_map{{"name", std::string("m")}, {"gain", std::string("x")}}};
+        } catch (const gr::exception& e) {
+            refusal = e.message;
+        }
+        expect(refusal.contains("LimitedGain: block 'm' refuses gain = ")) << "the first block's refusal is missing: " << refusal;
+        expect(refusal.contains("SignedGain: block 'm' refuses gain = ")) << "the second block's refusal is missing: " << refusal;
+    };
+
+    "a staged reset calls the block's reset() once"_test = [] {
+        CountingResetWithinLimits                       block{property_map{{"name", std::string("gain_stage")}}};
+        ResetStagingSettings<CountingResetWithinLimits> settings{block};
+        settings.init();
+        std::ignore = settings.set({{"gain", 0.25f}});
+        expect(settings.activateContext().has_value());
+        std::ignore = settings.applyStagedParameters();
+        expect(eq(block.gain.value, 0.25f)) << "the value to reset does not reach the member";
+
+        const std::size_t resetsBefore = block.resets;
+        settings.stageResetDefaults();
+        const ApplyStagedParametersResult result = settings.applyStagedParameters();
+        expect(result.refusal.empty()) << result.refusal;
+        expect(eq(block.gain.value, 0.5f)) << "the reset leaves the member off its default";
+        expect(eq(block.resets, resetsBefore + 1UZ)) << "the staged reset calls reset() a number of times other than once";
+
+        settings.resetDefaults();
+        expect(eq(block.resets, resetsBefore + 2UZ)) << "resetDefaults() calls reset() a number of times other than once";
+    };
+
+    "a staged reset the limits refuse leaves the block's reset() uncalled"_test = [] {
+        CountingReset                       block{property_map{{"name", std::string("gain_stage")}}};
+        ResetStagingSettings<CountingReset> settings{block};
+        settings.init();
+        std::ignore = settings.set({{"gain", 0.5f}});
+        expect(settings.activateContext().has_value());
+        std::ignore = settings.applyStagedParameters();
+        expect(eq(block.gain.value, 0.5f)) << "the value to reset does not reach the member";
+
+        const std::size_t resetsBefore = block.resets;
+        settings.stageResetDefaults();
+        const ApplyStagedParametersResult result = settings.applyStagedParameters();
+        expect(result.refusal.contains("refuses gain = 2")) << result.refusal;
+        expect(eq(block.resets, resetsBefore)) << "the refused reset calls reset()";
+        expect(eq(block.gain.value, 0.5f)) << "the refused default reaches the member";
+    };
+
+    "a reset to a default the limits refuse throws and leaves every setting as it was"_test = [] {
+        OutOfLimitsDefault block{property_map{{"name", std::string("gain_stage")}}};
+        block.init(std::make_shared<gr::Sequence>());
+        std::ignore = block.settings().set({{"gain", 0.5f}, {"offset", 3.0f}});
+        expect(block.settings().activateContext().has_value());
+        std::ignore = block.settings().applyStagedParameters();
+        expect(eq(block.gain.value, 0.5f) && eq(block.offset, 3.0f)) << "the values to reset do not reach the members";
+
+        std::string refusal;
+        try {
+            block.settings().resetDefaults();
+        } catch (const gr::exception& e) {
+            refusal = e.message;
+        }
+        expect(refusal.contains("block 'gain_stage' refuses gain = 2")) << refusal;
+        expect(refusal.contains("[0, 1]")) << refusal;
+        expect(eq(block.gain.value, 0.5f)) << "the refused default reaches the member";
+        expect(eq(block.offset, 3.0f)) << "the reset applies the other defaults";
     };
 };
 

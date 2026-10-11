@@ -5,6 +5,7 @@
 #include <chrono>
 #include <concepts>
 #include <format>
+#include <functional>
 #include <initializer_list>
 #include <mutex>
 #include <optional>
@@ -82,6 +83,9 @@ struct ApplyStagedParametersResult {
     property_map forwardParameters; // parameters that should be forwarded to dependent child blocks
     property_map appliedParameters;
     property_map failedParameters; // staged values the block's setter rejected -- neither applied nor forwarded
+    std::string  refusal;          // the block, the key, the value and the reason of each failed parameter; empty when none failed
+    std::string  tagRefusal;       // the part of `refusal` whose values a tag staged
+    std::string  untaggedRefusal;  // the rest of `refusal`: values setStaged(), a context or a reset staged
 };
 
 namespace detail {
@@ -395,8 +399,6 @@ template<typename Type>
 
 // the type-independent tail of the apply path, compiled once in Settings.cpp
 [[nodiscard]] bool recordAppliedValue(std::string_view key, const pmt::Value& stagedValue, property_map& appliedParameters, property_map& stagedForCallback, bool hasSettingsChangedCallback);
-void               reportValidationFailure(std::string_view key, const pmt::Value& value);
-void               reportConversionFailure(std::string_view key, std::string_view error);
 
 /**
  * @brief One reflected member of a block, as the compiled settings machinery sees it.
@@ -501,11 +503,9 @@ bool applyStagedMember(void* memberPointer, std::string_view key, const pmt::Val
         if (maybeValue && member.validate_and_set(*maybeValue)) {
             return settings::recordAppliedValue(key, stagedValue, appliedParameters, stagedForCallback, hasSettingsChangedCallback);
         }
-        settings::reportValidationFailure(key, stagedValue);
         return false;
     } else {
         if (!maybeValue) {
-            settings::reportConversionFailure(key, maybeValue.error());
             return false;
         }
         member = *maybeValue;
@@ -890,6 +890,7 @@ protected:
     SettingsCtx                                                                      _activeCtx{};
     bool                                                                             _contextActivated{false}; ///< set when `_activeCtx.context` moved, consumed by the next apply
     property_map                                                                     _stagedParameters{};
+    std::set<std::string, std::less<>>                                               _taggedKeys{}; ///< the keys of `_stagedParameters` whose value a tag staged last
     property_map                                                                     _activeParameters{};
 
     const std::size_t _timePrecisionTolerance = 100; // ns, now used for emscripten
@@ -963,7 +964,12 @@ protected:
     // a refusal names the block by `blockName`, or by its own name when that is empty
     [[nodiscard]] property_map setImpl(const property_map& parameters, SettingsCtx ctx, std::string_view blockName = {});
     [[nodiscard]] property_map setStagedImpl(const property_map& parameters);
-    void                       resetDefaultsImpl();
+    struct ResetDefaultsResult {
+        property_map failedParameters; // the defaults the limits or the members refuse
+        bool         refused = false;  // the limits refused a default, and nothing was stored or applied
+    };
+    // checks the defaults against their limits, then stores and applies them. The caller runs the block's reset() once, after its whole change is applied
+    [[nodiscard]] ResetDefaultsResult resetDefaultsImpl();
     // reentrantLock is null when a caller already holds _mutex and cannot have it released underneath it
     [[nodiscard]] ApplyStagedParametersResult          applyStagedParametersImpl(std::unique_lock<std::mutex>* reentrantLock = nullptr);
     void                                               updateActiveParametersImpl() noexcept;
@@ -982,6 +988,7 @@ protected:
     [[nodiscard]] std::optional<std::uint64_t>         triggeredTimeInTag(const Tag& tag) const;
     [[nodiscard]] std::optional<SettingsCtx>           createSettingsCtxFromTag(const Tag& tag) const;
     [[nodiscard]] std::string                          describeRefusal(std::string_view key, const pmt::Value& value, std::string_view blockName = {}) const;
+    [[nodiscard]] std::string                          describeRefusals(const property_map& refused) const;
 }; // class CtxSettingsBase
 
 /**

@@ -440,11 +440,7 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
             // settings here.
             const ApplyStagedParametersResult applied = currentBlock->settings().applyStagedParameters();
             if (!applied.failedParameters.empty()) {
-                std::string rejected;
-                for (const auto& [key, value] : applied.failedParameters) {
-                    rejected += std::format("{}'{}'", rejected.empty() ? "" : ", ", std::string_view(key.data(), key.size()));
-                }
-                throw gr::exception(std::format("Unable to create block '{}' of type '{}': the scheduler rejects the settings {}", blockName, *schedulerId, rejected));
+                throw gr::exception(std::format("Unable to create block '{}' of type '{}': {}", blockName, *schedulerId, applied.refusal));
             }
         }
         restoreMetaInformation(*currentBlock);

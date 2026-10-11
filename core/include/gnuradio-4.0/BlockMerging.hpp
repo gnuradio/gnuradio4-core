@@ -91,13 +91,47 @@ struct to_forward_descriptor : TDesc {
     }
 };
 
+/// Applies the keys of `params` the block declares. Returns the refusals, empty when the block takes every value.
+/// Each key is staged alone. A value that does not convert leaves the block's other keys staged and applied. Every
+/// refusal names the block by the name it holds after the apply. The block's type leads its refusals when that name
+/// differs from the type's name.
 template<typename B>
-void forwardSettings(B& block, const gr::property_map& params) {
+[[nodiscard]] std::string applyForwardedSettings(B& block, const gr::property_map& params) {
+    std::string refusals;
     if constexpr (refl::reflectable<std::remove_cvref_t<B>>) {
-        if (!params.empty()) {
-            std::ignore = block.settings().setStaged(params);
-            std::ignore = block.settings().applyStagedParameters();
+        if (params.empty()) {
+            return refusals;
         }
+        gr::property_map unconverted;
+        for (const auto& [key, value] : params) {
+            try {
+                std::ignore = block.settings().setStaged(gr::property_map{{key, value}});
+            } catch (const gr::exception&) {
+                unconverted.insert_or_assign(key, value);
+            }
+        }
+        refusals = block.settings().applyStagedParameters().refusal;
+        for (const auto& [key, value] : unconverted) {
+            refusals += std::format("{}block '{}' refuses {} = {}: the value does not convert to the setting's type", refusals.empty() ? "" : "; ", block.name.value, key, value);
+        }
+        if (const std::string typeName = gr::meta::type_name<std::remove_cvref_t<B>>(); !refusals.empty() && block.name.value != typeName) {
+            refusals = std::format("{}: {}", typeName, refusals);
+        }
+    }
+    return refusals;
+}
+
+/// Forwards the shared map to every merged block, then throws once with the refusals of all of them.
+template<typename... Bs>
+void forwardSettings(const gr::property_map& params, Bs&... blocks) {
+    std::string refusals;
+    for (const std::string& refusal : {applyForwardedSettings(blocks, params)...}) {
+        if (!refusal.empty()) {
+            refusals += std::format("{}{}", refusals.empty() ? "" : "; ", refusal);
+        }
+    }
+    if (!refusals.empty()) {
+        throw gr::exception(refusals);
     }
 }
 
@@ -105,7 +139,7 @@ template<typename B>
 void forwardNestedSettings(B& block, const gr::property_map& init, std::string_view key) {
     if (auto it = init.find(key); it != init.end()) {
         if (const auto* nested = it->second.template get_if<pmt::Value::Map>()) {
-            forwardSettings(block, *nested);
+            forwardSettings(*nested, block);
         }
     }
 }
@@ -249,8 +283,7 @@ private:
 public:
     constexpr MergeByIndex(Left&& l, Right&& r) : _leftBlock(std::move(l)), _rightBlock(std::move(r)) {}
     explicit constexpr MergeByIndex(gr::property_map init = {}) {
-        detail::forwardSettings(_leftBlock, init);
-        detail::forwardSettings(_rightBlock, init);
+        detail::forwardSettings(init, _leftBlock, _rightBlock);
         detail::forwardNestedSettings(_leftBlock, init, "leftBlock");
         detail::forwardNestedSettings(_rightBlock, init, "rightBlock");
     }
@@ -264,10 +297,7 @@ public:
         }
     }
 
-    void settingsChanged(const gr::property_map& /*oldSettings*/, const gr::property_map& newSettings) {
-        detail::forwardSettings(_leftBlock, newSettings);
-        detail::forwardSettings(_rightBlock, newSettings);
-    }
+    void settingsChanged(const gr::property_map& /*oldSettings*/, const gr::property_map& newSettings) { detail::forwardSettings(newSettings, _leftBlock, _rightBlock); }
 
     template<meta::any_simd... Ts>
     requires traits::block::can_processOne_simd<Left> and traits::block::can_processOne_simd<Right>
@@ -473,7 +503,7 @@ struct SplitMergeCombine<Paths...> : detail::MergedBlockBase<SplitMergeCombine<P
 
     explicit constexpr SplitMergeCombine(gr::property_map init = {}) {
         [&]<std::size_t... Is>(std::index_sequence<Is...>) {
-            (detail::forwardSettings(std::get<Is>(_paths), init), ...);
+            detail::forwardSettings(init, std::get<Is>(_paths)...);
             (detail::forwardNestedSettings(std::get<Is>(_paths), init, std::format("path{}", Is)), ...);
         }(std::make_index_sequence<sizeof...(Paths)>());
     }
@@ -501,7 +531,7 @@ struct SplitMergeCombine<Paths...> : detail::MergedBlockBase<SplitMergeCombine<P
     }
 
     void settingsChanged(const gr::property_map& /*oldSettings*/, const gr::property_map& newSettings) {
-        [&]<std::size_t... Is>(std::index_sequence<Is...>) { (detail::forwardSettings(std::get<Is>(_paths), newSettings), ...); }(std::make_index_sequence<sizeof...(Paths)>());
+        [&]<std::size_t... Is>(std::index_sequence<Is...>) { detail::forwardSettings(newSettings, std::get<Is>(_paths)...); }(std::make_index_sequence<sizeof...(Paths)>());
     }
 
     [[nodiscard]] constexpr OutputType processOne(InputType x) const noexcept {
@@ -571,7 +601,7 @@ struct SplitMergeCombine<OutputSigns<Vs...>, Paths...> : detail::MergedBlockBase
 
     explicit constexpr SplitMergeCombine(gr::property_map init = {}) {
         [&]<std::size_t... Is>(std::index_sequence<Is...>) {
-            (detail::forwardSettings(std::get<Is>(_paths), init), ...);
+            detail::forwardSettings(init, std::get<Is>(_paths)...);
             (detail::forwardNestedSettings(std::get<Is>(_paths), init, std::format("path{}", Is)), ...);
         }(std::make_index_sequence<sizeof...(Paths)>());
     }
@@ -599,7 +629,7 @@ struct SplitMergeCombine<OutputSigns<Vs...>, Paths...> : detail::MergedBlockBase
     }
 
     void settingsChanged(const gr::property_map& /*oldSettings*/, const gr::property_map& newSettings) {
-        [&]<std::size_t... Is>(std::index_sequence<Is...>) { (detail::forwardSettings(std::get<Is>(_paths), newSettings), ...); }(std::make_index_sequence<sizeof...(Paths)>());
+        [&]<std::size_t... Is>(std::index_sequence<Is...>) { detail::forwardSettings(newSettings, std::get<Is>(_paths)...); }(std::make_index_sequence<sizeof...(Paths)>());
     }
 
     [[nodiscard]] constexpr OutputType processOne(InputType x) const noexcept {
@@ -676,8 +706,7 @@ public:
     constexpr FeedbackMergeBase(Forward&& fwd, Feedback&& fbk) : _forward(std::move(fwd)), _feedback(std::move(fbk)) {}
 
     explicit FeedbackMergeBase(gr::property_map init = {}) {
-        detail::forwardSettings(_forward, init);
-        detail::forwardSettings(_feedback, init);
+        detail::forwardSettings(init, _forward, _feedback);
         detail::forwardNestedSettings(_forward, init, "forward");
         detail::forwardNestedSettings(_feedback, init, "feedback");
         if constexpr (!std::is_same_v<void, Monitor>) {
@@ -685,10 +714,7 @@ public:
         }
     }
 
-    void settingsChanged(const gr::property_map& /*oldSettings*/, const gr::property_map& newSettings) {
-        detail::forwardSettings(_forward, newSettings);
-        detail::forwardSettings(_feedback, newSettings);
-    }
+    void settingsChanged(const gr::property_map& /*oldSettings*/, const gr::property_map& newSettings) { detail::forwardSettings(newSettings, _forward, _feedback); }
 
 public:
     template<typename... Ts>
