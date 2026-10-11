@@ -20,10 +20,6 @@ bool recordAppliedValue(std::string_view key, const pmt::Value& stagedValue, pro
     return true;
 }
 
-void reportValidationFailure(std::string_view key, const pmt::Value& value) { std::fputs(std::format("Failed to validate field '{}' with value '{}'.\n", key, value).c_str(), stderr); }
-
-void reportConversionFailure(std::string_view key, std::string_view error) { std::fputs(std::format("Failed to convert key '{}': {}\n", key, error).c_str(), stderr); }
-
 BlockDescriptor::BlockDescriptor(const BlockHooks& blockHooks) : hooks(blockHooks) {
     for (const MemberDescriptor& member : hooks.members) {
         if (member.setParameter != nullptr) {
@@ -304,6 +300,7 @@ void CtxSettingsBase::assignFrom(const CtxSettingsBase& other) {
     _activeCtx             = other._activeCtx;
     _contextActivated      = other._contextActivated;
     _stagedParameters      = other._stagedParameters;
+    _taggedKeys            = other._taggedKeys;
     _activeParameters      = other._activeParameters;
 }
 
@@ -319,6 +316,7 @@ void CtxSettingsBase::assignFrom(CtxSettingsBase&& other) noexcept {
     _activeCtx             = std::exchange(other._activeCtx, {});
     _contextActivated      = std::exchange(other._contextActivated, false);
     _stagedParameters      = std::move(other._stagedParameters);
+    _taggedKeys            = std::move(other._taggedKeys);
     _activeParameters      = std::move(other._activeParameters);
 }
 
@@ -630,6 +628,9 @@ property_map CtxSettingsBase::setStagedImpl(const property_map& parameters) {
                 if (auto error = it->second->setParameter(key, value, _stagedParameters)) {
                     throw gr::exception(*error);
                 }
+                if (const auto tagged = _taggedKeys.find(std::string_view(key)); tagged != _taggedKeys.end()) {
+                    _taggedKeys.erase(tagged);
+                }
             } else {
                 ret.insert_or_assign(key, value);
             }
@@ -644,25 +645,46 @@ property_map CtxSettingsBase::setStagedImpl(const property_map& parameters) {
 void CtxSettingsBase::storeDefaults() { storeCurrentParameters(_defaultParameters); }
 
 void CtxSettingsBase::resetDefaults() {
-    std::lock_guard lg(_mutex);
-    resetDefaultsImpl();
+    std::lock_guard           lg(_mutex);
+    const ResetDefaultsResult reset = resetDefaultsImpl();
+    if (_descriptor->hooks.reset != nullptr && !reset.refused) {
+        _descriptor->hooks.reset(_block);
+    }
+    if (!reset.failedParameters.empty()) {
+        throw gr::exception(describeRefusals(reset.failedParameters));
+    }
 }
 
-void CtxSettingsBase::resetDefaultsImpl() {
+CtxSettingsBase::ResetDefaultsResult CtxSettingsBase::resetDefaultsImpl() {
     // add default parameters to stored and apply the parameters
     auto ctx = SettingsCtx{settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), std::string()};
 #ifdef __EMSCRIPTEN__
     resolveDuplicateTimestamp(ctx);
 #endif
+    // the activation below stages every default when another context is active, otherwise the defaults outside the
+    // context's auto-update set. A default the limits refuse stops the reset before anything is stored or applied.
+    const bool                  otherContextActive = _activeCtx.context != ctx.context;
+    const std::set<std::string> autoUpdate         = getBestMatchAutoUpdateParameters(ctx).value_or(_descriptor->writableMembers);
+    property_map                refused;
+    for (const auto& [key, value] : _defaultParameters) {
+        const auto it = _descriptor->writableByName.find(key);
+        if (it == _descriptor->writableByName.end() || it->second->refuseByLimits == nullptr || (!otherContextActive && autoUpdate.contains(std::string(key)))) {
+            continue;
+        }
+        if (it->second->refuseByLimits(key, value).has_value()) {
+            refused.insert_or_assign(key, value);
+        }
+    }
+    if (!refused.empty()) {
+        return {.failedParameters = std::move(refused), .refused = true};
+    }
+
     addStoredParameters(_defaultParameters, ctx);
-    std::ignore = activateContextImpl({});
-    std::ignore = applyStagedParametersImpl();
+    std::ignore                          = activateContextImpl({});
+    ApplyStagedParametersResult defaults = applyStagedParametersImpl();
 
     removeExpiredStoredParameters();
-
-    if (_descriptor->hooks.reset != nullptr) {
-        _descriptor->hooks.reset(_block);
-    }
+    return {.failedParameters = std::move(defaults.failedParameters), .refused = false};
 }
 
 void CtxSettingsBase::autoUpdate(const Tag& tag) {
@@ -699,6 +721,7 @@ void CtxSettingsBase::autoUpdate(const Tag& tag) {
         auto it = _descriptor->writableByName.find(key);
         if (it != _descriptor->writableByName.end() && (activeCtxChanged || !isActiveValueImpl(key, value))) {
             if (it->second->autoUpdate(key, value, autoUpdateParams, _stagedParameters)) {
+                _taggedKeys.emplace(key);
                 wasChanged = true;
             }
         }
@@ -735,11 +758,16 @@ ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::uniq
         // setStaged() call that arrives during the settingsChanged() window then stages for the
         // next apply instead of being cleared with this one, and a concurrent apply takes an empty
         // map rather than repeating this batch.
-        const property_map batch = std::exchange(_stagedParameters, {});
+        const property_map                       batch      = std::exchange(_stagedParameters, {});
+        const std::set<std::string, std::less<>> taggedKeys = std::exchange(_taggedKeys, {});
 
         // check if reset of settings should be performed
-        if (batch.contains(static_cast<std::pmr::string>(gr::tag::RESET_DEFAULTS))) {
-            resetDefaultsImpl();
+        const bool resetRequested = batch.contains(static_cast<std::pmr::string>(gr::tag::RESET_DEFAULTS));
+        bool       resetRefused   = false;
+        if (resetRequested) {
+            ResetDefaultsResult reset = resetDefaultsImpl();
+            result.failedParameters   = std::move(reset.failedParameters);
+            resetRefused              = reset.refused;
         }
 
         property_map staged;
@@ -784,6 +812,16 @@ ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::uniq
         }
 
         updateActiveParametersImpl();
+        result.refusal = describeRefusals(result.failedParameters);
+        if (!result.failedParameters.empty()) {
+            property_map tagged;
+            property_map untagged;
+            for (const auto& [key, value] : result.failedParameters) {
+                (taggedKeys.contains(std::string_view(key)) ? tagged : untagged).insert_or_assign(key, value);
+            }
+            result.tagRefusal      = describeRefusals(tagged);
+            result.untaggedRefusal = describeRefusals(untagged);
+        }
 
         // the settings keep the input rate; only the forwarded value carries the block's output rate
         if (hooks.chunkRatio != nullptr && result.forwardParameters.contains(gr::tag::SAMPLE_RATE.shortKey())) {
@@ -803,7 +841,8 @@ ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::uniq
             storeDefaults();
         }
 
-        if (hooks.reset != nullptr && batch.contains(static_cast<std::pmr::string>(gr::tag::RESET_DEFAULTS))) {
+        // a reset the limits refuse stores and applies no default and skips the block's reset()
+        if (hooks.reset != nullptr && resetRequested && !resetRefused) {
             hooks.reset(_block);
         }
     } else {
@@ -864,6 +903,14 @@ std::string CtxSettingsBase::describeRefusal(std::string_view key, const pmt::Va
         blockName = _descriptor->hooks.blockName(_block);
     }
     return std::format("block '{}' refuses {} = {}: {}", blockName, key, value, reason);
+}
+
+std::string CtxSettingsBase::describeRefusals(const property_map& refused) const {
+    std::string described;
+    for (const auto& [key, value] : refused) {
+        described += std::format("{}{}", described.empty() ? "" : "; ", describeRefusal(key, value));
+    }
+    return described;
 }
 
 void CtxSettingsBase::loadParametersFromPropertyMap(const property_map& parameters, SettingsCtx ctx) {

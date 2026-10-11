@@ -422,6 +422,19 @@ protected:
         _profilerHandler = _profiler.forThisThread();
     }
 
+    // throws for a key the scheduler does not declare and for a value it refuses. The key check runs after the apply
+    // and names the scheduler by the name the map gives
+    void applyInitialSettings(const property_map& initParameters) {
+        const property_map undeclared = this->settings().set(initParameters);
+        if (!this->settings().activateContext().has_value()) {
+            throw gr::exception("Settings for context could not be activated");
+        }
+        if (const ApplyStagedParametersResult applied = this->settings().applyStagedParameters(); !applied.failedParameters.empty()) {
+            throw gr::exception(applied.refusal);
+        }
+        gr::detail::checkDeclared(this->settings().writableMembers(), this->name.value, gr::meta::type_name<Derived>(), undeclared);
+    }
+
     void registerPropertyCallbacks() noexcept {
         _forbid_reserved_overrides();
         using PropertyCallback                            = BlockBase::PropertyCallback;
@@ -595,16 +608,12 @@ public:
 
     SchedulerBase(std::initializer_list<std::pair<const std::pmr::string, pmt::Value>> initParameter) noexcept(false) : base_t(initParameter) {
         registerPropertyCallbacks();
-        std::ignore = this->settings().set(initParameter);
-        std::ignore = this->settings().activateContext();
-        std::ignore = this->settings().applyStagedParameters();
+        applyInitialSettings(initParameter);
     }
 
     explicit SchedulerBase(property_map initParameters) noexcept(false) : base_t(initParameters) {
         registerPropertyCallbacks();
-        std::ignore = this->settings().set(initParameters);
-        std::ignore = this->settings().activateContext();
-        std::ignore = this->settings().applyStagedParameters();
+        applyInitialSettings(initParameters);
     }
 
     ~SchedulerBase() {
