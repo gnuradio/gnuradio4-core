@@ -3104,8 +3104,9 @@ protected:
     // replacement out of the run, and the sweep then stops the replacement. A block in STOPPED or REQUESTED_STOP that
     // holds the port at the other end of an edge that the replacement takes over runs again through
     // restartStoppedEndpoints(). The inputs that the replaced block released and the replacement took over are
-    // connected again the same way. An edge of the replacement that cannot be connected again is the reply's error. The
-    // BlockReplaced reply carries the replacement as the graph serializes it, "jobList", the index of the job list it
+    // connected again the same way. An edge of the replacement that cannot be connected again is the reply's error. A
+    // replacement that a failed lifecycle hook leaves in ERROR releases every stream input it took over through
+    // releaseStreamInputs(), and the hook's error is the reply's error. The BlockReplaced reply carries the replacement as the graph serializes it, "jobList", the index of the job list it
     // joined, "restartedBlocks", the unique names of the blocks restarted, and "refusedRestarts", the reason for each
     // restart refused
     std::expected<property_map, Error> replaceBlockByMessage(const Message& message) {
@@ -3160,6 +3161,8 @@ protected:
                 adopted                      = adoptBlock(newBlock, runGeneration() == generation ? heldBy : std::nullopt);
                 if (adopted) {
                     restarts = restartStoppedEndpoints(stopped, generation, newBlock);
+                } else if (newBlock->state() == lifecycle::State::ERROR) {
+                    releaseStreamInputs(*newBlock);
                 }
             }
             // outside the sweep lock: cleanupZombieBlocks() takes _executionOrderMutex under the zombie lock, and start()

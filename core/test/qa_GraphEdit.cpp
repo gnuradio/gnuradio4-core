@@ -510,6 +510,20 @@ struct OneStartRelay : gr::Block<OneStartRelay> {
     [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
 };
 
+constexpr std::string_view kNeverStarts = "the stage never starts";
+
+// passes its input to its output. Its start() always throws kNeverStarts
+struct NeverStartingStage : gr::Block<NeverStartingStage> {
+    gr::PortIn<float>  in;
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(NeverStartingStage, in, out);
+
+    void start() { throw gr::exception(std::string(kNeverStarts)); }
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
+};
+
 inline std::atomic<bool>        gGateOpen{false};
 inline std::atomic<std::size_t> gGatedPublished{0UZ};
 
@@ -3122,6 +3136,53 @@ const boost::ut::suite<"edits that give a block a reader or take its last one"> 
         expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
         expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
     };
+
+#ifndef GR_TEST_WITHOUT_BLOCK_REGISTRY // replacement by name resolves the type through the registry
+    // The source feeds a stage and a sink. The stage is replaced by a block whose start() throws. The source publishes
+    // only after the edit. The reader that the replacement took over then sits at the ring's write position
+    "a replacement whose start() throws releases the inputs it took over, and the source's ring empties again"_test = [] {
+        constexpr std::string_view kPoolName = "qa_edit_one_thread";
+        gr::thread_pool::Manager::instance().replacePool(std::string(kPoolName), std::make_shared<gr::thread_pool::ThreadPoolWrapper>(std::make_unique<gr::thread_pool::BasicThreadPool>(kPoolName, gr::thread_pool::TaskType::CPU_BOUND, 1U, 1U), "CPU"));
+        qa_edit::registerTestBlocks();
+        std::ignore = gr::globalBlockRegistry().insert<qa_edit::NeverStartingStage>();
+        qa_edit::gGateOpen.store(false);
+        qa_edit::gGatedPublished.store(0UZ);
+        qa_edit::gFreeRunningSamples.store(0UZ);
+
+        gr::Graph flow;
+        auto&     source    = flow.emplaceBlock<qa_edit::GatedSource>();
+        auto&     stage     = flow.emplaceBlock<qa_edit::Tunable>();
+        auto&     stageSink = flow.emplaceBlock<qa_edit::Sink>();
+        auto&     sink      = flow.emplaceBlock<qa_edit::FreeSink>();
+        expect(flow.connect<"out", "in">(source, stage).has_value());
+        expect(flow.connect<"out", "in">(stage, stageSink).has_value());
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+        const std::string stageName{stage.unique_name};
+        auto*             sourceBlock = &source;
+
+        qa_edit::JobListProbe scheduler({{"poolName", std::string(kPoolName)}});
+        expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(fatal(toScheduler.connect(scheduler.msgIn).has_value()));
+        expect(fatal(scheduler.msgOut.connect(fromScheduler).has_value()));
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(fatal(qa_edit::awaitCondition([sourceBlock] { return sourceBlock->out.nReaders() == 2UZ; }))) << "the stage and the sink do not both read the source";
+
+        qa_edit::sendMessage(toScheduler, kReplaceBlock, {{"uniqueName", stageName}, {"type", gr::meta::type_name<qa_edit::NeverStartingStage>()}});
+        const std::string error = qa_edit::awaitError(fromScheduler, kBlockReplaced);
+        expect(error.contains(qa_edit::kNeverStarts)) << "the reply does not carry the replacement's start() failure: " << error;
+        expect(eq(sourceBlock->out.nReaders(), 1UZ)) << "the replacement whose start() failed still reads the source";
+
+        qa_edit::gGateOpen.store(true);
+        expect(qa_edit::awaitCondition([] { return qa_edit::gGatedPublished.load() == qa_edit::GatedSource::kSamples && qa_edit::gFreeRunningSamples.load() == qa_edit::GatedSource::kSamples; })) << "the sink did not take every sample the source published";
+        expect(qa_edit::awaitCondition([sourceBlock] { return sourceBlock->out.available() == sourceBlock->out.bufferSize(); })) << std::format("the source's ring stays held after the sink took every sample: {} of {} slots free", sourceBlock->out.available(), sourceBlock->out.bufferSize());
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
+    };
+#endif
 };
 
 int main() { /* tests are statically registered */ }
