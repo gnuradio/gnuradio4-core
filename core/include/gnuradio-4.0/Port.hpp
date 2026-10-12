@@ -1273,24 +1273,18 @@ private:
         std::conditional_t<owning, TPortType, TPortType&> _value;
 
         [[nodiscard]] Handlers handlers() noexcept override {
-            if constexpr (requires {
-                              { _value._ioHandler->hasOutstandingSpans() } noexcept;
-                              { _value._tagIoHandler->hasOutstandingSpans() } noexcept;
-                              { _value.hasRings() } noexcept;
-                          }) {
-                using Stream = std::remove_reference_t<decltype(_value._ioHandler)>;
-                using Tags   = std::remove_reference_t<decltype(_value._tagIoHandler)>;
-                if constexpr (std::is_nothrow_swappable_v<Stream> && std::is_nothrow_swappable_v<Tags>) {
-                    const bool spansInUse = _value.hasRings() && (_value._ioHandler->hasOutstandingSpans() || _value._tagIoHandler->hasOutstandingSpans());
-                    return {std::addressof(_value._ioHandler), std::addressof(_value._tagIoHandler), std::addressof(_value._hasRings), &typeid(std::pair<Stream, Tags>), spansInUse, //
-                        [](Handlers first, Handlers second) noexcept {
-                            std::swap(*static_cast<Stream*>(first.stream), *static_cast<Stream*>(second.stream));
-                            std::swap(*static_cast<Tags*>(first.tags), *static_cast<Tags*>(second.tags));
-                            const bool firstHasRings = first.hasRings->load(std::memory_order_acquire);
-                            first.hasRings->store(second.hasRings->load(std::memory_order_acquire), std::memory_order_release);
-                            second.hasRings->store(firstHasRings, std::memory_order_release);
-                        }};
-                }
+            if constexpr (exchangesHandlers<TPortType>()) {
+                using Stream          = decltype(TPortType::_ioHandler);
+                using Tags            = decltype(TPortType::_tagIoHandler);
+                const bool spansInUse = _value.hasRings() && (_value._ioHandler->hasOutstandingSpans() || _value._tagIoHandler->hasOutstandingSpans());
+                return {std::addressof(_value._ioHandler), std::addressof(_value._tagIoHandler), std::addressof(_value._hasRings), &typeid(std::pair<Stream, Tags>), spansInUse, //
+                    [](Handlers first, Handlers second) noexcept {
+                        std::swap(*static_cast<Stream*>(first.stream), *static_cast<Stream*>(second.stream));
+                        std::swap(*static_cast<Tags*>(first.tags), *static_cast<Tags*>(second.tags));
+                        const bool firstHasRings = first.hasRings->load(std::memory_order_acquire);
+                        first.hasRings->store(second.hasRings->load(std::memory_order_acquire), std::memory_order_release);
+                        second.hasRings->store(firstHasRings, std::memory_order_release);
+                    }};
             }
             return {};
         }
@@ -1381,6 +1375,21 @@ private:
 
 public:
     using value_type = void; // a sterile port
+
+    // true when the stream and tag handlers of the port type report an outstanding span and swap without throwing. A
+    // port of another type offers no handlers, and checkHandlerExchange() refuses it
+    template<PortLike TPort>
+    [[nodiscard]] static consteval bool exchangesHandlers() {
+        if constexpr (requires(TPort& port) {
+                          { port._ioHandler->hasOutstandingSpans() } noexcept;
+                          { port._tagIoHandler->hasOutstandingSpans() } noexcept;
+                          { port.hasRings() } noexcept;
+                      }) {
+            return std::is_nothrow_swappable_v<decltype(TPort::_ioHandler)> && std::is_nothrow_swappable_v<decltype(TPort::_tagIoHandler)>;
+        } else {
+            return false;
+        }
+    }
 
     struct owned_value_tag {};
 
@@ -1476,6 +1485,8 @@ template<PortLike T, bool owning>
 }
 
 static_assert(PortLike<DynamicPort>);
+static_assert(DynamicPort::exchangesHandlers<PortIn<float>>() && DynamicPort::exchangesHandlers<PortOut<float>>(), "a default stream port offers no handlers to exchange, and Graph::replaceBlock() refuses every block");
+static_assert(DynamicPort::exchangesHandlers<MsgPortIn>() && DynamicPort::exchangesHandlers<MsgPortOut>(), "a default message port offers no handlers to exchange, and Graph::replaceBlock() refuses every block");
 
 namespace detail {
 template<typename T>
