@@ -490,6 +490,47 @@ struct OneRunSource : gr::Block<OneRunSource> {
     }
 };
 
+constexpr std::string_view kRelaySecondStart = "the relay starts once";
+
+// passes its input to its output. Its start() throws kRelaySecondStart from the second start on
+struct OneStartRelay : gr::Block<OneStartRelay> {
+    gr::PortIn<float>  in;
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(OneStartRelay, in, out);
+
+    std::size_t _nStarts = 0UZ;
+
+    void start() {
+        if (++_nStarts > 1UZ) {
+            throw gr::exception(std::string(kRelaySecondStart));
+        }
+    }
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
+};
+
+inline std::atomic<bool>        gGateOpen{false};
+inline std::atomic<std::size_t> gGatedPublished{0UZ};
+
+// publishes nothing until gGateOpen is set, then kSamples samples, counted in gGatedPublished, and then nothing,
+// without ending its stream
+struct GatedSource : gr::Block<GatedSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(GatedSource, out);
+
+    static constexpr std::size_t kSamples = 1024UZ;
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        const std::size_t nPublish = gGateOpen.load() ? std::min(outSpan.size(), kSamples - gGatedPublished.load()) : 0UZ;
+        std::fill_n(outSpan.begin(), nPublish, 1.0f);
+        outSpan.publish(nPublish);
+        gGatedPublished.fetch_add(nPublish);
+        return gr::work::Status::OK;
+    }
+};
+
 // its stop() hook watches gFreeRunningSamples for 100 ms or until the first change, and stores the change in
 // gSamplesDuringStop
 struct StopProbe : gr::Block<StopProbe> {
@@ -2938,6 +2979,69 @@ const boost::ut::suite<"edits that give a block a reader or take its last one"> 
         expect(fatal(scheduler.changeStateTo(RUNNING).has_value()));
         expect(qa_edit::awaitCondition([nBeforeResume] { return qa_edit::gSourcedSamples.load() > nBeforeResume; })) << "the source never ran after the edit";
         expect(sourceBlock->state() == RUNNING);
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
+    };
+
+    // The source feeds the relay and a sink. The relay enters REQUESTED_STOP during a pause as in the case above and
+    // keeps its input. The edge to the spare sink restarts it, and its start() throws. The source publishes only after
+    // the edit, so the relay's reader sits at the ring's write position when the source begins
+    "a relay in REQUESTED_STOP whose restart throws releases its input, and the source's ring empties again"_test = [] {
+        constexpr std::string_view kPoolName = "qa_edit_one_thread";
+        gr::thread_pool::Manager::instance().replacePool(std::string(kPoolName), std::make_shared<gr::thread_pool::ThreadPoolWrapper>(std::make_unique<gr::thread_pool::BasicThreadPool>(kPoolName, gr::thread_pool::TaskType::CPU_BOUND, 1U, 1U), "CPU"));
+        qa_edit::gGateOpen.store(false);
+        qa_edit::gGatedPublished.store(0UZ);
+        qa_edit::gFreeRunningSamples.store(0UZ);
+
+        gr::Graph flow;
+        auto&     source    = flow.emplaceBlock<qa_edit::GatedSource>();
+        auto&     relay     = flow.emplaceBlock<qa_edit::OneStartRelay>();
+        auto&     relaySink = flow.emplaceBlock<qa_edit::Sink>();
+        auto&     sink      = flow.emplaceBlock<qa_edit::FreeSink>();
+        auto&     spareSink = flow.emplaceBlock<qa_edit::Sink>();
+        expect(flow.connect<"out", "in">(source, relay).has_value());
+        expect(flow.connect<"out", "in">(relay, relaySink).has_value());
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+        const std::string relayName{relay.unique_name};
+        const std::string spareSinkName{spareSink.unique_name};
+        auto*             sourceBlock = &source;
+        auto*             relayBlock  = &relay;
+
+        qa_edit::JobListProbe scheduler({{"poolName", std::string(kPoolName)}});
+        expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(fatal(toScheduler.connect(scheduler.msgIn).has_value()));
+        expect(fatal(scheduler.msgOut.connect(fromScheduler).has_value()));
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(fatal(eq(scheduler.nJobLists(), 1UZ))) << "the run has more than one job list";
+        expect(fatal(qa_edit::awaitCondition([sourceBlock] { return sourceBlock->out.nReaders() == 2UZ; }))) << "the relay and the sink do not both read the source";
+
+        expect(fatal(scheduler.changeStateTo(REQUESTED_PAUSE).has_value()));
+        expect(fatal(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == PAUSED; }))) << "the scheduler did not pause";
+        qa_edit::sendMessage(toScheduler, kSchedulerInspect, {});
+        expect(fatal(qa_edit::takeReply(fromScheduler, kSchedulerInspected))) << "the paused worker did not answer";
+        relayBlock->requestStop();
+        expect(fatal(relayBlock->state() == REQUESTED_STOP)) << "the relay did not enter REQUESTED_STOP";
+
+        qa_edit::sendMessage(toScheduler, kEmplaceEdge, qa_edit::edgeRequest(relayName, spareSinkName, std::int32_t{0}));
+        const std::optional<gr::property_map> reply = qa_edit::awaitReplyData(fromScheduler, kEdgeEmplaced);
+        expect(fatal(reply.has_value())) << "the edge was refused";
+        const auto  refusedEntry = reply->find("refusedRestarts");
+        const auto* refused      = refusedEntry != reply->end() ? refusedEntry->second.get_if<gr::property_map>() : nullptr;
+        expect(fatal(refused != nullptr)) << "the reply does not list the refused restarts";
+        const auto relayEntry = refused->find(std::pmr::string(relayName));
+        expect(relayEntry != refused->end() && relayEntry->second.value_or(std::string()).contains(qa_edit::kRelaySecondStart)) << "the reply does not list the relay with its start() failure";
+        expect(relayBlock->state() == ERROR) << "the relay whose restart failed is not in ERROR";
+        expect(!relayBlock->in.isConnected()) << "the relay whose restart failed still reads the source";
+        expect(eq(sourceBlock->out.nReaders(), 1UZ)) << "the source keeps a reader besides the sink";
+
+        expect(fatal(scheduler.changeStateTo(RUNNING).has_value()));
+        qa_edit::gGateOpen.store(true);
+        expect(qa_edit::awaitCondition([] { return qa_edit::gGatedPublished.load() == qa_edit::GatedSource::kSamples && qa_edit::gFreeRunningSamples.load() == qa_edit::GatedSource::kSamples; })) << "the sink did not take every sample the source published";
+        expect(eq(sourceBlock->out.available(), sourceBlock->out.bufferSize())) << "the source's ring stays held after the sink took every sample";
 
         expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
         expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
