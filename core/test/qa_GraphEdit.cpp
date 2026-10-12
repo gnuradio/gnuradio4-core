@@ -1249,9 +1249,9 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(fatal(eq(sink.in.streamReader().available(), kQueued))) << "the replacement did not pass every queued sample";
 
         std::vector<std::pair<std::size_t, std::string>> published;
-        for (const gr::Tag& tag : sink.in.tagReader().get()) {
-            if (const auto id = tag.map.find("id"); id != tag.map.end()) {
-                published.emplace_back(tag.index, id->second.value_or(std::string()));
+        for (const gr::Tag& sinkTag : sink.in.tagReader().get()) {
+            if (const auto id = sinkTag.map.find("id"); id != sinkTag.map.end()) {
+                published.emplace_back(sinkTag.index, id->second.value_or(std::string()));
             }
         }
         expect(published == kTagged) << std::format("the replacement published the tags {}, not {}", published, kTagged);
