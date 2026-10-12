@@ -2402,10 +2402,10 @@ protected:
     // from its start(). The block keeps its message ports, and a message forwarded to it while it was stopped stays
     // queued for it. A block that cannot be connected again or that the run refuses does not restart. The inputs
     // connected here for its edges, at either end, are released, and "refused" gives the reason. A refused block
-    // that a failed lifecycle hook left in ERROR leaves every job list through withdrawFromRun(). An edge of the
-    // joining block that cannot be connected again sets "joiningFailure". The caller holds the edit's quiescence and the
-    // sweep lock. A start or a stop since the endpoints were read changes the generation, and this call then restarts
-    // none.
+    // that a failed lifecycle hook left in ERROR releases every stream input it holds through releaseStreamInputs()
+    // and leaves every job list through withdrawFromRun(). An edge of the joining block that cannot be connected again
+    // sets "joiningFailure". The caller holds the edit's quiescence and the sweep lock. A start or a stop since the
+    // endpoints were read changes the generation, and this call then restarts none.
     [[nodiscard]] Restarts restartStoppedEndpoints(std::span<const StoppedEndpoint> stopped, std::size_t generation, const std::shared_ptr<BlockModel>& joining = nullptr) {
         using enum lifecycle::State;
         Restarts result;
@@ -2475,11 +2475,29 @@ protected:
                 }
             }
             if (endpoint.block->state() != STOPPED) {
+                releaseStreamInputs(*endpoint.block);
                 withdrawFromRun(endpoint.block);
             }
             result.refused[std::pmr::string(endpoint.block->uniqueName())] = joined.has_value() ? std::string("no run is active") : joined.error().message;
         }
         return result;
+    }
+
+    // disconnects every stream input of the block that has a reader. The samples queued at such an input are dropped,
+    // and the writer of its ring and the other readers of that ring no longer wait on it
+    static void releaseStreamInputs(BlockModel& block) {
+        auto release = [](DynamicPort& port) {
+            if (port::isStream(port.portMaskInfo()) && port.isConnected()) {
+                std::ignore = port.disconnect();
+            }
+        };
+        for (BlockModel::DynamicPortOrCollection& portOrCollection : block.dynamicInputPorts()) {
+            if (auto* port = std::get_if<DynamicPort>(&portOrCollection)) {
+                release(*port);
+            } else {
+                std::ranges::for_each(std::get<BlockModel::NamedPortCollection>(portOrCollection).ports, release);
+            }
+        }
     }
 
     // records the block for every worker of the run, which takes it out of its list before its next traversal
