@@ -1217,7 +1217,8 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(fatal(eq(built.streamReader().available(), 0UZ))); // the reader handed out builds the default rings
 
         const auto intoUnbuilt = queuedPort.checkHandlerExchange(unbuiltPort);
-        expect(fatal(intoUnbuilt.has_value())) << "refused for a port without rings: " << (intoUnbuilt.has_value() ? std::string{} : intoUnbuilt.error().message);
+        expect(intoUnbuilt.has_value()) << "the exchange into the port without rings was refused: " << (intoUnbuilt.has_value() ? std::string{} : intoUnbuilt.error().message);
+        expect(fatal(intoUnbuilt.has_value()));
         queuedPort.exchangeHandlers(unbuiltPort);
         expect(fatal(unbuilt.isConnected())) << "the port without rings did not take the connected ring";
         expect(eq(unbuilt.streamReader().available(), kQueued)) << "the queued samples did not move";
@@ -1225,7 +1226,8 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(eq(source.nReaders(), 1UZ)) << "the exchange changed the source's readers";
 
         const auto intoBuilt = unbuiltPort.checkHandlerExchange(builtPort);
-        expect(fatal(intoBuilt.has_value())) << "refused for a port with rings: " << (intoBuilt.has_value() ? std::string{} : intoBuilt.error().message);
+        expect(intoBuilt.has_value()) << "the exchange into the port with rings was refused: " << (intoBuilt.has_value() ? std::string{} : intoBuilt.error().message);
+        expect(fatal(intoBuilt.has_value()));
         unbuiltPort.exchangeHandlers(builtPort);
         expect(fatal(built.isConnected())) << "the port with its own rings did not take the connected ring";
         expect(eq(built.streamReader().available(), kQueued)) << "the queued samples did not move";
