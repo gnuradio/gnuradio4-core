@@ -1215,8 +1215,8 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(eq(sink._nReceived, kQueuedAtInput + kQueuedAtOutput)) << "the sink did not receive the samples queued at the replaced block's ports";
     };
 
-    // The source publishes samples with tags that the stage never reads. The sink is not called, so its input holds
-    // every sample and tag that the replacement publishes
+    // The source publishes samples with tags that the stage never reads. The sink is not called. Its input holds every
+    // sample and tag that the replacement publishes
     "a replacement publishes each tag queued at the replaced block's input once, at its sample index"_test = [] {
         constexpr std::size_t                                  kQueued = 10UZ;
         const std::vector<std::pair<std::size_t, std::string>> kTagged{{0UZ, "first"}, {3UZ, "second"}, {7UZ, "third"}};

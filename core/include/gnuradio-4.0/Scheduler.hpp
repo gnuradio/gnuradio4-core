@@ -2483,7 +2483,7 @@ protected:
         return result;
     }
 
-    // disconnects every stream input of the block that has a reader. The samples queued at such an input are dropped.
+    // disconnects every connected stream input of the block. The samples queued at such an input are dropped.
     // The writer of its ring then waits on the ring's other readers alone
     static void releaseStreamInputs(BlockModel& block) {
         auto release = [](DynamicPort& port) {
