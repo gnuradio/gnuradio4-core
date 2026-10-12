@@ -2396,16 +2396,16 @@ protected:
     // moves to STOPPED here first, since no worker calls it inside the quiescence. That transition runs no hook. The
     // block first gets back the stream inputs that its stop released. An edge at the block whose stream input has no
     // writer is connected again when the block at its other end runs or restarts here. A block that is STOPPED or in
-    // REQUESTED_STOP and does not restart here takes no such edge. The edges at the joining block, a replacement that
-    // takes over released ports, are connected again the same way. A new reader starts at the ring's write position. The
-    // block then joins the run through joinRun(), preferring the job list that holds it. A source that ended runs again
-    // from its start(). The block keeps its message ports, and a message forwarded to it while it was stopped stays
-    // queued for it. A block that cannot be connected again or that the run refuses does not restart. The inputs
-    // connected here for its edges, at either end, are released, and "refused" gives the reason. A refused block
-    // that a failed lifecycle hook left in ERROR releases every stream input it holds through releaseStreamInputs()
-    // and leaves every job list through withdrawFromRun(). An edge of the joining block that cannot be connected again
-    // sets "joiningFailure". The caller holds the edit's quiescence and the sweep lock. A start or a stop since the
-    // endpoints were read changes the generation, and this call then restarts none.
+    // REQUESTED_STOP and does not restart here takes no such edge, and neither does a block in ERROR. The edges at the
+    // joining block, a replacement that takes over released ports, are connected again the same way. A new reader starts
+    // at the ring's write position. The block then joins the run through joinRun(), preferring the job list that holds
+    // it. A source that ended runs again from its start(). The block keeps its message ports, and a message forwarded to
+    // it while it was stopped stays queued for it. A block that cannot be connected again or that the run refuses does
+    // not restart. The inputs connected here for its edges, at either end, are released, and "refused" gives the
+    // reason. A refused block that a failed lifecycle hook left in ERROR releases every stream input it holds through
+    // releaseStreamInputs() and leaves every job list through withdrawFromRun(). An edge of the joining block that
+    // cannot be connected again sets "joiningFailure". The caller holds the edit's quiescence and the sweep lock. A
+    // start or a stop since the endpoints were read changes the generation, and this call then restarts none.
     [[nodiscard]] Restarts restartStoppedEndpoints(std::span<const StoppedEndpoint> stopped, std::size_t generation, const std::shared_ptr<BlockModel>& joining = nullptr) {
         using enum lifecycle::State;
         Restarts result;
@@ -2426,7 +2426,7 @@ protected:
             reconnecting.push_back(joining);
         }
         auto isReconnecting = [&reconnecting](const std::shared_ptr<BlockModel>& block) { return std::ranges::contains(reconnecting, block); };
-        auto runsAfterEdit  = [&isReconnecting](const std::shared_ptr<BlockModel>& block) { return isReconnecting(block) || !isStoppedOrStopping(*block); };
+        auto runsAfterEdit  = [&isReconnecting](const std::shared_ptr<BlockModel>& block) { return isReconnecting(block) || (!isStoppedOrStopping(*block) && block->state() != ERROR); };
 
         struct ConnectedInput {
             std::shared_ptr<BlockModel> source;

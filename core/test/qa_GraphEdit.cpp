@@ -3075,9 +3075,9 @@ const boost::ut::suite<"edits that give a block a reader or take its last one"> 
     };
 
     // The source feeds the relay and a sink. The relay enters REQUESTED_STOP during a pause as in the case above and
-    // keeps its input. The edge to the spare sink restarts it, and its start() throws. The source publishes only after
-    // the edit, so the relay's reader sits at the ring's write position when the source begins
-    "a relay in REQUESTED_STOP whose restart throws releases its input, and the source's ring empties again"_test = [] {
+    // keeps its input. The edge to the spare sink restarts it, and its start() throws. The source then enters
+    // REQUESTED_STOP, and an edge to a second spare sink restarts it. The source publishes only after both edits
+    "a relay whose restart throws releases its input, a restart of its source leaves it released, and the source's ring empties again"_test = [] {
         constexpr std::string_view kPoolName = "qa_edit_one_thread";
         gr::thread_pool::Manager::instance().replacePool(std::string(kPoolName), std::make_shared<gr::thread_pool::ThreadPoolWrapper>(std::make_unique<gr::thread_pool::BasicThreadPool>(kPoolName, gr::thread_pool::TaskType::CPU_BOUND, 1U, 1U), "CPU"));
         qa_edit::gGateOpen.store(false);
@@ -3090,11 +3090,14 @@ const boost::ut::suite<"edits that give a block a reader or take its last one"> 
         auto&     relaySink = flow.emplaceBlock<qa_edit::Sink>();
         auto&     sink      = flow.emplaceBlock<qa_edit::FreeSink>();
         auto&     spareSink = flow.emplaceBlock<qa_edit::Sink>();
+        auto&     lateSink  = flow.emplaceBlock<qa_edit::Sink>();
         expect(flow.connect<"out", "in">(source, relay).has_value());
         expect(flow.connect<"out", "in">(relay, relaySink).has_value());
         expect(flow.connect<"out", "in">(source, sink).has_value());
+        const std::string sourceName{source.unique_name};
         const std::string relayName{relay.unique_name};
         const std::string spareSinkName{spareSink.unique_name};
+        const std::string lateSinkName{lateSink.unique_name};
         auto*             sourceBlock = &source;
         auto*             relayBlock  = &relay;
 
@@ -3127,11 +3130,22 @@ const boost::ut::suite<"edits that give a block a reader or take its last one"> 
         expect(relayBlock->state() == ERROR) << "the relay whose restart failed is not in ERROR";
         expect(!relayBlock->in.isConnected()) << "the relay whose restart failed still reads the source";
         expect(eq(sourceBlock->out.nReaders(), 1UZ)) << "the source keeps a reader besides the sink";
+        expect(fatal(qa_edit::takeReply(fromScheduler, kEdgeEmplaced))) << "the first reply was not taken";
+
+        sourceBlock->requestStop();
+        expect(fatal(sourceBlock->state() == REQUESTED_STOP)) << "the source did not enter REQUESTED_STOP";
+        qa_edit::sendMessage(toScheduler, kEmplaceEdge, qa_edit::edgeRequest(sourceName, lateSinkName, std::int32_t{0}));
+        const std::optional<gr::property_map> sourceReply = qa_edit::awaitReplyData(fromScheduler, kEdgeEmplaced);
+        expect(fatal(sourceReply.has_value())) << "the edge from the source was refused";
+        expect(std::ranges::contains(qa_edit::listedNames(*sourceReply, "restartedBlocks"), sourceName)) << "the reply does not name the restarted source";
+        expect(relayBlock->state() == ERROR) << "the restart of the source moved the relay out of ERROR";
+        expect(!relayBlock->in.isConnected()) << "the restart of the source connected the relay's input again";
+        expect(eq(sourceBlock->out.nReaders(), 2UZ)) << "the source does not have the sink and the late sink as its readers";
 
         expect(fatal(scheduler.changeStateTo(RUNNING).has_value()));
         qa_edit::gGateOpen.store(true);
         expect(qa_edit::awaitCondition([] { return qa_edit::gGatedPublished.load() == qa_edit::GatedSource::kSamples && qa_edit::gFreeRunningSamples.load() == qa_edit::GatedSource::kSamples; })) << "the sink did not take every sample the source published";
-        expect(qa_edit::awaitCondition([sourceBlock] { return sourceBlock->out.available() == sourceBlock->out.bufferSize(); })) << std::format("the source's ring stays held after the sink took every sample: {} of {} slots free", sourceBlock->out.available(), sourceBlock->out.bufferSize());
+        expect(qa_edit::awaitCondition([sourceBlock] { return sourceBlock->out.available() == sourceBlock->out.bufferSize(); })) << std::format("the source's ring stays held after its readers took every sample: {} of {} slots free", sourceBlock->out.available(), sourceBlock->out.bufferSize());
 
         expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
         expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
