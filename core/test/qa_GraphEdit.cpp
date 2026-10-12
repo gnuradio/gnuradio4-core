@@ -3131,7 +3131,7 @@ const boost::ut::suite<"edits that give a block a reader or take its last one"> 
         expect(fatal(scheduler.changeStateTo(RUNNING).has_value()));
         qa_edit::gGateOpen.store(true);
         expect(qa_edit::awaitCondition([] { return qa_edit::gGatedPublished.load() == qa_edit::GatedSource::kSamples && qa_edit::gFreeRunningSamples.load() == qa_edit::GatedSource::kSamples; })) << "the sink did not take every sample the source published";
-        expect(eq(sourceBlock->out.available(), sourceBlock->out.bufferSize())) << "the source's ring stays held after the sink took every sample";
+        expect(qa_edit::awaitCondition([sourceBlock] { return sourceBlock->out.available() == sourceBlock->out.bufferSize(); })) << std::format("the source's ring stays held after the sink took every sample: {} of {} slots free", sourceBlock->out.available(), sourceBlock->out.bufferSize());
 
         expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
         expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
