@@ -1201,6 +1201,48 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(eq(sink._nReceived, kQueuedAtInput + kQueuedAtOutput)) << "the sink did not receive the samples queued at the replaced block's ports";
     };
 
+    // The source publishes samples with tags that the stage never reads. The sink is not called, so its input holds
+    // every sample and tag that the replacement publishes
+    "a replacement publishes each tag queued at the replaced block's input once, at its sample index"_test = [] {
+        constexpr std::size_t                                  kQueued = 10UZ;
+        const std::vector<std::pair<std::size_t, std::string>> kTagged{{0UZ, "first"}, {3UZ, "second"}, {7UZ, "third"}};
+        qa_edit::registerTestBlocks();
+
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_edit::Source>();
+        auto&     stage  = flow.emplaceBlock<qa_edit::Tunable>();
+        auto&     sink   = flow.emplaceBlock<qa_edit::Sink>();
+        expect(flow.connect<"out", "in">(source, stage).has_value());
+        expect(flow.connect<"out", "in">(stage, sink).has_value());
+        expect(fatal(flow.connectPendingEdges())) << "the graph did not connect";
+        {
+            auto span = source.out.tryReserve<gr::SpanReleasePolicy::ProcessAll>(kQueued);
+            expect(fatal(eq(span.size(), kQueued))) << "the source's ring has no room for the samples";
+            for (const auto& [index, id] : kTagged) {
+                span.publishTag(gr::property_map{{"id", id}}, index);
+            }
+            std::ranges::fill(span, 1.0f);
+            span.publish(kQueued);
+        }
+        expect(fatal(eq(stage.in.tagReader().available(), kTagged.size()))) << "the tags are not queued at the stage's input";
+
+        auto [oldBlock, newBlock] = flow.replaceBlock(stage.unique_name, gr::meta::type_name<qa_edit::Tunable>(), {});
+        expect(fatal(newBlock != nullptr));
+        qa_edit::startForWork(*newBlock);
+        for (std::size_t call = 0UZ; call < 2UZ * kQueued && sink.in.streamReader().available() < kQueued; ++call) {
+            std::ignore = newBlock->work(std::numeric_limits<std::size_t>::max());
+        }
+        expect(fatal(eq(sink.in.streamReader().available(), kQueued))) << "the replacement did not pass every queued sample";
+
+        std::vector<std::pair<std::size_t, std::string>> published;
+        for (const gr::Tag& tag : sink.in.tagReader().get()) {
+            if (const auto id = tag.map.find("id"); id != tag.map.end()) {
+                published.emplace_back(tag.index, id->second.value_or(std::string()));
+            }
+        }
+        expect(published == kTagged) << std::format("the replacement published the tags {}, not {}", published, kTagged);
+    };
+
     "a port takes the rings of a port that has not built its own and of one that has"_test = [] {
         constexpr std::size_t kQueued = 5UZ;
 
