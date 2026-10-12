@@ -1256,6 +1256,38 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(eq(stage.in.streamReader().available(), kQueuedAtInput)) << "a refused replacement moved the queued samples";
         expect(eq(sink.in.nWriters(), 1UZ)) << "a refused replacement moved the sink's ring";
     };
+
+    "a replacement while a span of the replaced block's input is held is refused, and the graph is unchanged"_test = [] {
+        constexpr std::size_t kQueuedAtInput = 5UZ;
+        constexpr std::size_t kHeld          = 2UZ;
+        qa_edit::registerTestBlocks();
+
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_edit::Source>();
+        auto&     stage  = flow.emplaceBlock<qa_edit::Tunable>();
+        auto&     sink   = flow.emplaceBlock<qa_edit::Sink>();
+        expect(flow.connect<"out", "in">(source, stage).has_value());
+        expect(flow.connect<"out", "in">(stage, sink).has_value());
+        expect(fatal(flow.connectPendingEdges())) << "the graph did not connect";
+        qa_edit::publishOnes(source.out, kQueuedAtInput);
+        const std::string namesBefore = qa_edit::blockNames(flow);
+
+        {
+            auto held = stage.in.streamReader().get<gr::SpanReleasePolicy::ProcessNone>(kHeld);
+            expect(fatal(eq(held.size(), kHeld))) << "the case holds no span";
+            const std::string refused = qa_edit::refusal([&] { std::ignore = flow.replaceBlock(stage.unique_name, gr::meta::type_name<qa_edit::Tunable>(), {}); });
+            expect(refused.contains("span outstanding")) << "the replacement was not refused for the held span: " << refused;
+            expect(eq(qa_edit::blockNames(flow), namesBefore)) << "a refused replacement changed the blocks: " << refused;
+            expect(eq(flow.edges()[0UZ].destinationBlock()->uniqueName(), std::string_view(stage.unique_name))) << "a refused replacement repointed an edge";
+            expect(stage.in.isConnected()) << "a refused replacement released the input of the block it would replace";
+            expect(eq(stage.in.streamReader().available(), kQueuedAtInput)) << "a refused replacement moved the queued samples";
+            expect(eq(sink.in.nWriters(), 1UZ)) << "a refused replacement moved the sink's ring";
+        }
+
+        auto [oldBlock, newBlock] = flow.replaceBlock(stage.unique_name, gr::meta::type_name<qa_edit::Tunable>(), {});
+        expect(fatal(newBlock != nullptr)) << "the replacement was refused after the span ended";
+        expect(!stage.in.isConnected()) << "the replaced block still reads the source";
+    };
 #endif
 
     "a typed emplacement with a setting the block does not declare leaves the graph as it was"_test = [] {
