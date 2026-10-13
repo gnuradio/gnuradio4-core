@@ -366,7 +366,7 @@ public:
             // it for one of the shared objects that register blocks without carrying a plugin interface.
             std::string reason  = std::format("plugin ABI version {} does not match the host's plugin ABI version {}", pluginAbiVersion, GR_PLUGIN_CURRENT_ABI_VERSION);
             std::string warning = std::format("warning: plugin {} not loaded: {}", plugin_file, reason);
-            std::println("{}", warning);
+            std::println(stderr, "{}", warning);
             refuse(std::move(reason), std::move(warning));
             return;
         }

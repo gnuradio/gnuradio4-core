@@ -72,7 +72,7 @@ endif()
 
 # grinfo is tested as the program a caller runs, for the same reason. It is given core's own test plugins and, beside
 # them, the directory of shared objects that register blocks without being plugins, so that both kinds of file appear in
-# one report.
+# one report. One case is given the plugin ABI test directory, which holds a plugin built at plugin ABI version 1.
 if(TARGET grinfo)
   add_ut_test(qa_GrInfo)
   target_compile_definitions(qa_GrInfo PRIVATE GR_TOOLS_GRINFO="$<TARGET_FILE:grinfo>")
@@ -83,7 +83,8 @@ if(TARGET grinfo)
       qa_GrInfo
       PRIVATE GR_TOOLS_CORE_TEST_PLUGINS="${CMAKE_BINARY_DIR}/core/test/plugins"
               GR_TOOLS_TEST_BLOCK_LIBRARY="${CMAKE_BINARY_DIR}/core/test/block_library"
-              GR_TOOLS_TEST_SCHEDULER_LIBRARY="${CMAKE_BINARY_DIR}/core/test/scheduler_library")
+              GR_TOOLS_TEST_SCHEDULER_LIBRARY="${CMAKE_BINARY_DIR}/core/test/scheduler_library"
+              GR_TOOLS_TEST_PLUGIN_ABI="${CMAKE_BINARY_DIR}/core/test/plugin_abi")
     add_dependencies(
       qa_GrInfo
       GoodBasePlugin
@@ -94,6 +95,9 @@ if(TARGET grinfo)
       block_library_second
       scheduler_library
       scheduler_library_v1
-      scheduler_library_unversioned)
+      scheduler_library_unversioned
+      abi_probe_plugin
+      abi_probe_plugin_v1
+      abi_probe_plugin_foreign_scheduler)
   endif()
 endif()
