@@ -26,6 +26,7 @@
  * - the block listing, and one block in detail
  * - the scheduler listing
  * - scheduler libraries refused at an earlier plugin ABI version or at none
+ * - a plugin refused for its plugin ABI version
  * - a name nothing is registered under
  * - a command line that cannot be used
  * - the Markdown and HTML documents of each command
@@ -489,6 +490,18 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         expect(version.output.contains("\"reason\": \"scheduler test::library_scheduler_v1 has plugin ABI version 1, which does not match the host's plugin ABI version")) << "with the reason the loader gave" << version.output;
         expect(version.output.contains("\"reason\": \"scheduler test::library_scheduler_unversioned carries no plugin ABI version")) << "with the reason the loader gave" << version.output;
         expect(version.output.contains("\"test::library_scheduler\"")) << "the kept library's scheduler is registered" << version.output;
+    };
+
+    "a plugin refused for its plugin ABI version is reported on standard error and not in the document"_test = [] {
+        const std::vector<std::string> arguments{"blocks", "--markdown", "--plugin-dir", GR_TOOLS_TEST_PLUGIN_ABI};
+        const Result                   document = run(arguments, Streams::standardOutput);
+        expect(eq(document.exitCode, 0)) << document.output;
+        expect(document.output.starts_with("# grinfo blocks\n")) << "the document opens standard output" << document.output;
+        expect(!document.output.contains("not loaded")) << document.output;
+
+        const Result both = run(arguments);
+        expect(eq(both.exitCode, 0)) << both.output;
+        expect(both.output.contains("libabi_probe_plugin_v1.so not loaded: plugin ABI version 1 does not match")) << "the warning reaches standard error" << both.output;
     };
 
     "version --markdown and --html carry the search path and the plugins as table rows"_test = [] {
