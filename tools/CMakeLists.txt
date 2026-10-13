@@ -34,7 +34,8 @@ endif()
 # build with the registry has.
 if(GR_ENABLE_BLOCK_REGISTRY)
   add_executable(grinfo grinfo_main.cpp)
-  target_link_libraries(grinfo PRIVATE gnuradio-options gnuradio-core gnuradio-blocklib-core)
+  # gnuradio-doctools carries the writer of its Markdown and HTML forms
+  target_link_libraries(grinfo PRIVATE gnuradio-doctools)
   if(TARGET gnuradio-plugin)
     target_link_libraries(grinfo PRIVATE gnuradio-plugin)
   endif()
