@@ -91,6 +91,7 @@ struct YamlDefinitionsLoader {
         gr_plugin_metadata metadata;
     };
 
+    /// the data cache directory: the GR_DATA_CACHE_DIR environment variable when set, else the path compiled in
     static std::string assetsCacheDir() {
         if (const char* env = ::getenv("GR_DATA_CACHE_DIR"); env != nullptr) {
             return std::string(env);
@@ -119,7 +120,7 @@ struct YamlDefinitionsLoader {
                 std::filesystem::create_directories(cacheDir, createEc);
                 cacheReady = !createEc && std::filesystem::is_directory(cacheDir);
                 if (!*cacheReady) {
-                    std::println("warning: plugin cache directory {} is not available; caching disabled", cacheDir.string());
+                    std::println("warning: plugin cache directory {} cannot be made ({}); caching disabled; set GR_DATA_CACHE_DIR to a writable directory", cacheDir.string(), createEc ? createEc.message() : "not a directory");
                 }
             }
             return *cacheReady;

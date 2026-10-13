@@ -1,6 +1,8 @@
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -293,6 +295,23 @@ const boost::ut::suite AssetsLoadingTests = [] {
         expect(message.contains("qa::NoSuchBlockIsRegistered")) << "the reason the definition gave" << message;
 
         std::filesystem::remove_all(root);
+    };
+
+    "the cache directory is GR_DATA_CACHE_DIR from the environment when set, else the compiled path"_test = [] {
+        const char*                      inherited = std::getenv("GR_DATA_CACHE_DIR");
+        const std::optional<std::string> saved     = inherited != nullptr ? std::optional<std::string>(inherited) : std::nullopt;
+        const std::string                override  = (std::filesystem::temp_directory_path() / "gr4_qa_cache_override").string();
+
+        expect(fatal(::setenv("GR_DATA_CACHE_DIR", override.c_str(), 1) == 0));
+        expect(eq(gr::detail::YamlDefinitionsLoader::assetsCacheDir(), override)) << "the environment must override the compiled path";
+
+        expect(fatal(::unsetenv("GR_DATA_CACHE_DIR") == 0));
+        expect(eq(gr::detail::YamlDefinitionsLoader::assetsCacheDir(), std::string(GR_DATA_CACHE_DIR))) << "without the variable the compiled path must apply";
+        expect(override != std::string(GR_DATA_CACHE_DIR)) << "the two arms must name different directories";
+
+        if (saved.has_value()) {
+            ::setenv("GR_DATA_CACHE_DIR", saved->c_str(), 1);
+        }
     };
 
     // ── remote tests (server started by CMake fixture) ────────────────────────

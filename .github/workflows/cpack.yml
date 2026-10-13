@@ -44,6 +44,7 @@ jobs:
             -DCMAKE_COLOR_DIAGNOSTICS=ON \
             -DDISABLE_EXTERNAL_DEPS_WARNINGS=ON \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_INSTALL_PREFIX=/opt/gnuradio4 \
             -DCPACK_PACKAGING_INSTALL_PREFIX=/opt/gnuradio4 \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
             ${{ steps.enable_sccache.outputs.CXX_LAUNCHER }} \
