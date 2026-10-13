@@ -2166,7 +2166,7 @@ protected:
     // the index of the job list that holds the named block. A single-threaded run holds _executionOrderMutex on its
     // worker for the whole run and has one job list. Only a multi-threaded scheduler looks
     [[nodiscard]] std::optional<std::size_t> jobListHolding(std::string_view uniqueName) {
-        if constexpr (executionPolicy() == ExecutionPolicy::multiThreaded) {
+        if constexpr (isMultiThreaded(executionPolicy())) {
             std::lock_guard lock(_executionOrderMutex);
             for (std::size_t i = 0UZ; i < _executionOrder->size(); ++i) {
                 if (std::ranges::any_of((*_executionOrder)[i], [uniqueName](const std::shared_ptr<BlockModel>& block) { return block->uniqueName() == uniqueName; })) {
@@ -2181,7 +2181,7 @@ protected:
     // whole run. A caller on another thread during such a run cannot read the job lists and gets true
     [[nodiscard]] bool jobListHolds(const std::shared_ptr<BlockModel>& block) {
         std::unique_lock lock(_executionOrderMutex, std::defer_lock);
-        if constexpr (executionPolicy() == ExecutionPolicy::multiThreaded) {
+        if constexpr (isMultiThreaded(executionPolicy())) {
             lock.lock();
         } else if (!lock.try_lock()) {
             return true;
