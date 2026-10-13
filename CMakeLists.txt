@@ -250,7 +250,8 @@ set(GR_QA_OPTIMIZATION_LEVEL
     CACHE STRING "Optimization level for test executables in optimized build types (empty = build-type default)")
 
 # A build for a chosen install prefix places the data cache under the installation's state directory. A build without
-# one places it in the build tree. The GR_DATA_CACHE_DIR environment variable overrides the compiled path at run time.
+# one places it in the build tree. The GR_DATA_CACHE_DIR environment variable overrides the compiled path at run time. A
+# compiled path the running user cannot make gives way to the user's cache directory (gr::dataCacheDirectory()).
 if(NOT DEFINED GR_DATA_CACHE_DIR)
   if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
     set(_gr_data_cache_default "${CMAKE_CURRENT_BINARY_DIR}/gnuradio_cache")

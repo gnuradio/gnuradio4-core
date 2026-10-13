@@ -1,10 +1,14 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <optional>
+#include <print>
 #include <string>
+#include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <boost/ut.hpp>
@@ -27,6 +31,33 @@ const std::string kAssetsDir  = std::string(TESTS_SOURCE_PATH) + "/assets";
 const std::string kServerBase = "http://127.0.0.1:" + std::to_string(HTTP_SERVER_PORT);
 const std::string kCacheDir   = gr::detail::YamlDefinitionsLoader::assetsCacheDir() + "/asset_cache";
 const bool        kSkipRemote = true;
+
+// sets or clears one environment variable for the length of a case, and puts back the value it found
+class EnvironmentVariable {
+    std::string                _name;
+    std::optional<std::string> _found;
+
+public:
+    EnvironmentVariable(std::string name, const std::optional<std::string>& value) : _name(std::move(name)) {
+        if (const char* found = std::getenv(_name.c_str()); found != nullptr) {
+            _found = found;
+        }
+        if (value.has_value()) {
+            ::setenv(_name.c_str(), value->c_str(), 1);
+        } else {
+            ::unsetenv(_name.c_str());
+        }
+    }
+    ~EnvironmentVariable() {
+        if (_found.has_value()) {
+            ::setenv(_name.c_str(), _found->c_str(), 1);
+        } else {
+            ::unsetenv(_name.c_str());
+        }
+    }
+    EnvironmentVariable(const EnvironmentVariable&)            = delete;
+    EnvironmentVariable& operator=(const EnvironmentVariable&) = delete;
+};
 
 gr::PluginLoader makeLoader(const std::vector<std::string>& paths) {
     static gr::BlockRegistry     registry;
@@ -297,21 +328,117 @@ const boost::ut::suite AssetsLoadingTests = [] {
         std::filesystem::remove_all(root);
     };
 
-    "the cache directory is GR_DATA_CACHE_DIR from the environment when set, else the compiled path"_test = [] {
-        const char*                      inherited = std::getenv("GR_DATA_CACHE_DIR");
-        const std::optional<std::string> saved     = inherited != nullptr ? std::optional<std::string>(inherited) : std::nullopt;
-        const std::string                override  = (std::filesystem::temp_directory_path() / "gr4_qa_cache_override").string();
-
-        expect(fatal(::setenv("GR_DATA_CACHE_DIR", override.c_str(), 1) == 0));
-        expect(eq(gr::detail::YamlDefinitionsLoader::assetsCacheDir(), override)) << "the environment must override the compiled path";
-
-        expect(fatal(::unsetenv("GR_DATA_CACHE_DIR") == 0));
-        expect(eq(gr::detail::YamlDefinitionsLoader::assetsCacheDir(), std::string(GR_DATA_CACHE_DIR))) << "without the variable the compiled path must apply";
-        expect(override != std::string(GR_DATA_CACHE_DIR)) << "the two arms must name different directories";
-
-        if (saved.has_value()) {
-            ::setenv("GR_DATA_CACHE_DIR", saved->c_str(), 1);
+    // The compiled path of the arms without the variable is a directory the process may make, so the case holds for a
+    // build whose own compiled path the process cannot use.
+    "the cache directory is GR_DATA_CACHE_DIR from the environment when set and not empty, else the compiled path"_test = [] {
+        using Origin                         = gr::DataCacheDirectory::Origin;
+        const std::filesystem::path root     = std::filesystem::temp_directory_path() / "gr4_qa_cache_override";
+        const std::string           override = (root / "override").string();
+        const std::string           compiled = (root / "compiled").string();
+        {
+            const EnvironmentVariable variable("GR_DATA_CACHE_DIR", override);
+            expect(eq(gr::detail::YamlDefinitionsLoader::assetsCacheDir(), override)) << "the environment must override the compiled path";
+            expect(eq(gr::dataCacheDirectory(compiled).path, override));
         }
+        {
+            const EnvironmentVariable    empty("GR_DATA_CACHE_DIR", std::string());
+            const gr::DataCacheDirectory chosen = gr::dataCacheDirectory(compiled);
+            expect(chosen.origin == Origin::Compiled) << "an empty variable counts as unset";
+            expect(eq(chosen.path, compiled));
+        }
+        const EnvironmentVariable    variable("GR_DATA_CACHE_DIR", std::nullopt);
+        const gr::DataCacheDirectory chosen = gr::dataCacheDirectory(compiled);
+        expect(chosen.origin == Origin::Compiled) << "without the variable the compiled path must apply";
+        expect(eq(chosen.path, compiled));
+        expect(override != compiled) << "the two arms must name different directories";
+    };
+
+    // Each arm names a compiled directory in a tree of its own: one under a regular file, one under a directory the
+    // process may not write to, one under a broken symbolic link, and one the process may make. The case makes the
+    // asset_cache subdirectory of a chosen directory, as the loader does.
+    "the user's cache directory takes over when the compiled one cannot be made, and GR_DATA_CACHE_DIR overrides both"_test = [] {
+        using Origin              = gr::DataCacheDirectory::Origin;
+        namespace fs              = std::filesystem;
+        const fs::path  root      = fs::temp_directory_path() / "gr4_qa_cache_fallback";
+        const fs::path  file      = root / "file";
+        const fs::path  locked    = root / "locked";
+        const fs::path  xdg       = root / "xdg";
+        const fs::path  home      = root / "home";
+        const fs::path  makeable  = root / "compiled" / "cache";
+        const fs::path  underFile = file / "cache";
+        const fs::path  underLock = locked / "cache";
+        const fs::path  xdgCache  = xdg / "gnuradio4" / "cache";
+        const fs::path  homeCache = home / ".cache" / "gnuradio4" / "cache";
+        const fs::path  dangling  = root / "dangling";
+        std::error_code ignored;
+        fs::remove_all(root, ignored);
+        fs::create_directories(locked);
+        std::ofstream(file) << "a file where the compiled directory's parent would be\n";
+        fs::create_symlink(root / "absent", dangling);
+
+        const EnvironmentVariable variable("GR_DATA_CACHE_DIR", std::nullopt);
+        const EnvironmentVariable xdgVariable("XDG_CACHE_HOME", xdg.string());
+        const EnvironmentVariable homeVariable("HOME", home.string());
+
+        const gr::DataCacheDirectory compiled = gr::dataCacheDirectory(makeable.string());
+        expect(compiled.origin == Origin::Compiled) << "the instrument: a compiled directory that can be made is taken";
+        expect(eq(compiled.path, makeable.string()));
+        expect(compiled.whyNotCompiled.empty()) << compiled.whyNotCompiled;
+        expect(!fs::exists(makeable)) << "the choice made a directory";
+        std::error_code madeCompiled;
+        fs::create_directories(fs::path(compiled.path) / "asset_cache", madeCompiled);
+        expect(!madeCompiled) << madeCompiled.message();
+
+        const gr::DataCacheDirectory fromXdg = gr::dataCacheDirectory(underFile.string());
+        expect(fromXdg.origin == Origin::User);
+        expect(eq(fromXdg.path, xdgCache.string())) << "the user's cache directory is under XDG_CACHE_HOME";
+        expect(eq(fromXdg.compiled, underFile.string()));
+        expect(eq(fromXdg.whyNotCompiled, std::format("{} is not a directory", file.string())));
+        std::error_code madeXdg;
+        fs::create_directories(fs::path(fromXdg.path) / "asset_cache", madeXdg);
+        expect(!madeXdg) << madeXdg.message();
+
+        const gr::DataCacheDirectory fromLink = gr::dataCacheDirectory((dangling / "cache").string());
+        expect(fromLink.origin == Origin::User) << "a directory cannot be made under a broken symbolic link";
+        expect(eq(fromLink.path, xdgCache.string()));
+        expect(eq(fromLink.whyNotCompiled, std::format("{} is a broken symbolic link", dangling.string())));
+
+        {
+            const EnvironmentVariable    noXdg("XDG_CACHE_HOME", std::nullopt);
+            const gr::DataCacheDirectory fromHome = gr::dataCacheDirectory(underFile.string());
+            expect(fromHome.origin == Origin::User);
+            expect(eq(fromHome.path, homeCache.string())) << "without XDG_CACHE_HOME the user's cache directory is under HOME";
+        }
+
+        fs::permissions(locked, fs::perms::owner_read | fs::perms::owner_exec);
+        if (std::ofstream(locked / "probe")) {
+            std::println("the process writes to a directory without write permission; the unwritable-directory arm has no subject here");
+        } else {
+            const gr::DataCacheDirectory fromLocked = gr::dataCacheDirectory(underLock.string());
+            expect(fromLocked.origin == Origin::User);
+            expect(eq(fromLocked.path, xdgCache.string()));
+            expect(fromLocked.whyNotCompiled.starts_with(std::format("{}: ", locked.string()))) << fromLocked.whyNotCompiled;
+        }
+        fs::permissions(locked, fs::perms::owner_all, ignored);
+
+        {
+            const EnvironmentVariable    blockedXdg("XDG_CACHE_HOME", (file / "xdg").string());
+            const gr::DataCacheDirectory none = gr::dataCacheDirectory(underFile.string());
+            expect(none.origin == Origin::None) << "neither directory can be made";
+            expect(none.path.empty());
+            expect(eq(none.user, (file / "xdg" / "gnuradio4" / "cache").string()));
+            expect(eq(none.whyNotUser, std::format("{} is not a directory", file.string())));
+        }
+
+        {
+            const EnvironmentVariable    named("GR_DATA_CACHE_DIR", (file / "named").string());
+            const gr::DataCacheDirectory fromEnvironment = gr::dataCacheDirectory(underFile.string());
+            expect(fromEnvironment.origin == Origin::Environment) << "the variable is taken as given, whether or not it can be made";
+            expect(eq(fromEnvironment.path, (file / "named").string()));
+            expect(fromEnvironment.whyNotCompiled.empty()) << "the compiled directory was never considered";
+        }
+
+        fs::remove_all(root, ignored);
     };
 
     // ── remote tests (server started by CMake fixture) ────────────────────────
