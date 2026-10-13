@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <any>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <complex>
@@ -1245,15 +1246,45 @@ private:
 
     // The stream and tag handlers of a port hold its ring, its read or write position and its tags. A port without
     // rings holds no handlers, and an exchange moves the handlers or their absence together with the port's flag
-    // that its rings are built. A null type means that the port offers no handlers to exchange.
+    // that its rings are built. The type, size and alignment are those of the pair of handler types. A null type means
+    // that the port offers no handlers to exchange.
     struct Handlers {
         void*                 stream                  = nullptr;
         void*                 tags                    = nullptr;
         std::atomic<bool>*    hasRings                = nullptr;
         const std::type_info* type                    = nullptr;
+        std::size_t           size                    = 0UZ;
+        std::size_t           alignment               = 0UZ;
         bool                  spansInUse              = false; // a span of either handler is outstanding
         void (*exchange)(Handlers, Handlers) noexcept = nullptr;
     };
+
+    // A port of a loaded shared object and a port of the program compile one handler type into two objects. Under hidden
+    // visibility each object holds its own type_info for that type, and a runtime that compares type_info by address
+    // finds the two unequal. The mangled name identifies a type across objects only when the type has external
+    // linkage. Two objects can give one mangled name to two distinct types in anonymous namespaces, to two local
+    // classes of functions with internal linkage, and to two unnamed classes or closures. Two handler pairs are of one
+    // type when they share one type_info, or when their mangled name carries none of these forms and their sizes and
+    // alignments agree.
+    [[nodiscard]] static bool sameHandlerType(const Handlers& first, const Handlers& second) noexcept {
+        if (first.type == nullptr || second.type == nullptr) {
+            return false;
+        }
+        if (first.type == second.type) {
+            return true;
+        }
+        const std::string_view name = first.type->name();
+        return !namesTypeWithoutExternalLinkage(name) && name == std::string_view(second.type->name()) && first.size == second.size && first.alignment == second.alignment;
+    }
+
+    // true when a mangled name contains a form that gcc or clang gives to a type without external linkage: an anonymous
+    // namespace (_GLOBAL__N), an entity local to a function with internal linkage (ZL), an unnamed class or closure
+    // (clang's $_, gcc's ._anon_) or a closure or unnamed type in a mangled scope (Ul, Ut). A name that contains one of
+    // these strings by chance is refused too.
+    [[nodiscard]] static bool namesTypeWithoutExternalLinkage(std::string_view mangledName) noexcept {
+        constexpr std::array<std::string_view, 6UZ> kMarkers{"_GLOBAL__N", "ZL", "$_", "._anon_", "Ul", "Ut"};
+        return std::ranges::any_of(kMarkers, [mangledName](std::string_view marker) { return mangledName.contains(marker); });
+    }
 
     // A wrapper offers its handlers through this interface and not through model. The layout of model stays as it is.
     // A wrapper compiled without the interface offers no handlers.
@@ -1276,8 +1307,9 @@ private:
             if constexpr (exchangesHandlers<TPortType>()) {
                 using Stream          = decltype(TPortType::_ioHandler);
                 using Tags            = decltype(TPortType::_tagIoHandler);
+                using Pair            = std::pair<Stream, Tags>;
                 const bool spansInUse = _value.hasRings() && (_value._ioHandler->hasOutstandingSpans() || _value._tagIoHandler->hasOutstandingSpans());
-                return {std::addressof(_value._ioHandler), std::addressof(_value._tagIoHandler), std::addressof(_value._hasRings), &typeid(std::pair<Stream, Tags>), spansInUse, //
+                return {std::addressof(_value._ioHandler), std::addressof(_value._tagIoHandler), std::addressof(_value._hasRings), &typeid(Pair), sizeof(Pair), alignof(Pair), spansInUse, //
                     [](Handlers first, Handlers second) noexcept {
                         std::swap(*static_cast<Stream*>(first.stream), *static_cast<Stream*>(second.stream));
                         std::swap(*static_cast<Tags*>(first.tags), *static_cast<Tags*>(second.tags));
@@ -1462,7 +1494,7 @@ public:
     [[nodiscard]] std::expected<void, Error> checkHandlerExchange(DynamicPort& other) {
         const Handlers own   = handlers();
         const Handlers their = other.handlers();
-        if (own.type == nullptr || their.type == nullptr || *own.type != *their.type) {
+        if (!sameHandlerType(own, their)) {
             return std::unexpected(Error(std::format("port {} ({}) cannot take the buffers of port {} ({})", other.metaInfo.name, other.typeName(), metaInfo.name, typeName())));
         }
         if (own.spansInUse || their.spansInUse) {
