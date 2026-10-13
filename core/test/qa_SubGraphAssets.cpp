@@ -59,6 +59,20 @@ public:
     EnvironmentVariable& operator=(const EnvironmentVariable&) = delete;
 };
 
+// makes a directory the working directory for the length of a case, and puts back the one it found
+class WorkingDirectory {
+    std::filesystem::path _found = std::filesystem::current_path();
+
+public:
+    explicit WorkingDirectory(const std::filesystem::path& directory) { std::filesystem::current_path(directory); }
+    ~WorkingDirectory() {
+        std::error_code ignored;
+        std::filesystem::current_path(_found, ignored);
+    }
+    WorkingDirectory(const WorkingDirectory&)            = delete;
+    WorkingDirectory& operator=(const WorkingDirectory&) = delete;
+};
+
 gr::PluginLoader makeLoader(const std::vector<std::string>& paths) {
     static gr::BlockRegistry     registry;
     static gr::SchedulerRegistry schedulerRegistry;
@@ -438,6 +452,43 @@ const boost::ut::suite AssetsLoadingTests = [] {
             expect(fromEnvironment.whyNotCompiled.empty()) << "the compiled directory was never considered";
         }
 
+        fs::remove_all(root, ignored);
+    };
+
+    // The working directory is a tree of the case's own, and with HOME and XDG_CACHE_HOME unset a refused compiled path
+    // selects no directory at all.
+    "a relative compiled cache directory is taken under the working directory, whether it exists or not"_test = [] {
+        using Origin         = gr::DataCacheDirectory::Origin;
+        namespace fs         = std::filesystem;
+        const fs::path  root = fs::temp_directory_path() / "gr4_qa_cache_relative";
+        std::error_code ignored;
+        fs::remove_all(root, ignored);
+        fs::create_directories(root / "existing" / "cache");
+        std::ofstream(root / "file") << "a file where the compiled directory's parent would be\n";
+
+        {
+            const WorkingDirectory    workingDirectory(root);
+            const EnvironmentVariable variable("GR_DATA_CACHE_DIR", std::nullopt);
+            const EnvironmentVariable xdgVariable("XDG_CACHE_HOME", std::nullopt);
+            const EnvironmentVariable homeVariable("HOME", std::nullopt);
+
+            for (const std::string relative : {"existing/cache", "missing/cache", "cache"}) {
+                const gr::DataCacheDirectory chosen = gr::dataCacheDirectory(relative);
+                expect(chosen.origin == Origin::Compiled) << relative << ": " << chosen.whyNotCompiled;
+                expect(eq(chosen.path, relative));
+                expect(chosen.whyNotCompiled.empty()) << chosen.whyNotCompiled;
+            }
+            expect(!fs::exists(root / "missing")) << "the choice made a directory";
+            std::error_code made;
+            fs::create_directories(fs::path("missing/cache") / "asset_cache", made);
+            expect(!made) << made.message();
+            expect(fs::is_directory(root / "missing" / "cache" / "asset_cache")) << "the relative directory is made under the working directory";
+
+            const gr::DataCacheDirectory refused = gr::dataCacheDirectory("file/cache");
+            expect(refused.origin == Origin::None) << "the instrument: a relative directory under a regular file cannot be made";
+            expect(refused.path.empty());
+            expect(eq(refused.whyNotCompiled, std::string("file is not a directory")));
+        }
         fs::remove_all(root, ignored);
     };
 
