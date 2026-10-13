@@ -3106,9 +3106,9 @@ protected:
     // restartStoppedEndpoints(). The inputs that the replaced block released and the replacement took over are
     // connected again the same way. An edge of the replacement that cannot be connected again is the reply's error. A
     // replacement that a failed lifecycle hook leaves in ERROR releases every stream input it took over through
-    // releaseStreamInputs(), and the hook's error is the reply's error. The BlockReplaced reply carries the replacement as the graph serializes it, "jobList", the index of the job list it
-    // joined, "restartedBlocks", the unique names of the blocks restarted, and "refusedRestarts", the reason for each
-    // restart refused
+    // releaseStreamInputs(), and the hook's error is the reply's error. The BlockReplaced reply carries the
+    // replacement as the graph serializes it, "jobList", the index of the job list it joined, "restartedBlocks", the
+    // unique names of the blocks restarted, and "refusedRestarts", the reason for each restart refused.
     std::expected<property_map, Error> replaceBlockByMessage(const Message& message) {
         const auto& messageData = message.data.value();
         const auto  uniqueName  = messageData.at("uniqueName").value_or(std::string_view{});
