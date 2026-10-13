@@ -364,7 +364,7 @@ const boost::ut::suite<"GraphDoc"> graphDocTests = [] {
         const auto level = graphdoc::read("blocks:\n  - id: qa::Convert<float32, complex<float32>>\n    parameters:\n      name: widen\n");
         expect(level.has_value());
         const std::string markdown = graphdoc::render(*level, Format::Markdown, "t");
-        expect(markdown.find("qa::Convert<br><float32, complex<float32>>") != std::string::npos) << markdown;
+        expect(markdown.find("qa::Convert<br>\\<float32, complex\\<float32\\>\\>") != std::string::npos) << markdown;
 
         const std::string html = graphdoc::render(*level, Format::Html, "t");
         expect(html.find("qa::Convert<br>&lt;float32, complex&lt;float32&gt;&gt;") != std::string::npos) << html;
@@ -399,7 +399,7 @@ const boost::ut::suite<"GraphDoc"> graphDocTests = [] {
 
         const std::string markdown = graphdoc::render(*level, Format::Markdown, "t");
         expect(markdown.find("| From | Port | To | Port | Type | Minimum buffer |") != std::string::npos) << markdown;
-        expect(markdown.find("| first | out | second | in | complex<float32> |  |") != std::string::npos) << markdown;
+        expect(markdown.find("| first | out | second | in | complex\\<float32\\> |  |") != std::string::npos) << markdown;
         expect(markdown.find("| third | out | second | in |  |  |") != std::string::npos) << markdown;
     };
 #endif

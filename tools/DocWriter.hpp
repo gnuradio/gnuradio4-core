@@ -53,7 +53,8 @@ public:
     [[nodiscard]] Format format() const noexcept { return _format; }
 
     /// escapes text for a table cell: a newline becomes a line break, and the cell separator and
-    /// the markup characters of the target format lose their meaning
+    /// the markup characters of the target format lose their meaning. In Markdown that includes the
+    /// angle brackets, which a renderer reads as raw HTML: `Block<float32>` would lose `<float32>`.
     [[nodiscard]] std::string cell(std::string_view text) const {
         std::string out;
         out.reserve(text.size());
@@ -71,7 +72,7 @@ public:
                 default: break;
                 }
             } else {
-                if (c == '|' || c == '\\') {
+                if (c == '|' || c == '\\' || c == '<' || c == '>') {
                     out += '\\';
                 }
             }
@@ -236,7 +237,7 @@ public:
             // the blank line that separates blocks is a separator, not part of the last one
             std::string_view body(_body);
             body.remove_suffix(body.size() - std::min(body.size(), body.find_last_not_of("\n") + 1UZ));
-            return std::format("# {}\n\n{}\n", _title, body);
+            return std::format("# {}\n\n{}\n", text(_title), body);
         }
         return std::format(R"(<!DOCTYPE html>
 <html lang="en">

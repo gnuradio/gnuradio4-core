@@ -28,6 +28,7 @@
  * - scheduler libraries refused at an earlier plugin ABI version or at none
  * - a name nothing is registered under
  * - a command line that cannot be used
+ * - the Markdown and HTML documents of each command
  *
  * The shape of the report is part of that contract - no line wider than a terminal, one entry per block however many
  * instantiations it has, and a JSON document on standard output that carries no null - so each is pinned here too.
@@ -183,6 +184,25 @@ constexpr std::size_t kWidth = 80UZ;
     return joined;
 }
 
+// The targets of every link that `opening` starts and `closing` ends, in the order they appear: `](#` and `)` for a
+// Markdown document, `href="#` and `"` for an HTML page.
+[[nodiscard]] std::vector<std::string> linkTargets(std::string_view text, std::string_view opening, std::string_view closing) {
+    std::vector<std::string> targets;
+    for (std::size_t at = text.find(opening); at != std::string_view::npos; at = text.find(opening, at + opening.size())) {
+        const std::size_t start = at + opening.size();
+        const std::size_t end   = text.find(closing, start);
+        if (end == std::string_view::npos) {
+            break;
+        }
+        targets.emplace_back(text.substr(start, end - start));
+    }
+    return targets;
+}
+
+// what an HTML page may not carry if it is to render with no network: a script, a style sheet or an image loaded
+// from elsewhere, or any address
+constexpr std::array<std::string_view, 5> kExternalReferences{"<script", "<link", "<img", "http", "@import"};
+
 // what a reader sees of a path the report had to cut: the tool keeps a path's tail, which is what tells one
 // directory from another
 [[nodiscard]] std::string_view tailOf(std::string_view path, std::size_t count) { return path.size() <= count ? path : path.substr(path.size() - count); }
@@ -232,6 +252,16 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         const Result withoutValue = run({"--plugin-dir"});
         expect(eq(withoutValue.exitCode, 2)) << withoutValue.output;
         expect(withoutValue.output.contains("--plugin-dir needs a value")) << withoutValue.output;
+    };
+
+    "a command line that selects two forms is refused with a line naming both"_test = [] {
+        const Result jsonAndMarkdown = run({"--json", "--markdown"});
+        expect(eq(jsonAndMarkdown.exitCode, 2)) << jsonAndMarkdown.output;
+        expect(jsonAndMarkdown.output.contains("--json and --markdown cannot be combined")) << jsonAndMarkdown.output;
+
+        const Result markdownAndHtml = run({"blocks", "--markdown", "--html"});
+        expect(eq(markdownAndHtml.exitCode, 2)) << markdownAndHtml.output;
+        expect(markdownAndHtml.output.contains("--markdown and --html cannot be combined")) << markdownAndHtml.output;
     };
 
     "a plugin directory that cannot be searched ends the run"_test = [] {
@@ -459,6 +489,135 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         expect(version.output.contains("\"reason\": \"scheduler test::library_scheduler_v1 has plugin ABI version 1, which does not match the host's plugin ABI version")) << "with the reason the loader gave" << version.output;
         expect(version.output.contains("\"reason\": \"scheduler test::library_scheduler_unversioned carries no plugin ABI version")) << "with the reason the loader gave" << version.output;
         expect(version.output.contains("\"test::library_scheduler\"")) << "the kept library's scheduler is registered" << version.output;
+    };
+
+    "version --markdown and --html carry the search path and the plugins as table rows"_test = [] {
+        const Result markdown = run(overTestDirectories({"version", "--markdown"}), Streams::standardOutput);
+        expect(eq(markdown.exitCode, 0)) << markdown.output;
+        expect(markdown.output.starts_with("# grinfo version\n")) << "the command is the title" << markdown.output;
+        expect(markdown.output.contains(std::format("| {} | option | searched |", GR_TOOLS_CORE_TEST_PLUGINS))) << "a directory row, its path whole" << markdown.output;
+        expect(markdown.output.contains("| Good Math Plugin | v1 | MIT | 4 | 1 |")) << "a plugin row" << markdown.output;
+        expect(markdown.output.contains("- gr::scheduler::Simple\\<singleThreaded\\>\n")) << "a scheduler key, its brackets escaped" << markdown.output;
+
+        const Result html = run(overTestDirectories({"version", "--html"}), Streams::standardOutput);
+        expect(eq(html.exitCode, 0)) << html.output;
+        expect(html.output.contains(std::format("<tr><td>{}</td><td>option</td><td>searched</td></tr>", GR_TOOLS_CORE_TEST_PLUGINS))) << html.output;
+        expect(html.output.contains("<tr><td>Good Math Plugin</td><td>v1</td><td>MIT</td><td>4</td><td>1</td></tr>")) << html.output;
+    };
+
+    "blocks --markdown and --html list each family's blocks with their types"_test = [] {
+        const Result markdown = run(overTestDirectories({"blocks", "--markdown"}), Streams::standardOutput);
+        expect(eq(markdown.exitCode, 0)) << markdown.output;
+        expect(markdown.output.starts_with("# grinfo blocks\n")) << markdown.output;
+        expect(markdown.output.contains("| multiply | \\<float32\\> \\<float64\\> |")) << "a block row, the angle brackets of its types escaped" << markdown.output;
+        expect(markdown.output.contains("| LibraryDoubler |  |")) << "a block of no type parameters" << markdown.output;
+
+        const Result html = run(overTestDirectories({"blocks", "--html"}), Streams::standardOutput);
+        expect(eq(html.exitCode, 0)) << html.output;
+        expect(html.output.contains("<tr><td>multiply</td><td>&lt;float32&gt; &lt;float64&gt;</td></tr>")) << html.output;
+    };
+
+    "blocks --verbose --markdown and --html carry each block's port and setting rows"_test = [] {
+        const Result markdown = run(overTestDirectories({"blocks", "--verbose", "--markdown"}), Streams::standardOutput);
+        expect(eq(markdown.exitCode, 0)) << markdown.output;
+        expect(markdown.output.contains("| in | input | float32 |")) << "a port with its type" << markdown.output;
+        expect(markdown.output.contains("| extra_gain | float32 | 1.000000 | dB | yes |")) << "a setting with its type and default" << markdown.output;
+        expect(markdown.output.contains("| in | input | T |")) << "a port written in the block's type parameter" << markdown.output;
+
+        const Result html = run(overTestDirectories({"blocks", "--verbose", "--html"}), Streams::standardOutput);
+        expect(eq(html.exitCode, 0)) << html.output;
+        expect(html.output.contains("<tr><td>in</td><td>input</td><td>float32</td></tr>")) << html.output;
+        expect(html.output.contains("<tr><td>extra_gain</td><td>float32</td><td>1.000000</td><td>dB</td><td>yes</td></tr>")) << html.output;
+    };
+
+    "every link of blocks --verbose leads to an anchor of the same document"_test = [] {
+        const Result markdown = run(overTestDirectories({"blocks", "--verbose", "--markdown"}), Streams::standardOutput);
+        expect(eq(markdown.exitCode, 0)) << markdown.output;
+        const std::vector<std::string> markdownLinks = linkTargets(markdown.output, "](#", ")");
+        expect(markdown.output.contains("- [gr::testing::LibraryDoubler](#")) << "the list opens with a link per block" << markdown.output;
+        expect(ge(markdownLinks.size(), 2UZ)) << markdown.output;
+        for (const std::string& target : markdownLinks) {
+            expect(markdown.output.contains(std::format("<a id=\"{}\"></a>", target))) << target << markdown.output;
+        }
+
+        const Result html = run(overTestDirectories({"blocks", "--verbose", "--html"}), Streams::standardOutput);
+        expect(eq(html.exitCode, 0)) << html.output;
+        const std::vector<std::string> htmlLinks = linkTargets(html.output, "href=\"#", "\"");
+        expect(eq(htmlLinks.size(), markdownLinks.size())) << "the same list in both forms" << html.output;
+        for (const std::string& target : htmlLinks) {
+            expect(html.output.contains(std::format(" id=\"{}\">", target))) << target << html.output;
+        }
+    };
+
+    "block --markdown and --html carry the block's port and setting rows"_test = [] {
+        const Result markdown = run(overTestDirectories({"block", "LibraryDoubler", "--markdown"}), Streams::standardOutput);
+        expect(eq(markdown.exitCode, 0)) << markdown.output;
+        expect(markdown.output.starts_with("# grinfo block LibraryDoubler\n")) << markdown.output;
+        expect(markdown.output.contains("## gr::testing::LibraryDoubler\n")) << "the block named in full" << markdown.output;
+        expect(markdown.output.contains("| out | output | float32 |")) << markdown.output;
+        expect(markdown.output.contains("| extra_gain | float32 | 1.000000 | dB | yes |")) << markdown.output;
+        expect(markdown.output.contains("doubles its input")) << "the description the block declares" << markdown.output;
+
+        const Result html = run(overTestDirectories({"block", "LibraryDoubler", "--html"}), Streams::standardOutput);
+        expect(eq(html.exitCode, 0)) << html.output;
+        expect(html.output.contains("<tr><td>out</td><td>output</td><td>float32</td></tr>")) << html.output;
+        expect(html.output.contains("<tr><td>extra_gain</td><td>float32</td><td>1.000000</td><td>dB</td><td>yes</td></tr>")) << html.output;
+    };
+
+    "a templated key in a Markdown title and table cell keeps its angle brackets"_test = [] {
+        const Result markdown = run(overTestDirectories({"block", "good::multiply<float32>", "--all-settings", "--markdown"}), Streams::standardOutput);
+        expect(eq(markdown.exitCode, 0)) << markdown.output;
+        expect(markdown.output.starts_with("# grinfo block good::multiply\\<float32\\>\n")) << "the title, escaped" << markdown.output;
+        expect(markdown.output.contains("| name | string | \"good::multiply\\<float32\\>\" |  | yes |")) << "the default of name, escaped" << markdown.output;
+        expect(!markdown.output.contains("\"good::multiply<float32>\"")) << "and nowhere raw" << markdown.output;
+    };
+
+    "an alias is named as an alias in both documents"_test = [] {
+        const Result markdown = run(overTestDirectories({"block", "library_doubler", "--markdown"}), Streams::standardOutput);
+        expect(eq(markdown.exitCode, 0)) << markdown.output;
+        expect(markdown.output.contains("- **alias of**: gr::testing::LibraryDoubler\n")) << markdown.output;
+
+        const Result html = run(overTestDirectories({"block", "library_doubler", "--html"}), Streams::standardOutput);
+        expect(eq(html.exitCode, 0)) << html.output;
+        expect(html.output.contains("<li><strong>alias of</strong>: gr::testing::LibraryDoubler</li>")) << html.output;
+    };
+
+    "the documents leave out the framework's settings unless asked for them"_test = [] {
+        for (const std::string_view form : {"--markdown", "--html"}) {
+            const Result hidden = run(overTestDirectories({"block", "LibraryDoubler", std::string(form)}), Streams::standardOutput);
+            expect(eq(hidden.exitCode, 0)) << hidden.output;
+            expect(!hidden.output.contains("unique_name")) << form << hidden.output;
+            expect(hidden.output.contains("--all-settings shows them")) << form << hidden.output;
+
+            const Result shown = run(overTestDirectories({"block", "LibraryDoubler", std::string(form), "--all-settings"}), Streams::standardOutput);
+            expect(eq(shown.exitCode, 0)) << shown.output;
+            expect(shown.output.contains(form == "--html" ? "<tr><td>unique_name</td><td>string</td>" : "| unique_name | string |")) << form << shown.output;
+        }
+    };
+
+    "schedulers --markdown and --html carry a scheduler's setting row"_test = [] {
+        const Result markdown = run(overTestDirectories({"schedulers", "--markdown"}), Streams::standardOutput);
+        expect(eq(markdown.exitCode, 0)) << markdown.output;
+        expect(markdown.output.starts_with("# grinfo schedulers\n")) << markdown.output;
+        expect(markdown.output.contains("| timeout_ms | uint32 | 100 | ms |")) << "a setting with its type, default and unit" << markdown.output;
+        expect(!markdown.output.contains("| port |")) << "a scheduler has no port table" << markdown.output;
+
+        const Result html = run(overTestDirectories({"schedulers", "--html"}), Streams::standardOutput);
+        expect(eq(html.exitCode, 0)) << html.output;
+        expect(html.output.contains("<tr><td>timeout_ms</td><td>uint32</td><td>100</td><td>ms</td></tr>")) << html.output;
+    };
+
+    "every HTML page is one self-contained page"_test = [] {
+        for (const std::vector<std::string>& arguments : {std::vector<std::string>{"version"}, {"blocks"}, {"blocks", "--verbose"}, {"block", "convert"}, {"schedulers"}}) {
+            std::vector<std::string> withForm(arguments);
+            withForm.emplace_back("--html");
+            const Result page = run(overTestDirectories(withForm), Streams::standardOutput);
+            expect(eq(page.exitCode, 0)) << page.output;
+            expect(page.output.starts_with("<!DOCTYPE html>\n")) << arguments.front() << page.output;
+            for (const std::string_view reference : kExternalReferences) {
+                expect(!page.output.contains(reference)) << arguments.front() << reference << page.output;
+            }
+        }
     };
 
     "no line of any report is wider than a terminal"_test = [] {

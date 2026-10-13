@@ -42,6 +42,7 @@
 #include <gnuradio-4.0/meta/formatter.hpp>
 
 #include "BlockLookup.hpp"
+#include "DocWriter.hpp"
 #include "SchedulerRegistrations.hpp"
 
 #ifdef INTERNAL_ENABLE_BLOCK_PLUGINS
@@ -55,8 +56,8 @@ using gr::tools::searchDirectories;
 
 constexpr std::string_view kProgram = "grinfo";
 
-// Every line of the report fits a terminal this wide. A value that does not is cut with an ellipsis and kept whole
-// in the JSON document, which is where a reader who needs it in full goes.
+// Every line of the report fits a terminal this wide. A value that does not is cut with an ellipsis. The JSON, Markdown
+// and HTML documents keep it whole.
 constexpr std::size_t kWidth = 80UZ;
 
 // The settings gr::Block declares on behalf of every block. They carry the same name, type and default everywhere,
@@ -74,6 +75,8 @@ Usage: grinfo [command] [options]
 
   --plugin-dir <dir> a directory of plugins and block libraries; repeatable
   --json             the same content as a pretty-printed JSON document
+  --markdown         the same content as a CommonMark document
+  --html             the same content as one HTML page that loads nothing else
   --verbose          with blocks, every block in detail rather than its name
   --all-settings     also the settings the framework declares on every block
   --help, -h         this text
@@ -100,6 +103,9 @@ creates with no parameters. The file a key came from is the file the dynamic
 linker holds that instance's type information in, so a block linked into this
 program is told apart from one a library brought.
 
+--json, --markdown and --html each select one form of the report, and a
+command line that selects two is refused.
+
 The JSON document carries "schema": 2 and one shape per command. A field the
 framework holds nothing in is left out rather than written as null; an array is
 always present, and empty where the block declares none of it.
@@ -111,11 +117,28 @@ used.
 
 enum class Command : std::uint8_t { Version, Blocks, Block, Schedulers };
 
+enum class Form : std::uint8_t { Text, Json, Markdown, Html };
+
+// the form an option selects, or nothing for an option that selects none
+[[nodiscard]] std::optional<Form> formOf(std::string_view option) {
+    if (option == "--json") {
+        return Form::Json;
+    }
+    if (option == "--markdown") {
+        return Form::Markdown;
+    }
+    if (option == "--html") {
+        return Form::Html;
+    }
+    return std::nullopt;
+}
+
 struct Options {
     Command                  command = Command::Version;
     std::string              blockName;
     std::vector<std::string> pluginDirectories;
-    bool                     json        = false;
+    Form                     form = Form::Text;
+    std::string              formOption; // the option that selected `form`, for the line that refuses a second one
     bool                     verbose     = false;
     bool                     allSettings = false;
     bool                     help        = false;
@@ -132,8 +155,13 @@ struct Options {
             ++index;
             continue;
         }
-        if (argument == "--json") {
-            options.json = true;
+        if (const std::optional<Form> form = formOf(argument); form.has_value()) {
+            if (options.form != Form::Text && options.form != *form) {
+                std::println(stderr, "{}: {} and {} cannot be combined", kProgram, options.formOption, argument);
+                return std::nullopt;
+            }
+            options.form       = *form;
+            options.formOption = argument;
             ++index;
             continue;
         }
@@ -357,10 +385,9 @@ void printFacts(std::string_view indent, const std::vector<std::pair<std::string
     }
 }
 
-// A block's own text under `indent`: the source lines of a paragraph joined and wrapped again to the report's
-// width, the blank line between paragraphs kept, and the `@brief` marker of the first paragraph dropped because
-// the paragraph's place in the report already says what it is.
-void printDescription(std::string_view description, std::string_view indent, bool firstParagraphOnly) {
+// A block's own text as paragraphs: the source lines of a paragraph joined, and the `@brief` marker of the first
+// paragraph dropped because the paragraph's place in the report already says what it is.
+[[nodiscard]] std::vector<std::string> paragraphsOf(std::string_view description) {
     std::vector<std::string> paragraphs;
     std::string              paragraph;
     for (std::size_t start = 0UZ; start <= description.size();) {
@@ -381,7 +408,7 @@ void printDescription(std::string_view description, std::string_view indent, boo
         paragraphs.push_back(std::move(paragraph));
     }
     if (paragraphs.empty()) {
-        return;
+        return paragraphs;
     }
     std::string& first = paragraphs.front();
     if (first.starts_with("@brief ")) {
@@ -392,7 +419,12 @@ void printDescription(std::string_view description, std::string_view indent, boo
             first.pop_back();
         }
     }
-    for (const std::string& text : paragraphs) {
+    return paragraphs;
+}
+
+// a block's own text under `indent`, each paragraph wrapped again to the report's width
+void printDescription(std::string_view description, std::string_view indent, bool firstParagraphOnly) {
+    for (const std::string& text : paragraphsOf(description)) {
         std::print("\n");
         printWrapped(indent, indent, text);
         if (firstParagraphOnly) {
@@ -1016,18 +1048,44 @@ void splitConstantColumns(std::span<const Column> columns, std::vector<std::vect
     }
 }
 
-void printSection(std::string_view indent, std::string_view name, std::string_view constant) {
-    if (constant.empty()) {
-        std::println("{}{}", indent, name);
-        return;
-    }
-    printWrapped(indent, std::format("{}  ", indent), std::format("{} ({})", name, constant));
+// The rows of one table of the report and the columns they stand under, with the columns every row agrees on taken
+// out and written as `header value` pairs in `constant`
+struct Table {
+    std::vector<Column>                   columns;
+    std::vector<std::vector<std::string>> rows;
+    std::string                           constant;
+};
+
+[[nodiscard]] Table tableOf(std::span<const Column> columns, std::vector<std::vector<std::string>> rows) {
+    Table table;
+    table.rows = std::move(rows);
+    splitConstantColumns(columns, table.rows, table.columns, table.constant);
+    return table;
 }
 
-// the ports and the settings of one block: one table for all its instantiations, and under it what only some of
-// them declare
-void printPortsAndSettings(const NamedBlock& block, const TypeParameters& types, std::string_view indent, bool allSettings) {
-    const std::string   inner = std::format("{}  ", indent);
+// the line that names a table, followed by the values its rows share
+[[nodiscard]] std::string sectionLine(std::string_view name, std::string_view constant) { return constant.empty() ? std::string(name) : std::format("{} ({})", name, constant); }
+
+void printSection(std::string_view indent, std::string_view name, std::string_view constant) { printWrapped(indent, std::format("{}  ", indent), sectionLine(name, constant)); }
+
+constexpr std::array<Column, 9> kPortColumns{Column{.header = "port"}, Column{.header = "direction"}, Column{.header = "type"}, Column{.header = "port type", .collapsible = true}, Column{.header = "domain", .collapsible = true}, Column{.header = "sync", .collapsible = true}, Column{.header = "optional", .collapsible = true}, Column{.header = "collection", .collapsible = true}, Column{.header = "samples", .collapsible = true}};
+
+constexpr std::array<Column, 5> kSettingColumns{Column{.header = "setting"}, Column{.header = "type"}, Column{.header = "default"}, Column{.header = "unit", .collapsible = true}, Column{.header = "writable", .collapsible = true}};
+
+constexpr std::array<Column, 3> kDifferenceColumns{Column{.header = "item"}, Column{.header = "name"}, Column{.header = "types"}};
+
+[[nodiscard]] std::string hiddenSettingsLine(std::size_t count) { return std::format("{} settings the framework declares on every block are not shown; --all-settings shows them", count); }
+
+// The ports and the settings of one block: one table for all its instantiations, and a table of what only some of
+// them declare. A scheduler has no port table.
+struct BlockTables {
+    std::optional<Table> ports;
+    Table                settings;
+    std::size_t          hiddenSettings = 0UZ; // the framework's settings left out of `settings`
+    Table                differences;
+};
+
+[[nodiscard]] BlockTables tablesOf(const NamedBlock& block, const TypeParameters& types, bool allSettings) {
     std::vector<Merged> ports;
     std::vector<Merged> settings;
 
@@ -1073,54 +1131,33 @@ void printPortsAndSettings(const NamedBlock& block, const TypeParameters& types,
         mergeCells(settings[i], settingCells[i], types);
     }
 
+    BlockTables tables;
     if (block.instantiations.front().registry == Registry::Blocks) {
-        std::print("\n");
-        if (ports.empty()) {
-            std::println("{}no stream ports", indent);
-        } else {
-            constexpr std::array<Column, 9>       portColumns{Column{.header = "port"}, Column{.header = "direction"}, Column{.header = "type"}, Column{.header = "port type", .collapsible = true}, Column{.header = "domain", .collapsible = true}, Column{.header = "sync", .collapsible = true}, Column{.header = "optional", .collapsible = true}, Column{.header = "collection", .collapsible = true}, Column{.header = "samples", .collapsible = true}};
-            std::vector<std::vector<std::string>> rows;
-            for (const Merged& port : ports) {
-                const std::size_t        tab = port.name.find('\t');
-                std::vector<std::string> row{port.name.substr(tab + 1UZ), port.name.substr(0UZ, tab)};
-                for (const std::string& cell : port.cells) {
-                    row.push_back(cell);
-                }
-                rows.push_back(std::move(row));
-            }
-            std::vector<Column> kept;
-            std::string         constant;
-            splitConstantColumns(portColumns, rows, kept, constant);
-            printSection(indent, "ports", constant);
-            printTable(inner, kept, rows);
-        }
-    }
-
-    std::print("\n");
-    if (settings.empty() && hidden.empty()) {
-        std::println("{}no settings", indent);
-    } else if (!settings.empty()) {
-        constexpr std::array<Column, 5>       settingColumns{Column{.header = "setting"}, Column{.header = "type"}, Column{.header = "default"}, Column{.header = "unit", .collapsible = true}, Column{.header = "writable", .collapsible = true}};
         std::vector<std::vector<std::string>> rows;
-        for (const Merged& setting : settings) {
-            std::vector<std::string> row{setting.name};
-            for (const std::string& cell : setting.cells) {
+        for (const Merged& port : ports) {
+            const std::size_t        tab = port.name.find('\t');
+            std::vector<std::string> row{port.name.substr(tab + 1UZ), port.name.substr(0UZ, tab)};
+            for (const std::string& cell : port.cells) {
                 row.push_back(cell);
             }
             rows.push_back(std::move(row));
         }
-        std::vector<Column> kept;
-        std::string         constant;
-        splitConstantColumns(settingColumns, rows, kept, constant);
-        printSection(indent, "settings", constant);
-        printTable(inner, kept, rows);
-    }
-    if (!hidden.empty()) {
-        printWrapped(indent, indent, std::format("{} settings the framework declares on every block are not shown; --all-settings shows them", hidden.size()));
+        tables.ports = tableOf(kPortColumns, std::move(rows));
     }
 
-    std::vector<std::vector<std::string>> differences;
-    auto                                  difference = [&block, &differences](std::string_view what, const Merged& item) {
+    std::vector<std::vector<std::string>> rows;
+    for (const Merged& setting : settings) {
+        std::vector<std::string> row{setting.name};
+        for (const std::string& cell : setting.cells) {
+            row.push_back(cell);
+        }
+        rows.push_back(std::move(row));
+    }
+    tables.settings       = tableOf(kSettingColumns, std::move(rows));
+    tables.hiddenSettings = hidden.size();
+
+    tables.differences.columns.assign(kDifferenceColumns.begin(), kDifferenceColumns.end());
+    auto difference = [&block, &tables](std::string_view what, const Merged& item) {
         if (item.declaredBy.size() == block.instantiations.size()) {
             return;
         }
@@ -1130,7 +1167,7 @@ void printPortsAndSettings(const NamedBlock& block, const TypeParameters& types,
             declared += parameterList(block.instantiations[i]);
         }
         const std::size_t tab = item.name.find('\t');
-        differences.push_back({std::string(what), tab == std::string::npos ? item.name : item.name.substr(tab + 1UZ), declared});
+        tables.differences.rows.push_back({std::string(what), tab == std::string::npos ? item.name : item.name.substr(tab + 1UZ), declared});
     };
     for (const Merged& port : ports) {
         difference("port", port);
@@ -1138,21 +1175,43 @@ void printPortsAndSettings(const NamedBlock& block, const TypeParameters& types,
     for (const Merged& setting : settings) {
         difference("setting", setting);
     }
-    if (!differences.empty()) {
+    return tables;
+}
+
+void printPortsAndSettings(const BlockTables& tables, std::string_view indent) {
+    const std::string inner = std::format("{}  ", indent);
+    if (tables.ports.has_value()) {
+        std::print("\n");
+        if (tables.ports->rows.empty()) {
+            std::println("{}no stream ports", indent);
+        } else {
+            printSection(indent, "ports", tables.ports->constant);
+            printTable(inner, tables.ports->columns, tables.ports->rows);
+        }
+    }
+
+    std::print("\n");
+    if (tables.settings.rows.empty() && tables.hiddenSettings == 0UZ) {
+        std::println("{}no settings", indent);
+    } else if (!tables.settings.rows.empty()) {
+        printSection(indent, "settings", tables.settings.constant);
+        printTable(inner, tables.settings.columns, tables.settings.rows);
+    }
+    if (tables.hiddenSettings != 0UZ) {
+        printWrapped(indent, indent, hiddenSettingsLine(tables.hiddenSettings));
+    }
+
+    if (!tables.differences.rows.empty()) {
         std::print("\n");
         std::println("{}declared by some types only", indent);
-        constexpr std::array<Column, 3> columns{Column{.header = "item"}, Column{.header = "name"}, Column{.header = "types"}};
-        printTable(inner, columns, differences);
+        printTable(inner, tables.differences.columns, tables.differences.rows);
     }
 }
 
-// One block, whatever the number of its instantiations: what it is, what its text says, its ports and its
-// settings, each once. `qualified` names the block in full where no family heading stands above it.
-void printBlock(const NamedBlock& block, std::string_view indent, bool qualified, bool wholeDescription, bool allSettings) {
-    const TypeParameters types  = typeParametersOf(block);
-    const std::string    detail = std::format("{}  ", indent);
-    std::println("{}{}", indent, headingOf(block, types, qualified));
-
+// The facts of one block as `name  value` pairs: the file it came from, its types, its category, the type it is an
+// alias of, and the error its settings gave, if any. A block that could not be read has its error in place of the
+// category.
+[[nodiscard]] std::vector<std::pair<std::string, std::string>> factsOf(const NamedBlock& block) {
     std::vector<std::pair<std::string, std::string>> facts;
     facts.emplace_back("library", block.file.empty() ? std::string(nameOf(block.origin)) : std::format("{} ({})", std::filesystem::path(block.file).filename().string(), nameOf(block.origin)));
     if (block.instantiations.size() > 1UZ) {
@@ -1166,8 +1225,7 @@ void printBlock(const NamedBlock& block, std::string_view indent, bool qualified
     const Instantiation& first = block.instantiations.front();
     if (!first.error.empty()) {
         facts.emplace_back("error", first.error);
-        printFacts(detail, facts, Break::BetweenTypes);
-        return;
+        return facts;
     }
     if (first.registry == Registry::Blocks) {
         facts.emplace_back("category", std::format("{}, UI {}", first.blockCategory, first.uiCategory));
@@ -1181,13 +1239,23 @@ void printBlock(const NamedBlock& block, std::string_view indent, bool qualified
     if (!first.settingsError.empty()) {
         facts.emplace_back("settings error", first.settingsError);
     }
-    printFacts(detail, facts, Break::BetweenTypes);
+    return facts;
+}
 
-    if (!first.detailed) {
+// One block, whatever the number of its instantiations: what it is, what its text says, its ports and its
+// settings, each once. `qualified` names the block in full where no family heading stands above it.
+void printBlock(const NamedBlock& block, std::string_view indent, bool qualified, bool wholeDescription, bool allSettings) {
+    const TypeParameters types  = typeParametersOf(block);
+    const std::string    detail = std::format("{}  ", indent);
+    std::println("{}{}", indent, headingOf(block, types, qualified));
+    printFacts(detail, factsOf(block), Break::BetweenTypes);
+
+    const Instantiation& first = block.instantiations.front();
+    if (!first.error.empty() || !first.detailed) {
         return;
     }
     printDescription(first.description, detail, !wholeDescription);
-    printPortsAndSettings(block, types, detail, allSettings);
+    printPortsAndSettings(tablesOf(block, types, allSettings), detail);
 }
 
 struct JsonWriter {
@@ -1547,10 +1615,8 @@ void reportVersionAsJson(const Context& context) {
     return directories;
 }
 
-void reportVersion(const Context& context) {
-    std::println("GNU Radio 4 {}", GR_TOOLS_CORE_VERSION);
-    std::print("\n");
-
+// what this build of the framework is and where this installation keeps its plugins and its cache
+[[nodiscard]] std::vector<std::pair<std::string, std::string>> frameworkFacts() {
     std::vector<std::pair<std::string, std::string>> facts;
 #ifdef GR_ENABLE_BLOCK_REGISTRY
     facts.emplace_back("block registry", "enabled");
@@ -1566,40 +1632,100 @@ void reportVersion(const Context& context) {
     facts.emplace_back("install prefix", GR_TOOLS_INSTALLED_PREFIX);
     facts.emplace_back("plugin directory", underPrefix(GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY, GR_TOOLS_INSTALLED_PREFIX));
     facts.emplace_back("data cache", dataCacheFact(gr::dataCacheDirectory()));
-    printFacts("  ", facts);
+    return facts;
+}
+
+constexpr std::array<Column, 3> kDirectoryColumns{Column{.header = "directory"}, Column{.header = "origin"}, Column{.header = "result"}};
+
+[[nodiscard]] std::vector<std::vector<std::string>> directoryRows(const Context& context) {
+    std::vector<std::vector<std::string>> rows;
+    rows.reserve(context.directories.size());
+    for (const Directory& directory : context.directories) {
+        rows.push_back({directory.path, directory.origin, directory.present ? "searched" : "not a directory"});
+    }
+    return rows;
+}
+
+constexpr std::array<Column, 4> kFileColumns{Column{.header = "library"}, Column{.header = "kind", .collapsible = true}, Column{.header = "blocks", .align = Align::Right}, Column{.header = "schedulers", .align = Align::Right}};
+
+// the files of one directory by their names, with the counts of what each registered
+[[nodiscard]] Table fileTable(std::span<const FileFact* const> files) {
+    std::vector<std::vector<std::string>> rows;
+    rows.reserve(files.size());
+    for (const FileFact* file : files) {
+        rows.push_back({std::filesystem::path(file->file).filename().string(), std::string(nameOf(file->kind)), file->reason.empty() ? std::to_string(file->blockRegistrations) : "-", file->reason.empty() ? std::to_string(file->schedulerRegistrations) : "-"});
+    }
+    return tableOf(kFileColumns, std::move(rows));
+}
+
+// `file: reason` for each file of one directory that did not load
+[[nodiscard]] std::vector<std::string> refusals(std::span<const FileFact* const> files) {
+    std::vector<std::string> lines;
+    for (const FileFact* file : files) {
+        if (!file->reason.empty()) {
+            lines.push_back(std::format("{}: {}", std::filesystem::path(file->file).filename().string(), file->reason));
+        }
+    }
+    return lines;
+}
+
+constexpr std::array<Column, 5> kPluginColumns{Column{.header = "plugin"}, Column{.header = "version"}, Column{.header = "license"}, Column{.header = "blocks", .align = Align::Right}, Column{.header = "schedulers", .align = Align::Right}};
+
+[[nodiscard]] std::vector<std::vector<std::string>> pluginRows(const Context& context) {
+    std::vector<std::vector<std::string>> rows;
+    rows.reserve(context.plugins.size());
+    for (const PluginFact& plugin : context.plugins) {
+        rows.push_back({plugin.name, plugin.version, plugin.license, std::to_string(plugin.blocks), std::to_string(plugin.schedulers)});
+    }
+    return rows;
+}
+
+[[nodiscard]] std::vector<std::pair<std::string, std::string>> versionTotals(const Context& context) {
+    return {
+        {"block keys", std::to_string(context.totals.blockKeys)},
+        {"block families", std::to_string(context.totals.blockFamilies)},
+        {"scheduler keys", std::to_string(context.totals.schedulerKeys)},
+        {"libraries", std::to_string(context.totals.blockLibraries)},
+        {"plugins", std::to_string(context.totals.plugins)},
+        {"files not loaded", std::to_string(context.totals.filesNotLoaded)},
+        {"files not opened", std::to_string(context.totals.filesNotOpened)},
+    };
+}
+
+// the totals as a table of two columns without a header line, the counts aligned on their last digit
+void printTotals(const std::vector<std::pair<std::string, std::string>>& totals) {
+    std::print("\n");
+    std::println("totals");
+    constexpr std::array<Column, 2>       totalColumns{Column{.header = ""}, Column{.header = "", .align = Align::Right}};
+    std::vector<std::vector<std::string>> rows;
+    rows.reserve(totals.size());
+    for (const auto& [name, count] : totals) {
+        rows.push_back({name, count});
+    }
+    printTable("  ", totalColumns, rows);
+}
+
+void reportVersion(const Context& context) {
+    std::println("GNU Radio 4 {}", GR_TOOLS_CORE_VERSION);
+    std::print("\n");
+    printFacts("  ", frameworkFacts());
 
     std::print("\n");
     std::println("search path");
-    std::vector<std::vector<std::string>> directoryRows;
-    directoryRows.reserve(context.directories.size());
-    for (const Directory& directory : context.directories) {
-        directoryRows.push_back({directory.path, directory.origin, directory.present ? "searched" : "not a directory"});
-    }
-    constexpr std::array<Column, 3> directoryColumns{Column{.header = "directory"}, Column{.header = "origin"}, Column{.header = "result"}};
-    printTable("  ", directoryColumns, directoryRows);
+    printTable("  ", kDirectoryColumns, directoryRows(context));
 
     if (!context.files.empty()) {
         std::print("\n");
         std::println("libraries");
         for (const auto& [directory, files] : byDirectory(context.files)) {
             std::println("  {}", fit(directory, kWidth - 2UZ));
-            std::vector<std::vector<std::string>> rows;
-            rows.reserve(files.size());
-            for (const FileFact* file : files) {
-                rows.push_back({std::filesystem::path(file->file).filename().string(), std::string(nameOf(file->kind)), file->reason.empty() ? std::to_string(file->blockRegistrations) : "-", file->reason.empty() ? std::to_string(file->schedulerRegistrations) : "-"});
+            const Table table = fileTable(files);
+            if (!table.constant.empty()) {
+                printWrapped("    ", "    ", std::format("({})", table.constant));
             }
-            std::vector<Column>             kept;
-            std::string                     constant;
-            constexpr std::array<Column, 4> fileColumns{Column{.header = "library"}, Column{.header = "kind", .collapsible = true}, Column{.header = "blocks", .align = Align::Right}, Column{.header = "schedulers", .align = Align::Right}};
-            splitConstantColumns(fileColumns, rows, kept, constant);
-            if (!constant.empty()) {
-                printWrapped("    ", "    ", std::format("({})", constant));
-            }
-            printTable("    ", kept, rows);
-            for (const FileFact* file : files) {
-                if (!file->reason.empty()) {
-                    printWrapped("    ", "      ", std::format("{}: {}", std::filesystem::path(file->file).filename().string(), file->reason));
-                }
+            printTable("    ", table.columns, table.rows);
+            for (const std::string& refusal : refusals(files)) {
+                printWrapped("    ", "      ", refusal);
             }
         }
     }
@@ -1607,13 +1733,7 @@ void reportVersion(const Context& context) {
     if (!context.plugins.empty()) {
         std::print("\n");
         std::println("plugins");
-        std::vector<std::vector<std::string>> pluginRows;
-        pluginRows.reserve(context.plugins.size());
-        for (const PluginFact& plugin : context.plugins) {
-            pluginRows.push_back({plugin.name, plugin.version, plugin.license, std::to_string(plugin.blocks), std::to_string(plugin.schedulers)});
-        }
-        constexpr std::array<Column, 5> pluginColumns{Column{.header = "plugin"}, Column{.header = "version"}, Column{.header = "license"}, Column{.header = "blocks", .align = Align::Right}, Column{.header = "schedulers", .align = Align::Right}};
-        printTable("  ", pluginColumns, pluginRows);
+        printTable("  ", kPluginColumns, pluginRows(context));
     }
 
     if (!context.schedulers.empty()) {
@@ -1624,19 +1744,7 @@ void reportVersion(const Context& context) {
         }
     }
 
-    std::print("\n");
-    std::println("totals");
-    constexpr std::array<Column, 2>             totalColumns{Column{.header = ""}, Column{.header = "", .align = Align::Right}};
-    const std::vector<std::vector<std::string>> totalRows{
-        {"block keys", std::to_string(context.totals.blockKeys)},
-        {"block families", std::to_string(context.totals.blockFamilies)},
-        {"scheduler keys", std::to_string(context.totals.schedulerKeys)},
-        {"libraries", std::to_string(context.totals.blockLibraries)},
-        {"plugins", std::to_string(context.totals.plugins)},
-        {"files not loaded", std::to_string(context.totals.filesNotLoaded)},
-        {"files not opened", std::to_string(context.totals.filesNotOpened)},
-    };
-    printTable("  ", totalColumns, totalRows);
+    printTotals(versionTotals(context));
 }
 
 // a block's name and the type parameters of its instantiations after it, the list carried on under the name where
@@ -1732,6 +1840,184 @@ void printLibraries(const std::vector<Library>& libraries, bool detailed, bool a
     }
 }
 
+using gr::tools::DocWriter;
+
+// The Markdown and HTML forms of the report. They carry what the text report prints, from the same facts and the same
+// tables, as headings, lists and tables. A value is never cut, because a document has no line width.
+[[nodiscard]] DocWriter documentFor(Form form, std::string title) { return DocWriter(form == Form::Html ? gr::tools::Format::Html : gr::tools::Format::Markdown, std::move(title)); }
+
+[[nodiscard]] std::vector<std::string_view> headersOf(std::span<const Column> columns) {
+    std::vector<std::string_view> headers;
+    headers.reserve(columns.size());
+    for (const Column& column : columns) {
+        headers.push_back(column.header);
+    }
+    return headers;
+}
+
+void writeTable(DocWriter& document, std::span<const Column> columns, std::span<const std::vector<std::string>> rows) { document.table(headersOf(columns), rows); }
+
+// one `name: value` item per fact
+void writeFacts(DocWriter& document, const std::vector<std::pair<std::string, std::string>>& facts) {
+    std::vector<std::string> items;
+    items.reserve(facts.size());
+    for (const auto& [name, value] : facts) {
+        items.push_back(document.labeled(name, value));
+    }
+    document.rawBullets(items);
+}
+
+void writeTotals(DocWriter& document, const std::vector<std::pair<std::string, std::string>>& totals) {
+    document.heading(2UZ, "Totals", document.anchor("totals"));
+    writeFacts(document, totals);
+}
+
+// one block as a section under a heading of `level`
+void documentBlock(DocWriter& document, const NamedBlock& block, std::size_t level, std::string_view anchorName, bool qualified, bool wholeDescription, bool allSettings) {
+    const TypeParameters types = typeParametersOf(block);
+    document.heading(level, headingOf(block, types, qualified), anchorName);
+    writeFacts(document, factsOf(block));
+
+    const Instantiation& first = block.instantiations.front();
+    if (!first.error.empty() || !first.detailed) {
+        return;
+    }
+    for (const std::string& paragraph : paragraphsOf(first.description)) {
+        document.paragraph(paragraph);
+        if (!wholeDescription) {
+            break;
+        }
+    }
+
+    const BlockTables tables = tablesOf(block, types, allSettings);
+    if (tables.ports.has_value()) {
+        if (tables.ports->rows.empty()) {
+            document.paragraph("no stream ports");
+        } else {
+            document.paragraph(sectionLine("ports", tables.ports->constant));
+            writeTable(document, tables.ports->columns, tables.ports->rows);
+        }
+    }
+    if (tables.settings.rows.empty() && tables.hiddenSettings == 0UZ) {
+        document.paragraph("no settings");
+    } else if (!tables.settings.rows.empty()) {
+        document.paragraph(sectionLine("settings", tables.settings.constant));
+        writeTable(document, tables.settings.columns, tables.settings.rows);
+    }
+    if (tables.hiddenSettings != 0UZ) {
+        document.paragraph(hiddenSettingsLine(tables.hiddenSettings));
+    }
+    if (!tables.differences.rows.empty()) {
+        document.paragraph("declared by some types only");
+        writeTable(document, tables.differences.columns, tables.differences.rows);
+    }
+}
+
+// A section per library and in it one per family. Each family is a table of its entries. With `detailed`, each entry
+// has a section of its own, and the document opens with a link to every entry's section.
+void documentLibraries(DocWriter& document, const std::vector<Library>& libraries, bool detailed, bool allSettings) {
+    std::vector<std::string> anchors; // one per entry, in the order of their sections
+    if (detailed) {
+        std::vector<std::string> links;
+        for (const Library& library : libraries) {
+            for (const Family& family : library.families) {
+                for (const NamedBlock& block : family.blocks) {
+                    const std::string name = headingOf(block, typeParametersOf(block), true);
+                    anchors.push_back(document.anchor(family.name.empty() ? block.name : std::format("{}::{}", family.name, block.name)));
+                    links.push_back(document.link(name, anchors.back()));
+                }
+            }
+        }
+        document.rawBullets(links);
+    }
+
+    std::size_t entry = 0UZ;
+    for (const Library& library : libraries) {
+        const std::string name      = library.file.empty() ? std::string(nameOf(library.origin)) : std::filesystem::path(library.file).filename().string();
+        const std::string directory = std::filesystem::path(library.file).parent_path().string();
+        document.heading(2UZ, name, document.anchor(name));
+        writeFacts(document, {{"directory", directory.empty() ? "not attributed" : directory}, {"origin", std::string(nameOf(library.origin))}, {"keys", std::to_string(library.keys)}});
+        for (const Family& family : library.families) {
+            const std::string familyName = family.name.empty() ? "(no namespace)" : family.name;
+            document.heading(3UZ, familyName, document.anchor(std::format("{} {}", name, familyName)));
+            if (detailed) {
+                for (const NamedBlock& block : family.blocks) {
+                    documentBlock(document, block, 4UZ, anchors[entry++], false, false, allSettings);
+                }
+                continue;
+            }
+            std::vector<std::vector<std::string>> rows;
+            rows.reserve(family.blocks.size());
+            for (const NamedBlock& block : family.blocks) {
+                std::string list;
+                for (const Instantiation& fact : block.instantiations) {
+                    if (!fact.parameters.empty()) {
+                        list += list.empty() ? "" : " ";
+                        list += parameterList(fact);
+                    }
+                }
+                rows.push_back({block.name, std::move(list)});
+            }
+            constexpr std::array<Column, 2> blockColumns{Column{.header = "block"}, Column{.header = "types"}};
+            writeTable(document, blockColumns, rows);
+        }
+    }
+}
+
+void documentVersion(DocWriter& document, const Context& context) {
+    document.paragraph(std::format("GNU Radio 4 {}", GR_TOOLS_CORE_VERSION));
+    writeFacts(document, frameworkFacts());
+
+    document.heading(2UZ, "Search path", document.anchor("search path"));
+    writeTable(document, kDirectoryColumns, directoryRows(context));
+
+    if (!context.files.empty()) {
+        document.heading(2UZ, "Libraries", document.anchor("libraries"));
+        for (const auto& [directory, files] : byDirectory(context.files)) {
+            document.heading(3UZ, directory, document.anchor(directory));
+            const Table table = fileTable(files);
+            document.paragraph(table.constant);
+            writeTable(document, table.columns, table.rows);
+            std::vector<std::string> items;
+            for (const std::string& refusal : refusals(files)) {
+                items.push_back(document.text(refusal));
+            }
+            document.rawBullets(items);
+        }
+    }
+
+    if (!context.plugins.empty()) {
+        document.heading(2UZ, "Plugins", document.anchor("plugins"));
+        writeTable(document, kPluginColumns, pluginRows(context));
+    }
+
+    if (!context.schedulers.empty()) {
+        document.heading(2UZ, "Schedulers", document.anchor("schedulers"));
+        std::vector<std::string> items;
+        for (const std::string& scheduler : context.schedulers) {
+            items.push_back(document.text(scheduler));
+        }
+        document.rawBullets(items);
+    }
+
+    writeTotals(document, versionTotals(context));
+}
+
+[[nodiscard]] std::vector<std::pair<std::string, std::string>> blockTotals(const Context& context, const std::vector<Library>& libraries) {
+    return {
+        {"block keys", std::to_string(context.totals.blockKeys)},
+        {"block families", std::to_string(context.totals.blockFamilies)},
+        {"libraries", std::to_string(libraries.size())},
+    };
+}
+
+[[nodiscard]] std::vector<std::pair<std::string, std::string>> schedulerTotals(const Context& context, const std::vector<Library>& libraries) {
+    return {
+        {"scheduler keys", std::to_string(context.totals.schedulerKeys)},
+        {"libraries", std::to_string(libraries.size())},
+    };
+}
+
 void reportBlocks(Context& context, const Options& options) {
     std::vector<Instantiation> facts;
     facts.reserve(context.keys.size());
@@ -1740,7 +2026,7 @@ void reportBlocks(Context& context, const Options& options) {
     }
     const std::vector<Library> libraries = group(std::move(facts));
 
-    if (options.json) {
+    if (options.form == Form::Json) {
         JsonWriter json;
         json.beginObject();
         json.count("schema", 2UZ);
@@ -1751,18 +2037,16 @@ void reportBlocks(Context& context, const Options& options) {
         std::println("{}", json.text);
         return;
     }
+    if (options.form != Form::Text) {
+        DocWriter document = documentFor(options.form, "grinfo blocks");
+        documentLibraries(document, libraries, options.verbose, options.allSettings);
+        writeTotals(document, blockTotals(context, libraries));
+        std::print("{}", document.finish());
+        return;
+    }
 
     printLibraries(libraries, options.verbose, options.allSettings);
-
-    std::print("\n");
-    std::println("totals");
-    constexpr std::array<Column, 2>             totalColumns{Column{.header = ""}, Column{.header = "", .align = Align::Right}};
-    const std::vector<std::vector<std::string>> totalRows{
-        {"block keys", std::to_string(context.totals.blockKeys)},
-        {"block families", std::to_string(context.totals.blockFamilies)},
-        {"libraries", std::to_string(libraries.size())},
-    };
-    printTable("  ", totalColumns, totalRows);
+    printTotals(blockTotals(context, libraries));
 }
 
 void reportSchedulers(Context& context, const Options& options) {
@@ -1773,7 +2057,7 @@ void reportSchedulers(Context& context, const Options& options) {
     }
     const std::vector<Library> libraries = group(std::move(facts));
 
-    if (options.json) {
+    if (options.form == Form::Json) {
         JsonWriter json;
         json.beginObject();
         json.count("schema", 2UZ);
@@ -1784,17 +2068,16 @@ void reportSchedulers(Context& context, const Options& options) {
         std::println("{}", json.text);
         return;
     }
+    if (options.form != Form::Text) {
+        DocWriter document = documentFor(options.form, "grinfo schedulers");
+        documentLibraries(document, libraries, true, options.allSettings);
+        writeTotals(document, schedulerTotals(context, libraries));
+        std::print("{}", document.finish());
+        return;
+    }
 
     printLibraries(libraries, true, options.allSettings);
-
-    std::print("\n");
-    std::println("totals");
-    constexpr std::array<Column, 2>             totalColumns{Column{.header = ""}, Column{.header = "", .align = Align::Right}};
-    const std::vector<std::vector<std::string>> totalRows{
-        {"scheduler keys", std::to_string(context.totals.schedulerKeys)},
-        {"libraries", std::to_string(libraries.size())},
-    };
-    printTable("  ", totalColumns, totalRows);
+    printTotals(schedulerTotals(context, libraries));
 }
 
 // 0 when the name selected something, 1 when nothing of that name is registered
@@ -1823,7 +2106,7 @@ void reportSchedulers(Context& context, const Options& options) {
         }
     }
 
-    if (options.json) {
+    if (options.form == Form::Json) {
         JsonWriter json;
         json.beginObject();
         json.count("schema", 2UZ);
@@ -1837,6 +2120,14 @@ void reportSchedulers(Context& context, const Options& options) {
         json.endArray();
         json.endObject();
         std::println("{}", json.text);
+        return 0;
+    }
+    if (options.form != Form::Text) {
+        DocWriter document = documentFor(options.form, std::format("grinfo block {}", wanted));
+        for (const NamedBlock& block : blocks) {
+            documentBlock(document, block, 2UZ, document.anchor(std::format("{}::{}", block.family, block.name)), true, true, options.allSettings);
+        }
+        std::print("{}", document.finish());
         return 0;
     }
 
@@ -1930,8 +2221,12 @@ int main(int argc, char** argv) {
 
     switch (options.command) {
     case Command::Version:
-        if (options.json) {
+        if (options.form == Form::Json) {
             reportVersionAsJson(context);
+        } else if (options.form != Form::Text) {
+            DocWriter document = documentFor(options.form, "grinfo version");
+            documentVersion(document, context);
+            std::print("{}", document.finish());
         } else {
             reportVersion(context);
         }
