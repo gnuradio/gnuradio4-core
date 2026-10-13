@@ -68,6 +68,11 @@ sets another path at configure time, and the `GR_DATA_CACHE_DIR` environment
 variable overrides the path at run time. A package build should set
 `CMAKE_INSTALL_PREFIX` to its `CPACK_PACKAGING_INSTALL_PREFIX`, so the
 package compiles the data cache path of the prefix it installs to.
+When the running user cannot use the compiled directory, the loader uses the
+user's cache directory, `gnuradio4/cache` under `$XDG_CACHE_HOME` or else
+under `$HOME/.cache`, and prints a note that names it and the reason. With
+neither directory, caching is off. An empty `GR_DATA_CACHE_DIR` environment
+variable counts as unset. `grinfo version` reports the directory in use.
 
 Downstream repositories should configure with:
 

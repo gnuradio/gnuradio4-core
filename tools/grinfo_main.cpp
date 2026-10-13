@@ -546,6 +546,17 @@ enum class FileKind : std::uint8_t { BlockLibrary, NotLoaded, NotOpened };
     std::unreachable();
 }
 
+[[nodiscard]] std::string_view nameOf(gr::DataCacheDirectory::Origin origin) {
+    using enum gr::DataCacheDirectory::Origin;
+    switch (origin) {
+    case Environment: return "environment";
+    case Compiled: return "compiled";
+    case User: return "user";
+    case None: return "none";
+    }
+    std::unreachable();
+}
+
 // one file a plugin directory held
 struct FileFact {
     std::string file;
@@ -1443,7 +1454,11 @@ void reportVersionAsJson(const Context& context) {
     json.member("compilerVersion", CXX_COMPILER_VERSION);
     json.member("installPrefix", GR_TOOLS_INSTALLED_PREFIX);
     json.member("installedPluginDirectory", GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY);
-    json.member("dataCacheDirectory", GR_DATA_CACHE_DIR);
+    const gr::DataCacheDirectory dataCache = gr::dataCacheDirectory();
+    json.member("dataCacheDirectory", dataCache.path);
+    json.member("dataCacheOrigin", nameOf(dataCache.origin));
+    json.member("compiledDataCacheDirectory", dataCache.compiled);
+    json.member("whyNotCompiledDataCacheDirectory", dataCache.whyNotCompiled);
     json.endObject();
 
     json.key("directories");
@@ -1504,6 +1519,19 @@ void reportVersionAsJson(const Context& context) {
     return rest.empty() ? std::string(".") : std::string(rest);
 }
 
+// The data cache directory in use for the report, with what chose it when that is not the compiled path: the
+// environment variable, or the user's cache directory and why the compiled one cannot be used.
+[[nodiscard]] std::string dataCacheFact(const gr::DataCacheDirectory& dataCache) {
+    using enum gr::DataCacheDirectory::Origin;
+    switch (dataCache.origin) {
+    case Environment: return std::format("{}, from GR_DATA_CACHE_DIR", dataCache.path);
+    case Compiled: return underPrefix(dataCache.path, GR_TOOLS_INSTALLED_PREFIX);
+    case User: return std::format("{}, the user's cache directory; the compiled {} cannot be used: {}", dataCache.path, dataCache.compiled, dataCache.whyNotCompiled);
+    case None: break;
+    }
+    return std::format("none, caching is off; the compiled {} cannot be used: {}; {}", dataCache.compiled, dataCache.whyNotCompiled, dataCache.user.empty() ? dataCache.whyNotUser : std::format("the user's {} cannot be used: {}", dataCache.user, dataCache.whyNotUser));
+}
+
 // the files of one directory under the directory's own line, by the name that tells them apart
 [[nodiscard]] std::vector<std::pair<std::string, std::vector<const FileFact*>>> byDirectory(const std::vector<FileFact>& files) {
     std::vector<std::pair<std::string, std::vector<const FileFact*>>> directories;
@@ -1537,7 +1565,7 @@ void reportVersion(const Context& context) {
     facts.emplace_back("compiler", std::format("{} {}", CXX_COMPILER_ID, CXX_COMPILER_VERSION));
     facts.emplace_back("install prefix", GR_TOOLS_INSTALLED_PREFIX);
     facts.emplace_back("plugin directory", underPrefix(GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY, GR_TOOLS_INSTALLED_PREFIX));
-    facts.emplace_back("data cache", underPrefix(GR_DATA_CACHE_DIR, GR_TOOLS_INSTALLED_PREFIX));
+    facts.emplace_back("data cache", dataCacheFact(gr::dataCacheDirectory()));
     printFacts("  ", facts);
 
     std::print("\n");

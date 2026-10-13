@@ -4,9 +4,13 @@
 #include <array>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <format>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #ifndef _WIN32
@@ -74,6 +78,33 @@ enum class Streams { both, standardOutput };
 #endif
     return result;
 }
+
+// sets or clears one environment variable for the programs a case runs, and puts back the value it found
+class EnvironmentVariable {
+    std::string                _name;
+    std::optional<std::string> _found;
+
+public:
+    EnvironmentVariable(std::string name, const std::optional<std::string>& value) : _name(std::move(name)) {
+        if (const char* found = std::getenv(_name.c_str()); found != nullptr) {
+            _found = found;
+        }
+        if (value.has_value()) {
+            ::setenv(_name.c_str(), value->c_str(), 1);
+        } else {
+            ::unsetenv(_name.c_str());
+        }
+    }
+    ~EnvironmentVariable() {
+        if (_found.has_value()) {
+            ::setenv(_name.c_str(), _found->c_str(), 1);
+        } else {
+            ::unsetenv(_name.c_str());
+        }
+    }
+    EnvironmentVariable(const EnvironmentVariable&)            = delete;
+    EnvironmentVariable& operator=(const EnvironmentVariable&) = delete;
+};
 
 // whether `text` is exactly one JSON document. The document opens the text. Every bracket outside a string closes in
 // order. Only white space follows the document.
@@ -208,6 +239,28 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         expect(!isOneJsonDocument("{\"a\": 1}\n{\"b\": 2}\n")) << "a second document";
         expect(!isOneJsonDocument("{\"a\": 1}\ntrailing\n")) << "a line after the document";
         expect(!isOneJsonDocument("{\"a\": 1")) << "a document left open";
+    };
+
+    "version reports the data cache directory in use, the one GR_DATA_CACHE_DIR names when it is set"_test = [] {
+        const std::string named = (std::filesystem::temp_directory_path() / "gr4_qa_grinfo_cache").string();
+        {
+            const EnvironmentVariable unset("GR_DATA_CACHE_DIR", std::nullopt);
+            const Result              compiled = run({"version", "--json"});
+            expect(eq(compiled.exitCode, 0)) << compiled.output;
+            expect(compiled.output.contains("\"dataCacheOrigin\": \"")) << "the instrument: the report names an origin" << compiled.output;
+            expect(!compiled.output.contains("\"dataCacheOrigin\": \"environment\"")) << "without the variable the origin is not the environment" << compiled.output;
+            expect(!compiled.output.contains(named)) << compiled.output;
+        }
+
+        const EnvironmentVariable variable("GR_DATA_CACHE_DIR", named);
+        const Result              json = run({"version", "--json"});
+        expect(eq(json.exitCode, 0)) << json.output;
+        expect(json.output.contains(std::format("\"dataCacheDirectory\": \"{}\"", named))) << json.output;
+        expect(json.output.contains("\"dataCacheOrigin\": \"environment\"")) << json.output;
+
+        const Result text = run({"version"});
+        expect(eq(text.exitCode, 0)) << text.output;
+        expect(text.output.contains(std::format("{}, from GR_DATA_CACHE_DIR", named))) << text.output;
     };
 
 #ifdef GR_TOOLS_CORE_TEST_PLUGINS

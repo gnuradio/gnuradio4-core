@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -35,6 +36,29 @@ using namespace std::string_view_literals;
 
 // Forward declaration needed for instantiateBlockFromYamlDefinition before PluginLoader is fully defined.
 class PluginLoader;
+
+/// The data cache directory in use, its origin, and the reason for each directory passed over.
+struct DataCacheDirectory {
+    enum class Origin : std::uint8_t { Environment, Compiled, User, None };
+
+    std::string path; ///< the directory in use, empty with Origin::None
+    Origin      origin = Origin::None;
+    std::string compiled;       ///< the directory compiled in
+    std::string whyNotCompiled; ///< why the compiled directory cannot be used, empty when it was not passed over
+    std::string user;           ///< the user's cache directory, empty when it was not tried
+    std::string whyNotUser;     ///< why the user's cache directory cannot be used, empty when it was not passed over
+};
+
+/**
+ * @brief The data cache directory the plugin loader keeps remote assets in.
+ *
+ * The GR_DATA_CACHE_DIR environment variable names it when set and not empty. Otherwise it is `compiled` when that
+ * directory exists and is writable or can be made, and the user's cache directory when that one can: `gnuradio4/cache`
+ * under `$XDG_CACHE_HOME` when that is an absolute path, else under `$HOME/.cache`. With neither, caching is off. A
+ * missing directory can be made when its nearest existing ancestor is a directory the process may write to. A path
+ * through a broken symbolic link cannot be made. The call makes nothing; the loader makes the directory on first use.
+ */
+[[nodiscard]] DataCacheDirectory dataCacheDirectory(std::string_view compiled = GR_DATA_CACHE_DIR);
 
 namespace detail {
 
@@ -91,14 +115,8 @@ struct YamlDefinitionsLoader {
         gr_plugin_metadata metadata;
     };
 
-    /// the data cache directory: the GR_DATA_CACHE_DIR environment variable when set, else the path compiled in
-    static std::string assetsCacheDir() {
-        if (const char* env = ::getenv("GR_DATA_CACHE_DIR"); env != nullptr) {
-            return std::string(env);
-        } else {
-            return std::string(GR_DATA_CACHE_DIR);
-        }
-    }
+    /// the data cache directory in use, as dataCacheDirectory() chooses it; empty when caching is off
+    static std::string assetsCacheDir() { return dataCacheDirectory().path; }
 
     std::unordered_map<std::string, Definition> _definitionForBlockName;
 
@@ -110,17 +128,26 @@ struct YamlDefinitionsLoader {
     explicit YamlDefinitionsLoader(std::span<const std::string> uris) { loadBlockDefinitions(uris); }
 
     void loadBlockDefinitions(std::span<const std::string> uris) {
-        const auto cacheDir = std::filesystem::path(assetsCacheDir()) / "asset_cache";
-        // the directory is made on first use, so a run that reaches no remote asset makes none and
+        // the directory is chosen and made on first use, so a run that reaches no remote asset makes none and
         // says nothing about a cache it never needed
-        std::optional<bool> cacheReady;
-        auto                cacheAvailable = [&] {
+        std::filesystem::path cacheDir;
+        std::optional<bool>   cacheReady;
+        auto                  cacheAvailable = [&] {
             if (!cacheReady.has_value()) {
+                const DataCacheDirectory chosen = dataCacheDirectory();
+                if (chosen.path.empty()) {
+                    cacheReady = false;
+                    std::println(stderr, "warning: no plugin cache directory can be used ({} cannot be used: {}; {}); caching disabled; set GR_DATA_CACHE_DIR to a writable directory", chosen.compiled, chosen.whyNotCompiled, chosen.user.empty() ? chosen.whyNotUser : std::format("{} cannot be used: {}", chosen.user, chosen.whyNotUser));
+                    return false;
+                }
+                cacheDir = std::filesystem::path(chosen.path) / "asset_cache";
                 std::error_code createEc;
                 std::filesystem::create_directories(cacheDir, createEc);
                 cacheReady = !createEc && std::filesystem::is_directory(cacheDir);
                 if (!*cacheReady) {
-                    std::println("warning: plugin cache directory {} cannot be made ({}); caching disabled; set GR_DATA_CACHE_DIR to a writable directory", cacheDir.string(), createEc ? createEc.message() : "not a directory");
+                    std::println(stderr, "warning: plugin cache directory {} cannot be made ({}); caching disabled; set GR_DATA_CACHE_DIR to a writable directory", cacheDir.string(), createEc ? createEc.message() : "not a directory");
+                } else if (chosen.origin == DataCacheDirectory::Origin::User) {
+                    std::println(stderr, "note: plugin cache directory {} in use, because the compiled {} cannot be used: {}", chosen.path, chosen.compiled, chosen.whyNotCompiled);
                 }
             }
             return *cacheReady;
