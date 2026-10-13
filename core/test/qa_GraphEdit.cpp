@@ -274,8 +274,9 @@ struct Ticker : gr::Block<Ticker> {
 };
 
 // reads the job lists, the count of workers that have not left and the size of the zombie list
-struct JobListProbe : TestScheduler {
-    using TestScheduler::TestScheduler;
+template<typename TScheduler>
+struct JobListProbeOf : TScheduler {
+    using TScheduler::TScheduler;
 
     [[nodiscard]] std::size_t nRunningJobs() const { return this->_nRunningJobs->value(); }
 
@@ -304,7 +305,21 @@ struct JobListProbe : TestScheduler {
         }
         return std::nullopt;
     }
+
+    // the index of the job list that the address of the named block selects, the choice for a block adopted without a
+    // preferred job list while every job list takes adopted blocks
+    [[nodiscard]] std::optional<std::size_t> jobListSelectedByAddress(std::string_view uniqueName) {
+        std::lock_guard lock(this->_executionOrderMutex);
+        for (const std::vector<std::shared_ptr<gr::BlockModel>>& jobList : *this->_executionOrder) {
+            if (const auto it = std::ranges::find_if(jobList, [uniqueName](const std::shared_ptr<gr::BlockModel>& block) { return block->uniqueName() == uniqueName; }); it != jobList.end()) {
+                return std::hash<gr::BlockModel*>{}(it->get()) % this->_executionOrder->size();
+            }
+        }
+        return std::nullopt;
+    }
 };
+
+using JobListProbe = JobListProbeOf<TestScheduler>;
 
 inline std::atomic<std::size_t> gCountedSamples{0UZ};
 
@@ -1030,6 +1045,79 @@ void expectQueuedSamplesPassReplacement() {
     expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
     runner.join();
     expect(eq(gSinkReceived.load(), HeldSource::kSamples)) << "the sink received a sample twice";
+}
+
+// Runs Source -> four Tunables -> Sink. The scheduler splits the chain into three job lists on a pool of three threads.
+// The case replaces the Tunables in turn with CountedTunables. Each replacement runs in the job list of the block it
+// replaces, and the reply names that job list. A block adopted without a preferred job list joins the job list its
+// address selects. The case ends after the first replacement whose address selects another job list, and fails when 16
+// replacements find none. The stages span all three job lists.
+template<typename TScheduler>
+void expectReplacementJoinsJobList() {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+    constexpr std::string_view kPoolName = "qa_edit_three_threads";
+    gr::thread_pool::Manager::instance().replacePool(std::string(kPoolName), std::make_shared<gr::thread_pool::ThreadPoolWrapper>(std::make_unique<gr::thread_pool::BasicThreadPool>(kPoolName, gr::thread_pool::TaskType::CPU_BOUND, 3U, 3U), "CPU"));
+    registerTestBlocks();
+    gCountedSamples.store(0UZ);
+
+    gr::Graph                flow;
+    std::vector<std::string> stageNames;
+    auto&                    source = flow.emplaceBlock<Source>();
+    Tunable*                 last   = &flow.emplaceBlock<Tunable>();
+    expect(flow.connect<"out", "in">(source, *last).has_value());
+    stageNames.emplace_back(last->unique_name);
+    while (stageNames.size() < 4UZ) {
+        Tunable& stage = flow.emplaceBlock<Tunable>();
+        expect(flow.connect<"out", "in">(*last, stage).has_value());
+        stageNames.emplace_back(stage.unique_name);
+        last = &stage;
+    }
+    auto& sink = flow.emplaceBlock<Sink>();
+    expect(flow.connect<"out", "in">(*last, sink).has_value());
+
+    JobListProbeOf<TScheduler> scheduler({{"poolName", std::string(kPoolName)}});
+    expect(scheduler.exchange(std::move(flow)).has_value());
+    gr::MsgPortOut toScheduler;
+    gr::MsgPortIn  fromScheduler;
+    expect(toScheduler.connect(scheduler.msgIn).has_value());
+    expect(scheduler.msgOut.connect(fromScheduler).has_value());
+
+    expect(scheduler.changeStateTo(INITIALISED).has_value());
+    expect(scheduler.changeStateTo(RUNNING).has_value());
+    expect(fatal(eq(scheduler.nJobLists(), 3UZ))) << "the graph was not split into three job lists";
+    std::vector<std::optional<std::size_t>> heldBy;
+    for (const std::string& stageName : stageNames) {
+        heldBy.push_back(scheduler.jobListOf(stageName));
+    }
+    for (std::size_t jobList = 0UZ; jobList < 3UZ; ++jobList) {
+        expect(fatal(std::ranges::contains(heldBy, std::optional<std::size_t>{jobList}))) << std::format("no stage is in job list {}", jobList);
+    }
+
+    constexpr std::size_t kMaxRounds            = 4UZ;
+    bool                  everyReplacementHeld  = true;
+    bool                  addressSelectsAnother = false;
+    for (std::size_t n = 0UZ; n < kMaxRounds * stageNames.size() && everyReplacementHeld && !addressSelectsAnother; ++n) {
+        const std::size_t i         = n % stageNames.size();
+        const std::string requestID = std::format("replacement {}", n);
+        gr::sendMessage<gr::message::Command::Set>(toScheduler, "", gr::scheduler::property::kReplaceBlock, {{"uniqueName", stageNames[i]}, {"type", gr::meta::type_name<CountedTunable>()}}, requestID);
+        const std::optional<gr::Message> reply    = takeReplyTo(fromScheduler, requestID);
+        const bool                       accepted = reply.has_value() && reply->data.has_value();
+        expect(accepted) << std::format("the replacement of stage {} was refused", i);
+        const ReplacementRecord record = accepted ? replacementRecord(*reply->data) : ReplacementRecord{};
+        const bool              named  = record.jobList.has_value() && record.jobList == heldBy[i];
+        expect(named) << std::format("the reply for stage {} does not name its job list", i);
+        const bool joined = accepted && awaitCondition([&scheduler, &record, &heldBy, i] { return scheduler.jobListOf(record.uniqueName) == heldBy[i]; });
+        expect(joined) << std::format("the replacement of stage {} runs in another job list", i);
+        everyReplacementHeld  = named && joined;
+        addressSelectsAnother = scheduler.jobListSelectedByAddress(record.uniqueName) != heldBy[i];
+        stageNames[i]         = record.uniqueName;
+    }
+    expect(!everyReplacementHeld || addressSelectsAnother) << "the address of every replacement selects the job list of the block it replaces";
+    expect(awaitCondition([] { return gCountedSamples.load() > 0UZ; })) << "the replacements never ran";
+
+    expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+    expect(awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
 }
 
 } // namespace qa_edit
@@ -2381,49 +2469,15 @@ const boost::ut::suite<"a replacement in a running graph"> runningReplacementTes
 
     "a replacement in a multi-threaded run passes on the samples queued at its ports"_test = [] { qa_edit::expectQueuedSamplesPassReplacement<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>>(); };
 
+    "a replacement in a multi-threaded blocking run passes on the samples queued at its ports"_test = [] { qa_edit::expectQueuedSamplesPassReplacement<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreadedBlocking>>(); };
+
     "a replacement in a single-threaded run passes on the samples queued at its ports"_test = [] { qa_edit::expectQueuedSamplesPassReplacement<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>>(); };
 
     "a replacement in a single-threaded blocking run passes on the samples queued at its ports"_test = [] { qa_edit::expectQueuedSamplesPassReplacement<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking>>(); };
 
-    // a pool of three threads splits the three blocks into three job lists
-    "a replacement joins the job list of the block it replaces, and the reply names that job list"_test = [] {
-        constexpr std::string_view kPoolName = "qa_edit_three_threads";
-        gr::thread_pool::Manager::instance().replacePool(std::string(kPoolName), std::make_shared<gr::thread_pool::ThreadPoolWrapper>(std::make_unique<gr::thread_pool::BasicThreadPool>(kPoolName, gr::thread_pool::TaskType::CPU_BOUND, 3U, 3U), "CPU"));
-        qa_edit::registerTestBlocks();
-        qa_edit::gCountedSamples.store(0UZ);
+    "a replacement in a multi-threaded run joins the job list of the block it replaces, and the reply names that job list"_test = [] { qa_edit::expectReplacementJoinsJobList<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>>(); };
 
-        gr::Graph flow;
-        auto&     source = flow.emplaceBlock<qa_edit::Source>();
-        auto&     stage  = flow.emplaceBlock<qa_edit::Tunable>();
-        auto&     sink   = flow.emplaceBlock<qa_edit::Sink>();
-        expect(flow.connect<"out", "in">(source, stage).has_value());
-        expect(flow.connect<"out", "in">(stage, sink).has_value());
-        const std::string stageName{stage.unique_name};
-
-        qa_edit::JobListProbe scheduler({{"poolName", std::string(kPoolName)}});
-        expect(scheduler.exchange(std::move(flow)).has_value());
-        gr::MsgPortOut toScheduler;
-        gr::MsgPortIn  fromScheduler;
-        expect(toScheduler.connect(scheduler.msgIn).has_value());
-        expect(scheduler.msgOut.connect(fromScheduler).has_value());
-
-        expect(scheduler.changeStateTo(INITIALISED).has_value());
-        expect(scheduler.changeStateTo(RUNNING).has_value());
-        expect(eq(scheduler.nJobLists(), 3UZ)) << "the graph was not split into three job lists";
-        const std::optional<std::size_t> heldBy = scheduler.jobListOf(stageName);
-        expect(heldBy.has_value()) << "no job list holds the stage";
-
-        qa_edit::sendMessage(toScheduler, kReplaceBlock, {{"uniqueName", stageName}, {"type", gr::meta::type_name<qa_edit::CountedTunable>()}});
-        const std::optional<gr::property_map> reply = qa_edit::awaitReplyData(fromScheduler, kBlockReplaced);
-        expect(reply.has_value()) << "the replacement was refused";
-        const qa_edit::ReplacementRecord record = reply.has_value() ? qa_edit::replacementRecord(*reply) : qa_edit::ReplacementRecord{};
-        expect(record.jobList.has_value() && record.jobList == heldBy) << "the reply does not name the job list of the replaced block";
-        expect(qa_edit::awaitCondition([&scheduler, &record, &heldBy] { return scheduler.jobListOf(record.uniqueName) == heldBy; })) << "the replacement runs in another job list";
-        expect(qa_edit::awaitCondition([] { return qa_edit::gCountedSamples.load() > 0UZ; })) << "the replacement never ran";
-
-        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
-        expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
-    };
+    "a replacement in a multi-threaded blocking run joins the job list of the block it replaces, and the reply names that job list"_test = [] { qa_edit::expectReplacementJoinsJobList<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreadedBlocking>>(); };
 
     "a replacement inside a subgraph of a running graph runs"_test = [] {
         qa_edit::registerTestBlocks();
