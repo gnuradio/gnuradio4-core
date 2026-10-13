@@ -19,8 +19,9 @@ namespace gr {
 namespace {
 
 // Why `directory` cannot serve as a writable directory, or nothing when it can. An existing directory needs write and
-// search permission; a missing one needs them on its nearest existing ancestor, under which it would be made. A broken
-// symbolic link in the missing part is refused, since a directory cannot be made in its place.
+// search permission; a missing one needs them on its nearest existing ancestor, under which it would be made. The
+// nearest ancestor of a relative path can be the working directory. A broken symbolic link in the missing part is
+// refused, since a directory cannot be made in its place.
 std::optional<std::string> whyNotWritable(const std::filesystem::path& directory) {
     std::filesystem::path probe = directory;
     for (;;) {
@@ -32,6 +33,9 @@ std::optional<std::string> whyNotWritable(const std::filesystem::path& directory
                 return std::format("{} is a broken symbolic link", probe.string());
             }
             std::filesystem::path parent = probe.parent_path();
+            if (parent.empty() && !probe.empty() && probe.is_relative() && probe != ".") {
+                parent = ".";
+            }
             if (parent.empty() || parent == probe) {
                 return std::format("{} has no existing ancestor", directory.string());
             }
