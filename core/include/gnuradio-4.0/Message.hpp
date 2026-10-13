@@ -3,6 +3,7 @@
 
 #include <gnuradio-4.0/Buffer.hpp>
 #include <gnuradio-4.0/CircularBuffer.hpp>
+#include <gnuradio-4.0/Exception.hpp>
 #include <gnuradio-4.0/SharedState.hpp>
 #include <gnuradio-4.0/Tag.hpp>
 #include <gnuradio-4.0/meta/formatter.hpp>
@@ -16,28 +17,6 @@
 #include <string_view>
 
 namespace gr {
-
-struct exception : public std::exception {
-    std::string                           message;
-    std::source_location                  sourceLocation;
-    std::chrono::system_clock::time_point errorTime = std::chrono::system_clock::now();
-
-    exception(std::string_view msg = "unknown exception", std::source_location location = std::source_location::current()) noexcept : message(msg), sourceLocation(location) {
-#ifndef NDEBUG
-        std::println("Exception thrown: {} at {}:{}", msg, location.file_name(), location.line());
-#endif
-    }
-
-    [[nodiscard]] const char* what() const noexcept override {
-        if (formattedMessage.empty()) {
-            formattedMessage = std::format("{} at {}:{}", message, sourceLocation.file_name(), sourceLocation.line());
-        }
-        return formattedMessage.c_str();
-    }
-
-private:
-    mutable std::string formattedMessage; // Now storing the formatted message
-};
 
 struct Error {
     std::string                           message;
