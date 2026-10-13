@@ -169,6 +169,20 @@ constexpr std::size_t kWidth = 80UZ;
     return found;
 }
 
+// `text` with each run of spaces and line breaks replaced by one space; a value the report wrapped reads as one line
+[[nodiscard]] std::string withSingleSpaces(std::string_view text) {
+    std::string joined;
+    for (const char c : text) {
+        const bool space = c == ' ' || c == '\n';
+        if (!space) {
+            joined += c;
+        } else if (!joined.empty() && joined.back() != ' ') {
+            joined += ' ';
+        }
+    }
+    return joined;
+}
+
 // what a reader sees of a path the report had to cut: the tool keeps a path's tail, which is what tells one
 // directory from another
 [[nodiscard]] std::string_view tailOf(std::string_view path, std::size_t count) { return path.size() <= count ? path : path.substr(path.size() - count); }
@@ -241,8 +255,11 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         expect(!isOneJsonDocument("{\"a\": 1")) << "a document left open";
     };
 
+    // The text report cuts a long path to its tail and wraps a long value across lines. The text arms join the lines and
+    // look for the path's last component; the JSON arms look for the whole path.
     "version reports the data cache directory in use, the one GR_DATA_CACHE_DIR names when it is set"_test = [] {
-        const std::string named = (std::filesystem::temp_directory_path() / "gr4_qa_grinfo_cache").string();
+        const std::string named        = (std::filesystem::temp_directory_path() / "gr4_qa_grinfo_cache").string();
+        const std::string fromVariable = "gr4_qa_grinfo_cache, from GR_DATA_CACHE_DIR";
         {
             const EnvironmentVariable unset("GR_DATA_CACHE_DIR", std::nullopt);
             const Result              compiled = run({"version", "--json"});
@@ -250,6 +267,11 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
             expect(compiled.output.contains("\"dataCacheOrigin\": \"")) << "the instrument: the report names an origin" << compiled.output;
             expect(!compiled.output.contains("\"dataCacheOrigin\": \"environment\"")) << "without the variable the origin is not the environment" << compiled.output;
             expect(!compiled.output.contains(named)) << compiled.output;
+
+            const Result text = run({"version"});
+            expect(eq(text.exitCode, 0)) << text.output;
+            expect(text.output.contains("data cache")) << text.output;
+            expect(!withSingleSpaces(text.output).contains(fromVariable)) << "without the variable the text names no variable" << text.output;
         }
 
         const EnvironmentVariable variable("GR_DATA_CACHE_DIR", named);
@@ -260,7 +282,7 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
 
         const Result text = run({"version"});
         expect(eq(text.exitCode, 0)) << text.output;
-        expect(text.output.contains(std::format("{}, from GR_DATA_CACHE_DIR", named))) << text.output;
+        expect(withSingleSpaces(text.output).contains(fromVariable)) << text.output;
     };
 
 #ifdef GR_TOOLS_CORE_TEST_PLUGINS
