@@ -314,6 +314,16 @@ struct StagedSettings {
     return staged;
 }
 
+// The reason a refusal or a failure gives: the message of a gr::exception, and the what() of any other exception or
+// of a gr::exception with an empty message. gr::exception::what() appends the file and line of the throw, a path on
+// the machine that built the library.
+[[nodiscard]] std::string_view reasonOf(const std::exception& error) {
+    if (const auto* refusal = dynamic_cast<const gr::exception*>(&error); refusal != nullptr && !refusal->message.empty()) {
+        return refusal->message;
+    }
+    return error.what();
+}
+
 // Applies the settings to the scheduler, before the graph reaches it and before the plan is built.
 //
 // The name is checked against the settings the scheduler declares first: a key outside that set is filed as meta
@@ -332,7 +342,7 @@ struct StagedSettings {
             return false;
         }
     } catch (const std::exception& error) {
-        std::println(stderr, "{}: a scheduler setting could not be applied: {}", kProgram, error.what());
+        std::println(stderr, "{}: a scheduler setting could not be applied: {}", kProgram, reasonOf(error));
         return false;
     }
     std::ignore = scheduler.settings().activateContext();
@@ -348,7 +358,7 @@ struct StagedSettings {
         try {
             scheduler = loader.instantiateScheduler(key);
         } catch (const std::exception& error) {
-            std::println(stderr, "{}: the scheduler {} could not be built: {}", kProgram, key, error.what());
+            std::println(stderr, "{}: the scheduler {} could not be built: {}", kProgram, key, reasonOf(error));
             return nullptr;
         }
     }
@@ -437,7 +447,7 @@ int main(int argc, char** argv) {
     try {
         graph.emplace(gr::loadGrc(loader, *document, staged->blocks));
     } catch (const std::exception& error) {
-        std::println(stderr, "{}: {} did not load: {}", kProgram, options.graph, error.what());
+        std::println(stderr, "{}: {} did not load: {}", kProgram, options.graph, reasonOf(error));
         return 1;
     }
 

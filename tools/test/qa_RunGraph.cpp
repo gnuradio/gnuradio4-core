@@ -19,6 +19,7 @@
  * - a graph that would not end by itself, bounded by --seconds
  * - the settings --show prints when the run is over
  * - a scheduler setting and a block setting, each taken and each refused
+ * - a refused setting's reason, printed without the source file and line of the library
  * - the program's own scheduler, a plugin's and a shared object's, each chosen by its registry key
  * - a shared object's scheduler refused at an earlier plugin ABI version
  * - a command line that cannot be used
@@ -89,6 +90,20 @@ constexpr std::string_view kUnnamedResourceFile{GR_TOOLS_TEST_ASSETS "/unnamed_r
     const std::array<std::string_view, 7UZ> added{"--scheduler", key, "--set", "source.event_count=1000", "--show", "source", "--verbose"};
     arguments.insert(arguments.end(), added.begin(), added.end());
     return arguments;
+}
+
+// The first line of `output` that holds `marker`, without its newline; empty when no line holds it. A build without
+// NDEBUG also prints a line of its own for every gr::exception it constructs. That line names the source file and line
+// of the throw, and a case about rungraph's message reads rungraph's line alone.
+[[nodiscard]] std::string_view lineHolding(std::string_view output, std::string_view marker) {
+    const std::size_t found = output.find(marker);
+    if (found == std::string_view::npos) {
+        return {};
+    }
+    const std::size_t begin = output.rfind('\n', found);
+    const std::size_t first = begin == std::string_view::npos ? 0UZ : begin + 1UZ;
+    const std::size_t end   = output.find('\n', found);
+    return output.substr(first, end == std::string_view::npos ? std::string_view::npos : end - first);
 }
 #endif
 
@@ -260,6 +275,24 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
         const Result refusedBlock = run(unknownBlock);
         expect(eq(refusedBlock.exitCode, 1)) << refusedBlock.output;
         expect(refusedBlock.output.contains("settings are given for block 'no_such_block', and the graph holds no block of that name")) << refusedBlock.output;
+    };
+
+    "a value that does not convert is refused by its reason alone, without the source location of the refusal"_test = [] {
+        const Result schedulerRefused = run({"--graph", "unread.yaml", "--set", "timeout_ms=many"});
+        expect(eq(schedulerRefused.exitCode, 2)) << schedulerRefused.output;
+        const std::string_view schedulerLine = lineHolding(schedulerRefused.output, "a scheduler setting could not be applied: ");
+        expect(schedulerLine.contains("value \"many\" for key 'timeout_ms'")) << schedulerRefused.output;
+        expect(!schedulerLine.contains(".cpp:") && !schedulerLine.contains(".hpp:")) << "a scheduler setting's refusal names no file and line of the library" << schedulerRefused.output;
+
+        std::vector<std::string> member = settingsChainRun();
+        member.emplace_back("-s");
+        member.emplace_back("source.event_count=many");
+
+        const Result memberRefused = run(member);
+        expect(eq(memberRefused.exitCode, 1)) << memberRefused.output;
+        const std::string_view memberLine = lineHolding(memberRefused.output, " did not load: ");
+        expect(memberLine.contains("value \"many\" for key 'event_count'")) << memberRefused.output;
+        expect(!memberLine.contains(".cpp:") && !memberLine.contains(".hpp:")) << "a member's refusal names no file and line of the library" << memberRefused.output;
     };
 
     "without --scheduler the graph runs on the single-threaded Simple scheduler"_test = [] {
