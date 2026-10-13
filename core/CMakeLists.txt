@@ -26,13 +26,13 @@ target_link_libraries(
          magic_enum
          vir)
 
-# the values that gnuradio-4.0/SharedState.hpp declares and the type information of DynamicPort's port interfaces, one
-# copy that every shared object of a program shares. The library compiles the core headers that build those values and
-# links no compiled core library. gnuradio-core links it
+# the values that gnuradio-4.0/SharedState.hpp declares and the type information of DynamicPort's port interfaces and of
+# gr::exception, one copy that every shared object of a program shares. The library compiles the core headers that build
+# those values and links no compiled core library. gnuradio-core links it
 if(EMSCRIPTEN)
-  add_library(gnuradio-shared-state STATIC src/SharedState.cpp src/DynamicPort.cpp)
+  add_library(gnuradio-shared-state STATIC src/SharedState.cpp src/DynamicPort.cpp src/Exception.cpp)
 else()
-  add_library(gnuradio-shared-state SHARED src/SharedState.cpp src/DynamicPort.cpp)
+  add_library(gnuradio-shared-state SHARED src/SharedState.cpp src/DynamicPort.cpp src/Exception.cpp)
 endif()
 add_library(gnuradio4::gnuradio-shared-state ALIAS gnuradio-shared-state)
 target_include_directories(gnuradio-shared-state PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include/)
