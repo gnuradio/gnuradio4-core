@@ -5190,8 +5190,8 @@ struct SlowIdleSource : gr::Block<SlowIdleSource> {
 using BlockingWakeProbe = WakeProbe<BlockingScheduler>;
 
 // runs an idle graph under singleThreadedBlocking with a park that outlasts the case. With kWakes set, it waits until
-// the watchdog has woken the worker that many times. Without, it waits for `window`. It returns the source's work()
-// calls, the wakes, and the time it waited
+// the watchdog has woken the worker that many times. Without, it waits until the worker has parked and `window` has
+// passed. It returns the source's work() calls, the wakes, and the time it waited
 struct IdleRun {
     std::size_t                         nCalls = 0UZ;
     std::size_t                         nWakes = 0UZ;
@@ -5217,7 +5217,8 @@ constexpr gr::Size_t kIdleInactivityCount = 20U;
     if (nWakesToAwait > 0UZ) {
         expect(awaitCondition([&scheduler, nWakesToAwait] { return scheduler.nWakes() >= nWakesToAwait; })) << "the watchdog did not wake the idle run";
     } else {
-        std::this_thread::sleep_for(window);
+        expect(awaitParkedWorkers(scheduler, 1UZ)) << "the idle run's worker did not park";
+        std::this_thread::sleep_until(startedAt + window);
     }
     IdleRun result{gCountedSourceCalls.load(std::memory_order_acquire), scheduler.nWakes(), std::chrono::steady_clock::now() - startedAt};
     scheduler.requestStop();
@@ -5247,39 +5248,70 @@ const boost::ut::suite<"a watchdog wake"> watchdogWakeTests = [] {
         expect(le(woken.nCalls, control.nCalls + 2UZ * woken.nWakes)) << std::format("{} work() calls for {} watchdog wakes: a wake restarted the inactivity count", woken.nCalls, woken.nWakes);
     };
 
-    // The pause and the resume complete inside one watchdog period, right after the report, so the watchdog never
-    // reads a state other than RUNNING. The graph makes no progress throughout, and the watchdog reports the stall once
+    // The watchdog reads the state once per period and reports a stall after that read. Its next read comes at least
+    // one period after the report. A pause and a resume between the two leave the stall marked as reported. The graph
+    // makes no progress throughout, and the watchdog reports the stall only once. The report reaches the test after
+    // the last poll that found none. An attempt whose resume ends a period or more after that poll may have met the
+    // next read. The case then repeats the attempt on a new run. After three such attempts the case prints that it
+    // skipped its check.
     "a pause and a resume during a stall leave the stall report intact once RUNNING again"_test = [] {
         constexpr std::size_t kStalledPeriods = 2UZ;
+        constexpr std::size_t kAttempts       = 3UZ;
+        constexpr auto        kPeriod         = std::chrono::milliseconds(100);
 
-        gr::Graph flow;
-        auto&     source = flow.emplaceBlock<qa_sched::ReleasedSource>(); // never released: the graph stalls
-        auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
-        expect(flow.connect<"out", "in">(source, sink).has_value());
+        auto attempt = [&](std::size_t nAttempt) {
+            gr::Graph flow;
+            auto&     source = flow.emplaceBlock<qa_sched::ReleasedSource>(); // never released: the graph stalls
+            auto&     sink   = flow.emplaceBlock<qa_sched::CountingSink>();
+            expect(flow.connect<"out", "in">(source, sink).has_value());
 
-        qa_sched::WakeProbe<qa_sched::TestScheduler> scheduler({{"watchdog_timeout", gr::Size_t(100)}, {"timeout_inactivity_count", gr::Size_t(kStalledPeriods)}});
-        gr::MsgPortIn                                fromScheduler;
-        expect(scheduler.msgOut.connect(fromScheduler).has_value());
-        expect(scheduler.exchange(std::move(flow)).has_value());
-        expect(scheduler.changeStateTo(INITIALISED).has_value());
-        expect(scheduler.changeStateTo(RUNNING).has_value());
+            qa_sched::WakeProbe<qa_sched::TestScheduler> scheduler({{"watchdog_timeout", static_cast<gr::Size_t>(kPeriod.count())}, {"timeout_inactivity_count", gr::Size_t(kStalledPeriods)}});
+            gr::MsgPortIn                                fromScheduler;
+            expect(scheduler.msgOut.connect(fromScheduler).has_value());
+            expect(scheduler.exchange(std::move(flow)).has_value());
+            expect(scheduler.changeStateTo(INITIALISED).has_value());
+            expect(scheduler.changeStateTo(RUNNING).has_value());
 
-        qa_sched::StallReports reports;
-        expect(qa_sched::awaitCondition([&] { return (reports.take(fromScheduler), reports.count >= 1UZ); })) << "the stall produced no report";
+            qa_sched::StallReports                               reports;
+            std::optional<std::chrono::steady_clock::time_point> lastEmptyPoll;
+            expect(qa_sched::awaitCondition([&] {
+                const auto polledAt = std::chrono::steady_clock::now();
+                reports.take(fromScheduler);
+                if (reports.count == 0UZ) {
+                    lastEmptyPoll = polledAt;
+                }
+                return reports.count >= 1UZ;
+            })) << "the stall produced no report";
 
-        const std::size_t progressBefore = scheduler.graph().progress().value();
-        expect(scheduler.changeStateTo(REQUESTED_PAUSE).has_value());
-        expect(qa_sched::awaitState(scheduler, PAUSED)) << "the scheduler did not pause";
-        expect(scheduler.changeStateTo(RUNNING).has_value());
-        expect(eq(scheduler.graph().progress().value(), progressBefore)) << "the pause and the resume moved the progress sequence";
+            const std::size_t progressBefore = scheduler.graph().progress().value();
+            expect(scheduler.changeStateTo(REQUESTED_PAUSE).has_value());
+            expect(qa_sched::awaitState(scheduler, PAUSED)) << "the scheduler did not pause";
+            expect(scheduler.changeStateTo(RUNNING).has_value());
+            const auto resumedAt = std::chrono::steady_clock::now();
+            expect(eq(scheduler.graph().progress().value(), progressBefore)) << "the pause and the resume moved the progress sequence";
 
-        const std::size_t from = scheduler.nWakes();
-        expect(qa_sched::awaitCondition([&scheduler, from] { return scheduler.nWakes() >= from + 2UZ * kStalledPeriods + 2UZ; })) << "the watchdog stopped observing the stall";
-        reports.take(fromScheduler);
-        expect(eq(reports.count, 1UZ)) << "the stall was reported again after the pause and the resume";
+            const bool beforeNextRead = lastEmptyPoll.has_value() && resumedAt - *lastEmptyPoll < kPeriod;
+            if (beforeNextRead) {
+                const std::size_t nWakesToAwait = scheduler.nWakes() + 2UZ * kStalledPeriods + 2UZ;
+                expect(qa_sched::awaitCondition([&scheduler, nWakesToAwait] { return scheduler.nWakes() >= nWakesToAwait; })) << "the watchdog stopped observing the stall";
+                reports.take(fromScheduler);
+                expect(eq(reports.count, 1UZ)) << "the stall was reported again after the pause and the resume";
+            } else {
+                std::println("attempt {}: the resume did not end within one watchdog period of the last poll before the report", nAttempt + 1UZ);
+            }
 
-        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
-        expect(qa_sched::awaitState(scheduler, STOPPED)) << "the stalled graph did not stop";
+            expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+            expect(qa_sched::awaitState(scheduler, STOPPED)) << "the stalled graph did not stop";
+            return beforeNextRead;
+        };
+
+        bool tested = false;
+        for (std::size_t nAttempt = 0UZ; nAttempt < kAttempts && !tested; ++nAttempt) {
+            tested = attempt(nAttempt);
+        }
+        if (!tested) {
+            std::println("a pause and a resume during a stall: skipped, no attempt of {} resumed within one watchdog period of the last poll before the report", kAttempts);
+        }
     };
 };
 
