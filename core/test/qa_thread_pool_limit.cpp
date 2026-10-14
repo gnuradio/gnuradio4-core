@@ -184,6 +184,7 @@ const boost::ut::suite<"gr::thread_pool global thread limit"> threadLimitTests =
             expect(eq(pool.numTasksQueued(), 0UZ)) << "a refused task is not queued";
         }
 
+        pool.setThreadBounds(1U, 8U); // a minimum of one keeps the added worker past its keep-alive
         runAndWait(pool);
         expect(eq(pool.numThreads(), 1UZ)) << "below the limit the pool adds a worker";
         expect(!refusedRan.load()) << "the refused task never runs";
