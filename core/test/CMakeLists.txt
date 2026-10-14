@@ -173,6 +173,9 @@ if(GR_ENABLE_BLOCK_REGISTRY)
 endif()
 set_tests_properties(${_CORE_DEADLOCK_TESTS} PROPERTIES TIMEOUT 120)
 
+# a thread that outlives a case stalls the case's wait on the thread count
+set_tests_properties(qa_thread_pool_limit PROPERTIES TIMEOUT 60)
+
 # the cases time a parked worker's wake on the wall clock
 add_ut_test(qa_SchedulerNestedProgress)
 set_tests_properties(qa_SchedulerNestedProgress PROPERTIES TIMEOUT 60)
