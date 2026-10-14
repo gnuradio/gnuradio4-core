@@ -17,6 +17,7 @@
 #include <utility>
 #include <variant>
 
+#include <gnuradio-4.0/Export.hpp>
 #include <gnuradio-4.0/PmtTypeHelpers.hpp>
 #include <gnuradio-4.0/meta/utils.hpp>
 
@@ -1212,8 +1213,12 @@ public:
     PortMetaInfo metaInfo;
 
 private:
-    struct model { // intentionally class-private definition to limit interface exposure and enhance composition
-        virtual ~model() = default;
+    // The destructors of model and HandlerAccess are defined in the library gnuradio-shared-state. The type information
+    // and the virtual tables of both are emitted there, once for the whole program. handlers() casts a port wrapper
+    // from model to HandlerAccess. For a wrapper that a loaded plugin built, the cast needs one definition of each
+    // type.
+    struct GNURADIO_EXPORT model { // intentionally class-private definition to limit interface exposure and enhance composition
+        virtual ~model();
 
         [[nodiscard]] virtual DynamicPort weakRef() const noexcept = 0;
 
@@ -1288,8 +1293,8 @@ private:
 
     // A wrapper offers its handlers through this interface and not through model. The layout of model stays as it is.
     // A wrapper compiled without the interface offers no handlers.
-    struct HandlerAccess {
-        virtual ~HandlerAccess()                           = default;
+    struct GNURADIO_EXPORT HandlerAccess {
+        virtual ~HandlerAccess();
         [[nodiscard]] virtual Handlers handlers() noexcept = 0;
     };
 
