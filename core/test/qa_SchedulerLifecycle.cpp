@@ -4147,11 +4147,10 @@ namespace qa_sched {
 using Millis = std::chrono::duration<double, std::milli>;
 
 // A blocking run of a graph that never moves parks for kParkTimeoutMs after every pass. A watchdog period far beyond
-// the test keeps the watchdog from ending a park. A message is sent kParkSettle after the previous one was answered;
-// the worker parks right after its message pass, well inside that.
+// the test keeps the watchdog from ending a park. A message is sent once the worker has parked after the previous one
+// was answered.
 constexpr gr::Size_t  kParkTimeoutMs = 200U;
 constexpr std::size_t kWakeTrials    = 5UZ;
-constexpr auto        kParkSettle    = std::chrono::milliseconds(5);
 constexpr double      kWakeBoundMs   = static_cast<double>(kParkTimeoutMs) / 4.0;
 
 [[nodiscard]] inline gr::property_map parkingSettings() { return {{"timeout_ms", kParkTimeoutMs}, {"timeout_inactivity_count", gr::Size_t(0)}, {"watchdog_timeout", gr::Size_t(60'000)}}; }
@@ -4215,14 +4214,15 @@ struct OutsideNotifier : gr::Block<OutsideNotifier> {
     return found;
 }
 
-// the time from send() to a message on fromScheduler with the request ID, for each of kWakeTrials requests
-template<typename TSend>
-[[nodiscard]] std::vector<double> replyTimes(gr::MsgPortIn& fromScheduler, std::string_view prefix, TSend send) {
+// the time from send() to a message on fromScheduler with the request ID, for each of kWakeTrials requests. Each
+// request goes out once the scheduler's one worker has parked
+template<typename TScheduler, typename TSend>
+[[nodiscard]] std::vector<double> replyTimes(const TScheduler& scheduler, gr::MsgPortIn& fromScheduler, std::string_view prefix, TSend send) {
     std::vector<double> times;
     for (std::size_t trial = 0UZ; trial < kWakeTrials; ++trial) {
-        std::this_thread::sleep_for(kParkSettle);
         const std::string requestId = std::format("{}-{}", prefix, trial);
-        const auto        sentAt    = std::chrono::steady_clock::now();
+        boost::ut::expect(awaitParkedWorkers(scheduler, 1UZ)) << std::format("the worker did not park before {}", requestId);
+        const auto sentAt = std::chrono::steady_clock::now();
         send(requestId);
         bool replied = false;
         while (!replied && std::chrono::steady_clock::now() - sentAt < kEventBound) {
@@ -4321,7 +4321,7 @@ const boost::ut::suite<"a message to a parked run"> parkedMessageTests = [] {
         std::thread runner([&scheduler] { std::ignore = scheduler.runAndWait(); });
         expect(qa_sched::awaitCondition([&scheduler] { return scheduler.state() == RUNNING; }));
 
-        const std::vector<double> times = qa_sched::replyTimes(fromScheduler, "settings", [&](std::string_view requestId) { gr::sendMessage<gr::message::Command::Get>(toScheduler, scheduler.unique_name, gr::block::property::kSetting, gr::property_map{}, requestId); });
+        const std::vector<double> times = qa_sched::replyTimes(scheduler, fromScheduler, "settings", [&](std::string_view requestId) { gr::sendMessage<gr::message::Command::Get>(toScheduler, scheduler.unique_name, gr::block::property::kSetting, gr::property_map{}, requestId); });
         scheduler.requestStop();
         runner.join();
 
@@ -4351,7 +4351,7 @@ const boost::ut::suite<"a message to a parked run"> parkedMessageTests = [] {
         std::thread runner([&scheduler] { std::ignore = scheduler.runAndWait(); });
         expect(qa_sched::awaitCondition([&scheduler] { return scheduler.state() == RUNNING; }));
 
-        const std::vector<double> times = qa_sched::replyTimes(fromScheduler, "block-settings", [&](std::string_view requestId) { gr::sendMessage<gr::message::Command::Get>(toScheduler, sinkName, gr::block::property::kSetting, gr::property_map{}, requestId); });
+        const std::vector<double> times = qa_sched::replyTimes(scheduler, fromScheduler, "block-settings", [&](std::string_view requestId) { gr::sendMessage<gr::message::Command::Get>(toScheduler, sinkName, gr::block::property::kSetting, gr::property_map{}, requestId); });
         scheduler.requestStop();
         runner.join();
 
@@ -4374,7 +4374,7 @@ const boost::ut::suite<"a message to a parked run"> parkedMessageTests = [] {
         std::thread runner([&scheduler] { std::ignore = scheduler.runAndWait(); });
         expect(qa_sched::awaitCondition([&scheduler] { return scheduler.state() == RUNNING; }));
 
-        const std::vector<double> times = qa_sched::replyTimes(fromScheduler, "outside", [&notifier](std::string_view requestId) { notifier.notifyFromOutside(requestId); });
+        const std::vector<double> times = qa_sched::replyTimes(scheduler, fromScheduler, "outside", [&notifier](std::string_view requestId) { notifier.notifyFromOutside(requestId); });
         scheduler.requestStop();
         runner.join();
 
@@ -4427,7 +4427,7 @@ const boost::ut::suite<"a message to a parked run"> parkedMessageTests = [] {
         expect(allAnswered) << std::format("{} requests sent around the swap were never answered", pending.size());
 
         const std::size_t         retiredValue = retiredProgress->value();
-        const std::vector<double> times        = qa_sched::replyTimes(fromScheduler, "after-swap", [&](std::string_view requestId) { gr::sendMessage<gr::message::Command::Get>(toScheduler, scheduler.unique_name, gr::block::property::kSetting, gr::property_map{}, requestId); });
+        const std::vector<double> times        = qa_sched::replyTimes(scheduler, fromScheduler, "after-swap", [&](std::string_view requestId) { gr::sendMessage<gr::message::Command::Get>(toScheduler, scheduler.unique_name, gr::block::property::kSetting, gr::property_map{}, requestId); });
         scheduler.requestStop();
         runner.join();
 
@@ -4532,7 +4532,7 @@ const boost::ut::suite<"a message to a parked run"> parkedMessageTests = [] {
         std::thread runner([&scheduler] { std::ignore = scheduler.runAndWait(); });
         expect(qa_sched::awaitCondition([&scheduler] { return scheduler.state() == RUNNING; }));
 
-        const std::vector<double> times = qa_sched::replyTimes(fromScheduler, "library-settings", [&](std::string_view requestId) { gr::sendMessage<gr::message::Command::Get>(toScheduler, sinkName, gr::block::property::kSetting, gr::property_map{}, requestId); });
+        const std::vector<double> times = qa_sched::replyTimes(scheduler, fromScheduler, "library-settings", [&](std::string_view requestId) { gr::sendMessage<gr::message::Command::Get>(toScheduler, sinkName, gr::block::property::kSetting, gr::property_map{}, requestId); });
         scheduler.requestStop();
         runner.join();
 
