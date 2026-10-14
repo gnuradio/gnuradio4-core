@@ -725,6 +725,12 @@ struct WatchdogProbe : TestScheduler {
 
     [[nodiscard]] std::size_t nWatchdogsRunning() { return gr::atomic_ref(this->_nWatchdogsRunning).load_acquire(); }
 
+    // the watchdogs asleep in their period. A watchdog sleeps on the generation sequence that a retirement advances.
+    // Nothing else waits on that sequence. A watchdog counts as running from the scheduler's start() on. The pool
+    // starts it when one of its threads takes the task. One that starts after its run has ended returns without
+    // sleeping.
+    [[nodiscard]] std::size_t nSleepingWatchdogs() const { return this->_watchdogGeneration.nTimedWaiters(); }
+
     // retires the watchdogs and returns once each has returned
     void retireWatchdogs() { TestScheduler::retireWatchdogs(); }
 };
@@ -3579,14 +3585,21 @@ const boost::ut::suite<"watchdog lifetime"> watchdogTests = [] {
     "restarts inside one check interval leave a single watchdog"_test = [] {
         constexpr std::size_t kCycles = 8UZ;
 
-        // every cycle below falls inside one check interval, so no earlier watchdog can time out on its own
+        // each run is held until every counted watchdog sleeps. Each restart then meets the earlier watchdog asleep in
+        // its period. A restart that does not retire it leaves two watchdogs asleep, and the final wait for one fails.
+        // The cycles take far less than one 5 s period, and no earlier watchdog wakes on its own meanwhile.
         qa_sched::WatchdogProbe scheduler({{"watchdog_timeout", gr::Size_t(5000)}});
         expect(scheduler.exchange(qa_sched::makeEndlessGraph()).has_value());
+        auto everyWatchdogAsleep = [&scheduler] {
+            const std::size_t nSleeping = scheduler.nSleepingWatchdogs();
+            return nSleeping != 0UZ && nSleeping == scheduler.nWatchdogsRunning();
+        };
 
         for (std::size_t cycle = 0UZ; cycle < kCycles; ++cycle) {
             expect(scheduler.changeStateTo(INITIALISED).has_value());
             expect(scheduler.changeStateTo(RUNNING).has_value());
             expect(qa_sched::awaitState(scheduler, RUNNING)) << std::format("cycle {} did not reach RUNNING", cycle);
+            expect(qa_sched::awaitCondition(everyWatchdogAsleep)) << std::format("cycle {}: {} watchdogs counted, {} asleep", cycle, scheduler.nWatchdogsRunning(), scheduler.nSleepingWatchdogs());
             expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
             expect(qa_sched::awaitState(scheduler, STOPPED)) << std::format("cycle {} did not reach STOPPED", cycle);
         }
@@ -3596,7 +3609,8 @@ const boost::ut::suite<"watchdog lifetime"> watchdogTests = [] {
         expect(scheduler.changeStateTo(RUNNING).has_value());
         expect(qa_sched::awaitState(scheduler, RUNNING)) << "the final run did not reach RUNNING";
 
-        expect(qa_sched::awaitCondition([&scheduler] { return scheduler.nWatchdogsRunning() <= 1UZ; })) << std::format("{} watchdogs are alive after {} restarts", scheduler.nWatchdogsRunning(), kCycles);
+        // a retired watchdog stays counted and asleep until its thread runs again
+        expect(qa_sched::awaitCondition([&scheduler] { return scheduler.nWatchdogsRunning() == 1UZ && scheduler.nSleepingWatchdogs() == 1UZ; })) << std::format("{} watchdogs counted and {} asleep after {} restarts", scheduler.nWatchdogsRunning(), scheduler.nSleepingWatchdogs(), kCycles);
 
         expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
         expect(qa_sched::awaitState(scheduler, STOPPED)) << "the final run did not stop";
@@ -3604,16 +3618,20 @@ const boost::ut::suite<"watchdog lifetime"> watchdogTests = [] {
 
     "a retired watchdog returns without waiting out its period"_test = [] {
         // timed on the wall clock, from the retirement to the watchdog's return, without the graph's teardown. Each
-        // retirement meets a watchdog in the middle of a 60 s period, after the run has stopped. The bound holds only
-        // when the retirement wakes the watchdog at once. A watchdog that checks for its retirement between sleeps of
-        // up to 100 ms fails it. A timeout_ms of 1 keeps every interval derived from timeout_ms short. The destructor
-        // and a graph swap retire the watchdog the same way.
+        // retirement meets a watchdog asleep in a 60 s period after the run has stopped. Each run is held until its
+        // watchdog sleeps. A watchdog that polls for its retirement between plain sleeps never counts as asleep and
+        // fails that wait. The ten retirements together return within 100 ms. A woken watchdog returns within a small
+        // fraction of a millisecond, and the rest of the bound absorbs the scheduling delays of a loaded runner. A
+        // watchdog that leaves its sleep in slices of 100 ms instead of on the retirement spends about 500 ms over the
+        // ten. A timeout_ms of 1 keeps every interval derived from timeout_ms short. The destructor and a graph swap
+        // retire the watchdog the same way.
         constexpr std::size_t kCycles  = 10UZ;
         constexpr std::size_t kSamples = 4096UZ;
         constexpr auto        kBound   = std::chrono::milliseconds(100);
 
         std::chrono::steady_clock::duration exitTime{};
-        for (std::size_t cycle = 0UZ; cycle < kCycles; ++cycle) {
+        std::size_t                         nRetired = 0UZ;
+        for (std::size_t cycle = 0UZ; cycle < kCycles && exitTime < kBound; ++cycle) {
             gr::Graph flow;
             auto&     source = flow.emplaceBlock<qa_sched::EndlessSource>();
             auto&     sink   = flow.emplaceBlock<qa_sched::ObservedSink>();
@@ -3625,16 +3643,19 @@ const boost::ut::suite<"watchdog lifetime"> watchdogTests = [] {
             expect(scheduler.changeStateTo(INITIALISED).has_value());
             expect(scheduler.changeStateTo(RUNNING).has_value());
             expect(qa_sched::awaitObservedSamplesAbove(kSamples)) << std::format("cycle {} moved no samples", cycle);
+            expect(qa_sched::awaitCondition([&scheduler] { return scheduler.nSleepingWatchdogs() == 1UZ; })) << std::format("cycle {}: the watchdog never slept in its period", cycle);
             expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
             expect(qa_sched::awaitState(scheduler, STOPPED)) << std::format("cycle {} did not reach STOPPED", cycle);
             expect(eq(scheduler.nWatchdogsRunning(), 1UZ)) << std::format("cycle {} has no watchdog to retire", cycle);
+            expect(eq(scheduler.nSleepingWatchdogs(), 1UZ)) << std::format("cycle {}: the watchdog left its sleep before the retirement", cycle);
 
             const auto retiredAt = std::chrono::steady_clock::now();
             scheduler.retireWatchdogs();
             exitTime += std::chrono::steady_clock::now() - retiredAt;
+            ++nRetired;
         }
 
-        expect(exitTime < kBound) << std::format("{} retired watchdogs took {} to return", kCycles, std::chrono::duration_cast<std::chrono::microseconds>(exitTime));
+        expect(exitTime < kBound) << std::format("{} retired watchdogs took {} to return", nRetired, std::chrono::duration_cast<std::chrono::microseconds>(exitTime));
     };
 };
 
