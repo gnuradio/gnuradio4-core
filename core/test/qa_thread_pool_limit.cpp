@@ -13,6 +13,7 @@
 
 namespace {
 constexpr std::size_t kLoweredThreadLimit = 32UZ;
+constexpr std::size_t kQueuedRuns         = 100UZ;
 
 // The thread limit is read once from RLIMIT_NPROC. Lowering the soft limit around that first read gives this process a
 // small pool limit; restoring it at once keeps the kernel from refusing threads below the original limit.
@@ -158,30 +159,43 @@ const boost::ut::suite<"gr::thread_pool global thread limit"> threadLimitTests =
 
     limitTest("ThreadPool: a task submitted at the global thread limit behind a task its only worker has not started is refused", [] {
         // At its maximum of one worker the pool queues the first task without waiting for the worker to take it. Raising
-        // the maximum then lets the second submission try to grow while the first task can still be in the queue.
-        std::atomic<bool> firstStarted{false};
-        std::atomic<bool> releaseFirst{false};
-        std::atomic<bool> refusedRan{false};
-        BasicThreadPool   pool("LimitQueuedTest", TaskType::IO_BOUND, 0U, 1U);
+        // the maximum then lets the second submission try to grow. The worker can take the first task before that
+        // submission. One task queued right after the refusal shows that it had not. The case repeats, up to
+        // kQueuedRuns times, until a run shows it.
+        const auto refuseBehindFirst = [] {
+            std::atomic<bool> firstStarted{false};
+            std::atomic<bool> releaseFirst{false};
+            std::atomic<bool> refusedRan{false};
+            bool              firstQueued = false;
+            BasicThreadPool   pool("LimitQueuedTest", TaskType::IO_BOUND, 0U, 1U);
 
-        {
-            LimitFillers fillers(1UZ);
-            pool.execute([&] {
-                firstStarted = true;
-                firstStarted.notify_all();
-                releaseFirst.wait(false);
-            });
-            pool.setThreadBounds(1U, 2U);
-            expect(throws<std::out_of_range>([&] { pool.execute([&refusedRan] { refusedRan = true; }); })) << "the only worker has the first task. The second needs a worker the pool cannot add";
-            firstStarted.wait(false);
-            expect(eq(pool.numThreads(), 1UZ));
-            expect(eq(pool.numTasksQueued(), 0UZ)) << "the refused task is not queued behind the first";
+            {
+                LimitFillers fillers(1UZ);
+                pool.execute([&] {
+                    firstStarted = true;
+                    firstStarted.notify_all();
+                    releaseFirst.wait(false);
+                });
+                pool.setThreadBounds(1U, 2U);
+                expect(throws<std::out_of_range>([&] { pool.execute([&refusedRan] { refusedRan = true; }); })) << "the only worker has the first task. The second needs a worker the pool cannot add";
+                firstQueued = pool.numTasksQueued() == 1UZ;
+                firstStarted.wait(false);
+                expect(eq(pool.numThreads(), 1UZ));
+                expect(eq(pool.numTasksQueued(), 0UZ)) << "the refused task is not queued behind the first";
+            }
+
+            releaseFirst = true;
+            releaseFirst.notify_all();
+            runAndWait(pool);
+            expect(!refusedRan.load()) << "the refused task never runs";
+            return firstQueued;
+        };
+
+        bool firstQueued = false;
+        for (std::size_t run = 0UZ; run < kQueuedRuns && !firstQueued; ++run) {
+            runSettled([&] { firstQueued = refuseBehindFirst(); });
         }
-
-        releaseFirst = true;
-        releaseFirst.notify_all();
-        runAndWait(pool);
-        expect(!refusedRan.load()) << "the refused task never runs";
+        expect(firstQueued) << "a run submits the second task while the first is still queued";
     });
 
     limitTest("ThreadPool: a task submitted while the pool's last worker is being created and then refused is refused too", [] {
