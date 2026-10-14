@@ -6,6 +6,7 @@
 #include <format>
 #include <map>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -41,10 +42,11 @@ enum class Format { Markdown, Html };
  * carry an explicit HTML anchor element, which every CommonMark renderer passes through.
  */
 class DocWriter {
-    Format                     _format;
-    std::string                _title;
-    std::string                _body;
-    std::map<std::string, int> _anchorUse;
+    Format                             _format;
+    std::string                        _title;
+    std::string                        _body;
+    std::set<std::string>              _anchors;    // every id the document carries
+    std::map<std::string, std::size_t> _nextSuffix; // per slug, the last suffix tried
 
 public:
     DocWriter(Format format, std::string title) : _format(format), _title(std::move(title)) {}
@@ -116,7 +118,8 @@ public:
         return out;
     }
 
-    /// a slug of the given text, made unique within the document by a numeric suffix
+    /// a slug of the given text, made unique within the document by the first numeric suffix that
+    /// gives an id no earlier call returned, a suffixed one included
     [[nodiscard]] std::string anchor(std::string_view source) {
         std::string slug;
         slug.reserve(source.size());
@@ -134,8 +137,13 @@ public:
         if (slug.empty()) {
             slug = "section";
         }
-        const int seen = _anchorUse[slug]++;
-        return seen == 0 ? slug : std::format("{}-{}", slug, seen);
+        std::string  id     = slug;
+        std::size_t& suffix = _nextSuffix[slug];
+        while (_anchors.contains(id)) {
+            id = std::format("{}-{}", slug, ++suffix);
+        }
+        _anchors.insert(id);
+        return id;
     }
 
     void heading(std::size_t level, std::string_view headingText, std::string_view anchorName = {}) {
