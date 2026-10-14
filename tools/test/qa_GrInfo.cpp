@@ -30,7 +30,8 @@
  * - a plugin refused for its plugin ABI version
  * - a name nothing is registered under
  * - a command line that cannot be used
- * - the Markdown and HTML documents of each command, and a value with markup characters in them
+ * - the Markdown and HTML documents of each command, a value with markup characters in them, and the ids of their
+ *   sections
  *
  * The shape of the report is part of that contract - no line wider than a terminal, one entry per block however many
  * instantiations it has, and a JSON document on standard output that carries no null - so each is pinned here too.
@@ -244,6 +245,54 @@ constexpr std::size_t kWidth = 80UZ;
         shown += c;
     }
     return shown;
+}
+
+// One navigation link: the text it shows and the fragment it targets.
+struct Link {
+    std::string label;
+    std::string target;
+};
+
+// The links of the list that opens a document, in order: `- [label](#target)` lines in Markdown, `<li><a
+// href="#target">label</a>` items in HTML.
+[[nodiscard]] std::vector<Link> navigationLinks(std::string_view text, bool html) {
+    const std::string_view opening   = html ? "<li><a href=\"#" : "\n- [";
+    const std::string_view separator = html ? "\">" : "](#";
+    const std::string_view closing   = html ? "</a>" : ")";
+    std::vector<Link>      links;
+    for (std::size_t at = text.find(opening); at != std::string_view::npos; at = text.find(opening, at + opening.size())) {
+        const std::size_t start  = at + opening.size();
+        const std::size_t middle = text.find(separator, start);
+        const std::size_t end    = text.find(closing, middle);
+        if (middle == std::string_view::npos || end == std::string_view::npos) {
+            break;
+        }
+        const std::string first(text.substr(start, middle - start));
+        const std::string second(text.substr(middle + separator.size(), end - middle - separator.size()));
+        links.push_back(html ? Link{.label = second, .target = first} : Link{.label = first, .target = second});
+    }
+    return links;
+}
+
+// The heading of the section whose id is `id`: the line after `<a id="id"></a>` in Markdown, without its `#` marks,
+// and the text of the heading element that carries the id in HTML. Nothing when no section carries the id.
+[[nodiscard]] std::optional<std::string> headingWithId(std::string_view text, std::string_view id, bool html) {
+    if (html) {
+        const std::string tag   = std::format(" id=\"{}\">", id);
+        const std::size_t start = text.find(tag);
+        if (start == std::string_view::npos) {
+            return std::nullopt;
+        }
+        const std::size_t from = start + tag.size();
+        return std::string(text.substr(from, text.find("</h", from) - from));
+    }
+    const std::string anchor = std::format("<a id=\"{}\"></a>\n\n", id);
+    const std::size_t start  = text.find(anchor);
+    if (start == std::string_view::npos) {
+        return std::nullopt;
+    }
+    const std::size_t from = text.find_first_not_of('#', start + anchor.size()) + 1UZ;
+    return std::string(text.substr(from, text.find('\n', from) - from));
 }
 
 // the first line of `text` that starts with `prefix`, or nothing
@@ -741,6 +790,33 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         const Result json = run({"block", "probe::Stage", "--json", "--plugin-dir", GR_TOOLS_TEST_DOC_PROBE_LIBRARY}, Streams::standardOutput);
         expect(eq(json.exitCode, 0)) << json.output;
         expect(json.output.contains(std::format("\"default\": \"{}\"", written))) << json.output;
+    };
+
+    // The three type names make the slugs probe-stage, probe-stage and probe-stage-1: the suffix that sets the second
+    // apart from the first gives the third's slug. A detailed entry's heading is its type name without the namespace.
+    "every id of blocks --verbose is unique and each link reaches its own block's section"_test = [] {
+        for (const bool html : {false, true}) {
+            const std::string_view form     = html ? "--html" : "--markdown";
+            const Result           document = run({"blocks", "--verbose", std::string(form), "--plugin-dir", GR_TOOLS_TEST_DOC_PROBE_LIBRARY}, Streams::standardOutput);
+            expect(eq(document.exitCode, 0)) << document.output;
+
+            std::vector<std::string> ids = linkTargets(document.output, html ? " id=\"" : "<a id=\"", "\"");
+            expect(ge(ids.size(), 6UZ)) << form << "the library, its two families and its three blocks" << document.output;
+            std::ranges::sort(ids);
+            expect(std::ranges::adjacent_find(ids) == ids.end()) << form << "an id appears twice" << document.output;
+
+            const std::vector<Link>  links = navigationLinks(document.output, html);
+            std::vector<std::string> labels;
+            for (const Link& link : links) {
+                labels.push_back(link.label);
+                const std::size_t                qualifier = link.label.rfind("::");
+                const std::string                expected  = qualifier == std::string::npos ? link.label : link.label.substr(qualifier + 2UZ);
+                const std::optional<std::string> heading   = headingWithId(document.output, link.target, html);
+                expect(eq(heading.value_or("(no section)"), expected)) << form << link.label << "leads to" << link.target << document.output;
+            }
+            std::ranges::sort(labels);
+            expect(labels == std::vector<std::string>{"probe::Stage", "probe_Stage", "probe_Stage_1"}) << form << "a link per block" << document.output;
+        }
     };
 #endif
 
