@@ -19,7 +19,7 @@ jobs:
           - label: Clang 20
             brew_pkg: llvm@20
             prefix: /opt/homebrew/opt/llvm@20
-            cache_key: clang20
+            cache_key: ninja-clang20
     env:
       CC: ${{ matrix.compiler.prefix }}/bin/clang
       CXX: ${{ matrix.compiler.prefix }}/bin/clang++
@@ -39,7 +39,7 @@ jobs:
         uses: Homebrew/actions/setup-homebrew@3cdb78d0f62ad29dd32de765782654f4eedea607
 
       - name: Install LLVM and sccache and dependencies
-        run: brew install ${{ matrix.compiler.brew_pkg }} sccache cpp-httplib pkgconf
+        run: brew install ${{ matrix.compiler.brew_pkg }} sccache cpp-httplib pkgconf ninja
 
       - name: Log compiler version
         run: ${{ matrix.compiler.prefix }}/bin/clang --version
@@ -65,7 +65,8 @@ jobs:
 
       - name: Configure
         run: |
-          cmake -S . -B build \
+          cmake -S . -B build -G Ninja \
+            -DGR_BUILD_PARALLEL_LEVEL=2 \
             -DCMAKE_COLOR_DIAGNOSTICS=ON \
             -DDISABLE_EXTERNAL_DEPS_WARNINGS=ON \
             -DCMAKE_BUILD_TYPE=Debug \
