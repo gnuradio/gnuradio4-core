@@ -7,6 +7,7 @@
 #include <array>
 #include <chrono>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <semaphore>
@@ -128,6 +129,8 @@ std::string bits(const std::vector<bool>& mask) {
 } // namespace
 #endif
 
+// A case declares the state that its tasks use before the pool, whose destructor joins the workers before that state
+// ends. A task whose state ends before its pool holds that state through a shared pointer.
 const boost::ut::suite<"gr::thread_pool GR4 default"> defaultThreadPool = [] {
     using namespace boost::ut;
 
@@ -595,7 +598,8 @@ const boost::ut::suite<"gr::thread_pool GR4 default"> defaultThreadPool = [] {
     "ThreadPool: a throwing void task must not kill the worker"_test = [] {
         using namespace gr::thread_pool;
 
-        BasicThreadPool pool("ThrowingTaskTest", TaskType::IO_BOUND, 1U, 1U);
+        std::atomic<bool> ranAfterThrow{false};
+        BasicThreadPool   pool("ThrowingTaskTest", TaskType::IO_BOUND, 1U, 1U);
         pool.waitUntilInitialised();
 
         const std::size_t nFailedBefore = pool.numTasksFailed();
@@ -605,7 +609,6 @@ const boost::ut::suite<"gr::thread_pool GR4 default"> defaultThreadPool = [] {
         }
         expect(eq(pool.numTasksFailed(), nFailedBefore + 1UZ)) << "the escaping exception should be caught and counted";
 
-        std::atomic<bool> ranAfterThrow{false};
         pool.execute([&ranAfterThrow] {
             ranAfterThrow = true;
             ranAfterThrow.notify_all();
@@ -618,13 +621,13 @@ const boost::ut::suite<"gr::thread_pool GR4 default"> defaultThreadPool = [] {
         using namespace gr::thread_pool;
         using Clock = std::chrono::steady_clock;
 
+        std::binary_semaphore started{0};
         // the pool starts its only worker at the first task, after the keep-alive is set
         BasicThreadPool pool("IdleWakeUpTest", TaskType::IO_BOUND, 0U, 1U);
         pool.keepAliveDuration = std::chrono::seconds(1);
 
         // the delays sweep the moment the idle worker blocks on the condition variable
         constexpr std::size_t kSubmissions = 50'000UZ;
-        std::binary_semaphore started{0};
         Clock::duration       longestWait{};
         bool                  allStarted = true;
         for (std::size_t i = 0UZ; i < kSubmissions; ++i) {
@@ -704,12 +707,12 @@ const boost::ut::suite<"gr::thread_pool GR4 default"> defaultThreadPool = [] {
         const auto before = pool.numTasksRecycled();
 
         for (std::size_t i = 0; i < 5; ++i) {
-            std::atomic<bool> flag{false};
-            pool.execute([&] {
-                flag = true;
-                flag.notify_all();
+            auto flag = std::make_shared<std::atomic<bool>>(false);
+            pool.execute([flag] {
+                *flag = true;
+                flag->notify_all();
             });
-            flag.wait(false);
+            flag->wait(false);
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(10)); // let worker recycle
@@ -785,12 +788,12 @@ const boost::ut::suite<"gr::thread_pool Manager"> ThreadPoolManager = [] {
         expect(eq(min, cpu->minThreads()));
         expect(eq(max, cpu->maxThreads()));
 
-        std::atomic<std::size_t> flag{0UZ};
-        cpu->execute([&] {
-            flag = 1UZ;
-            flag.notify_all();
+        auto flag = std::make_shared<std::atomic<std::size_t>>(0UZ);
+        cpu->execute([flag] {
+            *flag = 1UZ;
+            flag->notify_all();
         });
-        flag.wait(0UZ);
+        flag->wait(0UZ);
 
         expect(cpu->numThreads() >= 1U) << "needed to execute one task to spawn one thread";
         expect(cpu->isShutdown() == false);
@@ -808,13 +811,13 @@ const boost::ut::suite<"gr::thread_pool Manager"> ThreadPoolManager = [] {
         expect(pool->device() == "VirtualDevice");
         expect(pool->type() == TaskType::IO_BOUND);
 
-        std::atomic<std::size_t> flag{0UZ};
-        pool->execute([&] {
-            flag = 1UZ;
-            flag.notify_all();
+        auto flag = std::make_shared<std::atomic<std::size_t>>(0UZ);
+        pool->execute([flag] {
+            *flag = 1UZ;
+            flag->notify_all();
         });
-        flag.wait(0UZ);
-        expect(flag.load() == 1UZ);
+        flag->wait(0UZ);
+        expect(flag->load() == 1UZ);
     };
 
     "Manager: duplicate registration fails"_test = [] {
@@ -836,13 +839,13 @@ const boost::ut::suite<"gr::thread_pool Manager"> ThreadPoolManager = [] {
         expect(pool->device() == "CPU-Updated");
         expect(pool->threadBounds().second == 4UZ);
 
-        std::atomic<std::size_t> taskRan{0UZ};
-        pool->execute([&] {
-            taskRan = 1UZ;
-            taskRan.notify_all();
+        auto taskRan = std::make_shared<std::atomic<std::size_t>>(0UZ);
+        pool->execute([taskRan] {
+            *taskRan = 1UZ;
+            taskRan->notify_all();
         });
-        taskRan.wait(0UZ);
-        expect(taskRan.load() == 1UZ);
+        taskRan->wait(0UZ);
+        expect(taskRan->load() == 1UZ);
     };
 };
 

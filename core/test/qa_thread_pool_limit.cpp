@@ -2,6 +2,7 @@
 
 #include <gnuradio-4.0/thread/thread_pool.hpp>
 
+#include <memory>
 #include <thread>
 
 #if defined(__linux__) && !defined(__EMSCRIPTEN__)
@@ -62,13 +63,14 @@ struct HeldThreadExit {
     }
 };
 
+// The task notifies after the store that ends the wait. It holds the flag through a shared pointer.
 void runAndWait(gr::thread_pool::BasicThreadPool& pool) {
-    std::atomic<bool> ran{false};
-    pool.execute([&ran] {
-        ran = true;
-        ran.notify_all();
+    auto ran = std::make_shared<std::atomic<bool>>(false);
+    pool.execute([ran] {
+        *ran = true;
+        ran->notify_all();
     });
-    ran.wait(false);
+    ran->wait(false);
 }
 } // namespace
 
@@ -85,12 +87,15 @@ const boost::ut::suite<"gr::thread_pool global thread limit"> threadLimitTests =
         }
     };
 
+    // Each case declares the state that its tasks use before the pool. A task can still be returning from a wait when
+    // the case ends, and the pool's destructor joins its workers before that state ends.
     limitTest("ThreadPool: a task submitted at the global thread limit with no idle worker is refused, not queued", [] {
-        BasicThreadPool pool("LimitTest", TaskType::IO_BOUND, 1U, static_cast<std::uint32_t>(2UZ * kLoweredThreadLimit));
-        pool.waitUntilInitialised();
-
         std::atomic<bool> firstStarted{false};
         std::atomic<bool> releaseFirst{false};
+        std::atomic<bool> refusedRan{false};
+        BasicThreadPool   pool("LimitTest", TaskType::IO_BOUND, 1U, static_cast<std::uint32_t>(2UZ * kLoweredThreadLimit));
+        pool.waitUntilInitialised();
+
         pool.execute([&] {
             firstStarted = true;
             firstStarted.notify_all();
@@ -98,7 +103,6 @@ const boost::ut::suite<"gr::thread_pool global thread limit"> threadLimitTests =
         });
         firstStarted.wait(false);
 
-        std::atomic<bool> refusedRan{false};
         {
             LimitFillers fillers;
             expect(throws<std::out_of_range>([&] { pool.execute([&refusedRan] { refusedRan = true; }); })) << "the caller learns that no worker can run the task";
@@ -113,10 +117,10 @@ const boost::ut::suite<"gr::thread_pool global thread limit"> threadLimitTests =
     });
 
     limitTest("ThreadPool: a pool with no worker refuses a task at the global thread limit", [] {
-        BasicThreadPool pool("LimitNoWorkerTest", TaskType::IO_BOUND, 0U, 8U);
+        std::atomic<bool> refusedRan{false};
+        BasicThreadPool   pool("LimitNoWorkerTest", TaskType::IO_BOUND, 0U, 8U);
         expect(eq(pool.numThreads(), 0UZ));
 
-        std::atomic<bool> refusedRan{false};
         {
             LimitFillers fillers;
             expect(throws<std::out_of_range>([&] { pool.execute([&refusedRan] { refusedRan = true; }); })) << "a pool with no worker cannot run the task";
@@ -132,11 +136,11 @@ const boost::ut::suite<"gr::thread_pool global thread limit"> threadLimitTests =
     limitTest("ThreadPool: a task submitted at the global thread limit behind a task its only worker has not started is refused", [] {
         // At its maximum of one worker the pool queues the first task without waiting for the worker to take it. Raising
         // the maximum then lets the second submission try to grow while the first task can still be in the queue.
-        BasicThreadPool pool("LimitQueuedTest", TaskType::IO_BOUND, 0U, 1U);
-
         std::atomic<bool> firstStarted{false};
         std::atomic<bool> releaseFirst{false};
         std::atomic<bool> refusedRan{false};
+        BasicThreadPool   pool("LimitQueuedTest", TaskType::IO_BOUND, 0U, 1U);
+
         {
             LimitFillers fillers(1UZ);
             pool.execute([&] {
@@ -158,7 +162,8 @@ const boost::ut::suite<"gr::thread_pool global thread limit"> threadLimitTests =
     });
 
     limitTest("ThreadPool: a task submitted while the pool's last worker is being created and then refused is refused too", [] {
-        BasicThreadPool pool("LimitCreatingTest", TaskType::IO_BOUND, 0U, 1U);
+        std::atomic<bool> dependentRan{false};
+        BasicThreadPool   pool("LimitCreatingTest", TaskType::IO_BOUND, 0U, 1U);
         pool.keepAliveDuration = std::chrono::milliseconds(1);
         pool.execute([] { [[maybe_unused]] thread_local HeldThreadExit heldExit; });
         HeldThreadExit::entered.wait(false);
@@ -180,7 +185,6 @@ const boost::ut::suite<"gr::thread_pool global thread limit"> threadLimitTests =
         }
 
         std::atomic<bool> dependentRefused{false};
-        std::atomic<bool> dependentRan{false};
         std::thread       dependent([&] {
             try {
                 pool.execute([&dependentRan] { dependentRan = true; });
