@@ -34,7 +34,7 @@ flowchart LR
 | --- | --- | --- | --- |
 | source<br>(source_1) | qa::RampSource | n_samples: 4096<br>name: "source" |  |
 | front_end | SUBGRAPH<br>(subgraph) |  |  |
-| sink | qa::RecordingSink | name: "sink"<br>[context fast @ 0] buffer_size: 512 | role: "terminal" |
+| sink | qa::RecordingSink | name: "sink"<br>\[context fast @ 0\] buffer_size: 512 | role: "terminal" |
 
 ## Connections
 

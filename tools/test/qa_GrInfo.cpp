@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -29,7 +30,7 @@
  * - a plugin refused for its plugin ABI version
  * - a name nothing is registered under
  * - a command line that cannot be used
- * - the Markdown and HTML documents of each command
+ * - the Markdown and HTML documents of each command, and a value with markup characters in them
  *
  * The shape of the report is part of that contract - no line wider than a terminal, one entry per block however many
  * instantiations it has, and a JSON document on standard output that carries no null - so each is pinned here too.
@@ -198,6 +199,77 @@ constexpr std::size_t kWidth = 80UZ;
         targets.emplace_back(text.substr(start, end - start));
     }
     return targets;
+}
+
+// The cells of one Markdown table row, split at each `|` that no backslash escapes, without the spaces around them. The
+// row opens and closes with a `|`.
+[[nodiscard]] std::vector<std::string> cellsOf(std::string_view row) {
+    std::vector<std::string> pieces(1UZ);
+    for (std::size_t i = 0UZ; i < row.size(); ++i) {
+        if (row[i] == '|') {
+            pieces.emplace_back();
+            continue;
+        }
+        pieces.back() += row[i];
+        if (row[i] == '\\' && i + 1UZ < row.size()) {
+            pieces.back() += row[++i];
+        }
+    }
+    std::vector<std::string> cells;
+    for (std::size_t i = 1UZ; i + 1UZ < pieces.size(); ++i) {
+        const std::size_t first = pieces[i].find_first_not_of(' ');
+        cells.push_back(first == std::string::npos ? std::string{} : pieces[i].substr(first, pieces[i].find_last_not_of(' ') - first + 1UZ));
+    }
+    return cells;
+}
+
+// The text a CommonMark renderer shows for the source of one table cell, or nothing when the source holds a character
+// that acts as markup there. A backslash before ASCII punctuation makes that character literal, and a literal `&`
+// starts no entity. An unescaped `*`, backtick, `[`, `]`, `<`, `>`, `&`, `~` or `|`, or an `_` that does not stand
+// between two letters or digits, opens emphasis, a code span, a link, raw HTML, an entity, a strikethrough or a cell.
+[[nodiscard]] std::optional<std::string> renderedCell(std::string_view source) {
+    constexpr std::string_view kMarkup         = "*`[]<>&~|";
+    const auto                 isWordCharacter = [source](std::size_t i) { return i < source.size() && std::isalnum(static_cast<unsigned char>(source[i])) != 0; };
+    std::string                shown;
+    for (std::size_t i = 0UZ; i < source.size(); ++i) {
+        const char c = source[i];
+        if (c == '\\' && i + 1UZ < source.size() && std::ispunct(static_cast<unsigned char>(source[i + 1UZ])) != 0) {
+            shown += source[++i];
+            continue;
+        }
+        const bool intraword = c == '_' && i > 0UZ && isWordCharacter(i - 1UZ) && isWordCharacter(i + 1UZ);
+        if (kMarkup.contains(c) || (c == '_' && !intraword)) {
+            return std::nullopt;
+        }
+        shown += c;
+    }
+    return shown;
+}
+
+// the first line of `text` that starts with `prefix`, or nothing
+[[nodiscard]] std::optional<std::string> lineStartingWith(std::string_view text, std::string_view prefix) {
+    for (std::size_t start = 0UZ; start < text.size();) {
+        const std::size_t end = std::min(text.find('\n', start), text.size());
+        if (text.substr(start, end - start).starts_with(prefix)) {
+            return std::string(text.substr(start, end - start));
+        }
+        start = end + 1UZ;
+    }
+    return std::nullopt;
+}
+
+// whether a Markdown table in `text` has a row whose cells a renderer shows as `shown`
+[[nodiscard]] bool hasRenderedRow(std::string_view text, const std::vector<std::string>& shown) {
+    for (std::size_t start = 0UZ; start < text.size();) {
+        const std::size_t              end   = std::min(text.find('\n', start), text.size());
+        const std::string_view         line  = text.substr(start, end - start);
+        const std::vector<std::string> cells = line.starts_with('|') ? cellsOf(line) : std::vector<std::string>{};
+        if (cells.size() == shown.size() && std::ranges::equal(cells, shown, [](const std::string& cell, const std::string& expected) { return renderedCell(cell) == expected; })) {
+            return true;
+        }
+        start = end + 1UZ;
+    }
+    return false;
 }
 
 // what an HTML page may not carry if it is to render with no network: a script, a style sheet or an image loaded
@@ -508,7 +580,7 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         const Result markdown = run(overTestDirectories({"version", "--markdown"}), Streams::standardOutput);
         expect(eq(markdown.exitCode, 0)) << markdown.output;
         expect(markdown.output.starts_with("# grinfo version\n")) << "the command is the title" << markdown.output;
-        expect(markdown.output.contains(std::format("| {} | option | searched |", GR_TOOLS_CORE_TEST_PLUGINS))) << "a directory row, its path whole" << markdown.output;
+        expect(hasRenderedRow(markdown.output, {GR_TOOLS_CORE_TEST_PLUGINS, "option", "searched"})) << "a directory row, its path whole" << markdown.output;
         expect(markdown.output.contains("| Good Math Plugin | v1 | MIT | 4 | 1 |")) << "a plugin row" << markdown.output;
         expect(markdown.output.contains("- gr::scheduler::Simple\\<singleThreaded\\>\n")) << "a scheduler key, its brackets escaped" << markdown.output;
 
@@ -639,6 +711,36 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
             expect(eq(report.exitCode, 0)) << report.output;
             expect(le(widestLine(report.output), kWidth)) << arguments.front() << report.output;
         }
+    };
+#endif
+
+    "the Markdown cell reader shows escaped characters as written and refuses markup"_test = [] {
+        expect(eq(renderedCell("\\*literal\\* \\&lt;").value_or("(markup)"), std::string("*literal* &lt;")));
+        expect(eq(renderedCell("sample_rate").value_or("(markup)"), std::string("sample_rate"))) << "an underscore inside a word";
+        expect(!renderedCell("*literal*").has_value()) << "emphasis";
+        expect(!renderedCell("&lt;").has_value()) << "an entity";
+        expect(!renderedCell("_x").has_value()) << "an underscore at a word's start";
+        expect(cellsOf("| a | b\\|c |  |") == std::vector<std::string>{"a", "b\\|c", ""}) << "a row split at its unescaped bars";
+    };
+
+#ifdef GR_TOOLS_TEST_DOC_PROBE_LIBRARY
+    "a string default keeps its characters in the Markdown cell, the HTML cell and the JSON document"_test = [] {
+        const std::string written  = "*literal* &lt;";
+        const Result      markdown = run({"block", "probe::Stage", "--markdown", "--plugin-dir", GR_TOOLS_TEST_DOC_PROBE_LIBRARY}, Streams::standardOutput);
+        expect(eq(markdown.exitCode, 0)) << markdown.output;
+        const std::optional<std::string> row = lineStartingWith(markdown.output, "| label | string | ");
+        expect(fatal(row.has_value())) << "the setting's row" << markdown.output;
+        const std::vector<std::string> cells = cellsOf(*row);
+        expect(fatal(ge(cells.size(), 3UZ))) << *row;
+        expect(eq(renderedCell(cells[2]).value_or("(markup)"), std::format("\"{}\"", written))) << "the default as a renderer shows it" << *row;
+
+        const Result html = run({"block", "probe::Stage", "--html", "--plugin-dir", GR_TOOLS_TEST_DOC_PROBE_LIBRARY}, Streams::standardOutput);
+        expect(eq(html.exitCode, 0)) << html.output;
+        expect(html.output.contains("<td>label</td><td>string</td><td>&quot;*literal* &amp;lt;&quot;</td>")) << html.output;
+
+        const Result json = run({"block", "probe::Stage", "--json", "--plugin-dir", GR_TOOLS_TEST_DOC_PROBE_LIBRARY}, Streams::standardOutput);
+        expect(eq(json.exitCode, 0)) << json.output;
+        expect(json.output.contains(std::format("\"default\": \"{}\"", written))) << json.output;
     };
 #endif
 

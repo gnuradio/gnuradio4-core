@@ -329,7 +329,7 @@ const boost::ut::suite<"GraphDoc"> graphDocTests = [] {
             expect(document.find(endpoint) != std::string::npos) << std::format("connection endpoint '{}' is missing from the document", endpoint);
         }
         expect(document.find("4096") != std::string::npos) << "the minimum buffer size of the second connection is missing";
-        expect(document.find("[context fast @ 0]") != std::string::npos) << "the context parameters of the sink are missing";
+        expect(document.find("\\[context fast @ 0\\]") != std::string::npos) << "the context parameters of the sink are missing";
     };
 
     "each subgraph has its own section, exported ports and diagram"_test = [] {
@@ -701,8 +701,8 @@ const boost::ut::suite<"GraphDoc"> graphDocTests = [] {
         expect(markdown.find("| thread_pool | \"workers\" |") != std::string::npos) << "the parameters of the scheduler that manages a subgraph" << markdown;
         expect(markdown.find("| inner_note | \"nested_metadata\" |") != std::string::npos) << "the definition metadata of a nested level" << markdown;
         expect(markdown.find("| scheduler.affinity |") != std::string::npos) << "a key of the scheduler map nothing renders" << markdown;
-        expect(markdown.find("| ctx_parameters[0].note |") != std::string::npos) << "a key of a context entry nothing renders" << markdown;
-        expect(markdown.find("| connections[0][5] |") != std::string::npos) << "a connection element past the buffer size" << markdown;
+        expect(markdown.find("| ctx_parameters\\[0\\].note |") != std::string::npos) << "a key of a context entry nothing renders" << markdown;
+        expect(markdown.find("| connections\\[0\\]\\[5\\] |") != std::string::npos) << "a connection element past the buffer size" << markdown;
     };
 
     "every scalar of a file with every known key reaches both documents"_test = [] {
@@ -721,7 +721,7 @@ const boost::ut::suite<"GraphDoc"> graphDocTests = [] {
         expect(fatal(level.has_value())) << "the importer passes over an entry that is not a map, so the document is written";
         expect(eq(level->blocks.size(), 1UZ));
         const std::string markdown = graphdoc::render(*level, Format::Markdown, "t");
-        expect(markdown.find("| blocks[0] | 42 |") != std::string::npos) << markdown;
+        expect(markdown.find("| blocks\\[0\\] | 42 |") != std::string::npos) << markdown;
     };
 };
 
