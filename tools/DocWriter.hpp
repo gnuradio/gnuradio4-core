@@ -53,12 +53,18 @@ public:
     [[nodiscard]] Format format() const noexcept { return _format; }
 
     /// escapes text for a table cell: a newline becomes a line break, and the cell separator and
-    /// the markup characters of the target format lose their meaning. In Markdown that includes the
-    /// angle brackets, which a renderer reads as raw HTML: `Block<float32>` would lose `<float32>`.
+    /// the markup characters of the target format lose their meaning. In Markdown these are the
+    /// angle brackets, which a renderer reads as raw HTML (`Block<float32>` would lose `<float32>`),
+    /// the ampersand of an entity (`&lt;` would show as `<`), and the characters of emphasis, code
+    /// spans, links and strikethrough. An underscore between two letters or digits opens no
+    /// emphasis and stays unescaped, which keeps a snake_case name legible in the source.
     [[nodiscard]] std::string cell(std::string_view text) const {
-        std::string out;
+        constexpr std::string_view kMarkdownMarkup = "|\\<>&*`[]~";
+        const auto                 isWordCharacter = [text](std::size_t i) { return i < text.size() && std::isalnum(static_cast<unsigned char>(text[i])) != 0; };
+        std::string                out;
         out.reserve(text.size());
-        for (const char c : text) {
+        for (std::size_t i = 0UZ; i < text.size(); ++i) {
+            const char c = text[i];
             if (c == '\n') {
                 out += "<br>";
                 continue;
@@ -72,7 +78,8 @@ public:
                 default: break;
                 }
             } else {
-                if (c == '|' || c == '\\' || c == '<' || c == '>') {
+                const bool intraword = c == '_' && i > 0UZ && isWordCharacter(i - 1UZ) && isWordCharacter(i + 1UZ);
+                if (kMarkdownMarkup.contains(c) || (c == '_' && !intraword)) {
                     out += '\\';
                 }
             }

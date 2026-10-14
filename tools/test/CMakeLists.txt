@@ -84,7 +84,8 @@ if(TARGET grinfo)
       PRIVATE GR_TOOLS_CORE_TEST_PLUGINS="${CMAKE_BINARY_DIR}/core/test/plugins"
               GR_TOOLS_TEST_BLOCK_LIBRARY="${CMAKE_BINARY_DIR}/core/test/block_library"
               GR_TOOLS_TEST_SCHEDULER_LIBRARY="${CMAKE_BINARY_DIR}/core/test/scheduler_library"
-              GR_TOOLS_TEST_PLUGIN_ABI="${CMAKE_BINARY_DIR}/core/test/plugin_abi")
+              GR_TOOLS_TEST_PLUGIN_ABI="${CMAKE_BINARY_DIR}/core/test/plugin_abi"
+              GR_TOOLS_TEST_DOC_PROBE_LIBRARY="${CMAKE_BINARY_DIR}/core/test/doc_probe_library")
     add_dependencies(
       qa_GrInfo
       GoodBasePlugin
@@ -98,6 +99,7 @@ if(TARGET grinfo)
       scheduler_library_unversioned
       abi_probe_plugin
       abi_probe_plugin_v1
-      abi_probe_plugin_foreign_scheduler)
+      abi_probe_plugin_foreign_scheduler
+      doc_probe_library)
   endif()
 endif()

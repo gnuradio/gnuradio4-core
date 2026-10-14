@@ -62,6 +62,9 @@ add_block_library(cross_object_library cross_object_library)
 # loads them
 add_block_library(opaque_stage_library opaque_stage_library)
 
+# blocks whose type names and setting default test the anchors and the escaping of grinfo's documents
+add_block_library(doc_probe_library doc_probe_library)
+
 # One plugin at two plugin ABI versions, in a directory of their own: one at the version this core implements and one at
 # version 1. A third plugin is at the version this core implements and registers a scheduler at version 1 when it loads.
 # A single load of that directory reaches every outcome of the loader's version checks for plugins.
