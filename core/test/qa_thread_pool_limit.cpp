@@ -3,11 +3,15 @@
 #include <gnuradio-4.0/thread/thread_pool.hpp>
 
 #include <atomic>
+#include <exception>
 #include <memory>
+#include <print>
+#include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <vector>
 
-#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+#if defined(__linux__) && !defined(__EMSCRIPTEN__) && !defined(EMBEDDED)
 #include <sys/resource.h>
 #endif
 
@@ -16,9 +20,12 @@ constexpr std::size_t kLoweredThreadLimit = 32UZ;
 constexpr std::size_t kQueuedRuns         = 100UZ;
 
 // The thread limit is read once from RLIMIT_NPROC. Lowering the soft limit around that first read gives this process a
-// small pool limit; restoring it at once keeps the kernel from refusing threads below the original limit.
+// small pool limit; restoring it at once keeps the kernel from refusing threads below the original limit. The kernel
+// checks the limit only when a thread starts, and no thread starts while the lowered limit is in force. The test lowers
+// the limit only on Linux without EMBEDDED, where the pool reads RLIMIT_NPROC and counts every thread of the process.
+// Elsewhere, or where the soft limit cannot be lowered, threadLimit is zero.
 const std::size_t threadLimit = [] {
-#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+#if defined(__linux__) && !defined(__EMSCRIPTEN__) && !defined(EMBEDDED)
     rlimit original{};
     if (getrlimit(RLIMIT_NPROC, &original) == 0) {
         rlimit lowered   = original;
@@ -30,7 +37,7 @@ const std::size_t threadLimit = [] {
         }
     }
 #endif
-    return gr::thread_pool::thread::getThreadLimit();
+    return 0UZ;
 }();
 
 // The kernel counts a thread until the thread has finished exiting, which can be after its join returns. The pool reads
@@ -42,6 +49,7 @@ void waitForThreadCount(std::size_t count) {
 }
 
 // Starts threads until the pool can add only `room` more workers; with no room, one more thread would reach threadLimit.
+// It starts at most kLoweredThreadLimit threads.
 // The count is exact when no joined thread is still counted. Each case starts with the count settled, and the
 // destructor waits until the kernel has dropped the fillers from the count.
 struct LimitFillers {
@@ -49,12 +57,21 @@ struct LimitFillers {
     std::vector<std::thread> threads;
 
     explicit LimitFillers(std::size_t room = 0UZ) {
-        while (gr::thread_pool::getTotalThreadCount() + 1UZ + room < threadLimit) {
-            threads.emplace_back([this] { release.wait(false); });
+        try {
+            while (threads.size() < kLoweredThreadLimit && gr::thread_pool::getTotalThreadCount() + 1UZ + room < threadLimit) {
+                add();
+            }
+        } catch (...) {
+            joinAll();
+            throw;
         }
     }
 
     ~LimitFillers() { joinAll(); }
+
+    void add() {
+        threads.emplace_back([this] { release.wait(false); });
+    }
 
     void joinAll() {
         const std::size_t counted = gr::thread_pool::getTotalThreadCount();
@@ -66,6 +83,21 @@ struct LimitFillers {
         waitForThreadCount(counted - threads.size());
     }
 };
+
+// Empty when the cases can run. A case runs up to kLoweredThreadLimit threads at once. A per-user or container thread
+// limit can refuse them when the user's other threads come near it.
+const std::string_view skipReason = []() -> std::string_view {
+    if (threadLimit != kLoweredThreadLimit) {
+        return "the test lowers the thread limit only on Linux without EMBEDDED, through the soft RLIMIT_NPROC before its first read";
+    }
+    try {
+        LimitFillers fillers;
+        fillers.add();
+    } catch (const std::exception&) {
+        return "the system refuses this process the threads that fill the lowered limit, or the thread count cannot be read";
+    }
+    return {};
+}();
 
 // Runs `body`, then waits until the count is back to its value before `body`. `body` joins every thread it starts.
 void runSettled(auto body) {
@@ -102,11 +134,11 @@ const boost::ut::suite<"gr::thread_pool global thread limit"> threadLimitTests =
     using namespace boost::ut;
     using namespace gr::thread_pool;
 
-    // the cases need a lowered limit, which only Linux provides here
     const auto limitTest = [](std::string_view name, auto body) {
-        if (threadLimit == kLoweredThreadLimit) {
+        if (skipReason.empty()) {
             test(name) = [body] { runSettled(body); };
         } else {
+            std::println("skipping '{}': {}", name, skipReason);
             skip / test(name) = body;
         }
     };
@@ -239,7 +271,7 @@ const boost::ut::suite<"gr::thread_pool global thread limit"> threadLimitTests =
         {
             LimitFillers fillers;
             // one more filler takes the place of the worker that left once the pool joins it
-            fillers.threads.emplace_back([&fillers] { fillers.release.wait(false); });
+            fillers.add();
             HeldThreadExit::release = true;
             HeldThreadExit::release.notify_all();
             dependent.join();
