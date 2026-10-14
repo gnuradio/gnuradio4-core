@@ -31,10 +31,10 @@ printf '::group::S3 setup\n'
     # set up default bucket here
     echo "AWS key ID not set. Using default read-only key ID & key"
     use_default=true
-    export AWS_ACCESS_KEY_ID="0021090e73dcc120000000011"
+    export AWS_ACCESS_KEY_ID="0021090e73dcc120000000015"
     add_env AWS_ACCESS_KEY_ID "${AWS_ACCESS_KEY_ID}"
     # Can't have a key without a key id.
-    export AWS_SECRET_ACCESS_KEY="K002ZRGEBKHUTomcuA//6KbtGDpLJ5w"
+    export AWS_SECRET_ACCESS_KEY="K002wh+KgHc9bNdIG0r4GHv0fTlWWi8"
   fi
   add_env AWS_SECRET_ACCESS_KEY "${AWS_SECRET_ACCESS_KEY}"
   # lets mask a few things in output. I bet people are scraping github action
