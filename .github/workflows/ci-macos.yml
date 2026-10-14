@@ -35,10 +35,10 @@ jobs:
           echo "SDKROOT=${sdk_path}" >> "$GITHUB_ENV"
           echo "SDK path: ${sdk_path}"
 
-      - name: Set up Homebrew
-        uses: Homebrew/actions/setup-homebrew@3cdb78d0f62ad29dd32de765782654f4eedea607
-
       - name: Install LLVM and sccache and dependencies
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+          HOMEBREW_NO_INSTALL_CLEANUP: 1
         run: brew install ${{ matrix.compiler.brew_pkg }} sccache cpp-httplib pkgconf ninja
 
       - name: Log compiler version
