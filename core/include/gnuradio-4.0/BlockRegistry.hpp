@@ -247,11 +247,11 @@ public:
 };
 
 class BlockRegistry : public GeneralRegistry<BlockModel, BlockWrapper> {
-    friend BlockRegistry& globalBlockRegistry(std::source_location location);
+    friend GNURADIO_EXPORT BlockRegistry& globalBlockRegistry(std::source_location location);
 };
 
 class SchedulerRegistry : public GeneralRegistry<SchedulerModel, SchedulerWrapper> {
-    friend SchedulerRegistry& globalSchedulerRegistry(std::source_location location);
+    friend GNURADIO_EXPORT SchedulerRegistry& globalSchedulerRegistry(std::source_location location);
 };
 
 /**
