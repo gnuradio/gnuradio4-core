@@ -1765,7 +1765,7 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(flow.edges()[0].state() == gr::Edge::EdgeState::WaitingToBeConnected) << "the removal connected the remaining edge";
         expect(!source.out.isConnected()) << "the removal connected the source port";
 
-        gr::scheduler::Simple scheduler;
+        gr::scheduler::Simple<> scheduler;
         expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
         expect(qa_edit::runUntil(scheduler, [&kept] { return kept.state() == gr::lifecycle::State::STOPPED; })) << "the kept consumer did not finish";
         expect(eq(kept._nReceived, qa_edit::FiniteSource::kSamples)) << "the kept consumer missed samples";
@@ -1782,7 +1782,7 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(flow.connect<"out", "in">(source, kept).has_value());
         expect(flow.connect<"out", "in">(source, removed).has_value());
 
-        gr::scheduler::Simple scheduler;
+        gr::scheduler::Simple<> scheduler;
         expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
         expect(fatal(scheduler.runAndWait().has_value()));
         expect(fatal(eq(kept._nReceived, kSamples)));
