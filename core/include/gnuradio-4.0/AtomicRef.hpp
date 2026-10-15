@@ -10,7 +10,11 @@
 #endif
 
 #ifndef forceinline
+#ifdef _MSC_VER
+#define forceinline __forceinline
+#else
 #define forceinline inline __attribute__((always_inline))
+#endif
 #endif
 
 namespace gr {
