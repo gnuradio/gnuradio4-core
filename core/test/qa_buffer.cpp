@@ -2025,25 +2025,30 @@ const boost::ut::suite<"SlowestReader"> _slowestReaderTests = [] {
     } | SlowestReaderStrategies{};
 
     // Three readers take turns. The reader at the back moves to one past the reader at the front. The slowest reader
-    // changes at every step. Reader cursors only advance. The readers start together and stop once the writer has seen
-    // the slowest reader change nChangesWanted times. The bound the writer takes must not exceed any reader position
-    // read after it. A minimum that loads a cursor twice, as libc++'s std::ranges::min does, fails this case. With
-    // libstdc++, whose std::ranges::min loads each cursor once, the case pins the single-read minimum's result alone.
+    // changes at every step. Reader cursors only advance. After each sample the writer lets the readers take at most
+    // nStepsPerSample more steps. That count is below nReaders, and a sample that follows a step sees a new slowest
+    // reader. The readers wait while the writer does not sample. The case runs until the writer has counted
+    // nChangesWanted changes, however the threads are scheduled. A writer that keeps seeing the same slowest reader
+    // yields its CPU. Where a yield gives up the CPU, the readers can then move on a single CPU. The bound the writer
+    // takes must not exceed any reader position read after it. A minimum that loads a cursor twice, as libc++'s
+    // std::ranges::min does, fails this case. With libstdc++, whose std::ranges::min loads each cursor once, the case
+    // checks only the result of a single-read minimum.
     "the writer's bound stays at or below every reader while readers overtake one another"_test = []<typename StrategyType> {
-        using Strategy                       = typename StrategyType::type;
-        constexpr std::size_t cap            = 1UZ << 18UZ;
-        constexpr std::size_t nReaders       = 3UZ;
-        constexpr std::size_t nChangesWanted = 1UZ << 12UZ;
-        Strategy              strategy(cap);
-        const auto            readers = attachReadersAtCapacity(strategy, nReaders, cap);
+        using Strategy                            = typename StrategyType::type;
+        constexpr std::size_t cap                 = 1UZ << 18UZ;
+        constexpr std::size_t nReaders            = 3UZ;
+        constexpr std::size_t nChangesWanted      = 1UZ << 12UZ;
+        constexpr std::size_t nStepsPerSample     = 2UZ;
+        constexpr std::size_t nSamplesBeforeYield = 1UZ << 8UZ;
+        static_assert(nStepsPerSample < nReaders);
+        Strategy   strategy(cap);
+        const auto readers = attachReadersAtCapacity(strategy, nReaders, cap);
 
-        std::atomic<bool>        go{false};
+        // once the readers have spread out, the front reader is nReaders - 1 ahead of the slowest one. A step moves the
+        // front to frontLimit at most.
+        std::atomic<std::size_t> frontLimit{nReaders - 1UZ + nStepsPerSample};
         std::atomic<bool>        stop{false};
-        std::atomic<std::size_t> nReadersDone{0UZ};
         auto                     readerJob = [&](std::size_t self) {
-            while (!go.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
-            }
             while (!stop.load(std::memory_order_acquire)) {
                 const std::size_t own    = readers[self]->value();
                 std::size_t       front  = 0UZ;
@@ -2055,29 +2060,25 @@ const boost::ut::suite<"SlowestReader"> _slowestReaderTests = [] {
                         atBack = false;
                     }
                 }
-                if (front >= cap) {
-                    break;
-                }
-                if (atBack) {
+                if (atBack && front < frontLimit.load(std::memory_order_acquire)) {
                     readers[self]->setValue(front + 1UZ);
                 } else {
                     std::this_thread::yield();
                 }
             }
-            nReadersDone.fetch_add(1UZ, std::memory_order_acq_rel);
         };
 
         std::vector<std::thread> threads;
         for (std::size_t i = 0UZ; i < nReaders; ++i) {
             threads.emplace_back(readerJob, i);
         }
-        go.store(true, std::memory_order_release);
 
-        std::size_t nSamples        = 0UZ;
-        std::size_t nAboveAReader   = 0UZ;
-        std::size_t nSlowestChanges = 0UZ;
-        std::size_t lastSlowest     = nReaders;
-        while (nReadersDone.load(std::memory_order_acquire) < nReaders) {
+        std::size_t nSamples          = 0UZ;
+        std::size_t nAboveAReader     = 0UZ;
+        std::size_t nSlowestChanges   = 0UZ;
+        std::size_t nSamplesUnchanged = 0UZ;
+        std::size_t lastSlowest       = nReaders;
+        while (nSlowestChanges < nChangesWanted) {
             const std::size_t bound   = strategy.getRemainingCapacity();
             std::size_t       slowest = 0UZ;
             std::size_t       lowest  = cap + 1UZ;
@@ -2091,18 +2092,26 @@ const boost::ut::suite<"SlowestReader"> _slowestReaderTests = [] {
                     slowest = i;
                 }
             }
-            nSlowestChanges += (slowest != lastSlowest) ? 1UZ : 0UZ;
+            if (slowest != lastSlowest) {
+                ++nSlowestChanges;
+                nSamplesUnchanged = 0UZ;
+            } else if (++nSamplesUnchanged % nSamplesBeforeYield == 0UZ) {
+                std::this_thread::yield();
+            }
             lastSlowest = slowest;
             ++nSamples;
-            if (nSlowestChanges >= nChangesWanted) {
-                stop.store(true, std::memory_order_release);
-            }
+            frontLimit.store(lowest + nReaders - 1UZ + nStepsPerSample, std::memory_order_release);
         }
+        stop.store(true, std::memory_order_release);
         for (auto& thread : threads) {
             thread.join();
         }
 
-        expect(ge(nSlowestChanges, nChangesWanted)) << "the readers must overtake one another while the writer samples";
+        std::size_t front = 0UZ;
+        for (const auto& reader : readers) {
+            front = std::max(front, reader->value());
+        }
+        expect(lt(front, cap)) << "the bound is the slowest reader's position only while every reader stays below the reserve cursor";
         expect(eq(nAboveAReader, 0UZ)) << std::format("the writer's bound exceeded a reader's position in {} of {} samples", nAboveAReader, nSamples);
     } | SlowestReaderStrategies{};
 };
