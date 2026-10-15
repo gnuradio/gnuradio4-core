@@ -1,7 +1,9 @@
 #ifndef CORE_TEST_MAPPED_LIBRARY_HPP
 #define CORE_TEST_MAPPED_LIBRARY_HPP
 
+#include <format>
 #include <string>
+#include <string_view>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -30,6 +32,15 @@ namespace gr::testing {
     }
     dlclose(handle);
     return true;
+#endif
+}
+
+// the file name a MODULE library is built under, with the platform's prefix and suffix
+[[nodiscard]] inline std::string moduleFileName(std::string_view stem) {
+#if defined(_WIN32)
+    return std::format("{}.dll", stem);
+#else
+    return std::format("lib{}.so", stem);
 #endif
 }
 
