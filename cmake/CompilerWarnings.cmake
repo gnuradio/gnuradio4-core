@@ -33,6 +33,8 @@ function(set_project_warnings target_name)
       /wd4146 # unary minus applied to unsigned type: `-1UZ` is the codebase's invalid-index sentinel
       /wd4624 # destructor implicitly deleted: the port-descriptor tag types delete theirs on purpose
       /wd4547 # 'operator before comma has no effect': misfires on every C++23 `tensor[i + 1, j]`
+      /wd4251 # 'member' needs dll-interface: the exported types hold std:: members, as the whole API does
+      /wd4275 # non dll-interface base: gr::exception derives from std::exception
   )
 
   set(CLANG_WARNINGS
