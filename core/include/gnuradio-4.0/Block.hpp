@@ -1129,6 +1129,16 @@ public:
     [[nodiscard]] static constexpr bool hasForwardTagsOverride() noexcept { return acceptsForwardTagsSpans<true>() || acceptsForwardTagsSpans<false>(); }
 
 private:
+    /// as acceptsForwardTagsSpans, on the spans prepareStreams() builds. Kept a function template
+    /// because MSVC rejects the member lookup outright when this requires-expression is written
+    /// directly in a non-template member body, rather than substituting false.
+    template<typename TDerived = Derived>
+    [[nodiscard]] static constexpr bool acceptsPreparedForwardTagsSpans() noexcept {
+        using TInputSpans  = decltype(prepareStreams(inputPorts<PortType::STREAM>(std::declval<TDerived*>()), 0UZ));
+        using TOutputSpans = decltype(prepareStreams(outputPorts<PortType::STREAM>(std::declval<TDerived*>()), 0UZ));
+        return requires(TDerived& block, TInputSpans& inputSpans, TOutputSpans& outputSpans) { block.forwardTags(inputSpans, outputSpans, 0UZ); };
+    }
+
     template<bool kRetireOnlyFirstTag>
     [[nodiscard]] static constexpr bool acceptsForwardTagsSpans() noexcept {
         using TInputSpans  = decltype(prepareStreamsRetiring<kRetireOnlyFirstTag>(inputPorts<PortType::STREAM>(std::declval<Derived*>()), 0UZ));
@@ -1166,9 +1176,7 @@ public:
             static_assert(!unfilteredTagPropagation && !noTagPropagation, "FilteredTagPropagation cannot be combined with UnfilteredTagPropagation or NoTagPropagation: the first requires every key, and the second forwards no tag.");
         }
         if constexpr (forwardsEveryKey()) {
-            using TInputSpans  = decltype(prepareStreams(inputPorts<PortType::STREAM>(std::declval<Derived*>()), 0UZ));
-            using TOutputSpans = decltype(prepareStreams(outputPorts<PortType::STREAM>(std::declval<Derived*>()), 0UZ));
-            static_assert(!requires(Derived& block, TInputSpans& inputSpans, TOutputSpans& outputSpans) { block.forwardTags(inputSpans, outputSpans, 0UZ); }, "A block forwarding every key calls a forwardTags() that hasForwardTagsOverride() does not see: the override deduces its return type from a body that reads the tag window. Declare the override's return type.");
+            static_assert(!acceptsPreparedForwardTagsSpans(), "A block forwarding every key calls a forwardTags() that hasForwardTagsOverride() does not see: the override deduces its return type from a body that reads the tag window. Declare the override's return type.");
         }
     }
 
