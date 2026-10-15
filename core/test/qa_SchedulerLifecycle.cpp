@@ -5293,8 +5293,8 @@ const boost::ut::suite<"a watchdog wake"> watchdogWakeTests = [] {
 
             const bool beforeNextRead = lastEmptyPoll.has_value() && resumedAt - *lastEmptyPoll < kPeriod;
             if (beforeNextRead) {
-                const std::size_t from = scheduler.nWakes();
-                expect(qa_sched::awaitCondition([&scheduler, from] { return scheduler.nWakes() >= from + 2UZ * kStalledPeriods + 2UZ; })) << "the watchdog stopped observing the stall";
+                const std::size_t nWakesToAwait = scheduler.nWakes() + 2UZ * kStalledPeriods + 2UZ;
+                expect(qa_sched::awaitCondition([&scheduler, nWakesToAwait] { return scheduler.nWakes() >= nWakesToAwait; })) << "the watchdog stopped observing the stall";
                 reports.take(fromScheduler);
                 expect(eq(reports.count, 1UZ)) << "the stall was reported again after the pause and the resume";
             } else {
