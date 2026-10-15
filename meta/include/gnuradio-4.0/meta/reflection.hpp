@@ -131,6 +131,28 @@ constexpr typename base_type_impl<T>::type& to_base_type(T& obj) {
 template<auto X>
 inline constexpr std::integral_constant<std::remove_const_t<decltype(X)>, X> ic = {};
 
+// Determine size of MSVCs elaborated-type-specifier with which all class/struct/enums/unions are prefixed with
+// which is not the case with PRETTY_PRINT
+[[nodiscard]] constexpr std::size_t elaboratedSpecifierLength(std::string_view text, std::size_t pos) noexcept {
+    if (pos != 0UZ) { // must start an identifier, so that a user type named e.g. `class_traits` survives
+        const char previous         = text[pos - 1UZ];
+        const bool insideIdentifier = (previous >= 'a' and previous <= 'z') or (previous >= 'A' and previous <= 'Z') or (previous >= '0' and previous <= '9') or previous == '_' or previous == ':';
+        if (insideIdentifier) {
+            return 0UZ;
+        }
+    }
+    constexpr std::string_view kElaboratedSpecifiers[]{"struct ", "class ", "union ", "enum "};
+    for (std::string_view keyword : kElaboratedSpecifiers) {
+        if (text.substr(pos).starts_with(keyword)) {
+            return keyword.size();
+        }
+    }
+    return 0UZ;
+}
+
+/// true when a ", " has to be inserted at `pos` -- MSVC writes template-argument lists without the space
+[[nodiscard]] constexpr bool needsSpaceAfterComma(std::string_view text, std::size_t pos) noexcept { return text[pos] == ',' and pos + 1UZ < text.size() and text[pos + 1UZ] != ' '; }
+
 template<typename T>
 consteval auto type_to_string(T*) {
 #ifdef __GNUC__
@@ -159,17 +181,7 @@ consteval auto type_to_string(T*) {
         if (offset + 2 >= fun_size or offset < 20 or fun[offset - 1] != 'g') {
             return {0, fun_size};
         }
-        offset += 1; // skip over '<'
-        // remove 'struct ', 'union ', 'class ', or 'enum ' prefix.
-        if (std::string_view(fun + offset, 7) == "struct ") {
-            offset += 7;
-        } else if (std::string_view(fun + offset, 6) == "class ") {
-            offset += 6;
-        } else if (std::string_view(fun + offset, 6) == "union ") {
-            offset += 6;
-        } else if (std::string_view(fun + offset, 5) == "enum ") {
-            offset += 5;
-        }
+        offset += 1; // skip over '<'; any 'struct '/'class '/'union '/'enum ' prefix is removed below
         size_t size = 0;
         for (; offset + size < fun_size and fun[offset + size] != '('; ++size)
             ;
@@ -183,26 +195,37 @@ consteval auto type_to_string(T*) {
     static_assert(offset < fun_size);
     static_assert(size <= fun_size);
     static_assert(offset + size <= fun_size);
-    constexpr size_t comma_nospace_count = [&] {
-        size_t count = 0;
-        for (size_t i = offset; i < offset + size - 1; ++i) {
-            if (fun[i] == ',' and fun[i + 1] != ' ') {
-                ++count;
+    constexpr std::string_view signature{fun + offset, size};
+
+    // normalise the compiler-specific spellings so a given type reads the same everywhere
+    constexpr size_t rewritten_size = [&] {
+        size_t out = 0;
+        for (size_t r = 0; r < signature.size();) {
+            if (const size_t keyword = elaboratedSpecifierLength(signature, r); keyword != 0UZ) {
+                r += keyword;
+                continue;
             }
+            out += needsSpaceAfterComma(signature, r) ? 2UZ : 1UZ;
+            ++r;
         }
-        return count;
+        return out;
     }();
-    if constexpr (comma_nospace_count == 0) {
+
+    if constexpr (rewritten_size == size) {
         return ::gr::meta::fixed_string<size>(fun + offset, fun + offset + size);
     } else {
-        ::gr::meta::fixed_string<size + comma_nospace_count> buf = {};
-        size_t                                               r   = offset;
-        size_t                                               w   = 0;
-        for (; r < offset + size; ++w, ++r) {
-            buf[w] = fun[r];
-            if (fun[r] == ',' and fun[r + 1] != ' ') {
-                buf[++w] = ' ';
+        ::gr::meta::fixed_string<rewritten_size> buf{};
+        size_t                                   w = 0;
+        for (size_t r = 0; r < signature.size();) {
+            if (const size_t keyword = elaboratedSpecifierLength(signature, r); keyword != 0UZ) {
+                r += keyword;
+                continue;
             }
+            buf[w++] = signature[r];
+            if (needsSpaceAfterComma(signature, r)) {
+                buf[w++] = ' ';
+            }
+            ++r;
         }
         return buf;
     }
