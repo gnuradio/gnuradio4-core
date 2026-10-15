@@ -11,6 +11,10 @@
 #include <thread>
 #include <vector>
 
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
+
 #include "Sequence.hpp"
 
 namespace gr {
@@ -249,9 +253,13 @@ class SpinWait {
 static inline void yieldProcessor() noexcept {
 #if defined(__EMSCRIPTEN__)
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
-#elif defined(__aarch64__) || defined(__arm__) || defined(_M_ARM) || defined(_M_ARM64)
+#elif defined(_MSC_VER) && (defined(_M_ARM) || defined(_M_ARM64))
+    __yield();                               // ARM/AArch64 (MSVC intrinsic, <intrin.h>)
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    _mm_pause();                             // x86/x64 (MSVC intrinsic, <intrin.h>)
+#elif defined(__aarch64__) || defined(__arm__)
     asm volatile("yield" ::: "memory");      // ARM/AArch64
-#elif defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+#elif defined(__x86_64__) || defined(__i386__)
     asm volatile("pause" ::: "memory");      // x86/x64 (rep; nop)
 #else
     std::this_thread::yield();               // generic fallback
