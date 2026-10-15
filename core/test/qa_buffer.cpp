@@ -1415,9 +1415,10 @@ const boost::ut::suite<"MultiProducerStrategy"> _multiProducerStrategy1 = [] {
     "MultiProducerStrategy - two producers publishing adjacent slots never leave the cursor behind"_test = [] {
         using Strategy = gr::MultiProducerStrategy<std::dynamic_extent, gr::NoWaitStrategy>;
 
-        constexpr std::size_t kProducers = 2UZ;
-        constexpr std::size_t cap        = 16UZ;
-        constexpr std::size_t kRounds    = 100'000UZ;
+        constexpr std::size_t kProducers        = 2UZ;
+        constexpr std::size_t cap               = 16UZ;
+        constexpr std::size_t kRounds           = 100'000UZ;
+        constexpr std::size_t kSpinsBeforeYield = 1UZ << 10UZ;
 
         Strategy strategy(cap);
         auto     reader = std::make_shared<gr::Sequence>();
@@ -1443,8 +1444,12 @@ const boost::ut::suite<"MultiProducerStrategy"> _multiProducerStrategy1 = [] {
                 nRoundsDone                  = round;
                 const std::size_t claimedEnd = strategy.next(1UZ);
                 nClaimed.fetch_add(1UZ, std::memory_order_acq_rel);
-                while (nClaimed.load(std::memory_order_acquire) < kProducers * round) {
-                    // both claims complete before either publish starts
+                // both claims complete before either publish starts. A waiting producer yields every kSpinsBeforeYield
+                // spins. Where a yield gives up the CPU, the other producer can then claim on a single CPU.
+                for (std::size_t nSpins = 1UZ; nClaimed.load(std::memory_order_acquire) < kProducers * round; ++nSpins) {
+                    if (nSpins % kSpinsBeforeYield == 0UZ) {
+                        std::this_thread::yield();
+                    }
                 }
                 strategy.publish(claimedEnd - 1UZ, 1UZ);
                 nPublished.fetch_add(1UZ, std::memory_order_acq_rel);
