@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <filesystem>
 #include <format>
 #include <memory>
 #include <optional>
@@ -70,6 +71,7 @@ constexpr gr::Size_t kTerminalCount = 1000U;
 [[nodiscard]] std::unique_ptr<SchedulerModel> makeThrowingScheduler(property_map /*parameters*/) { throw std::logic_error("the factory of a replaced entry is never called"); }
 
 using gr::testing::isMapped;
+using gr::testing::moduleFileName;
 
 // ends the stream after `n_samples_max` items
 struct CountedSource : gr::Block<CountedSource> {
@@ -175,7 +177,7 @@ const boost::ut::suite<"PluginAbiVersion"> pluginAbiVersionTests = [] {
 
         expect(fatal(eq(loader.blockLibraries().size(), 1UZ))) << "only the library of this ABI version is kept";
         const PluginLoader::BlockLibrary& kept = loader.blockLibraries().front();
-        expect(kept.file.ends_with("/libscheduler_library.so")) << kept.file;
+        expect(eq(std::filesystem::path(kept.file).filename().string(), moduleFileName("scheduler_library"))) << kept.file;
         expect(eq(kept.nSchedulerRegistrations, 1UZ));
         expect(that % isMapped(kept.file)) << "the probe sees a library the loader keeps";
         expect(that % !std::ranges::contains(loader.blockLibraries(), refused->first, &PluginLoader::BlockLibrary::file)) << "a refused library is not kept";
@@ -208,10 +210,10 @@ const boost::ut::suite<"PluginAbiVersion"> pluginAbiVersionTests = [] {
     // run again. Every loader after the first one in the process refuses such a file from the record of its refusal.
     "each loader in the process refuses a file that an earlier loader refused, for the same reason"_test = [] {
         const std::vector<std::pair<std::string, std::string>> refusals{
-            {"/libabi_probe_plugin_v1.so", earlierPluginReason()},
-            {"/libabi_probe_plugin_foreign_scheduler.so", earlierSchedulerReason(kForeignSchedulerKey)},
-            {"/libscheduler_library_v1.so", earlierSchedulerReason(kEarlierSchedulerKey)},
-            {"/libscheduler_library_unversioned.so", unversionedSchedulerReason(kUnversionedSchedulerKey)},
+            {moduleFileName("abi_probe_plugin_v1"), earlierPluginReason()},
+            {moduleFileName("abi_probe_plugin_foreign_scheduler"), earlierSchedulerReason(kForeignSchedulerKey)},
+            {moduleFileName("scheduler_library_v1"), earlierSchedulerReason(kEarlierSchedulerKey)},
+            {moduleFileName("scheduler_library_unversioned"), unversionedSchedulerReason(kUnversionedSchedulerKey)},
         };
         const std::vector<std::string> directories{abiPluginDirectory(), schedulerLibraryDirectory()};
 
@@ -221,7 +223,7 @@ const boost::ut::suite<"PluginAbiVersion"> pluginAbiVersionTests = [] {
             PluginLoader      loader(registry, schedulerRegistry, directories);
 
             for (const auto& [fileName, reason] : refusals) {
-                const auto refused = std::ranges::find_if(loader.failedPlugins(), [&fileName](const auto& entry) { return entry.first.ends_with(fileName); });
+                const auto refused = std::ranges::find_if(loader.failedPlugins(), [&fileName](const auto& entry) { return std::filesystem::path(entry.first).filename().string() == fileName; });
                 expect(refused != loader.failedPlugins().end()) << std::format("loader {} admitted {}: plugins={} failed={}", loaderIndex, fileName, loader.plugins().size(), loader.failedPlugins().size());
                 if (refused != loader.failedPlugins().end()) {
                     expect(eq(refused->second, reason)) << std::format("the reason of loader {} for {}", loaderIndex, fileName);
