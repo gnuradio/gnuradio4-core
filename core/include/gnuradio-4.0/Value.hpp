@@ -16,12 +16,26 @@
 
 #include <gnuradio-4.0/Tensor.hpp>
 
+// `value_to_string()` and friends bottom out in std::format, which is not constexpr, so they can never
+// be constant-evaluated. GCC and clang >= 20 tolerate the redundant marker; clang < 20 and MSVC
+// diagnose it ([dcl.constexpr]/6, MSVC C3615), so the marker is dropped there.
+#if (defined(__clang__) && __clang_major__ < 20) || defined(_MSC_VER)
+#define GR_VALUE_TO_STRING_CONSTEXPR
+#else
+#define GR_VALUE_TO_STRING_CONSTEXPR constexpr
+#endif
+
 namespace gr::pmt {
 
 class Value;
 
 namespace detail {
-[[noreturn, gnu::cold]] inline void value_type_mismatch() noexcept {
+#if defined(__GNUC__) || defined(__clang__)
+[[noreturn, gnu::cold]]
+#else
+[[noreturn]]
+#endif
+inline void value_type_mismatch() noexcept {
     assert(false && "gr::pmt::Value type mismatch");
     std::unreachable();
     std::abort();
@@ -80,7 +94,7 @@ concept ValueMapLike = requires(const std::remove_cvref_t<M>& m) {
 template<typename M>
 concept ExternalValueMap = ValueMapLike<M> && !std::same_as<std::remove_cvref_t<M>, std::pmr::unordered_map<std::pmr::string, Value>>;
 
-constexpr std::string value_to_string(const Value&); // forward declaration
+GR_VALUE_TO_STRING_CONSTEXPR std::string value_to_string(const Value&); // forward declaration
 } // namespace detail
 
 /**
@@ -759,8 +773,8 @@ public:
         set_types(ValueType::Monostate, ContainerType::Scalar);
     }
 
-    friend constexpr std::string detail::value_to_string(const Value&);
-    friend void                  swap(Value& a, Value& b) noexcept;
+    friend GR_VALUE_TO_STRING_CONSTEXPR std::string detail::value_to_string(const Value&);
+    friend void                                     swap(Value& a, Value& b) noexcept;
 };
 
 static_assert(sizeof(gr::pmt::Value) <= 24UZ, "minimise Value struct size");
