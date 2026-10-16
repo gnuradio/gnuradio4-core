@@ -1086,8 +1086,8 @@ class Manager {
             throw std::out_of_range(std::format("gr::thread_pool::Manager - config violation #CPU {} + #IO {} >= getThreadLimit(): {}", cpuMax, ioMax, gr::thread_pool::thread::getThreadLimit()));
         }
 
-        auto cpu = std::make_shared<ThreadPoolWrapper>(std::make_unique<BasicThreadPool>(kDefaultCpuPoolId, TaskType::CPU_BOUND, cpuMin, cpuMax), "CPU");
-        auto io  = std::make_shared<ThreadPoolWrapper>(std::make_unique<BasicThreadPool>(kDefaultIoPoolId, TaskType::IO_BOUND, ioMin, ioMax), "CPU");
+        auto cpu = std::make_shared<ThreadPoolWrapper>(std::make_unique<BasicThreadPool>(kDefaultCpuPoolId, TaskType::CPU_BOUND, static_cast<std::uint32_t>(cpuMin), static_cast<std::uint32_t>(cpuMax)), "CPU");
+        auto io  = std::make_shared<ThreadPoolWrapper>(std::make_unique<BasicThreadPool>(kDefaultIoPoolId, TaskType::IO_BOUND, static_cast<std::uint32_t>(ioMin), static_cast<std::uint32_t>(ioMax)), "CPU");
 
         registerPool(std::string(kDefaultCpuPoolId), std::move(cpu));
         registerPool(std::string(kDefaultIoPoolId), std::move(io));

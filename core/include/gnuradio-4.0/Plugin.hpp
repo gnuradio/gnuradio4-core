@@ -5,8 +5,6 @@
 #include <string>
 #include <string_view>
 
-#include <dlfcn.h>
-
 #include "BlockRegistry.hpp"
 
 #include <gnuradio-4.0/Export.hpp>
@@ -15,11 +13,12 @@
 using namespace std::string_literals;
 using namespace std::string_view_literals;
 
+// exported so every module shares one vtable and typeinfo for the interface
 class GNURADIO_EXPORT gr_plugin_base {
 public:
     gr_plugin_metadata metadata;
 
-    virtual ~gr_plugin_base();
+    virtual ~gr_plugin_base() = default;
 
     virtual std::uint8_t abiVersion() const = 0;
 

@@ -369,7 +369,7 @@ const boost::ut::suite<"Port"> _portTests = [] { // NOSONAR (N.B. lambda size)
         const auto elapsed = std::chrono::steady_clock::now() - before;
 
         expect(eq(out.nEoSTagsLost, 1UZ)) << "a marker with nowhere to go must be counted as the terminal failure it is";
-        expect(lt(elapsed, std::chrono::milliseconds(50))) << "the marker path waited on a consumer that was never going to run";
+        expect(that % (elapsed < std::chrono::milliseconds(50))) << "the marker path waited on a consumer that was never going to run";
         std::ignore = tagReader.get<SpanReleasePolicy::ProcessAll>();
     };
 
@@ -544,7 +544,7 @@ const boost::ut::suite<"port::BitMask"> _bitmask = [] { // NOSONAR (N.B. lambda 
         expect(static_cast<bool>(mask & Input));
         expect(static_cast<bool>(mask & Stream));
         expect(static_cast<bool>(mask & Synchronous));
-        expect(not static_cast<bool>(mask & Optional));
+        expect(not static_cast<bool>(mask & BitMask::Optional)); // N.B. qualified: gr::Optional is also a type
         expect(not static_cast<bool>(mask & Connected));
     };
 
@@ -590,7 +590,7 @@ const boost::ut::suite<"port::BitMask"> _bitmask = [] { // NOSONAR (N.B. lambda 
         expect(not any(mask, Input));
         expect(not any(mask, Stream));
         expect(not any(mask, Synchronous));
-        expect(any(mask, Optional));
+        expect(any(mask, BitMask::Optional));
         expect(any(mask, Connected));
     };
 

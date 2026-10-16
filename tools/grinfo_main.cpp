@@ -46,7 +46,17 @@
 #include "SchedulerRegistrations.hpp"
 
 #ifdef INTERNAL_ENABLE_BLOCK_PLUGINS
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#endif
 #endif
 
 namespace {
@@ -438,11 +448,25 @@ const int kAddressInThisProgram = 0;
 
 // the file the dynamic linker holds `address` in, or nothing when it names none
 [[nodiscard]] std::string fileHolding(const void* address) {
+#if defined(_WIN32)
+    // resolve the module owning the address, then name its file. UNCHANGED_REFCOUNT leaves the
+    // module's reference count untouched.
+    HMODULE module = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCSTR>(address), &module) == 0) {
+        return {};
+    }
+    char path[MAX_PATH]{};
+    if (GetModuleFileNameA(module, path, static_cast<DWORD>(std::size(path))) == 0) {
+        return {};
+    }
+    return canonicalPath(path);
+#else
     Dl_info info{};
     if (dladdr(address, &info) == 0 || info.dli_fname == nullptr) {
         return {};
     }
     return canonicalPath(info.dli_fname);
+#endif
 }
 
 // The file a block's type information was loaded from: the plugin or the block library that registered the key, and

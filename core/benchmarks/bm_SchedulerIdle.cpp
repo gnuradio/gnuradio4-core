@@ -1,7 +1,17 @@
 #include <benchmark.hpp>
 #include <boost/ut.hpp>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <sys/resource.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -241,10 +251,23 @@ void registerPool() {
 }
 
 [[nodiscard]] std::chrono::duration<double> processCpuTime() {
+#if defined(_WIN32)
+    FILETIME creation{};
+    FILETIME exit{};
+    FILETIME kernel{};
+    FILETIME user{};
+    if (::GetProcessTimes(::GetCurrentProcess(), &creation, &exit, &kernel, &user) == 0) {
+        return std::chrono::duration<double>(0.0);
+    }
+    // FILETIME counts 100 ns ticks
+    const auto seconds = [](const FILETIME& t) { return 1e-7 * static_cast<double>((static_cast<std::uint64_t>(t.dwHighDateTime) << 32U) | t.dwLowDateTime); };
+    return std::chrono::duration<double>(seconds(kernel) + seconds(user));
+#else
     rusage usage{};
     getrusage(RUSAGE_SELF, &usage);
     const auto seconds = [](const timeval& t) { return static_cast<double>(t.tv_sec) + 1e-6 * static_cast<double>(t.tv_usec); };
     return std::chrono::duration<double>(seconds(usage.ru_utime) + seconds(usage.ru_stime));
+#endif
 }
 
 // runs runAndWait() on a thread pinned for the policy; `whileRunning` runs on the caller's thread meanwhile

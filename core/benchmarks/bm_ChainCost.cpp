@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <format>
 #include <functional>
@@ -36,7 +37,8 @@ inline constexpr float       kGain    = 1.0000001f;
 inline constexpr std::size_t kSamples = 10'000'000UZ;
 inline constexpr std::size_t kRepeat  = 7UZ;
 
-inline void barrier() noexcept { asm volatile("" : : : "memory"); }
+// a compiler barrier: orders the accesses around it without emitting an instruction
+inline void barrier() noexcept { std::atomic_signal_fence(std::memory_order_acq_rel); }
 
 struct Source : gr::Block<Source> {
     gr::PortOut<float> out;
