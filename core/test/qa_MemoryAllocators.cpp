@@ -1,7 +1,11 @@
+#if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wnull-dereference"
+#endif
 #include <boost/ut.hpp>
+#if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
+#endif
 
 #include <vector>
 
@@ -119,7 +123,7 @@ const boost::ut::suite<"gr::allocator::Logging"> _logging = [] {
 
         auto alloc_copy = v.get_allocator();
         expect(alloc_copy.logger().alloc_count >= 1UZ);
-#if defined(_LIBCPP_VERSION) // libc++ -- specific behaviour
+#if defined(_LIBCPP_VERSION) || defined(_MSVC_STL_VERSION) // libc++ and the MSVC STL release the block on shrink_to_fit()
         expect(alloc_copy.logger().dealloc_count == 1UZ);
 #else // libstdc++ -- specific behaviour
         expect(alloc_copy.logger().dealloc_count == 0UZ); // nothing deallocated here - vector and allocator still lives

@@ -33,7 +33,7 @@ static const char* value_type_name(Value::ValueType vt) {
     }
 }
 
-inline constexpr std::string type_name(const Value& value) {
+inline GR_VALUE_TO_STRING_CONSTEXPR std::string type_name(const Value& value) {
     if (value.is_tensor()) {
         std::string result;
         result = "Tensor<";
@@ -46,20 +46,13 @@ inline constexpr std::string type_name(const Value& value) {
     return value_type_name(value.value_type()); // scalar
 }
 
-inline constexpr auto append_quoted(std::string& out, std::string_view s) {
+inline GR_VALUE_TO_STRING_CONSTEXPR auto append_quoted(std::string& out, std::string_view s) {
     out.push_back('"');
     out.append(s);
     out.push_back('"');
 };
 
-inline
-#if defined(__clang__) && __clang_major__ < 20
-/* constexpr */
-#else
-    constexpr
-#endif
-    std::string
-    map_value_to_string(const Value::Map& map) {
+inline GR_VALUE_TO_STRING_CONSTEXPR std::string map_value_to_string(const Value::Map& map) {
     std::string out;
     out += '{';
     bool first = true;
@@ -76,7 +69,7 @@ inline
     return out;
 }
 
-inline constexpr std::string value_to_string(const Value& v) {
+inline GR_VALUE_TO_STRING_CONSTEXPR std::string value_to_string(const Value& v) {
     std::string out;
     if (v.is_monostate()) {
         out += "monostate";

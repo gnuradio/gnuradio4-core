@@ -378,7 +378,7 @@ struct typelist {
     using apply = Other<Ts...>;
 
     template<class F, std::size_t... Is, typename... LeadingArguments>
-    static constexpr void for_each_impl(F&& f, std::index_sequence<Is...>, LeadingArguments&&... args) {
+    static constexpr void for_each_impl([[maybe_unused]] F&& f, std::index_sequence<Is...>, [[maybe_unused]] LeadingArguments&&... args) {
         (f(std::forward<LeadingArguments>(args)..., std::integral_constant<std::size_t, Is>{}, static_cast<Ts*>(nullptr)), ...);
     }
 
@@ -388,7 +388,7 @@ struct typelist {
     }
 
     template<std::size_t I>
-    using at = detail::at_impl<I, Ts...>::type;
+    using at = typename detail::at_impl<I, Ts...>::type;
 
     template<typename... Heads>
     using prepend = typelist<Heads..., Ts...>;
@@ -427,9 +427,9 @@ struct typelist {
     };
 
     template<typename DefaultType>
-    using safe_head_default = typename safe_head_impl<(sizeof...(Ts) > 0), DefaultType, this_t>::type;
+    using safe_head_default = typename safe_head_impl<(sizeof...(Ts) != 0UZ), DefaultType, this_t>::type;
 
-    using safe_head = typename safe_head_impl<(sizeof...(Ts) > 0), void, this_t>::type;
+    using safe_head = typename safe_head_impl<(sizeof...(Ts) != 0UZ), void, this_t>::type;
 
     template<typename Matcher = typename this_t::safe_head>
     constexpr static bool all_same = ((std::is_same_v<Matcher, Ts> && ...));
@@ -482,11 +482,15 @@ namespace detail {
 template<template<typename...> typename OtherTypelist, typename... Args>
 meta::typelist<Args...> to_typelist_helper(OtherTypelist<Args...>*);
 
+// Yields T whatever the index. Deliberately a class template: an alias template is substituted
+// before the pack is expanded, which would leave no pack in the pattern to expand.
 template<typename T, size_t>
-using repeat_type_for_index = T;
+struct repeat_type_for_index {
+    using type = T;
+};
 
 template<typename T, size_t... Is>
-meta::typelist<repeat_type_for_index<T, Is>...> array_to_typelist_helper(std::index_sequence<Is...>);
+meta::typelist<typename repeat_type_for_index<T, Is>::type...> array_to_typelist_helper(std::index_sequence<Is...>);
 
 template<template<typename, size_t> typename ArrayLike, typename T, size_t N>
 decltype(array_to_typelist_helper<T>(std::make_index_sequence<N>())) to_typelist_helper(ArrayLike<T, N>*);
