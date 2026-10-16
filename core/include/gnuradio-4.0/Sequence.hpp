@@ -22,7 +22,11 @@ namespace gr {
 #ifndef forceinline
 // use this for hot-spots only <-> may bloat code size, not fit into cache and
 // consequently slow down execution
+#ifdef _MSC_VER
+#define forceinline __forceinline
+#else
 #define forceinline inline __attribute__((always_inline))
+#endif
 #endif
 inline constexpr std::size_t kInitialCursorValue = 0L;
 
