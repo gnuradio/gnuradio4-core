@@ -1129,6 +1129,16 @@ public:
     [[nodiscard]] static constexpr bool hasForwardTagsOverride() noexcept { return acceptsForwardTagsSpans<true>() || acceptsForwardTagsSpans<false>(); }
 
 private:
+    /// as acceptsForwardTagsSpans, on the spans prepareStreams() builds. Kept a function template
+    /// because MSVC rejects the member lookup outright when this requires-expression is written
+    /// directly in a non-template member body, rather than substituting false.
+    template<typename TDerived = Derived>
+    [[nodiscard]] static constexpr bool acceptsPreparedForwardTagsSpans() noexcept {
+        using TInputSpans  = decltype(prepareStreams(inputPorts<PortType::STREAM>(std::declval<TDerived*>()), 0UZ));
+        using TOutputSpans = decltype(prepareStreams(outputPorts<PortType::STREAM>(std::declval<TDerived*>()), 0UZ));
+        return requires(TDerived& block, TInputSpans& inputSpans, TOutputSpans& outputSpans) { block.forwardTags(inputSpans, outputSpans, 0UZ); };
+    }
+
     template<bool kRetireOnlyFirstTag>
     [[nodiscard]] static constexpr bool acceptsForwardTagsSpans() noexcept {
         using TInputSpans  = decltype(prepareStreamsRetiring<kRetireOnlyFirstTag>(inputPorts<PortType::STREAM>(std::declval<Derived*>()), 0UZ));
@@ -1166,9 +1176,7 @@ public:
             static_assert(!unfilteredTagPropagation && !noTagPropagation, "FilteredTagPropagation cannot be combined with UnfilteredTagPropagation or NoTagPropagation: the first requires every key, and the second forwards no tag.");
         }
         if constexpr (forwardsEveryKey()) {
-            using TInputSpans  = decltype(prepareStreams(inputPorts<PortType::STREAM>(std::declval<Derived*>()), 0UZ));
-            using TOutputSpans = decltype(prepareStreams(outputPorts<PortType::STREAM>(std::declval<Derived*>()), 0UZ));
-            static_assert(!requires(Derived& block, TInputSpans& inputSpans, TOutputSpans& outputSpans) { block.forwardTags(inputSpans, outputSpans, 0UZ); }, "A block forwarding every key calls a forwardTags() that hasForwardTagsOverride() does not see: the override deduces its return type from a body that reads the tag window. Declare the override's return type.");
+            static_assert(!acceptsPreparedForwardTagsSpans(), "A block forwarding every key calls a forwardTags() that hasForwardTagsOverride() does not see: the override deduces its return type from a body that reads the tag window. Declare the override's return type.");
         }
     }
 
@@ -1217,7 +1225,7 @@ public:
         }
     }
 
-    void publishSamples(std::size_t nSamples, auto& outputSpanTuple) noexcept {
+    void publishSamples([[maybe_unused]] std::size_t nSamples, [[maybe_unused]] auto& outputSpanTuple) noexcept {
         if constexpr (traits::block::stream_output_ports<Derived>::size > 0) {
             for_each_writer_span(
                 [nSamples]<typename Out>(Out& out) {
@@ -1241,7 +1249,7 @@ public:
         }
     }
 
-    bool consumeReaders(std::size_t nSamples, auto& consumableSpanTuple) {
+    bool consumeReaders([[maybe_unused]] std::size_t nSamples, [[maybe_unused]] auto& consumableSpanTuple) {
         bool success = true;
         if constexpr (traits::block::stream_input_ports<Derived>::size > 0) {
             for_each_reader_span(
@@ -2074,7 +2082,7 @@ public:
     gr::work::Status invokeBulkDispatch(Fn&& fn, TIn& inputReaderTuple, TOut& outputReaderTuple) {
         auto tempInputSpanStorage = std::apply(
             []<typename... PortReader>(PortReader&... args) {
-                return std::tuple{([](auto& a) {
+                return std::tuple{([]([[maybe_unused]] auto& a) {
                     if constexpr (gr::meta::array_or_vector_type<PortReader>) {
                         return std::span{a.data(), a.size()};
                     } else {
@@ -2086,7 +2094,7 @@ public:
 
         auto tempOutputSpanStorage = std::apply(
             []<typename... PortReader>(PortReader&... args) {
-                return std::tuple{([](auto& a) {
+                return std::tuple{([]([[maybe_unused]] auto& a) {
                     if constexpr (gr::meta::array_or_vector_type<std::remove_cvref_t<decltype(a)>>) {
                         return std::span{a.data(), a.size()};
                     } else {
@@ -2827,10 +2835,10 @@ void checkBlockContracts() {
         []<std::size_t... Idxs>(std::index_sequence<Idxs...>) {
             (
                 [] {
-                    using MemberType           = refl::data_member_type<TDecayedBlock, Idxs>;
-                    using RawType              = std::remove_cvref_t<MemberType>;
-                    using Type                 = std::remove_cvref_t<unwrap_if_wrapped_t<RawType>>;
-                    constexpr bool isAnnotated = !std::is_same_v<RawType, Type>;
+                    using MemberType                            = refl::data_member_type<TDecayedBlock, Idxs>;
+                    using RawType                               = std::remove_cvref_t<MemberType>;
+                    using Type                                  = std::remove_cvref_t<unwrap_if_wrapped_t<RawType>>;
+                    [[maybe_unused]] constexpr bool isAnnotated = !std::is_same_v<RawType, Type>;
                     // N.B. this function is compile-time ready but static_assert does not allow for configurable error
                     // messages
                     if constexpr (!gr::settings::isReadableMember<Type>() && !traits::port::AnyPort<Type>) {
