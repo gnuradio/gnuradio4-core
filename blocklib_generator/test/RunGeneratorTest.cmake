@@ -72,13 +72,26 @@ function(
   set(_stream "")
   foreach(_name IN LISTS _produced)
     file(READ "${_generated}/${_name}" _text)
+    # a generator records the path it was invoked with, in either separator form; normalise both
+    file(TO_NATIVE_PATH "${_generator}" _generator_native)
     string(
       REPLACE "${_generator}"
               "GENERATOR"
               _text
               "${_text}")
     string(
+      REPLACE "${_generator_native}"
+              "GENERATOR"
+              _text
+              "${_text}")
+    file(TO_NATIVE_PATH "${HEADER}" _header_native)
+    string(
       REPLACE "${HEADER}"
+              "FIXTURE"
+              _text
+              "${_text}")
+    string(
+      REPLACE "${_header_native}"
               "FIXTURE"
               _text
               "${_text}")
@@ -101,11 +114,21 @@ function(
   LEFT
   RIGHT
   WHAT)
-  execute_process(COMMAND ${CMAKE_COMMAND} -E compare_files "${LEFT}" "${RIGHT}" RESULT_VARIABLE _differs)
-  if(NOT
-     _differs
-     EQUAL
-     0)
+  # Compares content, not bytes: what these fixtures pin is the text a generator emits, not the
+  # line endings of the host that wrote it.
+  file(READ "${LEFT}" _left_text)
+  file(READ "${RIGHT}" _right_text)
+  string(
+    REPLACE "\r\n"
+            "\n"
+            _left_text
+            "${_left_text}")
+  string(
+    REPLACE "\r\n"
+            "\n"
+            _right_text
+            "${_right_text}")
+  if(NOT _left_text STREQUAL _right_text)
     message(FATAL_ERROR "${WHAT}: ${LEFT} and ${RIGHT} differ")
   endif()
 endfunction()

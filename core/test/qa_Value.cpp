@@ -1412,7 +1412,7 @@ const boost::ut::suite<"Value - Containers"> _container_suite = [] {
         expect(eq(vt.container_type(), Value::ContainerType::Tensor));
         expect(eq(vt.value_type(), Value::ValueType::Int32));
 
-        Tensor<int>* tref = vt.get_if<Tensor<std::int32_t>>();
+        [[maybe_unused]] Tensor<int>* tref = vt.get_if<Tensor<std::int32_t>>();
         static_assert(std::is_same_v<decltype(*tref), Tensor<std::int32_t>&>);
     };
 
