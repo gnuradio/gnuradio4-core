@@ -6,11 +6,13 @@
 #include <complex>
 #include <concepts>
 #include <cstdint>
-#include <cxxabi.h>
+#include <cstdlib>
 #include <format>
 #include <map>
+#include <memory>
 #include <new>
 
+#include <gnuradio-4.0/meta/Attributes.hpp>
 #include <gnuradio-4.0/meta/CacheLineSize.hpp>
 #include <numeric>
 #include <print>
@@ -22,6 +24,14 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#ifndef _MSC_VER
+#include <cxxabi.h>
+#endif
+
+#ifdef _MSC_VER
+#include <intrin.h> // __debugbreak
+#endif
 
 #if __has_include(<stdfloat>) && !defined(__ADAPTIVECPP__)
 #include <stdfloat>
@@ -45,6 +55,7 @@ static_assert(std::numeric_limits<float64_t>::is_iec559 && sizeof(float64_t) * 8
 
 namespace gr {
 
+#if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic push // suppress unavoidable float/int/size_t conversion warnings
 #pragma GCC diagnostic ignored "-Wconversion"
 #ifdef __clang__
@@ -52,6 +63,7 @@ namespace gr {
 #pragma GCC diagnostic ignored "-Wshorten-64-to-32"
 #pragma GCC diagnostic ignored "-Wimplicit-int-float-conversion"
 #pragma GCC diagnostic ignored "-Wimplicit-float-conversion"
+#endif
 #endif
 
 using Size_t                                = std::uint32_t; // strict type definition in view of cross-platform/cross-compiler/cross-network portability similar to 'std::size_t' (N.B. which is not portable)
@@ -65,7 +77,9 @@ T cast(U value) { /// gcc/clang warning suppressing cast
     return static_cast<T>(value);
 }
 
+#if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
+#endif
 
 namespace meta {
 
@@ -85,8 +99,21 @@ struct null_type {};
 template<typename... Ts>
 struct print_types;
 
+// break into the debugger, then tell the compiler the path does not return
+#if defined(_MSC_VER)
+#define GR_TRAP()                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              \
+    do {                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       \
+        __debugbreak();                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        \
+        __assume(0);                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           \
+    } while (0)
+#elif defined(__GNUC__) || defined(__clang__)
+#define GR_TRAP() __builtin_trap()
+#else
+#define GR_TRAP() std::abort()
+#endif
+
 #if HAVE_SOURCE_LOCATION
-[[gnu::always_inline]] constexpr void precondition(bool cond, const std::source_location loc = std::source_location::current()) {
+GR_ALWAYS_INLINE constexpr void precondition(bool cond, const std::source_location loc = std::source_location::current()) {
     if consteval {
         if (not cond) {
             std::unreachable();
@@ -95,7 +122,7 @@ struct print_types;
         struct handle {
             [[noreturn]] static void failure(std::source_location const& loc) {
                 std::clog << "failed precondition in " << loc.file_name() << ':' << loc.line() << ':' << loc.column() << ": `" << loc.function_name() << "`\n";
-                __builtin_trap();
+                GR_TRAP();
             }
         };
 
@@ -105,7 +132,7 @@ struct print_types;
     }
 }
 #else
-[[gnu::always_inline]] constexpr void precondition(bool cond) {
+GR_ALWAYS_INLINE constexpr void precondition(bool cond) {
     if consteval {
         if (not cond) {
             std::unreachable();
@@ -114,7 +141,7 @@ struct print_types;
         struct handle {
             [[noreturn]] static void failure() {
                 std::println(stderr, "failed precondition");
-                __builtin_trap();
+                GR_TRAP();
             }
         };
 
@@ -398,13 +425,19 @@ consteval bool operator==(constexpr_string<S1, T1>, constexpr_string<S2, T2>) {
     return S1 == S2;
 }
 
+template<typename T>
+[[nodiscard]] std::string type_name() noexcept; // defined below; needed by the template-argument renderer
+
 namespace detail {
 template<std::integral auto N>
 consteval auto fixed_string_from_number_impl() {
     constexpr size_t buf_len = [] {
         auto   x   = N;
-        size_t len = x < 0 ? 1u : 0u; // minus character
-        while (x != 0) {              // count digits
+        size_t len = 0UZ;
+        if constexpr (std::is_signed_v<decltype(N)>) {
+            len = x < 0 ? 1UZ : 0UZ; // minus character
+        }
+        while (x != 0) { // count digits
             ++len;
             x /= 10;
         }
@@ -430,19 +463,41 @@ consteval auto fixed_string_from_number_impl() {
     return ret;
 }
 
+[[nodiscard]] inline std::string stripMsvcTypeDecorations(std::string name) {
+    auto eraseAll = [&name](std::string_view token, auto isTokenStart) {
+        for (std::size_t pos = 0UZ; (pos = name.find(token, pos)) != std::string::npos;) {
+            if (isTokenStart(pos)) {
+                name.erase(pos, token.size());
+            } else {
+                pos += token.size();
+            }
+        }
+    };
+
+    const auto startsIdentifier = [&name](std::size_t pos) {
+        if (pos == 0UZ) {
+            return true;
+        }
+        const unsigned char previous = static_cast<unsigned char>(name[pos - 1UZ]);
+        return !(std::isalnum(previous) || previous == '_' || previous == ':');
+    };
+    for (std::string_view keyword : {"class ", "struct ", "union ", "enum "}) {
+        eraseAll(keyword, startsIdentifier);
+    }
+    eraseAll(" __ptr64", [](std::size_t) { return true; });
+    return name;
+}
+
 template<typename T>
 [[nodiscard]] std::string local_type_name() noexcept {
-    std::string type_name = typeid(T).name();
-    int         status;
-    char*       demangled_name = abi::__cxa_demangle(type_name.c_str(), nullptr, nullptr, &status);
-    if (status == 0) {
-        std::string ret(demangled_name);
-        free(demangled_name);
-        return ret;
-    } else {
-        free(demangled_name);
-        return typeid(T).name();
-    }
+    const std::string typeName = typeid(T).name();
+#ifdef _MSC_VER
+    return stripMsvcTypeDecorations(typeName);
+#else
+    int                                    status = -1;
+    std::unique_ptr<char, void (*)(char*)> demangledName(abi::__cxa_demangle(typeName.c_str(), nullptr, nullptr, &status), [](char* p) { std::free(p); });
+    return (status == 0 && demangledName) ? std::string(demangledName.get()) : typeName;
+#endif
 }
 
 inline std::string makePortableTypeName(std::string_view name) {
@@ -497,6 +552,16 @@ inline std::string makePortableTypeName(std::string_view name) {
     if (writtenIt != writtenMapping.end()) {
         const auto mappedIt = std::ranges::find_if(typeMapping, [&](const auto& pair) { return pair.first == writtenIt->second; });
         return mappedIt != typeMapping.end() ? mappedIt->second : writtenIt->second;
+    }
+
+    // Peel any pointer/reference suffix so the pointee gets normalised too, and so that MSVC's
+    // "Foo<int> *" collapses onto the same spelling as GCC's "Foo<int>*".
+    if (const auto suffixStart = name.find_last_not_of(" *&"); suffixStart != std::string_view::npos and suffixStart + 1UZ < name.size()) {
+        std::string suffix(name.substr(suffixStart + 1UZ));
+        std::erase(suffix, ' ');
+        if (!suffix.empty()) {
+            return makePortableTypeName(trimmed(name.substr(0UZ, suffixStart + 1UZ))) + suffix;
+        }
     }
 
     auto stripStdPrivates = [](std::string_view _name) -> std::string {
@@ -579,6 +644,54 @@ inline std::string makePortableTypeName(std::string_view name) {
     return std::format("{}<{}>", base, join(params, ", "));
 }
 
+/// Render one non-type template argument the way the Itanium demangler does, which is the spelling
+/// makePortableTypeName() normalises towards. The typeid() name cannot be used for this on MSVC: it
+/// mangles every integral and enum argument as a bare number ($0<n>), so `true` and `Color::Red` both
+/// arrive as digits carrying no trace of their type.
+template<auto kValue>
+[[nodiscard]] std::string renderTemplateArgument() {
+    using ValueType = decltype(kValue);
+    if constexpr (std::same_as<ValueType, bool>) {
+        return kValue ? "true" : "false";
+    } else if constexpr (std::is_enum_v<ValueType>) {
+        // the unary plus promotes a `char` underlying type to int: std::format gives `char` character
+        // presentation, so an enumerator of value 65 would otherwise render as `A` instead of `65`
+        return std::format("({}){}", type_name<ValueType>(), +static_cast<std::underlying_type_t<ValueType>>(kValue));
+    } else {
+        return std::format("{}", kValue);
+    }
+}
+
+template<auto kValue>
+inline constexpr bool kIsTypeSensitiveArgument = std::same_as<decltype(kValue), bool> || std::is_enum_v<decltype(kValue)>;
+
+template<typename T>
+struct TemplateArguments {
+    static constexpr bool kRenderable = false;
+};
+
+template<template<typename, auto...> class Tpl, typename T0, auto... kValues>
+struct TemplateArguments<Tpl<T0, kValues...>> {
+    static constexpr bool kRenderable = (... || kIsTypeSensitiveArgument<kValues>);
+
+    [[nodiscard]] static std::string render() {
+        std::string out = type_name<T0>();
+        ((out += ", " + renderTemplateArgument<kValues>()), ...);
+        return out;
+    }
+};
+
+template<template<auto...> class Tpl, auto... kValues>
+struct TemplateArguments<Tpl<kValues...>> {
+    static constexpr bool kRenderable = (... || kIsTypeSensitiveArgument<kValues>);
+
+    [[nodiscard]] static std::string render() {
+        std::string out;
+        ((out += (out.empty() ? "" : ", ") + renderTemplateArgument<kValues>()), ...);
+        return out;
+    }
+};
+
 } // namespace detail
 
 template<std::integral auto N>
@@ -609,7 +722,19 @@ static_assert((fixed_string("out") + fixed_string_from_number<123>) == fixed_str
 
 template<typename T>
 [[nodiscard]] std::string type_name() noexcept {
-    return detail::makePortableTypeName(detail::local_type_name<T>());
+    const std::string localName = detail::local_type_name<T>();
+#ifdef _MSC_VER
+    // MSVC's typeid() spelling renders bool and enum template arguments as bare numbers, losing the
+    // information the Itanium demangler keeps ("true", "(gr::Color)0"). Rebuild those template-ids
+    // from the arguments themselves so a type reads the same on either toolchain. these names are
+    // block registration keys and end up in serialised graphs, so they have to agree across platforms.
+    if constexpr (detail::TemplateArguments<T>::kRenderable) {
+        if (const auto baseEnd = localName.find('<'); baseEnd != std::string::npos) {
+            return std::format("{}<{}>", localName.substr(0UZ, baseEnd), detail::TemplateArguments<T>::render());
+        }
+    }
+#endif
+    return detail::makePortableTypeName(localName);
 }
 
 namespace detail {
@@ -728,24 +853,26 @@ concept array_or_vector_type = (vector_type<T> || array_type<T>) && (std::same_a
 template<typename T>
 concept complex_like = std::is_same_v<T, std::complex<float>> || std::is_same_v<T, std::complex<double>>;
 
+namespace detail {
+template<typename TPort>
+consteval auto staticPortName() {
+    if constexpr (requires { TPort::Name; }) {
+        return TPort::Name;
+    } else {
+        // should never see a tuple here => needs to be flattened into given PortList earlier
+        return TPort::value_type::Name;
+    }
+}
+} // namespace detail
+
 template<fixed_string Name, typename PortList>
 consteval std::size_t indexForName() {
     auto helper = []<std::size_t... Ids>(std::index_sequence<Ids...>) {
-        auto static_name_for_index = [](auto id) {
-            using Port = typename PortList::template at<id>;
-            if constexpr (requires { Port::Name; }) {
-                return Port::Name;
-            } else {
-                // should never see a tuple here => needs to be flattened into given PortList earlier
-                return Port::value_type::Name;
-            }
-        };
-
-        constexpr int n_matches = ((static_name_for_index(std::integral_constant<size_t, Ids>()) == Name) + ...);
+        constexpr int n_matches = ((detail::staticPortName<typename PortList::template at<Ids>>() == Name) + ...);
         static_assert(n_matches <= 1, "Multiple ports with that name were found. The name must be unique. You can "
                                       "still use a port index instead.");
         static_assert(n_matches == 1, "No port with the given name exists.");
-        constexpr std::size_t result = (((static_name_for_index(std::integral_constant<size_t, Ids>()) == Name) * Ids) + ...);
+        constexpr std::size_t result = (((detail::staticPortName<typename PortList::template at<Ids>>() == Name) * Ids) + ...);
         return result;
     };
     return helper(std::make_index_sequence<PortList::size>());

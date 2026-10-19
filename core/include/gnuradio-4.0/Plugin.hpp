@@ -5,8 +5,6 @@
 #include <string>
 #include <string_view>
 
-#include <dlfcn.h>
-
 #include "BlockRegistry.hpp"
 
 #include <gnuradio-4.0/Export.hpp>
