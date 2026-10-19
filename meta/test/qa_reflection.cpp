@@ -35,6 +35,18 @@ static_assert(gr::refl::type_name<Bar<float>> == "ns0::Bar<float>");
 static_assert(gr::refl::type_name<Enum> == "ns0::Enum");
 static_assert(gr::refl::type_name<EnumClass> == "ns0::EnumClass");
 
+// MSVC spells the elaborated-type-specifier that the normalisation strips, and writes template-argument
+// lists without a space after the comma. The two cancel in length at seven `class` arguments and eight
+// `struct` ones, so the rewritten length alone cannot stand in for "nothing to rewrite".
+template<typename, typename, typename, typename, typename, typename, typename>
+class SevenArgs {};
+
+template<typename, typename, typename, typename, typename, typename, typename, typename>
+struct EightArgs {};
+
+static_assert(gr::refl::type_name<SevenArgs<int, int, int, int, int, int, int>> == "ns0::SevenArgs<int, int, int, int, int, int, int>");
+static_assert(gr::refl::type_name<EightArgs<int, int, int, int, int, int, int, int>> == "ns0::EightArgs<int, int, int, int, int, int, int, int>");
+
 static_assert(gr::refl::enum_name<A> == "ns0::A");
 static_assert(gr::refl::enum_name<B> == "ns0::B");
 static_assert(gr::refl::enum_name<C> == "ns0::C");

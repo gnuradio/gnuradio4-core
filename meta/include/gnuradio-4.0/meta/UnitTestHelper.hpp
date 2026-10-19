@@ -34,7 +34,7 @@ template<typename T>
 concept Collection = std::ranges::range<T> && HasSize<T> && !std::is_convertible_v<T, std::string_view> && !std::is_same_v<std::remove_cvref_t<T>, std::string>;
 } // namespace gr::test
 
-namespace boost::ut {
+namespace boost::inline ext::ut {
 template<gr::test::Collection RangeLHS, gr::test::Collection RangeRHS>
 requires std::is_same_v<std::ranges::range_value_t<RangeLHS>, std::ranges::range_value_t<RangeRHS>>
 auto eq(const RangeLHS& lhs, const RangeRHS& rhs);
@@ -56,7 +56,7 @@ constexpr auto expect(const TExpr& expr, const std::source_location& sl) {
     return boost::ut::expect(expr, reflection::source_location::current(sl.file_name(), static_cast<int>(sl.line())));
 }
 #endif
-} // namespace boost::ut
+} // namespace boost::inline ext::ut
 
 namespace gr::test {
 using namespace boost::ut;
