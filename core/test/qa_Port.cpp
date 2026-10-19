@@ -544,7 +544,7 @@ const boost::ut::suite<"port::BitMask"> _bitmask = [] { // NOSONAR (N.B. lambda 
         expect(static_cast<bool>(mask & Input));
         expect(static_cast<bool>(mask & Stream));
         expect(static_cast<bool>(mask & Synchronous));
-        expect(not static_cast<bool>(mask & Optional));
+        expect(not static_cast<bool>(mask & BitMask::Optional)); // N.B. qualified: gr::Optional is also a type
         expect(not static_cast<bool>(mask & Connected));
     };
 
@@ -590,7 +590,7 @@ const boost::ut::suite<"port::BitMask"> _bitmask = [] { // NOSONAR (N.B. lambda 
         expect(not any(mask, Input));
         expect(not any(mask, Stream));
         expect(not any(mask, Synchronous));
-        expect(any(mask, Optional));
+        expect(any(mask, BitMask::Optional));
         expect(any(mask, Connected));
     };
 

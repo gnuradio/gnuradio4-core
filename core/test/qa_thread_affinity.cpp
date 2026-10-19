@@ -48,7 +48,7 @@ const boost::ut::suite ThreadAffinityTests = [] {
     };
 
     "thread_helper"_test = [] {
-#if not defined(__EMSCRIPTEN__) && not defined(__APPLE__)
+#if defined(_POSIX_THREADS) && not defined(__EMSCRIPTEN__) && not defined(__APPLE__)
         expect(that % gr::thread_pool::thread::detail::getEnumPolicy(SCHED_FIFO) == gr::thread_pool::thread::Policy::FIFO);
         expect(that % gr::thread_pool::thread::detail::getEnumPolicy(SCHED_RR) == gr::thread_pool::thread::Policy::ROUND_ROBIN);
         expect(that % gr::thread_pool::thread::detail::getEnumPolicy(SCHED_OTHER) == gr::thread_pool::thread::Policy::OTHER);
@@ -57,7 +57,7 @@ const boost::ut::suite ThreadAffinityTests = [] {
         expect(that % gr::thread_pool::thread::detail::getEnumPolicy(-2) == gr::thread_pool::thread::Policy::UNKNOWN);
     };
 
-#if not defined(__EMSCRIPTEN__) && not defined(__APPLE__)
+#if defined(_POSIX_VERSION) && not defined(__EMSCRIPTEN__) && not defined(__APPLE__)
     "basic thread affinity"_test = [] {
         using namespace gr::thread_pool;
         std::atomic<bool> run         = true;
@@ -114,31 +114,6 @@ const boost::ut::suite ThreadAffinityTests = [] {
         thread::setProcessAffinity(threadMapOn);
         expect(throws<std::system_error>([&] { thread::getProcessAffinity(-1); }));
         expect(throws<std::system_error>([&] { thread::setProcessAffinity(threadMapOn, -1); }));
-    };
-
-    "ThreadName"_test = [] {
-        using namespace gr::thread_pool;
-        expect(!thread::getThreadName().empty()) << "Thread name shouldn't be empty";
-        expect(nothrow([] { thread::setThreadName("testCoreName"); }));
-        expect(thread::getThreadName() == "testCoreName"_b);
-
-        std::atomic<bool> run         = true;
-        const auto        dummyAction = [&run]() {
-            while (run) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(20));
-            }
-        };
-        std::thread testThread(dummyAction);
-        expect(!thread::getThreadName(testThread).empty()) << "Thread Name shouldn't be empty";
-        expect(nothrow([&] { thread::setThreadName("testThreadName", testThread); }));
-        thread::setThreadName("testThreadName", testThread);
-        expect(thread::getThreadName(testThread) == "testThreadName"_b);
-
-        std::thread uninitialisedTestThread;
-        expect(throws<std::system_error>([&] { thread::getThreadName(uninitialisedTestThread); }));
-        expect(throws<std::system_error>([&] { thread::setThreadName("name", uninitialisedTestThread); }));
-        run = false;
-        testThread.join();
     };
 
     "ProcessName"_test = [] {
@@ -211,6 +186,35 @@ const boost::ut::suite ThreadAffinityTests = [] {
         run = false;
         testThread.join();
     };
+#endif
+
+#if (defined(_POSIX_THREADS) && not defined(__EMSCRIPTEN__) && not defined(__APPLE__)) || defined(_WIN32)
+    // thread naming is one of the few affinity APIs Windows also provides (SetThreadDescription)
+    "ThreadName"_test = [] {
+        using namespace gr::thread_pool;
+        expect(!thread::getThreadName().empty()) << "Thread name shouldn't be empty";
+        expect(nothrow([] { thread::setThreadName("testCoreName"); }));
+        expect(thread::getThreadName() == "testCoreName"_b);
+
+        std::atomic<bool> run         = true;
+        const auto        dummyAction = [&run]() {
+            while (run) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+        };
+        std::thread testThread(dummyAction);
+        expect(!thread::getThreadName(testThread).empty()) << "Thread Name shouldn't be empty";
+        expect(nothrow([&] { thread::setThreadName("testThreadName", testThread); }));
+        thread::setThreadName("testThreadName", testThread);
+        expect(thread::getThreadName(testThread) == "testThreadName"_b);
+
+        std::thread uninitialisedTestThread;
+        expect(throws<std::system_error>([&] { thread::getThreadName(uninitialisedTestThread); }));
+        expect(throws<std::system_error>([&] { thread::setThreadName("name", uninitialisedTestThread); }));
+        run = false;
+        testThread.join();
+    };
+
 #endif
 };
 

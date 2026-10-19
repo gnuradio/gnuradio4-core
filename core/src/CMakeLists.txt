@@ -4,18 +4,12 @@ if(ENABLE_TESTS)
 endif()
 
 if(NOT EMSCRIPTEN)
-  add_library(gnuradio-plugin SHARED plugin.cpp)
+  # the libraries a plugin needs, named as one
+  add_library(gnuradio-plugin INTERFACE)
   add_library(gnuradio4::gnuradio-plugin ALIAS gnuradio-plugin)
-  set_target_properties(gnuradio-plugin PROPERTIES BUILD_WITH_INSTALL_RPATH ON)
-  target_include_directories(
-    gnuradio-plugin PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
-                           $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}> $<INSTALL_INTERFACE:include/>)
-  target_link_libraries(gnuradio-plugin PUBLIC gnuradio-core gnuradio-blocklib-core gnuradio-options)
+  target_link_libraries(gnuradio-plugin INTERFACE gnuradio-core gnuradio-blocklib-core gnuradio-options)
 
-  install(
-    TARGETS gnuradio-plugin
-    EXPORT gnuradio4PluginTargets
-    PUBLIC_HEADER DESTINATION include/gnuradio-4.0)
+  install(TARGETS gnuradio-plugin EXPORT gnuradio4PluginTargets)
 endif()
 
 if(ENABLE_EXAMPLES)
