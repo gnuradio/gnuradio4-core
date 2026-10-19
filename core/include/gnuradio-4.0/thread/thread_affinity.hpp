@@ -34,6 +34,17 @@
 #endif
 #endif
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <filesystem>
+#include <windows.h>
+#endif
+
 namespace gr::thread_pool::thread {
 
 constexpr size_t THREAD_MAX_NAME_LENGTH  = 16;
@@ -71,12 +82,12 @@ concept thread_type = std::is_same_v<type, std::thread>;
 #endif
 
 namespace detail {
-#if defined(_POSIX_THREADS) && not defined(__EMSCRIPTEN__) && not defined(__APPLE__)
 template<typename Tp, typename... Us>
 constexpr decltype(auto) firstElement(Tp&& t, Us&&...) noexcept {
     return std::forward<Tp>(t);
 }
 
+#if defined(_POSIX_THREADS) && not defined(__EMSCRIPTEN__) && not defined(__APPLE__)
 inline constexpr pthread_t getPosixHandler(thread_type auto&... t) noexcept {
     if constexpr (sizeof...(t) > 0) {
         return firstElement(t...).native_handle();
@@ -97,8 +108,57 @@ inline std::string getThreadName(const pthread_t& handle) {
 }
 
 inline int getPid() { return getpid(); }
+#elif defined(_WIN32)
+inline HANDLE getWin32Handle(thread_type auto&... t) noexcept {
+    if constexpr (sizeof...(t) > 0) {
+        return static_cast<HANDLE>(firstElement(t...).native_handle());
+    } else {
+        return GetCurrentThread();
+    }
+}
+
+inline std::string toUtf8(const wchar_t* wide) {
+    if (wide == nullptr || wide[0] == wchar_t{}) {
+        return {};
+    }
+    const int required = WideCharToMultiByte(CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
+    if (required <= 1) { // 'required' counts the terminating NUL
+        return {};
+    }
+    std::string narrow(static_cast<std::size_t>(required - 1), char{});
+    WideCharToMultiByte(CP_UTF8, 0, wide, -1, narrow.data(), required, nullptr, nullptr);
+    return narrow;
+}
+
+inline std::wstring toWide(std::string_view narrow) {
+    if (narrow.empty()) {
+        return {};
+    }
+    const int required = MultiByteToWideChar(CP_UTF8, 0, narrow.data(), static_cast<int>(narrow.size()), nullptr, 0);
+    if (required <= 0) {
+        return {};
+    }
+    std::wstring wide(static_cast<std::size_t>(required), wchar_t{});
+    MultiByteToWideChar(CP_UTF8, 0, narrow.data(), static_cast<int>(narrow.size()), wide.data(), required);
+    return wide;
+}
+
+inline std::string getThreadName(HANDLE handle) {
+    if (handle == nullptr) {
+        return "uninitialised thread";
+    }
+    PWSTR description = nullptr;
+    if (FAILED(GetThreadDescription(handle, &description))) {
+        throw std::system_error(THREAD_ERROR_UNKNOWN, thread_exception(), "getThreadName(thread_type)");
+    }
+    std::string name = toUtf8(description);
+    LocalFree(description);
+    return name;
+}
+
+inline int getPid() { return static_cast<int>(GetCurrentProcessId()); }
 #else
-inline int getPid() { return 0; }
+    inline int getPid() { return 0; }
 #endif
 } // namespace detail
 
@@ -111,6 +171,25 @@ inline std::string getProcessName(const int pid = detail::getPid()) {
     }
     return "unknown_process";
 }
+#elif defined(_WIN32)
+inline std::string getProcessName(const int pid = detail::getPid()) {
+    std::wstring buffer(MAX_PATH, wchar_t{});
+    DWORD        length = 0UL;
+    if (pid == detail::getPid()) {
+        length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    } else if (HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid)); process != nullptr) {
+        DWORD size = static_cast<DWORD>(buffer.size());
+        if (QueryFullProcessImageNameW(process, 0UL, buffer.data(), &size)) {
+            length = size;
+        }
+        CloseHandle(process);
+    }
+    if (length == 0UL) {
+        return "unknown_process";
+    }
+    buffer.resize(length);
+    return std::filesystem::path(buffer).stem().string(); // match /proc/<pid>/comm, which holds the bare executable name
+}
 #else
 inline std::string getProcessName(const int /*pid*/ = -1) { return "unknown_process"; }
 #endif
@@ -122,6 +201,17 @@ inline std::string getThreadName(thread_type auto&... thread) {
         throw std::system_error(THREAD_UNINITIALISED, thread_exception(), "getThreadName(thread_type)");
     }
     return detail::getThreadName(handle);
+}
+#elif defined(_WIN32)
+inline std::string getThreadName(thread_type auto&... thread) {
+    const HANDLE handle = detail::getWin32Handle(thread...);
+    if (handle == nullptr) {
+        throw std::system_error(THREAD_UNINITIALISED, thread_exception(), "getThreadName(thread_type)");
+    }
+    if (std::string name = detail::getThreadName(handle); !name.empty()) {
+        return name;
+    }
+    return getProcessName(); // a Windows thread starts out unnamed, where POSIX seeds it with the process name
 }
 #else
 inline std::string getThreadName(thread_type auto&... /*thread*/) { return "unknown thread name"; }
@@ -154,6 +244,16 @@ inline void setThreadName(const std::string_view& threadName, thread_type auto&.
     threadName.copy(boundedName.data(), boundedName.size() - 1UZ);
     if (const int rc = pthread_setname_np(handle, boundedName.data()); rc != 0) {
         throw std::system_error(rc, thread_exception(), std::format("setThreadName({},{}) - error code '{}'", threadName, detail::getThreadName(handle), rc));
+    }
+}
+#elif defined(_WIN32)
+inline void setThreadName(const std::string_view& threadName, thread_type auto&... thread) {
+    const HANDLE handle = detail::getWin32Handle(thread...);
+    if (handle == nullptr) {
+        throw std::system_error(THREAD_UNINITIALISED, thread_exception(), std::format("setThreadName({}, thread_type)", threadName));
+    }
+    if (FAILED(SetThreadDescription(handle, detail::toWide(threadName).c_str()))) {
+        throw std::system_error(THREAD_ERROR_UNKNOWN, thread_exception(), std::format("setThreadName({}) - SetThreadDescription failed", threadName));
     }
 }
 #else
@@ -298,15 +398,17 @@ struct SchedulingParameter {
 };
 
 namespace detail {
-inline Policy getEnumPolicy(const int policy) {
-    switch (policy) {
+inline Policy getEnumPolicy([[maybe_unused]] const int policy) {
 #if defined(_POSIX_THREADS) && not defined(__EMSCRIPTEN__) && not defined(__APPLE__)
+    switch (policy) {
     case SCHED_FIFO: return Policy::FIFO;
     case SCHED_RR: return Policy::ROUND_ROBIN;
     case SCHED_OTHER: return Policy::OTHER;
-#endif
     default: return Policy::UNKNOWN;
     }
+#else
+    return Policy::UNKNOWN; // no scheduling policies to map without POSIX threads
+#endif
 }
 } // namespace detail
 

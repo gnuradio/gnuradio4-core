@@ -1,0 +1,70 @@
+name: "GNURadio Windows CI"
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  pull_request:
+    branches:
+    - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  win-build:
+    strategy:
+      matrix:
+        os:
+          - windows-latest # vs26
+          - windows-22 # vs22
+          - windows-11-arm # vs26 - arm
+    runs-on: ${{ matrix.os }}
+    name: "GR4-build-win32-${{ matrix.os }}"
+    steps:
+      - name: Checkout GR Core
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          fetch-depth: 1
+      - name: Setup VS Dev Prompt
+        uses: step-security/msvc-dev-cmd@22c98154b708dbd743e6f27a933cf6ceba3305c4 # v1.13.1
+      - name: Restore FetchContent
+        id: restore-fetchcontent
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # 5.1
+        with:
+          path: ${{ github.workspace }}/build/_deps
+          key: fetchContent-win32-${{ matrix.os }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: |
+            fetchContent-win32-${{ matrix.os }}
+      - name: Configure and Generate
+        run: >
+          cmake -S . -B build
+          -DCMAKE_COLOR_DIAGNOSTICS=ON
+          -DDISABLE_EXTERNAL_DEPS_WARNINGS=ON
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          -DENABLE_COVERAGE=OFF
+          -DGR_USE_FETCHCONTENT_DEPS=ON
+      - name: Build
+        run: |
+          cmake --build build
+      - name: Test
+        run: |
+          ctest --test-dir build --output-on-failure --timeout 120
+      - name: Execute main binary
+        working-directory: ${{ github.workspace }}/build
+        run: .\core\src\main.exe
+      - name: Install
+        run: cmake --install build --prefix "${{ github.workspace }}/install"
+
+      - name: Build installed SDK smoke project
+        run: |
+          cmake -S test_external/minimal_blocklib -B build-smoke -DCMAKE_PREFIX_PATH="${{ github.workspace }}/install"
+          cmake --build build-smoke
+      - name: Save FetchContent
+        if: always() && steps.restore-fetchcontent.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # 5.1
+        with:
+          path: ${{ github.workspace }}/build/_deps
+          key: ${{ steps.restore-fetchcontent.outputs.cache-primary-key }}
+
