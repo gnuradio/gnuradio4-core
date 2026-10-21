@@ -38,24 +38,26 @@ jobs:
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
-      - name: Ensure fork is public
-        if: ${{ github.event.pull_request.head.repo.private }}
-        run: |
-          echo "Private forks are not supported for restyling" >&2
-          exit 1
-
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
         with:
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.ref }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
 
-      - uses: restyled-io/actions/setup@67eaade33e75b529818c2e07c506ad29c2c1d776 # 4.4.28
-
-      - id: restyler
-        uses: restyled-io/actions/run@67eaade33e75b529818c2e07c506ad29c2c1d776 # 4.4.28
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # 7.0.0
         with:
-          fail-on-differences: true
+          python-version: "3.14"
+
+      - name: Install the pinned restylers
+        run: python3 .github/ci-tools/restyle.py install --tools "$RUNNER_TEMP/restyle-tools"
+
+      - name: Restyle the changed files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+            --jq '.[].filename' > "$RUNNER_TEMP/changed-files"
+          python3 .github/ci-tools/restyle.py run --tools "$RUNNER_TEMP/restyle-tools" \
+            --event "$GITHUB_EVENT_PATH" --paths-from "$RUNNER_TEMP/changed-files"
 
   build:
     name: "${{ matrix.name }}"
