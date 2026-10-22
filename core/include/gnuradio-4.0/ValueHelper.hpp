@@ -160,12 +160,17 @@ std::expected<std::vector<DstT>, ConversionError> tensorToVector(const Tensor<Sr
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wconversion"
 #pragma GCC diagnostic ignored "-Wfloat-conversion"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4244) // narrowing element conversion, which is the point of the cast
 #endif
         for (const SrcT& elem : src) {
             result.emplace_back(static_cast<DstT>(elem));
         }
 #if defined(__GNUC__)
 #pragma GCC diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
 #endif
         return result;
     }

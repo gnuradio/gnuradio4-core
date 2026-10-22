@@ -766,9 +766,6 @@ endif()
 
 # Configure and install the pkg-config file TODO: This should become more granular - .pc for each in-tree module
 set(GR4_PKGCONFIG_PLUGIN_LIB "")
-if(TARGET gnuradio-plugin)
-  set(GR4_PKGCONFIG_PLUGIN_LIB " -lgnuradio-plugin")
-endif()
 configure_file(cmake/gnuradio4.pc.in ${CMAKE_CURRENT_BINARY_DIR}/gnuradio4.pc @ONLY)
 
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/gnuradio4.pc DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig # Standard location

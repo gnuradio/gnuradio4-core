@@ -37,22 +37,28 @@ struct checked_access_ptr {
     T* ptr = nullptr;
 
     checked_access_ptr(T* _ptr) : ptr(_ptr) {
-        if (not_null && ptr == nullptr) {
-            std::terminate();
+        if constexpr (not_null) {
+            if (ptr == nullptr) {
+                std::terminate();
+            }
         }
     }
 
     bool operator==(std::nullptr_t) const { return ptr == nullptr; }
     bool operator!=(std::nullptr_t) const { return ptr != nullptr; }
     T&   operator*() const {
-        if (not_null && ptr == nullptr) {
-            std::terminate();
+        if constexpr (not_null) {
+            if (ptr == nullptr) {
+                std::terminate();
+            }
         }
         return *ptr;
     }
     T* operator->() const {
-        if (not_null && ptr == nullptr) {
-            std::terminate();
+        if constexpr (not_null) {
+            if (ptr == nullptr) {
+                std::terminate();
+            }
         }
         return ptr;
     }
@@ -92,7 +98,7 @@ struct Tag {
     [[nodiscard]] std::optional<std::reference_wrapper<const pmt::Value>> get(const std::string& key) const noexcept {
         try {
             return map.at(convert_string_domain(key));
-        } catch (const std::out_of_range& e) {
+        } catch (const std::out_of_range&) {
             return std::nullopt;
         }
     }
