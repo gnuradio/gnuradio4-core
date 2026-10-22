@@ -508,8 +508,10 @@ activation is active again. A batch that `removeContext()` staged keeps the cont
 back to. When `removeContext()` removed the context active before the activation, the default
 context is active instead. A reset activates the default context: when the callback refuses a
 batch with a reset, the context active before the batch is active again. A setting whose
-`Limits` refuse its value from `oldSettings` keeps the refused value. The block reports the
-exception as an error on its message output.
+`Limits` refuse its value from `oldSettings` keeps the refused value. When tags alone carried
+every value in `newSettings`, the block reports the refusal in a plain message, as it reports a
+tag value outside a setting's `Limits`. Otherwise it reports the exception as an error on its
+message output.
 
 ### 2-argument variant
 
