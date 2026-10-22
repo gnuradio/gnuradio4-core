@@ -911,7 +911,7 @@ const boost::ut::suite<"gr::thread_pool Manager WASM"> _wasm = [] {
         const auto        taskSleep      = std::chrono::seconds(2);
 #endif
         // replace IO pool to unlimited upper bound
-        manager.replacePool(std::string(kDefaultIoPoolId), std::make_shared<ThreadPoolWrapper>(std::make_unique<BasicThreadPool>(kDefaultIoPoolId, TaskType::IO_BOUND, 1U, poolMaxThreads), "CPU"));
+        manager.replacePool(std::string(kDefaultIoPoolId), std::make_shared<ThreadPoolWrapper>(std::make_unique<BasicThreadPool>(kDefaultIoPoolId, TaskType::IO_BOUND, 1U, static_cast<std::uint32_t>(poolMaxThreads)), "CPU"));
         std::shared_ptr<TaskExecutor> pool = manager.get(gr::thread_pool::kDefaultIoPoolId);
 
         std::println("HW threads = {} - max wasm threads: {} actual: {} - pool max size: {}", //
