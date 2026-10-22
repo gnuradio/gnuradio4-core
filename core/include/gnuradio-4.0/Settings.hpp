@@ -82,7 +82,7 @@ inline auto nullMatchPred = [](auto, auto, auto) { return std::nullopt; };
 struct ApplyStagedParametersResult {
     property_map forwardParameters; // parameters that should be forwarded to dependent child blocks
     property_map appliedParameters;
-    property_map failedParameters; // staged values the block's setter rejected -- neither applied nor forwarded
+    property_map failedParameters; // staged values the block's setter or its settingsChanged() rejected -- neither applied nor forwarded
     std::string  refusal;          // the block, the key, the value and the reason of each failed parameter; empty when none failed
     std::string  tagRefusal;       // the part of `refusal` whose values a tag staged
     std::string  untaggedRefusal;  // the rest of `refusal`: values setStaged(), a context or a reset staged
@@ -190,7 +190,9 @@ std::string enumToString(T&& enum_value) {
  * `removeContext()` staged keeps the context it falls back to. When `removeContext()` removed the context active before
  * the activation, the default context is active instead. A reset activates the default context: when the callback
  * refuses a batch with a reset, the context active before the batch is active again. A member whose limits refuse its
- * value from `oldSettings` keeps the refused value. The exception then reaches the caller.
+ * value from `oldSettings` keeps the refused value. When tags alone staged every value in `newSettings`, the apply
+ * returns the refusal in `refusal` and `tagRefusal`, as it returns a tag value the limits refuse. Otherwise the
+ * exception reaches the caller.
  */
 template<typename BlockType>
 concept HasSettingsChangedCallback = requires(BlockType* block, const property_map& oldSettings, property_map& newSettings) {

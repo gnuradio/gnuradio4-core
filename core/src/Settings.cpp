@@ -56,6 +56,34 @@ namespace {
     }
     return std::nullopt;
 }
+
+/// each key of `values` with its value, as "key = value", joined by commas
+[[nodiscard]] std::string describeValues(const property_map& values) {
+    std::string described;
+    for (const auto& [key, value] : values) {
+        described += std::format("{}{} = {}", described.empty() ? "" : ", ", key, value);
+    }
+    return described;
+}
+
+[[nodiscard]] std::string describeThrown(const std::exception_ptr& thrown) {
+    try {
+        std::rethrow_exception(thrown);
+    } catch (const gr::exception& e) {
+        return e.message;
+    } catch (const std::exception& e) {
+        return e.what();
+    } catch (...) {
+        return "unknown error";
+    }
+}
+
+[[nodiscard]] std::string joinRefusals(const std::string& first, const std::string& second) {
+    if (first.empty() || second.empty()) {
+        return first + second;
+    }
+    return std::format("{}; {}", first, second);
+}
 } // namespace
 
 CtxSettingsBase::CtxSettingsBase(void* block, const settings::BlockDescriptor& descriptor) noexcept : _block(block), _descriptor(&descriptor) { _autoForwardParameters.insert(gr::tag::kDefaultTags.begin(), gr::tag::kDefaultTags.end()); }
@@ -903,6 +931,8 @@ ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::uniq
 
         updateActiveParametersImpl();
 
+        std::string  callbackRefusal;
+        property_map callbackRefused;
         // invoke user-callback function if staged is not empty; oldSettings, staged and result are local
         // copies, so the callback may read or write settings() without _mutex being held across it
         if (!staged.empty()) {
@@ -922,7 +952,17 @@ ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::uniq
                     restoreContextImpl(*contextBefore, batchCtx);
                 }
                 updateActiveParametersImpl();
-                std::rethrow_exception(refusal);
+                // a refusal of values that tags alone staged is reported with the refusals of tag values
+                const bool taggedOnly = std::ranges::all_of(staged, [&taggedKeys](const auto& entry) { return taggedKeys.contains(std::string_view(entry.first)); });
+                if (!taggedOnly) {
+                    std::rethrow_exception(refusal);
+                }
+                callbackRefusal = std::format("block '{}' refuses {}: {}", hooks.blockName != nullptr ? hooks.blockName(_block) : std::string_view{}, describeValues(staged), describeThrown(refusal));
+                for (const auto& [key, value] : staged) {
+                    result.appliedParameters.erase(key);
+                    result.forwardParameters.erase(key);
+                }
+                callbackRefused = staged;
             }
         }
 
@@ -936,6 +976,11 @@ ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::uniq
             }
             result.tagRefusal      = describeRefusals(tagged);
             result.untaggedRefusal = describeRefusals(untagged);
+        }
+        if (!callbackRefusal.empty()) {
+            result.refusal    = joinRefusals(result.refusal, callbackRefusal);
+            result.tagRefusal = joinRefusals(result.tagRefusal, callbackRefusal);
+            result.failedParameters.insert(callbackRefused.begin(), callbackRefused.end());
         }
 
         // the settings keep the input rate; only the forwarded value carries the block's output rate

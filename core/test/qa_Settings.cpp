@@ -1221,6 +1221,8 @@ struct LimitedSink : Block<LimitedSink> {
 
     std::size_t nReceived = 0UZ;
 
+    [[nodiscard]] float held() const noexcept { return gain.value; }
+
     work::Status processBulk(std::span<const float> input) {
         nReceived += input.size();
         return work::Status::OK;
@@ -1237,6 +1239,8 @@ struct RefusingSink : Block<RefusingSink> {
     GR_MAKE_REFLECTABLE(RefusingSink, in, count, level);
 
     std::size_t nReceived = 0UZ;
+
+    [[nodiscard]] gr::Size_t held() const noexcept { return count; }
 
     void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings) {
         if (newSettings.contains("count") && count == 0U) {
@@ -1340,23 +1344,25 @@ struct ReportedRefusals {
     return reported;
 }
 
-struct LimitedSinkRun {
-    std::expected<void, gr::Error> result;
-    float                          gain      = 0.f;
-    std::size_t                    nReceived = 0UZ;
-    std::size_t                    nSent     = 0UZ;
-    ReportedRefusals               reported{};
+template<typename TSink>
+struct SinkRun {
+    std::expected<void, gr::Error>                result;
+    decltype(std::declval<const TSink&>().held()) held{};
+    std::size_t                                   nReceived = 0UZ;
+    std::size_t                                   nSent     = 0UZ;
+    ReportedRefusals                              reported{};
 };
 
-/// runs a source that tags its first sample with `tag` through a block that declares no tag policy into a LimitedSink.
-/// A Set message carries `set` to the sink when it is not empty. A reader takes the scheduler's messages when
-/// `readMessages` is true. With no reader a block's error ends the run.
-[[nodiscard]] LimitedSinkRun runIntoLimitedSink(const property_map& tag, const property_map& set, bool readMessages) {
+/// runs a source that tags its first sample with `tag` through a block that declares no tag policy into a sink named
+/// `sinkName`. A Set message carries `set` to the sink when it is not empty. A reader takes the scheduler's messages
+/// when `readMessages` is true. With no reader a block's error ends the run.
+template<typename TSink>
+[[nodiscard]] SinkRun<TSink> runIntoSink(const std::string& sinkName, const property_map& tag, const property_map& set, bool readMessages) {
     using namespace boost::ut;
     gr::Graph flow;
     auto&     source = flow.emplaceBlock<FiniteTagSource>();
     auto&     pass   = flow.emplaceBlock<UndeclaredPass>();
-    auto&     sink   = flow.emplaceBlock<LimitedSink>({{"name", std::string("limited_sink")}});
+    auto&     sink   = flow.emplaceBlock<TSink>({{"name", sinkName}});
     source.tag       = tag;
     expect(flow.connect<"out", "in">(source, pass).has_value());
     expect(flow.connect<"out", "in">(pass, sink).has_value());
@@ -1373,8 +1379,8 @@ struct LimitedSinkRun {
     }
     expect(scheduler.exchange(std::move(flow)).has_value());
 
-    LimitedSinkRun run{.result = scheduler.runAndWait()};
-    run.gain      = sink.gain.value;
+    SinkRun<TSink> run{.result = scheduler.runAndWait()};
+    run.held      = sink.held();
     run.nReceived = sink.nReceived;
     run.nSent     = source.nSamples;
     if (readMessages) {
@@ -1584,12 +1590,12 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
     "a tag value the limits refuse is reported in a plain message, and the run completes"_test = [] {
         const property_map tag{{"gain", 2.0f}};
 
-        const LimitedSinkRun unread = runIntoLimitedSink(tag, {}, false);
+        const SinkRun<LimitedSink> unread = runIntoSink<LimitedSink>("limited_sink", tag, {}, false);
         expect(unread.result.has_value()) << "the refused tag value ends the run: " << (unread.result.has_value() ? std::string() : unread.result.error().message);
-        expect(eq(unread.gain, 0.5f)) << "the refused value reaches the member";
+        expect(eq(unread.held, 0.5f)) << "the refused value reaches the member";
         expect(eq(unread.nReceived, unread.nSent)) << "the sink misses samples";
 
-        const LimitedSinkRun read = runIntoLimitedSink(tag, {}, true);
+        const SinkRun<LimitedSink> read = runIntoSink<LimitedSink>("limited_sink", tag, {}, true);
         expect(read.result.has_value());
         expect(read.reported.plain.contains("block 'limited_sink' refuses gain = 2")) << "no plain message names the refusal, got: " << read.reported.plain;
         expect(read.reported.plain.contains("[0, 1]")) << read.reported.plain;
@@ -1597,11 +1603,11 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
     };
 
     "a value a Set message stages and the limits refuse ends the run in the error"_test = [] {
-        const LimitedSinkRun run = runIntoLimitedSink({}, {{"gain", 2.0f}}, false);
+        const SinkRun<LimitedSink> run = runIntoSink<LimitedSink>("limited_sink", {}, {{"gain", 2.0f}}, false);
         expect(fatal(!run.result.has_value())) << "the run completes past the refused value";
         expect(run.result.error().message.contains(kRejectedSettings)) << run.result.error().message;
         expect(run.result.error().message.contains("block 'limited_sink' refuses gain = 2")) << run.result.error().message;
-        expect(eq(run.gain, 0.5f)) << "the refused value reaches the member";
+        expect(eq(run.held, 0.5f)) << "the refused value reaches the member";
     };
 
     "a value settingsChanged() refuses leaves the member and settings().get() at the value last taken"_test = [] {
@@ -1654,6 +1660,29 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
         expect(later.errors.empty()) << "the activation of another key applies the refused value again: " << later.errors;
         expect(eq(block.level, level)) << "the block does not take the other key";
         expect(eq(block.count, taken));
+    };
+
+    "a tag value settingsChanged() refuses is reported in a plain message, and the run completes"_test = [] {
+        const gr::Size_t   initial = RefusingSink{}.count;
+        const property_map tag{{"count", gr::Size_t{0U}}};
+
+        const SinkRun<RefusingSink> unread = runIntoSink<RefusingSink>("refusing_sink", tag, {}, false);
+        expect(unread.result.has_value()) << "the refused tag value ends the run: " << (unread.result.has_value() ? std::string() : unread.result.error().message);
+        expect(eq(unread.held, initial)) << "the refused value stays in the member";
+        expect(eq(unread.nReceived, unread.nSent)) << "the sink misses samples";
+
+        const SinkRun<RefusingSink> read = runIntoSink<RefusingSink>("refusing_sink", tag, {}, true);
+        expect(read.result.has_value());
+        expect(read.reported.plain.contains("block 'refusing_sink' refuses count = 0: count must be at least 1")) << "no plain message names the refusal, got: " << read.reported.plain;
+        expect(read.reported.errors.empty()) << "the refused tag value is reported as an error: " << read.reported.errors;
+    };
+
+    "a value a Set message stages and settingsChanged() refuses ends the run in the error"_test = [] {
+        const gr::Size_t            initial = RefusingSink{}.count;
+        const SinkRun<RefusingSink> run     = runIntoSink<RefusingSink>("refusing_sink", {}, {{"count", gr::Size_t{0U}}}, false);
+        expect(fatal(!run.result.has_value())) << "the run completes past the refused value";
+        expect(run.result.error().message.contains("count must be at least 1")) << run.result.error().message;
+        expect(eq(run.held, initial)) << "the refused value stays in the member";
     };
 
     "a refused activation of another context returns to the earlier context and leaves the refused one's stored set as set() stored it"_test = [] {
