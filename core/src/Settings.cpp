@@ -34,6 +34,29 @@ BlockDescriptor::BlockDescriptor(const BlockHooks& blockHooks) : hooks(blockHook
 
 } // namespace settings
 
+namespace {
+// The reason a set for `ctx` would pass kMaxContexts or kMaxPendingSets, or nothing when it fits.
+// `forLaterTime` says the caller asked for a time after `now`; only such a set counts against kMaxPendingSets.
+[[nodiscard]] std::optional<std::string> refuseStoredSet(const std::map<pmt::Value, std::vector<SettingsBase::CtxSettingsPair>, settings::PMTCompare>& stored, const SettingsCtx& ctx, bool forLaterTime, std::uint64_t now) {
+    const auto contextIt = stored.find(ctx.context);
+    if (contextIt == stored.end() || contextIt->second.empty()) {
+        const auto nContexts = static_cast<std::size_t>(std::ranges::count_if(stored, [](const auto& entry) { return !entry.second.empty(); }));
+        if (nContexts >= CtxSettingsBase::kMaxContexts) {
+            return std::format("refused context {}: the block already stores {} contexts, the cap kMaxContexts", ctx.context, CtxSettingsBase::kMaxContexts);
+        }
+        return std::nullopt;
+    }
+    if (!forLaterTime) {
+        return std::nullopt;
+    }
+    const auto nPending = static_cast<std::size_t>(std::ranges::count_if(contextIt->second, [now](const SettingsBase::CtxSettingsPair& pair) { return pair.context.time > now; }));
+    if (nPending >= CtxSettingsBase::kMaxPendingSets) {
+        return std::format("refused set for context {}: it already holds {} sets for a later time, the cap kMaxPendingSets", ctx.context, CtxSettingsBase::kMaxPendingSets);
+    }
+    return std::nullopt;
+}
+} // namespace
+
 CtxSettingsBase::CtxSettingsBase(void* block, const settings::BlockDescriptor& descriptor) noexcept : _block(block), _descriptor(&descriptor) { _autoForwardParameters.insert(gr::tag::kDefaultTags.begin(), gr::tag::kDefaultTags.end()); }
 
 // --- Simple accessors ---
@@ -273,6 +296,7 @@ bool CtxSettingsBase::removeContextImpl(SettingsCtx ctx) {
     if (exactIt == vec.end()) {
         return false;
     }
+    _autoUpdateParameters.erase(exactIt->context);
     vec.erase(exactIt);
 
     if (vec.empty()) {
@@ -574,12 +598,17 @@ property_map CtxSettingsBase::setImpl(const property_map& parameters, SettingsCt
 
     property_map ret;
     if (hooks.reflectable) {
+        const std::uint64_t now = settings::convertTimePointToUint64Ns(std::chrono::system_clock::now());
         if (ctx.time == 0ULL) {
-            ctx.time = settings::convertTimePointToUint64Ns(std::chrono::system_clock::now());
+            ctx.time = now;
         }
+        const bool forLaterTime = ctx.time > now;
 #ifdef __EMSCRIPTEN__
         resolveDuplicateTimestamp(ctx);
 #endif
+        if (std::optional<std::string> refusal = refuseStoredSet(_storedParameters, ctx, forLaterTime, now)) {
+            throw gr::exception(*refusal);
+        }
         // initialize with empty property_map when best match parameters not found
         property_map newParameters = getBestMatchStoredParameters(ctx).value_or(_defaultParameters);
         // the context keeps its keys that follow tags until every value of the map is taken

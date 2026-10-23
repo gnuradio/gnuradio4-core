@@ -732,7 +732,8 @@ struct SettingsBase {
      * @brief Add new key-value pairs to stored parameters.
      * N.B. settings become staged after calling activateContext(), and after executing 'applyStagedParameters()' settings are applied (usually done early on in the 'Block::work()' function)
      * Throws for a value that does not convert to the member's type. Throws for a value outside the limits, with a
-     * message that names the block, the key, the value and the limits.
+     * message that names the block, the key, the value and the limits. Throws for a new context once the block stores
+     * kMaxContexts, and for a set at a later time once its context holds kMaxPendingSets of them.
      * @return key-value pairs that could not be set
      */
     [[nodiscard]] virtual property_map set(const property_map& parameters, SettingsCtx ctx = {}) = 0;
@@ -900,6 +901,9 @@ protected:
 public:
     // Settings configuration
     std::uint64_t expiry_time{std::numeric_limits<std::uint64_t>::max()};
+
+    static constexpr std::size_t kMaxContexts    = 256UZ; ///< the most context names a block stores, the default context included
+    static constexpr std::size_t kMaxPendingSets = 16UZ;  ///< the most sets one context holds for a time after now
 
     [[nodiscard]] const std::set<std::string>& writableMembers() const override;
     [[nodiscard]] std::set<std::string>        readableMembers() const override;
