@@ -1043,7 +1043,7 @@ public:
         }
     }
 
-    std::expected<void, Error> runAndWait() {
+    std::expected<void, Error> runAndWait(bool restart = true) {
         using enum lifecycle::State;
         [[maybe_unused]] const auto pe = this->_profilerHandler->startCompleteEvent("scheduler_base.runAndWait");
 
@@ -1068,6 +1068,11 @@ public:
         // runs it, as it does after an earlier run that ended STOPPED or ERROR. A stop that lands after this point
         // claims the move to RUNNING or stops the run.
         if (this->state() == STOPPED || this->state() == ERROR) {
+            // The wrapper initializes an asynchronous run before launching its thread.
+            // A stop that won since then must not be treated as a restart request.
+            if (!restart) {
+                return this->state() == ERROR ? std::unexpected(runEndingError()) : std::expected<void, Error>{};
+            }
             if (auto e = this->changeStateTo(INITIALISED); !e) {
                 this->emitErrorMessage("runAndWait() -> LifecycleState", e.error());
                 return std::unexpected(e.error());
