@@ -213,6 +213,25 @@ const boost::ut::suite<"block message plumbing"> blockMessageTests = [] {
             expect(eq(static_cast<std::size_t>(std::ranges::count_if(ctx0->second, [&](const auto& pair) { return pair.context.time >= later; })), kMaxPendingSets));
         }
     };
+
+    "a SettingsCtx Set returns a key no setting takes and leaves meta_information as it is"_test = [] {
+        qa_block_messages::SettingHandler block;
+        MsgPortOut                        toBlock;
+        MsgPortIn                         fromBlock;
+        qa_block_messages::connect(block, toBlock, fromBlock);
+        const property_map metaInformation = block.meta_information.value;
+
+        qa_block_messages::sendSettingsCtxSet(toBlock, "qa", 0U, property_map{{"gain", 2.f}, {"description", std::string("replaced")}, {"qa_note", std::string("filed")}});
+        block.processScheduledMessages();
+        const std::vector<Message> replies = qa_block_messages::takeMessages(fromBlock);
+        expect(fatal(eq(replies.size(), 1UZ) && replies[0].data.has_value()));
+        const auto  failedIt = replies[0].data->find("failed_to_set");
+        const auto* failed   = failedIt != replies[0].data->end() ? failedIt->second.get_if<property_map>() : nullptr;
+        expect(fatal(failed != nullptr));
+        expect(failed->contains("description") && failed->contains("qa_note") && !failed->contains("gain")) << "the reply names the keys no setting takes";
+        expect(block.meta_information.value == metaInformation) << "the unknown keys are not filed";
+        expect(block.settings().getStored("gain", SettingsCtx{0U, std::string("qa")}) == std::optional<pmt::Value>(2.f)) << "the setting the block has still takes";
+    };
 };
 
 int main() { /* tests are statically registered */ }
