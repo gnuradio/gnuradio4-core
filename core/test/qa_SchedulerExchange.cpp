@@ -501,6 +501,74 @@ void requestSwap(SwapRequester& block) {
     return states;
 }
 
+std::atomic<std::size_t> gStagePassed{0UZ};
+std::atomic<std::size_t> gFanOutSamples{0UZ};
+std::atomic<std::size_t> gOtherSinkSamples{0UZ};
+
+// publishes samples of value 1 for as long as it runs
+struct OnesSource : gr::Block<OnesSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(OnesSource, out);
+
+    [[nodiscard]] constexpr float processOne() const noexcept { return 1.0f; }
+};
+
+// passes kPassed samples, counted in gStagePassed, and then requests its own stop
+struct EndingStage : gr::Block<EndingStage> {
+    gr::PortIn<float>  in;
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(EndingStage, in, out);
+
+    static constexpr std::size_t kPassed = 64UZ;
+
+    [[nodiscard]] float processOne(float value) {
+        if (gStagePassed.fetch_add(1UZ) + 1UZ >= kPassed) {
+            this->requestStop();
+        }
+        return value;
+    }
+};
+
+using FanOutSink = CountingSink<&gFanOutSamples>;
+using OtherSink  = CountingSink<&gOtherSinkSamples>;
+
+template<typename TPredicate>
+[[nodiscard]] bool awaitCondition(TPredicate satisfied) {
+    for (std::size_t i = 0UZ; i < 3000UZ; ++i) {
+        if (satisfied()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return satisfied();
+}
+
+// the reply that carries the clientRequestID, if one arrives. Consumes every message it reads
+[[nodiscard]] std::optional<gr::Message> takeReplyTo(gr::MsgPortIn& port, std::string_view clientRequestID) {
+    for (std::size_t i = 0UZ; i < 3000UZ; ++i) {
+        auto                       messages = port.streamReader().get();
+        std::optional<gr::Message> reply;
+        if (const auto it = std::ranges::find_if(messages, [clientRequestID](const gr::Message& message) { return message.clientRequestID == clientRequestID; }); it != messages.end()) {
+            reply = *it;
+        }
+        std::ignore = messages.consume(messages.size());
+        if (reply.has_value()) {
+            return reply;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return std::nullopt;
+}
+
+// the data of a RemoveEdge request for the edge from the source's "out" to the destination's "in"
+[[nodiscard]] gr::property_map removeEdgeRequest(std::string_view sourceBlock, std::string_view destinationBlock) {
+    using namespace gr::serialization_fields;
+    return {{std::pmr::string(EDGE_SOURCE_BLOCK), std::string(sourceBlock)}, {std::pmr::string(EDGE_SOURCE_PORT), std::string("out")}, //
+        {std::pmr::string(EDGE_DESTINATION_BLOCK), std::string(destinationBlock)}, {std::pmr::string(EDGE_DESTINATION_PORT), std::string("in")}};
+}
+
 } // namespace qa_exchange
 
 const boost::ut::suite<"scheduler graph exchange"> schedulerExchangeTests = [] {
@@ -1090,6 +1158,48 @@ const boost::ut::suite<"scheduler graph exchange"> schedulerExchangeTests = [] {
         expect(qa_exchange::awaitState(scheduler, STOPPED)) << "the stop requested during the swap's own stop left the restored run running";
 
         std::ignore = scheduler.changeStateTo(REQUESTED_STOP);
+        expect(qa_exchange::awaitState(scheduler, STOPPED)) << "the scheduler did not stop";
+    };
+    // A source feeds a stage that ends, a counting sink and a sink. The stage releases its input when it stops. The
+    // removal of the sink's edge gives the source's output a new ring. If the removal connected the stage's input to
+    // that ring, the stage would never read it, the source would stop after one ring, and the counting sink would take
+    // at most one ring after the reply. The case asks for more than two rings.
+    "a RemoveEdge of one fan-out edge leaves the input of a stopped sibling released, and the running sibling receives"_test = [] {
+        qa_exchange::gStagePassed   = 0UZ;
+        qa_exchange::gFanOutSamples = 0UZ;
+        gr::Graph flow;
+        auto&     source    = flow.emplaceBlock<qa_exchange::OnesSource>();
+        auto&     stage     = flow.emplaceBlock<qa_exchange::EndingStage>();
+        auto&     stageSink = flow.emplaceBlock<qa_exchange::OtherSink>();
+        auto&     counting  = flow.emplaceBlock<qa_exchange::FanOutSink>();
+        auto&     removed   = flow.emplaceBlock<qa_exchange::OtherSink>();
+        expect(flow.connect<"out", "in">(source, stage).has_value());
+        expect(flow.connect<"out", "in">(stage, stageSink).has_value());
+        expect(flow.connect<"out", "in">(source, counting).has_value());
+        expect(flow.connect<"out", "in">(source, removed).has_value());
+        const std::string sourceName{source.unique_name};
+        const std::string removedName{removed.unique_name};
+        const auto*       stageBlock = &stage;
+
+        qa_exchange::TestScheduler scheduler;
+        expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(fatal(toScheduler.connect(scheduler.msgIn).has_value()));
+        expect(fatal(scheduler.msgOut.connect(fromScheduler).has_value()));
+        expect(scheduler.changeStateTo(INITIALISED).has_value());
+        expect(scheduler.changeStateTo(RUNNING).has_value());
+        expect(fatal(qa_exchange::awaitCondition([stageBlock] { return stageBlock->state() == STOPPED && !stageBlock->in.isConnected(); }))) << "the stage did not end, or kept its input";
+
+        gr::sendMessage<gr::message::Command::Set>(toScheduler, "", gr::scheduler::property::kRemoveEdge, qa_exchange::removeEdgeRequest(sourceName, removedName), "fan-out");
+        const std::optional<gr::Message> reply = qa_exchange::takeReplyTo(fromScheduler, "fan-out");
+        expect(fatal(reply.has_value() && reply->data.has_value())) << "the removal of one edge of the fan-out was refused";
+        expect(!stage.in.isConnected()) << "the removal connected the input of the stopped stage again";
+        const std::size_t ringSize = source.out.bufferSize();
+        const std::size_t nAtReply = qa_exchange::gFanOutSamples.load();
+        expect(qa_exchange::awaitCondition([ringSize, nAtReply] { return qa_exchange::gFanOutSamples.load() - nAtReply > 2UZ * ringSize; })) << std::format("the counting sink took {} samples after the reply, the ring holds {}", qa_exchange::gFanOutSamples.load() - nAtReply, ringSize);
+
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
         expect(qa_exchange::awaitState(scheduler, STOPPED)) << "the scheduler did not stop";
     };
 };
