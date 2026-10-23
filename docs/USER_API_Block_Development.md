@@ -711,20 +711,21 @@ GR_REGISTER_BLOCK("my::AddConst", my::MathOpImpl,
                    ([T], std::plus<[T]>), [float, double, std::complex<float>])
 ```
 
-| Syntax element          | Meaning                                                      |
-| ----------------------- | ------------------------------------------------------------ |
-| `[T]`, `[U]`            | type parameters to expand                                    |
-| `3UZ`, `std::plus<[T]>` | fixed non-type/type template arguments                       |
-| `[float, double]`       | type list for expansion of corresponding `[T]`               |
-| `"custom::name"`        | optional custom registered name (default: deduced from type) |
+| Syntax element          | Meaning                                                                           |
+| ----------------------- | --------------------------------------------------------------------------------- |
+| `[T]`, `[U]`            | type parameters to expand                                                         |
+| `3UZ`, `std::plus<[T]>` | fixed non-type/type template arguments                                            |
+| `[float, double]`       | type list for expansion of corresponding `[T]`                                    |
+| `"custom::name"`        | optional custom registered name (default: the block type as the marker writes it) |
 
 Fixing a template argument in the registration is supported but is not how
 `gnuradio4-blocks` spells these blocks. Where a block is an alias for a more
 general template — `AddConst<T>` for `MathOpImpl<T, std::plus<T>>`,
 `ThreePhasePowerMetrics<T>` for `PowerMetrics<T, 3UZ>` — register the alias
-under its own name with a single `[T]`. The registered key is then the element
-type alone, `gr::blocks::math::AddConst<float32>`, rather than one that repeats
-the fixed argument.
+with a single `[T]`. A marker without a quoted name registers the block type it
+names, and the registered name is then the element type alone,
+`gr::blocks::math::AddConst<float32>`, rather than one that repeats the fixed
+argument.
 
 Downstream examples: common blocks, math blocks, power estimators, and
 hardware-backed blocks in `gnuradio4-blocks`.
