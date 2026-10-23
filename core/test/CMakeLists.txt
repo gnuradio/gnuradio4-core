@@ -268,3 +268,6 @@ if(GR_USE_ADAPTIVE_CPP)
                TIMEOUT
                60)
 endif()
+
+add_ut_test(qa_FiniteSchedulerCompletion)
+set_tests_properties(qa_FiniteSchedulerCompletion PROPERTIES TIMEOUT 60)
