@@ -1,6 +1,7 @@
 #include <boost/ut.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <format>
 #include <memory>
@@ -29,6 +30,10 @@
  * directory of its own. The three shared objects that register a scheduler without being plugins differ in the same
  * way as the first two. Their registrations record a version, or none.
  */
+// ABI 10's SchedulerModel has no stopAfterDrain slot. Do not let a version
+// rollback silently admit that vtable into a host which invokes drain.
+static_assert(GR_PLUGIN_CURRENT_ABI_VERSION >= 11);
+
 namespace qa_plugin_abi_version {
 
 using namespace gr;
@@ -146,6 +151,12 @@ const boost::ut::suite<"PluginAbiVersion"> pluginAbiVersionTests = [] {
         expect(fatal(refused != loader.failedPlugins().end())) << "the plugin of the previous version has to be reported as a failure";
         expect(eq(refused->second, std::format("plugin ABI version {} does not match the host's plugin ABI version {}", kPreviousAbiVersion, GR_PLUGIN_CURRENT_ABI_VERSION))) << "the reason names both versions";
 
+        const auto schedulerRefused = std::ranges::find_if(loader.failedPlugins(), [](const auto& entry) { return entry.first.contains("abi_probe_scheduler_previous"); });
+        expect(fatal(schedulerRefused != loader.failedPlugins().end()));
+        expect(eq(schedulerRefused->second, std::format("plugin ABI version {} does not match the host's plugin ABI version {}", kPreviousAbiVersion, GR_PLUGIN_CURRENT_ABI_VERSION)));
+        expect(!loader.isSchedulerAvailable("test::previous_plugin_scheduler"));
+        expect(loader.instantiateScheduler("test::previous_plugin_scheduler") == nullptr) << "the rejected scheduler factory must not be called";
+
         expect(that % loader.plugins().empty()) << "the loader holds no plugin of the previous version";
         expect(that % !loader.isBlockAvailable(kPreviousKey)) << "a refused plugin offers no block";
         expect(loader.instantiate(kPreviousKey) == nullptr) << "a refused plugin's block cannot be created";
@@ -200,6 +211,7 @@ const boost::ut::suite<"PluginAbiVersion"> pluginAbiVersionTests = [] {
 
         const std::expected<void, Error> result = scheduler->runAndWait();
         expect(result.has_value()) << (result.has_value() ? std::string() : result.error().message);
+        expect(scheduler->stopAfterDrain(std::chrono::milliseconds(50))) << "a scheduler rebuilt at the host ABI supports the drain entry";
         expect(eq(source._nProduced, kTerminalCount));
         expect(eq(sink._nReceived, kTerminalCount)) << "the run reached its terminal count";
     };

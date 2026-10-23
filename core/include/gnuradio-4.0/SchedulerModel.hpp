@@ -3,7 +3,10 @@
 
 #include <gnuradio-4.0/BlockModel.hpp>
 
+#include <chrono>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -68,6 +71,11 @@ public:
     // the calling thread
     virtual void requestQuiescenceOfOtherWork() = 0;
     virtual void releaseWorkQuiescence()        = 0;
+
+    // Cancel stream sources, let accepted downstream input reach EOS, then join.
+    // false means the drain deadline expired and immediate stop was required.
+    // The deadline bounds downstream draining; block stop hooks remain cooperative.
+    virtual bool stopAfterDrain(std::chrono::milliseconds timeout) = 0;
 };
 
 // A scheduler that holds a nested scheduler and exports its ports hands it the progress sequences of the graphs beyond
@@ -155,9 +163,61 @@ public:
         }
     }
 
+    bool stopAfterDrain(std::chrono::milliseconds timeout) override {
+        auto& scheduler = this->blockRef();
+        // A nested scheduler can already be producing while this scheduler is
+        // still starting its own workers. Such a run must drain, not stop early.
+        if (!scheduler.runInProgress()) {
+            stop();
+            return true;
+        }
+        const auto subSchedulers = scheduler.requestWorkQuiescenceAll();
+        auto cancelSources = [&](auto&& self, auto& group) -> void {
+            for (auto& block : group.blocks()) {
+                if (!block->blocks().empty()) {
+                    self(self, *block);
+                    continue;
+                }
+                // Optional clock/message ports do not turn an unclocked source into a consumer.
+                auto hasConnectedStream = [](auto& ports) {
+                    const auto connected = [](auto& port) { return port.isConnected() && port::decodePortType(port.portMaskInfo()) == PortType::STREAM; };
+                    for (auto& entry : ports) {
+                        if (std::visit(
+                                [&](auto& value) {
+                                    if constexpr (requires { value.ports; }) {
+                                        return std::ranges::any_of(value.ports, connected);
+                                    } else {
+                                        return connected(value);
+                                    }
+                                },
+                                entry)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+                if (!hasConnectedStream(block->dynamicInputPorts()) && hasConnectedStream(block->dynamicOutputPorts()) && lifecycle::isActive(block->state())) {
+                    std::ignore = block->changeStateTo(lifecycle::State::REQUESTED_STOP);
+                }
+            }
+        };
+        {
+            on_scope_exit releaseQuiescence = [&] { scheduler.releaseWorkQuiescenceAll(subSchedulers); };
+            cancelSources(cancelSources, *this);
+        }
+        std::unique_lock lock(_completionMutex);
+        const bool       drained = _completionCondition.wait_for(lock, timeout, [this] { return _completed; });
+        lock.unlock();
+        stop();
+        return drained;
+    }
+
     std::thread _schedulerThread;
 
 private:
+    std::mutex                 _completionMutex;
+    std::condition_variable    _completionCondition;
+    bool                       _completed = true;
     std::expected<void, Error> startOnOwnThread(bool requireWorkerCapacity) {
         using enum gr::lifecycle::State;
         auto& sched = this->blockRef();
@@ -166,6 +226,16 @@ private:
             return {};
         }
 
+        const auto initial = sched.state();
+        if (initial != IDLE && initial != INITIALISED && initial != STOPPED && initial != ERROR) {
+            return std::unexpected(Error(std::format("sub-scheduler '{}' is {} and cannot be started", sched.unique_name, gr::meta::enumName(initial).value_or(""))));
+        }
+        if (initial == INITIALISED && _schedulerThread.joinable()) {
+            std::lock_guard lock(_completionMutex);
+            if (!_completed) {
+                return {}; // its accepted asynchronous start has not entered RUNNING yet
+            }
+        }
         if (_schedulerThread.joinable()) { // a previous run may have finished without a stop()
             _schedulerThread.join();
         }
@@ -201,13 +271,25 @@ private:
             }
         }
 
-        _schedulerThread = std::thread([&sched] {
-            // runs the scheduler's start(). Under a single-threaded policy start() returns when the run ends, and under
-            // the others once the workers are queued. A stop that claims the transition first leaves the stop's state.
-            // Any other error fails the start and reaches the scheduler that runs this one.
-            if (auto started = sched.changeStateTo(RUNNING); !started.has_value() && !gr::lifecycle::isShuttingDown(sched.state())) {
-                sched.failStartAndReport(std::move(started.error()));
+        {
+            std::lock_guard lock(_completionMutex);
+            _completed = false;
+        }
+        _schedulerThread = std::thread([this, &sched] {
+            // Settle natural completion and collect worker errors just as a synchronous run does.
+            // Do not restart if stop() won the race with this thread's entry.
+            try {
+                if (auto result = sched.runAndWait(false); !result) {
+                    sched.failStartAndReport(std::move(result.error()));
+                }
+            } catch (const std::exception& error) {
+                sched.failStartAndReport(Error{error.what()});
             }
+            {
+                std::lock_guard lock(_completionMutex);
+                _completed = true;
+            }
+            _completionCondition.notify_all();
         });
         return {};
     }
