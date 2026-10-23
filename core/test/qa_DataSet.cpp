@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include <gnuradio-4.0/DataSet.hpp>
+#include <gnuradio-4.0/Exception.hpp>
 
 const boost::ut::suite<"DataSet<T>"> _dataSetAPI = [] {
     using namespace boost::ut;
@@ -89,6 +90,54 @@ const boost::ut::suite<"DataSet<T>"> _dataSetAPI = [] {
             expect(throws([&] { std::ignore = ds.signalValues(99); }));
             expect(throws([&] { std::ignore = ds.signalRange(99); }));
         };
+    };
+};
+
+const boost::ut::suite<"DataSet accessors check the vector they read"> _dataSetShortVectors = [] {
+    using namespace boost::ut;
+
+    // each per-signal vector holds one entry fewer than signal_names
+    "an index past a shorter per-signal vector throws"_test = [] {
+        gr::DataSet<float> ds;
+        ds.signal_names              = {"sigA", "sigB", "sigC"};
+        ds.signal_quantities         = {"quantityA", "quantityB"};
+        ds.signal_units              = {"unitA", "unitB"};
+        ds.signal_ranges             = {{0.f, 1.f}, {10.f, 11.f}};
+        ds.meta_information          = {{}, {}};
+        ds.timing_events             = {{}, {}};
+        const std::size_t lastSignal = ds.size() - 1UZ;
+        const auto&       constDs    = ds;
+
+        expect(nothrow([&] { std::ignore = ds.signalName(lastSignal); }));
+        expect(throws<gr::exception>([&] { std::ignore = ds.signalQuantity(lastSignal); }));
+        expect(throws<gr::exception>([&] { std::ignore = ds.signalUnit(lastSignal); }));
+        expect(throws<gr::exception>([&] { std::ignore = ds.signalRange(lastSignal); }));
+        expect(throws<gr::exception>([&] { std::ignore = ds.metaInformation(lastSignal); }));
+        expect(throws<gr::exception>([&] { std::ignore = ds.timingEvents(lastSignal); }));
+        expect(throws<gr::exception>([&] { std::ignore = constDs.signalQuantity(lastSignal); }));
+        expect(throws<gr::exception>([&] { std::ignore = constDs.signalUnit(lastSignal); }));
+        expect(throws<gr::exception>([&] { std::ignore = constDs.signalRange(lastSignal); }));
+        expect(throws<gr::exception>([&] { std::ignore = constDs.metaInformation(lastSignal); }));
+        expect(throws<gr::exception>([&] { std::ignore = constDs.timingEvents(lastSignal); }));
+
+        const std::size_t lastStored = ds.signal_units.size() - 1UZ;
+        expect(eq(ds.signalUnit(lastStored), ds.signal_units[lastStored]));
+        expect(eq(constDs.signalRange(lastStored).max, ds.signal_ranges[lastStored].max));
+    };
+
+    // axis_units holds one entry fewer than axis_names and axis_values
+    "an index past a shorter axis_units throws"_test = [] {
+        gr::DataSet<float> ds;
+        ds.axis_names              = {"Time", "Frequency"};
+        ds.axis_values             = {{0.f, 1.f}, {100.f, 200.f}};
+        ds.axis_units              = {"s"};
+        const std::size_t lastAxis = ds.axisCount() - 1UZ;
+        const auto&       constDs  = ds;
+
+        expect(nothrow([&] { std::ignore = ds.axisValues(lastAxis); }));
+        expect(throws<gr::exception>([&] { std::ignore = ds.axisUnit(lastAxis); }));
+        expect(throws<gr::exception>([&] { std::ignore = constDs.axisUnit(lastAxis); }));
+        expect(eq(ds.axisUnit(0UZ), ds.axis_units[0UZ]));
     };
 };
 
