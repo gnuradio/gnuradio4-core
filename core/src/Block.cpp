@@ -423,7 +423,16 @@ std::optional<Message> BlockBase::propertyCallbackSettingsCtx(std::string_view p
             }
         }
 
-        message.data = property_map{{"failed_to_set", cbSettings().set(parameters, ctx)}};
+        // a key no setting takes is returned unset and is not filed in meta_information
+        const std::set<std::string>& writable = cbSettings().writableMembers();
+        property_map                 settable;
+        property_map                 failedToSet;
+        for (const auto& [key, value] : parameters) {
+            (writable.contains(std::string(key)) ? settable : failedToSet).insert_or_assign(key, value);
+        }
+        const property_map notSet = cbSettings().set(settable, ctx);
+        failedToSet.insert(notSet.begin(), notSet.end());
+        message.data = property_map{{"failed_to_set", std::move(failedToSet)}};
         return message;
     }
 
