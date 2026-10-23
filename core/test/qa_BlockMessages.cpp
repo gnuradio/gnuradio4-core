@@ -1,7 +1,9 @@
 #include <boost/ut.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <format>
 #include <ranges>
 #include <span>
@@ -44,6 +46,13 @@ struct ForwardingHandler : gr::Block<ForwardingHandler> {
     }
 };
 
+// carries one setting, which a SettingsCtx Set stores per context
+struct SettingHandler : gr::Block<SettingHandler> {
+    float gain = 1.f;
+
+    GR_MAKE_REFLECTABLE(SettingHandler, gain);
+};
+
 // every message the block has sent since the last call
 inline std::vector<gr::Message> takeMessages(gr::MsgPortIn& fromBlock) {
     gr::ReaderSpanLike auto  span = fromBlock.streamReader().get(fromBlock.streamReader().available());
@@ -56,6 +65,11 @@ inline void connect(gr::BlockLike auto& block, gr::MsgPortOut& toBlock, gr::MsgP
     using namespace boost::ut;
     expect(block.msgOut.connect(fromBlock).has_value());
     expect(toBlock.connect(block.msgIn).has_value());
+}
+
+inline void sendSettingsCtxSet(gr::MsgPortOut& toBlock, std::string_view context, std::uint64_t time, const gr::property_map& parameters) {
+    gr::sendMessage<gr::message::Command::Set>(toBlock, "", gr::block::property::kSettingsCtx, //
+        gr::property_map{{gr::tag::CONTEXT.shortKey(), std::string(context)}, {gr::tag::CONTEXT_TIME.shortKey(), time}, {"parameters", parameters}}, "qa");
 }
 
 // the error replies among `messages` whose text contains `text`
@@ -153,6 +167,51 @@ const boost::ut::suite<"block message plumbing"> blockMessageTests = [] {
         expect(eq(replies.size(), kCap));
         expect(std::ranges::any_of(replies, [&](const Message& reply) { return reply.clientRequestID == clientID(kCap); })) << "the freed slot went to the new id";
         expect(std::ranges::none_of(replies, [&](const Message& reply) { return reply.clientRequestID == clientID(1UZ); }));
+    };
+
+    "a block stores at most kMaxContexts contexts and kMaxPendingSets future sets per context"_test = [] {
+        constexpr std::size_t             kMaxContexts    = CtxSettingsBase::kMaxContexts;
+        constexpr std::size_t             kMaxPendingSets = CtxSettingsBase::kMaxPendingSets;
+        constexpr std::size_t             nRefused        = 3UZ;
+        const property_map                parameters{{"gain", 2.f}};
+        const std::uint64_t               later = settings::convertTimePointToUint64Ns(std::chrono::system_clock::now() + std::chrono::hours(1));
+        qa_block_messages::SettingHandler block;
+        MsgPortOut                        toBlock;
+        MsgPortIn                         fromBlock;
+        qa_block_messages::connect(block, toBlock, fromBlock);
+
+        const gr::Size_t nAutoUpdate = block.settings().getNAutoUpdateParameters();
+        qa_block_messages::sendSettingsCtxSet(toBlock, "removed", later, parameters);
+        sendMessage<message::Command::Disconnect>(toBlock, "", block::property::kSettingsCtx, property_map{{tag::CONTEXT.shortKey(), std::string("removed")}, {tag::CONTEXT_TIME.shortKey(), later}}, "qa");
+        block.processScheduledMessages();
+        expect(eq(qa_block_messages::countErrors(qa_block_messages::takeMessages(fromBlock)), 0UZ));
+        expect(eq(block.settings().getNAutoUpdateParameters(), nAutoUpdate)) << "removing a context drops its auto-update entry";
+
+        const std::size_t nStored = block.settings().getStoredAll().size();
+        const std::size_t nNew    = kMaxContexts - nStored + nRefused;
+        for (std::size_t i = 0UZ; i < nNew; ++i) {
+            qa_block_messages::sendSettingsCtxSet(toBlock, std::format("ctx-{}", i), 0U, parameters);
+        }
+        qa_block_messages::sendSettingsCtxSet(toBlock, "ctx-0", 0U, parameters);
+        block.processScheduledMessages();
+        std::vector<Message> replies = qa_block_messages::takeMessages(fromBlock);
+        expect(eq(replies.size(), nNew + 1UZ));
+        expect(eq(qa_block_messages::countErrors(replies, qa_block_messages::capText(kMaxContexts)), nRefused)) << "a new context past the cap is refused, a stored one still takes a set";
+        expect(eq(block.settings().getStoredAll().size(), kMaxContexts));
+
+        for (std::size_t i = 0UZ; i < kMaxPendingSets + nRefused; ++i) {
+            qa_block_messages::sendSettingsCtxSet(toBlock, "ctx-0", later + i, parameters);
+        }
+        qa_block_messages::sendSettingsCtxSet(toBlock, "ctx-0", 0U, parameters);
+        block.processScheduledMessages();
+        replies = qa_block_messages::takeMessages(fromBlock);
+        expect(eq(qa_block_messages::countErrors(replies, qa_block_messages::capText(kMaxPendingSets)), nRefused)) << "a future set past the cap is refused, a set for now still takes";
+        const auto stored = block.settings().getStoredAll();
+        const auto ctx0   = stored.find(pmt::Value(std::string("ctx-0")));
+        expect(ctx0 != stored.end());
+        if (ctx0 != stored.end()) {
+            expect(eq(static_cast<std::size_t>(std::ranges::count_if(ctx0->second, [&](const auto& pair) { return pair.context.time >= later; })), kMaxPendingSets));
+        }
     };
 };
 
