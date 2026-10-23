@@ -16,6 +16,7 @@ Only the standard library is used, so the interpreter's presence is the whole de
 
 import argparse
 import os
+import re
 import sys
 
 MACRO_NAME = "GR_REGISTER_BLOCK"
@@ -25,6 +26,12 @@ PLACEHOLDERS = ("[T]", "[U]", "[A]", "[B]", "[X]", "[Y]", "[Z]", "[S]")
 
 OPENING = "([<"
 CLOSING = ")]>"
+
+# A decimal integer literal with its type suffix, which a value parameter's printed spelling drops. A digit after an
+# identifier character, a point or an exponent belongs to a name or a floating literal.
+INTEGER_LITERAL = re.compile(
+    r"(?<![0-9.][eEpP])(^|[^A-Za-z0-9_.])([0-9]+)[uUzZlL]+(?![A-Za-z0-9_])"
+)
 
 
 INTEGRATOR_SOURCE_TEMPLATE = """
@@ -109,6 +116,29 @@ def replace_placeholders(param_pack, values):
     return param
 
 
+def without_literal_suffixes(text):
+    """Decimal integer literals as a compiler prints a value parameter: `1UZ` reads `1`."""
+    return INTEGER_LITERAL.sub(r"\1\2", text)
+
+
+def registered_name(base_name, template_name, replaced):
+    """The marker text a registration's alias is mapped from, or empty for the reflected name.
+
+    An override name is taken as written. A marker without one is named by the block type it declares, its
+    integer literals spelled as the reflected name spells them. A pack that carries a string literal is left
+    to the reflected name: the name is written into a C++ string literal, which the pack's quotes would end.
+    """
+    if base_name:
+        return "{}<{}>".format(base_name, replaced) if replaced else base_name
+    if '"' in replaced:
+        return ""
+    return (
+        "{}<{}>".format(template_name, without_literal_suffixes(replaced))
+        if replaced
+        else template_name
+    )
+
+
 def cartesian_product(groups):
     """The combinations of one value per group, the last group varying fastest."""
     combinations = [()]
@@ -186,11 +216,7 @@ def registrations_of(header, lines):
 
         for values in cartesian_product(groups):
             replaced = replace_placeholders(param_pack, values)
-            final_name = (
-                "{}<{}>".format(base_name, replaced)
-                if base_name and replaced
-                else base_name
-            )
+            final_name = registered_name(base_name, template_name, replaced)
             block_type = (
                 "{}<{}>".format(template_name, replaced) if replaced else template_name
             )
