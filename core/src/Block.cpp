@@ -2,6 +2,21 @@
 
 namespace gr {
 
+namespace {
+// Adds the client id to the property's subscribers. Throws for a new id once the property holds
+// kMaxSubscribersPerProperty ids.
+void subscribe(std::map<std::string, std::set<std::string>>& subscriptions, std::string_view propertyName, const std::string& clientID) {
+    if (clientID.empty()) {
+        return;
+    }
+    std::set<std::string>& subscribers = subscriptions[std::string(propertyName)];
+    if (!subscribers.contains(clientID) && subscribers.size() >= message::kMaxSubscribersPerProperty) {
+        throw gr::exception(std::format("refused client {}: property {} already notifies {} clients, the cap kMaxSubscribersPerProperty", clientID, propertyName, message::kMaxSubscribersPerProperty));
+    }
+    subscribers.insert(clientID);
+}
+} // namespace
+
 void BlockBase::initStandardPropertyCallbacks() noexcept {
     propertyCallbacks = {
         {block::property::kHeartbeat, &BlockBase::propertyCallbackHeartbeat},
@@ -127,9 +142,7 @@ std::optional<Message> BlockBase::propertyCallbackHeartbeat(std::string_view pro
         message.data                    = pmt::Value::Map{{"heartbeat", nanoseconds_count}};
         return message;
     } else if (message.cmd == Subscribe) {
-        if (!message.clientRequestID.empty()) {
-            propertySubscriptions[std::string(propertyName)].insert(message.clientRequestID);
-        }
+        subscribe(propertySubscriptions, propertyName, message.clientRequestID);
         return std::nullopt;
     } else if (message.cmd == Unsubscribe) {
         propertySubscriptions[std::string(propertyName)].erase(message.clientRequestID);
@@ -188,9 +201,7 @@ std::optional<Message> BlockBase::propertyCallbackLifecycleState(std::string_vie
     }
 
     if (message.cmd == Subscribe) {
-        if (!message.clientRequestID.empty()) {
-            propertySubscriptions[std::string(propertyName)].insert(message.clientRequestID);
-        }
+        subscribe(propertySubscriptions, propertyName, message.clientRequestID);
         return std::nullopt;
     }
 
@@ -218,9 +229,7 @@ std::optional<Message> BlockBase::propertyCallbackSettings(std::string_view prop
         message.data = cbSettings().get();
         return message;
     } else if (message.cmd == Subscribe) {
-        if (!message.clientRequestID.empty()) {
-            propertySubscriptions[std::string(propertyName)].insert(message.clientRequestID);
-        }
+        subscribe(propertySubscriptions, propertyName, message.clientRequestID);
         return std::nullopt;
     } else if (message.cmd == Unsubscribe) {
         propertySubscriptions[std::string(propertyName)].erase(message.clientRequestID);
@@ -266,9 +275,7 @@ std::optional<Message> BlockBase::propertyCallbackStagedSettings(std::string_vie
         message.data = cbSettings().stagedParameters();
         return message;
     } else if (message.cmd == Subscribe) {
-        if (!message.clientRequestID.empty()) {
-            propertySubscriptions[std::string(propertyName)].insert(message.clientRequestID);
-        }
+        subscribe(propertySubscriptions, propertyName, message.clientRequestID);
         return std::nullopt;
     } else if (message.cmd == Unsubscribe) {
         propertySubscriptions[std::string(propertyName)].erase(message.clientRequestID);
@@ -477,9 +484,7 @@ std::optional<Message> BlockBase::propertyCallbackMetaInformation(std::string_vi
         message.data = cbMetaInformation(); // get
         return message;
     } else if (message.cmd == Subscribe) {
-        if (!message.clientRequestID.empty()) {
-            propertySubscriptions[std::string(propertyName)].insert(message.clientRequestID);
-        }
+        subscribe(propertySubscriptions, propertyName, message.clientRequestID);
         return std::nullopt;
     } else if (message.cmd == Unsubscribe) {
         propertySubscriptions[std::string(propertyName)].erase(message.clientRequestID);
@@ -505,9 +510,7 @@ std::optional<Message> BlockBase::propertyCallbackUiConstraints(std::string_view
         message.data = cbUiConstraints(); // get
         return message;
     } else if (message.cmd == Subscribe) {
-        if (!message.clientRequestID.empty()) {
-            propertySubscriptions[std::string(propertyName)].insert(message.clientRequestID);
-        }
+        subscribe(propertySubscriptions, propertyName, message.clientRequestID);
         return std::nullopt;
     } else if (message.cmd == Unsubscribe) {
         propertySubscriptions[std::string(propertyName)].erase(message.clientRequestID);

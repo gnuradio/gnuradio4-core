@@ -67,6 +67,9 @@ std::string commandName() noexcept {
 inline const std::string        defaultBlockProtocol  = "MDPW03";
 inline static const std::string defaultClientProtocol = "MDPC03";
 
+/// the most client ids a block notifies for one property; a `Subscribe` that adds an id past it is answered with an error
+inline constexpr std::size_t kMaxSubscribersPerProperty = 64UZ;
+
 } // namespace message
 
 /**
