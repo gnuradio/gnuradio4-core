@@ -52,8 +52,9 @@
 // port of the host, and the layout of `gr::Tag`, the tag store's element, crosses the boundary with them. The host's
 // scheduler reads the `msgIn` and `msgOut` ports of a plugin's block through typed pointers, and the layout of a port
 // crosses the boundary too. `SchedulerModel::start()` returns the refusal of a start as a `std::expected`, and a host
-// reads it from a plugin's scheduler.
-#define GR_PLUGIN_CURRENT_ABI_VERSION 10
+// reads it from a plugin's scheduler. `SchedulerModel::stopAfterDrain()` adds a virtual entry;
+// plugins built without it must be rebuilt before the host can invoke drain.
+#define GR_PLUGIN_CURRENT_ABI_VERSION 11
 
 namespace gr {
 
