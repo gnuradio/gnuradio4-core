@@ -119,44 +119,52 @@ struct DataSet {
     [[nodiscard]] std::size_t nDimensions() const noexcept { return extents.size(); }
 
     [[nodiscard]] std::size_t        axisCount() const noexcept { return axis_names.size(); }
-    [[nodiscard]] std::string&       axisName(std::size_t axisIdx = 0UZ) { return axis_names[_axCheck(axisIdx)]; }
-    [[nodiscard]] std::string_view   axisName(std::size_t axisIdx = 0UZ) const { return axis_names[_axCheck(axisIdx)]; }
-    [[nodiscard]] std::string&       axisUnit(std::size_t axisIdx = 0UZ) { return axis_units[_axCheck(axisIdx)]; }
-    [[nodiscard]] std::string_view   axisUnit(std::size_t axisIdx = 0UZ) const { return axis_units[_axCheck(axisIdx)]; }
-    [[nodiscard]] std::span<T>       axisValues(std::size_t axisIdx = 0UZ) { return axis_values[_axCheck(axisIdx)]; }
-    [[nodiscard]] std::span<const T> axisValues(std::size_t axisIdx = 0UZ) const { return axis_values[_axCheck(axisIdx)]; }
+    [[nodiscard]] std::string&       axisName(std::size_t axisIdx = 0UZ) { return axis_names[_axCheck(axis_names, axisIdx)]; }
+    [[nodiscard]] std::string_view   axisName(std::size_t axisIdx = 0UZ) const { return axis_names[_axCheck(axis_names, axisIdx)]; }
+    [[nodiscard]] std::string&       axisUnit(std::size_t axisIdx = 0UZ) { return axis_units[_axCheck(axis_units, axisIdx)]; }
+    [[nodiscard]] std::string_view   axisUnit(std::size_t axisIdx = 0UZ) const { return axis_units[_axCheck(axis_units, axisIdx)]; }
+    [[nodiscard]] std::span<T>       axisValues(std::size_t axisIdx = 0UZ) { return axis_values[_axCheck(axis_values, axisIdx)]; }
+    [[nodiscard]] std::span<const T> axisValues(std::size_t axisIdx = 0UZ) const { return axis_values[_axCheck(axis_values, axisIdx)]; }
 
     [[nodiscard]] constexpr std::size_t size() const noexcept { return signal_names.size(); }
-    [[nodiscard]] std::string&          signalName(std::size_t signalIdx = 0UZ) { return signal_names[_idxCheck(signalIdx)]; }
-    [[nodiscard]] std::string_view      signalName(std::size_t signalIdx = 0UZ) const { return signal_names[_idxCheck(signalIdx)]; }
-    [[nodiscard]] std::string&          signalQuantity(std::size_t signalIdx = 0UZ) { return signal_quantities[_idxCheck(signalIdx)]; }
-    [[nodiscard]] std::string_view      signalQuantity(std::size_t signalIdx = 0UZ) const { return signal_quantities[_idxCheck(signalIdx)]; }
-    [[nodiscard]] std::string&          signalUnit(std::size_t signalIdx = 0UZ) { return signal_units[_idxCheck(signalIdx)]; }
-    [[nodiscard]] std::string_view      signalUnit(std::size_t signalIdx = 0UZ) const { return signal_units[_idxCheck(signalIdx)]; }
+    [[nodiscard]] std::string&          signalName(std::size_t signalIdx = 0UZ) { return signal_names[_idxCheck(signal_names, signalIdx)]; }
+    [[nodiscard]] std::string_view      signalName(std::size_t signalIdx = 0UZ) const { return signal_names[_idxCheck(signal_names, signalIdx)]; }
+    [[nodiscard]] std::string&          signalQuantity(std::size_t signalIdx = 0UZ) { return signal_quantities[_idxCheck(signal_quantities, signalIdx)]; }
+    [[nodiscard]] std::string_view      signalQuantity(std::size_t signalIdx = 0UZ) const { return signal_quantities[_idxCheck(signal_quantities, signalIdx)]; }
+    [[nodiscard]] std::string&          signalUnit(std::size_t signalIdx = 0UZ) { return signal_units[_idxCheck(signal_units, signalIdx)]; }
+    [[nodiscard]] std::string_view      signalUnit(std::size_t signalIdx = 0UZ) const { return signal_units[_idxCheck(signal_units, signalIdx)]; }
     [[nodiscard]] std::span<T>          signalValues(std::size_t signalIdx = 0UZ) { return {std::next(signal_values.data(), _idxCheckS(signalIdx) * _valsPerSigS()), _valsPerSig()}; }
     [[nodiscard]] std::span<const T>    signalValues(std::size_t signalIdx = 0UZ) const { return {std::next(signal_values.data(), _idxCheckS(signalIdx) * _valsPerSigS()), _valsPerSig()}; }
-    [[nodiscard]] Range<T>&             signalRange(std::size_t signalIdx = 0UZ) { return signal_ranges[_idxCheck(signalIdx)]; }
-    [[nodiscard]] const Range<T>&       signalRange(std::size_t signalIdx = 0UZ) const { return signal_ranges[_idxCheck(signalIdx)]; }
+    [[nodiscard]] Range<T>&             signalRange(std::size_t signalIdx = 0UZ) { return signal_ranges[_idxCheck(signal_ranges, signalIdx)]; }
+    [[nodiscard]] const Range<T>&       signalRange(std::size_t signalIdx = 0UZ) const { return signal_ranges[_idxCheck(signal_ranges, signalIdx)]; }
 
-    [[nodiscard]] pmt_map&                     metaInformation(std::size_t signalIdx = 0UZ) { return meta_information[_idxCheck(signalIdx)]; }
-    [[nodiscard]] const pmt_map&               metaInformation(std::size_t signalIdx = 0UZ) const { return meta_information[_idxCheck(signalIdx)]; }
-    [[nodiscard]] std::span<idx_pmt_map>       timingEvents(std::size_t signalIdx = 0UZ) { return timing_events[_idxCheck(signalIdx)]; }
-    [[nodiscard]] std::span<const idx_pmt_map> timingEvents(std::size_t signalIdx = 0UZ) const { return timing_events[_idxCheck(signalIdx)]; }
+    [[nodiscard]] pmt_map&                     metaInformation(std::size_t signalIdx = 0UZ) { return meta_information[_idxCheck(meta_information, signalIdx)]; }
+    [[nodiscard]] const pmt_map&               metaInformation(std::size_t signalIdx = 0UZ) const { return meta_information[_idxCheck(meta_information, signalIdx)]; }
+    [[nodiscard]] std::span<idx_pmt_map>       timingEvents(std::size_t signalIdx = 0UZ) { return timing_events[_idxCheck(timing_events, signalIdx)]; }
+    [[nodiscard]] std::span<const idx_pmt_map> timingEvents(std::size_t signalIdx = 0UZ) const { return timing_events[_idxCheck(timing_events, signalIdx)]; }
 
 private:
-    [[nodiscard]] std::size_t _axCheck(std::size_t i, std::source_location loc = std::source_location::current()) const {
+    template<typename TVector>
+    [[nodiscard]] std::size_t _axCheck(const TVector& indexed, std::size_t i, std::source_location loc = std::source_location::current()) const {
         if (i >= axis_names.size()) {
             throw gr::exception(std::format("{} axis out of range: i={} >= axis_name [0, {}]", loc.function_name(), i, axis_names.size()), loc);
         }
         if (i >= axis_values.size()) {
             throw gr::exception(std::format("{} axis out of range: i={} >= axis_values [0, {}]", loc.function_name(), i, axis_values.size()), loc);
         }
+        if (i >= indexed.size()) {
+            throw gr::exception(std::format("{} axis out of range: i={} >= stored entries [0, {}]", loc.function_name(), i, indexed.size()), loc);
+        }
         return i;
     }
 
-    [[nodiscard]] std::size_t _idxCheck(std::size_t i, std::source_location location = std::source_location::current()) const {
+    template<typename TVector>
+    [[nodiscard]] std::size_t _idxCheck(const TVector& indexed, std::size_t i, std::source_location location = std::source_location::current()) const {
         if (i >= size()) {
             throw gr::exception(std::format("{} out of range: i={} >= [0, {}]", location.function_name(), i, size()), location);
+        }
+        if (i >= indexed.size()) {
+            throw gr::exception(std::format("{} out of range: i={} >= stored entries [0, {}]", location.function_name(), i, indexed.size()), location);
         }
         return i;
     }
