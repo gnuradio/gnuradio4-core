@@ -21,6 +21,15 @@ GR_REGISTER_BLOCK(gr::fixture::Combine, ([T], std::plus<[T]>), [float])
 
 GR_REGISTER_BLOCK(gr::fixture::Pair, ([T], [U]), [ float, double ], [ int, short ])
 
+// clang-format off
+// two literals with one character between them
+GR_REGISTER_BLOCK(gr::fixture::Values, ([T], 1UZ,2UZ, 3ul, 1.0L, 1.5E+3L, 0x10u, int16_t), [float])
+// clang-format on
+
+GR_REGISTER_BLOCK("NamedFixed", gr::fixture::Fixed, ([T], 3UZ), [float])
+
+GR_REGISTER_BLOCK(gr::fixture::Labeled, ([T], "rate 2u"), [float])
+
 // GR_REGISTER_BLOCK(gr::fixture::CommentedOut, [T], [float])
 
 } // namespace gr::fixture

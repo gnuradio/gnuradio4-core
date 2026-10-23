@@ -187,6 +187,65 @@ function(
       PARENT_SCOPE)
 endfunction()
 
+# Decimal integer literals as a compiler prints a value parameter: `1UZ` reads `1`. A digit after an identifier
+# character, a point or an exponent belongs to a name or a floating literal. An exponent's sign is marked with `_` while
+# the suffixes are dropped. A match consumes the character after the literal, and the second pass reaches a literal
+# that directly follows another one.
+function(gr_pr_without_literal_suffixes TEXT OUT_VAR)
+  string(
+    REGEX
+    REPLACE "([0-9.][eEpP][+-])"
+            "\\1_"
+            _text
+            "${TEXT}")
+  foreach(_pass RANGE 1)
+    string(
+      REGEX
+      REPLACE "(^|[^A-Za-z0-9_.])([0-9]+)[uUzZlL]+([^A-Za-z0-9_]|$)"
+              "\\1\\2\\3"
+              _text
+              "${_text}")
+  endforeach()
+  string(
+    REGEX
+    REPLACE "([0-9.][eEpP][+-])_"
+            "\\1"
+            _text
+            "${_text}")
+  set(${OUT_VAR}
+      "${_text}"
+      PARENT_SCOPE)
+endfunction()
+
+# The marker text a registration's alias is mapped from, or empty for the reflected name. An override name is taken as
+# written. A marker without one is named by the block type it declares, its integer literals spelled as the reflected
+# name spells them. A pack that carries a string literal is left to the reflected name: the name is written into a C++
+# string literal, which the pack's quotes would end.
+function(
+  gr_pr_registered_name
+  BASE_NAME
+  TEMPLATE_NAME
+  REPLACED
+  OUT_VAR)
+  if(NOT BASE_NAME STREQUAL "")
+    if(REPLACED STREQUAL "")
+      set(_name "${BASE_NAME}")
+    else()
+      set(_name "${BASE_NAME}<${REPLACED}>")
+    endif()
+  elseif(REPLACED MATCHES "\"")
+    set(_name "")
+  elseif(REPLACED STREQUAL "")
+    set(_name "${TEMPLATE_NAME}")
+  else()
+    gr_pr_without_literal_suffixes("${REPLACED}" _parameters)
+    set(_name "${TEMPLATE_NAME}<${_parameters}>")
+  endif()
+  set(${OUT_VAR}
+      "${_name}"
+      PARENT_SCOPE)
+endfunction()
+
 function(
   gr_pr_registration_symbol
   STEM
@@ -511,11 +570,7 @@ while(NOT GR_PR_AT_END)
     math(EXPR GR_PR_COMBINATION_INDEX "${GR_PR_COMBINATION_INDEX} + 1")
 
     gr_pr_replace_placeholders("${GR_PR_PARAM_PACK}" "${GR_PR_VARS}" GR_PR_REPLACED)
-    if(GR_PR_BASE_NAME STREQUAL "" OR GR_PR_REPLACED STREQUAL "")
-      set(GR_PR_FINAL_NAME "${GR_PR_BASE_NAME}")
-    else()
-      set(GR_PR_FINAL_NAME "${GR_PR_BASE_NAME}<${GR_PR_REPLACED}>")
-    endif()
+    gr_pr_registered_name("${GR_PR_BASE_NAME}" "${GR_PR_TEMPLATE_NAME}" "${GR_PR_REPLACED}" GR_PR_FINAL_NAME)
     if(GR_PR_REPLACED STREQUAL "")
       set(GR_PR_TYPE "${GR_PR_TEMPLATE_NAME}")
     else()
