@@ -561,8 +561,8 @@ public:
         return displaced;
     }
 
-    // an empty destination removes every edge fanning out from the source port; the port's buffer is shared by
-    // all of them, so the ones that stay must be reconnected afterwards
+    // an empty destination removes every edge fanning out from the source port. The edges share the port's ring, so a
+    // removal that tears the port down connects the kept edges whose inputs were connected again
     std::expected<std::size_t, Error> removeEdgeBySourcePort(std::string_view sourceBlock, std::string_view sourcePort, std::string_view destinationBlock = {}, std::string_view destinationPort = {}) {
         auto sourceBlockIt = std::ranges::find_if(_blocks, [&sourceBlock](const auto& block) { return block->uniqueName() == sourceBlock; });
         if (sourceBlockIt == _blocks.end()) {
@@ -621,7 +621,17 @@ public:
         const auto keptReader              = [&](const Edge& edge) { return sharesSourcePort(edge) && !isRequestedEdge(edge) && edge.state() == Edge::EdgeState::Connected && streamInput(edge) && inputConnected(edge); };
         const bool requestedInputConnected = std::ranges::any_of(_edges, [&](const Edge& edge) { return isRequestedEdge(edge) && inputConnected(edge); });
         const bool holdsReader             = requestedInputConnected && sourcePortRef.nReaders() > static_cast<std::size_t>(std::ranges::count_if(_edges, keptReader));
+
+        // The teardown releases the port's ring, and the first kept edge connected below makes a new one. A kept edge
+        // whose input was connected reads the new ring. A kept edge whose input was not connected stays as it is: a
+        // stopped block that released its input would never read the ring, and the ring would hold the source.
+        std::vector<const DynamicPort*> readingInputs;
         if (holdsReader) {
+            for (const Edge& edge : _edges) {
+                if (sharesSourcePort(edge) && !isRequestedEdge(edge) && inputConnected(edge)) {
+                    readingInputs.push_back(resolvedInput(edge));
+                }
+            }
             if (auto result = sourcePortRef.disconnect(); !result) {
                 return std::unexpected(Error(std::format("Block {} sourcePortRef could not be disconnected {}: {}", sourceBlock, this->unique_name, result.error().message)));
             }
@@ -632,12 +642,12 @@ public:
         _edges.erase(first, last);
 
         if (holdsReader) {
-            for (auto& edge : _edges) { // siblings lost their buffer with the port teardown
-                if (sharesSourcePort(edge)) {
-                    edge._state = Edge::EdgeState::WaitingToBeConnected;
+            for (Edge& edge : _edges) {
+                if (sharesSourcePort(edge) && std::ranges::contains(readingInputs, resolvedInput(edge)) && applyEdgeConnection(edge) != Edge::EdgeState::Connected) {
+                    std::print("Edge could not be connected {}\n", edge);
                 }
             }
-            std::ignore = connectPendingEdges();
+            sizeUnconnectedOptionalOutputs(**sourceBlockIt);
         }
 
         return nRemoved;
