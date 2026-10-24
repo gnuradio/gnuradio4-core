@@ -580,4 +580,17 @@ const boost::ut::suite<"a worker task queued for a stopped run"> queuedWorkerTes
     };
 };
 
+const boost::ut::suite<"the stream-to-message ratio"> messageRatioTests = [] {
+    using namespace boost::ut;
+
+    "a stream-to-message ratio of zero is refused"_test = [] {
+        qa_start_stop::TestScheduler scheduler;
+        const gr::Size_t             ratioBefore = scheduler.process_stream_to_message_ratio.value;
+        std::ignore                              = scheduler.settings().setStaged({{"process_stream_to_message_ratio", 0U}});
+        const auto result                        = scheduler.settings().applyStagedParameters();
+        expect(result.failedParameters.contains("process_stream_to_message_ratio")) << "a ratio of zero must be refused";
+        expect(eq(scheduler.process_stream_to_message_ratio.value, ratioBefore)) << "a refused ratio must leave the setting alone";
+    };
+};
+
 int main() { /* tests are statically registered */ }
