@@ -458,7 +458,7 @@ public:
     Annotated<gr::Size_t, "timeout", Unit<"ms">, Doc<"longest wait of an idle or paused worker">>                                                           timeout_ms                      = 100U;
     Annotated<gr::Size_t, "watchdog_timeout", Unit<"ms">, Doc<"sleep timeout for watchdog">>                                                                watchdog_timeout                = 1000U;
     Annotated<gr::Size_t, "timeout_inactivity_count", Doc<"inactive traversals before single-threaded parking, or watchdog periods before a stall report">> timeout_inactivity_count        = 5U;
-    Annotated<gr::Size_t, "process_stream_to_message_ratio", Doc<"number of stream to msg processing">>                                                     process_stream_to_message_ratio = 16U;
+    Annotated<gr::Size_t, "process_stream_to_message_ratio", Doc<"number of stream to msg processing">, Limits<1U, std::numeric_limits<gr::Size_t>::max()>> process_stream_to_message_ratio = 16U;
     Annotated<gr::Size_t, "pool_park_count", Doc<"idle passes at the longest back-off sleep before a pool worker parks">>                                   pool_park_count                 = 5U;
     Annotated<std::string, "pool name", Doc<"default pool name">>                                                                                           poolName                        = std::string(gr::thread_pool::kDefaultCpuPoolId);
     Annotated<std::size_t, "max_work_items", Doc<"number of work items per work scheduling interval (controls latency)">>                                   max_work_items                  = std::numeric_limits<std::size_t>::max(); // TODO: check whether we can keep this std::size_t or more consistently to gr::Size_t
@@ -1734,7 +1734,7 @@ protected:
         [[maybe_unused]] auto currentDraining    = gr::detail::drainingCalls();
         std::size_t           inactiveCycleCount = 0UZ;
         std::size_t           idleIterations     = 0UZ;
-        std::size_t           msgToCount         = 0UZ;
+        std::size_t           nPassesToMessages  = 0UZ; // the passes before the next message pass
         auto                  activeState        = this->state();
 
         do {
@@ -1757,7 +1757,7 @@ protected:
             // pending traffic. This keeps the ratio's amortisation of empty-queue checks while giving arriving
             // messages single-iteration latency (important for multi-hop sub-scheduler message paths).
             const bool hasPendingMessages   = msgInPending || childPending;
-            const bool hasMessagesToProcess = msgToCount == 0UZ || hasPendingMessages;
+            const bool hasMessagesToProcess = nPassesToMessages == 0UZ || hasPendingMessages;
             if (hasMessagesToProcess) {
                 this->processScheduledMessages();
                 // the run was retired. A restart among the messages above runs with the next run's workers, which own
@@ -1785,13 +1785,9 @@ protected:
                 if (restartsBackoff || activeState != previousState) {
                     idleIterations = 0UZ;
                 }
-                msgToCount++;
+                nPassesToMessages = std::max(static_cast<std::size_t>(process_stream_to_message_ratio.value), 1UZ) - 1UZ;
             } else {
-                if (std::has_single_bit(process_stream_to_message_ratio.value)) {
-                    msgToCount = (msgToCount + 1U) & (process_stream_to_message_ratio.value - 1);
-                } else {
-                    msgToCount = (msgToCount + 1U) % process_stream_to_message_ratio.value;
-                }
+                nPassesToMessages--;
             }
 
             if (activeState == RUNNING) {
@@ -1816,14 +1812,14 @@ protected:
                     idleIterations = result->performed_work > 0UZ ? 0UZ : idleIterations + 1UZ;
                     applyIdleBackoff(idleIterations);
                     if (idleIterations > kIdleSpinIterations) {
-                        msgToCount = 0UZ; // re-read lifecycle state every backoff period, bounding stop latency
+                        nPassesToMessages = 0UZ; // re-read lifecycle state every backoff period, bounding stop latency
                     }
                 }
             } else {                                    // PAUSED or any other non-RUNNING state
                 if (lifecycle::isActive(activeState)) { // a terminal state ends the loop below, do not sleep it out
                     sleepUntilStateChanges(activeState);
                 }
-                msgToCount = 0UZ;
+                nPassesToMessages = 0UZ;
             }
 
             // optionally tracking progress and block if there is none
@@ -1851,7 +1847,7 @@ protected:
                     // allow a scheduler process to wait on progress before retrying (N.B. intended to save CPU/battery power)
                     // work, or a wake since the top of this pass, ends the park. A wake does not count as progress
                     waitUntilChanged(*progress, waitFrom, *_wake, currentWake, timeout_ms);
-                    msgToCount = 0UZ;
+                    nPassesToMessages = 0UZ;
                 }
             }
         } while (lifecycle::isActive(activeState) && gr::atomic_ref(_run.generation).load_acquire() == generation);
