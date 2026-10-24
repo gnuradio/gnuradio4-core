@@ -142,6 +142,77 @@ struct MessageCountingSink : gr::Block<MessageCountingSink> {
     }
 };
 
+struct OnesSource : gr::Block<OnesSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(OnesSource, out);
+
+    [[nodiscard]] constexpr float processOne() const noexcept { return 1.0f; }
+};
+
+// the scheduler's running-job count, which the test reads without owning it
+struct JobCountProbe : TestScheduler {
+    using TestScheduler::TestScheduler;
+
+    [[nodiscard]] std::weak_ptr<gr::Sequence> runningJobs() const { return this->_nRunningJobs; }
+};
+
+// a pool that holds every task it is given until runHeld() runs them on the calling thread. It keeps each task it ran
+// until dropRan(), and it counts a held task as queued
+struct HoldingPool : gr::thread_pool::TaskExecutor {
+    std::string                                              _name;
+    std::uint32_t                                            _maxThreads;
+    mutable std::mutex                                       _mutex;
+    std::vector<gr::thread_pool::detail::move_only_function> _held;
+    std::vector<gr::thread_pool::detail::move_only_function> _ran;
+
+    HoldingPool(std::string_view poolName, std::uint32_t maxThreads) : _name(poolName), _maxThreads(maxThreads) {}
+
+    void execute(gr::thread_pool::detail::move_only_function&& task) override {
+        std::lock_guard lock(_mutex);
+        _held.push_back(std::move(task));
+    }
+
+    // returns the number of tasks it ran
+    std::size_t runHeld() {
+        std::vector<gr::thread_pool::detail::move_only_function> held;
+        {
+            std::lock_guard lock(_mutex);
+            held.swap(_held);
+        }
+        for (auto& task : held) {
+            task();
+        }
+        std::lock_guard lock(_mutex);
+        for (auto& task : held) {
+            _ran.push_back(std::move(task));
+        }
+        return held.size();
+    }
+
+    void dropRan() {
+        std::lock_guard lock(_mutex);
+        _ran.clear();
+    }
+
+    [[nodiscard]] gr::thread_pool::TaskType type() const noexcept override { return gr::thread_pool::TaskType::CPU_BOUND; }
+    [[nodiscard]] std::string_view          name() const noexcept override { return _name; }
+    [[nodiscard]] std::string_view          device() const noexcept override { return "CPU"; }
+    [[nodiscard]] std::size_t               numThreads() const override { return 0UZ; }
+    [[nodiscard]] std::size_t               numTasksQueued() const override {
+        std::lock_guard lock(_mutex);
+        return _held.size();
+    }
+    [[nodiscard]] std::size_t                   numTasksRunning() const override { return 0UZ; }
+    [[nodiscard]] std::size_t                   numTasksRecycled() const override { return 0UZ; }
+    void                                        setThreadBounds(std::uint32_t, std::uint32_t) override {}
+    [[nodiscard]] std::pair<uint32_t, uint32_t> threadBounds() const override { return {0U, _maxThreads}; }
+    [[nodiscard]] std::uint32_t                 minThreads() const override { return 0U; }
+    [[nodiscard]] std::uint32_t                 maxThreads() const override { return _maxThreads; }
+    void                                        requestShutdown() override {}
+    [[nodiscard]] bool                          isShutdown() const override { return false; }
+};
+
 // registers a pool under its name for the case. At the end of the case the name resolves to the default CPU pool
 struct ScopedPool {
     std::string                                    name;
@@ -471,6 +542,41 @@ const boost::ut::suite<"the scheduler's messages to its children"> childMessageT
         scheduler.processScheduledMessages();
         expect(newSink.recorded().empty()) << "the new graph's block received a message kept for the old graph";
         expect(eq(nDropped, messages.size() - ringSize)) << "the swap left kept messages uncounted";
+    };
+};
+
+const boost::ut::suite<"a worker task queued for a stopped run"> queuedWorkerTests = [] {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    // the pool runs the stopped run's worker tasks only after the stop. Each task then releases its count and returns
+    "a queued worker task keeps the job count it releases alive after the scheduler is gone"_test = [] {
+        constexpr std::string_view kPoolName = "qa_start_stop_holding_cpu";
+        auto                       holding   = std::make_shared<qa_start_stop::HoldingPool>(kPoolName, 4U);
+        qa_start_stop::ScopedPool  pool(kPoolName, holding);
+
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_start_stop::OnesSource>();
+        auto&     sink   = flow.emplaceBlock<qa_start_stop::CountingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        auto scheduler = std::make_unique<qa_start_stop::JobCountProbe>(gr::property_map{{"poolName", std::string(kPoolName)}});
+        expect(scheduler->exchange(std::move(flow)).has_value());
+        expect(scheduler->changeStateTo(INITIALISED).has_value());
+        expect(scheduler->changeStateTo(RUNNING).has_value());
+        expect(fatal(gt(holding->numTasksQueued(), 0UZ))) << "the run's workers must be held";
+        expect(scheduler->changeStateTo(REQUESTED_STOP).has_value());
+        expect(fatal(qa_start_stop::awaitCondition([&scheduler] { return scheduler->state() == STOPPED; }))) << "the scheduler did not stop with its workers held";
+
+        const std::weak_ptr<gr::Sequence> runningJobs = scheduler->runningJobs();
+        expect(gt(holding->runHeld(), 0UZ));
+        expect(!scheduler->workerStarted()) << "a worker task of the stopped run must leave without starting";
+        expect(fatal(qa_start_stop::awaitCondition([&scheduler] { return !scheduler->isProcessing(); }))) << "the stopped run's workers kept their count";
+        scheduler.reset();
+
+        expect(!runningJobs.expired()) << "a worker task must hold the job count it releases";
+        holding->dropRan();
+        expect(runningJobs.expired()) << "the job count must go with the last task that holds it";
     };
 };
 

@@ -1592,9 +1592,11 @@ protected:
             [[maybe_unused]] const auto pe = _profilerHandler->startCompleteEvent("scheduler_base.runOnPool");
             for (std::size_t runnerID = 0UZ; runnerID < nWorkers; runnerID++) {
                 try {
-                    _pool->execute([this, runnerID, jobListsCopy, workerGeneration = *workerGeneration]() {
+                    // the task holds the count it releases. ~SchedulerBase() may finish once the count is released,
+                    // and the release notifies the count after that
+                    _pool->execute([this, runnerID, jobListsCopy, workerGeneration = *workerGeneration, nRunningJobs = _nRunningJobs]() {
                         if (gr::atomic_ref(_run.generation).load_acquire() != workerGeneration) { // a restart occurred before the pool reached this task
-                            releaseWorkerCount(*_nRunningJobs);
+                            releaseWorkerCount(*nRunningJobs);
                             return;
                         }
                         gr::atomic_ref(_nWorkersStarted).fetch_add(1UZ);
