@@ -530,7 +530,7 @@ template<typename RawType, typename Type>
 std::optional<std::string> refuseByLimits(std::string_view key, const pmt::Value& value) {
     using Limit                                      = typename RawType::LimitType;
     const std::expected<Type, std::string> converted = settings::convertParameter<Type>(key, value);
-    if (!converted || Limit::validate(static_cast<typename Limit::ValueType>(*converted))) {
+    if (!converted || Limit::validate(*converted)) {
         return std::nullopt;
     }
     return describeLimits<Limit>();

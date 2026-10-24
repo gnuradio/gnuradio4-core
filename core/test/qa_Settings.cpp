@@ -4,11 +4,13 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <complex>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <format>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <ranges>
@@ -1069,6 +1071,18 @@ struct SignedGain : Block<SignedGain> {
     [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
 };
 
+/// a float rate the block takes between 0 and 100, with integral limits
+struct IntegralLimitedRate : Block<IntegralLimitedRate> {
+    PortIn<float>  in{};
+    PortOut<float> out{};
+
+    Annotated<float, "rate", Limits<0, 100>> rate = 50.f;
+
+    GR_MAKE_REFLECTABLE(IntegralLimitedRate, in, out, rate);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * rate; }
+};
+
 /// a gain whose default lies outside its limits, beside an offset without limits
 struct OutOfLimitsDefault : Block<OutOfLimitsDefault> {
     PortIn<float>  in{};
@@ -1263,6 +1277,21 @@ struct LimitedSinkRun {
     return run;
 }
 
+inline constexpr auto isEven       = [](const int& value) { return value % 2 == 0; };
+inline constexpr auto anyCharacter = [](const char&) { return true; };
+
+// true when Limit takes Character values at its limits and refuses values just outside them
+template<typename Limit, typename Character>
+constexpr bool limitsTakeCharacterByValue() {
+    const bool edgesTaken   = Limit::validate(static_cast<Character>(Limit::MinRange)) && Limit::validate(static_cast<Character>(Limit::MaxRange));
+    const bool aboveRefused = !Limit::validate(static_cast<Character>(Limit::MaxRange + 1));
+    if constexpr (std::is_signed_v<Character>) {
+        return edgesTaken && aboveRefused && !Limit::validate(static_cast<Character>(Limit::MinRange - 1));
+    } else {
+        return edgesTaken && aboveRefused;
+    }
+}
+
 } // namespace qa_refusals
 
 const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
@@ -1281,6 +1310,96 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
         std::ignore = block.settings().activateContext();
         std::ignore = block.settings().applyStagedParameters();
         expect(eq(block.gain.value, 0.5f)) << "the refused value does not reach the member";
+    };
+
+    "integral limits compare a float before converting it"_test = [] {
+        using RateLimits  = decltype(IntegralLimitedRate::rate)::LimitType;
+        const float lower = static_cast<float>(RateLimits::MinRange);
+        const float upper = static_cast<float>(RateLimits::MaxRange);
+        for (const float rate : {lower - 0.5f, upper + 0.5f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity()}) {
+            IntegralLimitedRate block{property_map{{"name", std::string("rate_stage")}}};
+            block.init(std::make_shared<gr::Sequence>());
+            expect(!setRefusal(block.settings(), {{"rate", rate}}).empty()) << std::format("set() takes rate = {}", rate);
+        }
+
+        IntegralLimitedRate block{property_map{{"name", std::string("rate_stage")}}};
+        block.init(std::make_shared<gr::Sequence>());
+        const std::string refusal = setRefusal(block.settings(), {{"rate", upper - 0.5f}});
+        expect(refusal.empty()) << refusal;
+        std::ignore = block.settings().activateContext();
+        std::ignore = block.settings().applyStagedParameters();
+        expect(eq(block.rate.value, upper - 0.5f)) << "an accepted value keeps its fraction";
+
+        Annotated<float, "wide", Limits<std::int64_t{0}, std::numeric_limits<std::int64_t>::max()>> wide = 1.f;
+        expect(!wide.validate_and_set(-0.5f)) << "below a lower limit of 0";
+        expect(!wide.validate_and_set(0x1p64f)) << "beyond the int64_t range";
+        expect(wide.validate_and_set(0.5f));
+        expect(eq(wide.value, 0.5f)) << "an accepted value keeps its fraction";
+    };
+
+    "a floating value compares exactly with an integral limit the floating type rounds"_test = [] {
+        constexpr std::int64_t                                         signedUpper = std::numeric_limits<std::int64_t>::max();
+        const float                                                    floatUpper  = static_cast<float>(signedUpper);
+        Annotated<float, "wide", Limits<std::int64_t{0}, signedUpper>> wide        = 1.f;
+        expect(!wide.validate_and_set(floatUpper)) << "the rounded limit lies above the limit";
+        expect(wide.validate_and_set(std::nextafter(floatUpper, 0.f))) << "the float below it lies inside";
+
+        constexpr std::uint64_t                                                    unsignedUpper = std::numeric_limits<std::uint64_t>::max();
+        const double                                                               doubleUpper   = static_cast<double>(unsignedUpper);
+        Annotated<double, "unsignedWide", Limits<std::uint64_t{0}, unsignedUpper>> unsignedWide  = 1.0;
+        expect(!unsignedWide.validate_and_set(doubleUpper)) << "the rounded limit lies above the limit";
+        expect(unsignedWide.validate_and_set(std::nextafter(doubleUpper, 0.0))) << "the double below it lies inside";
+
+        constexpr std::int32_t                                            narrowUpper = std::numeric_limits<std::int32_t>::max();
+        Annotated<double, "narrow", Limits<std::int32_t{0}, narrowUpper>> narrow      = 1.0;
+        expect(narrow.validate_and_set(static_cast<double>(narrowUpper))) << "a limit the double holds exactly is inside";
+        expect(!narrow.validate_and_set(static_cast<double>(narrowUpper) + 0.5)) << "and a fraction above it is outside";
+
+        constexpr std::int32_t twoToFloatDigits = std::int32_t{1} << std::numeric_limits<float>::digits;
+
+        constexpr std::int32_t                                          oddUpper     = twoToFloatDigits + 3;
+        const float                                                     roundedUpper = static_cast<float>(oddUpper);
+        Annotated<float, "belowOdd", Limits<std::int32_t{0}, oddUpper>> belowOdd     = 1.f;
+        expect(static_cast<double>(roundedUpper) > static_cast<double>(oddUpper)) << "float rounds the upper limit up";
+        expect(!belowOdd.validate_and_set(roundedUpper)) << "the rounded upper limit lies above the limit";
+        expect(belowOdd.validate_and_set(std::nextafter(roundedUpper, 0.f))) << "the float below it lies inside";
+
+        constexpr std::int32_t                                                                   oddLower     = twoToFloatDigits + 1;
+        const float                                                                              roundedLower = static_cast<float>(oddLower);
+        Annotated<float, "aboveOdd", Limits<oddLower, std::numeric_limits<std::int32_t>::max()>> aboveOdd     = static_cast<float>(twoToFloatDigits) * 2.f;
+        expect(static_cast<double>(roundedLower) < static_cast<double>(oddLower)) << "float rounds the lower limit down";
+        expect(!aboveOdd.validate_and_set(roundedLower)) << "the rounded lower limit lies below the limit";
+        expect(aboveOdd.validate_and_set(std::nextafter(roundedLower, std::numeric_limits<float>::max()))) << "the float above it lies inside";
+    };
+
+    "a character or bool value compares with integral limits by its integer value"_test = [] {
+        using Percent = Limits<0, 100>;
+        static_assert(Percent::validate(char{5}));
+        static_assert(limitsTakeCharacterByValue<Percent, char>());
+        static_assert(limitsTakeCharacterByValue<Percent, signed char>());
+        static_assert(limitsTakeCharacterByValue<Percent, unsigned char>());
+        static_assert(limitsTakeCharacterByValue<Percent, wchar_t>());
+        static_assert(limitsTakeCharacterByValue<Percent, char8_t>());
+        static_assert(limitsTakeCharacterByValue<Percent, char16_t>());
+        static_assert(limitsTakeCharacterByValue<Percent, char32_t>());
+        static_assert(Percent::validate(false) && Percent::validate(true));
+        static_assert(!Limits<2, 100>::validate(true));
+
+        using Digit = Limits<'0', '9'>;
+        static_assert(Digit::validate(int{'5'}));
+        static_assert(!Digit::validate(int{'0'} - 1) && !Digit::validate(int{'9'} + 1));
+
+        using EvenPercent = Limits<0, 100, isEven>;
+        static_assert(EvenPercent::validate(char{4}) && !EvenPercent::validate(char{5}));
+
+        using AnyCharacter = Limits<char{0}, char{0}, anyCharacter>;
+        static_assert(AnyCharacter::validate(int{'a'}));
+        static_assert(!AnyCharacter::validate(int{std::numeric_limits<char>::max()} + 1));
+
+        Annotated<char, "letter", Percent> letter = char{5};
+        expect(letter.validate_and_set(static_cast<char>(Percent::MaxRange)));
+        expect(!letter.validate_and_set(static_cast<char>(Percent::MaxRange + 1)));
+        expect(eq(letter.value, static_cast<char>(Percent::MaxRange))) << "the refused value does not reach the member";
     };
 
     "a refused set() leaves the keys that follow tags as they were"_test = [] {

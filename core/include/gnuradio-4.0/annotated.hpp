@@ -2,7 +2,10 @@
 #define GNURADIO_ANNOTATED_HPP
 
 #include <array>
+#include <cmath>
+#include <concepts>
 #include <format>
+#include <limits>
 #include <memory_resource>
 #include <sstream>
 #include <string_view>
@@ -339,6 +342,82 @@ using DefaultSupportedTypes = SupportedTypes<>;
 static_assert(gr::meta::is_instantiation_of<DefaultSupportedTypes, SupportedTypes>);
 static_assert(gr::meta::is_instantiation_of<SupportedTypes<float, double>, SupportedTypes>);
 
+namespace detail {
+template<typename T>
+concept LimitNumber = std::is_arithmetic_v<T> && !std::same_as<T, bool>;
+
+// the character types, which std::cmp_less and the other std::cmp_* functions refuse
+template<typename T>
+concept CharacterType = std::same_as<T, char> || std::same_as<T, wchar_t> || std::same_as<T, char8_t> || std::same_as<T, char16_t> || std::same_as<T, char32_t>;
+
+// a character as its promoted integer type, which the std::cmp_* functions take; any other integer unchanged
+template<std::integral T>
+[[nodiscard]] constexpr auto comparableInteger(T value) noexcept {
+    if constexpr (CharacterType<T>) {
+        return +value;
+    } else {
+        return value;
+    }
+}
+
+template<typename To, typename From>
+[[nodiscard]] constexpr To castUnlessSame(From value) noexcept {
+    if constexpr (std::same_as<To, From>) {
+        return value;
+    } else {
+        return static_cast<To>(value);
+    }
+}
+
+// 2^digits of Integer, one above its maximum: a power of two that Floating holds exactly
+template<std::floating_point Floating, std::integral Integer>
+inline constexpr Floating kTwoToDigits = castUnlessSame<Floating>(std::numeric_limits<Integer>::max() / 2 + 1) * Floating{2};
+
+// true when value lies in [lower, upper]; a pair with integral bounds compares exactly, any other pair in the common type
+template<LimitNumber Source, LimitNumber Bound>
+[[nodiscard]] constexpr bool withinBounds(Source value, Bound lower, Bound upper) noexcept {
+    if constexpr (std::is_integral_v<Source> && std::is_integral_v<Bound>) {
+        return std::cmp_greater_equal(comparableInteger(value), comparableInteger(lower)) && std::cmp_less_equal(comparableInteger(value), comparableInteger(upper));
+    } else if constexpr (std::is_floating_point_v<Source> && std::is_integral_v<Bound>) {
+        // NaN and a value outside [-2^digits, 2^digits) of Bound lie outside any bound of that type
+        // for an unsigned Bound, a negative value lies below any lower bound
+        constexpr Source twoToDigits = kTwoToDigits<Source, Bound>;
+        constexpr Source lowest      = std::is_signed_v<Bound> ? -twoToDigits : Source{0};
+        if (!(value >= lowest && value < twoToDigits)) {
+            return false;
+        }
+        // value >= lower exactly when floor(value) >= lower, and value <= upper exactly when ceil(value) <= upper
+        // a ceiling of 2^digits lies above any upper bound
+        const Source ceiling = std::ceil(value);
+        return static_cast<Bound>(std::floor(value)) >= lower && ceiling < twoToDigits && static_cast<Bound>(ceiling) <= upper;
+    } else {
+        using Common        = std::common_type_t<Source, Bound>;
+        const Common common = castUnlessSame<Common>(value);
+        return common >= castUnlessSame<Common>(lower) && common <= castUnlessSame<Common>(upper);
+    }
+}
+
+// true when static_cast<Target>(value) has defined behavior
+template<LimitNumber Target, LimitNumber Source>
+[[nodiscard]] constexpr bool castKeepsValue(Source value) noexcept {
+    if constexpr (std::is_integral_v<Source> && std::is_integral_v<Target>) {
+        return withinBounds(value, std::numeric_limits<Target>::lowest(), std::numeric_limits<Target>::max());
+    } else if constexpr (std::is_integral_v<Source>) {
+        return true;
+    } else if constexpr (std::is_integral_v<Target>) {
+        constexpr Source upper = kTwoToDigits<Source, Target>;
+        if constexpr (std::is_signed_v<Target>) {
+            return value >= -upper && value < upper;
+        } else {
+            return value > Source{-1} && value < upper;
+        }
+    } else {
+        constexpr Source infinity = std::numeric_limits<Source>::infinity();
+        return value == infinity || value == -infinity || !(value < castUnlessSame<Source>(std::numeric_limits<Target>::lowest()) || value > castUnlessSame<Source>(std::numeric_limits<Target>::max()));
+    }
+}
+} // namespace detail
+
 /**
  * @brief Represents limits and optional validation for an Annotated<..> type.
  *
@@ -389,6 +468,27 @@ struct Limits {
             return value >= LowerLimit && value <= UpperLimit;
         }
         return true;
+    }
+
+    // compares a number of another type with the limits before converting it to ValueType: -0.5 lies below a limit of 0
+    // the validator receives the number converted to ValueType; a number outside ValueType's range is refused first
+    template<typename U>
+    requires(!std::same_as<U, ValueType>)
+    static constexpr bool validate(const U& value) noexcept {
+        if constexpr (detail::LimitNumber<U> && detail::LimitNumber<ValueType>) {
+            if constexpr (LowerLimit != UpperLimit) {
+                if (!detail::withinBounds(value, LowerLimit, UpperLimit)) {
+                    return false;
+                }
+            }
+            if constexpr (Validator == nullptr) {
+                return true;
+            } else {
+                return detail::castKeepsValue<ValueType>(value) && validate(static_cast<ValueType>(value));
+            }
+        } else {
+            return validate(static_cast<ValueType>(value));
+        }
     }
 };
 
@@ -453,7 +553,7 @@ struct Annotated {
             value = std::forward<U>(value_);
             return true;
         } else {
-            if (LimitType::validate(static_cast<typename LimitType::ValueType>(value_))) { // N.B. implicit casting needed until clang supports floats as NTTPs
+            if (LimitType::validate(value_)) {
                 value = std::forward<U>(value_);
                 return true;
             } else {
