@@ -1,10 +1,14 @@
 #ifndef GNURADIO_BLOCKINGSYNC_HPP
 #define GNURADIO_BLOCKINGSYNC_HPP
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <concepts>
+#include <condition_variable>
 #include <format>
+#include <limits>
+#include <mutex>
 #include <type_traits>
 
 #include <gnuradio-4.0/Block.hpp>
@@ -118,12 +122,19 @@ struct BlockingSync {
     using TimePoint = std::chrono::time_point<ClockSourceType>;
 
 private:
+    using ClockRep = typename ClockSourceType::duration::rep;
+
+    static constexpr ClockRep kNotPaused = std::numeric_limits<ClockRep>::min();
+
     // owned jointly with the timer task, so the task can publish its exit and notify without touching
     // storage that the block's destructor may already have released
     struct TimerState {
-        std::atomic<bool> running{false};
-        std::atomic<bool> done{true};
-        std::atomic<bool> blockAlive{true};
+        std::atomic<bool>       running{false};
+        std::atomic<bool>       done{true};
+        std::atomic<bool>       blockAlive{true};
+        std::mutex              mutex;                // held to clear `running` and to wait for the next tick
+        std::condition_variable stopped;              // notified when `running` is cleared
+        std::atomic<ClockRep>   pausedAt{kNotPaused}; // the timer's latest tick while the block was paused
     };
 
     TimePoint                   _blockingSync_startTime{};
@@ -167,6 +178,11 @@ private:
     }
 
     [[nodiscard]] std::size_t computeWallClockSamples(std::size_t maxSamples, bool dropIfBehind) {
+        // the first call after a pause counts the time from the timer's latest tick in the pause, when that tick is later
+        // than the time counted so far
+        if (const ClockRep pausedAt = _blockingSync_timer->pausedAt.exchange(kNotPaused, std::memory_order_acquire); pausedAt != kNotPaused) {
+            _blockingSync_lastUpdateTime = std::max(_blockingSync_lastUpdateTime, TimePoint(typename ClockSourceType::duration(pausedAt)));
+        }
         const TimePoint now            = ClockSourceType::now();
         const double    elapsedSeconds = std::chrono::duration<double>(now - _blockingSync_lastUpdateTime).count();
         const auto      sampleRate     = static_cast<double>(getSampleRate());
@@ -248,7 +264,10 @@ public:
      *
      * Useful when using external timing (use_internal_thread = false) after receiving HW data.
      */
-    void blockingSyncResetTiming() { _blockingSync_lastUpdateTime = ClockSourceType::now(); }
+    void blockingSyncResetTiming() {
+        _blockingSync_timer->pausedAt.store(kNotPaused, std::memory_order_relaxed);
+        _blockingSync_lastUpdateTime = ClockSourceType::now();
+    }
 
     /**
      * @brief Start the timing system. Call from block's start() method.
@@ -256,6 +275,7 @@ public:
     void blockingSyncStart() {
         _blockingSync_startTime      = ClockSourceType::now();
         _blockingSync_lastUpdateTime = _blockingSync_startTime;
+        _blockingSync_timer->pausedAt.store(kNotPaused, std::memory_order_relaxed);
 
         if (isFreeRunning() && useInternalThread()) {
             startTimer();
@@ -281,8 +301,7 @@ public:
     void stopTimerAndJoin() {
         const std::shared_ptr<TimerState> timer = _blockingSync_timer; // outlives this object
         timer->blockAlive.store(false, std::memory_order_release);
-        timer->running.store(false, std::memory_order_release);
-        timer->done.wait(false);
+        stopTimer();
     }
 
     ~BlockingSync() { stopTimerAndJoin(); }
@@ -308,14 +327,15 @@ private:
             while (timer->running.load(std::memory_order_acquire) && getSampleRate() > 0.f && lifecycle::isActive(self().state())) {
                 const auto period = getChunkPeriod();
                 nextWakeUp += period;
-                std::this_thread::sleep_until(nextWakeUp);
-
-                if (!timer->running.load(std::memory_order_acquire)) {
-                    break; // stop requested — exit without touching self()
+                {
+                    std::unique_lock lock(timer->mutex);
+                    if (timer->stopped.wait_until(lock, nextWakeUp, [&timer] { return !timer->running.load(std::memory_order_acquire); })) {
+                        break; // stop requested — exit without touching self()
+                    }
                 }
 
                 if (self().state() == lifecycle::State::PAUSED) {
-                    _blockingSync_lastUpdateTime = ClockSourceType::now();
+                    timer->pausedAt.store(ClockSourceType::now().time_since_epoch().count(), std::memory_order_release);
                     continue;
                 }
 
@@ -336,9 +356,14 @@ private:
         }
     }
 
+    // ends the timer's wait for its next tick and returns once the timer task has finished
     void stopTimer() {
         const std::shared_ptr<TimerState> timer = _blockingSync_timer;
-        timer->running.store(false, std::memory_order_release);
+        {
+            std::lock_guard lock(timer->mutex);
+            timer->running.store(false, std::memory_order_release);
+        }
+        timer->stopped.notify_all();
         timer->done.wait(false);
     }
 };

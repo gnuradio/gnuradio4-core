@@ -108,6 +108,24 @@ const boost::ut::suite<"destruction safety"> destructionSafetyTests = [] {
         }
         expect(true) << "construct/start/destroy cycles completed";
     };
+
+    // the timer waits one chunk period between ticks. A stop that waits for the next tick takes up to that period
+    "a BlockingSync block stops its timer without waiting for the next tick"_test = [] {
+        gr::Graph  flow;
+        auto&      block  = flow.emplaceBlock<qa_destroy::TimedSource>({{"sample_rate", 16.0f}, {"chunk_size", 16U}});
+        const auto period = std::chrono::duration<double>(static_cast<double>(block.chunk_size.value) / static_cast<double>(block.sample_rate.value));
+        expect(fatal(ge(period, std::chrono::duration<double>(0.5)))) << "the settings must give a chunk period that a stop can be timed against";
+
+        const std::size_t progressBefore = block.progress->value();
+        expect(block.changeStateTo(RUNNING).has_value());
+        const auto tickDeadline = std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(10 * period);
+        expect(fatal(block.progress->waitUntil(progressBefore, tickDeadline))) << "the timer never ticked";
+
+        const auto stopBegin = std::chrono::steady_clock::now();
+        expect(block.changeStateTo(REQUESTED_STOP).has_value());
+        const std::chrono::duration<double> stopDuration = std::chrono::steady_clock::now() - stopBegin;
+        expect(lt(stopDuration.count(), 0.5 * period.count())) << "the stop waited for the timer's next tick";
+    };
 };
 
 int main() { /* tests are statically registered */ }
