@@ -1112,7 +1112,7 @@ struct CountingReset : Block<CountingReset> {
     [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
 };
 
-/// a gain whose default lies inside its limits, with a reset() that counts its calls
+/// a gain whose default lies inside its limits, with a reset() and a settingsChanged() that count their calls
 struct CountingResetWithinLimits : Block<CountingResetWithinLimits> {
     PortIn<float>  in{};
     PortOut<float> out{};
@@ -1121,25 +1121,38 @@ struct CountingResetWithinLimits : Block<CountingResetWithinLimits> {
 
     GR_MAKE_REFLECTABLE(CountingResetWithinLimits, in, out, gain);
 
-    std::size_t resets = 0;
+    std::size_t resets  = 0;
+    std::size_t changes = 0;
 
     void reset() { ++resets; }
 
     [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
+
+    void settingsChanged(const property_map& /*oldSettings*/, const property_map& /*newSettings*/) { ++changes; }
 };
 
-/// settings that put the reset key into the staged batch
-template<typename TBlock>
-struct ResetStagingSettings : CtxSettings<TBlock> {
-    using CtxSettings<TBlock>::CtxSettings;
-    using CtxSettings<TBlock>::_stagedParameters;
-    using CtxSettings<TBlock>::setChanged;
+/// a gain beside a setting named like the reset key, with a reset() and a settingsChanged() that count their calls
+struct ResetNamedSetting : Block<ResetNamedSetting> {
+    PortIn<float>  in{};
+    PortOut<float> out{};
 
-    void stageResetDefaults() {
-        _stagedParameters.insert_or_assign(static_cast<std::pmr::string>(gr::tag::RESET_DEFAULTS), true);
-        setChanged(true);
-    }
+    Annotated<float, "gain">                              gain          = 1.f;
+    Annotated<bool, "a setting named like the reset key"> reset_default = false;
+
+    GR_MAKE_REFLECTABLE(ResetNamedSetting, in, out, gain, reset_default);
+
+    std::size_t resets  = 0;
+    std::size_t changes = 0;
+
+    void reset() { ++resets; }
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
+
+    void settingsChanged(const property_map& /*oldSettings*/, const property_map& /*newSettings*/) { ++changes; }
 };
+
+/// a tag that carries only `key`, set to true
+[[nodiscard]] Tag flagTag(std::string_view key) { return Tag{0UZ, property_map{{std::pmr::string(key), true}}}; }
 
 [[nodiscard]] std::string setRefusal(SettingsBase& settings, const property_map& parameters, SettingsCtx ctx = {}) {
     try {
@@ -1593,29 +1606,55 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
         expect(refusal.contains("SignedGain: block 'm' refuses gain = ")) << "the second block's refusal is missing: " << refusal;
     };
 
-    "a staged reset calls the block's reset() once"_test = [] {
-        CountingResetWithinLimits                       block{property_map{{"name", std::string("gain_stage")}}};
-        ResetStagingSettings<CountingResetWithinLimits> settings{block};
-        settings.init();
-        std::ignore = settings.set({{"gain", 0.25f}});
-        expect(settings.activateContext().has_value());
-        std::ignore = settings.applyStagedParameters();
-        expect(eq(block.gain.value, 0.25f)) << "the value to reset does not reach the member";
+    "a reset_default tag in either key form restores the default and calls the block's reset() once"_test = [] {
+        for (const std::string_view key : {std::string_view(gr::tag::RESET_DEFAULTS.shortKey()), std::string_view(gr::tag::RESET_DEFAULTS.key())}) {
+            CountingResetWithinLimits              block{property_map{{"name", std::string("gain_stage")}}};
+            CtxSettings<CountingResetWithinLimits> settings{block};
+            settings.init();
+            const float defaultGain = block.gain.value;
+            std::ignore             = settings.set({{"gain", defaultGain / 2.f}});
+            expect(settings.activateContext().has_value());
+            std::ignore = settings.applyStagedParameters();
+            expect(eq(block.gain.value, defaultGain / 2.f)) << "the value to reset does not reach the member";
 
-        const std::size_t resetsBefore = block.resets;
-        settings.stageResetDefaults();
-        const ApplyStagedParametersResult result = settings.applyStagedParameters();
-        expect(result.refusal.empty()) << result.refusal;
-        expect(eq(block.gain.value, 0.5f)) << "the reset leaves the member off its default";
-        expect(eq(block.resets, resetsBefore + 1UZ)) << "the staged reset calls reset() a number of times other than once";
+            const std::size_t resetsBefore = block.resets;
+            settings.autoUpdate(flagTag(key));
+            expect(settings.changed()) << key << " leaves the settings unchanged";
+            const ApplyStagedParametersResult result = settings.applyStagedParameters();
+            expect(result.refusal.empty()) << result.refusal;
+            expect(eq(block.gain.value, defaultGain)) << key << " leaves the member off its default";
+            expect(eq(block.resets, resetsBefore + 1UZ)) << key << " calls reset() a number of times other than once";
 
-        settings.resetDefaults();
-        expect(eq(block.resets, resetsBefore + 2UZ)) << "resetDefaults() calls reset() a number of times other than once";
+            settings.resetDefaults();
+            expect(eq(block.resets, resetsBefore + 2UZ)) << "resetDefaults() calls reset() a number of times other than once";
+        }
     };
 
-    "a staged reset the limits refuse leaves the block's reset() uncalled"_test = [] {
-        CountingReset                       block{property_map{{"name", std::string("gain_stage")}}};
-        ResetStagingSettings<CountingReset> settings{block};
+    "a reset_default tag still staged when resetDefaults() runs is served by that reset"_test = [] {
+        CountingResetWithinLimits              block{property_map{{"name", std::string("gain_stage")}}};
+        CtxSettings<CountingResetWithinLimits> settings{block};
+        settings.init();
+        const float defaultGain = block.gain.value;
+        std::ignore             = settings.set({{"gain", defaultGain / 2.f}});
+        expect(settings.activateContext().has_value());
+        std::ignore = settings.applyStagedParameters();
+        expect(eq(block.gain.value, defaultGain / 2.f)) << "the value to reset does not reach the member";
+
+        const std::size_t resetsBefore  = block.resets;
+        const std::size_t changesBefore = block.changes;
+        settings.autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.shortKey()));
+        settings.resetDefaults();
+        expect(eq(block.gain.value, defaultGain)) << "the reset leaves the member off its default";
+        expect(eq(block.resets, resetsBefore + 1UZ)) << "the staged reset and the call run reset() a number of times other than once";
+        expect(eq(block.changes, changesBefore + 1UZ)) << "the staged reset and the call are reported as a number of changes other than one";
+
+        std::ignore = settings.applyStagedParameters();
+        expect(eq(block.resets, resetsBefore + 1UZ)) << "the staged reset runs again at the next apply";
+    };
+
+    "a reset_default tag the limits refuse leaves the block's reset() uncalled"_test = [] {
+        CountingReset              block{property_map{{"name", std::string("gain_stage")}}};
+        CtxSettings<CountingReset> settings{block};
         settings.init();
         std::ignore = settings.set({{"gain", 0.5f}});
         expect(settings.activateContext().has_value());
@@ -1623,11 +1662,111 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
         expect(eq(block.gain.value, 0.5f)) << "the value to reset does not reach the member";
 
         const std::size_t resetsBefore = block.resets;
-        settings.stageResetDefaults();
+        settings.autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.shortKey()));
         const ApplyStagedParametersResult result = settings.applyStagedParameters();
         expect(result.refusal.contains("refuses gain = 2")) << result.refusal;
         expect(eq(block.resets, resetsBefore)) << "the refused reset calls reset()";
         expect(eq(block.gain.value, 0.5f)) << "the refused default reaches the member";
+    };
+
+    "a store_default tag in either key form makes the current values the ones a reset restores"_test = [] {
+        for (const std::string_view key : {std::string_view(gr::tag::STORE_DEFAULTS.shortKey()), std::string_view(gr::tag::STORE_DEFAULTS.key())}) {
+            CountingResetWithinLimits              block{property_map{{"name", std::string("gain_stage")}}};
+            CtxSettings<CountingResetWithinLimits> settings{block};
+            settings.init();
+            const float storedGain = block.gain.value / 2.f;
+            std::ignore            = settings.set({{"gain", storedGain}});
+            expect(settings.activateContext().has_value());
+            std::ignore = settings.applyStagedParameters();
+
+            settings.autoUpdate(flagTag(key));
+            expect(settings.changed()) << key << " leaves the settings unchanged";
+            std::ignore = settings.applyStagedParameters();
+
+            std::ignore = settings.set({{"gain", storedGain / 2.f}});
+            expect(settings.activateContext().has_value());
+            std::ignore = settings.applyStagedParameters();
+            expect(eq(block.gain.value, storedGain / 2.f)) << "the value set after the store does not reach the member";
+
+            settings.autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.shortKey()));
+            std::ignore = settings.applyStagedParameters();
+            expect(eq(block.gain.value, storedGain)) << "a reset after " << key << " restores a value other than the stored one";
+        }
+    };
+
+    "a store_default tag stores the values the same tag carries"_test = [] {
+        CountingResetWithinLimits              block{property_map{{"name", std::string("gain_stage")}}};
+        CtxSettings<CountingResetWithinLimits> settings{block};
+        settings.init();
+        const float taggedGain = block.gain.value / 2.f;
+        settings.autoUpdate(Tag{0UZ, property_map{{"gain", taggedGain}, {std::pmr::string(gr::tag::STORE_DEFAULTS.shortKey()), true}}});
+        std::ignore = settings.applyStagedParameters();
+        expect(eq(block.gain.value, taggedGain)) << "the tagged value does not reach the member";
+
+        std::ignore = settings.set({{"gain", taggedGain / 2.f}});
+        expect(settings.activateContext().has_value());
+        std::ignore = settings.applyStagedParameters();
+
+        settings.autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.shortKey()));
+        std::ignore = settings.applyStagedParameters();
+        expect(eq(block.gain.value, taggedGain)) << "the store does not hold the value its own tag carries";
+    };
+
+    "a value staged with a reset_default tag at the value it held before is reported as no change"_test = [] {
+        qa_settings::ChangeRecordingBlock block;
+        block.init(std::make_shared<gr::Sequence>());
+        const gr::Size_t setSize = 2U * block.fft_size.value;
+        qa_settings::applySettings(block, {{"fft_size", setSize}});
+        expect(eq(block.fft_size.value, setSize)) << "the value to reset does not reach the member";
+        block.oldSeen.clear();
+        block.newSeen.clear();
+
+        std::ignore = block.settings().setStaged({{"fft_size", setSize}});
+        block.settings().autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.shortKey()));
+        std::ignore = block.settings().applyStagedParameters();
+        expect(eq(block.fft_size.value, setSize)) << "the value staged with the reset does not reach the member";
+        for (const property_map& reported : block.newSeen) {
+            expect(!qa_settings::sizeOf(reported, "fft_size").has_value()) << "a change names fft_size, which ends at the value it began with";
+        }
+    };
+
+    "a batch with a reset_default tag and a value of its own is reported as one change"_test = [] {
+        qa_settings::ChangeRecordingBlock block;
+        block.init(std::make_shared<gr::Sequence>());
+        const gr::Size_t defaultSize     = block.fft_size.value;
+        const gr::Size_t defaultAverages = block.n_averages.value;
+        qa_settings::applySettings(block, {{"fft_size", 2U * defaultSize}, {"n_averages", 2U * defaultAverages}});
+        expect(eq(block.fft_size.value, 2U * defaultSize) && eq(block.n_averages.value, 2U * defaultAverages)) << "the values to reset do not reach the members";
+        block.oldSeen.clear();
+        block.newSeen.clear();
+
+        std::ignore = block.settings().setStaged({{"n_averages", 4U * defaultAverages}});
+        block.settings().autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.shortKey()));
+        std::ignore = block.settings().applyStagedParameters();
+        expect(eq(block.fft_size.value, defaultSize)) << "the reset leaves fft_size off its default";
+        expect(eq(block.n_averages.value, 4U * defaultAverages)) << "the value staged with the reset does not reach the member";
+        expect(fatal(eq(block.newSeen.size(), 1UZ))) << "the batch is reported as a number of changes other than one";
+        expect(eq(qa_settings::sizeOf(block.newSeen.front(), "fft_size").value_or(0U), defaultSize)) << "the change names a restored value other than the default";
+        expect(eq(qa_settings::sizeOf(block.newSeen.front(), "n_averages").value_or(0U), 4U * defaultAverages)) << "the change names a value other than the staged one";
+        expect(eq(qa_settings::sizeOf(block.oldSeen.front(), "fft_size").value_or(0U), 2U * defaultSize)) << "the change is not against the values before the batch";
+        expect(eq(qa_settings::sizeOf(block.oldSeen.front(), "n_averages").value_or(0U), 2U * defaultAverages)) << "the change is not against the values before the batch";
+    };
+
+    "a setting named reset_default is an ordinary setting"_test = [] {
+        ResetNamedSetting block;
+        block.init(std::make_shared<gr::Sequence>());
+        const std::size_t changesBefore = block.changes;
+        const std::size_t resetsBefore  = block.resets;
+        const bool        setValue      = !block.reset_default.value;
+
+        expect(block.settings().setStaged({{gr::tag::RESET_DEFAULTS.shortKey(), setValue}}).empty()) << "the setting is not admitted";
+        std::ignore = block.settings().applyStagedParameters();
+        expect(eq(block.reset_default.value, setValue)) << "the value does not reach the member";
+        expect(eq(block.changes, changesBefore + 1UZ)) << "settingsChanged() runs a number of times other than once";
+        expect(eq(block.resets, resetsBefore)) << "the setting resets the block";
+
+        const property_map notSet = block.settings().setStaged({{gr::tag::RESET_DEFAULTS.key(), true}});
+        expect(notSet.contains(gr::tag::RESET_DEFAULTS.key())) << "setStaged() admits the gr: form of the reset key";
     };
 
     "a reset to a default the limits refuse throws and leaves every setting as it was"_test = [] {

@@ -656,7 +656,19 @@ void CtxSettingsBase::resetDefaults() {
 }
 
 CtxSettingsBase::ResetDefaultsResult CtxSettingsBase::resetDefaultsImpl() {
-    // add default parameters to stored and apply the parameters
+    if (property_map refused = stageDefaultsImpl(); !refused.empty()) {
+        return {.failedParameters = std::move(refused), .refused = true};
+    }
+    // a reset_default tag staged since the last apply is served by this reset
+    _stagedParameters.erase(std::pmr::string(gr::tag::RESET_DEFAULTS.key()));
+    ApplyStagedParametersResult defaults = applyStagedParametersImpl();
+
+    removeExpiredStoredParameters();
+    return {.failedParameters = std::move(defaults.failedParameters), .refused = false};
+}
+
+property_map CtxSettingsBase::stageDefaultsImpl() {
+    // add default parameters to stored and stage them
     auto ctx = SettingsCtx{settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), std::string()};
 #ifdef __EMSCRIPTEN__
     resolveDuplicateTimestamp(ctx);
@@ -676,15 +688,12 @@ CtxSettingsBase::ResetDefaultsResult CtxSettingsBase::resetDefaultsImpl() {
         }
     }
     if (!refused.empty()) {
-        return {.failedParameters = std::move(refused), .refused = true};
+        return refused;
     }
 
     addStoredParameters(_defaultParameters, ctx);
-    std::ignore                          = activateContextImpl({});
-    ApplyStagedParametersResult defaults = applyStagedParametersImpl();
-
-    removeExpiredStoredParameters();
-    return {.failedParameters = std::move(defaults.failedParameters), .refused = false};
+    std::ignore = activateContextImpl({});
+    return {};
 }
 
 void CtxSettingsBase::autoUpdate(const Tag& tag) {
@@ -718,6 +727,13 @@ void CtxSettingsBase::autoUpdate(const Tag& tag) {
     const auto& parameters = tag.map;
     bool        wasChanged = false;
     for (const auto& [key, value] : parameters) {
+        // either form of the two keys is staged under its gr: form, which names no member
+        const bool resetKey = key == gr::tag::RESET_DEFAULTS;
+        if (resetKey || key == gr::tag::STORE_DEFAULTS) {
+            _stagedParameters.insert_or_assign(std::pmr::string(resetKey ? gr::tag::RESET_DEFAULTS.key() : gr::tag::STORE_DEFAULTS.key()), value);
+            wasChanged = true;
+            continue;
+        }
         auto it = _descriptor->writableByName.find(key);
         if (it != _descriptor->writableByName.end() && (activeCtxChanged || !isActiveValueImpl(key, value))) {
             if (it->second->autoUpdate(key, value, autoUpdateParams, _stagedParameters)) {
@@ -743,7 +759,7 @@ ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::uniq
     const settings::BlockHooks& hooks = _descriptor->hooks;
 
     // one apply consumes one activation, so an event is reported once and does not reach a later batch
-    const bool contextActivated = std::exchange(_contextActivated, false);
+    bool contextActivated = std::exchange(_contextActivated, false);
 
     ApplyStagedParametersResult result;
     if (hooks.reflectable) {
@@ -761,24 +777,33 @@ ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::uniq
         const property_map                       batch      = std::exchange(_stagedParameters, {});
         const std::set<std::string, std::less<>> taggedKeys = std::exchange(_taggedKeys, {});
 
-        // check if reset of settings should be performed
-        const bool resetRequested = batch.contains(static_cast<std::pmr::string>(gr::tag::RESET_DEFAULTS));
-        bool       resetRefused   = false;
+        // a reset stages the defaults it restores, and the batch's own values apply over them as one change
+        const bool   resetRequested = batch.contains(gr::tag::RESET_DEFAULTS.key());
+        bool         resetRefused   = false;
+        property_map restored;
         if (resetRequested) {
-            ResetDefaultsResult reset = resetDefaultsImpl();
-            result.failedParameters   = std::move(reset.failedParameters);
-            resetRefused              = reset.refused;
+            result.failedParameters = stageDefaultsImpl();
+            resetRefused            = !result.failedParameters.empty();
+            if (!resetRefused) {
+                restored = std::exchange(_stagedParameters, {});
+                for (const auto& [key, value] : batch) {
+                    restored.insert_or_assign(key, value);
+                }
+                contextActivated = std::exchange(_contextActivated, false) || contextActivated;
+                removeExpiredStoredParameters();
+            }
         }
+        const property_map& toApply = resetRequested && !resetRefused ? restored : batch;
 
         property_map staged;
-        for (const auto& [key, stagedValue] : batch) {
+        for (const auto& [key, stagedValue] : toApply) {
             auto it = _descriptor->writableByName.find(key);
             if (it != _descriptor->writableByName.end()) {
                 if (!it->second->applyStaged(it->second->address(_block), key, stagedValue, result.appliedParameters, staged, hasSettingsChangedCallback)) {
                     result.failedParameters.insert_or_assign(key, stagedValue); // rejected: must not reach downstream blocks
                     continue;
                 }
-                if (_autoForwardParameters.contains(std::string(key))) {
+                if (_autoForwardParameters.contains(std::string(key)) && batch.contains(key)) { // a restored default is not forwarded
                     result.forwardParameters.insert_or_assign(key, stagedValue);
                 }
             }
@@ -837,7 +862,7 @@ ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::uniq
             }
         }
 
-        if (batch.contains(static_cast<std::pmr::string>(gr::tag::STORE_DEFAULTS))) {
+        if (batch.contains(gr::tag::STORE_DEFAULTS.key())) {
             storeDefaults();
         }
 

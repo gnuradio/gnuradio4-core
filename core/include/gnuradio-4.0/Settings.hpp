@@ -970,6 +970,10 @@ protected:
     };
     // checks the defaults against their limits, then stores and applies them. The caller runs the block's reset() once, after its whole change is applied
     [[nodiscard]] ResetDefaultsResult resetDefaultsImpl();
+    // checks the defaults against their limits, then stores them and activates the default context, which stages
+    // the defaults a reset restores. It returns the defaults the limits refuse; with any refused, nothing is stored
+    // or staged.
+    [[nodiscard]] property_map stageDefaultsImpl();
     // reentrantLock is null when a caller already holds _mutex and cannot have it released underneath it
     [[nodiscard]] ApplyStagedParametersResult          applyStagedParametersImpl(std::unique_lock<std::mutex>* reentrantLock = nullptr);
     void                                               updateActiveParametersImpl() noexcept;
