@@ -950,8 +950,7 @@ public:
     /// copies the named members into the map that `get()` returns and returns the number of members copied.
     /// A block calls this on the thread that writes those members, for example from its work function. The other
     /// members keep the values the map last took for them. A key that names no readable member copies nothing.
-    /// The next applied change notifies the subscribers to the settings. A call from the block's `reset()`, or from
-    /// `settingsChanged()` during a reset to defaults, never returns, because the settings hold their lock there.
+    /// The next applied change notifies the subscribers to the settings.
     std::size_t updateActiveParameters(std::initializer_list<std::string_view> keys) noexcept;
 
     void loadParametersFromPropertyMap(const property_map& parameters, SettingsCtx ctx = {}) override;
@@ -969,13 +968,14 @@ protected:
         bool         refused = false;  // the limits refused a default, and nothing was stored or applied
     };
     // checks the defaults against their limits, then stores and applies them. The caller runs the block's reset() once, after its whole change is applied
-    [[nodiscard]] ResetDefaultsResult resetDefaultsImpl();
+    // reentrantLock is the caller's hold on _mutex, released around settingsChanged() as in applyStagedParametersImpl()
+    [[nodiscard]] ResetDefaultsResult resetDefaultsImpl(std::unique_lock<std::mutex>& reentrantLock);
     // checks the defaults against their limits, then stores them and activates the default context, which stages
     // the defaults a reset restores. It returns the defaults the limits refuse; with any refused, nothing is stored
     // or staged.
     [[nodiscard]] property_map stageDefaultsImpl();
-    // reentrantLock is null when a caller already holds _mutex and cannot have it released underneath it
-    [[nodiscard]] ApplyStagedParametersResult          applyStagedParametersImpl(std::unique_lock<std::mutex>* reentrantLock = nullptr);
+    // reentrantLock is the caller's hold on _mutex; the apply releases it around settingsChanged() and reset()
+    [[nodiscard]] ApplyStagedParametersResult          applyStagedParametersImpl(std::unique_lock<std::mutex>& reentrantLock);
     void                                               updateActiveParametersImpl() noexcept;
     void                                               storeCurrentParameters(property_map& parameters);
     [[nodiscard]] bool                                 isActiveValueImpl(const std::pmr::string& key, const pmt::Value& value) const;

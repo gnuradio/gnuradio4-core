@@ -1642,8 +1642,6 @@ public:
                 std::ignore = capturedForwardParams;
             }
 
-            settings().setChanged(false);
-
             auto& appliedParametersMap = applyResult.appliedParameters;
             if (!appliedParametersMap.empty()) {
                 notifyListeners(block::property::kStagedSetting, appliedParametersMap);

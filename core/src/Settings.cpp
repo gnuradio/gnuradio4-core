@@ -645,23 +645,25 @@ property_map CtxSettingsBase::setStagedImpl(const property_map& parameters) {
 void CtxSettingsBase::storeDefaults() { storeCurrentParameters(_defaultParameters); }
 
 void CtxSettingsBase::resetDefaults() {
-    std::lock_guard           lg(_mutex);
-    const ResetDefaultsResult reset = resetDefaultsImpl();
+    std::unique_lock          lock(_mutex);
+    const ResetDefaultsResult reset   = resetDefaultsImpl(lock);
+    const std::string         refusal = describeRefusals(reset.failedParameters);
+    lock.unlock(); // the block's reset() may read or write settings()
     if (_descriptor->hooks.reset != nullptr && !reset.refused) {
         _descriptor->hooks.reset(_block);
     }
     if (!reset.failedParameters.empty()) {
-        throw gr::exception(describeRefusals(reset.failedParameters));
+        throw gr::exception(refusal);
     }
 }
 
-CtxSettingsBase::ResetDefaultsResult CtxSettingsBase::resetDefaultsImpl() {
+CtxSettingsBase::ResetDefaultsResult CtxSettingsBase::resetDefaultsImpl(std::unique_lock<std::mutex>& reentrantLock) {
     if (property_map refused = stageDefaultsImpl(); !refused.empty()) {
         return {.failedParameters = std::move(refused), .refused = true};
     }
     // a reset_default tag staged since the last apply is served by this reset
     _stagedParameters.erase(std::pmr::string(gr::tag::RESET_DEFAULTS.key()));
-    ApplyStagedParametersResult defaults = applyStagedParametersImpl();
+    ApplyStagedParametersResult defaults = applyStagedParametersImpl(reentrantLock);
 
     removeExpiredStoredParameters();
     return {.failedParameters = std::move(defaults.failedParameters), .refused = false};
@@ -763,10 +765,10 @@ void CtxSettingsBase::autoUpdate(const Tag& tag) {
 
 ApplyStagedParametersResult CtxSettingsBase::applyStagedParameters() {
     std::unique_lock lock(_mutex);
-    return applyStagedParametersImpl(&lock);
+    return applyStagedParametersImpl(lock);
 }
 
-ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::unique_lock<std::mutex>* reentrantLock) {
+ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::unique_lock<std::mutex>& reentrantLock) {
     const settings::BlockHooks& hooks = _descriptor->hooks;
 
     // one apply consumes one activation, so an event is reported once and does not reach a later batch
@@ -838,13 +840,9 @@ ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::uniq
         // invoke user-callback function if staged is not empty; oldSettings, staged and result are local
         // copies, so the callback may read or write settings() without _mutex being held across it
         if (!staged.empty()) {
-            if (reentrantLock != nullptr) {
-                reentrantLock->unlock();
-            }
+            reentrantLock.unlock();
             hooks.settingsChanged(_block, oldSettings, staged, result.forwardParameters);
-            if (reentrantLock != nullptr) {
-                reentrantLock->lock();
-            }
+            reentrantLock.lock();
         }
 
         updateActiveParametersImpl();
@@ -877,9 +875,12 @@ ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::uniq
             storeDefaults();
         }
 
-        // a reset the limits refuse stores and applies no default and skips the block's reset()
+        // a reset the limits refuse stores and applies no default and skips the block's reset(). The batch is
+        // applied in full when reset() runs, and reset() may read or write settings() with _mutex released.
         if (hooks.reset != nullptr && resetRequested && !resetRefused) {
+            reentrantLock.unlock();
             hooks.reset(_block);
+            reentrantLock.lock();
         }
     } else {
         _stagedParameters.clear(); // a block with no reflectable members cannot apply these
