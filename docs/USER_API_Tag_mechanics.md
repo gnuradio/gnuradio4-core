@@ -746,6 +746,21 @@ short key in code (`"sample_rate"`). Keys are aligned with the
 | `store_default` | `bool` | store current settings as new defaults                       |
 | `end_of_stream` | `bool` | signals end of data — downstream blocks transition to `DONE` |
 
+A block acts on a `reset_default` or `store_default` tag as it acts on a `Set` to its `ResetDefaults` or
+`StoreDefaults` property. Either key form acts, with or without the `gr:` prefix, and the value is not read.
+
+While the default context is active, a reset, by tag or by message, restores the default of each setting that `set()`
+changed in that context. A setting that a settings message changed, or that no call has set, follows tags, and a reset
+leaves it at its present value. With a named context active, a reset returns the block to the default context and
+restores every default.
+
+A reset and the other keys of its tag apply as one change: the restored defaults, with the tag's own values over them.
+`settingsChanged()` hears of that change once. A `Set` to `ResetDefaults` that arrives while a reset tag waits to apply
+serves both, and the block's `reset()` runs once. A store runs after the other keys of its tag apply. The stored
+defaults then include the values the tag carries. The tag forwards downstream, and each block it reaches acts on it. A block that
+forwards only its auto-forward keys passes on the short key and drops the `gr:` key. A reset or store sent only in the
+`gr:` form reaches no block past it.
+
 ### Transmit bursts
 
 | Key       | Type       | Unit | Purpose                                                                  |
