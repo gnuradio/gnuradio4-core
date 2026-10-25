@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <expected>
 #include <format>
+#include <functional>
+#include <future>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -17,6 +19,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <gnuradio-4.0/Block.hpp>
@@ -1817,6 +1820,188 @@ const boost::ut::suite<"keys that follow tags"> autoUpdateKeyTests = [] {
         std::ignore = settings.applyStagedParameters();
         expect(eq(block.gain.value, setGain)) << "the tag overrides the key the context set explicitly";
         expect(eq(block.offset.value, taggedOffset)) << "the tag leaves a key that follows tags";
+    };
+};
+
+namespace qa_reset_callbacks {
+using namespace gr;
+
+/// a gain whose settingsChanged() and reset() read the block's own settings
+struct SettingsReadingReset : Block<SettingsReadingReset> {
+    PortIn<float>  in{};
+    PortOut<float> out{};
+
+    Annotated<float, "gain"> gain = 1.f;
+
+    GR_MAKE_REFLECTABLE(SettingsReadingReset, in, out, gain);
+
+    std::optional<float> gainReadByLastChange; // the gain that settings() held in the last settingsChanged()
+    std::optional<float> gainReadByLastReset;  // the gain that settings() held in the last reset()
+    std::size_t          resets = 0;
+
+    void reset() {
+        ++resets;
+        gainReadByLastReset = readGain();
+    }
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
+
+    void settingsChanged(const property_map& /*oldSettings*/, const property_map& /*newSettings*/) { gainReadByLastChange = readGain(); }
+
+    [[nodiscard]] std::optional<float> readGain() {
+        const std::optional<pmt::Value> value     = this->settings().get(std::string("gain"));
+        const float*                    gainValue = value.has_value() ? value->get_if<float>() : nullptr;
+        return gainValue != nullptr ? std::optional<float>(*gainValue) : std::nullopt;
+    }
+};
+
+/// the time a reset gets to return. A reset that returns takes microseconds.
+constexpr std::chrono::seconds kResetBound{5};
+
+/// runs `resetBlock` on its own thread and returns whether it returned within kResetBound. A reset that does not
+/// return keeps its thread and its block, and both are leaked.
+[[nodiscard]] bool resetReturns(std::unique_ptr<SettingsReadingReset>& block, std::function<void(SettingsReadingReset&)> resetBlock) {
+    std::packaged_task<void()> task([&target = *block, resetBlock = std::move(resetBlock)] { resetBlock(target); });
+    std::future<void>          done = task.get_future();
+    std::thread                runner(std::move(task));
+    if (done.wait_for(kResetBound) != std::future_status::ready) {
+        runner.detach();
+        std::ignore = block.release();
+        return false;
+    }
+    runner.join();
+    done.get();
+    return true;
+}
+
+} // namespace qa_reset_callbacks
+
+const boost::ut::suite<"a reset whose callbacks read the settings"> resetCallbackTests = [] {
+    using namespace boost::ut;
+    using namespace qa_reset_callbacks;
+
+    "a reset by tag or by message returns when settingsChanged() and reset() read the settings"_test = [] {
+        for (const bool byTag : {true, false}) {
+            const std::string_view path  = byTag ? "a reset_default tag" : "a ResetDefaults message";
+            auto                   block = std::make_unique<SettingsReadingReset>();
+            block->init(std::make_shared<gr::Sequence>());
+            const float defaultGain = block->gain.value;
+            std::ignore             = block->settings().set({{"gain", defaultGain / 2.f}});
+            expect(block->settings().activateContext().has_value());
+            std::ignore = block->settings().applyStagedParameters();
+            expect(eq(block->gain.value, defaultGain / 2.f)) << "the value to reset does not reach the member";
+            block->gainReadByLastChange.reset();
+            const std::size_t resetsBefore = block->resets;
+
+            gr::MsgPortOut toBlock;
+            if (!byTag) {
+                expect(fatal(toBlock.connect(block->msgIn).has_value()));
+                gr::sendMessage<gr::message::Command::Set>(toBlock, "", gr::block::property::kResetDefaults, gr::property_map{});
+            }
+            const bool returned = resetReturns(block, [byTag](SettingsReadingReset& target) {
+                if (byTag) {
+                    target.settings().autoUpdate(qa_refusals::flagTag(gr::tag::RESET_DEFAULTS.shortKey()));
+                    std::ignore = target.settings().applyStagedParameters();
+                } else {
+                    target.processScheduledMessages();
+                }
+            });
+            expect(returned) << path << " does not return within " << kResetBound.count() << " s";
+            if (!returned) {
+                continue;
+            }
+            expect(eq(block->gain.value, defaultGain)) << path << " leaves the member off its default";
+            expect(eq(block->resets, resetsBefore + 1UZ)) << path << " calls reset() a number of times other than once";
+            expect(block->gainReadByLastChange == std::optional<float>(defaultGain)) << "settingsChanged() reads a gain other than the default after " << path;
+            expect(block->gainReadByLastReset == std::optional<float>(defaultGain)) << "reset() reads a gain other than the default after " << path;
+        }
+    };
+};
+
+namespace qa_callback_staging {
+using namespace gr;
+
+/// a gain and offset stage whose reset() or settingsChanged() stages an offset once, when armed
+struct StagingCallbacks : Block<StagingCallbacks> {
+    PortIn<float>  in{};
+    PortOut<float> out{};
+
+    Annotated<float, "gain">   gain   = 1.f;
+    Annotated<float, "offset"> offset = 0.f;
+
+    GR_MAKE_REFLECTABLE(StagingCallbacks, in, out, gain, offset);
+
+    std::optional<float> offsetFromReset;  // the offset the next reset() stages
+    std::optional<float> offsetFromChange; // the offset the next settingsChanged() stages
+
+    void reset() { stageOffsetOnce(offsetFromReset); }
+
+    void settingsChanged(const property_map& /*oldSettings*/, const property_map& /*newSettings*/) { stageOffsetOnce(offsetFromChange); }
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain.value + offset.value; }
+
+    void stageOffsetOnce(std::optional<float>& armed) {
+        if (const std::optional<float> value = std::exchange(armed, std::nullopt); value.has_value()) {
+            std::ignore = this->settings().setStaged({{"offset", *value}});
+        }
+    }
+};
+
+enum class StagingPath { resetTag, storeTag, contextActivation, resetCall };
+
+[[nodiscard]] constexpr std::string_view describe(StagingPath path) noexcept {
+    switch (path) {
+    case StagingPath::resetTag: return "a reset_default tag whose reset() stages";
+    case StagingPath::storeTag: return "a store_default tag whose settingsChanged() stages";
+    case StagingPath::contextActivation: return "a context activation whose settingsChanged() stages";
+    case StagingPath::resetCall: return "a resetDefaults() call whose reset() stages";
+    }
+    return "";
+}
+
+} // namespace qa_callback_staging
+
+const boost::ut::suite<"a value a callback stages during an apply"> callbackStagingTests = [] {
+    using namespace boost::ut;
+    using namespace qa_callback_staging;
+
+    "a value a callback stages during applyChangedSettings() is applied by the next one"_test = [] {
+        for (const StagingPath path : {StagingPath::resetTag, StagingPath::storeTag, StagingPath::contextActivation, StagingPath::resetCall}) {
+            StagingCallbacks block;
+            block.init(std::make_shared<gr::Sequence>());
+            const float defaultGain  = block.gain.value;
+            const float stagedOffset = block.offset.value + 2.f;
+            const float offsetBefore = block.offset.value;
+            const auto  now          = gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now());
+            if (path == StagingPath::resetTag || path == StagingPath::resetCall) {
+                block.offsetFromReset = stagedOffset;
+            } else {
+                block.offsetFromChange = stagedOffset;
+            }
+
+            switch (path) {
+            case StagingPath::resetTag:
+                block.settings().autoUpdate(qa_refusals::flagTag(gr::tag::RESET_DEFAULTS.shortKey()));
+                block.applyChangedSettings();
+                break;
+            case StagingPath::storeTag:
+                block.settings().autoUpdate(Tag{0UZ, property_map{{std::pmr::string(gr::tag::STORE_DEFAULTS.shortKey()), true}, {"gain", 2.f * defaultGain}}});
+                block.applyChangedSettings();
+                break;
+            case StagingPath::contextActivation:
+                expect(block.settings().set({{"gain", 2.f * defaultGain}}, gr::SettingsCtx{now, "B"}).empty());
+                expect(block.settings().activateContext(gr::SettingsCtx{now, "B"}).has_value());
+                block.applyChangedSettings();
+                break;
+            case StagingPath::resetCall: block.settings().resetDefaults(); break;
+            }
+
+            expect(!block.offsetFromReset.has_value() && !block.offsetFromChange.has_value()) << describe(path) << " runs no staging callback";
+            expect(eq(block.offset.value, offsetBefore)) << describe(path) << " applies the staged offset within its own apply";
+            expect(block.settings().changed()) << describe(path) << " leaves the staged offset unmarked";
+            block.applyChangedSettings();
+            expect(eq(block.offset.value, stagedOffset)) << "the apply after " << describe(path) << " leaves the staged offset unapplied";
+        }
     };
 };
 
