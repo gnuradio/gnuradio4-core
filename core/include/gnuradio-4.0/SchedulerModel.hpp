@@ -3,10 +3,9 @@
 
 #include <gnuradio-4.0/BlockModel.hpp>
 
+#include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <memory>
-#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -164,60 +163,17 @@ public:
     }
 
     bool stopAfterDrain(std::chrono::milliseconds timeout) override {
-        auto& scheduler = this->blockRef();
-        // A nested scheduler can already be producing while this scheduler is
-        // still starting its own workers. Such a run must drain, not stop early.
-        if (!scheduler.runInProgress()) {
-            stop();
-            return true;
+        const bool drained = this->blockRef().stopAfterDrain(timeout);
+        if (_schedulerThread.joinable()) {
+            _schedulerThread.join();
         }
-        const auto subSchedulers = scheduler.requestWorkQuiescenceAll();
-        auto cancelSources = [&](auto&& self, auto& group) -> void {
-            for (auto& block : group.blocks()) {
-                if (!block->blocks().empty()) {
-                    self(self, *block);
-                    continue;
-                }
-                // Optional clock/message ports do not turn an unclocked source into a consumer.
-                auto hasConnectedStream = [](auto& ports) {
-                    const auto connected = [](auto& port) { return port.isConnected() && port::decodePortType(port.portMaskInfo()) == PortType::STREAM; };
-                    for (auto& entry : ports) {
-                        if (std::visit(
-                                [&](auto& value) {
-                                    if constexpr (requires { value.ports; }) {
-                                        return std::ranges::any_of(value.ports, connected);
-                                    } else {
-                                        return connected(value);
-                                    }
-                                },
-                                entry)) {
-                            return true;
-                        }
-                    }
-                    return false;
-                };
-                if (!hasConnectedStream(block->dynamicInputPorts()) && hasConnectedStream(block->dynamicOutputPorts()) && lifecycle::isActive(block->state())) {
-                    std::ignore = block->changeStateTo(lifecycle::State::REQUESTED_STOP);
-                }
-            }
-        };
-        {
-            on_scope_exit releaseQuiescence = [&] { scheduler.releaseWorkQuiescenceAll(subSchedulers); };
-            cancelSources(cancelSources, *this);
-        }
-        std::unique_lock lock(_completionMutex);
-        const bool       drained = _completionCondition.wait_for(lock, timeout, [this] { return _completed; });
-        lock.unlock();
-        stop();
         return drained;
     }
 
     std::thread _schedulerThread;
 
 private:
-    std::mutex                 _completionMutex;
-    std::condition_variable    _completionCondition;
-    bool                       _completed = true;
+    std::atomic<bool>          _asyncThreadDone{true};
     std::expected<void, Error> startOnOwnThread(bool requireWorkerCapacity) {
         using enum gr::lifecycle::State;
         auto& sched = this->blockRef();
@@ -231,8 +187,7 @@ private:
             return std::unexpected(Error(std::format("sub-scheduler '{}' is {} and cannot be started", sched.unique_name, gr::meta::enumName(initial).value_or(""))));
         }
         if (initial == INITIALISED && _schedulerThread.joinable()) {
-            std::lock_guard lock(_completionMutex);
-            if (!_completed) {
+            if (!_asyncThreadDone.load()) {
                 return {}; // its accepted asynchronous start has not entered RUNNING yet
             }
         }
@@ -271,25 +226,21 @@ private:
             }
         }
 
-        {
-            std::lock_guard lock(_completionMutex);
-            _completed = false;
-        }
+        _asyncThreadDone.store(false);
         _schedulerThread = std::thread([this, &sched] {
-            // Settle natural completion and collect worker errors just as a synchronous run does.
-            // Do not restart if stop() won the race with this thread's entry.
+            on_scope_exit complete = [this] { _asyncThreadDone.store(true); };
+            // Run errors have already been reported by the scheduler. Only an
+            // exception before its workers started is a start failure.
             try {
-                if (auto result = sched.runAndWait(false); !result) {
-                    sched.failStartAndReport(std::move(result.error()));
-                }
+                std::ignore = sched.runAndWaitImpl(false);
             } catch (const std::exception& error) {
-                sched.failStartAndReport(Error{error.what()});
+                if (!sched.workerStarted()) {
+                    sched.failStartAndReport(Error{error.what()});
+                } else if (sched.state() != ERROR) {
+                    sched.emitErrorMessage("runAndWait()", Error{error.what()});
+                    std::ignore = sched.changeStateTo(ERROR);
+                }
             }
-            {
-                std::lock_guard lock(_completionMutex);
-                _completed = true;
-            }
-            _completionCondition.notify_all();
         });
         return {};
     }

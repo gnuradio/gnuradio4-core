@@ -88,8 +88,8 @@ set_target_properties(abi_probe_plugin_previous PROPERTIES LIBRARY_OUTPUT_DIRECT
 target_compile_definitions(abi_probe_plugin_previous
                            PRIVATE ABI_PROBE_PLUGIN_ABI_VERSION=GR_PLUGIN_CURRENT_ABI_VERSION-1)
 
-# A scheduler-providing plugin with the preceding ABI must be rejected before its
-# factory can expose an incompatible SchedulerModel vtable to the host.
+# A scheduler-providing plugin with the preceding ABI must be rejected before its factory can expose an incompatible
+# SchedulerModel vtable to the host.
 add_abi_probe_plugin(abi_probe_scheduler_previous)
 set_target_properties(abi_probe_scheduler_previous PROPERTIES LIBRARY_OUTPUT_DIRECTORY
                                                               ${TESTS_BINARY_PATH}/plugin_abi_previous)

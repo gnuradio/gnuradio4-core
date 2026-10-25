@@ -6,4 +6,6 @@ DynamicPort::model::~model() = default;
 
 DynamicPort::HandlerAccess::~HandlerAccess() = default;
 
+DynamicPort::EndOfStreamAccess::~EndOfStreamAccess() = default;
+
 } // namespace gr

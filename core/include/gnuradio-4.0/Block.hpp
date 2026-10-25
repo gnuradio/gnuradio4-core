@@ -2321,11 +2321,6 @@ public:
         }
         if (this->state() == lifecycle::State::REQUESTED_STOP) {
             emitErrorMessageIfAny("workInternal(): REQUESTED_STOP -> STOPPED", this->changeStateTo(lifecycle::State::STOPPED));
-            // A locally cancelled source still owes its downstream readers an EOS marker.
-            // The normal DONE path publishes its marker before entering STOPPED itself.
-            if (this->state() == lifecycle::State::STOPPED) {
-                publishEoS();
-            }
         }
         if constexpr (TOutputTypes::size.value > 0UZ) {
             if (disconnect_on_done && hasNoDownStreamConnectedChildren()) {
