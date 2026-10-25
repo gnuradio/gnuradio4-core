@@ -3,6 +3,8 @@
 
 #include <gnuradio-4.0/BlockModel.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -68,6 +70,11 @@ public:
     // the calling thread
     virtual void requestQuiescenceOfOtherWork() = 0;
     virtual void releaseWorkQuiescence()        = 0;
+
+    // Cancel stream sources, let accepted downstream input reach EOS, then join.
+    // false means the drain deadline expired and immediate stop was required.
+    // The deadline bounds downstream draining; block stop hooks remain cooperative.
+    virtual bool stopAfterDrain(std::chrono::milliseconds timeout) = 0;
 };
 
 // A scheduler that holds a nested scheduler and exports its ports hands it the progress sequences of the graphs beyond
@@ -155,9 +162,18 @@ public:
         }
     }
 
+    bool stopAfterDrain(std::chrono::milliseconds timeout) override {
+        const bool drained = this->blockRef().stopAfterDrain(timeout);
+        if (_schedulerThread.joinable()) {
+            _schedulerThread.join();
+        }
+        return drained;
+    }
+
     std::thread _schedulerThread;
 
 private:
+    std::atomic<bool>          _asyncThreadDone{true};
     std::expected<void, Error> startOnOwnThread(bool requireWorkerCapacity) {
         using enum gr::lifecycle::State;
         auto& sched = this->blockRef();
@@ -166,6 +182,15 @@ private:
             return {};
         }
 
+        const auto initial = sched.state();
+        if (initial != IDLE && initial != INITIALISED && initial != STOPPED && initial != ERROR) {
+            return std::unexpected(Error(std::format("sub-scheduler '{}' is {} and cannot be started", sched.unique_name, gr::meta::enumName(initial).value_or(""))));
+        }
+        if (initial == INITIALISED && _schedulerThread.joinable()) {
+            if (!_asyncThreadDone.load()) {
+                return {}; // its accepted asynchronous start has not entered RUNNING yet
+            }
+        }
         if (_schedulerThread.joinable()) { // a previous run may have finished without a stop()
             _schedulerThread.join();
         }
@@ -201,12 +226,20 @@ private:
             }
         }
 
-        _schedulerThread = std::thread([&sched] {
-            // runs the scheduler's start(). Under a single-threaded policy start() returns when the run ends, and under
-            // the others once the workers are queued. A stop that claims the transition first leaves the stop's state.
-            // Any other error fails the start and reaches the scheduler that runs this one.
-            if (auto started = sched.changeStateTo(RUNNING); !started.has_value() && !gr::lifecycle::isShuttingDown(sched.state())) {
-                sched.failStartAndReport(std::move(started.error()));
+        _asyncThreadDone.store(false);
+        _schedulerThread = std::thread([this, &sched] {
+            on_scope_exit complete = [this] { _asyncThreadDone.store(true); };
+            // Run errors have already been reported by the scheduler. Only an
+            // exception before its workers started is a start failure.
+            try {
+                std::ignore = sched.runAndWaitImpl(false);
+            } catch (const std::exception& error) {
+                if (!sched.workerStarted()) {
+                    sched.failStartAndReport(Error{error.what()});
+                } else if (sched.state() != ERROR) {
+                    sched.emitErrorMessage("runAndWait()", Error{error.what()});
+                    std::ignore = sched.changeStateTo(ERROR);
+                }
             }
         });
         return {};

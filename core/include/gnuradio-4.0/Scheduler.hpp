@@ -984,7 +984,51 @@ public:
         }
     }
 
-    std::expected<void, Error> runAndWait() {
+    std::expected<void, Error> runAndWait() { return runAndWaitImpl(true); }
+
+    // External controllers cancel sources, then wait for the actual run, whether
+    // it was driven directly by runAndWait() or by SchedulerWrapper::start().
+    // Only the downstream drain has a deadline; lifecycle hooks must cooperate.
+    bool stopAfterDrain(std::chrono::milliseconds timeout) {
+        using enum lifecycle::State;
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        bool       drained  = false;
+        while (true) {
+            if (!runInProgress()) {
+                drained = true;
+                break;
+            }
+            // RUNNING is published before start() starts the children. Retry
+            // after short waits until the worker dispatch makes them ready.
+            if (workerStarted()) {
+                cancelDrainSources();
+            }
+            if (!runInProgress()) {
+                drained = true;
+                break;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                break;
+            }
+            std::this_thread::sleep_until(std::min(deadline, now + std::chrono::milliseconds(1)));
+        }
+        if (this->changeStateTo(REQUESTED_STOP)) {
+            std::ignore = this->changeStateTo(STOPPED);
+        } else {
+            std::ignore = this->changeStateTo(ERROR);
+        }
+        waitForRunAndClaims();
+        return drained;
+    }
+
+private:
+    template<BlockLike TScheduler>
+    friend class ::gr::SchedulerWrapper;
+
+    // The wrapper initializes its run before launching its thread. Its entry
+    // must not restart a run whose stop won the race with thread startup.
+    std::expected<void, Error> runAndWaitImpl(bool restart) {
         using enum lifecycle::State;
         [[maybe_unused]] const auto pe = this->_profilerHandler->startCompleteEvent("scheduler_base.runAndWait");
 
@@ -1009,6 +1053,11 @@ public:
         // runs it, as it does after an earlier run that ended STOPPED or ERROR. A stop that lands after this point
         // claims the move to RUNNING or stops the run.
         if (this->state() == STOPPED || this->state() == ERROR) {
+            // The wrapper initializes an asynchronous run before launching its thread.
+            // A stop that won since then must not be treated as a restart request.
+            if (!restart) {
+                return this->state() == ERROR ? std::unexpected(runEndingError()) : std::expected<void, Error>{};
+            }
             if (auto e = this->changeStateTo(INITIALISED); !e) {
                 this->emitErrorMessage("runAndWait() -> LifecycleState", e.error());
                 return std::unexpected(e.error());
@@ -1056,6 +1105,7 @@ public:
         return {};
     }
 
+public:
     void waitDone() {
         [[maybe_unused]] const auto pe = _profilerHandler->startCompleteEvent("scheduler_base.waitDone");
         for (std::size_t nRunning = _nRunningJobs->value(); nRunning > 0UZ; nRunning = _nRunningJobs->value()) {
@@ -1066,6 +1116,66 @@ public:
     [[nodiscard]] std::shared_ptr<JobLists> jobs() const noexcept { return _executionOrder; }
 
 protected:
+    void cancelDrainSources() {
+        requestWorkQuiescence();
+        std::vector<std::shared_ptr<SchedulerModel>> quiesced;
+        on_scope_exit                                release = [this, &quiesced] {
+            for (auto it = quiesced.rbegin(); it != quiesced.rend(); ++it) {
+                (*it)->releaseWorkQuiescence();
+            }
+            releaseWorkQuiescence();
+        };
+        const auto connectedStream    = [](const DynamicPort& port) { return port.isConnected() && port::decodePortType(port.portMaskInfo()) == PortType::STREAM; };
+        const auto hasConnectedStream = [&connectedStream](auto& ports) {
+            return std::ranges::any_of(ports, [&connectedStream](auto& entry) {
+                return std::visit(
+                    [&connectedStream](auto& value) {
+                        if constexpr (requires { value.ports; }) {
+                            return std::ranges::any_of(value.ports, connectedStream);
+                        } else {
+                            return connectedStream(value);
+                        }
+                    },
+                    entry);
+            });
+        };
+        auto cancel = [&](auto&& self, auto& group) -> void {
+            for (auto& block : group.blocks()) {
+                if (auto* scheduler = dynamic_cast<SchedulerModel*>(block.get())) {
+                    quiesced.emplace_back(block, scheduler);
+                    scheduler->requestWorkQuiescence();
+                }
+                if (!block->blocks().empty()) {
+                    self(self, *block);
+                    continue;
+                }
+                // Optional unconnected clock/message inputs do not make a
+                // stream source a consumer. Keep every source output at EOS.
+                if (!hasConnectedStream(block->dynamicInputPorts()) && hasConnectedStream(block->dynamicOutputPorts()) && lifecycle::isActive(block->state())) {
+                    if (block->changeStateTo(lifecycle::State::REQUESTED_STOP)) {
+                        for (auto& entry : block->dynamicOutputPorts()) {
+                            std::visit(
+                                [&connectedStream](auto& value) {
+                                    const auto publish = [&connectedStream](auto& port) {
+                                        if (connectedStream(port)) {
+                                            std::ignore = port.publishEoS();
+                                        }
+                                    };
+                                    if constexpr (requires { value.ports; }) {
+                                        std::ranges::for_each(value.ports, publish);
+                                    } else {
+                                        publish(value);
+                                    }
+                                },
+                                entry);
+                        }
+                    }
+                }
+            }
+        };
+        cancel(cancel, *_graph);
+    }
+
     // the first block whose work() returned ERROR, or whose error a worker drained with no msgOut reader, since the
     // latest start
     [[nodiscard]] std::optional<std::string> runEndingBlock() {

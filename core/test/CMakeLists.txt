@@ -244,6 +244,7 @@ if(GR_ENABLE_BLOCK_REGISTRY AND INTERNAL_ENABLE_BLOCK_PLUGINS)
     abi_probe_plugin_v1
     abi_probe_plugin_foreign_scheduler
     abi_probe_plugin_previous
+    abi_probe_scheduler_previous
     scheduler_library
     scheduler_library_v1
     scheduler_library_unversioned)
@@ -268,3 +269,6 @@ if(GR_USE_ADAPTIVE_CPP)
                TIMEOUT
                60)
 endif()
+
+add_ut_test(qa_FiniteSchedulerCompletion)
+set_tests_properties(qa_FiniteSchedulerCompletion PROPERTIES TIMEOUT 60)

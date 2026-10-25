@@ -1303,10 +1303,33 @@ private:
         return access != nullptr ? access->handlers() : Handlers{};
     }
 
+    // Keep model's vtable unchanged. A port compiled without this capability
+    // cannot publish a drain marker, and the caller can fall back to a stop.
+    struct GNURADIO_EXPORT EndOfStreamAccess {
+        virtual ~EndOfStreamAccess();
+        [[nodiscard]] virtual bool publishEoS() noexcept = 0;
+    };
+
     template<PortLike T, bool owning>
-    class PortWrapper final : public model, public HandlerAccess {
+    class PortWrapper final : public model, public HandlerAccess, public EndOfStreamAccess {
         using TPortType = std::decay_t<T>;
         std::conditional_t<owning, TPortType, TPortType&> _value;
+
+        [[nodiscard]] bool publishEoS() noexcept override {
+            if constexpr (TPortType::kIsOutput && TPortType::kPortType == PortType::STREAM && requires(TPortType& port, const property_map& tagData) {
+                              port.publishEoSTag(tagData);
+                              port.nEoSTagsLost;
+                          }) {
+                if (!_value.isConnected()) {
+                    return false;
+                }
+                const auto lost = _value.nEoSTagsLost;
+                _value.publishEoSTag(property_map{{static_cast<std::pmr::string>(tag::END_OF_STREAM), true}});
+                return _value.nEoSTagsLost == lost;
+            } else {
+                return false;
+            }
+        }
 
         [[nodiscard]] Handlers handlers() noexcept override {
             if constexpr (exchangesHandlers<TPortType>()) {
@@ -1464,6 +1487,13 @@ public:
 
     template<PortLike T>
     explicit constexpr DynamicPort(T&& arg, owned_value_tag) noexcept : priority(arg.priority), min_samples(arg.min_samples), max_samples(arg.max_samples), metaInfo(arg.metaInfo), _accessor{std::make_unique<PortWrapper<T, true>>(std::forward<T>(arg))} {}
+
+    // Publish at the current write position only while the output's producer is
+    // quiescent. Older port wrappers offer no such capability and return false.
+    [[nodiscard]] bool publishEoS() noexcept {
+        auto* publisher = dynamic_cast<EndOfStreamAccess*>(_accessor.get());
+        return publisher != nullptr && publisher->publishEoS();
+    }
 
     [[nodiscard]] DynamicPort weakRef() const noexcept { return _accessor->weakRef(); }
     [[nodiscard]] std::any    defaultValue() const noexcept { return _accessor->defaultValue(); }
