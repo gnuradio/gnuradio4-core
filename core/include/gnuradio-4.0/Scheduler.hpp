@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <bit>
 #include <chrono>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <queue>
@@ -199,7 +200,7 @@ protected:
 
     MsgPortOutForChildren                     _toChildMessagePort;
     MsgPortInFromChildren                     _fromChildMessagePort;
-    std::vector<gr::Message>                  _pendingMessagesToChildren;
+    std::deque<gr::Message>                   _pendingMessagesToChildren;
     std::vector<gr::Message>                  _unforwardedReplies; // children's replies that found msgOut full, oldest first
     bool                                      _messagePortsConnected = false;
     std::optional<Error>                      _firstErrorFromChildren; // the first error a child sent since the latest start, named for the child
@@ -207,7 +208,8 @@ protected:
     std::mutex                                _runEndingBlockMutex;
     std::optional<std::string>                _runEndingBlock; // the first block that ended the run since the latest start (see failRun())
 
-    std::atomic_flag _processingScheduledMessages;
+    std::atomic_flag             _processingScheduledMessages;
+    std::atomic<std::thread::id> _messagePassThread{}; // the thread that holds _processingScheduledMessages, or none
     // A pass that moves samples, here or in a sub-scheduler's graph, sets _graphMoved. The holder's call to this
     // scheduler clears it. A pass writes the flag only while it reads false. A scheduler without a holder therefore
     // writes it once. A pass in which a sub-scheduler's graph moved advances _nNestedGraphMoves. The watchdog reads
@@ -712,16 +714,22 @@ public:
 
         // an active scheduler is stopped below through the state transitions. An inactive one is claimed instead:
         // another thread may start it after oldState was read
-        const bool  claimed                     = !lifecycle::isActive(oldState);
+        const bool claimed = !lifecycle::isActive(oldState);
+        // the swap holds the message pass before it takes the claim. A message pass that reaches init(), reset() or
+        // exchange() holds the pass while it waits for the claim. Every thread takes the two in this order
+        const bool  heldPass                    = claimed && awaitMessagePass();
         const void* previousExchangingScheduler = exchangingScheduler();
         if (claimed) {
             claimExchange();
             exchangingScheduler() = this;
         }
-        on_scope_exit releaseClaim = [this, claimed, previousExchangingScheduler] {
+        on_scope_exit releaseClaim = [this, claimed, heldPass, previousExchangingScheduler] {
             if (claimed) {
                 exchangingScheduler() = previousExchangingScheduler;
                 releaseExchange();
+            }
+            if (heldPass) {
+                releaseMessagePass();
             }
         };
         if (lifecycle::State observed = oldState; claimed && !gr::atomic_ref(this->_state).compare_exchange(observed, oldState)) {
@@ -751,6 +759,12 @@ public:
                     return std::unexpected(result.error());
                 }
             }
+        }
+
+        // the kept messages belong to the old graph's children. Before the first connection they wait for the first
+        // graph that connects
+        if (_messagePortsConnected) {
+            dropMessagesToChildren();
         }
 
         if (this->state() == ERROR || this->state() == STOPPED) {
@@ -826,10 +840,17 @@ public:
     [[nodiscard]] std::span<const Edge>                        edges() const noexcept { return _graph->edges(); }
 
     void connectBlockMessagePorts() {
+        const bool    heldPass    = awaitMessagePass();
+        on_scope_exit releasePass = [this, heldPass] {
+            if (heldPass) {
+                releaseMessagePass();
+            }
+        };
+        // the graph's unread messages are older than the kept ones
         const auto available = _graph->msgIn.available();
         if (available != 0UZ) {
             ReaderSpanLike auto msgInSpan = _graph->msgIn.streamReader().get<SpanReleasePolicy::ProcessAll>(available);
-            _pendingMessagesToChildren.insert(_pendingMessagesToChildren.end(), msgInSpan.begin(), msgInSpan.end());
+            _pendingMessagesToChildren.insert(_pendingMessagesToChildren.begin(), msgInSpan.begin(), msgInSpan.end());
         }
 
         auto toSchedulerBuffer = _fromChildMessagePort.buffer();
@@ -849,9 +870,7 @@ public:
         // Forward any messages to children that were received before the scheduler was initialised
         _messagePortsConnected = true;
 
-        WriterSpanLike auto msgSpan = _toChildMessagePort.streamWriter().template reserve<SpanReleasePolicy::ProcessAll>(_pendingMessagesToChildren.size());
-        std::ranges::move(_pendingMessagesToChildren, msgSpan.begin());
-        _pendingMessagesToChildren.clear();
+        std::ignore = forwardToChildren(std::span<const gr::Message>{});
     }
 
     void processMessages(gr::MsgPortInBuiltin& port, std::span<const gr::Message> messages) {
@@ -862,9 +881,7 @@ public:
             if (msg.serviceName != this->unique_name && msg.serviceName != this->name && msg.endpoint != block::property::kLifeCycleState) {
                 // only forward wildcard, non-scheduler messages, and non-lifecycle messages (N.B. the latter is exclusively handled by the scheduler)
                 if (_messagePortsConnected) {
-                    WriterSpanLike auto msgSpan = _toChildMessagePort.streamWriter().template reserve<SpanReleasePolicy::ProcessAll>(1UZ);
-                    msgSpan[0]                  = msg;
-                    forwarded                   = true;
+                    forwarded = forwardToChildren(std::span<const gr::Message>(&msg, 1UZ)) > 0UZ || forwarded;
                 } else {
                     // if not yet connected, keep messages to children in cache and forward when connecting
                     _pendingMessagesToChildren.push_back(msg);
@@ -876,15 +893,55 @@ public:
         }
     }
 
+    // writes what fits in the ring that every child's msgIn reads, and returns the number written. It never waits for
+    // room in the ring. The messages kept from earlier calls go first, in order. A message that does not fit is kept
+    // for a later call. When the kept messages outnumber the ring's slots, the oldest is dropped and counted.
+    std::size_t forwardToChildren(std::span<const gr::Message> messages) {
+        auto&             writer  = _toChildMessagePort.streamWriter();
+        const std::size_t nToSend = std::min(_pendingMessagesToChildren.size() + messages.size(), writer.available());
+        std::size_t       nSent   = 0UZ;
+        std::size_t       nKept   = 0UZ;
+        if (nToSend > 0UZ) {
+            WriterSpanLike auto msgSpan = writer.template tryReserve<SpanReleasePolicy::ProcessAll>(nToSend);
+            nSent                       = msgSpan.size();
+            nKept                       = std::min(nSent, _pendingMessagesToChildren.size());
+            std::ranges::move(_pendingMessagesToChildren.begin(), _pendingMessagesToChildren.begin() + static_cast<std::ptrdiff_t>(nKept), msgSpan.begin());
+            std::ranges::copy_n(messages.begin(), static_cast<std::ptrdiff_t>(nSent - nKept), msgSpan.begin() + static_cast<std::ptrdiff_t>(nKept));
+            msgSpan.publish(nSent);
+            _pendingMessagesToChildren.erase(_pendingMessagesToChildren.begin(), _pendingMessagesToChildren.begin() + static_cast<std::ptrdiff_t>(nKept));
+        }
+        _pendingMessagesToChildren.insert(_pendingMessagesToChildren.end(), messages.begin() + static_cast<std::ptrdiff_t>(nSent - nKept), messages.end());
+        if (const std::size_t capacity = _toChildMessagePort.bufferSize(); _pendingMessagesToChildren.size() > capacity) {
+            const std::size_t nOverflow = _pendingMessagesToChildren.size() - capacity;
+            _pendingMessagesToChildren.erase(_pendingMessagesToChildren.begin(), _pendingMessagesToChildren.begin() + static_cast<std::ptrdiff_t>(nOverflow));
+            message::droppedMessageCount().fetch_add(nOverflow, std::memory_order_relaxed);
+        }
+        return nSent;
+    }
+
+    // A message kept for the children of one graph reaches no block of another. Each kept message counts as dropped.
+    void dropMessagesToChildren() {
+        const bool    heldPass    = awaitMessagePass();
+        on_scope_exit releasePass = [this, heldPass] {
+            if (heldPass) {
+                releaseMessagePass();
+            }
+        };
+        message::droppedMessageCount().fetch_add(_pendingMessagesToChildren.size(), std::memory_order_relaxed);
+        _pendingMessagesToChildren.clear();
+    }
+
     // callable from any thread. One caller at a time runs the scheduler's and the graph's handlers, and a caller that
     // finds them running returns at once
     void processScheduledMessages() {
-        if (std::atomic_flag_test_and_set_explicit(&_processingScheduledMessages, std::memory_order_acquire)) {
+        if (!tryHoldMessagePass()) {
             return;
         }
+        on_scope_exit _ = [this] { releaseMessagePass(); };
 
-        on_scope_exit _ = [&] { std::atomic_flag_clear_explicit(&_processingScheduledMessages, std::memory_order_release); };
-
+        if (_messagePortsConnected && !_pendingMessagesToChildren.empty() && forwardToChildren(std::span<const gr::Message>{}) > 0UZ) {
+            wakeParkedWorkers();
+        }
         base_t::processScheduledMessages(); // filters messages and calls own property handler
 
         // Process messages in the graph
@@ -1066,6 +1123,33 @@ public:
     [[nodiscard]] std::shared_ptr<JobLists> jobs() const noexcept { return _executionOrder; }
 
 protected:
+    [[nodiscard]] bool tryHoldMessagePass() {
+        if (std::atomic_flag_test_and_set_explicit(&_processingScheduledMessages, std::memory_order_acquire)) {
+            return false;
+        }
+        _messagePassThread.store(std::this_thread::get_id(), std::memory_order_relaxed);
+        return true;
+    }
+
+    void releaseMessagePass() {
+        _messagePassThread.store(std::thread::id{}, std::memory_order_relaxed);
+        std::atomic_flag_clear_explicit(&_processingScheduledMessages, std::memory_order_release);
+    }
+
+    [[nodiscard]] bool holdsMessagePass() const { return _messagePassThread.load(std::memory_order_relaxed) == std::this_thread::get_id(); }
+
+    // holds the message pass. While another thread runs a pass, the caller yields. It returns false at once when the
+    // calling thread already runs one
+    [[nodiscard]] bool awaitMessagePass() {
+        while (!tryHoldMessagePass()) {
+            if (holdsMessagePass()) {
+                return false;
+            }
+            std::this_thread::yield();
+        }
+        return true;
+    }
+
     // the first block whose work() returned ERROR, or whose error a worker drained with no msgOut reader, since the
     // latest start
     [[nodiscard]] std::optional<std::string> runEndingBlock() {
@@ -1274,8 +1358,16 @@ protected:
     void init() {
         awaitExchange();
         [[maybe_unused]] const auto pe = _profilerHandler->startCompleteEvent("scheduler_base.init");
-        base_t::processScheduledMessages(); // make sure initial subscriptions are processed
-        connectBlockMessagePorts();
+        {
+            const bool    heldPass    = awaitMessagePass();
+            on_scope_exit releasePass = [this, heldPass] {
+                if (heldPass) {
+                    releaseMessagePass();
+                }
+            };
+            base_t::processScheduledMessages(); // make sure initial subscriptions are processed
+            connectBlockMessagePorts();
+        }
 
         if constexpr (requires(Derived& d) { d.customInit(); }) {
             static_cast<Derived*>(this)->customInit();
