@@ -718,11 +718,22 @@ void CtxSettingsBase::autoUpdate(const Tag& tag) {
 
     const bool activeCtxChanged = previousCtx != ctx;
 
-    // fuzzy-match auto-update parameters (exact lookup may fail due to timestamp mismatch)
-    if (!_autoUpdateParameters.contains(ctx)) {
-        _autoUpdateParameters[ctx] = getBestMatchAutoUpdateParameters(ctx).value_or(_descriptor->writableMembers);
+    // an active set that a newer set of its context pruned is matched by no stored set; the context's present set
+    // then holds the keys that follow tags
+    SettingsCtx autoUpdateCtx = ctx;
+    if (!_autoUpdateParameters.contains(ctx) && !findBestMatchSettingsCtx(ctx).has_value()) {
+        std::uint64_t now = settings::convertTimePointToUint64Ns(std::chrono::system_clock::now());
+#ifdef __EMSCRIPTEN__
+        now += _timePrecisionTolerance;
+#endif
+        autoUpdateCtx = findBestMatchSettingsCtx(SettingsCtx{.time = now, .context = ctx.context}).value_or(ctx);
     }
-    auto& autoUpdateParams = _autoUpdateParameters[ctx];
+
+    // fuzzy-match auto-update parameters (exact lookup may fail due to timestamp mismatch)
+    if (!_autoUpdateParameters.contains(autoUpdateCtx)) {
+        _autoUpdateParameters[autoUpdateCtx] = getBestMatchAutoUpdateParameters(autoUpdateCtx).value_or(_descriptor->writableMembers);
+    }
+    auto& autoUpdateParams = _autoUpdateParameters[autoUpdateCtx];
 
     const auto& parameters = tag.map;
     bool        wasChanged = false;

@@ -1790,4 +1790,34 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
     };
 };
 
+const boost::ut::suite<"keys that follow tags"> autoUpdateKeyTests = [] {
+    using namespace boost::ut;
+    using namespace qa_refusals;
+
+    "a tag on an active set that a newer set of its context pruned leaves a key the context set explicitly"_test = [] {
+        LimitedGainAndOffset              block{property_map{{"name", std::string("gain_stage")}}};
+        CtxSettings<LimitedGainAndOffset> settings{block};
+        settings.init();
+        const float       setGain = block.gain.value / 2.f;
+        const SettingsCtx activeCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now() - std::chrono::milliseconds(1)), "x"};
+        expect(settings.set({{"gain", setGain}}, activeCtx).empty());
+        expect(settings.activateContext(activeCtx).has_value());
+        std::ignore = settings.applyStagedParameters();
+        expect(eq(block.gain.value, setGain)) << "the explicit value does not reach the member";
+
+        expect(settings.set({}, SettingsCtx{0U, "x"}).empty());
+        const auto stored  = settings.getStoredAll();
+        const auto setsOfX = stored.find(pmt::Value(std::string("x")));
+        expect(fatal(setsOfX != stored.end()));
+        expect(eq(setsOfX->second.size(), 1UZ)) << "the set for now leaves more than one set of the context";
+        expect(setsOfX->second.front().context != activeCtx) << "the set for now leaves the active set stored";
+
+        const float taggedOffset = block.offset.value + 0.5f;
+        settings.autoUpdate(Tag{0UZ, property_map{{"gain", setGain / 2.f}, {"offset", taggedOffset}}});
+        std::ignore = settings.applyStagedParameters();
+        expect(eq(block.gain.value, setGain)) << "the tag overrides the key the context set explicitly";
+        expect(eq(block.offset.value, taggedOffset)) << "the tag leaves a key that follows tags";
+    };
+};
+
 int main() { /* not needed by the UT framework */ }
