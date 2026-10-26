@@ -15,13 +15,14 @@
 #include <gnuradio-4.0/Scheduler.hpp>
 
 /**
- * @brief What a negative relative tag index means, and who may act on it.
+ * @brief Each tag a block forwards leaves once, whichever chunk hands it over.
  *
- * A block sees its input tags as offsets relative to the first sample of the current chunk, and that offset may be
- * negative. The default forwarder clamps a negative offset to zero and publishes the tag there. These tests pin down
- * why: a negative offset marks a tag the framework deferred out of an earlier chunk and has not forwarded yet, so the
- * clamped publication is that tag's first and only one. They also pin down the one shape where the same tag is
- * seen twice — a block that supplies its own forwardTags() and reads a wider window than the framework retires.
+ * A block sees its input tags as offsets relative to the first sample of the current chunk. On a block declaring
+ * `Resampling<>` the input span retires every tag of the samples it consumes, so a tag inside a chunk is not handed to
+ * a later chunk. A block supplying forwardTags() has its span retire only the tags at the chunk's first sample. A tag
+ * inside the chunk comes back in the next chunk at a negative offset, and the override skips it there. These tests pin
+ * that down for the default forwarder, for a forwardTags() override, at the end of the stream and through
+ * processEpilogue.
  *
  * The blocks are defined here: gnuradio4-core carries no standard block library, so a core test may not depend on one.
  */
@@ -40,7 +41,7 @@ inline constexpr std::size_t kWindowOutput = kWindow / kDecim;
 inline constexpr std::size_t kInteriorAt   = 5UZ;
 static_assert(kInteriorAt < kWindow && kInteriorAt % kDecim != 0UZ);
 
-/// `gr:trigger_name` because only the standard tag keys survive the default forwarder's key filter
+/// a gr: key that no block here follows
 inline constexpr std::string_view kNameKey = "gr:trigger_name";
 
 struct TagRecord {
@@ -48,18 +49,21 @@ struct TagRecord {
     property_map map{};
 };
 
-/// the window the default forwarder reads — `tags(1)` — split by the sign of the relative index
+/// the tags a chunk holds, split by the sign of the relative index
 struct WindowCensus {
-    std::size_t deferred{}; // relIndex < 0: carried out of an earlier chunk, not yet forwarded
+    std::size_t deferred{}; // relIndex < 0: carried out of an earlier chunk
     std::size_t atStart{};  // relIndex == 0: this chunk begins at the tag
+    std::size_t interior{}; // relIndex > 0: inside the chunk
 };
 
 void census(InputSpanLike auto& inSpan, WindowCensus& counts) {
-    for (const auto& [relIndex, tagMapRef] : inSpan.tags(1UZ)) {
+    for (const auto& [relIndex, tagMapRef] : inSpan.tags()) {
         if (relIndex < 0) {
             counts.deferred++;
-        } else {
+        } else if (relIndex == 0) {
             counts.atStart++;
+        } else {
+            counts.interior++;
         }
     }
 }
@@ -358,8 +362,8 @@ struct BackwardDecimate : Block<BackwardDecimate, BackwardTagPropagation, Resamp
     }
 };
 
-/// fixed-chunk shape of an FFT: the chunk is never broken at a tag, so every interior tag is deferred
-struct FixedChunk : Block<FixedChunk, ForwardTagPropagation, Resampling<kChunk, kChunk, true>> {
+/// fixed-chunk shape of an FFT: a chunk breaks at a tag only where the tag is a whole chunk away
+struct FixedChunk : Block<FixedChunk, Resampling<kChunk, kChunk, true>> {
     PortIn<float>  in;
     PortOut<float> out;
 
@@ -378,7 +382,7 @@ struct FixedChunk : Block<FixedChunk, ForwardTagPropagation, Resampling<kChunk, 
 };
 
 /// a fixed-chunk copier whose trailing samples arrive through processEpilogue
-struct EpilogueChunk : Block<EpilogueChunk, ForwardTagPropagation, Resampling<kChunk, kChunk, true>> {
+struct EpilogueChunk : Block<EpilogueChunk, Resampling<kChunk, kChunk, true>> {
     PortIn<float>  in;
     PortOut<float> out;
 
@@ -641,13 +645,14 @@ const boost::ut::suite<"tag forwarding"> _tagForwarding = [] {
             [](InspectingForwarder& middle) { middle.in.max_samples = kChunk; });
     };
 
-    "a decimator's interior tags arrive through a negative relative index"_test = [&] {
+    "a decimator's interior tags reach it in the chunk that holds them"_test = [&] {
         runChain<Decimate>(kInteriorTags, [&](Decimate& middle, Sink& sink) {
             for (std::size_t at : kInteriorTags) {
                 expect(eq(countNamed(sink.tags, std::format("t{}", at)), 1UZ)) << std::format("tag t{} arrives exactly once", at);
             }
-            expect(eq(middle.counts.deferred + middle.counts.atStart, kInteriorTags.size())) << "every tag is forwarded from exactly one sighting";
-            expect(gt(middle.counts.deferred, 0UZ)) << "input_chunk_size forbids a boundary at every tag, and dropping the deferred ones would lose exactly those";
+            expect(eq(middle.counts.atStart + middle.counts.interior, kInteriorTags.size())) << "a tag reaches the block other than once";
+            expect(eq(middle.counts.deferred, 0UZ)) << "a tag is handed on to a later chunk";
+            expect(gt(middle.counts.interior, 0UZ)) << "input_chunk_size forbids a boundary at every tag, and the case needs one inside a chunk";
         });
     };
 
@@ -667,8 +672,8 @@ const boost::ut::suite<"tag forwarding"> _tagForwarding = [] {
         runChain<Decimate>(oneInteriorTag, [&](Decimate&, Sink& sink) { defaultIndex = onlyTagIndex(sink); }, fixedWindow);
         runChain<BackwardDecimate>(oneInteriorTag, [&](BackwardDecimate&, Sink& sink) { backwardIndex = onlyTagIndex(sink); }, fixedWindow);
 
-        expect(lt(backwardIndex, kWindowOutput)) << "the tag must land on an output sample the chunk holding it produced";
-        expect(ge(defaultIndex, kWindowOutput)) << "the default forwarder reads only tags(1), so it first sees the tag one chunk later";
+        expect(eq(backwardIndex, 0UZ)) << "the tag must land on the first output sample of the chunk holding it";
+        expect(eq(defaultIndex, kInteriorAt / kDecim)) << "the default forwarder places the tag on the output sample its input sample maps to";
     };
 
     "tags ride the tail through processEpilogue"_test = [] {
@@ -713,17 +718,18 @@ const boost::ut::suite<"tag forwarding"> _tagForwarding = [] {
         }
     };
 
-    "a fixed-chunk block defers every tag that is not at its chunk boundary"_test = [&] {
+    "a fixed-chunk block forwards every tag in the chunk that holds it"_test = [&] {
         runChain<FixedChunk>(
             kInteriorTags,
             [&](FixedChunk& middle, Sink& sink) {
                 for (std::size_t at : kInteriorTags) {
                     expect(eq(countNamed(sink.tags, std::format("t{}", at)), 1UZ)) << std::format("tag t{} arrives exactly once", at);
                 }
-                expect(eq(middle.counts.deferred + middle.counts.atStart, kInteriorTags.size())) << "every tag is forwarded from exactly one sighting";
-                expect(gt(middle.counts.deferred, 0UZ)) << "ForwardTagPropagation never breaks a chunk at a tag";
+                expect(eq(middle.counts.atStart + middle.counts.interior, kInteriorTags.size())) << "a tag reaches the block other than once";
+                expect(eq(middle.counts.deferred, 0UZ)) << "a tag is handed on to a later chunk";
+                expect(gt(middle.counts.interior, 0UZ)) << "the chunk size forbids a boundary at some tag, and the case needs one inside a chunk";
             },
-            [](FixedChunk& middle) { middle.in.max_samples = kChunk; }); // more than one chunk, so a deferred tag has a chunk to arrive in
+            [](FixedChunk& middle) { middle.in.max_samples = kChunk; });
     };
 
     "a custom forwardTags that reads the whole chunk sees a deferred tag a second time"_test = [&] {

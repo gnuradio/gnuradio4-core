@@ -254,8 +254,6 @@ inline EM_CONSTEXPR_STATIC DefaultTag<"tx_sob", bool, "", "start of a transmit b
 inline EM_CONSTEXPR_STATIC DefaultTag<"tx_eob", bool, "", "end of a transmit burst, on the burst's last sample"> TX_EOB;
 inline EM_CONSTEXPR_STATIC DefaultTag<"tx_time", std::uint64_t, "ns", "UTC time at which the tagged sample, a burst's first, leaves the antenna"> TX_TIME;
 
-inline constexpr std::array<std::string_view, 22> kDefaultTags = {"gr:sample_rate", "gr:frequency", "gr:signal_name", "gr:num_channels", "gr:signal_quantity", "gr:signal_unit", "gr:signal_min", "gr:signal_max", "gr:n_dropped_samples", "gr:rx_overflow", "gr:trigger_name", "gr:trigger_time", "gr:trigger_offset", "gr:trigger_meta_info", "gr:context", "gr:ctx_time", "gr:reset_default", "gr:store_default", "gr:end_of_stream", "gr:tx_sob", "gr:tx_eob", "gr:tx_time"};
-
 /// the gr: keys the framework itself acts on in every block a tag reaches; no setting may be coupled to one
 inline constexpr std::array<std::string_view, 5> kControlKeys = {END_OF_STREAM.key(), RESET_DEFAULTS.key(), STORE_DEFAULTS.key(), CONTEXT.key(), CONTEXT_TIME.key()};
 

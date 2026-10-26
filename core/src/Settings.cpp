@@ -91,7 +91,7 @@ namespace {
 }
 } // namespace
 
-CtxSettingsBase::CtxSettingsBase(void* block, const settings::BlockDescriptor& descriptor) noexcept : _block(block), _descriptor(&descriptor) { _autoForwardParameters.insert(gr::tag::kDefaultTags.begin(), gr::tag::kDefaultTags.end()); }
+CtxSettingsBase::CtxSettingsBase(void* block, const settings::BlockDescriptor& descriptor) noexcept : _block(block), _descriptor(&descriptor) {}
 
 // --- Simple accessors ---
 
@@ -111,19 +111,6 @@ void CtxSettingsBase::setChanged(bool b) noexcept { gr::atomic_ref(_changed).sto
 void CtxSettingsBase::setInitBlockParameters(const property_map& parameters) { _initBlockParameters = parameters; }
 
 const SettingsCtx& CtxSettingsBase::activeContext() const noexcept { return _activeCtx; }
-
-const std::set<std::string>& CtxSettingsBase::autoForwardParameters() const noexcept { return _autoForwardParameters; }
-
-void CtxSettingsBase::addAutoForwardParameters(std::set<std::string> parameterKeys) {
-    // the per-work() read of this set is unlocked because the set is fixed for the duration of a
-    // run, so a mutation while the block is running is refused rather than allowed to race
-    if (_descriptor->hooks.blockState != nullptr && lifecycle::isActive(_descriptor->hooks.blockState(_block))) {
-        std::println(stderr, "gr::Settings: addAutoForwardParameters() refused on a running block; the auto-forward set is fixed for the duration of a run");
-        return;
-    }
-    std::lock_guard guard(_mutex);
-    _autoForwardParameters.merge(parameterKeys);
-}
 
 property_map CtxSettingsBase::defaultParameters() const noexcept {
     std::lock_guard lg(_mutex);
@@ -362,7 +349,6 @@ void CtxSettingsBase::assignFrom(const CtxSettingsBase& other) {
     _defaultParameters       = other._defaultParameters;
     _initBlockParameters     = other._initBlockParameters;
     _autoUpdateParameters    = other._autoUpdateParameters;
-    _autoForwardParameters   = other._autoForwardParameters;
     _matchPred               = other._matchPred;
     _activeCtx               = other._activeCtx;
     _contextActivated        = other._contextActivated;
@@ -381,7 +367,6 @@ void CtxSettingsBase::assignFrom(CtxSettingsBase&& other) noexcept {
     _defaultParameters       = std::move(other._defaultParameters);
     _initBlockParameters     = std::move(other._initBlockParameters);
     _autoUpdateParameters    = std::move(other._autoUpdateParameters);
-    _autoForwardParameters   = std::move(other._autoForwardParameters);
     _matchPred               = std::exchange(other._matchPred, settings::nullMatchPred);
     _activeCtx               = std::exchange(other._activeCtx, {});
     _contextActivated        = std::exchange(other._contextActivated, false);
