@@ -29,13 +29,6 @@
 
 namespace gr {
 
-// Declared in LifeCycle.hpp. Forward-declared here so that the settings table can query a block's
-// lifecycle state without this header participating in that include cycle.
-namespace lifecycle {
-enum class State : char;
-constexpr bool isActive(State state) noexcept;
-} // namespace lifecycle
-
 namespace settings {
 
 template<typename T>
@@ -468,7 +461,6 @@ struct BlockHooks {
     using NameReader              = std::string_view (*)(const void* block);
     using SettingsChangedInvoker  = void (*)(void* block, property_map& oldSettings, property_map& newSettings, property_map& forwardSettings);
     using ResetInvoker            = void (*)(void* block);
-    using BlockStateReader        = lifecycle::State (*)(const void* block);
 
     std::span<const MemberDescriptor> members{};
     bool                              reflectable{false};
@@ -478,7 +470,6 @@ struct BlockHooks {
     NameReader              blockName{nullptr};
     SettingsChangedInvoker  settingsChanged{nullptr};
     ResetInvoker            reset{nullptr};
-    BlockStateReader        blockState{nullptr};
 };
 
 /**
@@ -598,11 +589,6 @@ void invokeReset(void* block) {
     static_cast<TBlock*>(block)->reset();
 }
 
-template<typename TBlock>
-lifecycle::State readBlockState(const void* block) {
-    return static_cast<const TBlock*>(block)->state();
-}
-
 } // namespace detail
 
 namespace settings {
@@ -687,11 +673,6 @@ template<typename TBlock>
     }
     if constexpr (HasSettingsResetCallback<TBlock>) {
         hooks.reset = &detail::invokeReset<TBlock>;
-    }
-    if constexpr (requires(const TBlock block) {
-                      { block.state() } -> std::same_as<lifecycle::State>;
-                  }) {
-        hooks.blockState = &detail::readBlockState<TBlock>;
     }
     return hooks;
 }
@@ -847,20 +828,6 @@ struct SettingsBase {
 
     [[nodiscard]] virtual std::set<std::string> autoUpdateParameters(SettingsCtx ctx = {}) noexcept = 0;
 
-    // N.B. by reference: fixed once the block runs, and read on the per-work() tag-forwarding
-    // path where a set copy costs more than the whole work() call
-    [[nodiscard]] virtual const std::set<std::string>& autoForwardParameters() const noexcept = 0;
-
-    /**
-     * @brief add keys a block forwards to its children beyond the default tag set.
-     *
-     * The set is read unlocked on the per-work() path, so it is fixed for the duration of a
-     * run: add to it while the block is not running -- at construction, or while the graph is
-     * being built. The rule is enforced rather than documented only: a call on a running block is
-     * refused and reported, so the unlocked read cannot race a mutation.
-     */
-    virtual void addAutoForwardParameters(std::set<std::string> parameterKeys) = 0;
-
     [[nodiscard]] virtual property_map defaultParameters() const noexcept = 0;
 
     [[nodiscard]] virtual property_map activeParameters() const noexcept = 0;
@@ -909,7 +876,6 @@ protected:
     property_map                                                                     _defaultParameters{};
     property_map                                                                     _initBlockParameters{};
     std::map<SettingsCtx, std::set<std::string>>                                     _autoUpdateParameters{};
-    std::set<std::string>                                                            _autoForwardParameters{};
     MatchPredicate                                                                   _matchPred = settings::nullMatchPred;
     SettingsCtx                                                                      _activeCtx{};
     bool                                                                             _contextActivated{false};   ///< set when `_activeCtx.context` moved, consumed by the next apply
@@ -942,10 +908,8 @@ public:
 
     [[nodiscard]] const SettingsCtx& activeContext() const noexcept override;
 
-    [[nodiscard]] const std::set<std::string>& autoForwardParameters() const noexcept override;
-    void                                       addAutoForwardParameters(std::set<std::string> parameterKeys) override;
-    [[nodiscard]] property_map                 defaultParameters() const noexcept override;
-    [[nodiscard]] property_map                 activeParameters() const noexcept override;
+    [[nodiscard]] property_map defaultParameters() const noexcept override;
+    [[nodiscard]] property_map activeParameters() const noexcept override;
 
     [[nodiscard]] property_map              get(std::span<const std::string> parameterKeys = {}) const noexcept override;
     [[nodiscard]] std::optional<pmt::Value> get(const std::string& parameterKey) const noexcept override;

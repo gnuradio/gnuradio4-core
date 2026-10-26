@@ -51,7 +51,7 @@ set(_CORE_TESTS
     qa_SettingsTable
     qa_TagForwarding
     qa_TagStore
-    qa_UnfilteredTagPropagation
+    qa_TagPropagation
     qa_Tensor
     qa_TriggerMatcher
     qa_YamlPmt
@@ -109,19 +109,11 @@ endif()
 # Each of these must fail to compile, with the guard's own diagnostic: a predicate that is true proves nothing about
 # whether the static_assert reads it. The targets are excluded from the default build, and the nested build they drive
 # shares one binary directory, so they may not run concurrently.
-set(_COMPILE_FAIL_TESTS cf_UnfilteredTagPropagation_resampling cf_UnfilteredTagPropagation_async
-                        cf_UnfilteredTagPropagation_forwardtags_constrained)
-set(_COMPILE_FAIL_FILTERED_TESTS cf_FilteredTagPropagation_unfiltered cf_FilteredTagPropagation_notag)
-set(_COMPILE_FAIL_EVERY_KEY_TESTS cf_ForwardsEveryKey_forwardtags_deduced)
-set(_COMPILE_FAIL_DROPPED_TESTS cf_UnfilteredTagPropagation_dropped)
+set(_COMPILE_FAIL_DEDUCED_OVERRIDE_TESTS cf_KeepsTagOffsets_forwardtags_deduced cf_Resampling_forwardtags_deduced)
 set(_COMPILE_FAIL_DROPPED_TWICE_TESTS cf_DroppedTagKeys_twice)
-foreach(
-  TEST_NAME IN
-  LISTS _COMPILE_FAIL_TESTS
-        _COMPILE_FAIL_FILTERED_TESTS
-        _COMPILE_FAIL_EVERY_KEY_TESTS
-        _COMPILE_FAIL_DROPPED_TESTS
-        _COMPILE_FAIL_DROPPED_TWICE_TESTS)
+set(_COMPILE_FAIL_DROPPED_SPELLING_TESTS cf_DroppedTagKeys_leading_colon)
+foreach(TEST_NAME IN LISTS _COMPILE_FAIL_DEDUCED_OVERRIDE_TESTS _COMPILE_FAIL_DROPPED_TWICE_TESTS
+                           _COMPILE_FAIL_DROPPED_SPELLING_TESTS)
   add_executable(${TEST_NAME} EXCLUDE_FROM_ALL compile_fail/${TEST_NAME}.cpp)
   target_include_directories(${TEST_NAME} PRIVATE ${CMAKE_BINARY_DIR}/include ${CMAKE_CURRENT_BINARY_DIR})
   target_link_libraries(${TEST_NAME} PRIVATE gnuradio-options gnuradio-core)
@@ -129,33 +121,9 @@ foreach(
                                      $<CONFIG>)
 endforeach()
 set_tests_properties(
-  ${_COMPILE_FAIL_TESTS}
-  PROPERTIES PASS_REGULAR_EXPRESSION
-             "UnfilteredTagPropagation is not available"
-             RESOURCE_LOCK
-             gr_core_build_tree
-             TIMEOUT
-             300)
-set_tests_properties(
-  ${_COMPILE_FAIL_FILTERED_TESTS}
-  PROPERTIES PASS_REGULAR_EXPRESSION
-             "FilteredTagPropagation cannot be combined"
-             RESOURCE_LOCK
-             gr_core_build_tree
-             TIMEOUT
-             300)
-set_tests_properties(
-  ${_COMPILE_FAIL_EVERY_KEY_TESTS}
+  ${_COMPILE_FAIL_DEDUCED_OVERRIDE_TESTS}
   PROPERTIES PASS_REGULAR_EXPRESSION
              "calls a forwardTags\\(\\) that hasForwardTagsOverride\\(\\) does not see"
-             RESOURCE_LOCK
-             gr_core_build_tree
-             TIMEOUT
-             300)
-set_tests_properties(
-  ${_COMPILE_FAIL_DROPPED_TESTS}
-  PROPERTIES PASS_REGULAR_EXPRESSION
-             "UnfilteredTagPropagation is not available for a block declaring DroppedTagKeys"
              RESOURCE_LOCK
              gr_core_build_tree
              TIMEOUT
@@ -164,6 +132,14 @@ set_tests_properties(
   ${_COMPILE_FAIL_DROPPED_TWICE_TESTS}
   PROPERTIES PASS_REGULAR_EXPRESSION
              "A block declares at most one DroppedTagKeys list"
+             RESOURCE_LOCK
+             gr_core_build_tree
+             TIMEOUT
+             300)
+set_tests_properties(
+  ${_COMPILE_FAIL_DROPPED_SPELLING_TESTS}
+  PROPERTIES PASS_REGULAR_EXPRESSION
+             "a DroppedTagKeys key is domain:name, with no leading colon and no space"
              RESOURCE_LOCK
              gr_core_build_tree
              TIMEOUT

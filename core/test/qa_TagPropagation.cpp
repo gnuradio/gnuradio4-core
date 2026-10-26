@@ -18,28 +18,34 @@
 #include <gnuradio-4.0/Scheduler.hpp>
 
 /**
- * @brief A block passing `kUnfilteredTagPropagationAdmissible` forwards every tag key at the tag's own offset.
+ * @brief Every block forwards every tag key.
  *
- * Such a block forwards every key whether it declares `UnfilteredTagPropagation` or no policy at all. A block declaring
- * `FilteredTagPropagation`, and every block the predicate refuses, keeps only the auto-forward keys. The tests check
- * that:
- * - every key survives
+ * The tests check that:
+ * - every key survives, at its offset on a 1:1 block and at its mapped offset on a block declaring `Resampling<>`
+ * - every tag of a chunk leaves at the chunk's first output sample under `BackwardTagPropagation`
+ * - a tag on a sample two overlapping chunks read leaves once
  * - a key a setting is coupled to carries the value it arrived with, whatever the setting holds
- * - a coupled setting a tag changes hands its value on through the block's own forward map, after the tag
- * - a key named after a setting `Block<>` declares for every block keeps the upstream value
- * - a tag inside a chunk keeps its offset where an input minimum forbids a boundary at it
+ * - a coupled setting a tag changes hands its value on through the block's own forward map, after the tag, on a 1:1
+ *   block and on a block declaring `Resampling<>`, and on the next call when the call that applies the tag publishes
+ *   no sample
+ * - a tag inside a chunk that an input minimum keeps whole leaves once, at its own offset
+ * - a tag in the stream's trailing window keeps its offset
+ * - a decimator that consumes less than its window places each tag of the samples it consumed once, in order, and
+ *   applies its settings once
+ * - a sink with an input minimum reads each tag of the samples it consumes once
+ * - a composed block forwards no tag where a member declares `NoTagPropagation` or supplies `forwardTags()`
  *
- * They also check the multi-input dedup, the merge rule, the key-filtered forwarding of a block the predicate refuses,
- * and the keys a block lists in `DroppedTagKeys`. The compile-time guards are checked twice. This file checks the
- * predicate, and seven translation units under `compile_fail/` must fail to build.
+ * They also check the multi-input dedup, the end-of-stream index and the keys a block lists in `DroppedTagKeys`, a
+ * `gr:` key among them.
  *
  * A second suite checks a block declaring `Stride<>`. A tag on a sample it skips leaves at the next chunk's first
- * output sample, and every chunk starts where the stride puts it.
+ * output sample, and every chunk starts where the stride puts it. The forward map of a tag in the stream's last skip
+ * leaves at the end index, after the tag.
  *
  * The blocks are defined here: gnuradio4-core carries no standard block library, so a core test may not depend on one.
  */
 
-namespace qa_unfiltered_tag_propagation {
+namespace qa_uniform_tag_propagation {
 
 using namespace gr;
 
@@ -48,10 +54,10 @@ inline constexpr std::size_t kSamples = 2048UZ;
 /// an input minimum above one forbids a chunk boundary at a tag closer than that to the chunk's start
 inline constexpr std::size_t kInputMinimum = 4UZ;
 
-inline constexpr std::string_view kReservedKey = "gr:trigger_name"; ///< reserved: survives the default key filter
-inline constexpr std::string_view kCustomKey   = "record_id";       ///< neither reserved nor any block's setting
-inline constexpr std::string_view kOwnedKey    = "gain";            ///< not reserved, but the key a case couples a gain setting to
-inline constexpr std::string_view kDroppedKey  = "phase_offset";    ///< not reserved, and listed by the dropping blocks
+inline constexpr std::string_view kReservedKey = "gr:trigger_name"; ///< a gr: key no block here is coupled to
+inline constexpr std::string_view kCustomKey   = "record_id";       ///< a default-domain key no setting is named after
+inline constexpr std::string_view kOwnedKey    = "gain";            ///< the key a case couples a gain setting to
+inline constexpr std::string_view kDroppedKey  = "phase_offset";    ///< listed by the dropping blocks
 inline constexpr std::string_view kHalfRateKey = "foo:half_rate";   ///< a key a block writes into its own forward map
 
 inline constexpr float kUpstreamGain = 10.f;
@@ -182,47 +188,12 @@ struct BulkRelay : Block<BulkRelay> {
     }
 };
 
-/// whatever a tag carries, only the auto-forward keys leave this block
-struct FilteredRelay : Block<FilteredRelay, FilteredTagPropagation> {
-    PortIn<float>  in;
-    PortOut<float> out;
-
-    GR_MAKE_REFLECTABLE(FilteredRelay, in, out);
-
-    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
-};
-
-struct FilteredBulkRelay : Block<FilteredBulkRelay, FilteredTagPropagation> {
-    PortIn<float>  in;
-    PortOut<float> out;
-
-    GR_MAKE_REFLECTABLE(FilteredBulkRelay, in, out);
-
-    work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
-        const std::size_t n = std::min(inSpan.size(), outSpan.size());
-        std::ranges::copy(inSpan | std::views::take(n), outSpan.begin());
-        std::ignore = inSpan.consume(n);
-        outSpan.publish(n);
-        return work::Status::OK;
-    }
-};
-
 /// forwards every key but the one it lists
 struct DroppingRelay : Block<DroppingRelay, DroppedTagKeys<"phase_offset">> {
     PortIn<float>  in;
     PortOut<float> out;
 
     GR_MAKE_REFLECTABLE(DroppingRelay, in, out);
-
-    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
-};
-
-/// keeps the auto-forward keys and drops one of them
-struct FilteredDroppingRelay : Block<FilteredDroppingRelay, FilteredTagPropagation, DroppedTagKeys<"gr:trigger_name">> {
-    PortIn<float>  in;
-    PortOut<float> out;
-
-    GR_MAKE_REFLECTABLE(FilteredDroppingRelay, in, out);
 
     [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
 };
@@ -271,19 +242,24 @@ struct AsyncOutputRelay : Block<AsyncOutputRelay> {
     }
 };
 
-/// its own forwardTags() republishes every tag at relIndex <= 0 whole. It relies on the input span retiring only those.
-struct FirstTagForwarder : Block<FirstTagForwarder> {
+/// its own forwardTags() publishes every tag of the chunk at the offset it arrived at, and skips a tag an earlier chunk
+/// handed it, at a negative relIndex
+struct ChunkForwarder : Block<ChunkForwarder> {
     PortIn<float>  in;
     PortOut<float> out;
 
-    GR_MAKE_REFLECTABLE(FirstTagForwarder, in, out);
+    GR_MAKE_REFLECTABLE(ChunkForwarder, in, out);
 
     template<typename TInputSpans, typename TOutputSpans>
-    void forwardTags(TInputSpans& inputSpans, TOutputSpans& outputSpans, std::size_t /*processedIn*/) {
+    void forwardTags(TInputSpans& inputSpans, TOutputSpans& outputSpans, std::size_t processedIn) {
         gr::for_each_reader_span(
-            [&outputSpans](auto& inSpan) {
-                for (const auto& [relIndex, tagMapRef] : inSpan.tags(1UZ)) {
-                    gr::for_each_writer_span([&tagMapRef](auto& outSpan) { outSpan.publishTag(tagMapRef.get(), 0UZ); }, outputSpans);
+            [&outputSpans, processedIn](auto& inSpan) {
+                for (const auto& [relIndex, tagMapRef] : inSpan.tags(processedIn)) {
+                    if (relIndex < 0) {
+                        continue;
+                    }
+                    const auto offset = static_cast<std::size_t>(relIndex);
+                    gr::for_each_writer_span([&tagMapRef, offset](auto& outSpan) { outSpan.publishTag(tagMapRef.get(), offset); }, outputSpans);
                 }
             },
             inputSpans);
@@ -298,36 +274,34 @@ struct FirstTagForwarder : Block<FirstTagForwarder> {
     }
 };
 
-struct UnfilteredRelay : Block<UnfilteredRelay, UnfilteredTagPropagation> {
+/// a processOne block whose own forwardTags() places each tag one output sample later, as a one-sample delay would
+struct DelayingForwarder : Block<DelayingForwarder> {
     PortIn<float>  in;
     PortOut<float> out;
 
-    GR_MAKE_REFLECTABLE(UnfilteredRelay, in, out);
+    GR_MAKE_REFLECTABLE(DelayingForwarder, in, out);
+
+    template<typename TInputSpans, typename TOutputSpans>
+    void forwardTags(TInputSpans& inputSpans, TOutputSpans& outputSpans, std::size_t processedIn) {
+        gr::for_each_reader_span(
+            [&outputSpans, processedIn](auto& inSpan) {
+                for (const auto& [relIndex, tagMapRef] : inSpan.tags(processedIn)) {
+                    const std::size_t offset = static_cast<std::size_t>(std::max(std::ptrdiff_t(0), relIndex)) + 1UZ;
+                    gr::for_each_writer_span([&tagMapRef, offset](auto& outSpan) { outSpan.publishTag(tagMapRef.get(), std::min(offset, outSpan.size())); }, outputSpans);
+                }
+            },
+            inputSpans);
+    }
 
     [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
 };
 
-struct UnfilteredBulkRelay : Block<UnfilteredBulkRelay, UnfilteredTagPropagation> {
-    PortIn<float>  in;
-    PortOut<float> out;
-
-    GR_MAKE_REFLECTABLE(UnfilteredBulkRelay, in, out);
-
-    work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
-        const std::size_t n = std::min(inSpan.size(), outSpan.size());
-        std::ranges::copy(inSpan | std::views::take(n), outSpan.begin());
-        std::ignore = inSpan.consume(n);
-        outSpan.publish(n);
-        return work::Status::OK;
-    }
-};
-
 /// an identity block whose trailing samples, and the tags among them, arrive through processEpilogue
-struct UnfilteredTailRelay : Block<UnfilteredTailRelay, UnfilteredTagPropagation> {
+struct TailRelay : Block<TailRelay> {
     PortIn<float>  in;
     PortOut<float> out;
 
-    GR_MAKE_REFLECTABLE(UnfilteredTailRelay, in, out);
+    GR_MAKE_REFLECTABLE(TailRelay, in, out);
 
     std::size_t epilogueRuns = 0UZ;
 
@@ -348,6 +322,73 @@ struct UnfilteredTailRelay : Block<UnfilteredTailRelay, UnfilteredTagPropagation
     }
 };
 
+/// a 2:1 decimator that consumes one input chunk per call, fewer than its window holds
+struct OneChunkDecimator : Block<OneChunkDecimator, Resampling<2U, 1U, true>> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(OneChunkDecimator, in, out);
+
+    work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
+        if (inSpan.size() < 2UZ || outSpan.empty()) {
+            std::ignore = inSpan.consume(0UZ);
+            outSpan.publish(0UZ);
+            return work::Status::INSUFFICIENT_INPUT_ITEMS;
+        }
+        outSpan[0UZ] = inSpan[0UZ];
+        std::ignore  = inSpan.consume(2UZ);
+        outSpan.publish(1UZ);
+        return work::Status::OK;
+    }
+};
+
+/// a sink that consumes at most two samples per call and records the tags of the samples it consumes
+struct TwoSampleSink : Block<TwoSampleSink> {
+    PortIn<float> in;
+
+    GR_MAKE_REFLECTABLE(TwoSampleSink, in);
+
+    std::vector<TagRecord> tags;
+
+    work::Status processBulk(InputSpanLike auto& inSpan) {
+        const std::size_t n = std::min(2UZ, inSpan.size());
+        for (const auto& [relIndex, tagMapRef] : inSpan.tags(n)) {
+            tags.push_back(TagRecord{static_cast<std::size_t>(static_cast<std::ptrdiff_t>(inSpan.streamIndex) + relIndex), tagMapRef.get()});
+        }
+        std::ignore = inSpan.consume(n);
+        return work::Status::OK;
+    }
+};
+
+/// records the tags its work calls read and, in its epilogue, the tags left in its ring
+struct RecordingSink : Block<RecordingSink> {
+    PortIn<float> in;
+
+    GR_MAKE_REFLECTABLE(RecordingSink, in);
+
+    std::size_t            nSamples = 0UZ;
+    std::vector<TagRecord> tags;
+
+    work::Status processBulk(InputSpanLike auto& inSpan) {
+        const std::size_t n = inSpan.size();
+        for (const Tag& tag : inSpan.rawTags) {
+            tags.push_back(TagRecord{tag.index, tag.map});
+        }
+        inSpan.consumeTags(n);
+        nSamples += n;
+        std::ignore = inSpan.consume(n);
+        return work::Status::OK;
+    }
+
+    work::Status processEpilogue(InputSpanLike auto& inSpan) {
+        for (const Tag& tag : in.tagReader().get()) {
+            tags.push_back(TagRecord{tag.index, tag.map});
+        }
+        nSamples += inSpan.size();
+        return work::Status::OK;
+    }
+};
+
 /// an override constrained to the span tuples the work path passes, which a probe on empty tuples does not see
 struct ConstrainedForwarder : Block<ConstrainedForwarder> {
     PortIn<float>  in;
@@ -363,7 +404,7 @@ struct ConstrainedForwarder : Block<ConstrainedForwarder> {
 };
 
 /// caps both of its settings, so a setting coupled to a key holds a value other than the one the tag carried
-struct UnfilteredCap : Block<UnfilteredCap, UnfilteredTagPropagation> {
+struct CappingRelay : Block<CappingRelay> {
     PortIn<float>  in;
     PortOut<float> out;
 
@@ -372,7 +413,7 @@ struct UnfilteredCap : Block<UnfilteredCap, UnfilteredTagPropagation> {
     float max_gain        = kGainCeiling;
     float max_sample_rate = kRateCeiling;
 
-    GR_MAKE_REFLECTABLE(UnfilteredCap, in, out, sample_rate, gain, max_gain, max_sample_rate);
+    GR_MAKE_REFLECTABLE(CappingRelay, in, out, sample_rate, gain, max_gain, max_sample_rate);
 
     void settingsChanged(const property_map& /*oldSettings*/, const property_map& /*newSettings*/) {
         gain        = std::min(gain, max_gain);
@@ -382,53 +423,176 @@ struct UnfilteredCap : Block<UnfilteredCap, UnfilteredTagPropagation> {
     [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
 };
 
+/// writes half of a changed sample rate into a block's forward map under kHalfRateKey
+void forwardHalfRate(const property_map& newSettings, float sampleRate, property_map& forward) {
+    if (newSettings.contains("sample_rate")) {
+        forward.insert_or_assign(std::pmr::string(kHalfRateKey), sampleRate / 2.f);
+    }
+}
+
+/// hands half its sample rate on under kHalfRateKey through its own forward map
+struct HalfRateRelay : Block<HalfRateRelay> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    float sample_rate = 1.f;
+
+    GR_MAKE_REFLECTABLE(HalfRateRelay, in, out, sample_rate);
+
+    void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings, property_map& forward) { forwardHalfRate(newSettings, sample_rate, forward); }
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
+};
+
+/// HalfRateRelay as a processBulk() block that consumes and publishes nothing on its first call
+struct WaitingHalfRateRelay : Block<WaitingHalfRateRelay> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    float sample_rate = 1.f;
+
+    GR_MAKE_REFLECTABLE(WaitingHalfRateRelay, in, out, sample_rate);
+
+    bool _waited = false;
+
+    void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings, property_map& forward) { forwardHalfRate(newSettings, sample_rate, forward); }
+
+    work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
+        if (!_waited) {
+            _waited     = true;
+            std::ignore = inSpan.consume(0UZ);
+            outSpan.publish(0UZ);
+            return work::Status::INSUFFICIENT_INPUT_ITEMS;
+        }
+        const std::size_t n = std::min(inSpan.size(), outSpan.size());
+        std::ranges::copy(inSpan | std::views::take(n), outSpan.begin());
+        std::ignore = inSpan.consume(n);
+        outSpan.publish(n);
+        return work::Status::OK;
+    }
+};
+
+/// HalfRateRelay's forward map on a 2:1 decimator
+struct HalfRateDecimator : Block<HalfRateDecimator, Resampling<2U, 1U, true>> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    float sample_rate = 1.f;
+
+    GR_MAKE_REFLECTABLE(HalfRateDecimator, in, out, sample_rate);
+
+    void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings, property_map& forward) { forwardHalfRate(newSettings, sample_rate, forward); }
+
+    work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
+        const std::size_t n = std::min(outSpan.size(), inSpan.size() / 2UZ);
+        for (std::size_t i = 0UZ; i < n; ++i) {
+            outSpan[i] = inSpan[2UZ * i];
+        }
+        std::ignore = inSpan.consume(2UZ * n);
+        outSpan.publish(n);
+        return work::Status::OK;
+    }
+};
+
+/// lists a gr: key in DroppedTagKeys
+struct ReservedKeyDropper : Block<ReservedKeyDropper, DroppedTagKeys<"gr:trigger_name">> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(ReservedKeyDropper, in, out);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
+};
+
+/// a 2:1 decimator that consumes one input chunk per call and counts its resets
+struct ResetCountingDecimator : Block<ResetCountingDecimator, Resampling<2U, 1U, true>> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(ResetCountingDecimator, in, out);
+
+    std::size_t nResets = 0UZ;
+
+    void reset() { ++nResets; }
+
+    work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
+        if (inSpan.size() < 2UZ || outSpan.empty()) {
+            std::ignore = inSpan.consume(0UZ);
+            outSpan.publish(0UZ);
+            return work::Status::INSUFFICIENT_INPUT_ITEMS;
+        }
+        outSpan[0UZ] = inSpan[0UZ];
+        std::ignore  = inSpan.consume(2UZ);
+        outSpan.publish(1UZ);
+        return work::Status::OK;
+    }
+};
+
 /// has a gain and a sample_rate setting that no case couples to a tag key
-struct UnfilteredUnmarked : Block<UnfilteredUnmarked, UnfilteredTagPropagation> {
+struct UnmarkedRelay : Block<UnmarkedRelay> {
     PortIn<float>  in;
     PortOut<float> out;
 
     float sample_rate = 1000.f;
     float gain        = 1.f;
 
-    GR_MAKE_REFLECTABLE(UnfilteredUnmarked, in, out, sample_rate, gain);
+    GR_MAKE_REFLECTABLE(UnmarkedRelay, in, out, sample_rate, gain);
 
     [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
 };
 
-/// hands half its sample rate on under kHalfRateKey through its own forward map
-struct UnfilteredHalfRate : Block<UnfilteredHalfRate, UnfilteredTagPropagation> {
+/// keeps the first sample of every four
+struct QuarterDecimator : Block<QuarterDecimator, Resampling<4U, 1U, true>> {
     PortIn<float>  in;
     PortOut<float> out;
 
-    float sample_rate = 1.f;
+    GR_MAKE_REFLECTABLE(QuarterDecimator, in, out);
 
-    GR_MAKE_REFLECTABLE(UnfilteredHalfRate, in, out, sample_rate);
-
-    void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings, property_map& forward) {
-        if (newSettings.contains("sample_rate")) {
-            forward.insert_or_assign(std::pmr::string(kHalfRateKey), sample_rate / 2.f);
+    work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
+        const std::size_t n = std::min(outSpan.size(), inSpan.size() / 4UZ);
+        for (std::size_t i = 0UZ; i < n; ++i) {
+            outSpan[i] = inSpan[4UZ * i];
         }
+        std::ignore = inSpan.consume(4UZ * n);
+        outSpan.publish(n);
+        return work::Status::OK;
     }
-
-    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
 };
 
-struct Decimating : Block<Decimating, UnfilteredTagPropagation, Resampling<2U, 1U, true>> {
+/// repeats every sample three times
+struct TripleInterpolator : Block<TripleInterpolator, Resampling<1U, 3U, true>> {
     PortIn<float>  in;
     PortOut<float> out;
 
-    GR_MAKE_REFLECTABLE(Decimating, in, out);
+    GR_MAKE_REFLECTABLE(TripleInterpolator, in, out);
 
-    work::Status processBulk(InputSpanLike auto&, OutputSpanLike auto&) { return work::Status::OK; }
+    work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
+        const std::size_t n = std::min(outSpan.size() / 3UZ, inSpan.size());
+        for (std::size_t i = 0UZ; i < 3UZ * n; ++i) {
+            outSpan[i] = inSpan[i / 3UZ];
+        }
+        std::ignore = inSpan.consume(n);
+        outSpan.publish(3UZ * n);
+        return work::Status::OK;
+    }
 };
 
-struct SettableRatio : Block<SettableRatio, Resampling<1U, 1U, false>> {
+/// reads four samples a chunk and steps two, so each sample after the first two is read by two chunks
+struct OverlappingDecimator : Block<OverlappingDecimator, Resampling<4U, 1U, true>, Stride<2U, true>> {
     PortIn<float>  in;
     PortOut<float> out;
 
-    GR_MAKE_REFLECTABLE(SettableRatio, in, out);
+    GR_MAKE_REFLECTABLE(OverlappingDecimator, in, out);
 
-    work::Status processBulk(InputSpanLike auto&, OutputSpanLike auto&) { return work::Status::OK; }
+    work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
+        if (inSpan.empty() || outSpan.empty()) {
+            outSpan.publish(0UZ);
+            return work::Status::INSUFFICIENT_INPUT_ITEMS;
+        }
+        outSpan[0UZ] = inSpan[0UZ];
+        outSpan.publish(1UZ);
+        return work::Status::OK;
+    }
 };
 
 struct Strided : Block<Strided, Stride<2U, true>> {
@@ -452,6 +616,28 @@ struct SkippingDecimator : Block<SkippingDecimator, Resampling<4U, 1U, true>, St
     GR_MAKE_REFLECTABLE(SkippingDecimator, in, out, sample_rate, max_sample_rate);
 
     void settingsChanged(const property_map& /*oldSettings*/, const property_map& /*newSettings*/) { sample_rate = std::min(sample_rate, max_sample_rate); }
+
+    work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
+        if (inSpan.empty() || outSpan.empty()) {
+            outSpan.publish(0UZ);
+            return work::Status::INSUFFICIENT_INPUT_ITEMS;
+        }
+        outSpan[0UZ] = inSpan[0UZ];
+        outSpan.publish(1UZ);
+        return work::Status::OK;
+    }
+};
+
+/// the frames of SkippingDecimator, handing half its sample rate on through its own forward map
+struct SkippingHalfRateDecimator : Block<SkippingHalfRateDecimator, Resampling<4U, 1U, true>, Stride<10U, true>> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    float sample_rate = 1.f;
+
+    GR_MAKE_REFLECTABLE(SkippingHalfRateDecimator, in, out, sample_rate);
+
+    void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings, property_map& forward) { forwardHalfRate(newSettings, sample_rate, forward); }
 
     work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
         if (inSpan.empty() || outSpan.empty()) {
@@ -493,34 +679,6 @@ struct SkippingForwarder : Block<SkippingForwarder, Resampling<4U, 1U, true>, St
     }
 };
 
-struct AsyncInput : Block<AsyncInput> {
-    PortIn<float, Async> in;
-    PortOut<float>       out;
-
-    GR_MAKE_REFLECTABLE(AsyncInput, in, out);
-
-    work::Status processBulk(InputSpanLike auto&, OutputSpanLike auto&) { return work::Status::OK; }
-};
-
-struct AsyncOutput : Block<AsyncOutput> {
-    PortIn<float>         in;
-    PortOut<float, Async> out;
-
-    GR_MAKE_REFLECTABLE(AsyncOutput, in, out);
-
-    work::Status processBulk(InputSpanLike auto&, OutputSpanLike auto&) { return work::Status::OK; }
-};
-
-/// `Optional` means "may be left unconnected", not "asynchronous", and must not be refused
-struct OptionalOutput : Block<OptionalOutput> {
-    PortIn<float>            in;
-    PortOut<float, Optional> out;
-
-    GR_MAKE_REFLECTABLE(OptionalOutput, in, out);
-
-    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
-};
-
 template<typename TPolicy>
 struct PolicyRelay : Block<PolicyRelay<TPolicy>, TPolicy> {
     PortIn<float>  in;
@@ -530,68 +688,6 @@ struct PolicyRelay : Block<PolicyRelay<TPolicy>, TPolicy> {
 
     [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
 };
-
-struct OwnForwarder : Block<OwnForwarder> {
-    PortIn<float>  in;
-    PortOut<float> out;
-
-    GR_MAKE_REFLECTABLE(OwnForwarder, in, out);
-
-    template<typename TInputSpans, typename TOutputSpans>
-    void forwardTags(TInputSpans&, TOutputSpans&, std::size_t) {}
-
-    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
-};
-
-template<bool kRetireOnlyFirstTag>
-using FloatInputSpan = std::remove_cvref_t<decltype(std::declval<PortIn<float>&>().template get<SpanReleasePolicy::ProcessAll, kRetireOnlyFirstTag>(0UZ))>;
-
-/// an override that accepts the input span of one tag window and refuses the other
-template<bool kRetireOnlyFirstTag>
-struct WindowConstrainedForwarder : Block<WindowConstrainedForwarder<kRetireOnlyFirstTag>> {
-    PortIn<float>  in;
-    PortOut<float> out;
-
-    GR_MAKE_REFLECTABLE(WindowConstrainedForwarder, in, out);
-
-    template<typename TInputSpans, typename TOutputSpans>
-    requires std::is_same_v<std::remove_cvref_t<std::tuple_element_t<0UZ, TInputSpans>>, FloatInputSpan<kRetireOnlyFirstTag>>
-    void forwardTags(TInputSpans&, TOutputSpans&, std::size_t) {}
-
-    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
-};
-
-/// the opt-out beside Resampling<>, which the predicate refuses already
-struct FilteredDecimator : Block<FilteredDecimator, FilteredTagPropagation, Resampling<2U, 1U, true>> {
-    PortIn<float>  in;
-    PortOut<float> out;
-
-    GR_MAKE_REFLECTABLE(FilteredDecimator, in, out);
-
-    work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
-        const std::size_t n = std::min(outSpan.size(), inSpan.size() / 2UZ);
-        for (std::size_t i = 0UZ; i < n; ++i) {
-            outSpan[i] = inSpan[2UZ * i];
-        }
-        std::ignore = inSpan.consume(2UZ * n);
-        outSpan.publish(n);
-        return work::Status::OK;
-    }
-};
-
-/// the opt-out beside `Stride<>` or another tag-propagation policy, which the predicate refuses already
-template<typename TArgument>
-struct FilteredPolicyRelay : Block<FilteredPolicyRelay<TArgument>, FilteredTagPropagation, TArgument> {
-    PortIn<float>  in;
-    PortOut<float> out;
-
-    GR_MAKE_REFLECTABLE(FilteredPolicyRelay, in, out);
-
-    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
-};
-
-template<typename TArgument>
-constexpr bool kOptOutChangesNothing = !FilteredPolicyRelay<TArgument>::forwardsEveryKey() && FilteredPolicyRelay<TArgument>::hasWholeChunkTagWindow() == PolicyRelay<TArgument>::hasWholeChunkTagWindow();
 
 /// passes its input through, and takes the previous output on a second input inside a feedback merge
 struct FeedbackRelay : Block<FeedbackRelay> {
@@ -604,18 +700,16 @@ struct FeedbackRelay : Block<FeedbackRelay> {
     [[nodiscard]] constexpr float processOne(float value, float /*previousOutput*/) const noexcept { return value; }
 };
 
+using SilentRelay       = PolicyRelay<NoTagPropagation>;
 using MergedPlain       = MergeByIndex<Relay, 0UZ, Relay, 0UZ>;
-using MergedFiltered    = MergeByIndex<FilteredRelay, 0UZ, Relay, 0UZ>;
-using MergedSilent      = MergeByIndex<Relay, 0UZ, PolicyRelay<NoTagPropagation>, 0UZ>;
+using MergedSilent      = MergeByIndex<Relay, 0UZ, SilentRelay, 0UZ>;
 using SplitPlain        = SplitMergeCombine<Relay, Relay>;
-using SplitFiltered     = SplitMergeCombine<Relay, FilteredRelay>;
-using SignedFiltered    = SplitMergeCombine<OutputSigns<1.0f, -1.0f>, Relay, FilteredRelay>;
+using SplitSilent       = SplitMergeCombine<Relay, SilentRelay>;
 using FeedbackPlain     = FeedbackMergeByIndex<FeedbackRelay, 0UZ, Relay, 0UZ, 1UZ, void>;
-using FeedbackFiltered  = FeedbackMergeByIndex<FeedbackRelay, 0UZ, FilteredRelay, 0UZ, 1UZ, void>;
-using FeedbackMonitored = FeedbackMergeByIndex<FeedbackRelay, 0UZ, Relay, 0UZ, 1UZ, FilteredRelay>;
-using TapFiltered       = FeedbackMergeWithTapByIndex<FeedbackRelay, 0UZ, FilteredRelay, 0UZ, 1UZ, void>;
+using FeedbackSilent    = FeedbackMergeByIndex<FeedbackRelay, 0UZ, SilentRelay, 0UZ, 1UZ, void>;
+using FeedbackMonitored = FeedbackMergeByIndex<FeedbackRelay, 0UZ, Relay, 0UZ, 1UZ, SilentRelay>;
 using MergedDropping    = MergeByIndex<Relay, 0UZ, DroppingRelay, 0UZ>;
-using MergedBothDrop    = MergeByIndex<DroppingRelay, 0UZ, FilteredDroppingRelay, 0UZ>;
+using MergedForwarding  = MergeByIndex<Relay, 0UZ, DelayingForwarder, 0UZ>;
 
 [[nodiscard]] const pmt::Value* valueOf(const property_map& map, std::string_view key) {
     const auto it = map.find(key);
@@ -702,9 +796,9 @@ template<typename TMiddle>
     auto& source      = flow.emplaceBlock<Source>(gr::property_map{{"name", std::string("src")}});
     source.tagsToEmit = tags;
 
-    auto& first          = flow.emplaceBlock<UnfilteredRelay>(gr::property_map{{"name", std::string("m0")}});
-    auto& second         = flow.emplaceBlock<UnfilteredRelay>(gr::property_map{{"name", std::string("m1")}});
-    auto& third          = flow.emplaceBlock<UnfilteredRelay>(gr::property_map{{"name", std::string("m2")}});
+    auto& first          = flow.emplaceBlock<Relay>(gr::property_map{{"name", std::string("m0")}});
+    auto& second         = flow.emplaceBlock<Relay>(gr::property_map{{"name", std::string("m1")}});
+    auto& third          = flow.emplaceBlock<Relay>(gr::property_map{{"name", std::string("m2")}});
     first.in.min_samples = minSamples;
 
     auto&      sink = flow.emplaceBlock<Sink>(gr::property_map{{"name", std::string("snk")}});
@@ -716,15 +810,45 @@ template<typename TMiddle>
     return std::addressof(sink);
 }
 
+/// what a recording sink read: its sample count and every tag, in arrival order
+struct RecordedRun {
+    std::size_t            nSamples{};
+    std::vector<TagRecord> tags;
+};
+
+/// source -> TMiddle -> recording sink, with the input window set on TMiddle where minSamples is above zero
+template<typename TMiddle>
+[[nodiscard]] RecordedRun runRecorded(const std::vector<TagRecord>& tags, std::size_t nTotal, std::size_t minSamples, std::size_t maxSamples) {
+    using namespace boost::ut;
+
+    gr::Graph flow;
+    auto&     source  = flow.emplaceBlock<Source>(gr::property_map{{"name", std::string("src")}});
+    source.tagsToEmit = tags;
+    source.nTotal     = nTotal;
+    auto& middle      = flow.emplaceBlock<TMiddle>(gr::property_map{{"name", std::string("mid")}});
+    if (minSamples > 0UZ) {
+        middle.in.min_samples = minSamples;
+        middle.in.max_samples = maxSamples;
+    }
+    auto& sink = flow.emplaceBlock<RecordingSink>(gr::property_map{{"name", std::string("snk")}});
+    expect(flow.connect<"out", "in">(source, middle).has_value());
+    expect(flow.connect<"out", "in">(middle, sink).has_value());
+
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler;
+    expect(scheduler.exchange(std::move(flow)).has_value());
+    expect(scheduler.runAndWait().has_value());
+    return RecordedRun{.nSamples = sink.nSamples, .tags = sink.tags};
+}
+
 /// what an end sink recorded
 struct EndResult {
     std::size_t            nSamples{};
     std::vector<TagRecord> endTags;
 };
 
-/// source -> TMiddle -> end sink, with `tags` published by the source
+/// source -> TMiddle -> end sink, with `tags` published by the source and `couplings` as TMiddle's tag coupling table
 template<typename TMiddle>
-[[nodiscard]] EndResult runToEnd(const std::vector<TagRecord>& tags) {
+[[nodiscard]] EndResult runToEnd(const std::vector<TagRecord>& tags, const gr::property_map& couplings = {}) {
     using namespace boost::ut;
 
     gr::Graph flow;
@@ -732,6 +856,9 @@ template<typename TMiddle>
     source.tagsToEmit = tags;
     auto& middle      = flow.emplaceBlock<TMiddle>(gr::property_map{{"name", std::string("mid")}});
     auto& sink        = flow.emplaceBlock<EndSink>(gr::property_map{{"name", std::string("snk")}});
+    if (!couplings.empty()) {
+        middle.settings().setTagCouplings(couplings);
+    }
     expect(flow.connect<"out", "in">(source, middle).has_value());
     expect(flow.connect<"out", "in">(middle, sink).has_value());
 
@@ -742,19 +869,19 @@ template<typename TMiddle>
     return EndResult{sink.nSamples, sink.endTags};
 }
 
-// a composition of blocks that all forward every key, against the same composition with one member filtering
-template<typename TPlain, typename TFiltered>
-void expectComposedKeyRule(std::string_view composition) {
+// a composition of blocks that all forward every key, against the same composition with one member that the composed
+// block cannot forward through
+template<typename TPlain, typename TSilent>
+void expectComposedSilenceRule(std::string_view composition) {
     using namespace boost::ut;
 
     const std::vector<TagRecord> tags{TagRecord{0UZ, protocolTag("r0")}, TagRecord{700UZ, protocolTag("r1")}};
-    const RunResult              plain    = runOnce([&tags](gr::Graph& flow) { return buildSeries<TPlain>(flow, tags); });
-    const RunResult              filtered = runOnce([&tags](gr::Graph& flow) { return buildSeries<TFiltered>(flow, tags); });
+    const RunResult              plain  = runOnce([&tags](gr::Graph& flow) { return buildSeries<TPlain>(flow, tags); });
+    const RunResult              silent = runOnce([&tags](gr::Graph& flow) { return buildSeries<TSilent>(flow, tags); });
 
     const std::vector<std::size_t> offsets{tags[0].index, tags[1].index};
     expect(indicesCarrying(plain.tags, kCustomKey) == offsets) << std::format("{}: members forwarding every key compose into a block forwarding every key", composition);
-    expect(indicesCarrying(filtered.tags, kReservedKey) == offsets) << std::format("{}: the reserved key crosses the composed block", composition);
-    expect(carrying(filtered.tags, kCustomKey).empty()) << std::format("{}: a member declaring FilteredTagPropagation filters the composed block", composition);
+    expect(carrying(silent.tags, kCustomKey).empty() && carrying(silent.tags, kReservedKey).empty()) << std::format("{}: a tag crosses the composed block", composition);
 }
 
 void expectTagIndices(std::string_view scenario, const std::vector<TagRecord>& tags, const std::vector<std::size_t>& expected) {
@@ -765,6 +892,18 @@ void expectTagIndices(std::string_view scenario, const std::vector<TagRecord>& t
     for (std::size_t i = 0UZ; i < std::min(actual.size(), expected.size()); ++i) {
         expect(eq(actual[i], expected[i])) << std::format("{}: tag {} arrived at output index {}, expected {}", scenario, i, actual[i], expected[i]);
     }
+}
+
+/// each sent tag arrives once, at its own index or a later one, and the sink reads every tag in index order
+void expectOnceInOrder(std::string_view scenario, const std::vector<TagRecord>& tags, const std::vector<std::size_t>& sent) {
+    using namespace boost::ut;
+
+    const std::vector<std::size_t> actual = indicesCarrying(tags, kCustomKey);
+    expect(eq(actual.size(), sent.size())) << std::format("{}: {} tags carrying {}, sent {}", scenario, actual.size(), kCustomKey, sent.size());
+    for (std::size_t i = 0UZ; i < std::min(actual.size(), sent.size()); ++i) {
+        expect(ge(actual[i], sent[i])) << std::format("{}: tag {} sent at {} arrived at output index {}", scenario, i, sent[i], actual[i]);
+    }
+    expect(std::ranges::is_sorted(tags, std::ranges::less{}, &TagRecord::index)) << std::format("{}: the sink reads the tags in index order", scenario);
 }
 
 /// a strided block fed a ramp of nTotal samples emits one sample per chunk, and chunk k starts at sample k * stride
@@ -784,51 +923,58 @@ void expectFramesOnStride(std::string_view scenario, const std::vector<float>& s
     expect(eq(onStride, nCompared)) << std::format("{}: every chunk starts a stride after the one before", scenario);
 }
 
-/// the output index at which SkippingDecimator forwards a tag on a skipped sample, or on a chunk sample after the first
+/// two gr:sample_rate tags cross TRelay, coupled to them. Each change leaves TRelay's forward map once, at the output
+/// sample its tag's input sample maps to, and after that tag.
+template<typename TRelay>
+void expectHalfRateAfterEachTag(std::string_view scenario) {
+    using namespace boost::ut;
+
+    constexpr std::size_t        kIn  = TRelay::ResamplingControl::kInputChunkSize;
+    constexpr std::size_t        kOut = TRelay::ResamplingControl::kOutputChunkSize;
+    const std::array<float, 2UZ> rates{1000.f, 3000.f};
+    std::vector<TagRecord>       tags;
+    for (std::size_t i = 0UZ; i < rates.size(); ++i) {
+        property_map map;
+        gr::tag::put(map, gr::tag::SAMPLE_RATE, rates[i]);
+        tags.push_back(TagRecord{i * 700UZ, map});
+    }
+    const property_map couplings{{"sample_rate", std::string(gr::tag::SAMPLE_RATE.key())}};
+    const RunResult    result = runOnce([&](gr::Graph& flow) { return buildSeries<TRelay>(flow, tags, {}, couplings); });
+
+    const std::vector<TagRecord> halves = carrying(result.tags, kHalfRateKey);
+    expect(eq(halves.size(), tags.size())) << std::format("{}: each tag-driven change of the rate leaves the block's forward map once", scenario);
+    for (std::size_t i = 0UZ; i < std::min(halves.size(), tags.size()); ++i) {
+        expect(eq(halves[i].index, tags[i].index * kOut / kIn)) << std::format("{}: the forward map of change {} leaves at the sample its tag maps to", scenario, i);
+        const pmt::Value* half = valueOf(halves[i].map, kHalfRateKey);
+        expect(half != nullptr && eq(half->value_or<float>(0.f), rates[i] / 2.f)) << std::format("{}: the forward map of change {} carries half the tag's rate", scenario, i);
+    }
+    const std::vector<TagRecord> passed = carrying(result.tags, gr::tag::SAMPLE_RATE.key());
+    expect(eq(passed.size(), tags.size())) << std::format("{}: the tags themselves cross the block", scenario);
+    for (std::size_t i = 0UZ; i < std::min(passed.size(), tags.size()); ++i) {
+        const auto atTag = std::ranges::find_if(result.tags, [&](const TagRecord& record) { return record.index == passed[i].index && record.map.contains(kHalfRateKey); });
+        const auto tagAt = std::ranges::find_if(result.tags, [&](const TagRecord& record) { return record.index == passed[i].index && record.map.contains(gr::tag::SAMPLE_RATE.key()); });
+        expect(tagAt <= atTag) << std::format("{}: the forward map of change {} precedes its tag", scenario, i);
+    }
+}
+
+/// the output index at which SkippingDecimator forwards a tag on a skipped sample
 [[nodiscard]] constexpr std::size_t nextChunkOutput(std::size_t inputIndex) noexcept { return inputIndex / SkippingDecimator::StrideControl::kStride + 1UZ; }
 
-} // namespace qa_unfiltered_tag_propagation
+} // namespace qa_uniform_tag_propagation
 
-const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation = [] {
+const boost::ut::suite<"uniform tag propagation"> _uniformTagPropagation = [] {
     using namespace boost::ut;
-    using namespace qa_unfiltered_tag_propagation;
+    using namespace qa_uniform_tag_propagation;
 
-    static_assert(gr::block::kUnfilteredTagPropagationAdmissible<Relay>);
-    static_assert(gr::block::kUnfilteredTagPropagationAdmissible<UnfilteredBulkRelay>);
-    static_assert(gr::block::kUnfilteredTagPropagationAdmissible<OptionalOutput>);
-    static_assert(!gr::block::kUnfilteredTagPropagationAdmissible<Decimating>);
-    static_assert(!gr::block::kUnfilteredTagPropagationAdmissible<SettableRatio>);
-    static_assert(!gr::block::kUnfilteredTagPropagationAdmissible<Strided>);
-    static_assert(!gr::block::kUnfilteredTagPropagationAdmissible<AsyncInput>);
-    static_assert(!gr::block::kUnfilteredTagPropagationAdmissible<AsyncOutput>);
-    static_assert(!gr::block::kUnfilteredTagPropagationAdmissible<PolicyRelay<gr::NoTagPropagation>>);
-    static_assert(!gr::block::kUnfilteredTagPropagationAdmissible<PolicyRelay<gr::ForwardTagPropagation>>);
-    static_assert(!gr::block::kUnfilteredTagPropagationAdmissible<PolicyRelay<gr::BackwardTagPropagation>>);
-    static_assert(!gr::block::kUnfilteredTagPropagationAdmissible<PolicyRelay<gr::MergeTagPropagation>>);
-    static_assert(!gr::block::kUnfilteredTagPropagationAdmissible<OwnForwarder>);
-    static_assert(!gr::block::kUnfilteredTagPropagationAdmissible<ConstrainedForwarder>); // the probe passes the work path's own span tuples
-    static_assert(gr::block::kUnfilteredTagPropagationAdmissible<UnfilteredTailRelay>);
-    static_assert(gr::block::kUnfilteredTagPropagationAdmissible<BulkRelay>);
-    static_assert(!gr::block::kUnfilteredTagPropagationAdmissible<FilteredRelay>);
-    static_assert(!gr::block::kUnfilteredTagPropagationAdmissible<HalvingDecimator>);
-    static_assert(!gr::block::kUnfilteredTagPropagationAdmissible<AsyncOutputRelay>);
-    static_assert(!gr::block::kUnfilteredTagPropagationAdmissible<FirstTagForwarder>);
-    static_assert(Relay::forwardsEveryKey() && UnfilteredRelay::forwardsEveryKey());
-    static_assert(!FilteredRelay::forwardsEveryKey() && !HalvingDecimator::forwardsEveryKey() && !Strided::forwardsEveryKey());
-    static_assert(!AsyncOutputRelay::forwardsEveryKey() && !FirstTagForwarder::forwardsEveryKey());
-    static_assert(WindowConstrainedForwarder<true>::hasForwardTagsOverride() && WindowConstrainedForwarder<false>::hasForwardTagsOverride(), "the probe tries the spans of both tag windows");
-    static_assert(!FilteredDecimator::forwardsEveryKey() && FilteredDecimator::hasWholeChunkTagWindow() == HalvingDecimator::hasWholeChunkTagWindow(), "the opt-out beside Resampling<> changes nothing");
-    static_assert(kOptOutChangesNothing<Stride<2U, true>> && kOptOutChangesNothing<ForwardTagPropagation> && kOptOutChangesNothing<BackwardTagPropagation> && kOptOutChangesNothing<MergeTagPropagation>);
-    static_assert(MergedPlain::forwardsEveryKey() && !MergedFiltered::forwardsEveryKey() && !MergedSilent::forwardsEveryKey());
-    static_assert(SplitPlain::forwardsEveryKey() && !SplitFiltered::forwardsEveryKey() && !SignedFiltered::forwardsEveryKey());
-    static_assert(FeedbackPlain::forwardsEveryKey() && !FeedbackFiltered::forwardsEveryKey() && !FeedbackMonitored::forwardsEveryKey() && !TapFiltered::forwardsEveryKey());
-    static_assert(DroppingRelay::forwardsEveryKey() && DroppingRelay::hasWholeChunkTagWindow(), "a dropped key changes neither the tag window nor the offsets");
-    static_assert(!FilteredDroppingRelay::forwardsEveryKey());
-    static_assert(MergedDropping::forwardsEveryKey() && std::ranges::equal(MergedDropping::DroppedTagKeysControl::kKeys, std::array<std::string_view, 1UZ>{kDroppedKey}));
-    static_assert(!MergedBothDrop::forwardsEveryKey() && std::ranges::equal(MergedBothDrop::DroppedTagKeysControl::kKeys, std::array<std::string_view, 2UZ>{kDroppedKey, kReservedKey}));
+    static_assert(ConstrainedForwarder::hasForwardTagsOverride(), "the probe passes the work path's own span tuples");
+    static_assert(ChunkForwarder::hasForwardTagsOverride() && !Relay::hasForwardTagsOverride());
+    static_assert(!MergedPlain::noTagPropagation && MergedSilent::noTagPropagation, "a merge forwards no tag where a member forwards none");
+    static_assert(!SplitPlain::noTagPropagation && SplitSilent::noTagPropagation);
+    static_assert(!FeedbackPlain::noTagPropagation && FeedbackSilent::noTagPropagation && FeedbackMonitored::noTagPropagation);
+    static_assert(std::ranges::equal(MergedDropping::DroppedTagKeysControl::kKeys, std::array<std::string_view, 1UZ>{kDroppedKey}));
     static_assert(MergedPlain::DroppedTagKeysControl::kKeys.empty() && std::is_same_v<MergedPlain::base_t, Block<MergedPlain>>, "a merge of members listing no key declares no list");
 
-    "an undeclared admissible block forwards every key with its value and offset intact"_test = [] {
+    "a block forwards every key with its value and offset intact"_test = [] {
         const std::vector<TagRecord> tags{TagRecord{0UZ, protocolTag("r0")}, TagRecord{700UZ, protocolTag("r1")}};
         const RunResult              result = runOnce([&tags](gr::Graph& flow) { return buildSeries<Relay, BulkRelay>(flow, tags); });
 
@@ -844,104 +990,80 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
         }
     };
 
-    "an undeclared admissible block keeps an interior tag at the offset it arrived at"_test = [] {
-        constexpr std::size_t        kTotal = 64UZ;
-        constexpr std::size_t        kAt    = 1UZ; // closer to the chunk start than the input minimum, so no boundary can fall on it
+    "a block with an input minimum forwards a tag inside its first chunk once, at its own offset"_test = [] {
+        constexpr std::size_t        kTotal      = 64UZ;
+        constexpr std::size_t        kAt         = 1UZ; // closer to the chunk start than the input minimum, so no boundary can fall on it
+        constexpr std::size_t        kMaxSamples = 7UZ; // the first call reads this many samples, the source's first publish
         const std::vector<TagRecord> tags{TagRecord{kAt, protocolTag("r0")}};
 
-        const RunResult result = runOnce([&tags](gr::Graph& flow) { return buildWindowed<BulkRelay>(flow, tags, kTotal, kInputMinimum, 7UZ); });
-        expectTagIndices("undeclared block, input minimum above one", result.tags, {kAt});
+        const auto windowed = [&tags](std::size_t minSamples) { return [&tags, minSamples](gr::Graph& flow) { return buildWindowed<BulkRelay>(flow, tags, kTotal, minSamples, kMaxSamples); }; };
+        expectTagIndices("input minimum of one, the chunk breaks at the tag", runOnce(windowed(1UZ)).tags, {kAt});
+        expectTagIndices(std::format("input minimum of {}", kInputMinimum), runOnce(windowed(kInputMinimum)).tags, {kAt});
+        expectTagIndices(std::format("processOne block, input minimum of {}", kInputMinimum), runOnce([&tags](gr::Graph& flow) { return buildWindowed<Relay>(flow, tags, kTotal, kInputMinimum, kMaxSamples); }).tags, {kAt});
     };
 
-    "a block declaring FilteredTagPropagation defers an interior tag as a key-filtered block does"_test = [] {
-        constexpr std::size_t        kTotal = 64UZ;
-        constexpr std::size_t        kAt    = 1UZ;
-        const std::vector<TagRecord> tags{TagRecord{kAt, protocolTag("r0")}};
-
-        const RunResult              result   = runOnce([&tags](gr::Graph& flow) { return buildWindowed<FilteredBulkRelay>(flow, tags, kTotal, kInputMinimum, 7UZ); });
-        const std::vector<TagRecord> reserved = carrying(result.tags, kReservedKey);
-        expect(eq(reserved.size(), 1UZ)) << "the reserved key leaves the block once";
-        if (!reserved.empty()) {
-            expect(gt(reserved.front().index, kAt)) << "the tag moves to the first sample of a later chunk";
-        }
-        expect(carrying(result.tags, kCustomKey).empty()) << "the custom key stays behind";
-    };
-
-    "an undeclared block declaring Resampling<> keeps the auto-forward keys alone"_test = [] {
+    "a block declaring Resampling<> places each tag on the output sample its input sample maps to"_test = [] {
         const std::vector<TagRecord> tags{TagRecord{0UZ, protocolTag("r0")}, TagRecord{700UZ, protocolTag("r1")}};
-        const RunResult              result = runOnce([&tags](gr::Graph& flow) { return buildSeries<HalvingDecimator>(flow, tags); });
+        const RunResult              halved = runOnce([&tags](gr::Graph& flow) { return buildSeries<HalvingDecimator>(flow, tags); });
+        expect(indicesCarrying(halved.tags, kCustomKey) == std::vector<std::size_t>{tags[0].index / 2UZ, tags[1].index / 2UZ}) << "a custom key does not cross a decimator at the decimated offset";
 
-        expect(indicesCarrying(result.tags, kReservedKey) == std::vector<std::size_t>{tags[0].index / 2UZ, tags[1].index / 2UZ}) << "the reserved key lands on the decimated offset";
-        expect(carrying(result.tags, kCustomKey).empty()) << "a rate-changing block keeps the key filter";
+        constexpr std::size_t        kInterior = 6UZ; // inside the second chunk of four
+        const std::vector<TagRecord> interior{TagRecord{kInterior, protocolTag("r0")}};
+        const RunResult              quartered = runOnce([&interior](gr::Graph& flow) { return buildSeries<QuarterDecimator>(flow, interior); });
+        expectTagIndices("4:1 decimator, a tag inside a chunk", quartered.tags, {kInterior / 4UZ});
+
+        constexpr std::size_t        kTotal = 64UZ;
+        constexpr std::size_t        kAt    = 2UZ; // inside the first chunk, which the input minimum keeps whole
+        const std::vector<TagRecord> early{TagRecord{kAt, protocolTag("r0")}};
+        const RunResult              tripled = runOnce([&early](gr::Graph& flow) { return buildWindowed<TripleInterpolator>(flow, early, kTotal, kInputMinimum, 8UZ); });
+        expectTagIndices("1:3 interpolator, a tag inside a chunk", tripled.tags, {3UZ * kAt});
     };
 
-    "an undeclared block declaring Stride<> keeps the auto-forward keys alone"_test = [] {
+    "a block declaring BackwardTagPropagation places every tag of a chunk on its first output sample"_test = [] {
+        constexpr std::size_t        kTotal = 64UZ;
+        constexpr std::size_t        kAt    = 2UZ;
+        const std::vector<TagRecord> tags{TagRecord{kAt, protocolTag("r0")}};
+        const RunResult              result = runOnce([&tags](gr::Graph& flow) { return buildWindowed<PolicyRelay<BackwardTagPropagation>>(flow, tags, kTotal, kInputMinimum, 8UZ); });
+        expectTagIndices("BackwardTagPropagation, a tag inside a chunk", result.tags, {0UZ});
+    };
+
+    "a block with an overlapping stride forwards a tag on a sample two chunks read once"_test = [] {
+        constexpr std::size_t        kAt = 3UZ; // read by the chunk at 0 and by the chunk at 2
+        const std::vector<TagRecord> tags{TagRecord{kAt, protocolTag("r0")}};
+        const RunResult              result = runOnce([&tags](gr::Graph& flow) { return buildSeries<OverlappingDecimator>(flow, tags); });
+        // the chunk that consumes the sample publishes the output sample with the chunk's own index
+        expectTagIndices("4:1 decimator stepping two", result.tags, {kAt / OverlappingDecimator::StrideControl::kStride});
+    };
+
+    "a block declaring Stride<> forwards every key"_test = [] {
         const std::vector<TagRecord> tags{TagRecord{0UZ, protocolTag("r0")}};
         const RunResult              result = runOnce([&tags](gr::Graph& flow) { return buildSeries<Strided>(flow, tags); });
-
-        expect(eq(carrying(result.tags, kReservedKey).size(), 1UZ)) << "the reserved key crosses the block";
-        expect(carrying(result.tags, kCustomKey).empty()) << "a strided block keeps the key filter";
+        expect(eq(carrying(result.tags, kCustomKey).size(), 1UZ)) << "a custom key does not cross a strided block";
     };
 
-    "an undeclared block with an asynchronous output keeps the auto-forward keys alone"_test = [] {
+    "a block with an asynchronous output forwards every key"_test = [] {
         const std::vector<TagRecord> tags{TagRecord{0UZ, protocolTag("r0")}, TagRecord{700UZ, protocolTag("r1")}};
         const RunResult              result = runOnce([&tags](gr::Graph& flow) { return buildSeries<AsyncOutputRelay>(flow, tags); });
-
-        expect(eq(carrying(result.tags, kReservedKey).size(), tags.size())) << "the reserved key crosses the block";
-        expect(carrying(result.tags, kCustomKey).empty()) << "an asynchronous port keeps the key filter";
+        expect(eq(carrying(result.tags, kCustomKey).size(), tags.size())) << "a custom key does not cross the block";
     };
 
-    "a block supplying forwardTags() keeps the retired tag window its override reads"_test = [] {
+    "a block supplying forwardTags() that skips a negative relIndex forwards a tag inside a chunk once, at its offset"_test = [] {
         constexpr std::size_t        kTotal = 64UZ;
         constexpr std::size_t        kAt    = 1UZ;
         const std::vector<TagRecord> tags{TagRecord{kAt, protocolTag("r0")}};
-
-        const RunResult              result  = runOnce([&tags](gr::Graph& flow) { return buildWindowed<FirstTagForwarder>(flow, tags, kTotal, kInputMinimum, 7UZ); });
-        const std::vector<TagRecord> carried = carrying(result.tags, kCustomKey);
-        expect(eq(carried.size(), 1UZ)) << "the interior tag reaches the override exactly once";
-        if (!carried.empty()) {
-            expect(gt(carried.front().index, kAt)) << "the override publishes the deferred tag at a later chunk's first sample";
-        }
+        const RunResult              result = runOnce([&tags](gr::Graph& flow) { return buildWindowed<ChunkForwarder>(flow, tags, kTotal, kInputMinimum, 7UZ); });
+        expectTagIndices("forwardTags() override, a tag inside a chunk", result.tags, {kAt});
     };
 
-    "a block declaring FilteredTagPropagation beside Resampling<> forwards as the undeclared block does"_test = [] {
-        const std::vector<TagRecord> tags{TagRecord{0UZ, protocolTag("r0")}, TagRecord{700UZ, protocolTag("r1")}};
-        const RunResult              undeclared = runOnce([&tags](gr::Graph& flow) { return buildSeries<HalvingDecimator>(flow, tags); });
-        const RunResult              declared   = runOnce([&tags](gr::Graph& flow) { return buildSeries<FilteredDecimator>(flow, tags); });
+    "a compile-time merge forwards no tag where a member forwards none"_test = [] { expectComposedSilenceRule<MergedPlain, MergedSilent>("MergeByIndex"); };
 
-        expect(eq(carrying(declared.tags, kReservedKey).size(), tags.size())) << "the reserved key crosses the block";
-        expect(declared.tags == undeclared.tags) << "the opt-out changes no forwarded tag";
-    };
+    "a compile-time merge forwards no tag where a member supplies forwardTags()"_test = [] { expectComposedSilenceRule<MergedPlain, MergedForwarding>("MergeByIndex with a forwardTags() member"); };
 
-    "a block declaring FilteredTagPropagation beside Stride<> or another policy forwards as that block does alone"_test = [] {
-        const std::vector<TagRecord> tags{TagRecord{0UZ, protocolTag("r0")}, TagRecord{700UZ, protocolTag("r1")}};
-        const auto                   compare = [&tags]<typename TArgument>(std::string_view name) {
-            const RunResult alone    = runOnce([&tags](gr::Graph& flow) { return buildSeries<PolicyRelay<TArgument>>(flow, tags); });
-            const RunResult declared = runOnce([&tags](gr::Graph& flow) { return buildSeries<FilteredPolicyRelay<TArgument>>(flow, tags); });
-            expect(!carrying(declared.tags, kReservedKey).empty()) << std::format("{}: the reserved key crosses the block", name);
-            expect(declared.tags == alone.tags) << std::format("{}: the opt-out changes no forwarded tag", name);
-        };
-        compare.template operator()<Stride<2U, true>>("Stride<>");
-        compare.template operator()<ForwardTagPropagation>("ForwardTagPropagation");
-        compare.template operator()<BackwardTagPropagation>("BackwardTagPropagation");
-        compare.template operator()<MergeTagPropagation>("MergeTagPropagation");
-    };
+    "a split-merge-combine forwards no tag where a path forwards none"_test = [] { expectComposedSilenceRule<SplitPlain, SplitSilent>("SplitMergeCombine"); };
 
-    "a compile-time merge keeps the auto-forward keys alone where either half does"_test = [] { expectComposedKeyRule<MergedPlain, MergedFiltered>("MergeByIndex"); };
+    "a feedback merge forwards no tag where its feedback block forwards none"_test = [] { expectComposedSilenceRule<FeedbackPlain, FeedbackSilent>("FeedbackMergeByIndex"); };
 
-    "a split-merge-combine keeps the auto-forward keys alone where any path does"_test = [] { expectComposedKeyRule<SplitPlain, SplitFiltered>("SplitMergeCombine"); };
-
-    "a feedback merge keeps the auto-forward keys alone where its feedback block does"_test = [] { expectComposedKeyRule<FeedbackPlain, FeedbackFiltered>("FeedbackMergeByIndex"); };
-
-    "a feedback merge keeps the auto-forward keys alone where its monitor does"_test = [] { expectComposedKeyRule<FeedbackPlain, FeedbackMonitored>("FeedbackMergeByIndex with a monitor"); };
-
-    "a block declaring FilteredTagPropagation drops a custom key and keeps the reserved one"_test = [] {
-        const std::vector<TagRecord> tags{TagRecord{0UZ, protocolTag("r0")}, TagRecord{700UZ, protocolTag("r1")}};
-        const RunResult              result = runOnce([&tags](gr::Graph& flow) { return buildSeries<FilteredRelay, Relay>(flow, tags); });
-
-        expect(indicesCarrying(result.tags, kReservedKey) == std::vector<std::size_t>{tags[0].index, tags[1].index}) << "a reserved key crosses the filtered block at its offset";
-        expect(carrying(result.tags, kCustomKey).empty()) << "a key outside the auto-forward set must not survive the key filter";
-    };
+    "a feedback merge forwards no tag where its monitor forwards none"_test = [] { expectComposedSilenceRule<FeedbackPlain, FeedbackMonitored>("FeedbackMergeByIndex with a monitor"); };
 
     "the default policy carries the transmit burst keys through blocks that declare nothing about them"_test = [] {
         constexpr std::size_t   kBurstFirst  = 100UZ;
@@ -949,25 +1071,25 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
         constexpr std::uint64_t kBurstTimeNs = 1'720'000'000'123'456'789ULL;
 
         property_map burstStart;
-        gr::tag::put(burstStart, "tx_sob", true);
-        gr::tag::put(burstStart, "tx_time", kBurstTimeNs);
+        gr::tag::put(burstStart, gr::tag::TX_SOB, true);
+        gr::tag::put(burstStart, gr::tag::TX_TIME, kBurstTimeNs);
         property_map burstEnd;
-        gr::tag::put(burstEnd, "tx_eob", true);
+        gr::tag::put(burstEnd, gr::tag::TX_EOB, true);
         const std::vector<TagRecord> tags{TagRecord{kBurstFirst, burstStart}, TagRecord{kBurstLast, burstEnd}};
         const RunResult              result = runOnce([&tags](gr::Graph& flow) { return buildSeries<Relay, Relay>(flow, tags); });
 
-        expect(indicesCarrying(result.tags, "tx_sob") == std::vector{kBurstFirst}) << "tx_sob stays on the burst's first sample";
-        expect(indicesCarrying(result.tags, "tx_time") == std::vector{kBurstFirst}) << "tx_time stays on the burst's first sample";
-        expect(indicesCarrying(result.tags, "tx_eob") == std::vector{kBurstLast}) << "tx_eob stays on the burst's last sample";
+        expect(indicesCarrying(result.tags, gr::tag::TX_SOB.key()) == std::vector{kBurstFirst}) << "tx_sob stays on the burst's first sample";
+        expect(indicesCarrying(result.tags, gr::tag::TX_TIME.key()) == std::vector{kBurstFirst}) << "tx_time stays on the burst's first sample";
+        expect(indicesCarrying(result.tags, gr::tag::TX_EOB.key()) == std::vector{kBurstLast}) << "tx_eob stays on the burst's last sample";
 
         for (const TagRecord& record : result.tags) {
-            if (const pmt::Value* start = valueOf(record.map, "tx_sob"); start != nullptr) {
+            if (const pmt::Value* start = valueOf(record.map, gr::tag::TX_SOB.key()); start != nullptr) {
                 expect(start->holds<bool>() && *start->get_if<bool>()) << "tx_sob keeps its type and value";
             }
-            if (const pmt::Value* time = valueOf(record.map, "tx_time"); time != nullptr) {
+            if (const pmt::Value* time = valueOf(record.map, gr::tag::TX_TIME.key()); time != nullptr) {
                 expect(time->holds<std::uint64_t>() && *time->get_if<std::uint64_t>() == kBurstTimeNs) << "tx_time keeps its type and value";
             }
-            if (const pmt::Value* end = valueOf(record.map, "tx_eob"); end != nullptr) {
+            if (const pmt::Value* end = valueOf(record.map, gr::tag::TX_EOB.key()); end != nullptr) {
                 expect(end->holds<bool>() && *end->get_if<bool>()) << "tx_eob keeps its type and value";
             }
         }
@@ -988,15 +1110,17 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
         expect(indicesCarrying(dropping.tags, kReservedKey) == offsets) << "the reserved key crosses at its offset";
     };
 
-    "a key-filtered block listing a reserved key drops it and keeps the other reserved keys"_test = [] {
-        property_map map = protocolTag("r0");
-        gr::tag::put(map, gr::tag::SIGNAL_NAME, std::string("carrier"));
-        const std::vector<TagRecord> tags{TagRecord{0UZ, map}};
+    "a block listing a gr: key in DroppedTagKeys drops that key and forwards the bare name"_test = [] {
+        const std::string_view bareKey = gr::tag::nameOf(kReservedKey);
+        property_map           map     = protocolTag("r0");
+        gr::tag::put(map, bareKey, std::string("bare"));
+        const std::vector<TagRecord>   tags{TagRecord{0UZ, map}, TagRecord{700UZ, map}};
+        const std::vector<std::size_t> offsets{tags[0].index, tags[1].index};
 
-        const RunResult result = runOnce([&tags](gr::Graph& flow) { return buildSeries<FilteredDroppingRelay>(flow, tags); });
-        expect(eq(carrying(result.tags, gr::tag::SIGNAL_NAME.key()).size(), 1UZ)) << "an unlisted reserved key crosses";
-        expect(carrying(result.tags, kReservedKey).empty()) << "the listed reserved key stops at the block";
-        expect(carrying(result.tags, kCustomKey).empty()) << "the key filter still applies";
+        const RunResult dropping = runOnce([&tags](gr::Graph& flow) { return buildSeries<ReservedKeyDropper, Relay>(flow, tags); });
+        expect(carrying(dropping.tags, kReservedKey).empty()) << "the listed gr: key stops at the block";
+        expect(indicesCarrying(dropping.tags, bareKey) == offsets) << "the bare name of the listed key crosses at its offset";
+        expect(indicesCarrying(dropping.tags, kCustomKey) == offsets) << "a key the block does not list crosses at its offset";
     };
 
     "a compile-time merge drops the keys its members list"_test = [] {
@@ -1009,9 +1133,9 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
         expect(indicesCarrying(result.tags, kCustomKey) == std::vector<std::size_t>{tags[0].index, tags[1].index}) << "the other keys cross the composed block at their offsets";
     };
 
-    "a custom key crosses a chain of unfiltered blocks with its value and offset intact"_test = [] {
+    "a custom key crosses a chain of blocks with its value and offset intact"_test = [] {
         const std::vector<TagRecord> tags{TagRecord{0UZ, protocolTag("r0")}, TagRecord{700UZ, protocolTag("r1")}};
-        const RunResult              result = runOnce([&tags](gr::Graph& flow) { return buildSeries<UnfilteredRelay, UnfilteredRelay>(flow, tags); });
+        const RunResult              result = runOnce([&tags](gr::Graph& flow) { return buildSeries<Relay, Relay>(flow, tags); });
 
         const std::vector<TagRecord> carried = carrying(result.tags, kCustomKey);
         expect(eq(carried.size(), tags.size())) << "every custom key survives two intermediate blocks";
@@ -1032,7 +1156,7 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
         gr::tag::put(map, gr::tag::SAMPLE_RATE, kUpstreamRate);
 
         const std::vector<TagRecord> tags{TagRecord{0UZ, map}};
-        const RunResult              result = runOnce([&tags](gr::Graph& flow) { return buildSeries<UnfilteredCap, UnfilteredRelay>(flow, tags, {}, coupledKeys()); });
+        const RunResult              result = runOnce([&tags](gr::Graph& flow) { return buildSeries<CappingRelay, Relay>(flow, tags, {}, coupledKeys()); });
 
         const std::vector<TagRecord> carried = carrying(result.tags, kCustomKey);
         expect(eq(carried.size(), 1UZ));
@@ -1042,7 +1166,7 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
         const property_map& arrived = carried.front().map;
 
         const pmt::Value* owned = valueOf(arrived, kOwnedKey);
-        expect(owned != nullptr) << "a coupled non-reserved key survives only under the policy, and must survive";
+        expect(owned != nullptr) << "a coupled key does not cross the block";
         if (owned != nullptr) {
             expect(eq(owned->value_or<float>(0.f), kUpstreamGain)) << "the block's capped gain replaces the value the tag carried";
         }
@@ -1060,32 +1184,11 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
         }
     };
 
-    "a coupled setting a tag changes hands its value on through the block's own forward map, after the tag"_test = [] {
-        const std::array<float, 2UZ> rates{1000.f, 3000.f};
-        std::vector<TagRecord>       tags;
-        for (std::size_t i = 0UZ; i < rates.size(); ++i) {
-            property_map map;
-            gr::tag::put(map, gr::tag::SAMPLE_RATE, rates[i]);
-            tags.push_back(TagRecord{i * 700UZ, map});
-        }
-        const property_map couplings{{"sample_rate", std::string(gr::tag::SAMPLE_RATE.key())}};
-        const RunResult    result = runOnce([&](gr::Graph& flow) { return buildSeries<UnfilteredHalfRate>(flow, tags, {}, couplings); });
+    "a coupled setting a tag changes hands its value on through the block's own forward map, after the tag"_test = [] { expectHalfRateAfterEachTag<HalfRateRelay>("1:1 block"); };
 
-        const std::vector<TagRecord> halves = carrying(result.tags, kHalfRateKey);
-        expect(eq(halves.size(), tags.size())) << "each tag-driven change of the rate leaves the block's forward map";
-        for (std::size_t i = 0UZ; i < std::min(halves.size(), tags.size()); ++i) {
-            expect(eq(halves[i].index, tags[i].index)) << std::format("the forward map of change {} leaves at its tag's offset", i);
-            const pmt::Value* half = valueOf(halves[i].map, kHalfRateKey);
-            expect(half != nullptr && eq(half->value_or<float>(0.f), rates[i] / 2.f)) << std::format("the forward map of change {} carries half the tag's rate", i);
-        }
-        const std::vector<TagRecord> passed = carrying(result.tags, gr::tag::SAMPLE_RATE.key());
-        expect(eq(passed.size(), tags.size())) << "the tags themselves cross the block";
-        for (std::size_t i = 0UZ; i < std::min(passed.size(), tags.size()); ++i) {
-            const auto atTag = std::ranges::find_if(result.tags, [&](const TagRecord& record) { return record.index == passed[i].index && record.map.contains(kHalfRateKey); });
-            const auto tagAt = std::ranges::find_if(result.tags, [&](const TagRecord& record) { return record.index == passed[i].index && record.map.contains(gr::tag::SAMPLE_RATE.key()); });
-            expect(tagAt <= atTag) << std::format("the forward map of change {} does not precede its tag", i);
-        }
-    };
+    "a forward map leaves on the next call when the call that fills it publishes no sample"_test = [] { expectHalfRateAfterEachTag<WaitingHalfRateRelay>("processBulk() block that waits on its first call"); };
+
+    "a block declaring Resampling<> hands a tag-driven change on through its own forward map, after the tag"_test = [] { expectHalfRateAfterEachTag<HalfRateDecimator>("2:1 decimator"); };
 
     "a key a block's setting is named after but does not follow crosses with the value it arrived with"_test = [] {
         property_map map = protocolTag("r0");
@@ -1094,7 +1197,7 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
 
         const std::vector<TagRecord>            tags{TagRecord{0UZ, map}};
         const std::array<gr::property_map, 2UZ> set{gr::property_map{{"gain", kUpstreamGain / 2.f}, {"sample_rate", kUpstreamRate / 2.f}}, gr::property_map{}};
-        const RunResult                         result = runOnce([&tags, &set](gr::Graph& flow) { return buildSeries<UnfilteredUnmarked, UnfilteredRelay>(flow, tags, set); });
+        const RunResult                         result = runOnce([&tags, &set](gr::Graph& flow) { return buildSeries<UnmarkedRelay, Relay>(flow, tags, set); });
 
         const std::vector<TagRecord> carried = carrying(result.tags, kCustomKey);
         expect(fatal(eq(carried.size(), 1UZ)));
@@ -1110,45 +1213,13 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
         gr::tag::put(map, "name", 7.f); // the upstream protocol's own use of the name, not a block name
 
         const std::vector<TagRecord> tags{TagRecord{0UZ, map}};
-        const RunResult              unfiltered = runOnce([&tags](gr::Graph& flow) { return buildSeries<UnfilteredRelay, UnfilteredRelay>(flow, tags); });
+        const RunResult              forwarded = runOnce([&tags](gr::Graph& flow) { return buildSeries<Relay, Relay>(flow, tags); });
 
-        const std::vector<TagRecord> carried = carrying(unfiltered.tags, kCustomKey);
+        const std::vector<TagRecord> carried = carrying(forwarded.tags, kCustomKey);
         expect(eq(carried.size(), 1UZ));
         if (!carried.empty()) {
             const pmt::Value* name = valueOf(carried.front().map, "name");
             expect(name != nullptr) << "the key still crosses the block";
-            if (name != nullptr) {
-                expect(name->get_if<float>() != nullptr) << "the upstream value, not the block's own name";
-                expect(eq(name->value_or<float>(0.f), 7.f));
-            }
-        }
-
-        const RunResult filtered = runOnce([&tags](gr::Graph& flow) { return buildSeries<FilteredRelay, FilteredRelay>(flow, tags); });
-        expect(carrying(filtered.tags, "name").empty()) << "under the key filter the key never reaches the substitution at all";
-    };
-
-    "a framework-owned key a filtered block auto-forwards keeps the value it arrived with"_test = [] {
-        property_map map = protocolTag("r0");
-        gr::tag::put(map, "name", 7.f); // the upstream protocol's own use of the name, not a block name
-
-        const std::vector<TagRecord> tags  = {TagRecord{0UZ, map}};
-        const auto                   build = [&tags](gr::Graph& flow) {
-            auto& source      = flow.emplaceBlock<Source>(gr::property_map{{"name", std::string("src")}});
-            source.tagsToEmit = tags;
-            auto& relay       = flow.emplaceBlock<FilteredRelay>(gr::property_map{{"name", std::string("mid")}});
-            relay.settings().addAutoForwardParameters({"name"}); // the set is fixed once the block runs, so it is widened here
-            auto& sink = flow.emplaceBlock<Sink>(gr::property_map{{"name", std::string("snk")}});
-            expect(flow.connect<"out", "in">(source, relay).has_value());
-            expect(flow.connect<"out", "in">(relay, sink).has_value());
-            return std::addressof(sink);
-        };
-        const RunResult result = runOnce(build);
-
-        const std::vector<TagRecord> carried = carrying(result.tags, "name");
-        expect(eq(carried.size(), 1UZ)) << "an auto-forwarded key survives the key filter";
-        if (!carried.empty()) {
-            const pmt::Value* name = valueOf(carried.front().map, "name");
-            expect(name != nullptr);
             if (name != nullptr) {
                 expect(name->get_if<float>() != nullptr) << "the upstream value, not the block's own name";
                 expect(eq(name->value_or<float>(0.f), 7.f));
@@ -1163,7 +1234,7 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
         const std::vector<TagRecord>            tags{TagRecord{0UZ, map}};
         const std::array<gr::property_map, 2UZ> caps{gr::property_map{{"max_gain", kGainCeiling}}, gr::property_map{{"max_gain", 1.f}}};
 
-        const RunResult result  = runOnce([&tags, &caps](gr::Graph& flow) { return buildSeries<UnfilteredCap, UnfilteredCap>(flow, tags, caps, coupledKeys()); });
+        const RunResult result  = runOnce([&tags, &caps](gr::Graph& flow) { return buildSeries<CappingRelay, CappingRelay>(flow, tags, caps, coupledKeys()); });
         const auto      carried = carrying(result.tags, kOwnedKey);
         expect(eq(carried.size(), 1UZ));
         if (!carried.empty()) {
@@ -1171,42 +1242,86 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
         }
     };
 
-    "an unfiltered processBulk block carries custom keys through its own work path"_test = [] {
+    "a processBulk block carries custom keys through its own work path"_test = [] {
         const std::vector<TagRecord> tags{TagRecord{0UZ, protocolTag("r0")}, TagRecord{700UZ, protocolTag("r1")}};
 
-        const RunResult result = runOnce([&tags](gr::Graph& flow) { return buildSeries<UnfilteredRelay, UnfilteredBulkRelay, UnfilteredRelay>(flow, tags); });
+        const RunResult result = runOnce([&tags](gr::Graph& flow) { return buildSeries<Relay, BulkRelay, Relay>(flow, tags); });
         expect(eq(carrying(result.tags, kCustomKey).size(), tags.size())) << "the custom key crosses a processBulk block between two processOne blocks";
     };
 
-    "an interior tag keeps its offset where an input minimum forbids a chunk boundary at it"_test = [] {
-        constexpr std::size_t        kTotal = 64UZ;
-        constexpr std::size_t        kAt    = 1UZ; // closer to the chunk start than the input minimum, so no boundary can fall on it
-        const std::vector<TagRecord> tags{TagRecord{kAt, protocolTag("r0")}};
-
-        const auto windowed = [&tags](std::size_t minSamples) { return [&tags, minSamples](gr::Graph& flow) { return buildWindowed<UnfilteredBulkRelay>(flow, tags, kTotal, minSamples, 7UZ); }; };
-
-        expectTagIndices("input minimum of one", runOnce(windowed(1UZ)).tags, {kAt});
-        expectTagIndices(std::format("input minimum of {}", kInputMinimum), runOnce(windowed(kInputMinimum)).tags, {kAt});
-    };
-
-    "a chain of three unfiltered blocks lands an interior tag at the offset it arrived at"_test = [] {
-        const std::vector<TagRecord>   tags{TagRecord{1UZ, protocolTag("r0")}, TagRecord{701UZ, protocolTag("r1")}, TagRecord{702UZ, protocolTag("r2")}};
-        const std::vector<std::size_t> expected{1UZ, 701UZ, 702UZ}; // the first and the third are interior, the second falls on a boundary
+    "a chain of three blocks with an input minimum delivers each tag once, in order"_test = [] {
+        const std::vector<TagRecord> tags{TagRecord{1UZ, protocolTag("r0")}, TagRecord{701UZ, protocolTag("r1")}, TagRecord{702UZ, protocolTag("r2")}};
 
         const RunResult result = runOnce([&tags](gr::Graph& flow) { return buildChainWindowed(flow, tags, kInputMinimum); });
-        expectTagIndices("three-block chain", result.tags, expected);
+        expectOnceInOrder("three-block chain", result.tags, tags | std::views::transform(&TagRecord::index) | std::ranges::to<std::vector>());
         expect(eq(result.samples.size(), kSamples)) << "every sample reaches the sink";
     };
 
-    "a tag interior to the stream's last chunk still leaves, and the trailing window keeps its offsets"_test = [] {
-        constexpr std::size_t        kTotal = 10UZ; // seven samples, then a three-sample tail below the input minimum
+    "a tag inside the stream's last full chunk and a tag in the trailing window keep their offsets"_test = [] {
+        constexpr std::size_t        kTotal      = 10UZ; // seven samples, then a three-sample tail below the input minimum
+        constexpr std::size_t        kMaxSamples = 7UZ;  // the one full chunk, which the trailing window follows
         const std::vector<TagRecord> tags{TagRecord{3UZ, protocolTag("r0")}, TagRecord{8UZ, protocolTag("r1")}};
 
-        const RunResult result = runOnce([&tags](gr::Graph& flow) { return buildWindowed<UnfilteredTailRelay>(flow, tags, kTotal, kInputMinimum, 7UZ); });
-        expectTagIndices("stream tail", result.tags, {3UZ, 8UZ});
+        const RunResult result = runOnce([&tags](gr::Graph& flow) { return buildWindowed<TailRelay>(flow, tags, kTotal, kInputMinimum, kMaxSamples); });
+        expectTagIndices("stream tail", result.tags, {tags[0].index, tags[1].index});
     };
 
-    "at the end index a custom key crosses a block forwarding every key and stops at the opt-out"_test = [] {
+    "a sink with an input minimum reads each tag of the samples it consumes once"_test = [] {
+        const std::vector<TagRecord> tags{TagRecord{1UZ, protocolTag("a")}, TagRecord{3UZ, protocolTag("b")}, TagRecord{6UZ, protocolTag("c")}, TagRecord{9UZ, protocolTag("d")}};
+        gr::Graph                    flow;
+        auto&                        source = flow.emplaceBlock<Source>(gr::property_map{{"name", std::string("src")}});
+        source.tagsToEmit                   = tags;
+        source.nTotal                       = 20UZ;
+        auto& sink                          = flow.emplaceBlock<TwoSampleSink>(gr::property_map{{"name", std::string("snk")}});
+        sink.in.min_samples                 = kInputMinimum;
+        sink.in.max_samples                 = 7UZ;
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(scheduler.runAndWait().has_value());
+        expectTagIndices("two samples consumed per call", sink.tags, tags | std::views::transform(&TagRecord::index) | std::ranges::to<std::vector>());
+    };
+
+    "a decimator consuming one chunk per call places each tag of the samples it consumed at floor(i / 2), once and in order"_test = [] {
+        const std::vector<TagRecord> tags{TagRecord{1UZ, protocolTag("a")}, TagRecord{3UZ, protocolTag("b")}, TagRecord{4UZ, protocolTag("c")}, TagRecord{9UZ, protocolTag("d")}, TagRecord{15UZ, protocolTag("e")}};
+        constexpr std::size_t        kTotal    = 16UZ;
+        constexpr std::size_t        kWindow   = 6UZ;                    // three chunks per window; a call consumes one
+        constexpr std::size_t        kConsumed = kTotal - kWindow + 2UZ; // the last full window's call consumes one chunk
+
+        const RecordedRun        sink = runRecorded<OneChunkDecimator>(tags, kTotal, kWindow, kWindow);
+        std::vector<std::size_t> expected;
+        for (const TagRecord& tag : tags) {
+            expected.push_back(tag.index < kConsumed ? tag.index / 2UZ : sink.nSamples); // a tag no call consumes leaves at the end index
+        }
+        expectTagIndices("2:1 decimator, one chunk per call", sink.tags, expected);
+        expect(std::ranges::is_sorted(sink.tags, std::ranges::less{}, &TagRecord::index)) << "the sink reads the tags in index order";
+    };
+
+    "a decimator consuming one chunk per call applies a reset_default tag inside its window once"_test = [] {
+        property_map reset;
+        gr::tag::put(reset, gr::tag::RESET_DEFAULTS, true);
+        const std::vector<TagRecord> tags{TagRecord{5UZ, reset}};
+        constexpr std::size_t        kWindow = 6UZ; // three chunks per window; a call consumes one
+
+        gr::Graph flow;
+        auto&     source      = flow.emplaceBlock<Source>(gr::property_map{{"name", std::string("src")}});
+        source.tagsToEmit     = tags;
+        source.nTotal         = 16UZ;
+        auto& middle          = flow.emplaceBlock<ResetCountingDecimator>(gr::property_map{{"name", std::string("mid")}});
+        middle.in.min_samples = kWindow;
+        middle.in.max_samples = kWindow;
+        auto& sink            = flow.emplaceBlock<RecordingSink>(gr::property_map{{"name", std::string("snk")}});
+        expect(flow.connect<"out", "in">(source, middle).has_value());
+        expect(flow.connect<"out", "in">(middle, sink).has_value());
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(scheduler.runAndWait().has_value());
+
+        expect(eq(middle.nResets, tags.size())) << "the reset runs once per reset_default tag";
+        expect(indicesCarrying(sink.tags, gr::tag::RESET_DEFAULTS.key()) == std::vector<std::size_t>{tags[0].index / 2UZ}) << "the reset_default tag leaves once, at the sample its input sample maps to";
+    };
+
+    "at the end index a custom key crosses a block"_test = [] {
         const std::vector<TagRecord> tags{TagRecord{kSamples, protocolTag("end")}};
 
         const auto expectOnce = [](const EndResult& sink, std::string_view scenario) {
@@ -1229,13 +1344,8 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
             }
         };
 
-        expectCustomKept(expectOnce(runToEnd<Relay>(tags), "undeclared block"), "undeclared block");
-        expectCustomKept(expectOnce(runToEnd<UnfilteredRelay>(tags), "unfiltered policy"), "unfiltered policy");
-
-        const std::vector<TagRecord> filtered = expectOnce(runToEnd<FilteredRelay>(tags), "FilteredTagPropagation");
-        for (const TagRecord& record : filtered) {
-            expect(!record.map.contains(kCustomKey)) << "FilteredTagPropagation drops a custom key at the end index";
-        }
+        expectCustomKept(expectOnce(runToEnd<Relay>(tags), "processOne block"), "processOne block");
+        expectCustomKept(expectOnce(runToEnd<BulkRelay>(tags), "processBulk block"), "processBulk block");
     };
 
     "at the end index a key a setting is named after leaves with the value it arrived with"_test = [] {
@@ -1243,7 +1353,7 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
         gr::tag::put(map, kOwnedKey, kUpstreamGain);
         gr::tag::put(map, gr::tag::SAMPLE_RATE, kUpstreamRate);
 
-        const EndResult              result  = runToEnd<UnfilteredCap>({TagRecord{kSamples, map}});
+        const EndResult              result  = runToEnd<CappingRelay>({TagRecord{kSamples, map}});
         const std::vector<TagRecord> carried = carrying(result.endTags, kCustomKey);
         expect(eq(carried.size(), 1UZ)) << "the tag stands once past the last sample";
         expect(eq(carrying(result.endTags, gr::tag::END_OF_STREAM.key()).size(), 1UZ)) << "the end_of_stream key stands once";
@@ -1347,14 +1457,14 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
             tags.push_back(TagRecord{300UZ + 2UZ * i, protocolTag(std::format("dense-{}", i))});
         }
 
-        const RunResult result = runOnce([&tags](gr::Graph& flow) { return buildSeries<UnfilteredRelay, UnfilteredRelay>(flow, tags); });
+        const RunResult result = runOnce([&tags](gr::Graph& flow) { return buildSeries<Relay, Relay>(flow, tags); });
         expect(eq(carrying(result.tags, kCustomKey).size(), tags.size())) << "every custom key survives, none is duplicated";
     };
 };
 
 const boost::ut::suite<"strided tag propagation"> _stridedTagPropagation = [] {
     using namespace boost::ut;
-    using namespace qa_unfiltered_tag_propagation;
+    using namespace qa_uniform_tag_propagation;
 
     constexpr std::size_t kChunk = SkippingDecimator::ResamplingControl::kInputChunkSize;
     constexpr std::size_t kStep  = SkippingDecimator::StrideControl::kStride;
@@ -1368,7 +1478,7 @@ const boost::ut::suite<"strided tag propagation"> _stridedTagPropagation = [] {
 
         const RunResult result = runOnce([&tags](gr::Graph& flow) { return buildSeries<SkippingDecimator>(flow, tags); });
         expect(indicesCarrying(result.tags, kReservedKey) == std::vector<std::size_t>{nextChunkOutput(kChunk)}) << "the reserved key leaves once, at the next chunk";
-        expect(carrying(result.tags, kCustomKey).empty()) << "the skip keeps the key filter";
+        expect(indicesCarrying(result.tags, kCustomKey) == std::vector<std::size_t>{nextChunkOutput(kChunk)}) << "a custom key leaves with the skipped tag";
 
         const std::vector<TagRecord> rates = carrying(result.tags, gr::tag::SAMPLE_RATE.key());
         expect(eq(rates.size(), 1UZ)) << "the rate leaves once";
@@ -1389,12 +1499,12 @@ const boost::ut::suite<"strided tag propagation"> _stridedTagPropagation = [] {
         expect(indicesCarrying(result.tags, kReservedKey) == std::vector<std::size_t>{nextChunkOutput(kAt)}) << "the reserved key leaves at the next chunk";
     };
 
-    "a tag after a chunk's first sample leaves at the next chunk's first output sample"_test = [] {
+    "a tag after a chunk's first sample leaves at that chunk's output sample"_test = [] {
         constexpr std::size_t        kAt = kStep + 2UZ;
         const std::vector<TagRecord> tags{TagRecord{kAt, protocolTag("inside-chunk")}};
 
         const RunResult result = runOnce([&tags](gr::Graph& flow) { return buildSeries<SkippingDecimator>(flow, tags); });
-        expect(indicesCarrying(result.tags, kReservedKey) == std::vector<std::size_t>{nextChunkOutput(kAt)}) << "the skip after the chunk forwards the tag the chunk left";
+        expect(indicesCarrying(result.tags, kReservedKey) == std::vector<std::size_t>{kAt / kStep}) << "the chunk that reads the tag forwards it";
         expectFramesOnStride<SkippingDecimator>("tag inside a chunk", result.samples, kSamples);
     };
 
@@ -1451,6 +1561,27 @@ const boost::ut::suite<"strided tag propagation"> _stridedTagPropagation = [] {
         const EndResult result = runToEnd<SkippingDecimator>({TagRecord{kAt, protocolTag("last-skip")}});
         expect(eq(result.nSamples, kLastChunk / kStep + 1UZ)) << "one output sample per chunk";
         expect(indicesCarrying(result.endTags, kReservedKey) == std::vector<std::size_t>{result.nSamples}) << "the reserved key leaves at the end index";
+    };
+
+    "the forward map of a tag in the stream's last skip leaves at the end index, after the tag"_test = [] {
+        constexpr std::size_t kLastChunk = (kSamples - kChunk) / kStep * kStep;
+        constexpr std::size_t kAt        = kSamples - 2UZ;
+        static_assert(kAt >= kLastChunk + kChunk, "the tag lies in the skip after the last chunk");
+        constexpr float kRate = 2000.f;
+        property_map    map   = protocolTag("last-skip");
+        gr::tag::put(map, gr::tag::SAMPLE_RATE, kRate);
+
+        const EndResult result = runToEnd<SkippingHalfRateDecimator>({TagRecord{kAt, map}}, property_map{{"sample_rate", std::string(gr::tag::SAMPLE_RATE.key())}});
+        const auto      tagAt  = std::ranges::find_if(result.endTags, [](const TagRecord& record) { return record.map.contains(kCustomKey); });
+        const auto      atTag  = std::ranges::find_if(result.endTags, [](const TagRecord& record) { return record.map.contains(kHalfRateKey); });
+        expect(atTag != result.endTags.end()) << "the forward map does not reach the end index";
+        if (atTag == result.endTags.end()) {
+            return;
+        }
+        expect(eq(atTag->index, result.nSamples)) << "the forward map leaves at the end index";
+        const pmt::Value* half = valueOf(atTag->map, kHalfRateKey);
+        expect(half != nullptr && eq(half->value_or<float>(0.f), kRate / 2.f)) << "the forward map carries half the tag's rate";
+        expect(tagAt < atTag) << "the forward map precedes the tag";
     };
 
     "a block supplying forwardTags() is handed a skipped tag in the next chunk"_test = [] {

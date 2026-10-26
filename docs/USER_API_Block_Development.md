@@ -435,7 +435,8 @@ struct WindowedFFT : gr::Block<WindowedFFT<T>, gr::Stride<512U>> { ... };
 A stride longer than the chunk skips the samples between two chunks. The tags on them set the
 block's coupled settings. The default forwarder publishes them at the next chunk's first output
 sample, or at the end-of-stream index. A `forwardTags()` override receives them with the next chunk
-(see `USER_API_Tag_mechanics.md`).
+(see `USER_API_Tag_mechanics.md`). A stride shorter than the chunk reads a sample in two chunks. The
+chunk that consumes a tag's sample forwards it, once.
 
 Downstream examples: converter and filter blocks in `gnuradio4-blocks`.
 
@@ -611,8 +612,15 @@ gr::work::Status processBulk(gr::InputSpanLike auto& inSpan,
 
 ### Tag forwarding policy
 
-By default, tags from all input ports are merged and forwarded to all output ports automatically.
-To handle tags manually, disable default forwarding:
+By default, every tag from every synchronous input port is forwarded to every synchronous output
+port, with every key. On a block with only synchronous stream ports and without `Resampling<>` or
+`Stride<>`, a tag leaves at the offset it arrived at. On a block with `Stride<>` or an asynchronous
+stream port the framework ends a chunk at the next tag, and the tag leaves on the call's first
+output sample. A block declaring `Resampling<>` maps input index `i` of the samples a call consumed
+to `floor(i * output_chunk_size / input_chunk_size)`, after the call. `BackwardTagPropagation` puts
+every tag of a chunk on its first output sample. `DroppedTagKeys<"key", ...>` drops the listed keys.
+A block whose output samples do not stand where the framework puts a tag, a delay for instance,
+handles tags itself, with `forwardTags()` or with default forwarding disabled:
 
 ```cpp
 template<typename T>
