@@ -432,7 +432,8 @@ struct EpilogueFlush : Block<EpilogueFlush> {
     }
 };
 
-/// the rate-changing shape: its own forwardTags() maps each tag to the output offset the rate change puts it at
+/// the rate-changing shape: its own forwardTags() maps each tag to the output offset the rate change puts it at. A
+/// change to its sample_rate leaves under sample_rate through its own forward map.
 struct MappedForwarder : Block<MappedForwarder, Resampling<kDecim, 1U, true>> {
     PortIn<float>  in;
     PortOut<float> out;
@@ -491,10 +492,16 @@ struct MappedForwarder : Block<MappedForwarder, Resampling<kDecim, 1U, true>> {
         }
         return work::Status::OK;
     }
+
+    void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings, property_map& forwardSettings) {
+        if (newSettings.contains("sample_rate")) {
+            forwardSettings.insert_or_assign(std::pmr::string(gr::tag::SAMPLE_RATE.shortKey()), sample_rate);
+        }
+    }
 };
 
-/// stages a forwardable setting inside its own work call and stops, so the framework applies and forwards those
-/// parameters while it still holds the output span
+/// stages a setting inside its own work call and stops. The framework applies it while it still holds the output
+/// span, and the block's forward map carries the new rate under sample_rate.
 struct StageAndStop : Block<StageAndStop> {
     PortIn<float>  in;
     PortOut<float> out;
@@ -520,6 +527,12 @@ struct StageAndStop : Block<StageAndStop> {
             this->requestStop();
         }
         return work::Status::OK;
+    }
+
+    void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings, property_map& forwardSettings) {
+        if (newSettings.contains("sample_rate")) {
+            forwardSettings.insert_or_assign(std::pmr::string(gr::tag::SAMPLE_RATE.shortKey()), sample_rate);
+        }
     }
 };
 

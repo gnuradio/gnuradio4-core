@@ -357,6 +357,51 @@ const boost::ut::suite<"GRC round trip"> grcTests = [] {
         expect(parameters.at("enabled") == pmt::Value(false)) << "a bool setting did not survive";
     };
 
+    "a block's tag couplings survive the round trip, and the loaded block follows its key"_test = [] {
+        registerTestBlocks();
+        PluginLoader& loader = gr::globalPluginLoader();
+
+        gr::Graph          flow;
+        auto&              scale = flow.emplaceBlock<Scale>({{"name", std::string("scale")}, {"gain", 2.5f}});
+        const property_map couplings{{"gain", std::string("foo:gain")}};
+        scale.settings().setTagCouplings(couplings);
+
+        const std::string dump = gr::saveGrc(loader, flow);
+        expect(dump.contains("tag_couplings")) << "the saved graph holds no tag_couplings: " << dump;
+        auto loaded = gr::loadGrc(loader, dump);
+        expect(fatal(eq(loaded->blocks().size(), 1UZ)));
+        gr::SettingsBase& settings = loaded->blocks().front()->settings();
+        expect(settings.tagCouplings() == couplings) << "the table does not survive the round trip";
+
+        const float taggedGain = 4.0f;
+        settings.autoUpdate(gr::Tag{0UZ, property_map{{"foo:gain", taggedGain}}});
+        std::ignore = settings.applyStagedParameters();
+        expect(settings.get("gain") == std::optional<pmt::Value>(pmt::Value(taggedGain))) << "the gain the file sets does not follow the key the file couples it to";
+    };
+
+    "a graph file that couples a setting to a key the framework acts on is refused, naming the block"_test = [] {
+        registerTestBlocks();
+        PluginLoader& loader = gr::globalPluginLoader();
+
+        const std::string document = R"yaml(blocks:
+  - id: qa::Scale
+    parameters:
+      name: scale
+    tag_couplings:
+      gain: "gr:reset_default"
+)yaml";
+
+        std::string reported;
+        try {
+            const auto loaded = gr::loadGrc(loader, document);
+            expect(false) << std::format("{} blocks loaded; a coupling to gr:reset_default must be refused", loaded->blocks().size());
+        } catch (const gr::exception& e) {
+            reported = e.message;
+        }
+        expect(reported.contains("'scale'") && reported.contains("qa::Scale")) << reported;
+        expect(reported.contains("gain") && reported.contains("gr:reset_default")) << reported;
+    };
+
     // a list without a type tag reaches the block as a sequence of type-erased values
     "an untagged list in a graph file sets a vector setting"_test = [] {
         registerTestBlocks();

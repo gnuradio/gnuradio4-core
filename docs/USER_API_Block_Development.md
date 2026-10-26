@@ -165,6 +165,12 @@ gr::Annotated<T, "snake_case_name", Doc<"...">, Unit<"[V]">, Visible, Limits<min
 | `Visible`          | show in UI settings panels                      |
 | `Limits<min, max>` | value range validation (compile-time constants) |
 
+A block declares no tag that sets a setting, and the framework infers nothing from a setting's name.
+The application or the graph couples a setting to a tag key per block instance, with
+`settings().setTagCouplings()`, a graph file's `tag_couplings` or a `TagCouplings` message. A block
+that hands a value downstream writes it into the forward map of `settingsChanged()`. The tag mechanics
+document (`USER_API_Tag_mechanics.md`) gives the full rules.
+
 ### Shorthand alias
 
 Blocks with many settings often define a local alias:
@@ -427,9 +433,9 @@ struct WindowedFFT : gr::Block<WindowedFFT<T>, gr::Stride<512U>> { ... };
 ```
 
 A stride longer than the chunk skips the samples between two chunks. The tags on them set the
-block's settings. The default forwarder publishes them at the next chunk's first output sample, or at
-the end-of-stream index. A `forwardTags()` override receives them with the next chunk (see
-`USER_API_Tag_mechanics.md`).
+block's coupled settings. The default forwarder publishes them at the next chunk's first output
+sample, or at the end-of-stream index. A `forwardTags()` override receives them with the next chunk
+(see `USER_API_Tag_mechanics.md`).
 
 Downstream examples: converter and filter blocks in `gnuradio4-blocks`.
 
@@ -512,11 +518,13 @@ callback refuses a batch that activates another context, the context active befo
 activation is active again. A batch that `removeContext()` staged keeps the context it falls
 back to. When `removeContext()` removed the context active before the activation, the default
 context is active instead. A reset activates the default context: when the callback refuses a
-batch with a reset, the context active before the batch is active again. A setting whose
+batch with a reset, the context active before the batch is active again. A coupled setting
+follows its tag key after that refusal only when it followed it before the reset. A set the
+callback stored with `set()` stays, and its keys decide which settings follow. A setting whose
 `Limits` refuse its value from `oldSettings` keeps the refused value. When tags alone carried
 every value in `newSettings`, the block reports the refusal in a plain message, as it reports a
 tag value outside a setting's `Limits`. Otherwise it reports the exception as an error on its
-message output.
+message output. The block publishes none of the forward map a refusing callback filled.
 
 ### 2-argument variant
 
@@ -540,6 +548,8 @@ void settingsChanged(const gr::property_map& oldSettings,
     }
 }
 ```
+
+The framework publishes this map on the block's outputs. It writes no tag for a setting itself.
 
 ### Common patterns
 

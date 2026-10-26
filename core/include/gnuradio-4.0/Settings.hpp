@@ -7,6 +7,7 @@
 #include <format>
 #include <functional>
 #include <initializer_list>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -189,9 +190,12 @@ std::string enumToString(T&& enum_value) {
  * a batch that activates another context, the context active before the activation is active again. A batch that
  * `removeContext()` staged keeps the context it falls back to. When `removeContext()` removed the context active before
  * the activation, the default context is active instead. A reset activates the default context: when the callback
- * refuses a batch with a reset, the context active before the batch is active again. A member whose limits refuse its
- * value from `oldSettings` keeps the refused value. When tags alone staged every value in `newSettings`, the apply
- * returns the refusal in `refusal` and `tagRefusal`, as it returns a tag value the limits refuse. Otherwise the
+ * refuses a batch with a reset, the context active before the batch is active again. Each coupled setting then follows
+ * its tag key only when it did before the reset, even when the callback called `setTagCouplings()` before it threw. The
+ * refusal puts back which settings follow their keys; a coupling table the callback wrote with `setTagCouplings()`
+ * stays. A set the callback stored with `set()` stays, and its keys decide which settings follow. A member whose limits
+ * refuse its value from `oldSettings` keeps the refused value. When tags alone staged every value in `newSettings`, the
+ * apply returns the refusal in `refusal` and `tagRefusal`, as it returns a tag value the limits refuse. Otherwise the
  * exception reaches the caller.
  */
 template<typename BlockType>
@@ -464,7 +468,6 @@ struct BlockHooks {
     using NameReader              = std::string_view (*)(const void* block);
     using SettingsChangedInvoker  = void (*)(void* block, property_map& oldSettings, property_map& newSettings, property_map& forwardSettings);
     using ResetInvoker            = void (*)(void* block);
-    using ChunkRatioReader        = bool (*)(const void* block, float& ratio);
     using BlockStateReader        = lifecycle::State (*)(const void* block);
 
     std::span<const MemberDescriptor> members{};
@@ -475,7 +478,6 @@ struct BlockHooks {
     NameReader              blockName{nullptr};
     SettingsChangedInvoker  settingsChanged{nullptr};
     ResetInvoker            reset{nullptr};
-    ChunkRatioReader        chunkRatio{nullptr};
     BlockStateReader        blockState{nullptr};
 };
 
@@ -597,16 +599,6 @@ void invokeReset(void* block) {
 }
 
 template<typename TBlock>
-bool readChunkRatio(const void* block, float& ratio) {
-    const TBlock* self = static_cast<const TBlock*>(block);
-    if (self->input_chunk_size == 1ULL && self->output_chunk_size == 1ULL) {
-        return false;
-    }
-    ratio = static_cast<float>(self->output_chunk_size) / static_cast<float>(self->input_chunk_size);
-    return true;
-}
-
-template<typename TBlock>
 lifecycle::State readBlockState(const void* block) {
     return static_cast<const TBlock*>(block)->state();
 }
@@ -696,11 +688,6 @@ template<typename TBlock>
     if constexpr (HasSettingsResetCallback<TBlock>) {
         hooks.reset = &detail::invokeReset<TBlock>;
     }
-    if constexpr (requires { TBlock::ResamplingControl::kEnabled; }) {
-        if constexpr (TBlock::ResamplingControl::kEnabled) {
-            hooks.chunkRatio = &detail::readChunkRatio<TBlock>;
-        }
-    }
     if constexpr (requires(const TBlock block) {
                       { block.state() } -> std::same_as<lifecycle::State>;
                   }) {
@@ -777,10 +764,33 @@ struct SettingsBase {
     [[nodiscard]] virtual std::optional<SettingsCtx> activateContext(SettingsCtx ctx = {}) = 0;
 
     /**
-     * @brief updates parameters based on block input tags for those with keys stored in `autoUpdateParameters()`
-     * Parameter changes to down-stream blocks is controlled via `autoForwardParameters()`
+     * @brief stages the value of each tag key a setting is coupled to, for the settings in `autoUpdateParameters()`
+     *
+     * A `gr:reset_default` or `gr:store_default` key stages a reset or a store. A context key switches the context.
      */
     virtual void autoUpdate(const Tag& tag) = 0;
+
+    /**
+     * @brief couples settings to tag keys
+     *
+     * Each entry maps a setting's name to a tag key, held as a string. A tag that carries the key sets
+     * the setting. An empty key removes the setting's coupling. A setting follows at most one key, and one key may
+     * set several settings. An entry for a coupled setting replaces its key. The table belongs to the block: it holds
+     * in every context, and a reset leaves it as it is.
+     *
+     * A coupled setting follows its key from this call on, whatever set it before. The values the block's `init()`
+     * applies leave it following. A later `set()` of the setting stops it following until a reset. A reset makes
+     * every coupled setting follow again, in every context. A reset that `settingsChanged()` refuses leaves each
+     * setting following as before, unless the callback stored a set with `set()`: that set stays, and its keys decide
+     * which settings follow.
+     *
+     * Throws for a name that is not a writable setting, a key that is not a string, and a key the framework acts on
+     * itself (`gr::tag::kControlKeys`). The message names the entry, and the table is left as it was.
+     */
+    virtual void setTagCouplings(const property_map& couplings) = 0;
+
+    /// the coupled settings, each mapped to its tag key as a string
+    [[nodiscard]] virtual property_map tagCouplings() const = 0;
 
     /**
      * @brief return all (or for selected multiple keys) available active block settings as key-value pairs
@@ -903,8 +913,10 @@ protected:
     SettingsCtx                                                                      _activeCtx{};
     bool                                                                             _contextActivated{false};   ///< set when `_activeCtx.context` moved, consumed by the next apply
     std::optional<SettingsCtx>                                                       _contextBeforeActivation{}; ///< active before the first activation since the last apply; a refused apply makes it active again while the activated context is still active
+    std::optional<std::map<SettingsCtx, std::set<std::string>>>                      _autoUpdateBeforeReset{};   ///< the keys that followed tags in each set before a reset made every coupled setting follow; a refused apply puts them back
     property_map                                                                     _stagedParameters{};
-    std::set<std::string, std::less<>>                                               _taggedKeys{}; ///< the keys of `_stagedParameters` whose value a tag staged last
+    std::set<std::string, std::less<>>                                               _taggedKeys{};   ///< the keys of `_stagedParameters` whose value a tag staged last
+    std::map<std::string, std::string, std::less<>>                                  _tagCouplings{}; ///< setting name to the tag key that sets it
     property_map                                                                     _activeParameters{};
 
     const std::size_t _timePrecisionTolerance = 100; // ns, now used for emscripten
@@ -959,6 +971,9 @@ public:
     [[nodiscard]] bool                       removeContext(SettingsCtx ctx) override;
 
     void autoUpdate(const Tag& tag) override;
+
+    void                       setTagCouplings(const property_map& couplings) override;
+    [[nodiscard]] property_map tagCouplings() const override;
 
     [[nodiscard]] ApplyStagedParametersResult applyStagedParameters() override;
 

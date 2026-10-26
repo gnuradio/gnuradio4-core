@@ -26,6 +26,9 @@ of annotated signal data.
   skips, and not yet forwarded — not a tag seen twice. A custom `forwardTags()` reading more than
   `tags(1)` also sees, at a negative index, the tags it handled in the chunk before. On a `Stride<>`
   block it forwards the ones from the skipped samples (see `forwardTags()` below).
+- **Settings**: a tag sets a setting only where the application or the graph couples the setting to
+  the tag's key: `settings().setTagCouplings()`, a graph file's `tag_couplings` or a `TagCouplings`
+  message. The framework writes no tag for a setting.
 - Tags are **never merged** across different positions or sources. No implicit data loss.
 - **Contexts** (`context` + `time` keys) switch entire settings presets per sample — a pipeline can
   coherently shift between different operating modes.
@@ -66,9 +69,10 @@ at sample 0):
 ```
 
 Standard tag keys are defined in `gr::tag::` (`SAMPLE_RATE`, `SIGNAL_NAME`, ...). Any string key is
-valid. Standard keys cross every forwarding block and update downstream settings. Any other key
-crosses a block with synchronous ports and no resampling, stride, tag-propagation policy or
-`forwardTags()` override (see "Which keys a forwarded tag carries" below).
+valid. Standard keys cross every forwarding block. Any other key crosses a block with synchronous
+ports and no resampling, stride, tag-propagation policy or `forwardTags()` override (see "Which keys
+a forwarded tag carries" below). A key sets a downstream setting only where that block couples the
+setting to it (see the settings section below).
 
 ---
 
@@ -156,10 +160,10 @@ the attempt is refused, reported on `stderr` and the tag dropped, rather than re
 reservation and handing the downstream block ring slots nobody wrote. Publish through the span —
 `outSpan.publishTag(map, offset)` in `processBulk` — not through the port, and not via
 `this->publishTag(map)`, which goes to the ports directly outside processOne dispatch. The framework
-follows the same rule for the settings tags it forwards on your behalf, including a setting a block
-stages from inside its own `processBulk` before calling `requestStop()`: those parameters are applied
-and forwarded on that same work call, through the span it is already holding, just before the
-end-of-stream tag.
+follows the same rule for the forward map a block's `settingsChanged()` fills, including for a setting
+a block stages from inside its own `processBulk` before calling `requestStop()`: the setting is
+applied and the forward map published on that same work call, through the span it is already
+holding, just before the end-of-stream tag.
 
 ---
 
@@ -179,8 +183,7 @@ The default policy breaks chunks at tag boundaries. On a key-filtered block it f
 at position 0 of each chunk. Tags at later positions within the chunk are NOT consumed — they carry
 over to the next chunk where they appear at position 0 (shifted forward). A block forwarding every
 key retires the whole chunk and forwards each tag at its own position. "Which keys a forwarded tag
-carries" below names the blocks of each kind. Each forwarded key is forwarded with value
-substitution (the block's current value replaces the tag value if modified).
+carries" below names the blocks of each kind.
 
 ```
   input:    ▽           ▼              ▽
@@ -357,19 +360,15 @@ republishes it at the next chunk's first sample. A block forwarding every key pu
 own chunk, at its own offset. The settings that tag carries take effect at the chunk's first
 sample. Those settings are in force a few samples before the forwarded tag.
 
-Value substitution works as it does elsewhere and reaches further: a key the block declares as a
-setting is forwarded with the block's own current value, whether or not that key is reserved. A key
-named after one of the settings `Block<>` declares for every block — `input_chunk_size`,
-`output_chunk_size`, `stride`, `disconnect_on_done`, `compute_domain`, `unique_name`, `name`,
-`ui_constraints` — is forwarded with the upstream value instead, because a tag using `name` for its
-own purpose must not be rewritten with the block's name.
+A forwarded key leaves with the value it arrived with. On a block declaring `Resampling<>`,
+`sample_rate` leaves scaled by the chunk ratio (see the decimation section below).
 
 ```
   input tag:  {trigger_name: "burst", record_id: "r7", gain: 10}
 
   standard keys alone ─►  {trigger_name: "burst"}                    record_id and gain dropped
-  every key           ─►  {trigger_name: "burst", record_id: "r7",   record_id passes through,
-                           gain: 2}                                  gain substituted (the block owns it)
+  every key           ─►  {trigger_name: "burst", record_id: "r7",   every key passes as it arrived
+                           gain: 10}
 ```
 
 `UnfilteredTagPropagation` changes nothing at run time on a block that passes the predicate. It
@@ -399,9 +398,8 @@ writes, and the list reaches it only through `filterAndSubstituteTag()`. A block
 time drops the keys of every member. A block declares at most one list, and the build refuses the
 annotation beside `UnfilteredTagPropagation`.
 
-Tags drive settings, which a later section covers in full. A key that crosses a block also drives
-any downstream setting of the same name. That is the mechanism that makes `sample_rate` work,
-applied to a wider key set. Pick key names accordingly.
+A key that crosses a block sets a downstream setting only where that block couples the setting to
+the key. A later section covers the coupling in full.
 
 ### Custom tag forwarding — `forwardTags()`
 
@@ -522,17 +520,70 @@ the capacity are forwarded without dedup tracking (redundant but correct — no 
 
 ## Settings synchronisation
 
-Tags drive automatic settings updates. When a tag arrives with a key matching a block setting (e.g.,
-`sample_rate`), the framework calls `settings().autoUpdate(tag)` which stages the new value. The
-block's `settingsChanged(old, new)` callback fires before the next processing call.
+A tag sets a setting only where the setting is coupled to the tag's key. Blocks declare no coupling;
+the application or the graph sets it per block instance:
+
+```cpp
+auto& gain = graph.emplaceBlock<Gain>();
+gain.settings().setTagCouplings({{"sample_rate", std::string("sample_rate")}});
+```
+
+When a tag carrying `sample_rate` arrives, the framework calls `settings().autoUpdate(tag)`, which
+stages the value for `sample_rate`. The block's `settingsChanged(old, new)` callback fires before
+the next processing call. With no coupling, no setting takes any tag, whatever its name. The key may
+be any string: a block's setting may follow `foo:level` that an out-of-tree block writes.
 
 ```
   upstream                  downstream
   ┌──────────┐              ┌──────────┐
   │ TagSource│──▽───────────│ Gain     │
   │          │  tag:        │          │
-  │          │  {sr: 48k}   │ sr=48000 │    ← auto-updated from tag
+  │          │  {sample_    │ sr=48000 │    ← sample_rate coupled to sample_rate
+  │          │   rate: 48k} │          │
   └──────────┘              └──────────┘
+```
+
+The coupling table maps a setting's name to a key. A setting follows at most one key, and one key
+may set several settings of a block. An entry with an empty key removes a coupling, and
+`settings().tagCouplings()` reads the table. The table belongs to the block: it holds in every
+context, and a reset leaves it as it is. The call refuses a name that is not a writable setting, a
+key that is not a string, and the four keys the framework acts on itself, in either spelling:
+`end_of_stream`, `reset_default`, `store_default` and `context`. The exception names the block, the
+setting and the key, and the table stays as it was.
+
+A coupled setting
+
+- follows its key from the call that couples it, whatever set it before. The values the block's
+  `init()` applies from its constructor's map leave it following.
+- takes the key's value until a caller sets it with `set()`. A reset makes it follow its key again,
+  in every context. A reset that `settingsChanged()` refuses leaves it as it was.
+
+A graph file holds the table in a block's `tag_couplings` map, and the loader applies it after the
+block's `parameters`:
+
+```yaml
+blocks:
+  - id: Gain
+    parameters:
+      name: gain
+      sample_rate: !!float32 1000
+    tag_couplings:
+      sample_rate: "sample_rate"
+```
+
+A `Set` to the block's `TagCouplings` property changes the table at run time, and a `Get` reads it.
+`grinfo` reports each setting's coupled key, read from the instance it inspects, as `tagKey`.
+
+The framework writes no tag for a setting, whether a caller or a tag set it. A block that hands a
+value downstream writes it into the forward map its `settingsChanged(old, new, forward)` receives,
+and the framework publishes that map on the block's outputs:
+
+```cpp
+void settingsChanged(const property_map&, const property_map& newSettings, property_map& forward) {
+    if (newSettings.contains("sample_rate")) {
+        forward.insert_or_assign(std::pmr::string(gr::tag::SAMPLE_RATE.shortKey()), sample_rate);
+    }
+}
 ```
 
 The set of auto-forwarded keys is `settings().autoForwardParameters()` — the standard tag keys
@@ -550,6 +601,15 @@ work::Status processBulk(InputSpanLike auto& input, OutputSpanLike auto& output)
     return work::Status::OK;
 }
 ```
+
+When `settingsChanged()` throws on a batch whose values coupled tags alone carried, each setting
+takes back its earlier value and the block reports the refusal in a plain message. A batch that
+also holds a value from `set()`, a context or a reset is reported as an error. The block publishes
+none of the forward map the refusing call filled. The tag leaves with the value it arrived with.
+When the batch holds a reset, each coupled setting follows its key only when it did before the reset,
+even after a `setTagCouplings()` that the callback itself made before it threw. A coupling table the
+callback wrote with `setTagCouplings()` stays. A set the callback stored with `set()` stays, and its
+keys decide which settings follow.
 
 A block that republishes _every_ input tag itself, whatever its keys, declares `NoTagPropagation`.
 The framework then forwards no tag on its own:
@@ -573,13 +633,6 @@ struct Delay : gr::Block<Delay, gr::NoTagPropagation> {
 
 To rewrite or filter keys per tag rather than republish them all, override `forwardTags()` (see
 "Custom tag forwarding" above).
-
-### Init-time settings forwarding
-
-When a block is constructed with explicit settings (e.g.,
-`emplaceBlock<Gain>({{"sample_rate", 48000.f}})`), the changed settings are re-staged and forwarded
-as a tag in the first work call. This ensures downstream blocks receive the initial configuration
-without requiring an explicit tag from the source.
 
 ### `sample_rate` and decimation/interpolation
 
@@ -610,10 +663,10 @@ Example — a 10× decimator:
            ─┴──┴─
 ```
 
-The ratio is applied wherever the rate is published — to the parameters a settings change forwards,
-and to the `sample_rate` a forwarded tag carries — so the block's own stored `sample_rate` stays at
-the rate it is fed. A block that declares no `sample_rate` of its own publishes the scaled value all
-the same. The decimation block only needs to set `input_chunk_size` in `settingsChanged`:
+The ratio is applied to the `sample_rate` a forwarded tag carries, so the block's own stored
+`sample_rate` stays at the rate it is fed. A block with no `sample_rate` setting also publishes the
+scaled value. A block's own forward map leaves as the block wrote it. The decimation block only
+needs to set `input_chunk_size` in `settingsChanged`:
 
 ```cpp
 void settingsChanged(const property_map&, const property_map&) {
@@ -761,9 +814,11 @@ short key in code (`"sample_rate"`). Keys are aligned with the
 A block acts on a `reset_default` or `store_default` tag as it acts on a `Set` to its `ResetDefaults` or
 `StoreDefaults` property. Either key form acts, with or without the `gr:` prefix, and the value is not read.
 
-While the default context is active, a reset, by tag or by message, restores the default of each setting that `set()`
-changed in that context. A setting that a settings message changed, or that no call has set, follows tags, and a reset
-leaves it at its present value. With a named context active, a reset returns the block to the default context and
+While the default context is active, a reset, by tag or by message, restores the default of each
+setting that `set()` changed in that context, a value from the constructor's map included. A reset
+leaves a setting that a settings message changed, or that no call has set, at its present value.
+After a reset, every coupled setting follows its key again in every context, and the coupling table
+stays as it was. With a named context active, a reset returns the block to the default context and
 restores every default.
 
 A reset and the other keys of its tag apply as one change: the restored defaults, with the tag's own values over them.
@@ -791,8 +846,6 @@ fractional seconds.
 
 - `inputTagsPresent()` is a `bool` check — zero cost in the no-tag path.
 - `input.tags()` is a lazy view over the tag buffer — no allocation.
-- `settings().get()` (for value substitution during forwarding) is allocated lazily via
-  `std::optional` — only when a key the block itself declares as a setting is found in a tag.
 - The processOne dispatch loop checks `_outputTagPending` (a `bool`) per sample —
   branch-predicted, no overhead when no tags are published.
 - Single-input blocks skip multi-port dedup entirely (compile-time `if constexpr`).

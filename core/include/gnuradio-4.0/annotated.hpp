@@ -118,9 +118,8 @@ struct MergeTagPropagation {};
  * fails to compile where it does not. Every other block keeps only its auto-forward keys. Those are the keys in
  * `gr::tag::kDefaultTags` and any added through `settings().addAutoForwardParameters()`.
  *
- * The forwarder substitutes the block's own current value for a key the block declares as a setting. A surviving key
- * that names a setting of a downstream block drives that setting, exactly as `sample_rate` does. The multi-input dedup
- * and the merge rule stay those of the key-filtered forwarder.
+ * Each key leaves with the value it arrived with. The multi-input dedup and the merge rule stay those of the
+ * key-filtered forwarder.
  *
  * Each tag leaves at the offset it arrived at, and the whole consumed chunk is retired. An input `min_samples` above
  * one can leave a tag inside a chunk. A key-filtered block defers that tag to the next chunk. A block forwarding every
@@ -139,9 +138,9 @@ struct UnfilteredTagPropagation {};
  * @brief Forward only the auto-forward keys of each tag on a block that would otherwise forward every key.
  *
  * The forwarder keeps the keys in `gr::tag::kDefaultTags` and any added through
- * `settings().addAutoForwardParameters()`. It substitutes the block's own value for a key the block declares as a
- * setting, and it defers a tag interior to a chunk to the next chunk's first sample. The build refuses the annotation
- * beside `UnfilteredTagPropagation` or `NoTagPropagation`.
+ * `settings().addAutoForwardParameters()`, each with the value it arrived with. It defers a tag interior to a chunk to
+ * the next chunk's first sample. The build refuses the annotation beside `UnfilteredTagPropagation` or
+ * `NoTagPropagation`.
  *
  * The annotation changes nothing on a block that fails `gr::block::kUnfilteredTagPropagationAdmissible` for another
  * reason, such as `Resampling<>`, `Stride<>` or a `forwardTags()` override. A block template whose variants differ in
@@ -160,7 +159,7 @@ struct FilteredTagPropagation {};
  * block composed at compile time drops the keys of every member. A block declares at most one list, and the build
  * refuses the annotation beside `UnfilteredTagPropagation`.
  *
- * @tparam Keys the short names of the dropped keys
+ * @tparam Keys the dropped keys
  */
 template<gr::meta::fixed_string... Keys>
 struct DroppedTagKeys {

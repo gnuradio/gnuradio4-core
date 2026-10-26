@@ -1,5 +1,6 @@
 # The graph the start cases run. It holds a source, two blocks that each open the resource they name when they start,
-# and a sink. `second` takes its sample rate from the stream `first` forwards.
+# and a sink. `first` forwards its sample rate as a gr:sample_rate tag, and `second`, which couples its sample rate to
+# that key, takes it from the stream.
 blocks:
   - id: good::fixed_source<float32>
     parameters:
@@ -13,6 +14,8 @@ blocks:
     parameters:
       name: second
       resource: named-in-the-graph-file
+    tag_couplings:
+      sample_rate: "gr:sample_rate"
   - id: good::cout_sink<float32>
     parameters:
       name: sink

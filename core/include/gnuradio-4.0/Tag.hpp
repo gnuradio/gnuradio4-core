@@ -226,6 +226,9 @@ inline EM_CONSTEXPR_STATIC DefaultTag<"tx_time", std::uint64_t, "ns", "UTC time 
 
 inline constexpr std::array<std::string_view, 22> kDefaultTags = {"sample_rate", "frequency", "signal_name", "num_channels", "signal_quantity", "signal_unit", "signal_min", "signal_max", "n_dropped_samples", "rx_overflow", "trigger_name", "trigger_time", "trigger_offset", "trigger_meta_info", "context", "time", "reset_default", "store_default", "end_of_stream", "tx_sob", "tx_eob", "tx_time"};
 
+/// the keys the framework itself acts on in every block a tag reaches, in either spelling; no setting may be coupled to one
+inline constexpr std::array<std::string_view, 4> kControlKeys = {END_OF_STREAM.key(), RESET_DEFAULTS.key(), STORE_DEFAULTS.key(), CONTEXT.key()};
+
 template<typename T>
 inline void put(property_map& map, std::string_view key, T&& value) {
     auto* res                       = map.get_allocator().resource();
