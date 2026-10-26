@@ -18,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include <gnuradio-4.0/SettingsCtx.hpp>
 #include <gnuradio-4.0/Tag.hpp>
 #include <gnuradio-4.0/Value.hpp>
 #include <gnuradio-4.0/YamlPmt.hpp>
@@ -372,8 +373,8 @@ enum class LevelKind { Root, Subgraph };
             if (context == nullptr) {
                 return std::unexpected(std::format("Unable to create block '{}' of type '{}': a ctx_parameters entry is not a map", block.name, block.type));
             }
-            const pmt::Value*                name              = entryOf(*context, gr::tag::CONTEXT.shortKey());
-            const pmt::Value*                time              = entryOf(*context, gr::tag::CONTEXT_TIME.shortKey());
+            const pmt::Value*                name              = entryOf(*context, gr::settings::kContextField);
+            const pmt::Value*                time              = entryOf(*context, gr::settings::kContextTimeField);
             const pmt::Value*                values            = entryOf(*context, "parameters");
             const std::optional<std::string> label             = name == nullptr ? std::nullopt : stringOf(*name);
             const std::uint64_t*             contextTime       = time == nullptr ? nullptr : time->get_if<std::uint64_t>();
@@ -384,8 +385,8 @@ enum class LevelKind { Root, Subgraph };
             block.contexts.emplace_back(std::format("{} @ {}", *label, *contextTime), mapLines(*contextParameters));
 
             KeysRead contextRead;
-            contextRead.add(gr::tag::CONTEXT.shortKey());
-            contextRead.add(gr::tag::CONTEXT_TIME.shortKey());
+            contextRead.add(gr::settings::kContextField);
+            contextRead.add(gr::settings::kContextTimeField);
             contextRead.add("parameters");
             for (NamedText& left : unreadKeysOf(*context, contextRead)) {
                 unread.emplace_back(std::format("ctx_parameters[{}].{}", at, left.name), std::move(left.value));

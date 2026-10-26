@@ -284,8 +284,8 @@ inline void loadEntrySettings(BlockModel& block, const property_map& grcBlock, c
                 throw gr::exception(std::format("Unable to create block '{}' of type '{}': a ctx_parameters entry is not a map", identity.name, identity.type));
             }
 
-            const auto ctxName       = ctxPar->at(gr::tag::CONTEXT.shortKey()).value_or(std::string_view{});
-            const auto ctxTime       = checked_access_ptr<const std::uint64_t, false>{ctxPar->at(gr::tag::CONTEXT_TIME.shortKey()).get_if<std::uint64_t>()};
+            const auto ctxName       = ctxPar->at(std::pmr::string(gr::settings::kContextField)).value_or(std::string_view{});
+            const auto ctxTime       = checked_access_ptr<const std::uint64_t, false>{ctxPar->at(std::pmr::string(gr::settings::kContextTimeField)).get_if<std::uint64_t>()};
             const auto ctxParameters = checked_access_ptr<const property_map, false>{ctxPar->at("parameters").get_if<property_map>()};
             if (ctxName.data() == nullptr || ctxTime == nullptr || ctxParameters == nullptr) {
                 throw gr::exception(std::format("Unable to create block '{}' of type '{}': a ctx_parameters entry needs a context, a context_time and a parameters map", identity.name, identity.type));

@@ -12,6 +12,11 @@ namespace gr {
 
 namespace settings {
 
+/// the field names of a context and its time in a settings-context message and in a saved graph's ctx_parameters.
+/// `settingsChanged()` receives a newly activated context under kContextField.
+inline constexpr std::string_view kContextField     = "context";
+inline constexpr std::string_view kContextTimeField = "time";
+
 // out-of-line so that this header stays independent of gr::exception and the message plane
 [[noreturn]] void throwInvalidContextType(const pmt::Value& value);
 

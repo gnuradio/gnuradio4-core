@@ -773,7 +773,7 @@ struct SettingsBase {
     /**
      * @brief couples settings to tag keys
      *
-     * Each entry maps a setting's name to a tag key, held as a string. A tag that carries the key sets
+     * Each entry maps a setting's name to a tag key, `domain:name`, held as a string. A tag that carries the key sets
      * the setting. An empty key removes the setting's coupling. A setting follows at most one key, and one key may
      * set several settings. An entry for a coupled setting replaces its key. The table belongs to the block: it holds
      * in every context, and a reset leaves it as it is.
@@ -784,8 +784,9 @@ struct SettingsBase {
      * setting following as before, unless the callback stored a set with `set()`: that set stays, and its keys decide
      * which settings follow.
      *
-     * Throws for a name that is not a writable setting, a key that is not a string, and a key the framework acts on
-     * itself (`gr::tag::kControlKeys`). The message names the entry, and the table is left as it was.
+     * Throws for a name that is not a writable setting, a key that is not a string, a malformed key, and a key the
+     * framework acts on itself (`gr::tag::kControlKeys`). The message names the entry, and the table is left as it
+     * was.
      */
     virtual void setTagCouplings(const property_map& couplings) = 0;
 
@@ -1022,7 +1023,7 @@ protected:
     void                                               addStoredParameters(const property_map& newParameters, const SettingsCtx& ctx);
     void                                               removeExpiredStoredParameters();
     [[nodiscard]] std::optional<std::string>           contextInTag(const Tag& tag) const;
-    [[nodiscard]] std::optional<std::uint64_t>         triggeredTimeInTag(const Tag& tag) const;
+    [[nodiscard]] std::optional<std::uint64_t>         contextTimeInTag(const Tag& tag) const;
     [[nodiscard]] std::optional<SettingsCtx>           createSettingsCtxFromTag(const Tag& tag) const;
     [[nodiscard]] std::string                          describeRefusal(std::string_view key, const pmt::Value& value, std::string_view blockName = {}) const;
     [[nodiscard]] std::string                          describeRefusals(const property_map& refused) const;

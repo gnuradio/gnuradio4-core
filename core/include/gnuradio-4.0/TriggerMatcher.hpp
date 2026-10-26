@@ -267,14 +267,14 @@ inline void verifyFilterState(std::string_view matchCriteria, property_map& stat
 
     std::string triggerName;
     std::string triggerCtx;
-    if (tag.map.contains(tag::TRIGGER_NAME.shortKey()) && tag.map.at(tag::TRIGGER_NAME.shortKey()).holds<std::string>()) {
-        const auto str = tag.map.at(tag::TRIGGER_NAME.shortKey()).value_or(std::string_view{});
+    if (tag.map.contains(tag::TRIGGER_NAME.key()) && tag.map.at(tag::TRIGGER_NAME.key()).holds<std::string>()) {
+        const auto str = tag.map.at(tag::TRIGGER_NAME.key()).value_or(std::string_view{});
         if (str.data() != nullptr) {
             triggerName = str;
         }
     }
-    if (tag.map.contains(tag::CONTEXT.shortKey()) && tag.map.at(tag::CONTEXT.shortKey()).holds<std::string>()) {
-        const auto str = tag.map.at(tag::CONTEXT.shortKey()).value_or(std::string_view{});
+    if (tag.map.contains(tag::CONTEXT.key()) && tag.map.at(tag::CONTEXT.key()).holds<std::string>()) {
+        const auto str = tag.map.at(tag::CONTEXT.key()).value_or(std::string_view{});
         if (str.data()) {
             triggerCtx = str;
         }

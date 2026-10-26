@@ -40,8 +40,8 @@ inline constexpr std::size_t kWindowOutput = kWindow / kDecim;
 inline constexpr std::size_t kInteriorAt   = 5UZ;
 static_assert(kInteriorAt < kWindow && kInteriorAt % kDecim != 0UZ);
 
-/// `trigger_name` because only the standard tag keys survive the default forwarder's key filter
-inline constexpr std::string_view kNameKey = "trigger_name";
+/// `gr:trigger_name` because only the standard tag keys survive the default forwarder's key filter
+inline constexpr std::string_view kNameKey = "gr:trigger_name";
 
 struct TagRecord {
     std::size_t  index{};
@@ -433,7 +433,7 @@ struct EpilogueFlush : Block<EpilogueFlush> {
 };
 
 /// the rate-changing shape: its own forwardTags() maps each tag to the output offset the rate change puts it at. A
-/// change to its sample_rate leaves under sample_rate through its own forward map.
+/// change to its sample_rate leaves under gr:sample_rate through its own forward map.
 struct MappedForwarder : Block<MappedForwarder, Resampling<kDecim, 1U, true>> {
     PortIn<float>  in;
     PortOut<float> out;
@@ -495,13 +495,13 @@ struct MappedForwarder : Block<MappedForwarder, Resampling<kDecim, 1U, true>> {
 
     void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings, property_map& forwardSettings) {
         if (newSettings.contains("sample_rate")) {
-            forwardSettings.insert_or_assign(std::pmr::string(gr::tag::SAMPLE_RATE.shortKey()), sample_rate);
+            forwardSettings.insert_or_assign(std::pmr::string(gr::tag::SAMPLE_RATE.key()), sample_rate);
         }
     }
 };
 
 /// stages a setting inside its own work call and stops. The framework applies it while it still holds the output
-/// span, and the block's forward map carries the new rate under sample_rate.
+/// span, and the block's forward map carries the new rate under gr:sample_rate.
 struct StageAndStop : Block<StageAndStop> {
     PortIn<float>  in;
     PortOut<float> out;
@@ -531,7 +531,7 @@ struct StageAndStop : Block<StageAndStop> {
 
     void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings, property_map& forwardSettings) {
         if (newSettings.contains("sample_rate")) {
-            forwardSettings.insert_or_assign(std::pmr::string(gr::tag::SAMPLE_RATE.shortKey()), sample_rate);
+            forwardSettings.insert_or_assign(std::pmr::string(gr::tag::SAMPLE_RATE.key()), sample_rate);
         }
     }
 };
@@ -754,7 +754,7 @@ const boost::ut::suite<"tag forwarding"> _tagForwarding = [] {
         runChain<MappedForwarder>(
             {2UZ, 12UZ, 13UZ}, // the first chunk stages the retune, the second maps its tags to a non-zero output offset
             [&](MappedForwarder& middle, Sink& sink) {
-                const std::vector<TagRecord> retuned = carrying(sink.tags, "sample_rate");
+                const std::vector<TagRecord> retuned = carrying(sink.tags, gr::tag::SAMPLE_RATE.key());
                 expect(eq(retuned.size(), 1UZ)) << "the staged parameters must reach the sink exactly once";
                 expect(std::ranges::is_sorted(sink.tags, {}, &TagRecord::index)) << "a tag published behind one already in the span breaks the span's order";
                 if (retuned.size() == 1UZ) {
@@ -783,7 +783,7 @@ const boost::ut::suite<"tag forwarding"> _tagForwarding = [] {
         expect(scheduler.exchange(std::move(flow)).has_value());
         expect(scheduler.runAndWait().has_value());
 
-        const std::vector<TagRecord> retuned = carrying(sink.tags, "sample_rate");
+        const std::vector<TagRecord> retuned = carrying(sink.tags, gr::tag::SAMPLE_RATE.key());
         expect(eq(retuned.size(), 1UZ)) << "the staged parameters must reach the sink exactly once";
         if (retuned.size() == 1UZ) {
             expect(eq(retuned.front().index, middle.produced - middle.lastWindow)) << "the tag marks the work call the setting was staged in";

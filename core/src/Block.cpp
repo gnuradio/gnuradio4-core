@@ -322,7 +322,7 @@ std::optional<Message> BlockBase::propertyCallbackActiveContext(std::string_view
         const auto& dataMap = message.data.value();
 
         std::string contextStr;
-        if (auto it = dataMap.find(gr::tag::CONTEXT.shortKey()); it != dataMap.end()) {
+        if (auto it = dataMap.find(gr::settings::kContextField); it != dataMap.end()) {
             if (const auto str = it->second.value_or(std::string_view{}); str.data()) {
                 contextStr = str;
             } else {
@@ -333,7 +333,7 @@ std::optional<Message> BlockBase::propertyCallbackActiveContext(std::string_view
         }
 
         std::uint64_t time = 0;
-        if (auto it = dataMap.find(gr::tag::CONTEXT_TIME.shortKey()); it != dataMap.end()) {
+        if (auto it = dataMap.find(gr::settings::kContextTimeField); it != dataMap.end()) {
             if (const std::uint64_t* timePtr = it->second.get_if<std::uint64_t>(); timePtr) {
                 time = *timePtr;
             }
@@ -352,8 +352,8 @@ std::optional<Message> BlockBase::propertyCallbackActiveContext(std::string_view
     if (message.cmd == Get || message.cmd == Set) {
         const auto& ctx = cbSettings().activeContext();
         message.data    = property_map{
-               {gr::tag::CONTEXT.shortKey(), ctx.context},  //
-               {gr::tag::CONTEXT_TIME.shortKey(), ctx.time} //
+               {std::pmr::string(gr::settings::kContextField), ctx.context}, //
+               {std::pmr::string(gr::settings::kContextTimeField), ctx.time} //
         };
         return message;
     }
@@ -395,7 +395,7 @@ std::optional<Message> BlockBase::propertyCallbackSettingsCtx(std::string_view p
     const auto& dataMap = message.data.value();
 
     std::string contextStr;
-    if (auto it = dataMap.find(gr::tag::CONTEXT.shortKey()); it != dataMap.end()) {
+    if (auto it = dataMap.find(gr::settings::kContextField); it != dataMap.end()) {
         if (const auto str = it->second.value_or(std::string_view{}); str.data()) {
             contextStr = str;
         } else {
@@ -406,7 +406,7 @@ std::optional<Message> BlockBase::propertyCallbackSettingsCtx(std::string_view p
     }
 
     std::uint64_t time = 0;
-    if (auto it = dataMap.find(gr::tag::CONTEXT_TIME.shortKey()); it != dataMap.end()) {
+    if (auto it = dataMap.find(gr::settings::kContextTimeField); it != dataMap.end()) {
         if (const std::uint64_t* timePtr = it->second.get_if<std::uint64_t>(); timePtr) {
             time = *timePtr;
         }

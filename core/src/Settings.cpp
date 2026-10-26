@@ -551,8 +551,8 @@ void CtxSettingsBase::removeExpiredStoredParameters() {
 // --- Private helpers: tag parsing ---
 
 std::optional<std::string> CtxSettingsBase::contextInTag(const Tag& tag) const {
-    if (tag.map.contains(gr::tag::CONTEXT.shortKey())) {
-        const pmt::Value& ctxInfo = tag.map.at(gr::tag::CONTEXT.shortKey());
+    if (tag.map.contains(gr::tag::CONTEXT.key())) {
+        const pmt::Value& ctxInfo = tag.map.at(gr::tag::CONTEXT.key());
         auto              result  = ctxInfo.value_or(std::string_view{});
         if (result.data() != nullptr) {
             return {std::string(result)};
@@ -561,9 +561,9 @@ std::optional<std::string> CtxSettingsBase::contextInTag(const Tag& tag) const {
     return std::nullopt;
 }
 
-std::optional<std::uint64_t> CtxSettingsBase::triggeredTimeInTag(const Tag& tag) const {
-    if (tag.map.contains(gr::tag::TRIGGER_TIME.shortKey())) {
-        const pmt::Value& pmtTimeUtcNs = tag.map.at(gr::tag::TRIGGER_TIME.shortKey());
+std::optional<std::uint64_t> CtxSettingsBase::contextTimeInTag(const Tag& tag) const {
+    if (tag.map.contains(gr::tag::CONTEXT_TIME.key())) {
+        const pmt::Value& pmtTimeUtcNs = tag.map.at(gr::tag::CONTEXT_TIME.key());
         auto              result       = pmt::convert_safely<std::uint64_t>(pmtTimeUtcNs);
         if (result) {
             return *result;
@@ -573,16 +573,14 @@ std::optional<std::uint64_t> CtxSettingsBase::triggeredTimeInTag(const Tag& tag)
 }
 
 std::optional<SettingsCtx> CtxSettingsBase::createSettingsCtxFromTag(const Tag& tag) const {
-    // If CONTEXT is not present then return std::nullopt
-    // IF TRIGGER_TIME is not present then time = now()
+    // a tag without gr:context selects no context, and one without gr:ctx_time selects the context's set for now
 
     if (auto ctxValue = contextInTag(tag); ctxValue.has_value()) {
         SettingsCtx ctx{};
         ctx.context = ctxValue.value();
 
-        // update trigger time if present
-        if (auto triggerTime = triggeredTimeInTag(tag); triggerTime.has_value()) {
-            ctx.time = triggerTime.value();
+        if (auto contextTime = contextTimeInTag(tag); contextTime.has_value()) {
+            ctx.time = contextTime.value();
         }
         if (ctx.time == 0ULL) {
             ctx.time = settings::convertTimePointToUint64Ns(std::chrono::system_clock::now());
@@ -865,7 +863,7 @@ void CtxSettingsBase::autoUpdate(const Tag& tag) {
     const auto& parameters = tag.map;
     bool        wasChanged = false;
     for (const auto& [key, value] : parameters) {
-        // either form of the two keys is staged under its gr: form, which names no member
+        // the two keys are staged under their gr: key, which names no member
         const bool resetKey = key == gr::tag::RESET_DEFAULTS;
         if (resetKey || key == gr::tag::STORE_DEFAULTS) {
             _stagedParameters.insert_or_assign(std::pmr::string(resetKey ? gr::tag::RESET_DEFAULTS.key() : gr::tag::STORE_DEFAULTS.key()), value);
@@ -897,7 +895,11 @@ void CtxSettingsBase::autoUpdate(const Tag& tag) {
 namespace {
 /// why `key` cannot be a coupling's tag key, or nothing for a key that can
 [[nodiscard]] std::optional<std::string_view> refuseTagKey(std::string_view key) {
-    if (std::ranges::any_of(gr::tag::kControlKeys, [key](std::string_view control) { return control == key || control.substr(std::string_view(GR_TAG_PREFIX).size()) == key; })) {
+    const bool printable = std::ranges::all_of(key, [](char c) { return static_cast<unsigned char>(c) > 0x20U && c != 0x7F; });
+    if (key.starts_with(':') || gr::tag::nameOf(key).empty() || !printable) {
+        return "the key is not domain:name with a name and no space";
+    }
+    if (std::ranges::contains(gr::tag::kControlKeys, key)) {
         return "the framework acts on this key in every block";
     }
     return std::nullopt;
@@ -927,10 +929,11 @@ void CtxSettingsBase::setTagCouplings(const property_map& couplings) {
             }
             continue;
         }
-        if (const std::optional<std::string_view> reason = refuseTagKey(spelled)) {
+        const std::string_view canonical = gr::tag::canonicalKey(spelled);
+        if (const std::optional<std::string_view> reason = refuseTagKey(canonical)) {
             throw refuse(setting, key, *reason);
         }
-        table.insert_or_assign(std::string(name), std::string(spelled));
+        table.insert_or_assign(std::string(name), std::string(canonical));
         following.emplace_back(name);
     }
     _tagCouplings = std::move(table);
@@ -1024,7 +1027,7 @@ ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::uniq
         // an activation is exempt from that rule: the newly active context is named after the erase, so a block
         // sees the event even when the two contexts carry the same values
         if (contextActivated && hasSettingsChangedCallback) {
-            staged.insert_or_assign(static_cast<std::pmr::string>(gr::tag::CONTEXT.shortKey()), _activeCtx.context);
+            staged.insert_or_assign(std::pmr::string(settings::kContextField), _activeCtx.context);
         }
 
         updateActiveParametersImpl();

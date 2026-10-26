@@ -1,7 +1,7 @@
 # Tag mechanics — User-API Reference
 
 Tags are key-value metadata attached to specific sample positions in a data stream. They carry
-signal descriptions (`sample_rate`, `signal_name`, ...), trigger events, context switches, and
+signal descriptions (`gr:sample_rate`, `gr:signal_name`, ...), trigger events, context switches, and
 user-defined metadata. Tags propagate through the graph alongside samples — the framework handles
 forwarding, settings synchronisation, and position tracking automatically unless the block opts out.
 
@@ -10,6 +10,10 @@ of annotated signal data.
 
 ## TL;DR
 
+- **Keys**: a tag key is `domain:name`. Only GNU Radio defines a new `gr:` key. Any block may write
+  or read a `gr:` key with the meaning GNU Radio gives it. A block's new keys go in its author's own
+  domain. A key with no colon is in the default domain, and `:name` and `name` are one key. The
+  constants in `gr::tag::` (`SAMPLE_RATE`, `TRIGGER_NAME`, ...) hold the `gr:` keys.
 - **processBulk**: read tags via `input.tags()` on the InputSpan. Publish via
   `outSpan.publishTag(map, offset)`. The framework forwards every tag key across a block with
   synchronous ports and no resampling, stride, tag-propagation policy or `forwardTags()` override.
@@ -30,8 +34,8 @@ of annotated signal data.
   the tag's key: `settings().setTagCouplings()`, a graph file's `tag_couplings` or a `TagCouplings`
   message. The framework writes no tag for a setting.
 - Tags are **never merged** across different positions or sources. No implicit data loss.
-- **Contexts** (`context` + `time` keys) switch entire settings presets per sample — a pipeline can
-  coherently shift between different operating modes.
+- **Contexts** (`gr:context` and `gr:ctx_time` keys) switch entire settings presets per sample — a
+  pipeline can coherently shift between different operating modes.
 
 ---
 
@@ -68,11 +72,11 @@ at sample 0):
             0  1  2  3  4  5  6  7
 ```
 
-Standard tag keys are defined in `gr::tag::` (`SAMPLE_RATE`, `SIGNAL_NAME`, ...). Any string key is
-valid. Standard keys cross every forwarding block. Any other key crosses a block with synchronous
-ports and no resampling, stride, tag-propagation policy or `forwardTags()` override (see "Which keys
-a forwarded tag carries" below). A key sets a downstream setting only where that block couples the
-setting to it (see the settings section below).
+Standard tag keys are defined in `gr::tag::` (`SAMPLE_RATE`, `SIGNAL_NAME`, ...) and are `gr:` keys.
+Any string key is valid. Standard keys cross every forwarding block. Any other key crosses a block
+with synchronous ports and no resampling, stride, tag-propagation policy or `forwardTags()` override
+(see "Which keys a forwarded tag carries" below). A key sets a downstream setting only where that
+block couples the setting to it (see the settings section below).
 
 ---
 
@@ -130,10 +134,14 @@ Publish directly on the OutputSpan:
 
 ```cpp
 work::Status processBulk(InputSpanLike auto& input, OutputSpanLike auto& output) {
-    output.publishTag({{"trigger_name", "peak_detected"}}, 42); // at sample offset 42
+    output.publishTag({{"my:event", "peak_detected"}}, 42); // at sample offset 42
     return work::Status::OK;
 }
 ```
+
+A block publishes the keys it defines in its author's own domain, here `my:`. Only GNU Radio
+defines a `gr:` key. Any block may publish one, `gr:trigger_name` for instance, with the meaning
+GNU Radio gives it.
 
 ### processOne
 
@@ -142,7 +150,7 @@ Use `this->publishTag()` — the framework determines the correct sample offset:
 ```cpp
 T processOne(T input) noexcept {
     if (input > threshold) {
-        this->publishTag({{"trigger_name", "threshold_crossed"}});
+        this->publishTag({{"my:event", "threshold_crossed"}});
     }
     return input;
 }
@@ -361,13 +369,13 @@ own chunk, at its own offset. The settings that tag carries take effect at the c
 sample. Those settings are in force a few samples before the forwarded tag.
 
 A forwarded key leaves with the value it arrived with. On a block declaring `Resampling<>`,
-`sample_rate` leaves scaled by the chunk ratio (see the decimation section below).
+`gr:sample_rate` leaves scaled by the chunk ratio (see the decimation section below).
 
 ```
-  input tag:  {trigger_name: "burst", record_id: "r7", gain: 10}
+  input tag:  {gr:trigger_name: "burst", record_id: "r7", gain: 10}
 
-  standard keys alone ─►  {trigger_name: "burst"}                    record_id and gain dropped
-  every key           ─►  {trigger_name: "burst", record_id: "r7",   every key passes as it arrived
+  standard keys alone ─►  {gr:trigger_name: "burst"}                  record_id and gain dropped
+  every key           ─►  {gr:trigger_name: "burst", record_id: "r7", every key passes as it arrived
                            gain: 10}
 ```
 
@@ -391,7 +399,7 @@ pass the predicate can therefore declare it on every variant.
 describe its output. A block that shifts the carrier frequency, for instance, lists the key that
 states a frequency estimate. The default forwarder drops each listed key, on every chunk and at the
 end-of-stream index, and keeps every other key it would keep without the annotation. It drops a
-listed key at the top level of a tag and inside the map a `trigger_meta_info` key holds. A block
+listed key at the top level of a tag and inside the map a `gr:trigger_meta_info` key holds. A block
 forwarding every key still forwards the rest at the offset each tag arrived at. A key-filtered block
 drops a listed key even where it is a standard key. A `forwardTags()` override publishes what it
 writes, and the list reaches it only through `filterAndSubstituteTag()`. A block composed at compile
@@ -411,8 +419,8 @@ default forwarding logic, at three points:
 - once more when an input's stream ends, with `processedIn` 0.
 
 In that last call the input and output spans hold no samples. An input span's `tags()` holds the tags
-at or past the block's read position, up to the first `end_of_stream` tag on any synchronous input,
-at a relative index of 0 or more. The input's own `end_of_stream` tag is among them, and an override
+at or past the block's read position, up to the first end-of-stream tag on any synchronous input,
+at a relative index of 0 or more. The input's own end-of-stream tag is among them, and an override
 drops that key, since `publishEoS()` publishes the block's own. Tags behind the read position that no
 span retired appear at a negative index, and an override skips them. Offset 0 of an output span is
 the end-of-stream index. On a block with only synchronous ports and no `processEpilogue()`, the end
@@ -525,20 +533,20 @@ the application or the graph sets it per block instance:
 
 ```cpp
 auto& gain = graph.emplaceBlock<Gain>();
-gain.settings().setTagCouplings({{"sample_rate", std::string("sample_rate")}});
+gain.settings().setTagCouplings({{"sample_rate", std::string("gr:sample_rate")}});
 ```
 
-When a tag carrying `sample_rate` arrives, the framework calls `settings().autoUpdate(tag)`, which
-stages the value for `sample_rate`. The block's `settingsChanged(old, new)` callback fires before
-the next processing call. With no coupling, no setting takes any tag, whatever its name. The key may
-be any string: a block's setting may follow `foo:level` that an out-of-tree block writes.
+When a tag carrying `gr:sample_rate` arrives, the framework calls `settings().autoUpdate(tag)`, which
+stages the value for `sample_rate`. The block's `settingsChanged(old, new)` callback fires before the
+next processing call. With no coupling, no setting takes any tag, whatever its name. The key may be in
+any domain: a block's setting may follow `foo:level` that an out-of-tree block writes.
 
 ```
   upstream                  downstream
   ┌──────────┐              ┌──────────┐
   │ TagSource│──▽───────────│ Gain     │
   │          │  tag:        │          │
-  │          │  {sample_    │ sr=48000 │    ← sample_rate coupled to sample_rate
+  │          │  {gr:sample_ │ sr=48000 │    ← sample_rate coupled to gr:sample_rate
   │          │   rate: 48k} │          │
   └──────────┘              └──────────┘
 ```
@@ -547,9 +555,9 @@ The coupling table maps a setting's name to a key. A setting follows at most one
 may set several settings of a block. An entry with an empty key removes a coupling, and
 `settings().tagCouplings()` reads the table. The table belongs to the block: it holds in every
 context, and a reset leaves it as it is. The call refuses a name that is not a writable setting, a
-key that is not a string, and the four keys the framework acts on itself, in either spelling:
-`end_of_stream`, `reset_default`, `store_default` and `context`. The exception names the block, the
-setting and the key, and the table stays as it was.
+key that is not a string or not `domain:name`, and the five keys the framework acts on itself:
+`gr:end_of_stream`, `gr:reset_default`, `gr:store_default`, `gr:context` and `gr:ctx_time`. The
+exception names the block, the setting and the key, and the table stays as it was.
 
 A coupled setting
 
@@ -568,7 +576,7 @@ blocks:
       name: gain
       sample_rate: !!float32 1000
     tag_couplings:
-      sample_rate: "sample_rate"
+      sample_rate: "gr:sample_rate"
 ```
 
 A `Set` to the block's `TagCouplings` property changes the table at run time, and a `Get` reads it.
@@ -581,7 +589,7 @@ and the framework publishes that map on the block's outputs:
 ```cpp
 void settingsChanged(const property_map&, const property_map& newSettings, property_map& forward) {
     if (newSettings.contains("sample_rate")) {
-        forward.insert_or_assign(std::pmr::string(gr::tag::SAMPLE_RATE.shortKey()), sample_rate);
+        forward.insert_or_assign(std::pmr::string(gr::tag::SAMPLE_RATE.key()), sample_rate);
     }
 }
 ```
@@ -634,11 +642,11 @@ struct Delay : gr::Block<Delay, gr::NoTagPropagation> {
 To rewrite or filter keys per tag rather than republish them all, override `forwardTags()` (see
 "Custom tag forwarding" above).
 
-### `sample_rate` and decimation/interpolation
+### `gr:sample_rate` and decimation/interpolation
 
-`sample_rate` receives special treatment in blocks with
-`input_chunk_size != output_chunk_size`. When the framework forwards `sample_rate`, it automatically
-adjusts the value based on the chunk ratio:
+`gr:sample_rate` receives special treatment in blocks with
+`input_chunk_size != output_chunk_size`. When the framework forwards `gr:sample_rate`, it
+automatically adjusts the value based on the chunk ratio:
 
 ```
   forwarded sample_rate = input sample_rate × (output_chunk_size / input_chunk_size)
@@ -663,10 +671,10 @@ Example — a 10× decimator:
            ─┴──┴─
 ```
 
-The ratio is applied to the `sample_rate` a forwarded tag carries, so the block's own stored
+The ratio is applied to the `gr:sample_rate` a forwarded tag carries, so the block's own stored
 `sample_rate` stays at the rate it is fed. A block with no `sample_rate` setting also publishes the
-scaled value. A block's own forward map leaves as the block wrote it. The decimation block only
-needs to set `input_chunk_size` in `settingsChanged`:
+scaled value. A block's own forward map leaves as the block wrote it. The decimation block only needs
+to set `input_chunk_size` in `settingsChanged`:
 
 ```cpp
 void settingsChanged(const property_map&, const property_map&) {
@@ -678,9 +686,9 @@ void settingsChanged(const property_map&, const property_map&) {
 
 ## Contexts — modal settings switching
 
-The `context` and `time` tag keys enable coherent pipeline-wide settings switching. A context is a
-named operating mode (e.g., `"calibration"`, `"measurement"`, `"beam_A"`) with an associated UTC
-timestamp.
+The `gr:context` and `gr:ctx_time` tag keys enable coherent pipeline-wide settings switching. A
+context is a named operating mode (e.g., `"calibration"`, `"measurement"`, `"beam_A"`) with an
+associated UTC timestamp.
 
 ### How contexts work
 
@@ -688,9 +696,9 @@ timestamp.
    `SettingsCtx{.time = ..., .context = "measurement"}`. The settings are stored (not yet applied)
    and associated with that context.
 
-2. **Activate via tag**: when a tag with `context` and/or `time` keys arrives at a block,
-   `autoUpdate` calls `activateContext(ctx)`. This looks up the best-matching stored settings for
-   that context and stages them.
+2. **Activate via tag**: when a tag with a `gr:context` key arrives at a block, `autoUpdate` calls
+   `activateContext(ctx)`. This looks up the best-matching stored settings for that context and
+   stages them.
 
 3. **Pipeline coherence**: the same context tag propagates through the graph. Each block activates
    its own stored settings for that context — the entire pipeline switches coherently at the tagged
@@ -701,8 +709,9 @@ timestamp.
   ┌───────────┐                 ┌────────────┐         ┌────────────┐
   │           │──▽──────────────│ ctx="cal"  │──▽──────│ ctx="cal"  │
   │  tag:     │   propagates    │ gain=0.5   │         │ filter=LP  │
-  │  {ctx:    │   through       │ (stored    │         │ (stored    │
-  │   "cal"}  │   graph         │  for "cal")│         │  for "cal")│
+  │  {gr:     │   through       │ (stored    │         │ (stored    │
+  │  context: │   graph         │  for "cal")│         │  for "cal")│
+  │   "cal"}  │                 │            │         │            │
   └───────────┘                 └────────────┘         └────────────┘
 
   Before tag:  gain=1.0, filter=BP      ← "default" context active
@@ -718,14 +727,14 @@ This mechanism is very powerful for:
 The context string is arbitrary — the user defines the operating modes. Settings for each context
 are stored independently and activated on demand.
 
-### `context` vs `time`
+### `gr:context` vs `gr:ctx_time`
 
-- `context` (string): the mode name — selects WHICH settings to apply
-- `time` (uint64, ns UTC): WHEN the settings should take effect — enables sample-accurate switching
-  synchronised across the pipeline
+- `gr:context` (string): the mode name — selects WHICH settings to apply
+- `gr:ctx_time` (uint64, ns UTC): selects the context's settings set in effect at that time
 
-Both are optional in a tag. A tag with only `context` activates immediately. A tag with both uses the
-timestamp for precise scheduling.
+A tag with only `gr:context` selects the set in effect now. A tag with both selects the set in
+effect at `gr:ctx_time`. The switch reads no other key: a trigger tag's `gr:trigger_time` beside
+`gr:context` does not move it. A block that stores no settings for the context ignores the tag.
 
 ---
 
@@ -734,23 +743,24 @@ timestamp for precise scheduling.
 Trigger tags mark events in the data stream — zero crossings, threshold exceedances, external timing
 events, etc. They use a standard key triplet (plus one optional key):
 
-| Key                 | Type            | Required | Description                                               |
-| ------------------- | --------------- | -------- | --------------------------------------------------------- |
-| `trigger_name`      | `std::string`   | yes      | event identifier (e.g., `"zero_crossing"`, `"beam_in"`)   |
-| `trigger_time`      | `uint64_t` (ns) | yes      | UTC timestamp of the event                                |
-| `trigger_offset`    | `float` (s)     | yes      | sub-sample time offset (compensating analog group delays) |
-| `trigger_meta_info` | `property_map`  | optional | additional key-value pairs (detector ID, amplitude, ...)  |
+| Key                    | Type            | Required | Description                                               |
+| ---------------------- | --------------- | -------- | --------------------------------------------------------- |
+| `gr:trigger_name`      | `std::string`   | yes      | event identifier (e.g., `"zero_crossing"`, `"beam_in"`)   |
+| `gr:trigger_time`      | `uint64_t` (ns) | yes      | UTC timestamp of the event                                |
+| `gr:trigger_offset`    | `float` (s)     | yes      | sub-sample time offset (compensating analog group delays) |
+| `gr:trigger_meta_info` | `property_map`  | optional | additional key-value pairs (detector ID, amplitude, ...)  |
 
-**These keys should always appear together** (except `trigger_meta_info` which is optional). A
-trigger tag without `trigger_time` or `trigger_offset` is incomplete.
+**These keys should always appear together** (except `gr:trigger_meta_info` which is optional). A
+trigger tag without `gr:trigger_time` or `gr:trigger_offset` is incomplete. The keys nested in
+`gr:trigger_meta_info` are free-form.
 
 ```
   trigger tag at sample 5:
   {
-      "trigger_name":      "beam_extraction",
-      "trigger_time":      1720000000000000000,    // UTC ns
-      "trigger_offset":    -0.000023,              // 23 µs before this sample
-      "trigger_meta_info": {
+      "gr:trigger_name":      "beam_extraction",
+      "gr:trigger_time":      1720000000000000000,    // UTC ns
+      "gr:trigger_offset":    -0.000023,              // 23 µs before this sample
+      "gr:trigger_meta_info": {
           "beam_id":    "PS_B1",
           "intensity":  2.3e12
       }
@@ -763,56 +773,63 @@ trigger patterns.
 
 ---
 
-## Standard tag keys — `kDefaultTags`
+## Standard tag keys (`gr:`)
 
-All standard keys use the `gr:` prefix internally (e.g., `gr:sample_rate`) but are referenced by
-short key in code (`"sample_rate"`). Keys are aligned with the
-[SigMF](https://sigmf.org/) standard for interoperability.
+The keys below are `gr:` keys, which GNU Radio defines. Any block may write or read one with the
+meaning given here. Code names them through the constants in `gr::tag::`
+(`gr::tag::SAMPLE_RATE.key()` is `"gr:sample_rate"`, and `.name()` is `"sample_rate"`). A bare
+`sample_rate` is a key in the default domain and means nothing to the framework. Keys are aligned
+with the [SigMF](https://sigmf.org/) standard for interoperability. A `gr:` key's value has the
+type of its constant's `value_type`.
 
 ### Signal description
 
-| Key               | Type          | Unit | Purpose                                                               |
-| ----------------- | ------------- | ---- | --------------------------------------------------------------------- |
-| `sample_rate`     | `float`       | Hz   | sample rate of the stream. Auto-adjusted by decimation/interpolation. |
-| `signal_name`     | `std::string` |      | human-readable signal name (e.g., `"RF_pickup_H"`)                    |
-| `num_channels`    | `gr::Size_t`  |      | interleaved channel count (for multi-channel streams)                 |
-| `signal_quantity` | `std::string` |      | physical quantity (e.g., `"voltage"`, `"current"`)                    |
-| `signal_unit`     | `std::string` |      | SI unit (e.g., `"V"`, `"A"`)                                          |
-| `signal_min`      | `float`       | a.u. | physical minimum (e.g., DAQ range lower bound)                        |
-| `signal_max`      | `float`       | a.u. | physical maximum (e.g., DAQ range upper bound)                        |
+| Key                  | Type          | Unit | Purpose                                                               |
+| -------------------- | ------------- | ---- | --------------------------------------------------------------------- |
+| `gr:sample_rate`     | `float`       | Hz   | sample rate of the stream. Auto-adjusted by decimation/interpolation. |
+| `gr:frequency`       | `double`      | Hz   | center frequency of the stream                                        |
+| `gr:signal_name`     | `std::string` |      | human-readable signal name (e.g., `"RF_pickup_H"`)                    |
+| `gr:num_channels`    | `gr::Size_t`  |      | interleaved channel count (for multi-channel streams)                 |
+| `gr:signal_quantity` | `std::string` |      | physical quantity (e.g., `"voltage"`, `"current"`)                    |
+| `gr:signal_unit`     | `std::string` |      | SI unit (e.g., `"V"`, `"A"`)                                          |
+| `gr:signal_min`      | `float`       | a.u. | physical minimum (e.g., DAQ range lower bound)                        |
+| `gr:signal_max`      | `float`       | a.u. | physical maximum (e.g., DAQ range upper bound)                        |
 
 ### Data quality
 
-| Key                 | Type         | Purpose                                                       |
-| ------------------- | ------------ | ------------------------------------------------------------- |
-| `n_dropped_samples` | `gr::Size_t` | number of samples lost before this point (DAQ overflow, etc.) |
+| Key                    | Type         | Purpose                                                                           |
+| ---------------------- | ------------ | --------------------------------------------------------------------------------- |
+| `gr:n_dropped_samples` | `gr::Size_t` | number of samples lost before this point, counted on the stream it was written on |
+
+A rate change does not rescale `gr:n_dropped_samples`. Its readers count the tags.
 
 ### Triggers
 
-| Key                 | Type           | Unit | Purpose                    |
-| ------------------- | -------------- | ---- | -------------------------- |
-| `trigger_name`      | `std::string`  |      | event identifier           |
-| `trigger_time`      | `uint64_t`     | ns   | UTC timestamp of the event |
-| `trigger_offset`    | `float`        | s    | sub-sample time correction |
-| `trigger_meta_info` | `property_map` |      | additional event metadata  |
+| Key                    | Type           | Unit | Purpose                    |
+| ---------------------- | -------------- | ---- | -------------------------- |
+| `gr:trigger_name`      | `std::string`  |      | event identifier           |
+| `gr:trigger_time`      | `uint64_t`     | ns   | UTC timestamp of the event |
+| `gr:trigger_offset`    | `float`        | s    | sub-sample time correction |
+| `gr:trigger_meta_info` | `property_map` |      | additional event metadata  |
 
 ### Context switching
 
-| Key       | Type            | Purpose                                                      |
-| --------- | --------------- | ------------------------------------------------------------ |
-| `context` | `std::string`   | multiplexing key — selects which stored settings to activate |
-| `time`    | `uint64_t` (ns) | UTC timestamp for sample-accurate context activation         |
+| Key           | Type            | Purpose                                                      |
+| ------------- | --------------- | ------------------------------------------------------------ |
+| `gr:context`  | `std::string`   | multiplexing key — selects which stored settings to activate |
+| `gr:ctx_time` | `uint64_t` (ns) | UTC time at which the tag's context takes effect             |
 
 ### Lifecycle
 
-| Key             | Type   | Purpose                                                      |
-| --------------- | ------ | ------------------------------------------------------------ |
-| `reset_default` | `bool` | reset block settings to stored defaults                      |
-| `store_default` | `bool` | store current settings as new defaults                       |
-| `end_of_stream` | `bool` | signals end of data — downstream blocks transition to `DONE` |
+| Key                | Type   | Purpose                                                      |
+| ------------------ | ------ | ------------------------------------------------------------ |
+| `gr:reset_default` | `bool` | reset block settings to stored defaults                      |
+| `gr:store_default` | `bool` | store current settings as new defaults                       |
+| `gr:end_of_stream` | `bool` | signals end of data — downstream blocks transition to `DONE` |
 
-A block acts on a `reset_default` or `store_default` tag as it acts on a `Set` to its `ResetDefaults` or
-`StoreDefaults` property. Either key form acts, with or without the `gr:` prefix, and the value is not read.
+A block acts on a `gr:reset_default` or `gr:store_default` tag as it acts on a `Set` to its
+`ResetDefaults` or `StoreDefaults` property. The value is not read. A bare `reset_default` or
+`store_default` key acts on nothing.
 
 While the default context is active, a reset, by tag or by message, restores the default of each
 setting that `set()` changed in that context, a value from the constructor's map included. A reset
@@ -824,20 +841,19 @@ restores every default.
 A reset and the other keys of its tag apply as one change: the restored defaults, with the tag's own values over them.
 `settingsChanged()` hears of that change once. A `Set` to `ResetDefaults` that arrives while a reset tag waits to apply
 serves both, and the block's `reset()` runs once. A store runs after the other keys of its tag apply. The stored
-defaults then include the values the tag carries. The tag forwards downstream, and each block it reaches acts on it. A block that
-forwards only its auto-forward keys passes on the short key and drops the `gr:` key. A reset or store sent only in the
-`gr:` form reaches no block past it.
+defaults then include the values the tag carries. The tag forwards downstream, and each block it reaches acts on it.
+A graph builder who wants one block to act sends it a message, not a tag.
 
 ### Transmit bursts
 
-| Key       | Type       | Unit | Purpose                                                                  |
-| --------- | ---------- | ---- | ------------------------------------------------------------------------ |
-| `tx_sob`  | `bool`     |      | the tagged sample is the first of a transmit burst                       |
-| `tx_eob`  | `bool`     |      | the tagged sample is the last of a transmit burst                        |
-| `tx_time` | `uint64_t` | ns   | UTC time at which the tagged sample, a burst's first, leaves the antenna |
+| Key          | Type       | Unit | Purpose                                                                  |
+| ------------ | ---------- | ---- | ------------------------------------------------------------------------ |
+| `gr:tx_sob`  | `bool`     |      | the tagged sample is the first of a transmit burst                       |
+| `gr:tx_eob`  | `bool`     |      | the tagged sample is the last of a transmit burst                        |
+| `gr:tx_time` | `uint64_t` | ns   | UTC time at which the tagged sample, a burst's first, leaves the antenna |
 
-A transmit sink reads these; a receive graph's `trigger_time` is never read as a transmit time. The names are GNU
-Radio 3's; `tx_time` is one count of nanoseconds, as `trigger_time` is, where GNU Radio 3 carried whole and
+A transmit sink reads these; a receive graph's `gr:trigger_time` is never read as a transmit time. The names are GNU
+Radio 3's; `gr:tx_time` is one count of nanoseconds, as `gr:trigger_time` is, where GNU Radio 3 carried whole and
 fractional seconds.
 
 ---
