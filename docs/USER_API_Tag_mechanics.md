@@ -22,8 +22,10 @@ of annotated signal data.
   `FilteredTagPropagation` keeps the standard keys alone on a block that would forward every key.
   `DroppedTagKeys<"key", ...>` drops the listed keys and forwards the rest.
   Override `forwardTags()` for full custom control.
-- A **negative `relIndex`** is a tag deferred out of an earlier chunk and not yet forwarded — not a
-  tag seen twice. A custom `forwardTags()` reading more than `tags(1)` is the one case where it is.
+- A **negative `relIndex`** is a tag deferred out of an earlier chunk, or out of the samples a stride
+  skips, and not yet forwarded — not a tag seen twice. A custom `forwardTags()` reading more than
+  `tags(1)` also sees, at a negative index, the tags it handled in the chunk before. On a `Stride<>`
+  block it forwards the ones from the skipped samples (see `forwardTags()` below).
 - Tags are **never merged** across different positions or sources. No implicit data loss.
 - **Contexts** (`context` + `time` keys) switch entire settings presets per sample — a pipeline can
   coherently shift between different operating modes.
@@ -300,6 +302,8 @@ struct MyBlock : gr::Block<MyBlock, gr::MergeTagPropagation> { ... };
 
 All auto-forward keys from all input tags are merged into a single output tag at position 0.
 This mimics the legacy forwarding behaviour. Last key wins when tags have overlapping keys.
+On a block declaring `Stride<>`, the tags of the samples a stride skips leave as a merged tag of
+their own, at the same output sample as the next chunk's merged tag.
 
 ### No tag propagation (`NoTagPropagation`)
 
@@ -415,6 +419,14 @@ drops that key, since `publishEoS()` publishes the block's own. Tags behind the 
 span retired appear at a negative index, and an override skips them. Offset 0 of an output span is
 the end-of-stream index. On a block with only synchronous ports and no `processEpilogue()`, the end
 call is the only call with `processedIn` 0.
+
+On a block declaring `Stride<>`, the override is not called for the samples a stride skips. Their
+tags stay in the input and reach the next chunk's call at a negative relative index. An override that
+reads a wider window than `tags(1)` sees these tags at `relIndex` from `-(stride - input_chunk_size)` to
+-1, and no earlier call has handed them over. It forwards them at offset 0 and skips only the tags
+before that range, which the previous chunk's call saw. When the stream ends before that chunk, they
+reach only the end call, at a negative index. The example below skips them there and does not forward
+them.
 
 The example adds a key to every tag it forwards, at a chunk and at the end of the stream:
 

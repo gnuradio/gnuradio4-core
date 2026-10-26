@@ -1372,8 +1372,9 @@ public:
     /// chunk from breaking at a tag. That tag stays in the buffer and returns in the next chunk at a negative relIndex.
     /// It has not been forwarded yet. Clamping it to offset 0 publishes it once. Under BackwardTagPropagation, and
     /// on a block forwarding every key, the span retires every tag of the consumed chunk. A block forwarding every key
-    /// publishes each tag at its own relIndex. A forwardTags() override reading a wider window than its policy retires
-    /// sees a deferred tag twice and must skip relIndex < 0.
+    /// publishes each tag at its own relIndex. A tag past an output span's last sample leaves at the span's end. A
+    /// forwardTags() override reading a wider window than its policy retires sees a deferred tag twice and must skip
+    /// relIndex < 0.
     template<typename TInputSpans, typename TOutputSpans>
     void forwardInputTags(TInputSpans& inputSpans, TOutputSpans& outputSpans, std::size_t processedIn, std::optional<std::size_t> tagWindowOverride = {}) noexcept {
         if constexpr (noTagPropagation) {
@@ -1393,7 +1394,7 @@ public:
                     assert(relIndex >= 0 && "a chunk that retires every tag it forwards cannot be handed one back");
                 }
                 const auto offset = backwardTagPropagation ? 0UZ : static_cast<std::size_t>(std::max(std::ptrdiff_t(0), relIndex));
-                for_each_writer_span([&forwarded, offset](auto& out) { out.publishTag(forwarded, offset); }, outputSpans);
+                for_each_writer_span([&forwarded, offset](auto& out) { out.publishTag(forwarded, std::min(offset, out.size())); }, outputSpans);
             }
         };
 
@@ -1593,8 +1594,14 @@ public:
     void applyInputTagsFromPorts(TInputSpans& inputSpans, std::size_t untilLocalIndex = 1UZ) noexcept {
         // the window matches the one the span retires, or a tag retired without being read here would never reach
         // settings at all; an interior tag's settings take effect from the chunk's first sample, not from its own
-        const std::size_t tagWindow = hasWholeChunkTagWindow() ? untilLocalIndex : 1UZ;
+        applyInputTagsInWindow(inputSpans, hasWholeChunkTagWindow() ? untilLocalIndex : 1UZ);
+    }
 
+private:
+    /// apply settings and PortMetaInfo from the tags behind each input's read position and less than tagWindow samples
+    /// past it
+    template<typename TInputSpans>
+    void applyInputTagsInWindow(TInputSpans& inputSpans, std::size_t tagWindow) noexcept {
         for_each_reader_span(
             [this, tagWindow](auto& in) {
                 if (!in.isSync || !in.isConnected) {
@@ -1617,6 +1624,7 @@ public:
             inputPorts<PortType::STREAM>(&self()), inputSpans);
     }
 
+public:
     void applyChangedSettings(bool publishForwardTags = true, property_map* capturedForwardParams = nullptr) {
         if (!settings().changed()) {
             return;
@@ -1707,6 +1715,35 @@ private:
                 }
             },
             ports);
+    }
+
+    /// skip the nSkip input samples a stride passes over between two chunks
+    ///
+    /// The default forwarder treats the skipped samples as a chunk that has no output samples. Their tags set the
+    /// block's settings and port meta information, pass the key filter and the substitution of forwardInputTags(),
+    /// and leave at offset 0. Offset 0 is the block's next output sample: the first output sample of the next chunk, or
+    /// the end-of-stream index. A skip that a call boundary splits forwards each part's tags in its own call. A block
+    /// with a forwardTags() override is handed these tags in the next chunk, at a negative relIndex.
+    void skipInputSamples(std::size_t nSkip) {
+        auto skipIn = prepareStreams(inputPorts<PortType::STREAM>(&self()), nSkip);
+        if constexpr (acceptsPreparedForwardTagsSpans()) {
+            for_each_reader_span([](auto& in) { in.consumeTags(0UZ); }, skipIn); // the tags stay for the next chunk
+        } else {
+            auto skipOut = prepareStreams(outputPorts<PortType::STREAM>(&self()), 0UZ);
+            applyChangedSettings(true, &_pendingForwardParams); // a setting changed since the call began keeps its forwarded parameters
+            applyInputTagsInWindow(skipIn, nSkip);
+            applyChangedSettings(false);
+            forwardInputTags(skipIn, skipOut, nSkip, nSkip);
+            publishSamples(0UZ, skipOut);
+            for_each_reader_span(
+                [nSkip](auto& in) {
+                    if (in.isSync && in.isConnected) {
+                        in.consumeTags(nSkip);
+                    }
+                },
+                skipIn);
+        }
+        consumeReaders(nSkip, skipIn);
     }
 
 public:
@@ -2366,7 +2403,7 @@ public:
             nextTag = std::numeric_limits<std::size_t>::max(); // don't break chunks at tags — tags carry forward
         }
         std::size_t       maxChunk                        = getMergedBlockLimit();
-        const std::size_t inputSkipBefore                 = inputSamplesToSkipBeforeNextChunk(std::min({maxSyncAvailableIn, nextTag, nextEosTag}));
+        const std::size_t inputSkipBefore                 = inputSamplesToSkipBeforeNextChunk(std::min(maxSyncAvailableIn, nextEosTag)); // a skip runs over tags; skipInputSamples() hands their tags on
         const std::size_t nextTagAfterSkip                = nextTag > inputSkipBefore ? nextTag - inputSkipBefore : 0UZ;
         const std::size_t availAfterSkip                  = maxSyncAvailableIn > inputSkipBefore ? maxSyncAvailableIn - inputSkipBefore : 0UZ;
         const std::size_t eosAfterSkip                    = nextEosTag > inputSkipBefore ? nextEosTag - inputSkipBefore : 0UZ;
@@ -2613,9 +2650,7 @@ public:
         SampleLimits limits = computeSampleLimits(requestedWork);
 
         if (limits.inputSkipBefore > 0) {
-            auto skipSpans = prepareStreams(inputPorts<PortType::STREAM>(&self()), limits.inputSkipBefore);
-            applyInputTagsFromPorts(skipSpans, limits.inputSkipBefore);
-            consumeReaders(limits.inputSkipBefore, skipSpans);
+            skipInputSamples(limits.inputSkipBefore);
         }
 
         const bool drainStalled = isDrainStalled(limits.draining); // evaluated before the test below, which would short-circuit past the bookkeeping

@@ -426,6 +426,11 @@ template<typename T>
 struct WindowedFFT : gr::Block<WindowedFFT<T>, gr::Stride<512U>> { ... };
 ```
 
+A stride longer than the chunk skips the samples between two chunks. The tags on them set the
+block's settings. The default forwarder publishes them at the next chunk's first output sample, or at
+the end-of-stream index. A `forwardTags()` override receives them with the next chunk (see
+`USER_API_Tag_mechanics.md`).
+
 Downstream examples: converter and filter blocks in `gnuradio4-blocks`.
 
 ## Lifecycle methods

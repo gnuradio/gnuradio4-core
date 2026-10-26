@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <memory>
 #include <ranges>
 #include <string>
 #include <string_view>
@@ -30,6 +31,9 @@
  * They also check the multi-input dedup, the merge rule, the key-filtered forwarding of a block the predicate refuses,
  * and the keys a block lists in `DroppedTagKeys`. The compile-time guards are checked twice. This file checks the
  * predicate, and seven translation units under `compile_fail/` must fail to build.
+ *
+ * A second suite checks a block declaring `Stride<>`. A tag on a sample it skips leaves at the next chunk's first
+ * output sample, and every chunk starts where the stride puts it.
  *
  * The blocks are defined here: gnuradio4-core carries no standard block library, so a core test may not depend on one.
  */
@@ -400,6 +404,59 @@ struct Strided : Block<Strided, Stride<2U, true>> {
     [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
 };
 
+/// reads four samples, then skips six. Each output sample is the first sample of its chunk, which on a ramp is the
+/// chunk's stream index. The block caps the rate it is fed.
+struct SkippingDecimator : Block<SkippingDecimator, Resampling<4U, 1U, true>, Stride<10U, true>> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    float sample_rate     = 1000.f;
+    float max_sample_rate = kRateCeiling;
+
+    GR_MAKE_REFLECTABLE(SkippingDecimator, in, out, sample_rate, max_sample_rate);
+
+    void settingsChanged(const property_map& /*oldSettings*/, const property_map& /*newSettings*/) { sample_rate = std::min(sample_rate, max_sample_rate); }
+
+    work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
+        if (inSpan.empty() || outSpan.empty()) {
+            outSpan.publish(0UZ);
+            return work::Status::INSUFFICIENT_INPUT_ITEMS;
+        }
+        outSpan[0UZ] = inSpan[0UZ];
+        outSpan.publish(1UZ);
+        return work::Status::OK;
+    }
+};
+
+/// the frames of SkippingDecimator, with a forwardTags() that republishes every tag at relIndex <= 0 whole
+struct SkippingForwarder : Block<SkippingForwarder, Resampling<4U, 1U, true>, Stride<10U, true>> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(SkippingForwarder, in, out);
+
+    template<typename TInputSpans, typename TOutputSpans>
+    void forwardTags(TInputSpans& inputSpans, TOutputSpans& outputSpans, std::size_t /*processedIn*/) {
+        gr::for_each_reader_span(
+            [&outputSpans](auto& inSpan) {
+                for (const auto& [relIndex, tagMapRef] : inSpan.tags(1UZ)) {
+                    gr::for_each_writer_span([&tagMapRef](auto& outSpan) { outSpan.publishTag(tagMapRef.get(), 0UZ); }, outputSpans);
+                }
+            },
+            inputSpans);
+    }
+
+    work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
+        if (inSpan.empty() || outSpan.empty()) {
+            outSpan.publish(0UZ);
+            return work::Status::INSUFFICIENT_INPUT_ITEMS;
+        }
+        outSpan[0UZ] = inSpan[0UZ];
+        outSpan.publish(1UZ);
+        return work::Status::OK;
+    }
+};
+
 struct AsyncInput : Block<AsyncInput> {
     PortIn<float, Async> in;
     PortOut<float>       out;
@@ -670,6 +727,26 @@ void expectTagIndices(std::string_view scenario, const std::vector<TagRecord>& t
         expect(eq(actual[i], expected[i])) << std::format("{}: tag {} arrived at output index {}, expected {}", scenario, i, actual[i], expected[i]);
     }
 }
+
+/// a strided block fed a ramp of nTotal samples emits one sample per chunk, and chunk k starts at sample k * stride
+template<typename TStrided>
+void expectFramesOnStride(std::string_view scenario, const std::vector<float>& samples, std::size_t nTotal) {
+    using namespace boost::ut;
+
+    constexpr std::size_t kChunk  = TStrided::ResamplingControl::kInputChunkSize;
+    constexpr std::size_t kStep   = TStrided::StrideControl::kStride;
+    const std::size_t     nFrames = (nTotal - kChunk) / kStep + 1UZ;
+    expect(eq(samples.size(), nFrames)) << std::format("{}: one output sample per chunk", scenario);
+    const std::size_t nCompared = std::min(samples.size(), nFrames);
+    std::size_t       onStride  = 0UZ; // the chunks before the first one off the stride
+    while (onStride < nCompared && samples[onStride] == static_cast<float>(onStride * kStep)) {
+        ++onStride;
+    }
+    expect(eq(onStride, nCompared)) << std::format("{}: every chunk starts a stride after the one before", scenario);
+}
+
+/// the output index at which SkippingDecimator forwards a tag on a skipped sample, or on a chunk sample after the first
+[[nodiscard]] constexpr std::size_t nextChunkOutput(std::size_t inputIndex) noexcept { return inputIndex / SkippingDecimator::StrideControl::kStride + 1UZ; }
 
 } // namespace qa_unfiltered_tag_propagation
 
@@ -1191,6 +1268,116 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
 
         const RunResult result = runOnce([&tags](gr::Graph& flow) { return buildSeries<UnfilteredRelay, UnfilteredRelay>(flow, tags); });
         expect(eq(carrying(result.tags, kCustomKey).size(), tags.size())) << "every custom key survives, none is duplicated";
+    };
+};
+
+const boost::ut::suite<"strided tag propagation"> _stridedTagPropagation = [] {
+    using namespace boost::ut;
+    using namespace qa_unfiltered_tag_propagation;
+
+    constexpr std::size_t kChunk = SkippingDecimator::ResamplingControl::kInputChunkSize;
+    constexpr std::size_t kStep  = SkippingDecimator::StrideControl::kStride;
+    constexpr float       kRatio = static_cast<float>(SkippingDecimator::ResamplingControl::kOutputChunkSize) / static_cast<float>(kChunk);
+    static_assert(kStep > kChunk + 2UZ, "the cases place a tag two samples into a skip");
+
+    "a tag on the first skipped sample leaves at the next chunk's first output sample"_test = [] {
+        property_map map = protocolTag("first-skipped");
+        gr::tag::put(map, gr::tag::SAMPLE_RATE.shortKey(), kUpstreamRate);
+        const std::vector<TagRecord> tags{TagRecord{kChunk, map}};
+
+        const RunResult result = runOnce([&tags](gr::Graph& flow) { return buildSeries<SkippingDecimator>(flow, tags); });
+        expect(indicesCarrying(result.tags, kReservedKey) == std::vector<std::size_t>{nextChunkOutput(kChunk)}) << "the reserved key leaves once, at the next chunk";
+        expect(carrying(result.tags, kCustomKey).empty()) << "the skip keeps the key filter";
+
+        const std::vector<TagRecord> rates = carrying(result.tags, gr::tag::SAMPLE_RATE.shortKey());
+        expect(eq(rates.size(), 1UZ)) << "the rate leaves once";
+        if (!rates.empty()) {
+            expect(eq(rates.front().index, nextChunkOutput(kChunk))) << "the rate leaves at the next chunk";
+            const pmt::Value* rate = valueOf(rates.front().map, gr::tag::SAMPLE_RATE.shortKey());
+            expect(rate != nullptr && rate->value_or(0.f) == std::min(kUpstreamRate, kRateCeiling) * kRatio) << "the rate is the block's capped setting at the output rate";
+        }
+        expectFramesOnStride<SkippingDecimator>("first skipped sample", result.samples, kSamples);
+    };
+
+    "a tag inside a skip leaves every chunk where the stride puts it"_test = [] {
+        constexpr std::size_t        kAt = kChunk + 2UZ;
+        const std::vector<TagRecord> tags{TagRecord{kAt, protocolTag("inside-skip")}};
+
+        const RunResult result = runOnce([&tags](gr::Graph& flow) { return buildSeries<SkippingDecimator>(flow, tags); });
+        expectFramesOnStride<SkippingDecimator>("tag inside a skip", result.samples, kSamples);
+        expect(indicesCarrying(result.tags, kReservedKey) == std::vector<std::size_t>{nextChunkOutput(kAt)}) << "the reserved key leaves at the next chunk";
+    };
+
+    "a tag after a chunk's first sample leaves at the next chunk's first output sample"_test = [] {
+        constexpr std::size_t        kAt = kStep + 2UZ;
+        const std::vector<TagRecord> tags{TagRecord{kAt, protocolTag("inside-chunk")}};
+
+        const RunResult result = runOnce([&tags](gr::Graph& flow) { return buildSeries<SkippingDecimator>(flow, tags); });
+        expect(indicesCarrying(result.tags, kReservedKey) == std::vector<std::size_t>{nextChunkOutput(kAt)}) << "the skip after the chunk forwards the tag the chunk left";
+        expectFramesOnStride<SkippingDecimator>("tag inside a chunk", result.samples, kSamples);
+    };
+
+    "a skip that spans two calls forwards the tag it covers"_test = [] {
+        constexpr std::size_t kFirstFeed = kChunk + 3UZ;         // the chunk, and three samples of its skip
+        constexpr std::size_t kAt        = kFirstFeed - 1UZ;     // the last sample of the first feed
+        constexpr std::size_t kTotal     = kStep + kChunk + 6UZ; // up to and past the second chunk
+        constexpr std::size_t kOwed      = kStep - kFirstFeed;   // the skip still owed after the second call
+        static_assert(kAt >= kChunk && kAt < kStep && kOwed > 0UZ);
+
+        PortOut<float>    upstream;
+        PortIn<float>     downstream;
+        SkippingDecimator block;
+        expect(upstream.connect(block.in).has_value());
+        expect(block.out.connect(downstream).has_value());
+        block.init(std::make_shared<gr::Sequence>());
+
+        const auto feed = [&upstream](std::size_t first, std::size_t last) {
+            auto span = upstream.reserve<SpanReleasePolicy::ProcessAll>(last - first);
+            for (std::size_t i = 0UZ; i < span.size(); ++i) {
+                span[i] = static_cast<float>(first + i);
+            }
+            span.publish(span.size());
+        };
+        upstream.publishTag(protocolTag("two-calls"), kAt);
+        feed(0UZ, kFirstFeed);
+
+        expect(block.work(kTotal).status == work::Status::OK) << "the first call reads the first chunk";
+        std::ignore = block.work(kTotal); // skips the rest of the first feed
+        expect(eq(static_cast<std::size_t>(block.strideCounter), kOwed)) << "the skip crosses the call boundary";
+        expect(eq(block.in.streamReader().position(), kFirstFeed)) << "the second call skips every sample it holds";
+
+        feed(kFirstFeed, kTotal);
+        expect(block.work(kTotal).status == work::Status::OK) << "the third call ends the skip and reads the second chunk";
+
+        auto out = downstream.get<SpanReleasePolicy::ProcessAll>(downstream.streamReader().available());
+        expect(eq(out.size(), 2UZ)) << "one output sample per chunk";
+        if (out.size() == 2UZ) {
+            expect(out[0UZ] == 0.f && out[1UZ] == static_cast<float>(kStep)) << "the second chunk starts one stride after the first";
+        }
+        std::vector<TagRecord> received;
+        for (const Tag& tag : out.rawTags) {
+            received.push_back(TagRecord{tag.index, tag.map});
+        }
+        expect(indicesCarrying(received, kReservedKey) == std::vector<std::size_t>{1UZ}) << "the tag leaves at the second chunk's output sample";
+        std::ignore = out.consume(out.size());
+    };
+
+    "a tag in a skip the stream ends in leaves at the end index"_test = [] {
+        constexpr std::size_t kLastChunk = (kSamples - kChunk) / kStep * kStep;
+        constexpr std::size_t kAt        = kSamples - 2UZ;
+        static_assert(kAt >= kLastChunk + kChunk, "the tag lies in the skip after the last chunk");
+
+        const EndResult result = runToEnd<SkippingDecimator>({TagRecord{kAt, protocolTag("last-skip")}});
+        expect(eq(result.nSamples, kLastChunk / kStep + 1UZ)) << "one output sample per chunk";
+        expect(indicesCarrying(result.endTags, kReservedKey) == std::vector<std::size_t>{result.nSamples}) << "the reserved key leaves at the end index";
+    };
+
+    "a block supplying forwardTags() is handed a skipped tag in the next chunk"_test = [] {
+        const std::vector<TagRecord> tags{TagRecord{kChunk, protocolTag("override")}};
+
+        const RunResult result = runOnce([&tags](gr::Graph& flow) { return buildSeries<SkippingForwarder>(flow, tags); });
+        expect(indicesCarrying(result.tags, kCustomKey) == std::vector<std::size_t>{nextChunkOutput(kChunk)}) << "the override publishes the skipped tag at the next chunk";
+        expectFramesOnStride<SkippingForwarder>("forwardTags() override", result.samples, kSamples);
     };
 };
 
