@@ -544,7 +544,7 @@ void settingsChanged(const gr::property_map& oldSettings,
                      const gr::property_map& newSettings,
                      gr::property_map& forwardSettings) {
     if (newSettings.contains("sample_rate")) {
-        forwardSettings["sample_rate"] = sample_rate.value;
+        forwardSettings[gr::tag::SAMPLE_RATE.key()] = sample_rate.value;
     }
 }
 ```
@@ -585,7 +585,7 @@ A tag is a `{index, property_map}` pair attached to a specific sample position.
         const gr::Tag& tag = this->mergedInputTag();
         // read tag.map entries
     }
-    this->publishTag({{"trigger_name", "my_event"}}, 0UZ);  // publish at current sample
+    this->publishTag({{"my:event", "detected"}}, 0UZ);  // publish at current sample
     return input;
 }
 ```
@@ -661,20 +661,25 @@ struct MyAccumulator : gr::Block<MyAccumulator, gr::Resampling<1024, 1024, true>
 
 ### Standard tag keys
 
-| Key                             | Type          | Description                        |
-| ------------------------------- | ------------- | ---------------------------------- |
-| `"sample_rate"`                 | `float`       | signal sample rate [Hz]            |
-| `"signal_name"`                 | `std::string` | signal name                        |
-| `"signal_quantity"`             | `std::string` | physical quantity (e.g. "voltage") |
-| `"signal_unit"`                 | `std::string` | SI unit (e.g. "[V]")               |
-| `"signal_min"` / `"signal_max"` | `float`       | expected value range               |
-| `"trigger_name"`                | `std::string` | trigger identifier                 |
-| `"trigger_time"`                | `uint64_t`    | UTC timestamp [ns]                 |
-| `"trigger_offset"`              | `float`       | sample delay w.r.t. trigger [s]    |
-| `"context"`                     | `std::string` | multiplexing context key           |
-| `"end_of_stream"`               | `bool`        | end-of-stream marker               |
-| `"reset_default"`               | `bool`        | reset block to stored defaults     |
-| `"store_default"`               | `bool`        | store current settings as defaults |
+A tag key is `domain:name`. Only GNU Radio defines a new `gr:` key. Any block may write or read a
+`gr:` key with the meaning GNU Radio gives it. A block's new keys go in its author's own domain.
+The constants in `gr::tag::` hold the `gr:` keys.
+
+| Key                                   | Type          | Description                        |
+| ------------------------------------- | ------------- | ---------------------------------- |
+| `"gr:sample_rate"`                    | `float`       | signal sample rate [Hz]            |
+| `"gr:signal_name"`                    | `std::string` | signal name                        |
+| `"gr:signal_quantity"`                | `std::string` | physical quantity (e.g. "voltage") |
+| `"gr:signal_unit"`                    | `std::string` | SI unit (e.g. "[V]")               |
+| `"gr:signal_min"` / `"gr:signal_max"` | `float`       | expected value range               |
+| `"gr:trigger_name"`                   | `std::string` | trigger identifier                 |
+| `"gr:trigger_time"`                   | `uint64_t`    | UTC timestamp [ns]                 |
+| `"gr:trigger_offset"`                 | `float`       | sample delay w.r.t. trigger [s]    |
+| `"gr:context"`                        | `std::string` | multiplexing context key           |
+| `"gr:ctx_time"`                       | `uint64_t`    | time the context takes effect [ns] |
+| `"gr:end_of_stream"`                  | `bool`        | end-of-stream marker               |
+| `"gr:reset_default"`                  | `bool`        | reset block to stored defaults     |
+| `"gr:store_default"`                  | `bool`        | store current settings as defaults |
 
 Downstream examples: tag source, tag monitor, and clock source blocks in
 `gnuradio4-blocks`.

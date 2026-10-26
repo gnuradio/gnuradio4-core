@@ -71,7 +71,7 @@ struct BarrierBlock : gr::Block<BarrierBlock> {
 };
 
 /// couples the block's sample_rate to gr:sample_rate
-void coupleRate(gr::SettingsBase& settings) { settings.setTagCouplings({{"sample_rate", std::string(gr::tag::SAMPLE_RATE.shortKey())}}); }
+void coupleRate(gr::SettingsBase& settings) { settings.setTagCouplings({{"sample_rate", std::string(gr::tag::SAMPLE_RATE.key())}}); }
 
 // gain is range-limited, so an out-of-range staged value is rejected by the annotation's validator
 struct ValidatingBlock : gr::Block<ValidatingBlock> {
@@ -125,7 +125,7 @@ struct RateSource : gr::Block<RateSource> {
 
     void settingsChanged(const gr::property_map& /*oldSettings*/, const gr::property_map& newSettings, gr::property_map& forwardSettings) {
         if (newSettings.contains("sample_rate")) {
-            forwardSettings.insert_or_assign(std::pmr::string(gr::tag::SAMPLE_RATE.shortKey()), sample_rate.value);
+            forwardSettings.insert_or_assign(std::pmr::string(gr::tag::SAMPLE_RATE.key()), sample_rate.value);
         }
     }
 
@@ -148,7 +148,7 @@ struct BadTagSource : gr::Block<BadTagSource> {
 
     float processOne() {
         if (_nProduced == 0UZ) {
-            this->publishTag(gr::property_map{{"sample_rate", std::string("not-a-number")}}, 0UZ);
+            this->publishTag(gr::property_map{{gr::tag::SAMPLE_RATE.key(), std::string("not-a-number")}}, 0UZ);
         }
         if (++_nProduced >= kSamples) {
             this->requestStop();
@@ -284,9 +284,9 @@ const boost::ut::suite<"settings concurrency"> settingsConcurrencyTests = [] {
     "a default-tag value of another numeric type is converted to the member's type"_test = [] {
         qa_settings::WideRateBlock block;
         block.init(std::make_shared<gr::Sequence>());
-        block.settings().setTagCouplings({{"sample_rate", std::string(gr::tag::SAMPLE_RATE.shortKey())}, {"num_channels", std::string(gr::tag::NUM_CHANNELS.shortKey())}});
+        block.settings().setTagCouplings({{"sample_rate", std::string(gr::tag::SAMPLE_RATE.key())}, {"num_channels", std::string(gr::tag::NUM_CHANNELS.key())}});
 
-        block.settings().autoUpdate(gr::Tag{0UZ, {{"sample_rate", 2.4e6f}, {"num_channels", 4U}}});
+        block.settings().autoUpdate(gr::Tag{0UZ, {{gr::tag::SAMPLE_RATE.key(), 2.4e6f}, {gr::tag::NUM_CHANNELS.key(), 4U}}});
         const gr::ApplyStagedParametersResult result = block.settings().applyStagedParameters();
 
         expect(result.failedParameters.empty()) << "a convertible numeric value was reported as rejected";
@@ -300,7 +300,7 @@ const boost::ut::suite<"settings concurrency"> settingsConcurrencyTests = [] {
         block.init(std::make_shared<gr::Sequence>());
         qa_settings::coupleRate(block.settings());
 
-        block.settings().autoUpdate(gr::Tag{0UZ, {{"sample_rate", 2.4e6}}});
+        block.settings().autoUpdate(gr::Tag{0UZ, {{gr::tag::SAMPLE_RATE.key(), 2.4e6}}});
         std::ignore = block.settings().applyStagedParameters();
 
         expect(eq(block.sample_rate.value, 2.4e6f)) << "the float64 tag did not reach the float member";
@@ -311,7 +311,7 @@ const boost::ut::suite<"settings concurrency"> settingsConcurrencyTests = [] {
         block.init(std::make_shared<gr::Sequence>());
         qa_settings::coupleRate(block.settings());
 
-        block.settings().autoUpdate(gr::Tag{0UZ, {{"sample_rate", 1e300}}});
+        block.settings().autoUpdate(gr::Tag{0UZ, {{gr::tag::SAMPLE_RATE.key(), 1e300}}});
         std::ignore = block.settings().applyStagedParameters();
 
         expect(eq(block.sample_rate.value, 1.0f)) << "an out-of-range value was applied instead of range-checked";
@@ -322,7 +322,7 @@ const boost::ut::suite<"settings concurrency"> settingsConcurrencyTests = [] {
         block.init(std::make_shared<gr::Sequence>());
         qa_settings::coupleRate(block.settings());
 
-        block.settings().autoUpdate(gr::Tag{0UZ, {{"sample_rate", std::string("not-a-number")}}});
+        block.settings().autoUpdate(gr::Tag{0UZ, {{gr::tag::SAMPLE_RATE.key(), std::string("not-a-number")}}});
         std::ignore = block.settings().applyStagedParameters();
 
         expect(eq(block.sample_rate.value, 1.0)) << "a string was coerced into a numeric member";

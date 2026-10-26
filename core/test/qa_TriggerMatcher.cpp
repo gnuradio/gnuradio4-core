@@ -63,7 +63,7 @@ const boost::ut::suite<"BasicTriggerNameCtxMatcher"> triggerTest = [] {
     "BasicTriggerNameCtxMatcher Tests"_test = [] {
         using namespace std::string_literals;
         using enum gr::trigger::MatchResult;
-        constexpr auto createTag = [](std::string triggerName, std::string cxt) noexcept { return Tag(0, {{tag::TRIGGER_NAME.shortKey(), triggerName}, {tag::CONTEXT.shortKey(), cxt}, {tag::TRIGGER_META_INFO.shortKey(), property_map{}}}); };
+        constexpr auto createTag = [](std::string triggerName, std::string cxt) noexcept { return Tag(0, {{tag::TRIGGER_NAME.key(), triggerName}, {tag::CONTEXT.key(), cxt}, {tag::TRIGGER_META_INFO.key(), property_map{}}}); };
 
         "trigger on room1-room3 (exclusive)"_test = [&] {
             auto&          matcher = trigger::BasicTriggerNameCtxMatcher::filter;
@@ -264,7 +264,7 @@ const boost::ut::suite<"BasicTriggerNameCtxMatcher"> triggerTest = [] {
             {"stopTriggerName", std::string("alarm")}, {"stopCtx", std::string("room3")},                                     //
             {"startTriggerNameEnds", 42}, {"startCtxEnds", 42}, {"stopTriggerNameEnds", 42}, {"stopCtxEnds", 42}};
 
-        const Tag tag(0, {{gr::tag::TRIGGER_NAME.shortKey(), std::string("alarm")}, {gr::tag::CONTEXT.shortKey(), std::string("room1")}});
+        const Tag tag(0, {{gr::tag::TRIGGER_NAME.key(), std::string("alarm")}, {gr::tag::CONTEXT.key(), std::string("room1")}});
         expect(nothrow([&] { expect(eq(trigger::BasicTriggerNameCtxMatcher::filter(filter, tag, state), Ignore)); }));
         expect(nothrow([&] { expect(!trigger::BasicTriggerNameCtxMatcher::isSingleTrigger(state)); }));
     };

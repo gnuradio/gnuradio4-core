@@ -48,11 +48,11 @@ inline constexpr std::size_t kSamples = 2048UZ;
 /// an input minimum above one forbids a chunk boundary at a tag closer than that to the chunk's start
 inline constexpr std::size_t kInputMinimum = 4UZ;
 
-inline constexpr std::string_view kReservedKey = "trigger_name"; ///< reserved: survives the default key filter
-inline constexpr std::string_view kCustomKey   = "record_id";    ///< neither reserved nor any block's setting
-inline constexpr std::string_view kOwnedKey    = "gain";         ///< not reserved, but the key a case couples a gain setting to
-inline constexpr std::string_view kDroppedKey  = "phase_offset"; ///< not reserved, and listed by the dropping blocks
-inline constexpr std::string_view kHalfRateKey = "foo:half_rate"; ///< a key a block writes into its own forward map
+inline constexpr std::string_view kReservedKey = "gr:trigger_name"; ///< reserved: survives the default key filter
+inline constexpr std::string_view kCustomKey   = "record_id";       ///< neither reserved nor any block's setting
+inline constexpr std::string_view kOwnedKey    = "gain";            ///< not reserved, but the key a case couples a gain setting to
+inline constexpr std::string_view kDroppedKey  = "phase_offset";    ///< not reserved, and listed by the dropping blocks
+inline constexpr std::string_view kHalfRateKey = "foo:half_rate";   ///< a key a block writes into its own forward map
 
 inline constexpr float kUpstreamGain = 10.f;
 inline constexpr float kUpstreamRate = 96000.f;
@@ -60,7 +60,7 @@ inline constexpr float kGainCeiling  = 2.f;
 inline constexpr float kRateCeiling  = 50000.f;
 
 /// couples a block's gain to kOwnedKey and its sample_rate to gr:sample_rate
-[[nodiscard]] gr::property_map coupledKeys() { return {{"gain", std::string(kOwnedKey)}, {"sample_rate", std::string(gr::tag::SAMPLE_RATE.shortKey())}}; }
+[[nodiscard]] gr::property_map coupledKeys() { return {{"gain", std::string(kOwnedKey)}, {"sample_rate", std::string(gr::tag::SAMPLE_RATE.key())}}; }
 
 struct TagRecord {
     std::size_t  index{};
@@ -218,7 +218,7 @@ struct DroppingRelay : Block<DroppingRelay, DroppedTagKeys<"phase_offset">> {
 };
 
 /// keeps the auto-forward keys and drops one of them
-struct FilteredDroppingRelay : Block<FilteredDroppingRelay, FilteredTagPropagation, DroppedTagKeys<"trigger_name">> {
+struct FilteredDroppingRelay : Block<FilteredDroppingRelay, FilteredTagPropagation, DroppedTagKeys<"gr:trigger_name">> {
     PortIn<float>  in;
     PortOut<float> out;
 
@@ -990,11 +990,11 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
 
     "a key-filtered block listing a reserved key drops it and keeps the other reserved keys"_test = [] {
         property_map map = protocolTag("r0");
-        gr::tag::put(map, "signal_name", std::string("carrier"));
+        gr::tag::put(map, gr::tag::SIGNAL_NAME, std::string("carrier"));
         const std::vector<TagRecord> tags{TagRecord{0UZ, map}};
 
         const RunResult result = runOnce([&tags](gr::Graph& flow) { return buildSeries<FilteredDroppingRelay>(flow, tags); });
-        expect(eq(carrying(result.tags, "signal_name").size(), 1UZ)) << "an unlisted reserved key crosses";
+        expect(eq(carrying(result.tags, gr::tag::SIGNAL_NAME.key()).size(), 1UZ)) << "an unlisted reserved key crosses";
         expect(carrying(result.tags, kReservedKey).empty()) << "the listed reserved key stops at the block";
         expect(carrying(result.tags, kCustomKey).empty()) << "the key filter still applies";
     };
@@ -1029,7 +1029,7 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
     "a key a setting is coupled to crosses with the value it arrived with, not the setting's value"_test = [] {
         property_map map = protocolTag("r0");
         gr::tag::put(map, kOwnedKey, kUpstreamGain);
-        gr::tag::put(map, "sample_rate", kUpstreamRate);
+        gr::tag::put(map, gr::tag::SAMPLE_RATE, kUpstreamRate);
 
         const std::vector<TagRecord> tags{TagRecord{0UZ, map}};
         const RunResult              result = runOnce([&tags](gr::Graph& flow) { return buildSeries<UnfilteredCap, UnfilteredRelay>(flow, tags, {}, coupledKeys()); });
@@ -1047,7 +1047,7 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
             expect(eq(owned->value_or<float>(0.f), kUpstreamGain)) << "the block's capped gain replaces the value the tag carried";
         }
 
-        const pmt::Value* rate = valueOf(arrived, "sample_rate");
+        const pmt::Value* rate = valueOf(arrived, gr::tag::SAMPLE_RATE.key());
         expect(rate != nullptr);
         if (rate != nullptr) {
             expect(eq(rate->value_or<float>(0.f), kUpstreamRate)) << "the block's capped rate replaces the value the tag carried";
@@ -1068,7 +1068,7 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
             gr::tag::put(map, gr::tag::SAMPLE_RATE, rates[i]);
             tags.push_back(TagRecord{i * 700UZ, map});
         }
-        const property_map couplings{{"sample_rate", std::string(gr::tag::SAMPLE_RATE.shortKey())}};
+        const property_map couplings{{"sample_rate", std::string(gr::tag::SAMPLE_RATE.key())}};
         const RunResult    result = runOnce([&](gr::Graph& flow) { return buildSeries<UnfilteredHalfRate>(flow, tags, {}, couplings); });
 
         const std::vector<TagRecord> halves = carrying(result.tags, kHalfRateKey);
@@ -1078,11 +1078,11 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
             const pmt::Value* half = valueOf(halves[i].map, kHalfRateKey);
             expect(half != nullptr && eq(half->value_or<float>(0.f), rates[i] / 2.f)) << std::format("the forward map of change {} carries half the tag's rate", i);
         }
-        const std::vector<TagRecord> passed = carrying(result.tags, gr::tag::SAMPLE_RATE.shortKey());
+        const std::vector<TagRecord> passed = carrying(result.tags, gr::tag::SAMPLE_RATE.key());
         expect(eq(passed.size(), tags.size())) << "the tags themselves cross the block";
         for (std::size_t i = 0UZ; i < std::min(passed.size(), tags.size()); ++i) {
             const auto atTag = std::ranges::find_if(result.tags, [&](const TagRecord& record) { return record.index == passed[i].index && record.map.contains(kHalfRateKey); });
-            const auto tagAt = std::ranges::find_if(result.tags, [&](const TagRecord& record) { return record.index == passed[i].index && record.map.contains(gr::tag::SAMPLE_RATE.shortKey()); });
+            const auto tagAt = std::ranges::find_if(result.tags, [&](const TagRecord& record) { return record.index == passed[i].index && record.map.contains(gr::tag::SAMPLE_RATE.key()); });
             expect(tagAt <= atTag) << std::format("the forward map of change {} does not precede its tag", i);
         }
     };
@@ -1099,7 +1099,7 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
         const std::vector<TagRecord> carried = carrying(result.tags, kCustomKey);
         expect(fatal(eq(carried.size(), 1UZ)));
         const pmt::Value* gain = valueOf(carried.front().map, kOwnedKey);
-        const pmt::Value* rate = valueOf(carried.front().map, gr::tag::SAMPLE_RATE.shortKey());
+        const pmt::Value* rate = valueOf(carried.front().map, gr::tag::SAMPLE_RATE.key());
         expect(fatal(gain != nullptr && rate != nullptr)) << "a key no setting follows does not cross";
         expect(eq(gain->value_or<float>(0.f), kUpstreamGain)) << "the block's gain replaces the value of a key it does not follow";
         expect(eq(rate->value_or<float>(0.f), kUpstreamRate)) << "the block's rate replaces the value of a key it does not follow";
@@ -1241,7 +1241,7 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
     "at the end index a key a setting is named after leaves with the value it arrived with"_test = [] {
         property_map map = protocolTag("end");
         gr::tag::put(map, kOwnedKey, kUpstreamGain);
-        gr::tag::put(map, "sample_rate", kUpstreamRate);
+        gr::tag::put(map, gr::tag::SAMPLE_RATE, kUpstreamRate);
 
         const EndResult              result  = runToEnd<UnfilteredCap>({TagRecord{kSamples, map}});
         const std::vector<TagRecord> carried = carrying(result.endTags, kCustomKey);
@@ -1258,7 +1258,7 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
         if (owned != nullptr) {
             expect(eq(owned->value_or<float>(0.f), kUpstreamGain)) << "the block forwards its own gain in place of the end tag's";
         }
-        const pmt::Value* rate = valueOf(arrived, "sample_rate");
+        const pmt::Value* rate = valueOf(arrived, gr::tag::SAMPLE_RATE.key());
         expect(rate != nullptr);
         if (rate != nullptr) {
             expect(eq(rate->value_or<float>(0.f), kUpstreamRate)) << "the block forwards its own rate in place of the end tag's";
@@ -1316,13 +1316,13 @@ const boost::ut::suite<"unfiltered tag propagation"> _unfilteredTagPropagation =
         meta.insert_or_assign(std::pmr::string("phase_est"), pmt::Value(0.75f));
         meta.insert_or_assign(std::pmr::string("snr_db"), pmt::Value(12.f));
         property_map map = protocolTag("meta");
-        map.insert_or_assign(std::pmr::string(gr::tag::TRIGGER_META_INFO.shortKey()), pmt::Value(meta));
+        map.insert_or_assign(std::pmr::string(gr::tag::TRIGGER_META_INFO.key()), pmt::Value(meta));
         const std::vector<TagRecord> tags{TagRecord{0UZ, map}, TagRecord{700UZ, map}};
 
         const auto metaKeysAt = [](const RunResult& result, std::string_view key) {
             std::vector<std::size_t> indices;
-            for (const TagRecord& record : carrying(result.tags, gr::tag::TRIGGER_META_INFO.shortKey())) {
-                const pmt::Value*   value  = valueOf(record.map, gr::tag::TRIGGER_META_INFO.shortKey());
+            for (const TagRecord& record : carrying(result.tags, gr::tag::TRIGGER_META_INFO.key())) {
+                const pmt::Value*   value  = valueOf(record.map, gr::tag::TRIGGER_META_INFO.key());
                 const property_map* nested = value == nullptr ? nullptr : value->get_if<property_map>();
                 if (nested != nullptr && nested->contains(std::pmr::string(key))) {
                     indices.push_back(record.index);
@@ -1363,18 +1363,18 @@ const boost::ut::suite<"strided tag propagation"> _stridedTagPropagation = [] {
 
     "a tag on the first skipped sample leaves at the next chunk's first output sample"_test = [] {
         property_map map = protocolTag("first-skipped");
-        gr::tag::put(map, gr::tag::SAMPLE_RATE.shortKey(), kUpstreamRate);
+        gr::tag::put(map, gr::tag::SAMPLE_RATE.key(), kUpstreamRate);
         const std::vector<TagRecord> tags{TagRecord{kChunk, map}};
 
         const RunResult result = runOnce([&tags](gr::Graph& flow) { return buildSeries<SkippingDecimator>(flow, tags); });
         expect(indicesCarrying(result.tags, kReservedKey) == std::vector<std::size_t>{nextChunkOutput(kChunk)}) << "the reserved key leaves once, at the next chunk";
         expect(carrying(result.tags, kCustomKey).empty()) << "the skip keeps the key filter";
 
-        const std::vector<TagRecord> rates = carrying(result.tags, gr::tag::SAMPLE_RATE.shortKey());
+        const std::vector<TagRecord> rates = carrying(result.tags, gr::tag::SAMPLE_RATE.key());
         expect(eq(rates.size(), 1UZ)) << "the rate leaves once";
         if (!rates.empty()) {
             expect(eq(rates.front().index, nextChunkOutput(kChunk))) << "the rate leaves at the next chunk";
-            const pmt::Value* rate = valueOf(rates.front().map, gr::tag::SAMPLE_RATE.shortKey());
+            const pmt::Value* rate = valueOf(rates.front().map, gr::tag::SAMPLE_RATE.key());
             expect(rate != nullptr && rate->value_or(0.f) == kUpstreamRate * kRatio) << "the rate is not the upstream rate at the output rate";
         }
         expectFramesOnStride<SkippingDecimator>("first skipped sample", result.samples, kSamples);

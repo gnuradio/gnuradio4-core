@@ -82,8 +82,8 @@ void serializeSettings(const std::shared_ptr<BlockModel>& block, property_map& r
                 }
             }).visit(ctxTime.context);
 
-            ctxParam.emplace(gr::tag::CONTEXT.shortKey(), contextStr);
-            ctxParam.emplace(gr::tag::CONTEXT_TIME.shortKey(), ctxTime.time);
+            ctxParam.emplace(gr::settings::kContextField, contextStr);
+            ctxParam.emplace(gr::settings::kContextTimeField, ctxTime.time);
             ctxParam.emplace(serialization_fields::BLOCK_PARAMETERS, writeParameters(settingsMap));
             ctxParamsSeq.emplace_back(std::move(ctxParam));
         }

@@ -1304,7 +1304,7 @@ public:
             if (input_chunk_size == output_chunk_size) {
                 return;
             }
-            auto it = parameters.find(gr::tag::SAMPLE_RATE.shortKey());
+            auto it = parameters.find(gr::tag::SAMPLE_RATE.key());
             if (it == parameters.end()) {
                 return;
             }
@@ -1321,12 +1321,12 @@ public:
         [[maybe_unused]] const auto& autoForwardKeys = settings().autoForwardParameters();
         property_map                 dst;
         for (const auto& [key, value] : src) {
-            auto shortKey = convert_string_domain(key);
-            if (std::ranges::contains(DroppedTagKeysControl::kKeys, shortKey)) {
+            const std::string_view keyView = key;
+            if (std::ranges::contains(DroppedTagKeysControl::kKeys, keyView)) {
                 continue;
             }
             if constexpr (!forwardsEveryKey()) {
-                if (!autoForwardKeys.contains(shortKey)) {
+                if (!autoForwardKeys.contains(std::string(keyView))) {
                     continue;
                 }
             }
@@ -1556,7 +1556,7 @@ public:
                             continue;
                         }
                         settings().autoUpdate(Tag{0UZ, map});
-                        if (const auto res = port.metaInfo.update(map); !res.has_value()) {
+                        if (const auto res = port.metaInfo.updateFromTag(map); !res.has_value()) {
                             emitMessage("Block::forwardTagsAtEndOfStream - rejected tag", {{"error", res.error().message}});
                         }
                     }
@@ -1605,7 +1605,7 @@ private:
         for_each_port_and_reader_span(
             [this, tagWindow]<PortLike TPort, ReaderSpanLike TReaderSpan>(TPort& port, TReaderSpan& span) {
                 for (const auto& [_, tagMapRef] : span.tags(tagWindow)) {
-                    if (const auto res = port.metaInfo.update(tagMapRef.get()); !res.has_value()) {
+                    if (const auto res = port.metaInfo.updateFromTag(tagMapRef.get()); !res.has_value()) {
                         emitMessage("Block::applyInputTagsFromPorts - rejected tag", {{"error", res.error().message}});
                     }
                 }
