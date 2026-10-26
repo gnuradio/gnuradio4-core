@@ -621,6 +621,7 @@ constexpr auto BLOCK_META_INFORMATION = "meta_information"sv;
 constexpr auto BLOCK_PARAMETERS       = "parameters"sv;
 constexpr auto BLOCK_CATEGORY         = "block_category"sv;
 constexpr auto BLOCK_CTX_PARAMETERS   = "ctx_parameters"sv;
+constexpr auto BLOCK_TAG_COUPLINGS    = "tag_couplings"sv;
 
 constexpr auto BLOCK_INPUT_PORTS  = "input_ports"sv;
 constexpr auto BLOCK_OUTPUT_PORTS = "output_ports"sv;

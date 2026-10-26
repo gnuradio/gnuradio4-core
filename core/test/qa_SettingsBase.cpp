@@ -36,6 +36,8 @@ struct MinimalSettings : gr::SettingsBase {
     [[nodiscard]] bool                           removeContext(gr::SettingsCtx) override { return false; }
     [[nodiscard]] std::optional<gr::SettingsCtx> activateContext(gr::SettingsCtx) override { return std::nullopt; }
     void                                         autoUpdate(const gr::Tag&) override {}
+    void                                         setTagCouplings(const gr::property_map&) override {}
+    [[nodiscard]] gr::property_map               tagCouplings() const override { return {}; }
 
     [[nodiscard]] gr::property_map                get(std::span<const std::string>) const noexcept override { return {}; }
     [[nodiscard]] std::optional<gr::pmt::Value>   get(const std::string&) const noexcept override { return std::nullopt; }
@@ -77,6 +79,7 @@ const boost::ut::suite<"an out-of-tree SettingsBase implementation"> settingsBas
         expect(base.stagedParameters().empty());
         expect(base.defaultParameters().empty());
         expect(base.activeParameters().empty());
+        expect(base.tagCouplings().empty());
 
         base.addAutoForwardParameters({"gain"});
         expect(base.autoForwardParameters().contains("gain")) << "the mutator did not reach the implementation";

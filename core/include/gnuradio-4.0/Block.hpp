@@ -533,6 +533,7 @@ namespace block::property {
 [[maybe_unused]] inline static const char* const kActiveContext    = "ActiveContext";    ///< retrieve and set active context
 [[maybe_unused]] inline const char* const        kSettingsCtx      = "SettingsCtx";      ///< retrieve/creates/remove a new stored context
 [[maybe_unused]] inline const char* const        kSettingsContexts = "SettingsContexts"; ///< retrieve/creates/remove a new stored context
+[[maybe_unused]] inline const char* const        kTagCouplings     = "TagCouplings";     ///< read or change the settings coupled to tag keys, @see SettingsBase::setTagCouplings
 
 } // namespace block::property
 
@@ -626,6 +627,7 @@ struct BlockBase {
     std::optional<Message> propertyCallbackActiveContext(std::string_view propertyName, Message message);
     std::optional<Message> propertyCallbackSettingsCtx(std::string_view propertyName, Message message);
     std::optional<Message> propertyCallbackSettingsContexts(std::string_view propertyName, Message message);
+    std::optional<Message> propertyCallbackTagCouplings(std::string_view propertyName, Message message);
     std::optional<Message> propertyCallbackMetaInformation(std::string_view propertyName, Message message);
     std::optional<Message> propertyCallbackUiConstraints(std::string_view propertyName, Message message);
     std::optional<Message> propertyCallbackSubgraphExport(std::string_view propertyName, Message message);
@@ -638,10 +640,6 @@ enum class Category {
     TransparentBlockGroup, ///< Block with children blocks which do not have a dedicated scheduler
     ScheduledBlockGroup    ///< Block with children that have a dedicated scheduler
 };
-
-/// the settings `Block<>` declares on every block's behalf, mirroring its own GR_MAKE_REFLECTABLE list; tag forwarding
-/// never substitutes a block's value for one of these, so an incoming key that happens to share a name keeps its value
-inline constexpr std::array<std::string_view, 8UZ> kFrameworkOwnedSettings{"input_chunk_size", "output_chunk_size", "stride", "disconnect_on_done", "compute_domain", "unique_name", "name", "ui_constraints"};
 
 /**
  * @brief Whether `TBlock` forwards every tag key and may declare `UnfilteredTagPropagation`.
@@ -747,6 +745,7 @@ constexpr bool kUnfilteredTagPropagationAdmissible =                            
  * - `kActiveContext`: Returns current active context and allows to set a new one
  * - `kSettingsCtx`: Manages Settings Contexts Add/Remove/Get
  * - `kSettingsContexts`: Returns all Contextxs
+ * - `kTagCouplings`: Get returns the settings coupled to tag keys; Set changes them, an empty key removing a coupling
  * - `kMetaInformation`: returns static meta-information (i.e. Annotated<> interfaces, constraints, etc...) (N.B. does not affect Block operation)
  * - `kUiConstraints`: returns user-defined UI constraints (N.B. does not affect Block operation)
  *
@@ -882,7 +881,6 @@ public:
     A<property_map, "ui-constraints", Doc<"store non-graph-processing information like UI block position etc.">>         ui_constraints;
     A<property_map, "meta-information", Doc<"store static non-graph-processing information like Annotated<> info etc.">> meta_information = initMetaInfo();
 
-    // these names are mirrored in gr::block::kFrameworkOwnedSettings, which keeps them out of tag-value substitution
     GR_MAKE_REFLECTABLE(Block, input_chunk_size, output_chunk_size, stride, disconnect_on_done, compute_domain, unique_name, name, ui_constraints);
 
     // TODO: C++26 make sure these are not reflected
@@ -1317,13 +1315,10 @@ public:
     }
 
     /// keep the auto-forward keys of an incoming tag, or every key where forwardsEveryKey(), less the keys listed in
-    /// DroppedTagKeys, substituting this block's own current value for a key it declares as a setting, and on a
-    /// resampling block the rate it publishes at for the rate it is fed. A listed key is also dropped from the map a
-    /// trigger_meta_info key holds. The settings snapshot is taken lazily, and only where a key is actually owned. A tag
-    /// whose keys are none of this block's settings costs no copy.
-    [[nodiscard]] property_map filterAndSubstituteTag(const property_map& src, std::optional<property_map>& cachedSettings) {
+    /// DroppedTagKeys, each with the value it arrived with. A resampling block substitutes the rate it publishes at for
+    /// the rate it is fed. A listed key is also dropped from the map a trigger_meta_info key holds.
+    [[nodiscard]] property_map filterAndSubstituteTag(const property_map& src) {
         [[maybe_unused]] const auto& autoForwardKeys = settings().autoForwardParameters();
-        const auto&                  blockSettings   = CtxSettings<Derived>::allWritableMembers();
         property_map                 dst;
         for (const auto& [key, value] : src) {
             auto shortKey = convert_string_domain(key);
@@ -1332,15 +1327,6 @@ public:
             }
             if constexpr (!forwardsEveryKey()) {
                 if (!autoForwardKeys.contains(shortKey)) {
-                    continue;
-                }
-            }
-            if (blockSettings.contains(shortKey) && !std::ranges::contains(block::kFrameworkOwnedSettings, shortKey)) {
-                if (!cachedSettings) {
-                    cachedSettings.emplace(settings().get());
-                }
-                if (auto it = cachedSettings->find(key); it != cachedSettings->end()) {
-                    dst.insert_or_assign(key, it->second);
                     continue;
                 }
             }
@@ -1384,8 +1370,7 @@ public:
         // exists to retire a deferred interior tag
         const std::size_t tagWindow = tagWindowOverride.value_or(hasWholeChunkTagWindow() ? processedIn : 1UZ);
 
-        std::optional<property_map> cachedSettings;
-        auto                        filterAndSubstitute = [&](const property_map& src) { return filterAndSubstituteTag(src, cachedSettings); };
+        auto filterAndSubstitute = [&](const property_map& src) { return filterAndSubstituteTag(src); };
 
         auto publishFiltered = [&](std::ptrdiff_t relIndex, const property_map& tagMap) {
             auto forwarded = filterAndSubstitute(tagMap);
@@ -1469,11 +1454,10 @@ public:
 
     /// default forwarding of the tags a stream leaves at or past each synchronous input's read position
     ///
-    /// The input spans are those of prepareStreams<true>() and the output spans hold no samples, so every tag leaves at
-    /// output offset 0, the end-of-stream index. The key filter, the substitution, the multi-input dedup and the merge
-    /// rule are those of forwardInputTags(). The block's settings already hold the values these tags set, so a key the
-    /// block declares leaves with the value its last tag set. The end_of_stream key stays behind, as publishEoS()
-    /// publishes its own.
+    /// The input spans are those of prepareStreams<true>(), and the output spans hold no samples. Every tag leaves at
+    /// output offset 0, the end-of-stream index. The key filter, the sample-rate scaling, the multi-input dedup and the
+    /// merge rule are those of forwardInputTags(). Each key leaves with the value it arrived with. The end-of-stream key
+    /// stays behind, as publishEoS() publishes its own.
     template<typename TInputSpans, typename TOutputSpans>
     void forwardRemainingInputTags(TInputSpans& inputSpans, TOutputSpans& outputSpans) {
         if constexpr (noTagPropagation) {
@@ -1481,7 +1465,6 @@ public:
         }
         constexpr bool kDedup = traits::block::stream_input_ports<Derived>::size > 1;
 
-        std::optional<property_map>                       cachedSettings;
         const std::pmr::string                            endOfStream = static_cast<std::pmr::string>(gr::tag::END_OF_STREAM);
         std::vector<const Tag*>                           seen;
         std::vector<std::pair<std::size_t, property_map>> remaining; // input index and forwarded map
@@ -1500,7 +1483,7 @@ public:
                         }
                         seen.push_back(&tag);
                     }
-                    property_map forwarded = filterAndSubstituteTag(tag.map, cachedSettings);
+                    property_map forwarded = filterAndSubstituteTag(tag.map);
                     forwarded.erase(endOfStream);
                     if (!forwarded.empty()) {
                         remaining.emplace_back(tag.index, std::move(forwarded));
@@ -1529,14 +1512,16 @@ public:
 
     /// forward the tags a stream leaves at or past each input's read position to the end-of-stream index
     ///
-    /// The tags reach as far as the first end_of_stream tag on any synchronous input. Their settings and port meta
-    /// information are applied first, as the ordinary path applies a chunk's tags before it forwards them. A block with
-    /// a forwardTags() override is handed them there: the call passes processedIn 0, input spans of no samples whose
-    /// tags() holds each such tag at a relative index of 0 or more, and output spans of no samples on which offset 0 is
-    /// the end-of-stream index. tags() also holds, at a negative index, tags behind the read position that no span
-    /// retired, which an override must skip. The input's own end_of_stream tag is among the others, and an override
-    /// must drop that key, as publishEoS() publishes its own. Every other block forwards them through
-    /// forwardRemainingInputTags(). workInternal() calls this when an input's stream ends; a stop request forwards none.
+    /// The tags reach as far as the first end-of-stream tag on any synchronous input. Their settings and port meta
+    /// information are applied first, as the ordinary path applies a chunk's tags before it forwards them. The forward
+    /// map the block's settingsChanged() fills for them leaves after them, with any forward map no earlier call
+    /// published. A block with a forwardTags() override is handed them there: the call passes processedIn 0, input
+    /// spans of no samples whose tags() holds each such tag at a relative index of 0 or more, and output spans of no
+    /// samples on which offset 0 is the end-of-stream index. tags() also holds, at a negative index, tags behind the
+    /// read position that no span retired, which an override must skip. The input's own end-of-stream tag is among
+    /// the others, and an override must drop that key, as publishEoS() publishes its own. Every other block forwards
+    /// them through forwardRemainingInputTags(). workInternal() calls this when an input's stream ends; a stop request
+    /// forwards none.
     void forwardTagsAtEndOfStream() {
         if constexpr (traits::block::stream_input_ports<Derived>::size > 0 && traits::block::stream_output_ports<Derived>::size > 0) {
             std::size_t endIndex = std::numeric_limits<std::size_t>::max();
@@ -1577,12 +1562,16 @@ public:
                     }
                 },
                 inputPorts<PortType::STREAM>(&self()), endIn);
-            applyChangedSettings(false);
+            applyChangedSettings(true, &_pendingForwardParams);
 
             if constexpr (requires { self().forwardTags(endIn, endOut, 0UZ); }) {
                 self().forwardTags(endIn, endOut, 0UZ);
             } else {
                 forwardRemainingInputTags(endIn, endOut);
+            }
+            if (!_pendingForwardParams.empty()) {
+                for_each_writer_span([this](auto& out) { publishForwardParams(out, _pendingForwardParams); }, endOut);
+                _pendingForwardParams.clear();
             }
             publishSamples(0UZ, endOut);
             consumeReaders(0UZ, endIn);
@@ -1732,7 +1721,7 @@ private:
             auto skipOut = prepareStreams(outputPorts<PortType::STREAM>(&self()), 0UZ);
             applyChangedSettings(true, &_pendingForwardParams); // a setting changed since the call began keeps its forwarded parameters
             applyInputTagsInWindow(skipIn, nSkip);
-            applyChangedSettings(false);
+            applyChangedSettings(true, &_pendingForwardParams);
             forwardInputTags(skipIn, skipOut, nSkip, nSkip);
             publishSamples(0UZ, skipOut);
             for_each_reader_span(
@@ -2496,7 +2485,7 @@ public:
     void applyInputTagsAndSettings(TInputSpans& inputSpans, std::size_t processedIn, bool hasAnyTag) {
         if (hasAnyTag) {
             applyInputTagsFromPorts(inputSpans, processedIn);
-            applyChangedSettings(false);
+            applyChangedSettings(true, &_pendingForwardParams);
         }
     }
 
@@ -2539,9 +2528,11 @@ public:
     void finaliseIO(TInputSpans& inputSpans, TOutputSpans& outputSpans, work::Status& userReturnStatus, std::size_t& processedIn, std::size_t processedOut, std::size_t resampledIn) {
         using enum gr::work::Status;
 
-        if (processedOut == 0) {
-            // if no data is published or consumed => do not publish any tags
+        if (traits::block::stream_output_ports<Derived>::size > 0UZ && processedOut == 0UZ) {
+            // if no data is published or consumed => do not publish any tags; the forwarded parameters wait for the next call
             for_each_writer_span([](auto& outSpan) { outSpan.tagsPublished = 0; }, outputSpans);
+        } else {
+            _pendingForwardParams.clear();
         }
 
         // a call that ends after the stop reached the block returns DONE, and an ERROR from the user's work stays ERROR
@@ -2577,8 +2568,10 @@ public:
         if (userReturnStatus == DONE) {
             emitErrorMessageIfAny("finaliseIO(): DONE -> REQUESTED_STOP", this->changeStateTo(lifecycle::State::REQUESTED_STOP));
             this->setAndNotifyState(lifecycle::State::STOPPED);
-            if (!forwardParams.empty()) {
-                for_each_writer_span([&forwardParams](auto& outSpan) { publishForwardParams(outSpan, forwardParams); }, outputSpans);
+            mergeForwardParams(_pendingForwardParams, std::move(forwardParams));
+            if (!_pendingForwardParams.empty()) {
+                for_each_writer_span([this](auto& outSpan) { publishForwardParams(outSpan, _pendingForwardParams); }, outputSpans);
+                _pendingForwardParams.clear();
             }
             publishEoS(outputSpans);
         } else if (userReturnStatus == ERROR && shuttingDown) {
@@ -2744,9 +2737,8 @@ public:
             forwardInputTags(inputSpans, outputSpans, processedIn);
         }
 
-        if (!_pendingForwardParams.empty()) {
+        if (!_pendingForwardParams.empty()) { // the map stays pending for the next call when this call publishes no sample
             for_each_writer_span([this](auto& out) { publishForwardParams(out, _pendingForwardParams); }, outputSpans);
-            _pendingForwardParams.clear();
         }
 
         if constexpr (HasProcessOneFunction<Derived> && !HasProcessBulkFunction<Derived>) {

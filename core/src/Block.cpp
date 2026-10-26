@@ -29,6 +29,7 @@ void BlockBase::initStandardPropertyCallbacks() noexcept {
         {block::property::kActiveContext, &BlockBase::propertyCallbackActiveContext},
         {block::property::kSettingsCtx, &BlockBase::propertyCallbackSettingsCtx},
         {block::property::kSettingsContexts, &BlockBase::propertyCallbackSettingsContexts},
+        {block::property::kTagCouplings, &BlockBase::propertyCallbackTagCouplings},
         {block::property::kMetaInformation, &BlockBase::propertyCallbackMetaInformation},
         {block::property::kUiConstraints, &BlockBase::propertyCallbackUiConstraints},
     };
@@ -354,6 +355,29 @@ std::optional<Message> BlockBase::propertyCallbackActiveContext(std::string_view
                {gr::tag::CONTEXT.shortKey(), ctx.context},  //
                {gr::tag::CONTEXT_TIME.shortKey(), ctx.time} //
         };
+        return message;
+    }
+
+    throw gr::exception(std::format("block {} property {} does not implement command {}, msg: {}", cbUniqueName(), propertyName, message.cmd, message));
+}
+
+std::optional<Message> BlockBase::propertyCallbackTagCouplings(std::string_view propertyName, Message message) {
+    using enum gr::message::Command;
+    assert(propertyName == block::property::kTagCouplings);
+
+    if (message.cmd == Set) {
+        if (!message.data.has_value()) {
+            throw gr::exception(std::format("block {} (aka. {}) cannot set {} w/o data msg: {}", cbUniqueName(), cbName(), propertyName, message));
+        }
+        cbSettings().setTagCouplings(*message.data);
+        if (message.clientRequestID.empty()) {
+            return std::nullopt;
+        }
+        message.cmd  = Final;
+        message.data = cbSettings().tagCouplings();
+        return message;
+    } else if (message.cmd == Get) {
+        message.data = cbSettings().tagCouplings();
         return message;
     }
 

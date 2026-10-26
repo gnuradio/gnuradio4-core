@@ -70,6 +70,9 @@ struct BarrierBlock : gr::Block<BarrierBlock> {
     }
 };
 
+/// couples the block's sample_rate to gr:sample_rate
+void coupleRate(gr::SettingsBase& settings) { settings.setTagCouplings({{"sample_rate", std::string(gr::tag::SAMPLE_RATE.shortKey())}}); }
+
 // gain is range-limited, so an out-of-range staged value is rejected by the annotation's validator
 struct ValidatingBlock : gr::Block<ValidatingBlock> {
     gr::PortIn<float>  in;
@@ -119,6 +122,12 @@ struct RateSource : gr::Block<RateSource> {
     static constexpr std::size_t kSamples = 4096UZ;
 
     std::size_t _nProduced = 0UZ;
+
+    void settingsChanged(const gr::property_map& /*oldSettings*/, const gr::property_map& newSettings, gr::property_map& forwardSettings) {
+        if (newSettings.contains("sample_rate")) {
+            forwardSettings.insert_or_assign(std::pmr::string(gr::tag::SAMPLE_RATE.shortKey()), sample_rate.value);
+        }
+    }
 
     float processOne() {
         if (++_nProduced >= kSamples) {
@@ -268,13 +277,14 @@ const boost::ut::suite<"settings concurrency"> settingsConcurrencyTests = [] {
         expect(eq(block.gain.value, 1.0f)) << "the out-of-range value reached the block";
 
         expect(!result.failedParameters.contains("sample_rate")) << "a valid value was reported as rejected";
-        expect(result.forwardParameters.contains("sample_rate")) << "a valid auto-forward value was not forwarded";
+        expect(result.forwardParameters.empty()) << "an applied value was forwarded as a tag";
         expect(eq(block.sample_rate.value, 48000.0f)) << "a valid value was not applied";
     };
 
     "a default-tag value of another numeric type is converted to the member's type"_test = [] {
         qa_settings::WideRateBlock block;
         block.init(std::make_shared<gr::Sequence>());
+        block.settings().setTagCouplings({{"sample_rate", std::string(gr::tag::SAMPLE_RATE.shortKey())}, {"num_channels", std::string(gr::tag::NUM_CHANNELS.shortKey())}});
 
         block.settings().autoUpdate(gr::Tag{0UZ, {{"sample_rate", 2.4e6f}, {"num_channels", 4U}}});
         const gr::ApplyStagedParametersResult result = block.settings().applyStagedParameters();
@@ -282,12 +292,13 @@ const boost::ut::suite<"settings concurrency"> settingsConcurrencyTests = [] {
         expect(result.failedParameters.empty()) << "a convertible numeric value was reported as rejected";
         expect(eq(block.sample_rate.value, 2.4e6)) << "the float32 tag did not reach the double member";
         expect(eq(block.num_channels.value, std::int64_t(4))) << "the gr::Size_t tag did not reach the int64 member";
-        expect(result.forwardParameters.contains("sample_rate")) << "the converted value was not forwarded downstream";
+        expect(result.forwardParameters.empty()) << "a tag's value was forwarded as a second tag";
     };
 
     "a wider default-tag value is narrowed onto the canonical member type"_test = [] {
         qa_settings::NarrowRateSink block;
         block.init(std::make_shared<gr::Sequence>());
+        qa_settings::coupleRate(block.settings());
 
         block.settings().autoUpdate(gr::Tag{0UZ, {{"sample_rate", 2.4e6}}});
         std::ignore = block.settings().applyStagedParameters();
@@ -298,6 +309,7 @@ const boost::ut::suite<"settings concurrency"> settingsConcurrencyTests = [] {
     "a default-tag value outside the member's range is not applied"_test = [] {
         qa_settings::NarrowRateSink block;
         block.init(std::make_shared<gr::Sequence>());
+        qa_settings::coupleRate(block.settings());
 
         block.settings().autoUpdate(gr::Tag{0UZ, {{"sample_rate", 1e300}}});
         std::ignore = block.settings().applyStagedParameters();
@@ -308,6 +320,7 @@ const boost::ut::suite<"settings concurrency"> settingsConcurrencyTests = [] {
     "a non-numeric default-tag value is not applied"_test = [] {
         qa_settings::WideRateBlock block;
         block.init(std::make_shared<gr::Sequence>());
+        qa_settings::coupleRate(block.settings());
 
         block.settings().autoUpdate(gr::Tag{0UZ, {{"sample_rate", std::string("not-a-number")}}});
         std::ignore = block.settings().applyStagedParameters();
@@ -324,6 +337,8 @@ const boost::ut::suite<"settings concurrency"> settingsConcurrencyTests = [] {
             auto&     source = flow.emplaceBlock<qa_settings::RateSource>({{"sample_rate", 2.4e6f}});
             wideBlock        = &flow.emplaceBlock<qa_settings::WideRateBlock>();
             sink             = &flow.emplaceBlock<qa_settings::NarrowRateSink>();
+            qa_settings::coupleRate(wideBlock->settings());
+            qa_settings::coupleRate(sink->settings());
             expect(flow.connect<"out", "in">(source, *wideBlock).has_value());
             expect(flow.connect<"out", "in">(*wideBlock, *sink).has_value());
             expect(scheduler.exchange(std::move(flow)).has_value());
@@ -331,8 +346,8 @@ const boost::ut::suite<"settings concurrency"> settingsConcurrencyTests = [] {
 
         expect(scheduler.runAndWait().has_value()) << "the graph did not run to completion";
         expect(gt(sink->_nReceived, 0UZ)) << "the sink received nothing";
-        expect(eq(wideBlock->sample_rate.value, 2.4e6)) << "the forwarded float32 rate did not reach the double member";
-        expect(eq(sink->sample_rate.value, 2.4e6f)) << "the re-forwarded float64 rate did not reach the float member";
+        expect(eq(wideBlock->sample_rate.value, 2.4e6)) << "the float32 rate tag did not reach the double member";
+        expect(eq(sink->sample_rate.value, 2.4e6f)) << "the rate tag that crossed the double-typed block did not reach the float member";
     };
 
     "a default-tag value the graph cannot convert does not stop the graph"_test = [] {
@@ -342,6 +357,7 @@ const boost::ut::suite<"settings concurrency"> settingsConcurrencyTests = [] {
             gr::Graph flow;
             auto&     source = flow.emplaceBlock<qa_settings::BadTagSource>();
             sink             = &flow.emplaceBlock<qa_settings::NarrowRateSink>();
+            qa_settings::coupleRate(sink->settings());
             expect(flow.connect<"out", "in">(source, *sink).has_value());
             expect(scheduler.exchange(std::move(flow)).has_value());
         }

@@ -265,7 +265,8 @@ inline property_map readEntryParameters(const property_map& grcBlock, const Bloc
     return *parameters;
 }
 
-/// Loads `parameters` and the entry's `ctx_parameters` into the block's settings and activates the default context.
+/// Loads `parameters`, the entry's `ctx_parameters` and its `tag_couplings` into the block's settings and activates the
+/// default context. `tag_couplings` maps a setting's name to the tag key that sets it.
 inline void loadEntrySettings(BlockModel& block, const property_map& grcBlock, const property_map& parameters, const BlockIdentity& identity) {
     block.settings().loadParametersFromPropertyMap(parameters);
 
@@ -292,6 +293,18 @@ inline void loadEntrySettings(BlockModel& block, const property_map& grcBlock, c
 
             checkDeclared(readable, identity.name, block.typeName(), *ctxParameters);
             block.settings().loadParametersFromPropertyMap(*ctxParameters, SettingsCtx{*ctxTime, ctxName});
+        }
+    }
+
+    if (auto it = grcBlock.find(serialization_fields::BLOCK_TAG_COUPLINGS); it != grcBlock.end()) {
+        const auto couplings = checked_access_ptr<const property_map, false>{it->second.get_if<property_map>()};
+        if (couplings == nullptr) {
+            throw gr::exception(std::format("Unable to create block '{}' of type '{}': tag_couplings is not a map", identity.name, identity.type));
+        }
+        try {
+            block.settings().setTagCouplings(*couplings);
+        } catch (const gr::exception& refused) {
+            throw gr::exception(std::format("Unable to create block '{}' of type '{}': {}", identity.name, identity.type, refused.message));
         }
     }
 
@@ -619,7 +632,7 @@ inline gr::meta::indirect<gr::Graph> loadGrc(PluginLoader& loader, std::string_v
 /// skimming a block sees what it is before how it is configured. Every map in the document is
 /// emitted with these keys first and the remainder lexicographically, which also makes the
 /// output deterministic (the underlying map's own iteration order is a hash artifact).
-inline constexpr std::array<std::string_view, 12> grcYamlKeyOrder{"id", "name", "unique_name", "block_category", "meta_information", "parameters", "ctx_parameters", "scheduler", "exported_ports", "blocks", "connections", "graph"};
+inline constexpr std::array<std::string_view, 13> grcYamlKeyOrder{"id", "name", "unique_name", "block_category", "meta_information", "parameters", "ctx_parameters", "tag_couplings", "scheduler", "exported_ports", "blocks", "connections", "graph"};
 
 inline std::string saveGrc(PluginLoader& loader, const gr::Graph& rootGraph) { return pmt::yaml::serialize(detail::saveGraphToMap(loader, rootGraph), grcYamlKeyOrder); }
 
