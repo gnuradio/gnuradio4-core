@@ -10,6 +10,11 @@ add_library(
   src/PluginLoader.cpp
   src/PmtTypeHelpers.cpp)
 
+# the shipped schedulers, registered under the keys a graph names them by, which needs a registry to hold them
+if(GR_ENABLE_BLOCK_REGISTRY)
+  target_sources(gnuradio-core PRIVATE src/ShippedSchedulers.cpp)
+endif()
+
 add_library(gnuradio4::gnuradio-core ALIAS gnuradio-core)
 # gr::installedPluginDirectory() returns the plugin directory of this installation, and the process's plugin loader
 # searches it when GNURADIO4_PLUGIN_DIRECTORIES is not set
