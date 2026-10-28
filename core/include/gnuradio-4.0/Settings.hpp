@@ -181,6 +181,16 @@ std::string enumToString(T&& enum_value) {
  * block's settings as they were before, and a batch that moves no value does not call back. Activating another
  * context is an event rather than a value change: it always calls back and always names the newly active context
  * under `gr::tag::CONTEXT`, whether or not any value moved with it.
+ *
+ * The callback refuses every value in `newSettings` by throwing. Each member named in `newSettings` then takes back its
+ * value from `oldSettings`, and `settings().get()` returns that value. When `set()` left a refused value in the stored
+ * set the batch was applied from, that set takes the value from `oldSettings` as well. A context that the batch
+ * activates, or that the callback activates before it throws, keeps its stored set as it is. When the callback refuses
+ * a batch that activates another context, the context active before the activation is active again. A batch that
+ * `removeContext()` staged keeps the context it falls back to. When `removeContext()` removed the context active before
+ * the activation, the default context is active instead. A reset activates the default context: when the callback
+ * refuses a batch with a reset, the context active before the batch is active again. A member whose limits refuse its
+ * value from `oldSettings` keeps the refused value. The exception then reaches the caller.
  */
 template<typename BlockType>
 concept HasSettingsChangedCallback = requires(BlockType* block, const property_map& oldSettings, property_map& newSettings) {
@@ -889,7 +899,8 @@ protected:
     std::set<std::string>                                                            _autoForwardParameters{};
     MatchPredicate                                                                   _matchPred = settings::nullMatchPred;
     SettingsCtx                                                                      _activeCtx{};
-    bool                                                                             _contextActivated{false}; ///< set when `_activeCtx.context` moved, consumed by the next apply
+    bool                                                                             _contextActivated{false};   ///< set when `_activeCtx.context` moved, consumed by the next apply
+    std::optional<SettingsCtx>                                                       _contextBeforeActivation{}; ///< active before the first activation since the last apply; a refused apply makes it active again while the activated context is still active
     property_map                                                                     _stagedParameters{};
     std::set<std::string, std::less<>>                                               _taggedKeys{}; ///< the keys of `_stagedParameters` whose value a tag staged last
     property_map                                                                     _activeParameters{};
@@ -987,6 +998,7 @@ protected:
     [[nodiscard]] bool                                 removeContextImpl(SettingsCtx ctx);
     [[nodiscard]] std::optional<pmt::Value>            findBestMatchCtx(const pmt::Value& contextToSearch) const;
     [[nodiscard]] std::optional<SettingsCtx>           findBestMatchSettingsCtx(const SettingsCtx& ctx) const;
+    [[nodiscard]] std::optional<SettingsCtx>           findCurrentDefaultCtx() const; // the default context's set that activating it picks now
     [[nodiscard]] std::optional<property_map>          getBestMatchStoredParameters(const SettingsCtx& ctx) const;
     [[nodiscard]] std::optional<std::set<std::string>> getBestMatchAutoUpdateParameters(const SettingsCtx& ctx) const;
     void                                               resolveDuplicateTimestamp(SettingsCtx& ctx);
@@ -997,6 +1009,10 @@ protected:
     [[nodiscard]] std::optional<SettingsCtx>           createSettingsCtxFromTag(const Tag& tag) const;
     [[nodiscard]] std::string                          describeRefusal(std::string_view key, const pmt::Value& value, std::string_view blockName = {}) const;
     [[nodiscard]] std::string                          describeRefusals(const property_map& refused) const;
+    // writes the values in `oldSettings` back to the members `refused` names, and to the stored set of `batchCtx`, the context active when the batch was applied, where it holds the refused value
+    void restoreRefusedImpl(const property_map& refused, const property_map& oldSettings, const SettingsCtx& batchCtx, bool contextActivated);
+    // on a refusal: makes `earlier` active while `refused` is still active, or the default context when no set of `earlier`'s context is stored; a record of `refused` takes the same context
+    void restoreContextImpl(const SettingsCtx& earlier, const SettingsCtx& refused);
 }; // class CtxSettingsBase
 
 /**

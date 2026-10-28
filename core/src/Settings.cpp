@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <exception>
 #include <print>
 #include <utility>
 
@@ -254,6 +255,9 @@ std::optional<SettingsCtx> CtxSettingsBase::activateContextImpl(SettingsCtx ctx)
         if (_parameters) {
             auto& parameters = *_parameters;
             _stagedParameters.insert(parameters.begin(), parameters.end());
+            if (!_contextActivated) {
+                _contextBeforeActivation = _activeCtx;
+            }
             _activeCtx = bestMatchSettingsCtx.value();
             // moving to another context is an event of its own: the next apply reports it whether or not the
             // context's parameters differ from the ones the block already holds
@@ -297,14 +301,20 @@ bool CtxSettingsBase::removeContextImpl(SettingsCtx ctx) {
         return false;
     }
     _autoUpdateParameters.erase(exactIt->context);
+    const bool removesEarlierContext = _contextBeforeActivation == exactIt->context;
     vec.erase(exactIt);
 
     if (vec.empty()) {
         _storedParameters.erase(ctx.context);
     }
+    if (removesEarlierContext) {
+        // a refusal falls back to the default context, as removing the active context does
+        _contextBeforeActivation = findCurrentDefaultCtx();
+    }
 
     if (_activeCtx.context == ctx.context) {
         std::ignore = activateContextImpl({}); // Activate default context
+        _contextBeforeActivation.reset();      // a refusal keeps the default context
     }
 
     return true;
@@ -315,33 +325,35 @@ bool CtxSettingsBase::removeContextImpl(SettingsCtx ctx) {
 void CtxSettingsBase::assignFrom(const CtxSettingsBase& other) {
     std::scoped_lock lock(_mutex, other._mutex);
     gr::atomic_ref(_changed).store_release(gr::atomic_ref(other._changed).load_acquire());
-    _storedParameters      = other._storedParameters;
-    _defaultParameters     = other._defaultParameters;
-    _initBlockParameters   = other._initBlockParameters;
-    _autoUpdateParameters  = other._autoUpdateParameters;
-    _autoForwardParameters = other._autoForwardParameters;
-    _matchPred             = other._matchPred;
-    _activeCtx             = other._activeCtx;
-    _contextActivated      = other._contextActivated;
-    _stagedParameters      = other._stagedParameters;
-    _taggedKeys            = other._taggedKeys;
-    _activeParameters      = other._activeParameters;
+    _storedParameters        = other._storedParameters;
+    _defaultParameters       = other._defaultParameters;
+    _initBlockParameters     = other._initBlockParameters;
+    _autoUpdateParameters    = other._autoUpdateParameters;
+    _autoForwardParameters   = other._autoForwardParameters;
+    _matchPred               = other._matchPred;
+    _activeCtx               = other._activeCtx;
+    _contextActivated        = other._contextActivated;
+    _contextBeforeActivation = other._contextBeforeActivation;
+    _stagedParameters        = other._stagedParameters;
+    _taggedKeys              = other._taggedKeys;
+    _activeParameters        = other._activeParameters;
 }
 
 void CtxSettingsBase::assignFrom(CtxSettingsBase&& other) noexcept {
     std::scoped_lock lock(_mutex, other._mutex);
     gr::atomic_ref(_changed).store_release(gr::atomic_ref(other._changed).load_acquire());
-    _storedParameters      = std::move(other._storedParameters);
-    _defaultParameters     = std::move(other._defaultParameters);
-    _initBlockParameters   = std::move(other._initBlockParameters);
-    _autoUpdateParameters  = std::move(other._autoUpdateParameters);
-    _autoForwardParameters = std::move(other._autoForwardParameters);
-    _matchPred             = std::exchange(other._matchPred, settings::nullMatchPred);
-    _activeCtx             = std::exchange(other._activeCtx, {});
-    _contextActivated      = std::exchange(other._contextActivated, false);
-    _stagedParameters      = std::move(other._stagedParameters);
-    _taggedKeys            = std::move(other._taggedKeys);
-    _activeParameters      = std::move(other._activeParameters);
+    _storedParameters        = std::move(other._storedParameters);
+    _defaultParameters       = std::move(other._defaultParameters);
+    _initBlockParameters     = std::move(other._initBlockParameters);
+    _autoUpdateParameters    = std::move(other._autoUpdateParameters);
+    _autoForwardParameters   = std::move(other._autoForwardParameters);
+    _matchPred               = std::exchange(other._matchPred, settings::nullMatchPred);
+    _activeCtx               = std::exchange(other._activeCtx, {});
+    _contextActivated        = std::exchange(other._contextActivated, false);
+    _contextBeforeActivation = std::exchange(other._contextBeforeActivation, std::nullopt);
+    _stagedParameters        = std::move(other._stagedParameters);
+    _taggedKeys              = std::move(other._taggedKeys);
+    _activeParameters        = std::move(other._activeParameters);
 }
 
 // --- Private helpers: match/search ---
@@ -397,6 +409,15 @@ std::optional<SettingsCtx> CtxSettingsBase::findBestMatchSettingsCtx(const Setti
         }
     }
     return std::nullopt;
+}
+
+std::optional<SettingsCtx> CtxSettingsBase::findCurrentDefaultCtx() const {
+    SettingsCtx ctx{};
+    ctx.time = settings::convertTimePointToUint64Ns(std::chrono::system_clock::now());
+#ifdef __EMSCRIPTEN__
+    ctx.time += _timePrecisionTolerance;
+#endif
+    return findBestMatchSettingsCtx(ctx);
 }
 
 std::optional<property_map> CtxSettingsBase::getBestMatchStoredParameters(const SettingsCtx& ctx) const {
@@ -810,7 +831,9 @@ ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::uniq
     const settings::BlockHooks& hooks = _descriptor->hooks;
 
     // one apply consumes one activation, so an event is reported once and does not reach a later batch
-    bool contextActivated = std::exchange(_contextActivated, false);
+    bool                       contextActivated = std::exchange(_contextActivated, false);
+    std::optional<SettingsCtx> contextBefore    = std::exchange(_contextBeforeActivation, std::nullopt);
+    SettingsCtx                batchCtx         = _activeCtx; // a callback may activate another context before it refuses
 
     ApplyStagedParametersResult result;
     if (hooks.reflectable) {
@@ -841,6 +864,11 @@ ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::uniq
                     restored.insert_or_assign(key, value);
                 }
                 contextActivated = std::exchange(_contextActivated, false) || contextActivated;
+                // a refusal of the batch returns the block to the context active before the batch
+                if (std::optional<SettingsCtx> beforeReset = std::exchange(_contextBeforeActivation, std::nullopt); !contextBefore.has_value()) {
+                    contextBefore = beforeReset;
+                }
+                batchCtx = _activeCtx;
                 removeExpiredStoredParameters();
             }
         }
@@ -879,8 +907,23 @@ ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::uniq
         // copies, so the callback may read or write settings() without _mutex being held across it
         if (!staged.empty()) {
             reentrantLock.unlock();
-            hooks.settingsChanged(_block, oldSettings, staged, result.forwardParameters);
+            // the callback edits a copy: a refusal writes back and names the values in `staged`
+            property_map       newSettings = staged;
+            std::exception_ptr refusal;
+            try {
+                hooks.settingsChanged(_block, oldSettings, newSettings, result.forwardParameters);
+            } catch (...) {
+                refusal = std::current_exception();
+            }
             reentrantLock.lock();
+            if (refusal != nullptr) {
+                restoreRefusedImpl(staged, oldSettings, batchCtx, contextActivated);
+                if (contextBefore.has_value()) {
+                    restoreContextImpl(*contextBefore, batchCtx);
+                }
+                updateActiveParametersImpl();
+                std::rethrow_exception(refusal);
+            }
         }
 
         updateActiveParametersImpl();
@@ -956,6 +999,48 @@ std::size_t CtxSettingsBase::updateActiveParameters(std::initializer_list<std::s
         }
     }
     return nCopied;
+}
+
+void CtxSettingsBase::restoreRefusedImpl(const property_map& refused, const property_map& oldSettings, const SettingsCtx& batchCtx, bool contextActivated) {
+    // a batch that activated a context leaves every stored set as it is
+    property_map* batchStored = nullptr;
+    if (const auto stored = _storedParameters.find(batchCtx.context); !contextActivated && stored != _storedParameters.end()) {
+        const auto batchSet = std::ranges::find_if(stored->second, [&batchCtx](const CtxSettingsPair& pair) { return pair.context == batchCtx; });
+        if (batchSet != stored->second.end()) {
+            batchStored = &batchSet->settings;
+        }
+    }
+    for (const auto& [key, refusedValue] : refused) {
+        const auto member   = _descriptor->writableByName.find(key);
+        const auto previous = oldSettings.find(key);
+        if (member == _descriptor->writableByName.end() || previous == oldSettings.end()) {
+            continue;
+        }
+        property_map applied;
+        property_map forCallback;
+        // a member whose limits refuse its previous value keeps the refused value, and the stored set stays as it is
+        if (!member->second->applyStaged(member->second->address(_block), key, previous->second, applied, forCallback, false)) {
+            continue;
+        }
+        if (batchStored != nullptr) {
+            if (const auto storedValue = batchStored->find(key); storedValue != batchStored->end() && storedValue->second == refusedValue) {
+                storedValue->second = previous->second;
+            }
+        }
+    }
+}
+
+void CtxSettingsBase::restoreContextImpl(const SettingsCtx& earlier, const SettingsCtx& refused) {
+    // a removal of the earlier context's last stored set leaves the default context in its place
+    const std::optional<SettingsCtx> restored = _storedParameters.contains(earlier.context) ? std::optional(earlier) : findCurrentDefaultCtx();
+    // a context another call activated while the callback ran stays active
+    if (_activeCtx == refused && restored.has_value()) {
+        _activeCtx = *restored;
+    }
+    // that activation recorded the refused context, which a refusal of its own batch must not make active
+    if (_contextBeforeActivation == refused) {
+        _contextBeforeActivation = restored;
+    }
 }
 
 void CtxSettingsBase::storeCurrentParameters(property_map& parameters) {
