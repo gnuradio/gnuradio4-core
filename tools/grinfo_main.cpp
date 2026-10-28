@@ -43,7 +43,7 @@
 
 #include "BlockLookup.hpp"
 #include "DocWriter.hpp"
-#include "SchedulerRegistrations.hpp"
+#include "ShippedSchedulers.hpp"
 
 #ifdef INTERNAL_ENABLE_BLOCK_PLUGINS
 #if defined(_WIN32)
@@ -2201,7 +2201,7 @@ int main(int argc, char** argv) {
     for (const Directory& directory : directories) {
         paths.push_back(directory.path);
     }
-    gr::tools::registerSchedulers(gr::globalSchedulerRegistry());
+    gr::detail::registerShippedSchedulers();
     gr::PluginLoader loader(gr::globalBlockRegistry(), gr::globalSchedulerRegistry(), paths);
 
     Context context{.loader = loader, .directories = std::move(directories), .keys = {}, .schedulers = {}, .files = {}, .plugins = {}, .libraryFiles = {}, .program = thisProgramFile(), .totals = {}};

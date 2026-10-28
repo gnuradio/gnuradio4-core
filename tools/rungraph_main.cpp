@@ -36,7 +36,7 @@
 #include <gnuradio-4.0/YamlPmt.hpp>
 #include <gnuradio-4.0/formatter/ValueFormatter.hpp>
 
-#include "SchedulerRegistrations.hpp"
+#include "ShippedSchedulers.hpp"
 
 namespace {
 
@@ -104,7 +104,7 @@ struct Setting {
 struct Options {
     std::string              graph; // the graph file, or "-" for standard input
     std::vector<std::string> pluginDirectories;
-    std::string              scheduler{gr::tools::kDefaultScheduler};
+    std::string              scheduler{gr::detail::kDefaultSchedulerKey};
     std::vector<std::string> show;          // the blocks whose settings are printed when the run ends
     std::vector<Setting>     settings;      // in command-line order, so that the last of a key wins
     double                   seconds = 0.0; // 0 runs until the graph ends or a signal arrives
@@ -410,7 +410,7 @@ int main(int argc, char** argv) {
 
     // registers the program's own schedulers before the loader runs. A library the loader opens can then replace one
     // under the same key.
-    gr::tools::registerSchedulers(gr::globalSchedulerRegistry());
+    gr::detail::registerShippedSchedulers();
     const std::vector<std::string> directories = searchDirectories(options.pluginDirectories);
     std::vector<std::string>       keysBefore  = gr::globalBlockRegistry().keys();
     std::ranges::sort(keysBefore);

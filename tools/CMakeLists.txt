@@ -16,10 +16,12 @@ target_compile_definitions(
   graphdoc PRIVATE GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY="${CMAKE_INSTALL_FULL_LIBDIR}/gnuradio-4/plugins")
 install(TARGETS graphdoc RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
-# rungraph, an ordinary consumer of the installed headers: it is not compiled into the libraries. It builds its graph by
-# name, which needs the registry, so it follows it.
+# rungraph, a consumer of the installed headers and of one internal header: it is not compiled into the libraries. It
+# builds its graph by name, which needs the registry, so it follows it. It also includes core's internal
+# ShippedSchedulers.hpp through a private include directory.
 if(GR_ENABLE_BLOCK_REGISTRY)
   add_executable(rungraph rungraph_main.cpp)
+  target_include_directories(rungraph PRIVATE ${PROJECT_SOURCE_DIR}/core/src)
   target_link_libraries(rungraph PRIVATE gnuradio-options gnuradio-core gnuradio-blocklib-core)
   if(TARGET gnuradio-plugin)
     target_link_libraries(rungraph PRIVATE gnuradio-plugin)
@@ -30,10 +32,11 @@ if(GR_ENABLE_BLOCK_REGISTRY)
   install(TARGETS rungraph RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
-# grinfo, an ordinary consumer of the installed headers as rungraph is. It reports the registered blocks, which only a
-# build with the registry has.
+# grinfo, a consumer of the installed headers and of ShippedSchedulers.hpp as rungraph is. It reports the registered
+# blocks, which only a build with the registry has.
 if(GR_ENABLE_BLOCK_REGISTRY)
   add_executable(grinfo grinfo_main.cpp)
+  target_include_directories(grinfo PRIVATE ${PROJECT_SOURCE_DIR}/core/src)
   # gnuradio-doctools carries the writer of its Markdown and HTML forms
   target_link_libraries(grinfo PRIVATE gnuradio-doctools)
   if(TARGET gnuradio-plugin)
