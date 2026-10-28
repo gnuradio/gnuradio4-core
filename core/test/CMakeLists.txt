@@ -31,6 +31,7 @@ set(_CORE_TESTS
     qa_DataSet
     qa_DestructionSafety
     qa_DynamicPort
+    qa_ErasedRuntime
     qa_GraphEdit
     qa_grc
     qa_LifeCycle
@@ -83,7 +84,11 @@ message(
 )
 
 if(NOT GR_ENABLE_BLOCK_REGISTRY)
-  list(REMOVE_ITEM _CORE_TESTS qa_BlockRegistration)
+  list(
+    REMOVE_ITEM
+    _CORE_TESTS
+    qa_BlockRegistration
+    qa_ErasedRuntime)
 endif()
 
 foreach(TEST_NAME IN LISTS _CORE_TESTS)
@@ -221,6 +226,9 @@ if(GR_ENABLE_BLOCK_REGISTRY AND INTERNAL_ENABLE_BLOCK_PLUGINS)
     good_math_plugin
     good_conversion_plugin
     bad_plugin)
+
+  # qa_ErasedRuntime loads a graph document and a scheduler through a loader over the test plugin directory
+  add_dependencies(qa_ErasedRuntime GoodBasePlugin good_math_plugin)
 
   add_app_test(qa_PluginRegistration)
   add_dependencies(

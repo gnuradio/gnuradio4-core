@@ -10,9 +10,10 @@ add_library(
   src/PluginLoader.cpp
   src/PmtTypeHelpers.cpp)
 
-# the shipped schedulers, registered under the keys a graph names them by, which needs a registry to hold them
+# the shipped schedulers, registered under the keys a graph names them by, and the runtime that builds a graph by name;
+# both need a registry to look the names up in
 if(GR_ENABLE_BLOCK_REGISTRY)
-  target_sources(gnuradio-core PRIVATE src/ShippedSchedulers.cpp)
+  target_sources(gnuradio-core PRIVATE src/ShippedSchedulers.cpp src/Runtime.cpp)
 endif()
 
 add_library(gnuradio4::gnuradio-core ALIAS gnuradio-core)
@@ -77,7 +78,14 @@ install(
 
 # the whole include directory is the public surface, and it is installed as it is laid out: a PUBLIC_HEADER list would
 # flatten the subdirectories into a second copy beside the first
-install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+if(GR_ENABLE_BLOCK_REGISTRY)
+  install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+else()
+  install(
+    DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    PATTERN "Runtime.hpp" EXCLUDE)
+endif()
 
 add_subdirectory(src)
 
