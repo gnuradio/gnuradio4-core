@@ -498,6 +498,19 @@ Downstream examples: hardware-backed lifecycle and finite-source blocks in
 
 Called automatically when settings are updated, **before** the next processing call.
 
+A callback refuses every value in `newSettings` by throwing. Each setting named in
+`newSettings` then takes back its value from `oldSettings`, in the member and in
+`settings().get()`. When `set()` left a refused value in the stored set the batch was applied
+from, that set takes the value from `oldSettings` as well. A context that the batch activates,
+or that the callback activates before it throws, keeps its stored set as it is. When the
+callback refuses a batch that activates another context, the context active before the
+activation is active again. A batch that `removeContext()` staged keeps the context it falls
+back to. When `removeContext()` removed the context active before the activation, the default
+context is active instead. A reset activates the default context: when the callback refuses a
+batch with a reset, the context active before the batch is active again. A setting whose
+`Limits` refuse its value from `oldSettings` keeps the refused value. The block reports the
+exception as an error on its message output.
+
 ### 2-argument variant
 
 ```cpp

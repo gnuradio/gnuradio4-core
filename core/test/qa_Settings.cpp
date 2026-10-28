@@ -1227,6 +1227,96 @@ struct LimitedSink : Block<LimitedSink> {
     }
 };
 
+/// a sink that counts its samples, with a count its settingsChanged() refuses at 0 and a level it takes at any value
+struct RefusingSink : Block<RefusingSink> {
+    PortIn<float> in{};
+
+    gr::Size_t count = 4U;
+    float      level = 1.f;
+
+    GR_MAKE_REFLECTABLE(RefusingSink, in, count, level);
+
+    std::size_t nReceived = 0UZ;
+
+    void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings) {
+        if (newSettings.contains("count") && count == 0U) {
+            throw gr::exception("count must be at least 1");
+        }
+    }
+
+    work::Status processBulk(std::span<const float> input) {
+        nReceived += input.size();
+        return work::Status::OK;
+    }
+};
+
+/// a count whose default lies outside its limits, which settingsChanged() refuses above kMostTaken
+struct LimitedRefusingBlock : Block<LimitedRefusingBlock> {
+    static constexpr gr::Size_t kMostTaken = 4U;
+
+    PortIn<float>  in{};
+    PortOut<float> out{};
+
+    Annotated<gr::Size_t, "count", Limits<1U, 10U>> count = 0U;
+
+    GR_MAKE_REFLECTABLE(LimitedRefusingBlock, in, out, count);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
+
+    void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings) {
+        if (newSettings.contains("count") && count.value > kMostTaken) {
+            throw gr::exception(std::format("count must be at most {}", kMostTaken));
+        }
+    }
+};
+
+/// a count its settingsChanged() refuses at 0, after it empties `newSettings`
+struct ClearingRefusingBlock : Block<ClearingRefusingBlock> {
+    PortIn<float>  in{};
+    PortOut<float> out{};
+
+    gr::Size_t count = 4U;
+
+    GR_MAKE_REFLECTABLE(ClearingRefusingBlock, in, out, count);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
+
+    void settingsChanged(const property_map& /*oldSettings*/, property_map& newSettings) {
+        if (count == 0U) {
+            newSettings.clear();
+            throw gr::exception("count must be at least 1");
+        }
+    }
+};
+
+/// a count its settingsChanged() refuses at 0, after it removes or activates the context a test names, once each
+struct ContextChangingSink : Block<ContextChangingSink> {
+    PortIn<float> in{};
+
+    gr::Size_t count = 4U;
+
+    GR_MAKE_REFLECTABLE(ContextChangingSink, in, count);
+
+    std::optional<SettingsCtx> removeOnRefusal{};
+    std::optional<SettingsCtx> activateOnRefusal{};
+    bool                       removed = false;
+
+    void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings) {
+        if (!newSettings.contains("count") || count != 0U) {
+            return;
+        }
+        if (removeOnRefusal.has_value()) {
+            removed = this->settings().removeContext(*std::exchange(removeOnRefusal, std::nullopt));
+        }
+        if (activateOnRefusal.has_value()) {
+            std::ignore = this->settings().activateContext(*std::exchange(activateOnRefusal, std::nullopt));
+        }
+        throw gr::exception("count must be at least 1");
+    }
+
+    work::Status processBulk(std::span<const float> /*input*/) { return work::Status::OK; }
+};
+
 constexpr std::string_view kRejectedSettings = "applyChangedSettings() - rejected settings";
 
 /// the refusals a port received, the plain messages apart from the errors
@@ -1512,6 +1602,313 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
         expect(run.result.error().message.contains(kRejectedSettings)) << run.result.error().message;
         expect(run.result.error().message.contains("block 'limited_sink' refuses gain = 2")) << run.result.error().message;
         expect(eq(run.gain, 0.5f)) << "the refused value reaches the member";
+    };
+
+    "a value settingsChanged() refuses leaves the member and settings().get() at the value last taken"_test = [] {
+        RefusingSink  block{property_map{{"name", std::string("refusing_stage")}}};
+        gr::MsgPortIn fromBlock;
+        expect(block.msgOut.connect(fromBlock).has_value());
+        block.init(std::make_shared<gr::Sequence>());
+
+        const gr::Size_t taken = block.count + 2U;
+        std::ignore            = block.settings().setStaged({{"count", taken}});
+        block.applyChangedSettings();
+        expect(fatal(eq(block.count, taken))) << "the block does not take a count it accepts";
+
+        std::ignore = block.settings().setStaged({{"count", gr::Size_t{0U}}});
+        block.applyChangedSettings();
+        const ReportedRefusals reported = readRefusals(fromBlock);
+        expect(reported.errors.contains("count must be at least 1")) << "the refusal does not reach the message output, got: " << reported.errors;
+        expect(eq(block.count, taken)) << "the refused value stays in the member";
+        const std::optional<pmt::Value> got = block.settings().get("count");
+        expect(fatal(got.has_value()));
+        expect(eq(got->value_or(gr::Size_t{0U}), taken)) << "settings().get() returns the refused value";
+    };
+
+    "a value set() stores and settingsChanged() refuses is not applied again by a later activation"_test = [] {
+        RefusingSink  block{property_map{{"name", std::string("refusing_stage")}}};
+        gr::MsgPortIn fromBlock;
+        expect(block.msgOut.connect(fromBlock).has_value());
+        block.init(std::make_shared<gr::Sequence>());
+
+        const gr::Size_t taken = block.count + 2U;
+        std::ignore            = block.settings().set({{"count", taken}});
+        std::ignore            = block.settings().activateContext();
+        block.applyChangedSettings();
+        expect(fatal(eq(block.count, taken))) << "the block does not take a count it accepts";
+
+        std::ignore = block.settings().set({{"count", gr::Size_t{0U}}});
+        std::ignore = block.settings().activateContext();
+        block.applyChangedSettings();
+        expect(readRefusals(fromBlock).errors.contains("count must be at least 1")) << "the refusal does not reach the message output";
+        expect(eq(block.count, taken)) << "the refused value stays in the member";
+        const std::optional<pmt::Value> stored = block.settings().getStored("count");
+        expect(fatal(stored.has_value()));
+        expect(eq(stored->value_or(gr::Size_t{0U}), taken)) << "the refused value stays stored";
+
+        const float level = block.level * 2.f;
+        std::ignore       = block.settings().set({{"level", level}});
+        std::ignore       = block.settings().activateContext();
+        block.applyChangedSettings();
+        const ReportedRefusals later = readRefusals(fromBlock);
+        expect(later.errors.empty()) << "the activation of another key applies the refused value again: " << later.errors;
+        expect(eq(block.level, level)) << "the block does not take the other key";
+        expect(eq(block.count, taken));
+    };
+
+    "a refused activation of another context returns to the earlier context and leaves the refused one's stored set as set() stored it"_test = [] {
+        RefusingSink  block{property_map{{"name", std::string("refusing_stage")}}};
+        gr::MsgPortIn fromBlock;
+        expect(block.msgOut.connect(fromBlock).has_value());
+        block.init(std::make_shared<gr::Sequence>());
+
+        const gr::Size_t   held       = block.count;
+        const SettingsCtx  earlierCtx = block.settings().activeContext();
+        const SettingsCtx  refusedCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), "refused"};
+        const property_map refusedSet{{"count", gr::Size_t{0U}}, {"level", block.level * 2.f}};
+        expect(block.settings().set(refusedSet, refusedCtx).empty());
+        expect(block.settings().activateContext(refusedCtx).has_value());
+        block.applyChangedSettings();
+        expect(readRefusals(fromBlock).errors.contains("count must be at least 1")) << "the activation is not refused";
+        expect(eq(block.count, held)) << "the refused value stays in the member";
+        expect(block.settings().activeContext() == earlierCtx) << "the refused context stays active";
+        for (const auto& [key, value] : refusedSet) {
+            const std::optional<pmt::Value> stored = block.settings().getStored(std::string(std::string_view(key)), refusedCtx);
+            expect(stored.has_value() && *stored == value) << "the refused context's stored set changes at " << key;
+        }
+
+        expect(block.settings().activateContext(refusedCtx).has_value());
+        block.applyChangedSettings();
+        expect(readRefusals(fromBlock).errors.contains("count must be at least 1")) << "activating the refused context again does not reach the callback";
+        expect(eq(block.count, held));
+        expect(block.settings().activeContext() == earlierCtx) << "the refused context stays active after a second refusal";
+    };
+
+    "a refused batch that removeContext() staged keeps the context it falls back to"_test = [] {
+        RefusingSink  block{property_map{{"name", std::string("refusing_stage")}}};
+        gr::MsgPortIn fromBlock;
+        expect(block.msgOut.connect(fromBlock).has_value());
+        block.init(std::make_shared<gr::Sequence>());
+
+        const SettingsCtx removedCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), "removed"};
+        expect(block.settings().set({{"count", gr::Size_t{block.count + 1U}}}, removedCtx).empty());
+        expect(block.settings().activateContext(removedCtx).has_value());
+        block.applyChangedSettings();
+        expect(readRefusals(fromBlock).errors.empty()) << "the activation is refused";
+        const gr::Size_t held = block.count;
+
+        // the default context's newest stored set holds a count the callback refuses
+        expect(block.settings().set({{"count", gr::Size_t{0U}}}, SettingsCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), ""}).empty());
+        expect(block.settings().removeContext(removedCtx));
+        block.applyChangedSettings();
+        expect(readRefusals(fromBlock).errors.contains("count must be at least 1")) << "the fallback to the default context is not refused";
+        expect(eq(block.count, held)) << "the refused value stays in the member";
+        expect(block.settings().activeContext().context.value_or(std::string_view{}).empty()) << "the removed context is active again";
+    };
+
+    "a refused activation whose earlier context removeContext() removed before the apply returns to the default context"_test = [] {
+        RefusingSink  block{property_map{{"name", std::string("refusing_stage")}}};
+        gr::MsgPortIn fromBlock;
+        expect(block.msgOut.connect(fromBlock).has_value());
+        block.init(std::make_shared<gr::Sequence>());
+
+        const SettingsCtx earlierCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), "earlier"};
+        expect(block.settings().set({{"count", gr::Size_t{block.count + 1U}}}, earlierCtx).empty());
+        expect(block.settings().activateContext(earlierCtx).has_value());
+        block.applyChangedSettings();
+        expect(readRefusals(fromBlock).errors.empty()) << "the earlier context is refused";
+        const gr::Size_t held = block.count;
+
+        const SettingsCtx refusedCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), "refused"};
+        expect(block.settings().set({{"count", gr::Size_t{0U}}}, refusedCtx).empty());
+        expect(block.settings().activateContext(refusedCtx).has_value());
+        expect(block.settings().removeContext(earlierCtx));
+        block.applyChangedSettings();
+        expect(readRefusals(fromBlock).errors.contains("count must be at least 1")) << "the activation is not refused";
+        expect(eq(block.count, held)) << "the refused value stays in the member";
+        expect(block.settings().activeContext().context.value_or(std::string_view{}).empty()) << "the default context is not active";
+
+        expect(block.settings().activateContext(refusedCtx).has_value());
+        block.applyChangedSettings();
+        expect(readRefusals(fromBlock).errors.contains("count must be at least 1")) << "activating the refused context again does not reach the callback";
+    };
+
+    "a refused activation returns to the earlier context when set() stored a newer set of it before the apply"_test = [] {
+        RefusingSink  block{property_map{{"name", std::string("refusing_stage")}}};
+        gr::MsgPortIn fromBlock;
+        expect(block.msgOut.connect(fromBlock).has_value());
+        block.init(std::make_shared<gr::Sequence>());
+
+        const SettingsCtx earlierCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), "earlier"};
+        expect(block.settings().set({{"count", gr::Size_t{block.count + 1U}}}, earlierCtx).empty());
+        expect(block.settings().activateContext(earlierCtx).has_value());
+        block.applyChangedSettings();
+        expect(readRefusals(fromBlock).errors.empty()) << "the earlier context is refused";
+        const gr::Size_t held  = block.count;
+        const gr::Size_t newer = held + 1U;
+
+        const SettingsCtx refusedCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), "refused"};
+        expect(block.settings().set({{"count", gr::Size_t{0U}}}, refusedCtx).empty());
+        expect(block.settings().activateContext(refusedCtx).has_value());
+        // a newer set of the earlier context prunes the set the activation recorded
+        expect(block.settings().set({{"count", newer}}, SettingsCtx{0U, "earlier"}).empty());
+        block.applyChangedSettings();
+        expect(readRefusals(fromBlock).errors.contains("count must be at least 1")) << "the activation is not refused";
+        expect(eq(block.count, held)) << "the refused value stays in the member";
+        expect(block.settings().activeContext().context == earlierCtx.context) << "the earlier context is not active";
+
+        expect(block.settings().activateContext(SettingsCtx{0U, "earlier"}).has_value());
+        block.applyChangedSettings();
+        expect(readRefusals(fromBlock).errors.empty()) << "the earlier context's newer set is refused";
+        expect(eq(block.count, newer)) << "activating the earlier context again does not stage its newer set";
+    };
+
+    "a refused activation whose earlier context settingsChanged() removes returns to the default context"_test = [] {
+        ContextChangingSink block{property_map{{"name", std::string("removing_stage")}}};
+        gr::MsgPortIn       fromBlock;
+        expect(block.msgOut.connect(fromBlock).has_value());
+        block.init(std::make_shared<gr::Sequence>());
+
+        const SettingsCtx earlierCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), "earlier"};
+        expect(block.settings().set({{"count", gr::Size_t{block.count + 1U}}}, earlierCtx).empty());
+        expect(block.settings().activateContext(earlierCtx).has_value());
+        block.applyChangedSettings();
+        expect(readRefusals(fromBlock).errors.empty()) << "the earlier context is refused";
+        const gr::Size_t held = block.count;
+
+        const SettingsCtx refusedCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), "refused"};
+        expect(block.settings().set({{"count", gr::Size_t{0U}}}, refusedCtx).empty());
+        block.removeOnRefusal = earlierCtx;
+        expect(block.settings().activateContext(refusedCtx).has_value());
+        block.applyChangedSettings();
+        expect(readRefusals(fromBlock).errors.contains("count must be at least 1")) << "the activation is not refused";
+        expect(block.removed) << "the callback does not remove the earlier context";
+        expect(eq(block.count, held)) << "the refused value stays in the member";
+        expect(block.settings().activeContext().context.value_or(std::string_view{}).empty()) << "the default context is not active";
+    };
+
+    "a context settingsChanged() activates before it refuses does not return to the refused context when it is refused too"_test = [] {
+        ContextChangingSink block{property_map{{"name", std::string("activating_stage")}}};
+        gr::MsgPortIn       fromBlock;
+        expect(block.msgOut.connect(fromBlock).has_value());
+        block.init(std::make_shared<gr::Sequence>());
+
+        const gr::Size_t  held       = block.count;
+        const SettingsCtx earlierCtx = block.settings().activeContext();
+        const SettingsCtx refusedCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), "refused"};
+        const SettingsCtx laterCtx{refusedCtx.time + 1U, "later"};
+        expect(block.settings().set({{"count", gr::Size_t{0U}}}, refusedCtx).empty());
+        expect(block.settings().set({{"count", gr::Size_t{0U}}}, laterCtx).empty());
+        block.activateOnRefusal = laterCtx;
+        expect(block.settings().activateContext(refusedCtx).has_value());
+        block.applyChangedSettings();
+        expect(readRefusals(fromBlock).errors.contains("count must be at least 1")) << "the activation is not refused";
+        expect(block.settings().activeContext() == laterCtx) << "the context the callback activates is not active";
+
+        block.applyChangedSettings();
+        expect(readRefusals(fromBlock).errors.contains("count must be at least 1")) << "the context the callback activates is not refused";
+        expect(eq(block.count, held)) << "the refused value stays in the member";
+        expect(block.settings().activeContext() == earlierCtx) << "a refused context is active";
+    };
+
+    "a value settingsChanged() refuses leaves the stored set of a context the callback activates as that context stored it"_test = [] {
+        const gr::Size_t refused = 0U;
+        for (const gr::Size_t storedInNext : {refused, gr::Size_t{refused + 5U}}) {
+            ContextChangingSink block{property_map{{"name", std::string("activating_stage")}}};
+            gr::MsgPortIn       fromBlock;
+            expect(block.msgOut.connect(fromBlock).has_value());
+            block.init(std::make_shared<gr::Sequence>());
+
+            const gr::Size_t  held = block.count;
+            const SettingsCtx nextCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), "next"};
+            expect(block.settings().set({{"count", storedInNext}}, nextCtx).empty());
+            block.activateOnRefusal = nextCtx;
+            std::ignore             = block.settings().setStaged({{"count", refused}});
+            block.applyChangedSettings();
+            expect(readRefusals(fromBlock).errors.contains("count must be at least 1")) << "the staged count is not refused";
+            expect(eq(block.count, held)) << "the refused value stays in the member";
+            expect(block.settings().activeContext() == nextCtx) << "the context the callback activates is not active";
+            const std::optional<pmt::Value> stored = block.settings().getStored("count", nextCtx);
+            expect(fatal(stored.has_value()));
+            expect(eq(stored->value_or(gr::Size_t{held}), storedInNext)) << "the rollback rewrites the stored set of the context the callback activates";
+        }
+    };
+
+    "a refused reset_default tag returns the block to the named context it was in"_test = [] {
+        RefusingSink  block{property_map{{"name", std::string("refusing_stage")}}};
+        gr::MsgPortIn fromBlock;
+        expect(block.msgOut.connect(fromBlock).has_value());
+        block.init(std::make_shared<gr::Sequence>());
+
+        const SettingsCtx namedCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), "named"};
+        const float       namedLevel = 2.f * block.level;
+        expect(block.settings().set({{"level", namedLevel}}, namedCtx).empty());
+        expect(block.settings().activateContext(namedCtx).has_value());
+        block.applyChangedSettings();
+        expect(fatal(eq(block.level, namedLevel))) << "the block does not take the named context's level";
+
+        block.settings().autoUpdate(Tag{0UZ, property_map{{std::pmr::string(gr::tag::RESET_DEFAULTS.key()), true}, {"count", gr::Size_t{0U}}}});
+        block.applyChangedSettings();
+        const ReportedRefusals reported = readRefusals(fromBlock);
+        expect((reported.errors + reported.plain).contains("count must be at least 1")) << "the reset with a count of 0 is not refused";
+        expect(eq(block.level, namedLevel)) << "the refused reset restores the level";
+        expect(block.settings().activeContext() == namedCtx) << "the refused reset leaves the default context active";
+    };
+
+    "a value settingsChanged() refuses after a reset_default tag left a named context keeps the default context"_test = [] {
+        RefusingSink  block{property_map{{"name", std::string("refusing_stage")}}};
+        gr::MsgPortIn fromBlock;
+        expect(block.msgOut.connect(fromBlock).has_value());
+        block.init(std::make_shared<gr::Sequence>());
+
+        const float       defaultLevel = block.level;
+        const SettingsCtx namedCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), "named"};
+        expect(block.settings().set({{"level", 2.f * defaultLevel}}, namedCtx).empty());
+        expect(block.settings().activateContext(namedCtx).has_value());
+        block.applyChangedSettings();
+
+        block.settings().autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.key()));
+        block.applyChangedSettings();
+        const SettingsCtx resetCtx = block.settings().activeContext();
+        expect(fatal(eq(block.level, defaultLevel))) << "the reset does not restore the level";
+        expect(fatal(resetCtx.context.value_or(std::string_view{}).empty())) << "the reset does not return to the default context";
+
+        std::ignore = block.settings().setStaged({{"count", gr::Size_t{0U}}});
+        block.applyChangedSettings();
+        expect(readRefusals(fromBlock).errors.contains("count must be at least 1")) << "the count of 0 is not refused";
+        expect(block.settings().activeContext() == resetCtx) << "the refused value returns the block to the named context the reset left";
+    };
+
+    "a member whose limits refuse its previous value keeps the refused value, and its stored set agrees"_test = [] {
+        LimitedRefusingBlock block{property_map{{"name", std::string("limited_refusing_stage")}}};
+        gr::MsgPortIn        fromBlock;
+        expect(block.msgOut.connect(fromBlock).has_value());
+        block.init(std::make_shared<gr::Sequence>());
+
+        const gr::Size_t refused = LimitedRefusingBlock::kMostTaken + 1U;
+        expect(block.settings().set({{"count", refused}}).empty());
+        std::ignore = block.settings().activateContext();
+        block.applyChangedSettings();
+        expect(readRefusals(fromBlock).errors.contains("count must be at most")) << "the refusal does not reach the message output";
+        expect(eq(block.count.value, refused)) << "the member takes back a previous value outside its limits";
+        const std::optional<pmt::Value> stored = block.settings().getStored("count");
+        expect(fatal(stored.has_value()));
+        expect(eq(stored->value_or(gr::Size_t{0U}), block.count.value)) << "the stored set and the member disagree";
+    };
+
+    "a refused value is written back when settingsChanged() empties newSettings before it throws"_test = [] {
+        ClearingRefusingBlock block{property_map{{"name", std::string("clearing_stage")}}};
+        gr::MsgPortIn         fromBlock;
+        expect(block.msgOut.connect(fromBlock).has_value());
+        block.init(std::make_shared<gr::Sequence>());
+
+        const gr::Size_t held = block.count;
+        std::ignore           = block.settings().setStaged({{"count", gr::Size_t{0U}}});
+        block.applyChangedSettings();
+        const ReportedRefusals reported = readRefusals(fromBlock);
+        expect(reported.errors.contains("count must be at least 1")) << "the refusal is not an error, got: " << reported.errors;
+        expect(reported.plain.empty()) << "the refusal of a staged value is a plain message: " << reported.plain;
+        expect(eq(block.count, held)) << "the refused value stays in the member";
     };
 
     "a batch with a tag value and a staged value the limits refuse reports each refusal by where it came from"_test = [] {
