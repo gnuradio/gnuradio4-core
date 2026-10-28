@@ -169,6 +169,36 @@ set_tests_properties(
              TIMEOUT
              300)
 
+if(GR_ENABLE_BLOCK_REGISTRY)
+  # The wiring half includes Runtime.hpp alone. The factory half is the only place a block type is named.
+  add_executable(qa_RuntimeConsumer qa_RuntimeConsumer.cpp qa_RuntimeConsumerBlocks.cpp)
+  setup_test(qa_RuntimeConsumer)
+
+  # the gate reads clang's -ftime-trace record of the wiring half's template instantiations, through a POSIX shell
+  # script that runs Python
+  find_program(GR_CASCADE_GATE_CLANG NAMES clang++)
+  find_package(Python3 COMPONENTS Interpreter)
+  if(UNIX
+     AND GR_CASCADE_GATE_CLANG
+     AND Python3_Interpreter_FOUND)
+    add_test(
+      NAME qa_RuntimeCascade
+      COMMAND
+        ${CMAKE_CURRENT_SOURCE_DIR}/check_runtime_cascade.sh ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../include ${CMAKE_CURRENT_BINARY_DIR}/../include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../meta/include ${vir-simd_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/magic_enum)
+    set_tests_properties(
+      qa_RuntimeCascade
+      PROPERTIES ENVIRONMENT
+                 "CXX_FOR_CASCADE_GATE=${GR_CASCADE_GATE_CLANG};PYTHON_FOR_CASCADE_GATE=${Python3_EXECUTABLE}"
+                 TIMEOUT
+                 300)
+  else()
+    message(STATUS "clang++, a POSIX shell or Python 3 not found: the erased-runtime cascade gate is not configured")
+  endif()
+endif()
+
 # regression tests for control-plane wedges: a failure shows up as a hang, so cap them
 set(_CORE_DEADLOCK_TESTS
     qa_DestructionSafety
