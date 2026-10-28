@@ -92,9 +92,10 @@ static_assert(!std::is_trivially_copyable_v<Message>); // because of the usage o
 static_assert(std::is_move_assignable_v<Message>);
 
 namespace detail {
+// Returns true once the message is published, and false when the port is full and the message is dropped.
 template<message::Command cmd, typename T>
 requires(std::is_same_v<T, property_map> || std::is_same_v<T, Error>)
-void sendMessage(auto& port, std::string_view serviceName, std::string_view endpoint, T userMessage, std::string_view clientRequestID = "") {
+bool sendMessage(auto& port, std::string_view serviceName, std::string_view endpoint, T userMessage, std::string_view clientRequestID = "") {
     using namespace gr::message;
     using enum gr::message::Command;
 
@@ -117,10 +118,11 @@ void sendMessage(auto& port, std::string_view serviceName, std::string_view endp
         if (message::droppedMessageCount().fetch_add(1UZ, std::memory_order_relaxed) == 0UZ) {
             std::print(stderr, "gr::sendMessage: message port full, dropping '{}' from '{}' -- further drops are counted only\n", endpoint, serviceName);
         }
-        return;
+        return false;
     }
     msgSpan[0] = std::move(message);
     msgSpan.publish(1UZ);
+    return true;
 }
 } // namespace detail
 

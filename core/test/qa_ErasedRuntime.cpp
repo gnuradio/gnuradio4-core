@@ -10,12 +10,15 @@
 #include <gnuradio-4.0/YamlPmt.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <concepts>
 #include <condition_variable>
 #include <cstdlib>
 #include <format>
 #include <functional>
+#include <iterator>
+#include <latch>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -248,6 +251,21 @@ struct FailingStartSource : Block<FailingStartSource> {
     }
 };
 
+/// a source that reports an error on the message plane once and ends
+struct ReportingSource : Block<ReportingSource> {
+    PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(ReportingSource, out);
+
+    explicit ReportingSource(property_map init = {}) : Block<ReportingSource>(std::move(init)) {}
+
+    work::Status processBulk(OutputSpanLike auto& outSpan) {
+        this->emitErrorMessage("processBulk", "the source reports a fault");
+        outSpan.publish(0UZ);
+        return work::Status::DONE;
+    }
+};
+
 /// holds each GatedStopSink's stop() until a case opens it, for at most ten seconds, and counts the stops it held
 struct StopGate {
     std::mutex              mutex;
@@ -291,10 +309,11 @@ struct GatedStopSink : Block<GatedStopSink> {
 inline void registerTestBlocks() {
     static const bool registered = [] {
         BlockRegistry& registry = globalBlockRegistry();
-        return registry.insert<RampSource>("=qa::RampSource") && registry.insert<Scale>("=qa::Scale")                        //
-               && registry.insert<RecordingSink>("=qa::RecordingSink") && registry.insert<SumInputs>("=qa::SumInputs")       //
-               && registry.insert<EndlessSource>("=qa::EndlessSource") && registry.insert<CountingSink>("=qa::CountingSink") //
-               && registry.insert<FailingStartSource>("=qa::FailingStartSource") && registry.insert<TallySink>("=qa::TallySink");
+        return registry.insert<RampSource>("=qa::RampSource") && registry.insert<Scale>("=qa::Scale")                            //
+               && registry.insert<RecordingSink>("=qa::RecordingSink") && registry.insert<SumInputs>("=qa::SumInputs")           //
+               && registry.insert<EndlessSource>("=qa::EndlessSource") && registry.insert<CountingSink>("=qa::CountingSink")     //
+               && registry.insert<FailingStartSource>("=qa::FailingStartSource") && registry.insert<TallySink>("=qa::TallySink") //
+               && registry.insert<ReportingSource>("=qa::ReportingSource");
     }();
     expect(registered) << "the test blocks must reach the global registry";
 }
@@ -374,6 +393,14 @@ inline std::size_t awaitHeldStops(std::size_t nStops) {
     std::unique_lock lock(gate.mutex);
     std::ignore = gate.changed.wait_for(lock, std::chrono::seconds(3), [&gate, nStops] { return gate.nStops >= nStops; });
     return gate.nStops;
+}
+
+inline std::optional<float> floatAt(const property_map& map, const std::string& key) {
+    const auto entry = map.find(convert_string_domain(key));
+    if (entry == map.end() || entry->second.get_if<float>() == nullptr) {
+        return std::nullopt;
+    }
+    return *entry->second.get_if<float>();
 }
 
 inline bool sameTags(const std::vector<TagRecord>& lhs, const std::vector<TagRecord>& rhs) {
@@ -1061,6 +1088,232 @@ const boost::ut::suite<"background run"> backgroundRunTests = [] {
         expect(eq(awaitHeldStops(1UZ), 1UZ)) << "the block's stop() ran more than once";
         expect(runtime->state() == Runtime::State::Stopped);
         expect(runtime->result().has_value()) << "a stopped run is a successful run";
+    };
+};
+
+const boost::ut::suite<"events and send"> eventTests = [] {
+    using namespace boost::ut;
+    using namespace gr;
+    using namespace qa_runtime;
+
+    "the endpoint names are the framework's"_test = [] {
+        expect(eq(Runtime::kSettingsEndpoint, std::string_view(block::property::kSetting)));
+        expect(eq(Runtime::kStagedSettingsEndpoint, std::string_view(block::property::kStagedSetting)));
+        expect(eq(Runtime::kGraphGRCEndpoint, std::string_view(gr::scheduler::property::kGraphGRC)));
+    };
+
+    "the scheduler answers a Get on the graph endpoint with the running graph as a document"_test = [] {
+        registerTestBlocks();
+        auto runtime = erasedChain("graph-document", 256U, 1.0f);
+        expect(fatal(runtime.has_value())) << messageOf(runtime);
+
+        expect(runtime->send(RuntimeCommand::Get, "", Runtime::kGraphGRCEndpoint).has_value());
+        expect(runtime->runAndWait().has_value());
+        std::ignore = takeCollected("graph-document");
+
+        const std::vector<RuntimeEvent> events = runtime->pollEvents();
+        const auto                      reply  = std::ranges::find_if(events, [](const RuntimeEvent& event) { return event.endpoint == Runtime::kGraphGRCEndpoint; });
+        expect(fatal(reply != events.end())) << "the scheduler did not answer on the graph endpoint";
+        expect(!reply->isError) << reply->text;
+        const auto document = reply->data.find(convert_string_domain(std::string("value")));
+        expect(fatal(document != reply->data.end())) << "the reply carried no graph document";
+        expect(document->second.value_or(std::string_view{}).contains("qa::Scale")) << "the document does not name the graph's block type";
+    };
+
+    // a reply is told from a notification by its command and matched to its request by its id
+    "an event carries its message's command and request id"_test = [] {
+        registerTestBlocks();
+        constexpr float kInitialGain = 2.0f;
+        constexpr float kStagedGain  = 5.0f;
+
+        RuntimeGraph graph;
+        auto         source = graph.emplace("qa::RampSource", "source", {{"n_samples", gr::Size_t{1U << 20U}}, {"tag_every", gr::Size_t{0U}}});
+        auto         scale  = graph.emplace("qa::Scale", "scale", {{"gain", kInitialGain}});
+        auto         sink   = graph.emplace("qa::RecordingSink", "event-ids");
+        expect(fatal(source.has_value() && scale.has_value() && sink.has_value()));
+        expect(graph.connect(*source, "out", *scale, "in").has_value());
+        expect(graph.connect(*scale, "out", *sink, "in").has_value());
+        const std::string scaleName(scale->uniqueName());
+
+        auto runtime = Runtime::create(std::move(graph));
+        expect(fatal(runtime.has_value())) << messageOf(runtime);
+
+        // queued before the run and handled by its first sweeps; the staged gain is applied while the graph runs
+        const std::string settings(Runtime::kSettingsEndpoint);
+        expect(runtime->send(RuntimeCommand::Get, scaleName, settings, {}, "get-1").has_value());
+        expect(runtime->send(RuntimeCommand::Subscribe, scaleName, settings, {}, "subscribe-2").has_value());
+        expect(runtime->send(RuntimeCommand::Set, scaleName, settings, {{"gain", kStagedGain}}).has_value());
+        expect(runtime->send(RuntimeCommand::Get, scaleName, settings).has_value());
+        const property_map absentEdge{{std::pmr::string(serialization_fields::EDGE_SOURCE_BLOCK), std::string("qa_no_such_block")}, {std::pmr::string(serialization_fields::EDGE_SOURCE_PORT), std::string("out")}};
+        expect(runtime->send(RuntimeCommand::Set, "", gr::scheduler::property::kRemoveEdge, absentEdge, "remove-3").has_value());
+        expect(runtime->runAndWait().has_value());
+        std::ignore = takeCollected("event-ids");
+
+        const std::vector<RuntimeEvent> events    = runtime->pollEvents();
+        const auto                      fromScale = [&events, &scaleName, &settings](RuntimeCommand command, std::string_view id) {
+            std::vector<RuntimeEvent> matching;
+            std::ranges::copy_if(events, std::back_inserter(matching), [&](const RuntimeEvent& event) { return event.source == scaleName && event.endpoint == settings && event.command == command && event.clientRequestID == id; });
+            return matching;
+        };
+
+        const std::vector<RuntimeEvent> replies = fromScale(RuntimeCommand::Final, "get-1");
+        expect(fatal(eq(replies.size(), 1UZ))) << "a Get with an id is answered exactly once, by a Final carrying that id";
+        expect(!replies.front().isError) << replies.front().text;
+        expect(floatAt(replies.front().data, "gain") == kInitialGain) << "the reply holds the settings the block had when it answered";
+
+        const std::vector<RuntimeEvent> notifications = fromScale(RuntimeCommand::Notify, "subscribe-2");
+        expect(std::ranges::any_of(notifications, [](const RuntimeEvent& event) { return floatAt(event.data, "gain").value_or(0.0f) == kStagedGain; })) << "a Notify carries the subscription's id and the staged value";
+        expect(eq(fromScale(RuntimeCommand::Final, "").size(), 1UZ)) << "the reply to a Get sent without an id carries an empty id";
+
+        const auto refused = std::ranges::find_if(events, [](const RuntimeEvent& event) { return event.isError && event.clientRequestID == "remove-3"; });
+        expect(fatal(refused != events.end())) << "an error reply carries the id of its request";
+        expect(refused->command == RuntimeCommand::Final) << "an error reply is a Final";
+    };
+
+    "an error event carries the block's message, and the source location apart from it"_test = [] {
+        registerTestBlocks();
+        RuntimeGraph graph;
+        auto         source = graph.emplace("qa::ReportingSource", "reporting");
+        auto         sink   = graph.emplace("qa::RecordingSink", "error-event");
+        expect(fatal(source.has_value() && sink.has_value()));
+        expect(graph.connect(*source, "out", *sink, "in").has_value());
+        const std::string sourceName(source->uniqueName());
+        auto              runtime = Runtime::create(std::move(graph));
+        expect(fatal(runtime.has_value())) << messageOf(runtime);
+        std::ignore = runtime->runAndWait();
+
+        const std::vector<RuntimeEvent> events   = runtime->pollEvents();
+        const auto                      reported = std::ranges::find_if(events, [&sourceName](const RuntimeEvent& event) { return event.isError && event.source == sourceName; });
+        expect(fatal(reported != events.end())) << "the block's error reached no event";
+        expect(eq(reported->text, std::string("the source reports a fault")));
+        expect(eq(reported->endpoint, std::string("processBulk")));
+        expect(!reported->where.empty()) << "the event carries no source location";
+        expect(gt(reported->time, 0ULL)) << "the event carries no time";
+        std::ignore = takeCollected("error-event");
+    };
+
+    "pollEvents() without a count takes every pending event, and with one takes at most that many"_test = [] {
+        registerTestBlocks();
+        constexpr std::size_t kRequests = 200UZ;
+        RuntimeGraph          graph;
+        auto                  source = graph.emplace("qa::RampSource", "source", {{"n_samples", gr::Size_t{1U << 20U}}, {"tag_every", gr::Size_t{0U}}});
+        auto                  sink   = graph.emplace("qa::RecordingSink", "all-pending");
+        expect(fatal(source.has_value() && sink.has_value()));
+        expect(graph.connect(*source, "out", *sink, "in").has_value());
+        const std::string sinkName(sink->uniqueName());
+        auto              runtime = Runtime::create(std::move(graph));
+        expect(fatal(runtime.has_value())) << messageOf(runtime);
+
+        for (std::size_t request = 0UZ; request < kRequests; ++request) {
+            expect(fatal(runtime->send(RuntimeCommand::Get, sinkName, Runtime::kSettingsEndpoint, {}, std::format("poll-{}", request)).has_value()));
+        }
+        expect(runtime->runAndWait().has_value());
+        std::ignore = takeCollected("all-pending");
+
+        const auto                      isReply = [](const RuntimeEvent& event) { return event.command == RuntimeCommand::Final && event.clientRequestID.starts_with("poll-"); };
+        const std::vector<RuntimeEvent> first   = runtime->pollEvents(1UZ);
+        expect(fatal(eq(first.size(), 1UZ))) << "a poll with a count of one took another number of events";
+        const std::vector<RuntimeEvent> rest     = runtime->pollEvents();
+        const std::size_t               nReplies = static_cast<std::size_t>(std::ranges::count_if(first, isReply) + std::ranges::count_if(rest, isReply));
+        expect(eq(nReplies, kRequests)) << "a poll without a count left replies pending";
+        expect(runtime->pollEvents().empty()) << "a poll after the one that took everything found events";
+    };
+
+    // The requests number fewer than the 1024 events the Runtime keeps. A burst of replies then loses none.
+    "requests several threads send at once each reach the block and are answered once"_test = [] {
+        registerTestBlocks();
+        constexpr std::size_t kThreads           = 8UZ;
+        constexpr std::size_t kRequestsPerThread = 120UZ;
+        constexpr std::size_t kRequests          = kThreads * kRequestsPerThread;
+        const std::string     sinkName("concurrent-send");
+        auto                  runtime = endlessChain(sinkName);
+        expect(fatal(runtime.has_value())) << messageOf(runtime);
+        expect(fatal(runtime->start().has_value()));
+
+        std::atomic<std::size_t> nRefused{0UZ};
+        std::latch               allReady(static_cast<std::ptrdiff_t>(kThreads));
+        std::vector<std::thread> senders;
+        senders.reserve(kThreads);
+        for (std::size_t thread = 0UZ; thread < kThreads; ++thread) {
+            senders.emplace_back([&runtime, &nRefused, &allReady, &sinkName, thread] {
+                allReady.arrive_and_wait();
+                for (std::size_t request = 0UZ; request < kRequestsPerThread; ++request) {
+                    if (!runtime->send(RuntimeCommand::Get, sinkName, Runtime::kSettingsEndpoint, {}, std::format("send-{}-{}", thread, request))) {
+                        nRefused.fetch_add(1UZ, std::memory_order_relaxed);
+                    }
+                }
+            });
+        }
+
+        std::map<std::string, std::size_t> nAnswers;
+        const auto                         takeAnswers = [&runtime, &nAnswers] {
+            for (const RuntimeEvent& event : runtime->pollEvents()) {
+                if (event.command == RuntimeCommand::Final && event.clientRequestID.starts_with("send-")) {
+                    ++nAnswers[event.clientRequestID];
+                }
+            }
+        };
+        const auto started = std::chrono::steady_clock::now();
+        while (nAnswers.size() < kRequests && std::chrono::steady_clock::now() - started < std::chrono::seconds(5)) {
+            takeAnswers();
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        for (std::thread& sender : senders) {
+            sender.join();
+        }
+        runtime->stop();
+        takeAnswers();
+
+        std::size_t nAnsweredOnce = 0UZ;
+        for (std::size_t thread = 0UZ; thread < kThreads; ++thread) {
+            for (std::size_t request = 0UZ; request < kRequestsPerThread; ++request) {
+                const auto answered = nAnswers.find(std::format("send-{}-{}", thread, request));
+                nAnsweredOnce += answered != nAnswers.end() && answered->second == 1UZ ? 1UZ : 0UZ;
+            }
+        }
+        expect(eq(nRefused.load(), 0UZ)) << "a send to an input with room was refused";
+        expect(eq(nAnsweredOnce, kRequests)) << "a request was lost or answered twice";
+        expect(eq(nAnswers.size(), kRequests)) << "a reply carried an id no thread sent";
+    };
+
+    "a message the full scheduler input drops is send()'s error, and every message it takes is a success"_test = [] {
+        auto runtime = Runtime::create(RuntimeGraph{});
+        expect(fatal(runtime.has_value())) << messageOf(runtime);
+        const auto nDropped = [] { return message::droppedMessageCount().load(std::memory_order_relaxed); };
+
+        // No run drains the scheduler's input. The loop ends at the first drop. The cap stops it if nothing drops.
+        constexpr std::size_t             kMaxSends     = 1UZ << 16U;
+        std::size_t                       nSent         = 0UZ;
+        std::size_t                       nTakenRefused = 0UZ;
+        bool                              dropped       = false;
+        std::expected<void, RuntimeError> sentAtDrop;
+        while (!dropped && nSent < kMaxSends) {
+            const std::size_t                 nDroppedBefore = nDropped();
+            std::expected<void, RuntimeError> sent           = runtime->send(RuntimeCommand::Heartbeat, "", "qa_flood");
+            ++nSent;
+            dropped = nDropped() != nDroppedBefore;
+            if (dropped) {
+                sentAtDrop = sent;
+            } else if (!sent) {
+                ++nTakenRefused;
+            }
+        }
+        expect(fatal(dropped)) << std::format("{} sends filled no input", nSent);
+        expect(eq(nTakenRefused, 0UZ)) << "a message the input took was reported as an error";
+        expect(fatal(!sentAtDrop.has_value())) << std::format("send {} was dropped and returned success", nSent);
+        expect(sentAtDrop.error().message.contains("full")) << sentAtDrop.error().message;
+
+        const std::size_t nDroppedBefore = nDropped();
+        expect(!runtime->send(RuntimeCommand::Set, "", "qa_flood", {{"gain", 1.0f}}).has_value()) << "a second send to the full input returned success";
+        expect(eq(nDropped() - nDroppedBefore, 1UZ)) << "the refused send was not counted as one drop";
+    };
+
+    "RuntimeCommand::Invalid is refused, not sent"_test = [] {
+        auto runtime = Runtime::create(RuntimeGraph{});
+        expect(fatal(runtime.has_value())) << messageOf(runtime);
+        const std::expected<void, RuntimeError> refused = runtime->send(RuntimeCommand::Invalid, "", Runtime::kSettingsEndpoint);
+        expect(fatal(!refused.has_value()));
+        expect(eq(refused.error().where, std::string("Runtime::send")));
     };
 };
 

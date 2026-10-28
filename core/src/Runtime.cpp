@@ -4,6 +4,7 @@
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/Graph_yaml_importer.hpp>
 #include <gnuradio-4.0/LifeCycle.hpp>
+#include <gnuradio-4.0/Message.hpp>
 #include <gnuradio-4.0/PluginLoader.hpp>
 #include <gnuradio-4.0/Port.hpp>
 #include <gnuradio-4.0/SchedulerModel.hpp>
@@ -13,6 +14,7 @@
 
 #include <algorithm>
 #include <condition_variable>
+#include <deque>
 #include <format>
 #include <mutex>
 #include <ranges>
@@ -33,6 +35,18 @@ static_assert(static_cast<std::uint8_t>(Runtime::State::Paused) == static_cast<s
 static_assert(static_cast<std::uint8_t>(Runtime::State::RequestedStop) == static_cast<std::uint8_t>(lifecycle::State::REQUESTED_STOP));
 static_assert(static_cast<std::uint8_t>(Runtime::State::Stopped) == static_cast<std::uint8_t>(lifecycle::State::STOPPED));
 static_assert(static_cast<std::uint8_t>(Runtime::State::Error) == static_cast<std::uint8_t>(lifecycle::State::ERROR));
+
+static_assert(static_cast<std::uint8_t>(RuntimeCommand::Invalid) == static_cast<std::uint8_t>(message::Command::Invalid));
+static_assert(static_cast<std::uint8_t>(RuntimeCommand::Get) == static_cast<std::uint8_t>(message::Command::Get));
+static_assert(static_cast<std::uint8_t>(RuntimeCommand::Set) == static_cast<std::uint8_t>(message::Command::Set));
+static_assert(static_cast<std::uint8_t>(RuntimeCommand::Partial) == static_cast<std::uint8_t>(message::Command::Partial));
+static_assert(static_cast<std::uint8_t>(RuntimeCommand::Final) == static_cast<std::uint8_t>(message::Command::Final));
+static_assert(static_cast<std::uint8_t>(RuntimeCommand::Ready) == static_cast<std::uint8_t>(message::Command::Ready));
+static_assert(static_cast<std::uint8_t>(RuntimeCommand::Disconnect) == static_cast<std::uint8_t>(message::Command::Disconnect));
+static_assert(static_cast<std::uint8_t>(RuntimeCommand::Subscribe) == static_cast<std::uint8_t>(message::Command::Subscribe));
+static_assert(static_cast<std::uint8_t>(RuntimeCommand::Unsubscribe) == static_cast<std::uint8_t>(message::Command::Unsubscribe));
+static_assert(static_cast<std::uint8_t>(RuntimeCommand::Notify) == static_cast<std::uint8_t>(message::Command::Notify));
+static_assert(static_cast<std::uint8_t>(RuntimeCommand::Heartbeat) == static_cast<std::uint8_t>(message::Command::Heartbeat));
 
 namespace {
 
@@ -123,8 +137,12 @@ struct RuntimeGraph::Impl {
 };
 
 struct Runtime::Impl {
-    std::shared_ptr<PluginLoader>   loader; // the graph's share, declared first to outlive the scheduler and the blocks
-    MsgPortIn                       events; // declared before the scheduler to outlive the scheduler writing to it
+    std::shared_ptr<PluginLoader>   loader;      // the graph's share, declared first to outlive the scheduler and the blocks
+    MsgPortIn                       events;      // declared before the scheduler to outlive the scheduler writing to it
+    MsgPortOut                      commands;    // feeds the scheduler's msgIn
+    std::mutex                      eventsMutex; // guards `events` and `pending`
+    std::deque<RuntimeEvent>        pending;
+    std::mutex                      commandsMutex; // one sender at a time on `commands`
     std::shared_ptr<SchedulerModel> scheduler;
     std::shared_ptr<BlockModel>     schedulerBlock;
 
@@ -139,6 +157,7 @@ struct Runtime::Impl {
     bool                              requestingStop = false; // a stop request has not returned
     std::expected<void, RuntimeError> lastResult;             // of the last run that ended, success before the first
 
+    static constexpr std::size_t               kMaxPendingEvents = 1024UZ;
     static constexpr std::chrono::milliseconds kStopPollInterval{10}; // requestStop() reads the scheduler's state this often
     static constexpr std::chrono::milliseconds kStartPollInterval{1}; // start() reads the scheduler's state this often
 
@@ -241,10 +260,29 @@ struct Runtime::Impl {
         runEnded.notify_all();
     }
 
-    // Consumes the scheduler's messages and drops them.
     void drain() {
+        std::lock_guard guard(eventsMutex);
+        drainLocked();
+    }
+
+    // Moves the scheduler's messages into `pending` as events.
+    void drainLocked() {
         ReaderSpanLike auto messages = events.streamReader().get();
-        std::ignore                  = messages.consume(messages.size());
+        for (const Message& message : messages) {
+            RuntimeEvent event{.source = message.serviceName, .endpoint = message.endpoint, .isError = !message.data.has_value(), .text = {}, .where = {}, .data = {}, .time = 0ULL, .command = static_cast<RuntimeCommand>(message.cmd), .clientRequestID = message.clientRequestID};
+            if (message.data.has_value()) {
+                event.data = message.data.value();
+            } else {
+                event.text  = message.data.error().message;
+                event.where = message.data.error().srcLoc();
+                event.time  = toNanoseconds(message.data.error().errorTime);
+            }
+            pending.push_back(std::move(event));
+        }
+        std::ignore = messages.consume(messages.size());
+        while (pending.size() > kMaxPendingEvents) {
+            pending.pop_front();
+        }
     }
 };
 
@@ -513,6 +551,9 @@ std::expected<Runtime, RuntimeError> Runtime::create(RuntimeGraph&& graph, std::
     if (auto connected = impl->schedulerBlock->msgOut->connect(impl->events); !connected) {
         return std::unexpected(toRuntimeError(connected.error()));
     }
+    if (auto connected = impl->commands.connect(*impl->schedulerBlock->msgIn); !connected) {
+        return std::unexpected(toRuntimeError(connected.error()));
+    }
 
     impl->scheduler->setGraph(std::move(*graph._impl->graph));
     impl->loader = std::move(graph._impl->loader);
@@ -595,6 +636,52 @@ std::expected<void, RuntimeError> Runtime::result() const {
 }
 
 Runtime::State Runtime::state() const noexcept { return _impl ? static_cast<State>(_impl->schedulerBlock->state()) : State::Idle; }
+
+std::vector<RuntimeEvent> Runtime::pollEvents(std::size_t maxEvents) {
+    std::vector<RuntimeEvent> events;
+    if (!_impl) {
+        return events;
+    }
+    std::lock_guard guard(_impl->eventsMutex);
+    _impl->drainLocked();
+
+    const std::size_t nEvents = std::min(maxEvents, _impl->pending.size());
+    events.reserve(nEvents);
+    for (std::size_t i = 0UZ; i < nEvents; ++i) {
+        events.push_back(std::move(_impl->pending.front()));
+        _impl->pending.pop_front();
+    }
+    return events;
+}
+
+std::expected<void, RuntimeError> Runtime::send(RuntimeCommand command, std::string_view serviceName, std::string_view endpoint, property_map payload, std::string_view clientRequestID) {
+    constexpr std::string_view where = "Runtime::send";
+    if (!_impl) {
+        return std::unexpected(localError("runtime handle is empty", where));
+    }
+    std::lock_guard guard(_impl->commandsMutex);
+    MsgPortOut&     port = _impl->commands;
+
+    using enum message::Command;
+    bool published = false;
+    switch (command) {
+    case RuntimeCommand::Get: published = detail::sendMessage<Get>(port, serviceName, endpoint, std::move(payload), clientRequestID); break;
+    case RuntimeCommand::Set: published = detail::sendMessage<Set>(port, serviceName, endpoint, std::move(payload), clientRequestID); break;
+    case RuntimeCommand::Partial: published = detail::sendMessage<Partial>(port, serviceName, endpoint, std::move(payload), clientRequestID); break;
+    case RuntimeCommand::Final: published = detail::sendMessage<Final>(port, serviceName, endpoint, std::move(payload), clientRequestID); break;
+    case RuntimeCommand::Ready: published = detail::sendMessage<Ready>(port, serviceName, endpoint, std::move(payload), clientRequestID); break;
+    case RuntimeCommand::Disconnect: published = detail::sendMessage<Disconnect>(port, serviceName, endpoint, std::move(payload), clientRequestID); break;
+    case RuntimeCommand::Subscribe: published = detail::sendMessage<Subscribe>(port, serviceName, endpoint, std::move(payload), clientRequestID); break;
+    case RuntimeCommand::Unsubscribe: published = detail::sendMessage<Unsubscribe>(port, serviceName, endpoint, std::move(payload), clientRequestID); break;
+    case RuntimeCommand::Notify: published = detail::sendMessage<Notify>(port, serviceName, endpoint, std::move(payload), clientRequestID); break;
+    case RuntimeCommand::Heartbeat: published = detail::sendMessage<Heartbeat>(port, serviceName, endpoint, std::move(payload), clientRequestID); break;
+    case RuntimeCommand::Invalid: return std::unexpected(localError("RuntimeCommand::Invalid is not sendable", where));
+    }
+    if (!published) {
+        return std::unexpected(localError(std::format("the scheduler's message input is full -- the message to '{}' endpoint '{}' is dropped", serviceName, endpoint), where));
+    }
+    return {};
+}
 
 BlockHandle Runtime::scheduler() const { return _impl ? BlockHandle(std::shared_ptr<void>(_impl->schedulerBlock), _impl->loader, true) : BlockHandle{}; }
 
