@@ -12,8 +12,7 @@ if(TARGET gnuradio-plugin)
   target_link_libraries(graphdoc PRIVATE gnuradio-plugin)
 endif()
 # where this installation puts its plugins, which the tool searches whatever the caller and the environment name
-target_compile_definitions(
-  graphdoc PRIVATE GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY="${CMAKE_INSTALL_FULL_LIBDIR}/gnuradio-4/plugins")
+target_compile_definitions(graphdoc PRIVATE GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY="${GR_INSTALLED_PLUGIN_DIRECTORY}")
 install(TARGETS graphdoc RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # rungraph, an ordinary consumer of the installed headers: it is not compiled into the libraries. It builds its graph by
@@ -25,8 +24,7 @@ if(GR_ENABLE_BLOCK_REGISTRY)
     target_link_libraries(rungraph PRIVATE gnuradio-plugin)
   endif()
   # where this installation puts its plugins, which the tool searches whatever the caller and the environment name
-  target_compile_definitions(
-    rungraph PRIVATE GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY="${CMAKE_INSTALL_FULL_LIBDIR}/gnuradio-4/plugins")
+  target_compile_definitions(rungraph PRIVATE GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY="${GR_INSTALLED_PLUGIN_DIRECTORY}")
   install(TARGETS rungraph RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
@@ -43,7 +41,7 @@ if(GR_ENABLE_BLOCK_REGISTRY)
   # hands it over too
   target_compile_definitions(
     grinfo PRIVATE GR_TOOLS_CORE_VERSION="${PROJECT_VERSION}" GR_TOOLS_INSTALLED_PREFIX="${CMAKE_INSTALL_PREFIX}"
-                   GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY="${CMAKE_INSTALL_FULL_LIBDIR}/gnuradio-4/plugins")
+                   GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY="${GR_INSTALLED_PLUGIN_DIRECTORY}")
   install(TARGETS grinfo RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 

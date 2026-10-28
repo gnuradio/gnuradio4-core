@@ -43,6 +43,8 @@ set(GR4_PKG_VERSION
 
 include(CMakePackageConfigHelpers)
 include(GNUInstallDirs)
+# where this installation puts its plugins; core, its tests and the tools use this one value
+set(GR_INSTALLED_PLUGIN_DIRECTORY "${CMAKE_INSTALL_FULL_LIBDIR}/gnuradio-4/plugins")
 find_package(PkgConfig QUIET)
 
 set(CMAKE_POSITION_INDEPENDENT_CODE TRUE)
