@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -44,6 +45,22 @@ struct GNURADIO_EXPORT RuntimeError {
 
 struct GNURADIO_EXPORT EdgeSpec {
     std::size_t minBufferSize = 0; // 0 selects the framework's default for the port's value type
+};
+
+/// A message-plane command, with the enumerators and values of the framework's `message::Command`.
+enum class RuntimeCommand : std::uint8_t { Invalid, Get, Set, Partial, Final, Ready, Disconnect, Subscribe, Unsubscribe, Notify, Heartbeat };
+
+/// One report the running graph made on the message plane.
+struct GNURADIO_EXPORT RuntimeEvent {
+    std::string    source;   // the reporting block's unique name
+    std::string    endpoint; // the endpoint it reported on
+    bool           isError = false;
+    std::string    text;                              // the error's message when isError
+    std::string    where;                             // the rendered source location of the error when isError
+    property_map   data;                              // the message payload when not an error
+    std::uint64_t  time    = 0;                       // ns since epoch when the error was raised, 0 otherwise
+    RuntimeCommand command = RuntimeCommand::Invalid; // Final for the reply to a request, Notify for a notification
+    std::string    clientRequestID;                   // the id of the request or subscription it answers, empty for none
 };
 
 /**
@@ -174,6 +191,14 @@ public:
 
     static constexpr std::string_view kDefaultScheduler = "gr::scheduler::Simple<singleThreaded>";
 
+    /// A block's endpoint that answers a `Get` with its settings, stages the settings of a `Set`, and takes a `Subscribe`
+    /// to their changes.
+    static constexpr std::string_view kSettingsEndpoint = "Settings";
+    /// A block's endpoint that answers a `Get` with its staged settings and stages the settings of a `Set`.
+    static constexpr std::string_view kStagedSettingsEndpoint = "StagedSettings";
+    /// The scheduler's endpoint that answers a `Get` with the running graph as a graph document under `value`.
+    static constexpr std::string_view kGraphGRCEndpoint = "GraphGRC";
+
     /// Builds the scheduler `type` through the graph's loader with `schedulerParameters` and hands it the graph. A
     /// parameter the scheduler does not declare is an error. So is a value its constructor refuses. `graph` is consumed
     /// when a Runtime is returned and left as it was on an error. The shipped `Simple` schedulers are registered in
@@ -216,6 +241,26 @@ public:
     /// the scheduler and the graph's plugin loader alive after the Runtime is destroyed, and it is invalid on a
     /// moved-from Runtime.
     [[nodiscard]] BlockHandle scheduler() const;
+
+    /// The reports the graph made since the last call, oldest first, at most `maxEvents` of them. Between calls the
+    /// scheduler's message output holds as many reports as its buffer has slots. A notification that finds no free slot
+    /// is dropped and counted by `gr::message::droppedMessageCount()`. A block's error is such a notification. A reply
+    /// waits for a free slot. When more replies wait than the output has slots, the oldest is dropped and counted. The
+    /// Runtime keeps at most the last 1024 reports it has read and not handed out.
+    [[nodiscard]] std::vector<RuntimeEvent> pollEvents(std::size_t maxEvents = std::numeric_limits<std::size_t>::max());
+
+    /// Sends a request to the scheduler's message input.
+    ///
+    /// The message reaches the endpoint `endpoint` of every block whose unique name or name is `serviceName`. An empty
+    /// `serviceName` reaches every block and the scheduler. A reply or a notification arrives through `pollEvents()`
+    /// with `clientRequestID`. A message no block answers gets no reply.
+    ///
+    /// `send()` is the path for requests and subscriptions. `BlockHandle::setStaged()` is the path for changing a
+    /// setting: it checks the keys and the conversion of the values and answers at once.
+    ///
+    /// The call never waits for the run. When the input is full, the call drops the message and returns an error, and
+    /// `gr::message::droppedMessageCount()` counts the drop.
+    [[nodiscard]] std::expected<void, RuntimeError> send(RuntimeCommand command, std::string_view serviceName, std::string_view endpoint, property_map payload = {}, std::string_view clientRequestID = {});
 
 private:
     struct Impl;
