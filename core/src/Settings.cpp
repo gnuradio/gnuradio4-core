@@ -749,22 +749,31 @@ void CtxSettingsBase::autoUpdate(const Tag& tag) {
 
     const bool activeCtxChanged = previousCtx != ctx;
 
-    // an active set that a newer set of its context pruned is matched by no stored set; the context's present set
-    // then holds the keys that follow tags
-    SettingsCtx autoUpdateCtx = ctx;
-    if (!_autoUpdateParameters.contains(ctx) && !findBestMatchSettingsCtx(ctx).has_value()) {
-        std::uint64_t now = settings::convertTimePointToUint64Ns(std::chrono::system_clock::now());
+    // only a stored set keeps an entry: pruning a set erases its entry, and the active set can be a pruned one
+    const auto                   storedIt         = _storedParameters.find(ctx.context);
+    const bool                   isStored         = storedIt != _storedParameters.end() && std::ranges::any_of(storedIt->second, [&ctx](const CtxSettingsPair& pair) { return pair.context == ctx; });
+    const std::set<std::string>* autoUpdateParams = &_descriptor->writableMembers;
+    if (isStored) {
+        if (!_autoUpdateParameters.contains(ctx)) {
+            // fuzzy-match auto-update parameters (exact lookup may fail due to timestamp mismatch)
+            _autoUpdateParameters[ctx] = getBestMatchAutoUpdateParameters(ctx).value_or(_descriptor->writableMembers);
+        }
+        autoUpdateParams = &_autoUpdateParameters.at(ctx);
+    } else {
+        // an active set that a newer set of its context pruned is matched by no stored set; the context's present
+        // set then holds the keys that follow tags
+        std::optional<SettingsCtx> bestMatch = findBestMatchSettingsCtx(ctx);
+        if (!bestMatch.has_value()) {
+            std::uint64_t now = settings::convertTimePointToUint64Ns(std::chrono::system_clock::now());
 #ifdef __EMSCRIPTEN__
-        now += _timePrecisionTolerance;
+            now += _timePrecisionTolerance;
 #endif
-        autoUpdateCtx = findBestMatchSettingsCtx(SettingsCtx{.time = now, .context = ctx.context}).value_or(ctx);
+            bestMatch = findBestMatchSettingsCtx(SettingsCtx{.time = now, .context = ctx.context});
+        }
+        if (bestMatch.has_value() && _autoUpdateParameters.contains(*bestMatch)) {
+            autoUpdateParams = &_autoUpdateParameters.at(*bestMatch);
+        }
     }
-
-    // fuzzy-match auto-update parameters (exact lookup may fail due to timestamp mismatch)
-    if (!_autoUpdateParameters.contains(autoUpdateCtx)) {
-        _autoUpdateParameters[autoUpdateCtx] = getBestMatchAutoUpdateParameters(autoUpdateCtx).value_or(_descriptor->writableMembers);
-    }
-    auto& autoUpdateParams = _autoUpdateParameters[autoUpdateCtx];
 
     const auto& parameters = tag.map;
     bool        wasChanged = false;
@@ -778,7 +787,7 @@ void CtxSettingsBase::autoUpdate(const Tag& tag) {
         }
         auto it = _descriptor->writableByName.find(key);
         if (it != _descriptor->writableByName.end() && (activeCtxChanged || !isActiveValueImpl(key, value))) {
-            if (it->second->autoUpdate(key, value, autoUpdateParams, _stagedParameters)) {
+            if (it->second->autoUpdate(key, value, *autoUpdateParams, _stagedParameters)) {
                 _taggedKeys.emplace(key);
                 wasChanged = true;
             }

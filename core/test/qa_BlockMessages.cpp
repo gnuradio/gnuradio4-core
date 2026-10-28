@@ -214,6 +214,32 @@ const boost::ut::suite<"block message plumbing"> blockMessageTests = [] {
         }
     };
 
+    "a tag on an active set that a set for now replaced adds no auto-update entry"_test = [] {
+        constexpr std::size_t             nCycles = 8UZ;
+        const property_map                parameters{{"gain", 2.f}};
+        const auto                        tagGain = [](std::size_t cycle) { return 3.f + static_cast<float>(cycle); };
+        qa_block_messages::SettingHandler block;
+        MsgPortOut                        toBlock;
+        MsgPortIn                         fromBlock;
+        qa_block_messages::connect(block, toBlock, fromBlock);
+        qa_block_messages::sendSettingsCtxSet(toBlock, "x", 0U, parameters);
+        block.processScheduledMessages();
+        expect(eq(qa_block_messages::countErrors(qa_block_messages::takeMessages(fromBlock)), 0UZ));
+        const gr::Size_t nAutoUpdate = block.settings().getNAutoUpdateParameters();
+        const gr::Size_t nStored     = block.settings().getNStoredParameters();
+
+        for (std::size_t cycle = 0UZ; cycle < nCycles; ++cycle) {
+            // the set for now prunes the set the block just activated, and the tag then reaches the pruned set
+            sendMessage<message::Command::Set>(toBlock, "", block::property::kActiveContext, property_map{{tag::CONTEXT.shortKey(), std::string("x")}}, "qa");
+            qa_block_messages::sendSettingsCtxSet(toBlock, "x", 0U, parameters);
+            block.processScheduledMessages();
+            expect(eq(qa_block_messages::countErrors(qa_block_messages::takeMessages(fromBlock)), 0UZ));
+            block.settings().autoUpdate(Tag{0UZ, property_map{{"gain", tagGain(cycle)}}});
+        }
+        expect(eq(block.settings().getNStoredParameters(), nStored)) << "each set for now replaces the one before";
+        expect(eq(block.settings().getNAutoUpdateParameters(), nAutoUpdate)) << "the pruned sets leave no auto-update entry";
+    };
+
     "a SettingsCtx Set returns a key no setting takes and leaves meta_information as it is"_test = [] {
         qa_block_messages::SettingHandler block;
         MsgPortOut                        toBlock;
