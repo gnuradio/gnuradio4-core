@@ -36,6 +36,7 @@ set(_CORE_TESTS
     qa_LifeCycle
     qa_MemoryAllocators
     qa_MessagePlane
+    qa_PluginInstalledDirectory
     qa_PmtCollections
     qa_Port
     qa_Profiler
@@ -89,6 +90,10 @@ endif()
 foreach(TEST_NAME IN LISTS _CORE_TESTS)
   add_ut_test(${TEST_NAME})
 endforeach()
+
+# the value core/CMakeLists.txt compiles into the library
+target_compile_definitions(qa_PluginInstalledDirectory
+                           PRIVATE GR_TEST_INSTALLED_PLUGIN_DIRECTORY="${GR_INSTALLED_PLUGIN_DIRECTORY}")
 
 # only the cases that emplace a block by name need the registry, so those cases are compiled out rather than the whole
 # test being dropped
@@ -237,6 +242,30 @@ if(GR_ENABLE_BLOCK_REGISTRY AND INTERNAL_ENABLE_BLOCK_PLUGINS)
     block_library_second
     block_library_duplicate
     block_library_duplicate_second)
+
+  # covers the default branch of globalPluginLoader(): it compiles its own copy of the loader's source, with the
+  # installed plugin directory set to the directory of the test plugins, and runs with GNURADIO4_PLUGIN_DIRECTORIES
+  # removed from its environment, in a directory that holds no core/test/plugins. The value the library compiles in is
+  # covered by qa_PluginInstalledDirectory.
+  add_executable(qa_PluginGlobalDefault qa_PluginGlobalDefault.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/PluginLoader.cpp)
+  setup_test(qa_PluginGlobalDefault)
+  file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/global_default_cwd)
+  set_tests_properties(qa_PluginGlobalDefault PROPERTIES WORKING_DIRECTORY
+                                                         ${CMAKE_CURRENT_BINARY_DIR}/global_default_cwd)
+  set_property(
+    TEST qa_PluginGlobalDefault
+    APPEND
+    PROPERTY ENVIRONMENT_MODIFICATION "GNURADIO4_PLUGIN_DIRECTORIES=unset:")
+  target_link_libraries(qa_PluginGlobalDefault PRIVATE gnuradio-core gnuradio-blocklib-core gnuradio-plugin)
+  target_compile_definitions(qa_PluginGlobalDefault
+                             PRIVATE GR_INSTALLED_PLUGIN_DIRECTORY="${CMAKE_CURRENT_BINARY_DIR}/plugins")
+  add_dependencies(
+    qa_PluginGlobalDefault
+    GoodBasePlugin
+    GoodRegistryPlugin
+    good_math_plugin
+    good_conversion_plugin
+    bad_plugin)
 
   add_app_test(qa_PluginAbiVersion)
   add_dependencies(

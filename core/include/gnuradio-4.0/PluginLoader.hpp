@@ -11,6 +11,7 @@
 #include <span>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -823,6 +824,13 @@ public:
 };
 #endif
 
+/// The plugin directory of the installation this library was built for: `<libdir>/gnuradio-4/plugins` under the install
+/// prefix given when the build was configured. It stays that path when the installed files are moved.
+[[nodiscard]] std::string_view installedPluginDirectory() noexcept;
+
+/// The process's loader. The first call builds it, and every gr::Graph constructor makes a call. Building the loader
+/// opens every shared object in the colon-separated directories of GNURADIO4_PLUGIN_DIRECTORIES, or in
+/// installedPluginDirectory() when the variable is not set. A directory that does not exist is skipped.
 PluginLoader& globalPluginLoader();
 
 } // namespace gr

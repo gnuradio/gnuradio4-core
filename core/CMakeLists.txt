@@ -11,6 +11,12 @@ add_library(
   src/PmtTypeHelpers.cpp)
 
 add_library(gnuradio4::gnuradio-core ALIAS gnuradio-core)
+# gr::installedPluginDirectory() returns the plugin directory of this installation, and the process's plugin loader
+# searches it when GNURADIO4_PLUGIN_DIRECTORIES is not set
+set_property(
+  SOURCE src/PluginLoader.cpp
+  APPEND
+  PROPERTY COMPILE_DEFINITIONS GR_INSTALLED_PLUGIN_DIRECTORY="${GR_INSTALLED_PLUGIN_DIRECTORY}")
 target_include_directories(
   gnuradio-core
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/>
