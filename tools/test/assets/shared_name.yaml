@@ -1,0 +1,20 @@
+# Two sources that share one name and carry a unique_name each, each feeding a sink of its own. Neither end asks to
+# stop, so a run of this graph ends on the --seconds bound unless a setting on a source ends it first.
+blocks:
+  - id: good::fixed_source<float32>
+    unique_name: left
+    parameters:
+      name: twin
+  - id: good::fixed_source<float32>
+    unique_name: right
+    parameters:
+      name: twin
+  - id: good::cout_sink<float32>
+    parameters:
+      name: left_sink
+  - id: good::cout_sink<float32>
+    parameters:
+      name: right_sink
+connections:
+  - [left, out, left_sink, in]
+  - [right, out, right_sink, in]
