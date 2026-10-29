@@ -45,7 +45,7 @@ target_link_libraries(
 # gnuradio-shared-state holds the values that gnuradio-4.0/SharedState.hpp declares and the type information of
 # DynamicPort's port interfaces and of gr::exception.
 #
-# gnuradio-blocklib-core holds the global block registry and the global scheduler registry. PluginLoader.cpp in the core
+# gnuradio-blocklib-core holds the global block, scheduler and device listing registries. PluginLoader.cpp in the core
 # archive reads them, so a program that builds a gr::Graph needs the library. The library names no core library, so the
 # link line of a consumer places it after the archive that calls it. GNU ld with --as-needed keeps a shared library only
 # when an earlier object uses it.

@@ -745,6 +745,30 @@ argument.
 Downstream examples: common blocks, math blocks, power estimators, and
 hardware-backed blocks in `gnuradio4-blocks`.
 
+### Device listings
+
+A library whose blocks drive hardware registers a `gr::DeviceListing` for each
+family word it serves: the word, whether listing the family opens a unit, the
+directions its blocks carry, and a function that returns each attached unit as
+a label and a selector. A block library and a plugin both add it to
+`gr::globalDeviceListingRegistry()` from a static initializer. The first
+registration of a family word holds it, and `add()` returns false for a later
+one.
+
+```cpp
+std::vector<gr::DeviceUnit> listMyUnits(); // the label and selector of each unit
+
+const bool registered = gr::globalDeviceListingRegistry().add(
+    {.family = "mydev", .opens = false, .receive = true, .transmit = false, .listUnits = listMyUnits});
+```
+
+`PluginLoader::listDevices()` asks every family whose listing opens no unit, and
+`listDevices(gr::Opening::Allowed)` asks every family. The result holds each
+unit with its family's word and directions, and a report of every family: a
+family left out, a listing that threw and a listing that found nothing each
+carry their reason. Core compares and orders family words and passes the
+selector on unread; it gives neither a meaning.
+
 ## Dos and don'ts
 
 | Do                                                   | Don't                                                                                                  |
