@@ -766,8 +766,9 @@ const bool registered = gr::globalDeviceListingRegistry().add(
 `listDevices(gr::Opening::Allowed)` asks every family. The result holds each
 unit with its family's word and directions, and a report of every family: a
 family left out, a listing that threw and a listing that found nothing each
-carry their reason. Core compares and orders family words and passes the
-selector on unread; it gives neither a meaning.
+carry their reason. `grinfo devices` prints the result. Core compares and
+orders family words and passes the selector on unread; it gives neither a
+meaning.
 
 ## Dos and don'ts
 

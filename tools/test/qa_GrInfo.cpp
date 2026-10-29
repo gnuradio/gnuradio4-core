@@ -28,6 +28,7 @@
  * - the scheduler listing
  * - scheduler libraries refused at an earlier plugin ABI version or at none
  * - a plugin refused for its plugin ABI version
+ * - the attached units of the device families a block library and a plugin register
  * - a name nothing is registered under
  * - a command line that cannot be used
  * - the Markdown and HTML documents of each command, a value with markup characters in them, and the ids of their
@@ -348,6 +349,33 @@ constexpr std::array<std::string_view, 5> kExternalReferences{"<script", "<link"
     all.emplace_back("--plugin-dir");
     all.emplace_back(GR_TOOLS_TEST_SCHEDULER_LIBRARY);
     return all;
+}
+#endif
+
+#ifdef GR_TOOLS_TEST_DEVICE_LISTING
+// the directory of a block library and a plugin that register device listings of invented units
+[[nodiscard]] std::vector<std::string> overDeviceListings(const std::vector<std::string>& arguments) {
+    std::vector<std::string> all(arguments);
+    all.emplace_back("--plugin-dir");
+    all.emplace_back(GR_TOOLS_TEST_DEVICE_LISTING);
+    return all;
+}
+
+// whether `text` has a line that names `name` and then `value`, as the text report prints a unit's selector and label
+[[nodiscard]] bool hasFact(std::string_view text, std::string_view name, std::string_view value) {
+    const std::optional<std::string> line = lineStartingWith(text, std::format("  {} ", name));
+    return line.has_value() && withSingleSpaces(*line) == std::format("{} {}", name, value);
+}
+
+// the text of the JSON object that holds `needle`, braces included; empty when there is none
+[[nodiscard]] std::string_view enclosingJsonObject(std::string_view text, std::string_view needle) {
+    const std::size_t at = text.find(needle);
+    if (at == std::string_view::npos) {
+        return {};
+    }
+    const std::size_t begin = text.rfind('{', at);
+    const std::size_t end   = text.find('}', at);
+    return begin == std::string_view::npos || end == std::string_view::npos ? std::string_view{} : text.substr(begin, end - begin + 1UZ);
 }
 #endif
 
@@ -816,6 +844,97 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
             }
             std::ranges::sort(labels);
             expect(labels == std::vector<std::string>{"probe::Stage", "probe_Stage", "probe_Stage_1"}) << form << "a link per block" << document.output;
+        }
+    };
+#endif
+
+#ifdef GR_TOOLS_TEST_DEVICE_LISTING
+    "devices lists the units of every loaded family under its word, and why a family listed none"_test = [] {
+        const Result devices = run(overDeviceListings({"devices"}));
+        expect(eq(devices.exitCode, 0)) << devices.output;
+        expect(devices.output.contains("fakelibrary (receive and transmit)\n")) << "a family with the directions of its blocks" << devices.output;
+        expect(hasFact(devices.output, "fakelibrary:serial=FAKE0001", "Fake unit A")) << "a unit by its selector and its label" << devices.output;
+        expect(hasFact(devices.output, "(no selector)", "Fake unit without a serial")) << devices.output;
+        expect(hasFact(devices.output, "fakeplugin:index=0", "Fake plugin unit")) << "a family a plugin's file registers" << devices.output;
+        expect(devices.output.contains("fakeopening (receive, opens a unit)\n  not listed: its listing opens a unit, and the call does not allow that\n")) << devices.output;
+        expect(!devices.output.contains("fakeopening:bus=1")) << "the listing that opens a unit is not called" << devices.output;
+        expect(devices.output.contains("fakethrowing (receive)\n  not listed: the fake bus does not answer\n")) << "a listing that throws, with its message" << devices.output;
+        expect(devices.output.contains("fakeempty (transmit)\n  listed: the listing found no unit\n")) << devices.output;
+        expect(devices.output.contains("is asked with --allow-open")) << devices.output;
+
+        const Result opened = run(overDeviceListings({"devices", "--allow-open"}));
+        expect(eq(opened.exitCode, 0)) << opened.output;
+        expect(opened.output.contains("fakeopening (receive, opens a unit)\n")) << opened.output;
+        expect(hasFact(opened.output, "fakeopening:bus=1", "Fake opened unit")) << opened.output;
+        expect(!opened.output.contains("--allow-open")) << "no family is left out" << opened.output;
+    };
+
+    "devices --json carries the units and the families in the shape a reader relies on"_test = [] {
+        const Result devices = run(overDeviceListings({"devices", "--json"}), Streams::standardOutput);
+        expect(eq(devices.exitCode, 0)) << devices.output;
+        expect(isOneJsonDocument(devices.output)) << devices.output;
+        expect(devices.output.contains("\"command\": \"devices\"")) << devices.output;
+
+        const std::string_view unit = enclosingJsonObject(devices.output, "\"label\": \"Fake unit A\"");
+        for (const std::string_view member : {"\"family\": \"fakelibrary\"", "\"selector\": \"fakelibrary:serial=FAKE0001\"", "\"receive\": true", "\"transmit\": true"}) {
+            expect(unit.contains(member)) << member << devices.output;
+        }
+        const std::string_view unnamed = enclosingJsonObject(devices.output, "\"label\": \"Fake unit without a serial\"");
+        expect(!unnamed.empty() && !unnamed.contains("selector")) << "a unit listed without a selector carries none" << devices.output;
+
+        const std::string_view opening = enclosingJsonObject(devices.output, "\"family\": \"fakeopening\",\n      \"opens\"");
+        for (const std::string_view member : {"\"opens\": true", "\"listed\": false", "\"reason\": \"its listing opens a unit, and the call does not allow that\""}) {
+            expect(opening.contains(member)) << member << devices.output;
+        }
+        const std::string_view throwing = enclosingJsonObject(devices.output, "\"family\": \"fakethrowing\",\n      \"opens\"");
+        expect(throwing.contains("\"listed\": false") && throwing.contains("\"reason\": \"the fake bus does not answer\"")) << devices.output;
+        const std::string_view listed = enclosingJsonObject(devices.output, "\"family\": \"fakelibrary\",\n      \"opens\"");
+        expect(listed.contains("\"listed\": true") && !listed.contains("reason")) << "a family that listed a unit carries no reason" << devices.output;
+    };
+
+    "devices --markdown and --html carry a section per family with its units and its reason"_test = [] {
+        const Result markdown = run(overDeviceListings({"devices", "--markdown"}), Streams::standardOutput);
+        expect(eq(markdown.exitCode, 0)) << markdown.output;
+        expect(markdown.output.starts_with("# grinfo devices\n")) << "the command is the title" << markdown.output;
+        expect(markdown.output.contains("\n## fakelibrary (receive and transmit)\n")) << "a section per family" << markdown.output;
+        expect(markdown.output.contains("\n- **fakelibrary:serial=FAKE0001**: Fake unit A\n")) << "a unit by its selector and its label" << markdown.output;
+        expect(markdown.output.contains("\n## fakethrowing (receive)\n\nnot listed: the fake bus does not answer\n")) << "a family's reason after its heading" << markdown.output;
+        expect(markdown.output.contains("asked with --allow-open")) << markdown.output;
+
+        const Result html = run(overDeviceListings({"devices", "--html"}), Streams::standardOutput);
+        expect(eq(html.exitCode, 0)) << html.output;
+        expect(html.output.starts_with("<!DOCTYPE html>\n")) << html.output;
+        expect(html.output.contains("<h2 id=\"fakelibrary-receive-and-transmit\">fakelibrary (receive and transmit)</h2>")) << html.output;
+        expect(html.output.contains("<li><strong>fakelibrary:serial=FAKE0001</strong>: Fake unit A</li>")) << html.output;
+        expect(html.output.contains("<p>not listed: its listing opens a unit, and the call does not allow that</p>")) << html.output;
+        for (const std::string_view reference : kExternalReferences) {
+            expect(!html.output.contains(reference)) << reference << html.output;
+        }
+    };
+
+    "a family that listed no unit carries its directions, and its section id is the same with --allow-open"_test = [] {
+        for (const std::vector<std::string>& arguments : {std::vector<std::string>{"devices", "--html"}, {"devices", "--html", "--allow-open"}}) {
+            const Result html = run(overDeviceListings(arguments), Streams::standardOutput);
+            expect(eq(html.exitCode, 0)) << html.output;
+            expect(html.output.contains("<h2 id=\"fakeopening-receive-opens-a-unit\">fakeopening (receive, opens a unit)</h2>")) << html.output;
+            expect(html.output.contains("<h2 id=\"fakeempty-transmit\">fakeempty (transmit)</h2>")) << "a family that found no unit" << html.output;
+        }
+    };
+
+    "devices over plugins that register no listing names none of the test families"_test = [] {
+        const EnvironmentVariable unset("GNURADIO4_PLUGIN_DIRECTORIES", std::nullopt);
+        const Result              devices = run({"devices", "--plugin-dir", GR_TOOLS_CORE_TEST_PLUGINS});
+        expect(eq(devices.exitCode, 0)) << devices.output;
+        for (const std::string_view family : {"fakelibrary", "fakeopening", "fakethrowing", "fakeempty", "fakeplugin"}) {
+            expect(!devices.output.contains(family)) << family << devices.output;
+        }
+    };
+
+    "no line of the device report is wider than a terminal"_test = [] {
+        for (const std::vector<std::string>& arguments : {std::vector<std::string>{"devices"}, {"devices", "--allow-open"}}) {
+            const Result report = run(overDeviceListings(arguments));
+            expect(eq(report.exitCode, 0)) << report.output;
+            expect(le(widestLine(report.output), kWidth)) << report.output;
         }
     };
 #endif
