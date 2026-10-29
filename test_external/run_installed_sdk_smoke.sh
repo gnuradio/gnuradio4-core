@@ -21,3 +21,9 @@ for consumer in minimal_blocklib_consumer_Shared minimal_blocklib_consumer_Stati
   minimal_blocklib_named_registry; do
   "${smoke_build_dir}/${consumer}"
 done
+
+# a program that names only gnuradio4::gnuradio-core builds a graph and runs it
+core_only_build_dir="${build_dir}/installed-sdk-core-only"
+cmake -S "${script_dir}/core_only_consumer" -B "${core_only_build_dir}" -DCMAKE_PREFIX_PATH="${install_prefix}"
+cmake --build "${core_only_build_dir}"
+timeout 60 "${core_only_build_dir}/core_only_consumer"

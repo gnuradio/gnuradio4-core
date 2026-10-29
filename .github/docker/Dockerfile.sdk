@@ -64,6 +64,22 @@ RUN set -eux; \
         "${system_node}" "/build/minimal-blocklib/${consumer}.js"; \
       done; \
     fi \
+    && if [ "${SDK_TARGET}" = emscripten ]; then \
+      emcmake cmake -S test_external/core_only_consumer -B /build/core-only-consumer \
+        -DCMAKE_FIND_ROOT_PATH=/opt/gnuradio4 \
+        -DCMAKE_PREFIX_PATH=/opt/gnuradio4 \
+        -DCMAKE_CROSSCOMPILING_EMULATOR="${system_node}"; \
+    else \
+      cmake -S test_external/core_only_consumer -B /build/core-only-consumer \
+        -DCMAKE_PREFIX_PATH=/opt/gnuradio4 \
+        -DCMAKE_C_COMPILER=${CC} \
+        -DCMAKE_CXX_COMPILER=${CXX} \
+        ${smoke_cmake_flags}; \
+    fi \
+    && cmake --build /build/core-only-consumer --parallel 4 \
+    && if [ "${SDK_TARGET}" = emscripten ]; then \
+      timeout 60 "${system_node}" /build/core-only-consumer/core_only_consumer.js; \
+    fi \
     && mkdir -p /opt/gnuradio4/share/gnuradio4-core-sdk \
     && if [ "${SDK_TARGET}" = emscripten ]; then emscripten_version="$(emcc -dumpversion)"; else emscripten_version=none; fi \
     && printf 'git_sha=%s\nprefix=/opt/gnuradio4\nbase_image=%s\nsdk_target=%s\nemscripten_version=%s\ncmake_build_type=%s\ncmake_flags=%s\n' \
