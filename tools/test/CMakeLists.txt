@@ -101,5 +101,9 @@ if(TARGET grinfo)
       abi_probe_plugin_v1
       abi_probe_plugin_foreign_scheduler
       doc_probe_library)
+    # the device cases read a block library and a plugin that register device listings of invented units
+    target_compile_definitions(qa_GrInfo
+                               PRIVATE GR_TOOLS_TEST_DEVICE_LISTING="${CMAKE_BINARY_DIR}/core/test/device_listing")
+    add_dependencies(qa_GrInfo device_listing_library device_listing_plugin)
   endif()
 endif()
