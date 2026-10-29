@@ -200,9 +200,10 @@ public:
     static constexpr std::string_view kGraphGRCEndpoint = "GraphGRC";
 
     /// Builds the scheduler `type` through the graph's loader with `schedulerParameters` and hands it the graph. A
-    /// parameter the scheduler does not declare is an error. So is a value its constructor refuses. `graph` is consumed
-    /// when a Runtime is returned and left as it was on an error. The shipped `Simple` schedulers are registered in
-    /// `gr::globalSchedulerRegistry()` alone, and a loader over another scheduler registry does not find them.
+    /// parameter the scheduler does not declare is an error. So is a value it refuses, in its constructor or when
+    /// `create()` applies the parameters to it. `graph` is consumed when a Runtime is returned and left as it was on an
+    /// error. The shipped `Simple` schedulers are registered in `gr::globalSchedulerRegistry()` alone, and a loader over
+    /// another scheduler registry does not find them.
     [[nodiscard]] static std::expected<Runtime, RuntimeError> create(RuntimeGraph&& graph, std::string_view type = kDefaultScheduler, property_map schedulerParameters = {});
 
     ~Runtime();
