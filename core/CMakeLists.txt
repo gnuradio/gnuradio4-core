@@ -38,9 +38,17 @@ target_link_libraries(
          magic_enum
          vir)
 
-# the values that gnuradio-4.0/SharedState.hpp declares and the type information of DynamicPort's port interfaces and of
-# gr::exception, one copy that every shared object of a program shares. The library compiles the core headers that build
-# those values and links no compiled core library. gnuradio-core links it
+# two libraries hold what a program and every shared object it loads must share one copy of. Each compiles the core
+# headers it needs and links no compiled core library. gnuradio-core links both PUBLIC: the link goes from the core
+# archive to them, so a program that links gnuradio-core alone links.
+#
+# gnuradio-shared-state holds the values that gnuradio-4.0/SharedState.hpp declares and the type information of
+# DynamicPort's port interfaces and of gr::exception.
+#
+# gnuradio-blocklib-core holds the global block registry and the global scheduler registry. PluginLoader.cpp in the core
+# archive reads them, so a program that builds a gr::Graph needs the library. The library names no core library, so the
+# link line of a consumer places it after the archive that calls it. GNU ld with --as-needed keeps a shared library only
+# when an earlier object uses it.
 if(EMSCRIPTEN)
   add_library(gnuradio-shared-state STATIC src/SharedState.cpp src/DynamicPort.cpp src/Exception.cpp)
 else()
@@ -62,10 +70,14 @@ add_library(gnuradio4::gnuradio-blocklib-core ALIAS gnuradio-blocklib-core)
 message(INFO "PATH include " $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/>)
 target_include_directories(gnuradio-blocklib-core PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/>
                                                          $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-target_link_libraries(gnuradio-blocklib-core PUBLIC gnuradio-core)
+target_include_directories(gnuradio-blocklib-core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include/
+                                                          ${CMAKE_CURRENT_BINARY_DIR}/include)
+target_link_libraries(gnuradio-blocklib-core PRIVATE gnuradio-options gnuradio-meta magic_enum)
 if(WIN32)
+  target_compile_definitions(gnuradio-blocklib-core PRIVATE BUILDING_MYPLUGIN)
   target_compile_definitions(gnuradio-core PUBLIC BUILDING_MYPLUGIN)
 endif()
+target_link_libraries(gnuradio-core PUBLIC gnuradio-blocklib-core)
 
 # configure a header file to pass the CMake settings to the source code
 configure_file("${PROJECT_SOURCE_DIR}/cmake/config.hpp.in"
