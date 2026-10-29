@@ -1,0 +1,5 @@
+# One block of the rungraph fixture plugin, which reports an error once. With `fails` false it then runs without end.
+blocks:
+  - id: test::fault
+    parameters:
+      name: fault
