@@ -19,6 +19,7 @@
 
 #include "BlockRegistry.hpp"
 
+#include <gnuradio-4.0/DeviceListing.hpp>
 #include <gnuradio-4.0/PluginMetadata.hpp>
 #include <gnuradio-4.0/YamlPmt.hpp>
 
@@ -474,7 +475,8 @@ public:
 class PluginLoader {
 public:
     /**
-     * @brief A shared object that is not a plugin but registered blocks or schedulers when it loaded.
+     * @brief A shared object that is not a plugin but registered blocks or schedulers, or offered a device listing, when
+     * it loaded.
      *
      * It carries no `gr_plugin_make`; its entries reach the registries from static initializers, and it is kept
      * mapped for the lifetime of the process because those entries point into its code. A shared object that
@@ -515,15 +517,19 @@ private:
      *
      * The registries then hold exactly what the file registered, a replaced key included, whichever copy of the
      * registry code inserted it. `restore(false)` drops those entries, and a file the loader refuses offers none of
-     * them.
+     * them. The device listings stay in place, because an earlier listing holds its family word against the file's.
+     * `restore(false)` drops the listings the file added.
      */
     class SetAsideRegistrations {
         std::vector<std::pair<BlockRegistry*, BlockRegistry::Entries>>         _blocks;
         std::vector<std::pair<SchedulerRegistry*, SchedulerRegistry::Entries>> _schedulers;
+        DeviceListingRegistry&                                                 _deviceListings;
+        std::size_t                                                            _nListingsBefore;
+        std::size_t                                                            _nOfferedBefore;
         bool                                                                   _restored = false;
 
     public:
-        SetAsideRegistrations(const std::vector<BlockRegistry*>& blockRegistries, const std::vector<SchedulerRegistry*>& schedulerRegistries) {
+        SetAsideRegistrations(const std::vector<BlockRegistry*>& blockRegistries, const std::vector<SchedulerRegistry*>& schedulerRegistries, DeviceListingRegistry& deviceListings) : _deviceListings(deviceListings), _nListingsBefore(deviceListings._listings.size()), _nOfferedBefore(deviceListings._nOffered) {
             for (BlockRegistry* registry : blockRegistries) {
                 _blocks.emplace_back(registry, registry->takeEntries());
             }
@@ -555,6 +561,9 @@ private:
             return std::nullopt;
         }
 
+        /// whether the file offered a device listing, held or not
+        [[nodiscard]] bool offeredDeviceListing() const noexcept { return _deviceListings._nOffered != _nOfferedBefore; }
+
         void restore(bool keepRegistered) {
             if (std::exchange(_restored, true)) {
                 return;
@@ -564,6 +573,9 @@ private:
             }
             for (auto& [registry, taken] : _schedulers) {
                 registry->restoreEntries(std::move(taken), keepRegistered);
+            }
+            if (!keepRegistered && _deviceListings._listings.size() > _nListingsBefore) {
+                _deviceListings._listings.resize(_nListingsBefore);
             }
         }
     };
@@ -618,7 +630,7 @@ public:
                 _loadedPluginFiles.insert(fileString);
 
                 const auto [blockGenerationBefore, schedulerGenerationBefore] = registryGenerations();
-                SetAsideRegistrations registrations(reachableRegistries(_registry, gr::globalBlockRegistry()), reachableRegistries(_schedulerRegistry, gr::globalSchedulerRegistry()));
+                SetAsideRegistrations registrations(reachableRegistries(_registry, gr::globalBlockRegistry()), reachableRegistries(_schedulerRegistry, gr::globalSchedulerRegistry()), gr::globalDeviceListingRegistry());
 
                 if (PluginHandler handler(fileString); handler) {
                     if (std::optional<std::string> mismatch = registrations.schedulerAbiMismatch(); mismatch.has_value()) {
@@ -647,7 +659,7 @@ public:
                     const std::size_t blockRegistrations                        = blockGenerationAfter - blockGenerationBefore;
                     const std::size_t schedulerRegistrations                    = schedulerGenerationAfter - schedulerGenerationBefore;
 
-                    if (handler.isLoaded() && (blockRegistrations != 0UZ || schedulerRegistrations != 0UZ)) {
+                    if (handler.isLoaded() && (blockRegistrations != 0UZ || schedulerRegistrations != 0UZ || registrations.offeredDeviceListing())) {
                         if (std::optional<std::string> mismatch = registrations.schedulerAbiMismatch(); mismatch.has_value()) {
                             registrations.restore(false);
                             std::string warning = std::format("warning: library {} not loaded: {}", fileString, *mismatch);
@@ -673,7 +685,7 @@ public:
 
     const auto& plugins() const { return _pluginHandlers; }
 
-    /// the shared objects that registered blocks or schedulers without being plugins
+    /// the shared objects that registered blocks or schedulers, or offered a device listing, without being plugins
     const std::vector<BlockLibrary>& blockLibraries() const { return _blockLibraries; }
 
     /// directory entries whose name reads as a shared object but which the scan did not open, so that a directory of them is not indistinguishable from an empty one
@@ -767,6 +779,10 @@ public:
     /// how many assets the definition roots named that did not register: unreadable, not
     /// deserializable, or carrying no block_type. Each was reported as it was skipped.
     [[nodiscard]] std::size_t nSkippedAssets() const noexcept { return _yamlRegistry.nSkippedAssets(); }
+
+    /// the attached units of every device family registered in the process, and a report of each family; with
+    /// Opening::Avoided a family whose listing opens a unit is not asked
+    [[nodiscard]] DeviceList listDevices(Opening opening = Opening::Avoided) const { return detail::listDevices(gr::globalDeviceListingRegistry().listings(), opening); }
 };
 #else
 // PluginLoader on WASM is just a wrapper on BlockRegistry to provide the
@@ -821,6 +837,9 @@ public:
 
     /// see the non-WASM PluginLoader::nSkippedAssets
     [[nodiscard]] std::size_t nSkippedAssets() const noexcept { return _yamlRegistry.nSkippedAssets(); }
+
+    /// see the non-WASM PluginLoader::listDevices
+    [[nodiscard]] DeviceList listDevices(Opening opening = Opening::Avoided) const { return detail::listDevices(gr::globalDeviceListingRegistry().listings(), opening); }
 };
 #endif
 

@@ -315,6 +315,16 @@ if(GR_ENABLE_BLOCK_REGISTRY AND INTERNAL_ENABLE_BLOCK_PLUGINS)
     scheduler_library
     scheduler_library_v1
     scheduler_library_unversioned)
+
+  add_app_test(qa_DeviceListing)
+  add_dependencies(
+    qa_DeviceListing
+    device_listing_library
+    device_listing_plugin
+    device_listing_duplicate_library
+    device_listing_stale_library
+    device_listing_stale_plugin
+    device_listing_foreign_scheduler_plugin)
 endif()
 
 if(GR_ENABLE_BLOCK_REGISTRY AND INTERNAL_ENABLE_BLOCK_PLUGINS)
