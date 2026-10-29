@@ -79,10 +79,11 @@ public:
     [[nodiscard]] std::string typeName() const;
 
     /// Stages parameters for the block to apply. A running block applies them at its next work call, and a block that
-    /// is not running applies them when its run starts. A key the block does not declare is an error naming the key,
-    /// and the call then stages nothing. A value that does not convert to its setting's type is an error carrying the
-    /// block's reason. A value outside the setting's limits is staged, and the block drops it without a report when it
-    /// applies it. The scheduler's handle refuses every call: a scheduler takes its settings in `Runtime::create()`.
+    /// is not running applies them when its run starts. A key the block does not declare is an error naming the key.
+    /// A value that does not convert to its setting's type is an error carrying the block's reason. Either error stages
+    /// none of the parameters. A value outside the setting's limits is staged, and the block drops it without a report
+    /// when it applies it. The scheduler's handle refuses every call: a scheduler takes its settings in
+    /// `Runtime::create()`.
     [[nodiscard]] std::expected<void, RuntimeError> setStaged(const property_map& parameters);
 
     /// The block's settings as of its last settings change, or of the end of its last run.

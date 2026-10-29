@@ -1364,6 +1364,39 @@ const boost::ut::suite<"refusals return"> refusalTests = [] {
         expect(!scaleBlock->settings().stagedParameters().empty()) << "a declared key was not staged";
     };
 
+    "a staged value the block cannot convert stages none of the keys beside it"_test = [] {
+        registerTestBlocks();
+        auto         scaleBlock = std::make_shared<BlockWrapper<Scale>>();
+        RuntimeGraph graph;
+        auto         source = graph.emplace("qa::RampSource", "source", {{"n_samples", gr::Size_t{16U}}});
+        auto         scale  = graph.add(std::shared_ptr<BlockModel>(scaleBlock), "scale");
+        auto         sink   = graph.emplace("qa::RecordingSink", "refused-sink");
+        expect(fatal(source.has_value() && scale.has_value() && sink.has_value()));
+        expect(graph.connect(*source, "out", *scale, "in").has_value());
+        expect(graph.connect(*scale, "out", *sink, "in").has_value());
+
+        // The map's key order is not fixed. Each key takes a turn as the refused one, so in some call a key whose value
+        // converts comes before it.
+        const property_map accepted{{"gain", 5.0f}, {"enabled", false}, {"taps", std::vector<float>{2.0f}}};
+        const property_map before = scale->get();
+        for (const std::string refusedKey : {"gain", "enabled", "taps"}) {
+            property_map parameters = accepted;
+            parameters.insert_or_assign(std::pmr::string(refusedKey), std::string("loud"));
+            const std::expected<void, RuntimeError> refused = scale->setStaged(parameters);
+            expect(fatal(!refused.has_value())) << refusedKey << ": a value that does not convert was taken";
+            expect(scaleBlock->settings().stagedParameters().empty()) << refusedKey << ": a refused call staged the keys whose values converted";
+            expect(!scaleBlock->settings().changed()) << refusedKey << ": a refused call marked the settings changed";
+        }
+
+        auto runtime = Runtime::create(std::move(graph));
+        expect(fatal(runtime.has_value())) << messageOf(runtime);
+        expect(runtime->runAndWait().has_value());
+        std::ignore = takeCollected("refused-sink");
+        for (const auto& [key, value] : before) {
+            expect(scale->get(std::string(std::string_view(key))) == std::optional<pmt::Value>(value)) << key << ": the run applied a value of a refused call";
+        }
+    };
+
     "a block built with a value it refuses is refused by add()"_test = [] {
         RuntimeGraph                                            graph;
         std::optional<std::expected<BlockHandle, RuntimeError>> refused;

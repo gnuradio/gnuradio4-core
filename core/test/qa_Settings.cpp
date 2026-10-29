@@ -1958,6 +1958,38 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
         expect(eq(block.gain.value, 0.5f) && eq(block.offset.value, 0.f)) << "a refused value reaches its member";
     };
 
+    "a typed setStaged() with a value that does not convert throws and stages none of the keys"_test = [] {
+        LimitedGainAndOffset block{property_map{{"name", std::string("atomic_stage")}}};
+        block.init(std::make_shared<gr::Sequence>());
+        std::ignore               = block.settings().setStaged({{"gain", 0.25f}, {"offset", 0.125f}});
+        const property_map before = block.settings().stagedParameters();
+        expect(eq(before.size(), 2UZ));
+
+        // The map's key order is not fixed, so each key is the refused one in turn.
+        const property_map accepted{{"gain", 0.75f}, {"offset", -0.5f}};
+        for (const std::string refusedKey : {"gain", "offset"}) {
+            property_map parameters = accepted;
+            parameters.insert_or_assign(std::pmr::string(refusedKey), std::string("loud"));
+            bool refused = false;
+            try {
+                std::ignore = block.settings().setStaged(parameters);
+            } catch (const gr::exception&) {
+                refused = true;
+            }
+            expect(refused) << refusedKey << ": a value that does not convert was taken";
+
+            const property_map after = block.settings().stagedParameters();
+            expect(eq(after.size(), before.size())) << refusedKey << ": a refused call changed the staged keys";
+            for (const auto& [key, value] : before) {
+                const auto staged = after.find(key);
+                expect(staged != after.end() && staged->second == value) << refusedKey << ": a refused call replaced the staged value of " << std::string_view(key);
+            }
+        }
+
+        block.applyChangedSettings();
+        expect(eq(block.gain.value, 0.25f) && eq(block.offset.value, 0.125f)) << "the apply took a value of a refused call";
+    };
+
     "a key a tag and setStaged() both stage is reported by the later of the two"_test = [] {
         LimitedGain   block{property_map{{"name", std::string("gain_stage")}}};
         gr::MsgPortIn fromBlock;
