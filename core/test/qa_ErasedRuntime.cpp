@@ -437,6 +437,7 @@ const boost::ut::suite<"a program's own loader"> programLoaderTests = [] {
     "a document naming a plugin block loads through the program's loader and not the process's, and the graph, its runtime and its handles keep that loader"_test = [] {
         constexpr std::string_view kSourceKey       = "good::fixed_source<float32>";
         constexpr std::string_view kDocument        = "blocks:\n  - id: good::fixed_source<float32>\n    parameters:\n      name: source\n";
+        constexpr gr::Size_t       kChosenTimeout   = 37U;
         const std::string          missingDirectory = std::string(TESTS_BINARY_PATH) + "/no_such_plugin_directory";
         expect(fatal(qa_runtime::setEnvironment("GNURADIO4_PLUGIN_DIRECTORIES", missingDirectory)));
         expect(fatal(!std::ranges::contains(globalPluginLoader().availableBlocks(), kSourceKey))) << "the process's loader holds the plugin block already";
@@ -464,11 +465,24 @@ const boost::ut::suite<"a program's own loader"> programLoaderTests = [] {
             pluginBlock = *found;
             expect(!watched.expired()) << "the graph does not keep its loader";
 
-            auto runtime = Runtime::create(std::move(*graph), *scheduler);
+            const auto unconverted = Runtime::create(std::move(*graph), *scheduler, {{"timeout_ms", std::string("soon")}});
+            expect(fatal(!unconverted.has_value())) << "a value that does not convert to the plugin scheduler's setting was taken";
+            expect(unconverted.error().message.contains("timeout_ms")) << unconverted.error().message;
+            expect(fatal(graph->find("source").has_value())) << "a create that refused a value consumed the graph";
+
+            const auto refused = Runtime::create(std::move(*graph), *scheduler, {{"process_stream_to_message_ratio", gr::Size_t{0U}}});
+            expect(fatal(!refused.has_value())) << "a value the plugin scheduler's limits refuse was taken";
+            expect(refused.error().message.contains("process_stream_to_message_ratio")) << refused.error().message;
+            expect(fatal(graph->find("source").has_value())) << "a refused create consumed the graph";
+
+            auto runtime = Runtime::create(std::move(*graph), *scheduler, {{"timeout_ms", kChosenTimeout}});
             expect(fatal(runtime.has_value())) << messageOf(runtime);
             expect(!watched.expired()) << "the runtime does not keep its graph's loader";
             pluginScheduler = runtime->scheduler();
         }
+        const std::optional<pmt::Value> timeout = pluginScheduler.get(std::string("timeout_ms"));
+        expect(fatal(timeout.has_value() && timeout->get_if<gr::Size_t>() != nullptr)) << "the plugin scheduler's handle reports no timeout_ms";
+        expect(eq(*timeout->get_if<gr::Size_t>(), kChosenTimeout)) << "a plugin scheduler whose constructor takes no settings was not given the caller's";
         // the plugin's code stays mapped while a handle holds one of its objects
         expect(fatal(!watched.expired())) << "the handles do not keep the loader of their graph";
         expect(eq(pluginBlock.name(), std::string("source")));

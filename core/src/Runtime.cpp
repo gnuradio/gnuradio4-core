@@ -547,6 +547,25 @@ std::expected<Runtime, RuntimeError> Runtime::create(RuntimeGraph&& graph, std::
         }
     }
 
+    // A plugin's scheduler may ignore its constructor's parameters. The parameters are applied to the built scheduler as a
+    // settings change.
+    if (!schedulerParameters.empty()) {
+        SettingsBase& settings = impl->schedulerBlock->settings();
+        try {
+            std::ignore = settings.set(schedulerParameters); // every key is declared, checked above
+            if (!settings.activateContext().has_value()) {
+                return std::unexpected(localError(std::format("scheduler type '{}' could not activate its settings", type), where));
+            }
+            if (const ApplyStagedParametersResult applied = settings.applyStagedParameters(); !applied.failedParameters.empty()) {
+                return std::unexpected(localError(applied.refusal, where));
+            }
+        } catch (const gr::exception& error) {
+            return std::unexpected(localError(error.message, where));
+        } catch (const std::exception& error) {
+            return std::unexpected(localError(error.what(), where));
+        }
+    }
+
     // A msgOut with no reader turns a child's error into an exception thrown on a worker thread, and the reason is lost.
     if (auto connected = impl->schedulerBlock->msgOut->connect(impl->events); !connected) {
         return std::unexpected(toRuntimeError(connected.error()));
