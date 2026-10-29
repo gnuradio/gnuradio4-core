@@ -622,18 +622,23 @@ property_map CtxSettingsBase::setImpl(const property_map& parameters, SettingsCt
 property_map CtxSettingsBase::setStagedImpl(const property_map& parameters) {
     property_map ret;
     if (_descriptor->hooks.reflectable) {
+        // a value that does not convert throws before any value is staged
+        property_map converted;
         for (const auto& [key, value] : parameters) {
             auto it = _descriptor->writableByName.find(key);
             if (it != _descriptor->writableByName.end()) {
-                if (auto error = it->second->setParameter(key, value, _stagedParameters)) {
+                if (auto error = it->second->setParameter(key, value, converted)) {
                     throw gr::exception(*error);
-                }
-                if (const auto tagged = _taggedKeys.find(std::string_view(key)); tagged != _taggedKeys.end()) {
-                    _taggedKeys.erase(tagged);
                 }
             } else {
                 ret.insert_or_assign(key, value);
             }
+        }
+        for (auto& [key, value] : converted) {
+            if (const auto tagged = _taggedKeys.find(std::string_view(key)); tagged != _taggedKeys.end()) {
+                _taggedKeys.erase(tagged);
+            }
+            _stagedParameters.insert_or_assign(key, std::move(value));
         }
     }
     if (!_stagedParameters.empty()) {

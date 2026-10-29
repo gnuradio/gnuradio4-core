@@ -328,6 +328,7 @@ std::expected<void, RuntimeError> BlockHandle::setStaged(const property_map& par
         return std::unexpected(localError(std::format("block '{}' declares no setting [{}]", uniqueName(), commaSeparated(undeclared)), where));
     }
     try {
+        // every key is declared, and setStaged() returns only undeclared keys
         std::ignore = settings.setStaged(parameters);
     } catch (const gr::exception& error) { // a value that does not convert to its setting's type
         return std::unexpected(localError(error.message, where));
