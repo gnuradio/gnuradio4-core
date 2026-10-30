@@ -1,0 +1,6 @@
+# The block of refusal.yaml, given a gain outside the limits [0, 1] its setting declares.
+blocks:
+  - id: test::refusal
+    parameters:
+      name: refusal
+      gain: !!float32 2

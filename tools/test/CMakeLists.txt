@@ -71,7 +71,7 @@ if(TARGET rungraph)
       scheduler_library_v1
       scheduler_library_unversioned)
 
-    # one plugin, in a directory of its own, whose block reports an error while the graph runs
+    # one plugin, in a directory of its own, whose blocks refuse a setting or fail at start or while running
     add_library(rungraph_fixture MODULE plugins/rungraph_fixture_plugin.cpp)
     target_include_directories(rungraph_fixture PRIVATE ${CMAKE_BINARY_DIR}/include)
     target_link_libraries(rungraph_fixture PRIVATE gnuradio-options gnuradio-core gnuradio-plugin)

@@ -402,6 +402,25 @@ void reportScheduler(const gr::BlockHandle& scheduler, std::string_view key, con
     return shown;
 }
 
+// The text of an error without the ` at <file>:<line>` a gr::exception's what() ends with, where `where` is the file the
+// error names. A text without it is returned as it is.
+[[nodiscard]] std::string withoutLocation(std::string_view text, std::string_view where) {
+    const std::size_t colon = text.rfind(':');
+    if (where.empty() || colon == std::string_view::npos || colon + 1UZ == text.size()) {
+        return std::string(text);
+    }
+    const auto isDigit = [](char c) { return c >= '0' && c <= '9'; };
+    if (!std::ranges::all_of(text.substr(colon + 1UZ), isDigit)) {
+        return std::string(text);
+    }
+    const std::string      location = std::format(" at {}", where);
+    const std::string_view head     = text.substr(0UZ, colon);
+    if (!head.ends_with(location)) {
+        return std::string(text);
+    }
+    return std::string(head.substr(0UZ, head.size() - location.size()));
+}
+
 // the errors a run reported: how many, and the first
 struct ReportedErrors {
     std::size_t count = 0UZ;
@@ -426,11 +445,12 @@ void takeReportedErrors(gr::Runtime& runtime, ReportedErrors& errors) {
             if (errors.count++ > 0UZ) {
                 continue;
             }
+            const std::string text = withoutLocation(event.text, event.where);
             if (event.source == scheduler) {
-                std::println(stderr, "{}: the scheduler reports an error on '{}': {}", kProgram, event.endpoint, event.text);
-                errors.first = event.text;
+                std::println(stderr, "{}: the scheduler reports an error on '{}': {}", kProgram, event.endpoint, text);
+                errors.first = text;
             } else {
-                errors.first = std::format("block '{}' reports an error on '{}': {}", event.source, event.endpoint, event.text);
+                errors.first = std::format("block '{}' reports an error on '{}': {}", event.source, event.endpoint, text);
                 std::println(stderr, "{}: {}", kProgram, errors.first);
             }
         }
@@ -503,7 +523,7 @@ int main(int argc, char** argv) {
     // arrives.
     std::expected<gr::RuntimeGraph, gr::RuntimeError> graph = gr::RuntimeGraph::fromYaml(loader, *document, staged->blocks);
     if (!graph.has_value()) {
-        std::println(stderr, "{}: {} did not load: {}", kProgram, options.graph, graph.error().message);
+        std::println(stderr, "{}: {} did not load: {}", kProgram, options.graph, withoutLocation(graph.error().message, graph.error().where));
         return 1;
     }
 
@@ -521,7 +541,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (const std::expected<void, gr::RuntimeError> started = runtime->start(); !started.has_value()) {
-        std::println(stderr, "{}: the graph stopped: {}", kProgram, started.error().message);
+        std::println(stderr, "{}: the graph stopped: {}", kProgram, withoutLocation(started.error().message, started.error().where));
         return 1;
     }
 
@@ -547,8 +567,10 @@ int main(int argc, char** argv) {
 
     // a run the first error failed returns that error as its result, and the line is printed once
     const std::expected<void, gr::RuntimeError> result = runtime->result();
-    if (!result.has_value() && result.error().message != errors.first) {
-        std::println(stderr, "{}: the graph stopped: {}", kProgram, result.error().message);
+    if (!result.has_value()) {
+        if (const std::string reason = withoutLocation(result.error().message, result.error().where); reason != errors.first) {
+            std::println(stderr, "{}: the graph stopped: {}", kProgram, reason);
+        }
     }
     for (std::size_t i = 0UZ; i < shown->size(); ++i) {
         showSettings(options.show[i], (*shown)[i]);
