@@ -1,0 +1,6 @@
+# The block of refusal.yaml, given a text where its count setting takes an unsigned integer.
+blocks:
+  - id: test::refusal
+    parameters:
+      name: refusal
+      count: many

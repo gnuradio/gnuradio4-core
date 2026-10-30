@@ -28,6 +28,7 @@
  * - what --verbose reports, and that it reports the scheduler before the graph file is read
  * - a scheduler that cannot be built
  * - the errors a block and the scheduler report while the graph runs
+ * - each refusal of a setting and each failure at start or while running of the fixture's blocks, each with its status and its reason
  */
 namespace qa_rungraph {
 
@@ -127,6 +128,37 @@ constexpr std::string_view kSharedNameFile{GR_TOOLS_TEST_ASSETS "/shared_name.ya
     const std::size_t first = begin == std::string_view::npos ? 0UZ : begin + 1UZ;
     const std::size_t end   = output.find('\n', found);
     return output.substr(first, end == std::string_view::npos ? std::string_view::npos : end - first);
+}
+#endif
+
+#ifdef GR_TOOLS_CORE_TEST_PLUGINS
+constexpr std::string_view kRefusalFile{GR_TOOLS_TEST_ASSETS "/refusal.yaml"};
+constexpr std::string_view kWrongTypeFile{GR_TOOLS_TEST_ASSETS "/refusal_wrong_type.yaml"};
+constexpr std::string_view kOutOfLimitsFile{GR_TOOLS_TEST_ASSETS "/refusal_out_of_limits.yaml"};
+
+// a graph of the fixture plugin; the bound is far beyond any failure, and a run that reaches it was not ended by one
+[[nodiscard]] std::vector<std::string> fixtureRun(std::string_view file) { return {"--graph", std::string(file), "--plugin-dir", GR_TOOLS_FIXTURE_PLUGINS, "--seconds", "10"}; }
+
+// the block that fails in the step `step` names
+[[nodiscard]] std::vector<std::string> failingIn(std::string_view step) {
+    std::vector<std::string> arguments = fixtureRun(kRefusalFile);
+    arguments.insert(arguments.end(), {"--set", std::format("refusal.fails_in={}", step)});
+    return arguments;
+}
+
+// The lines of `output` rungraph printed that hold `part`. A build without NDEBUG also prints a line of its own for
+// every gr::exception it constructs, with the source file and line of the throw; that line is not rungraph's.
+[[nodiscard]] std::vector<std::string_view> programLinesHolding(std::string_view output, std::string_view part) {
+    std::vector<std::string_view> lines;
+    for (std::size_t begin = 0UZ; begin < output.size();) {
+        const std::size_t      end  = output.find('\n', begin);
+        const std::string_view line = output.substr(begin, end == std::string_view::npos ? std::string_view::npos : end - begin);
+        if (line.starts_with("rungraph: ") && line.contains(part)) {
+            lines.push_back(line);
+        }
+        begin = end == std::string_view::npos ? output.size() : end + 1UZ;
+    }
+    return lines;
 }
 #endif
 
@@ -467,6 +499,32 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
         expect(eq(reported.exitCode, 1)) << reported.output;
         expect(reported.output.contains("rungraph: the scheduler reports an error on ")) << reported.output;
         expect(reported.output.contains("'nosuch'")) << "the scheduler's reason is not printed" << reported.output;
+    };
+
+    "each refusal and failure of the fixture blocks ends the run with status 1 and prints the block's reason once, without a source path"_test = [] {
+        struct Refusal {
+            std::string_view         path;
+            std::vector<std::string> arguments;
+            std::string_view         reason;
+        };
+        const std::vector<Refusal> refusals{
+            {"a graph file value of the wrong type", fixtureRun(kWrongTypeFile), R"(value "many" for key 'count' has wrong type)"},
+            {"a graph file value outside the limits", fixtureRun(kOutOfLimitsFile), "outside the limits [0, 1]"},
+            {"settingsChanged() throws", failingIn("settingsChanged"), "the fixture refuses its settings"},
+            {"start() throws", failingIn("start"), "the fixture refuses to start"},
+            {"processBulk() throws", failingIn("processBulk"), "the fixture fails in processBulk"},
+            {"work() returns ERROR", failingIn("work"), "its work() returned ERROR"},
+            {"an error on the message port", fixtureRun(kFaultFile), "the fixture reports a fault"},
+        };
+        for (const Refusal& refusal : refusals) {
+            const Result                        failed = run(refusal.arguments);
+            const std::vector<std::string_view> lines  = programLinesHolding(failed.output, refusal.reason);
+            expect(eq(failed.exitCode, 1)) << refusal.path << failed.output;
+            expect(eq(lines.size(), 1UZ)) << refusal.path << "prints its reason once" << failed.output;
+            for (const std::string_view line : lines) {
+                expect(!line.contains(".cpp:") && !line.contains(".hpp:")) << refusal.path << "names a source file" << failed.output;
+            }
+        }
     };
 #endif
 };

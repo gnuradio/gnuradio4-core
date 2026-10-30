@@ -1,0 +1,6 @@
+# One block of the rungraph fixture plugin that fails in the step its fails_in setting names. With the setting empty it
+# runs without end.
+blocks:
+  - id: test::refusal
+    parameters:
+      name: refusal
