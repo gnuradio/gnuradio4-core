@@ -4,8 +4,13 @@
 #include <algorithm>
 #include <cstdio>
 #include <exception>
+#include <map>
+#include <optional>
 #include <print>
+#include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 namespace gr {
 
@@ -86,7 +91,7 @@ namespace {
 }
 } // namespace
 
-CtxSettingsBase::CtxSettingsBase(void* block, const settings::BlockDescriptor& descriptor) noexcept : _block(block), _descriptor(&descriptor) { _autoForwardParameters.insert(gr::tag::kDefaultTags.begin(), gr::tag::kDefaultTags.end()); }
+CtxSettingsBase::CtxSettingsBase(void* block, const settings::BlockDescriptor& descriptor) noexcept : _block(block), _descriptor(&descriptor) {}
 
 // --- Simple accessors ---
 
@@ -106,19 +111,6 @@ void CtxSettingsBase::setChanged(bool b) noexcept { gr::atomic_ref(_changed).sto
 void CtxSettingsBase::setInitBlockParameters(const property_map& parameters) { _initBlockParameters = parameters; }
 
 const SettingsCtx& CtxSettingsBase::activeContext() const noexcept { return _activeCtx; }
-
-const std::set<std::string>& CtxSettingsBase::autoForwardParameters() const noexcept { return _autoForwardParameters; }
-
-void CtxSettingsBase::addAutoForwardParameters(std::set<std::string> parameterKeys) {
-    // the per-work() read of this set is unlocked because the set is fixed for the duration of a
-    // run, so a mutation while the block is running is refused rather than allowed to race
-    if (_descriptor->hooks.blockState != nullptr && lifecycle::isActive(_descriptor->hooks.blockState(_block))) {
-        std::println(stderr, "gr::Settings: addAutoForwardParameters() refused on a running block; the auto-forward set is fixed for the duration of a run");
-        return;
-    }
-    std::lock_guard guard(_mutex);
-    _autoForwardParameters.merge(parameterKeys);
-}
 
 property_map CtxSettingsBase::defaultParameters() const noexcept {
     std::lock_guard lg(_mutex);
@@ -357,13 +349,14 @@ void CtxSettingsBase::assignFrom(const CtxSettingsBase& other) {
     _defaultParameters       = other._defaultParameters;
     _initBlockParameters     = other._initBlockParameters;
     _autoUpdateParameters    = other._autoUpdateParameters;
-    _autoForwardParameters   = other._autoForwardParameters;
     _matchPred               = other._matchPred;
     _activeCtx               = other._activeCtx;
     _contextActivated        = other._contextActivated;
     _contextBeforeActivation = other._contextBeforeActivation;
+    _autoUpdateBeforeReset   = other._autoUpdateBeforeReset;
     _stagedParameters        = other._stagedParameters;
     _taggedKeys              = other._taggedKeys;
+    _tagCouplings            = other._tagCouplings;
     _activeParameters        = other._activeParameters;
 }
 
@@ -374,13 +367,14 @@ void CtxSettingsBase::assignFrom(CtxSettingsBase&& other) noexcept {
     _defaultParameters       = std::move(other._defaultParameters);
     _initBlockParameters     = std::move(other._initBlockParameters);
     _autoUpdateParameters    = std::move(other._autoUpdateParameters);
-    _autoForwardParameters   = std::move(other._autoForwardParameters);
     _matchPred               = std::exchange(other._matchPred, settings::nullMatchPred);
     _activeCtx               = std::exchange(other._activeCtx, {});
     _contextActivated        = std::exchange(other._contextActivated, false);
     _contextBeforeActivation = std::exchange(other._contextBeforeActivation, std::nullopt);
+    _autoUpdateBeforeReset   = std::exchange(other._autoUpdateBeforeReset, std::nullopt);
     _stagedParameters        = std::move(other._stagedParameters);
     _taggedKeys              = std::move(other._taggedKeys);
+    _tagCouplings            = std::move(other._tagCouplings);
     _activeParameters        = std::move(other._activeParameters);
 }
 
@@ -542,8 +536,8 @@ void CtxSettingsBase::removeExpiredStoredParameters() {
 // --- Private helpers: tag parsing ---
 
 std::optional<std::string> CtxSettingsBase::contextInTag(const Tag& tag) const {
-    if (tag.map.contains(gr::tag::CONTEXT.shortKey())) {
-        const pmt::Value& ctxInfo = tag.map.at(gr::tag::CONTEXT.shortKey());
+    if (tag.map.contains(gr::tag::CONTEXT.key())) {
+        const pmt::Value& ctxInfo = tag.map.at(gr::tag::CONTEXT.key());
         auto              result  = ctxInfo.value_or(std::string_view{});
         if (result.data() != nullptr) {
             return {std::string(result)};
@@ -552,9 +546,9 @@ std::optional<std::string> CtxSettingsBase::contextInTag(const Tag& tag) const {
     return std::nullopt;
 }
 
-std::optional<std::uint64_t> CtxSettingsBase::triggeredTimeInTag(const Tag& tag) const {
-    if (tag.map.contains(gr::tag::TRIGGER_TIME.shortKey())) {
-        const pmt::Value& pmtTimeUtcNs = tag.map.at(gr::tag::TRIGGER_TIME.shortKey());
+std::optional<std::uint64_t> CtxSettingsBase::contextTimeInTag(const Tag& tag) const {
+    if (tag.map.contains(gr::tag::CONTEXT_TIME.key())) {
+        const pmt::Value& pmtTimeUtcNs = tag.map.at(gr::tag::CONTEXT_TIME.key());
         auto              result       = pmt::convert_safely<std::uint64_t>(pmtTimeUtcNs);
         if (result) {
             return *result;
@@ -564,16 +558,14 @@ std::optional<std::uint64_t> CtxSettingsBase::triggeredTimeInTag(const Tag& tag)
 }
 
 std::optional<SettingsCtx> CtxSettingsBase::createSettingsCtxFromTag(const Tag& tag) const {
-    // If CONTEXT is not present then return std::nullopt
-    // IF TRIGGER_TIME is not present then time = now()
+    // a tag without gr:context selects no context, and one without gr:ctx_time selects the context's set for now
 
     if (auto ctxValue = contextInTag(tag); ctxValue.has_value()) {
         SettingsCtx ctx{};
         ctx.context = ctxValue.value();
 
-        // update trigger time if present
-        if (auto triggerTime = triggeredTimeInTag(tag); triggerTime.has_value()) {
-            ctx.time = triggerTime.value();
+        if (auto contextTime = contextTimeInTag(tag); contextTime.has_value()) {
+            ctx.time = contextTime.value();
         }
         if (ctx.time == 0ULL) {
             ctx.time = settings::convertTimePointToUint64Ns(std::chrono::system_clock::now());
@@ -624,8 +616,16 @@ void CtxSettingsBase::init() {
     // a refusal names the block by the name the constructor's map gives. The apply assigns that name later.
     const auto             nameIt      = _initBlockParameters.find("name");
     const std::string_view initialName = nameIt != _initBlockParameters.end() ? nameIt->second.value_or(std::string_view{}) : std::string_view{};
-    const property_map     notSet      = [this, initialName] {
-        std::lock_guard lg(_mutex);
+    // a coupled setting that follows its key keeps following it after the constructor's map sets it
+    std::vector<std::string> keepFollowing;
+    const property_map       notSet = [this, initialName, &keepFollowing] {
+        std::lock_guard             lg(_mutex);
+        const std::set<std::string> following = getBestMatchAutoUpdateParameters(SettingsCtx{settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), std::string()}).value_or(_descriptor->writableMembers);
+        for (const auto& [setting, _] : _tagCouplings) {
+            if (_initBlockParameters.contains(std::string_view(setting)) && following.contains(setting)) {
+                keepFollowing.push_back(setting);
+            }
+        }
         return setImpl(_initBlockParameters, {}, initialName);
     }();
     if (!notSet.empty()) {
@@ -634,6 +634,15 @@ void CtxSettingsBase::init() {
 
     if (const auto failed = activateContext(); failed == std::nullopt) {
         throw gr::exception("Settings for context could not be activated");
+    }
+    if (!keepFollowing.empty()) {
+        // the settings follow again in the default context's set, which the constructor's map wrote; another context
+        // keeps its own set
+        std::lock_guard                  lg(_mutex);
+        const std::optional<SettingsCtx> initCtx = findBestMatchSettingsCtx(SettingsCtx{settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), std::string()});
+        if (initCtx.has_value() && _autoUpdateParameters.contains(*initCtx)) {
+            _autoUpdateParameters.at(*initCtx).insert(keepFollowing.begin(), keepFollowing.end());
+        }
     }
 }
 
@@ -778,6 +787,13 @@ property_map CtxSettingsBase::stageDefaultsImpl() {
 
     addStoredParameters(_defaultParameters, ctx);
     std::ignore = activateContextImpl({});
+    // kept for a refused reset; taken after the new set's entry is filled from the set it came from
+    _autoUpdateBeforeReset = _autoUpdateParameters;
+    // every coupled setting follows its tag key again in every context, whatever set it
+    _autoUpdateParameters[ctx] = _descriptor->writableMembers;
+    for (auto& [_, autoUpdateKeys] : _autoUpdateParameters) {
+        autoUpdateKeys = _descriptor->writableMembers;
+    }
     return {};
 }
 
@@ -832,17 +848,23 @@ void CtxSettingsBase::autoUpdate(const Tag& tag) {
     const auto& parameters = tag.map;
     bool        wasChanged = false;
     for (const auto& [key, value] : parameters) {
-        // either form of the two keys is staged under its gr: form, which names no member
+        // the two keys are staged under their gr: key, which names no member
         const bool resetKey = key == gr::tag::RESET_DEFAULTS;
         if (resetKey || key == gr::tag::STORE_DEFAULTS) {
             _stagedParameters.insert_or_assign(std::pmr::string(resetKey ? gr::tag::RESET_DEFAULTS.key() : gr::tag::STORE_DEFAULTS.key()), value);
             wasChanged = true;
             continue;
         }
-        auto it = _descriptor->writableByName.find(key);
-        if (it != _descriptor->writableByName.end() && (activeCtxChanged || !isActiveValueImpl(key, value))) {
-            if (it->second->autoUpdate(key, value, *autoUpdateParams, _stagedParameters)) {
-                _taggedKeys.emplace(key);
+    }
+    for (const auto& [setting, tagKey] : _tagCouplings) {
+        const auto tagged = parameters.find(std::string_view(tagKey));
+        const auto member = _descriptor->writableByName.find(std::string_view(setting));
+        if (tagged == parameters.end() || member == _descriptor->writableByName.end()) {
+            continue;
+        }
+        if (activeCtxChanged || !isActiveValueImpl(std::pmr::string(setting), tagged->second)) {
+            if (member->second->autoUpdate(setting, tagged->second, *autoUpdateParams, _stagedParameters)) {
+                _taggedKeys.emplace(setting);
                 wasChanged = true;
             }
         }
@@ -853,6 +875,65 @@ void CtxSettingsBase::autoUpdate(const Tag& tag) {
     } else if (activeCtxChanged || wasChanged) {
         setChanged(true);
     }
+}
+
+namespace {
+/// why `key` cannot be a coupling's tag key, or nothing for a key that can
+[[nodiscard]] std::optional<std::string_view> refuseTagKey(std::string_view key) {
+    const bool printable = std::ranges::all_of(key, [](char c) { return static_cast<unsigned char>(c) > 0x20U && c != 0x7F; });
+    if (key.starts_with(':') || gr::tag::nameOf(key).empty() || !printable) {
+        return "the key is not domain:name with a name and no space";
+    }
+    if (std::ranges::contains(gr::tag::kControlKeys, key)) {
+        return "the framework acts on this key in every block";
+    }
+    return std::nullopt;
+}
+} // namespace
+
+void CtxSettingsBase::setTagCouplings(const property_map& couplings) {
+    std::lock_guard lg(_mutex);
+    auto            table  = _tagCouplings;
+    const auto      refuse = [this](std::string_view setting, const pmt::Value& key, std::string_view reason) {
+        const std::string_view blockName = _descriptor->hooks.blockName != nullptr ? _descriptor->hooks.blockName(_block) : std::string_view{};
+        return gr::exception(std::format("block '{}' refuses to couple {} to the tag key {}: {}", blockName, setting, key, reason));
+    };
+    std::vector<std::string> following;
+    for (const auto& [setting, key] : couplings) {
+        if (!_descriptor->writableByName.contains(std::string_view(setting))) {
+            throw refuse(setting, key, "the block has no writable setting of that name");
+        }
+        if (!key.is_string()) {
+            throw refuse(setting, key, "the key is not a string");
+        }
+        const std::string_view name    = setting;
+        const std::string_view spelled = key.value_or(std::string_view{});
+        if (spelled.empty()) {
+            if (const auto coupled = table.find(name); coupled != table.end()) {
+                table.erase(coupled);
+            }
+            continue;
+        }
+        const std::string_view canonical = gr::tag::canonicalKey(spelled);
+        if (const std::optional<std::string_view> reason = refuseTagKey(canonical)) {
+            throw refuse(setting, key, *reason);
+        }
+        table.insert_or_assign(std::string(name), std::string(canonical));
+        following.emplace_back(name);
+    }
+    _tagCouplings = std::move(table);
+    for (auto& [ctx, autoUpdateKeys] : _autoUpdateParameters) {
+        autoUpdateKeys.insert(following.begin(), following.end());
+    }
+}
+
+property_map CtxSettingsBase::tagCouplings() const {
+    std::lock_guard lg(_mutex);
+    property_map    table;
+    for (const auto& [setting, key] : _tagCouplings) {
+        table.insert_or_assign(std::pmr::string(setting), pmt::Value(key));
+    }
+    return table;
 }
 
 ApplyStagedParametersResult CtxSettingsBase::applyStagedParameters() {
@@ -867,6 +948,8 @@ ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::uniq
     bool                       contextActivated = std::exchange(_contextActivated, false);
     std::optional<SettingsCtx> contextBefore    = std::exchange(_contextBeforeActivation, std::nullopt);
     SettingsCtx                batchCtx         = _activeCtx; // a callback may activate another context before it refuses
+    // set when resetDefaults() staged the defaults this apply applies
+    std::optional<std::map<SettingsCtx, std::set<std::string>>> autoUpdateBefore = std::exchange(_autoUpdateBeforeReset, std::nullopt);
 
     ApplyStagedParametersResult result;
     if (hooks.reflectable) {
@@ -901,7 +984,8 @@ ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::uniq
                 if (std::optional<SettingsCtx> beforeReset = std::exchange(_contextBeforeActivation, std::nullopt); !contextBefore.has_value()) {
                     contextBefore = beforeReset;
                 }
-                batchCtx = _activeCtx;
+                batchCtx         = _activeCtx;
+                autoUpdateBefore = std::exchange(_autoUpdateBeforeReset, std::nullopt);
                 removeExpiredStoredParameters();
             }
         }
@@ -914,9 +998,6 @@ ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::uniq
                 if (!it->second->applyStaged(it->second->address(_block), key, stagedValue, result.appliedParameters, staged, hasSettingsChangedCallback)) {
                     result.failedParameters.insert_or_assign(key, stagedValue); // rejected: must not reach downstream blocks
                     continue;
-                }
-                if (_autoForwardParameters.contains(std::string(key)) && batch.contains(key)) { // a restored default is not forwarded
-                    result.forwardParameters.insert_or_assign(key, stagedValue);
                 }
             }
         }
@@ -931,7 +1012,7 @@ ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::uniq
         // an activation is exempt from that rule: the newly active context is named after the erase, so a block
         // sees the event even when the two contexts carry the same values
         if (contextActivated && hasSettingsChangedCallback) {
-            staged.insert_or_assign(static_cast<std::pmr::string>(gr::tag::CONTEXT.shortKey()), _activeCtx.context);
+            staged.insert_or_assign(std::pmr::string(settings::kContextField), _activeCtx.context);
         }
 
         updateActiveParametersImpl();
@@ -956,6 +1037,15 @@ ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::uniq
                 if (contextBefore.has_value()) {
                     restoreContextImpl(*contextBefore, batchCtx);
                 }
+                // a refused reset puts back the keys that followed tags in every set the snapshot holds. A set that
+                // pruning erased stays erased, and a set stored during the callback keeps its keys.
+                if (autoUpdateBefore.has_value()) {
+                    for (auto& [ctx, autoUpdateKeys] : _autoUpdateParameters) {
+                        if (const auto before = autoUpdateBefore->find(ctx); before != autoUpdateBefore->end()) {
+                            autoUpdateKeys = before->second;
+                        }
+                    }
+                }
                 updateActiveParametersImpl();
                 // a refusal of values that tags alone staged is reported with the refusals of tag values
                 const bool taggedOnly = std::ranges::all_of(staged, [&taggedKeys](const auto& entry) { return taggedKeys.contains(std::string_view(entry.first)); });
@@ -965,8 +1055,9 @@ ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::uniq
                 callbackRefusal = std::format("block '{}' refuses {}: {}", hooks.blockName != nullptr ? hooks.blockName(_block) : std::string_view{}, describeValues(staged), describeThrown(refusal));
                 for (const auto& [key, value] : staged) {
                     result.appliedParameters.erase(key);
-                    result.forwardParameters.erase(key);
                 }
+                // the map holds only what the refusing call wrote, and the whole batch is written back
+                result.forwardParameters.clear();
                 callbackRefused = staged;
             }
         }
@@ -986,20 +1077,6 @@ ApplyStagedParametersResult CtxSettingsBase::applyStagedParametersImpl(std::uniq
             result.refusal    = joinRefusals(result.refusal, callbackRefusal);
             result.tagRefusal = joinRefusals(result.tagRefusal, callbackRefusal);
             result.failedParameters.insert(callbackRefused.begin(), callbackRefused.end());
-        }
-
-        // the settings keep the input rate; only the forwarded value carries the block's output rate
-        if (hooks.chunkRatio != nullptr && result.forwardParameters.contains(gr::tag::SAMPLE_RATE.shortKey())) {
-            float ratio = 1.0f;
-            if (hooks.chunkRatio(_block, ratio)) {
-                const auto activeIt = _activeParameters.find(gr::tag::SAMPLE_RATE.shortKey());
-                // a sample_rate that is not a float (e.g. loaded as double from a GRC file) must not be dereferenced blindly
-                const float* activeSampleRate = activeIt != _activeParameters.end() ? activeIt->second.get_if<float>() : nullptr;
-                if (activeSampleRate != nullptr) {
-                    const float newSampleRate = ratio * (*activeSampleRate);
-                    result.forwardParameters.insert_or_assign(gr::tag::SAMPLE_RATE.shortKey(), newSampleRate);
-                }
-            }
         }
 
         if (batch.contains(gr::tag::STORE_DEFAULTS.key())) {

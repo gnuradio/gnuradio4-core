@@ -18,7 +18,8 @@ std::expected<void, Error> BlockModel::exportPort(bool, std::string_view, PortDi
 
 namespace {
 
-/// Writes the block's `parameters` and, when it stores any outside the default context, its `ctx_parameters`.
+/// Writes the block's `parameters`, its `ctx_parameters` when it stores any outside the default context, and its
+/// `tag_couplings` when it couples any setting to a tag key.
 void serializeSettings(const std::shared_ptr<BlockModel>& block, property_map& result) {
     // Helper function to write parameters
     auto writeParameters = [&](const property_map& settingsMap) {
@@ -81,14 +82,17 @@ void serializeSettings(const std::shared_ptr<BlockModel>& block, property_map& r
                 }
             }).visit(ctxTime.context);
 
-            ctxParam.emplace(gr::tag::CONTEXT.shortKey(), contextStr);
-            ctxParam.emplace(gr::tag::CONTEXT_TIME.shortKey(), ctxTime.time);
+            ctxParam.emplace(gr::settings::kContextField, contextStr);
+            ctxParam.emplace(gr::settings::kContextTimeField, ctxTime.time);
             ctxParam.emplace(serialization_fields::BLOCK_PARAMETERS, writeParameters(settingsMap));
             ctxParamsSeq.emplace_back(std::move(ctxParam));
         }
     }
     if (!ctxParamsSeq.empty()) { // absent and empty mean the same thing to a reader, as for meta_information
         result.emplace(serialization_fields::BLOCK_CTX_PARAMETERS, std::move(ctxParamsSeq));
+    }
+    if (property_map couplings = block->settings().tagCouplings(); !couplings.empty()) {
+        result.emplace(serialization_fields::BLOCK_TAG_COUPLINGS, std::move(couplings));
     }
 }
 

@@ -68,99 +68,37 @@ static_assert(!Documentation<EmptyUnit>);
 struct Visible {};
 
 /**
- * @brief Disable default tag forwarding.
+ * @brief Disable the default tag forwarder.
  *
- * There are two types of tag forwarding: (1) default All-To-All, and (2) user-implemented.
- *
- * By default, tag forwarding operates as All-To-All. Before tags on input ports are forwarded, they are merged.
- * If a block has multiple ports and tags on these ports contain maps with identical keys, only one value for each key
- * will be retained in the merged tag. This may lead to potential information loss, as it’s not guaranteed which
- * value will be kept.
- *
- * This default behavior is generally sufficient. However, if it’s not suitable for your use case, you can disable it
- * by adding `NoTagPropagation` to the template parameters and implementing custom forwarding via `forwardTags()`.
+ * The default forwarder passes every key of every input tag to every synchronous output. On a block with only
+ * synchronous stream ports and without `Resampling<>` or `Stride<>`, a tag leaves at the offset it arrived at. On a
+ * block with `Stride<>` or an asynchronous stream port, the framework ends a call at the next tag, and the tag leaves
+ * on the call's first output sample. There, a tag inside a chunk that an input `min_samples` keeps whole leaves on the
+ * first output sample of a later call. A block whose output samples do not stand where its input samples stood declares
+ * `NoTagPropagation` and publishes its own tags, or supplies `forwardTags()`. A delay, a block that drops samples
+ * without declaring `Resampling<>` and a block that reframes its input are such blocks.
  */
 struct NoTagPropagation {};
 
 /**
- * @brief For fixed-chunk blocks: tags NOT at position 0 are delayed to the next chunk's start.
- * Tags at position 0 are forwarded immediately. Chunk size is NOT broken by tag positions.
- * Use where a full-length chunk is worth more than placing a tag in the chunk it arrived in.
- */
-struct ForwardTagPropagation {};
-
-/**
- * @brief For fixed-chunk blocks: ALL tags within the chunk are mapped to output position 0.
- * All tags are consumed per chunk. Use wherever several input samples map to one output sample
- * or to one DataSet — every decimating and interpolating block, the FFT among them — so that a tag
- * interior to a chunk describes the output that chunk produces rather than the next chunk's.
+ * @brief Every tag of a chunk leaves at the chunk's first output sample.
+ *
+ * Without it, the default forwarder of a block declaring `Resampling<>` places a tag at input index `i` of the samples a
+ * call consumed on output index `floor(i * output_chunk_size / input_chunk_size)`, after the call. A block whose
+ * output describes its whole input chunk, a spectrum or a DataSet for instance, declares `BackwardTagPropagation`.
  */
 struct BackwardTagPropagation {};
-
-/**
- * @brief Merges all forwarded input tags into a single output tag per chunk.
- * This mimics the legacy forwarding behaviour. Tags at the same position are merged
- * (last key wins). By default, tags are forwarded individually with cross-port dedup.
- */
-struct MergeTagPropagation {};
-
-/**
- * @brief Require that the block forwards every key of every tag, at the offset the tag arrived at.
- *
- * The default forwarder keeps every key on a block that passes `gr::block::kUnfilteredTagPropagationAdmissible`. The
- * predicate holds for a block that
- * - declares neither `Resampling<>` nor `Stride<>`
- * - has only synchronous stream ports
- * - declares no tag-propagation policy other than this one
- * - supplies no `forwardTags()` of its own
- *
- * Such a block needs no annotation. A block annotated with `UnfilteredTagPropagation` must pass the predicate, and
- * fails to compile where it does not. Every other block keeps only its auto-forward keys. Those are the keys in
- * `gr::tag::kDefaultTags` and any added through `settings().addAutoForwardParameters()`.
- *
- * The forwarder substitutes the block's own current value for a key the block declares as a setting. A surviving key
- * that names a setting of a downstream block drives that setting, exactly as `sample_rate` does. The multi-input dedup
- * and the merge rule stay those of the key-filtered forwarder.
- *
- * Each tag leaves at the offset it arrived at, and the whole consumed chunk is retired. An input `min_samples` above
- * one can leave a tag inside a chunk. A key-filtered block defers that tag to the next chunk. A block forwarding every
- * key publishes it at its own offset. What the block itself applies from that tag, its settings, still takes effect
- * from the chunk's first sample.
- *
- * The remaining obligation is the author's, because no compile-time fact expresses it: a tag arriving at input
- * offset `t` must belong at output offset `t`. A block that shifts sample positions, an integer delay for instance,
- * or drops them, as one that keeps every Nth sample does, writes its own `forwardTags()`. A block whose output differs
- * from what some keys describe lists them in `DroppedTagKeys`. A block that keeps the auto-forward keys alone declares
- * `FilteredTagPropagation`.
- */
-struct UnfilteredTagPropagation {};
-
-/**
- * @brief Forward only the auto-forward keys of each tag on a block that would otherwise forward every key.
- *
- * The forwarder keeps the keys in `gr::tag::kDefaultTags` and any added through
- * `settings().addAutoForwardParameters()`. It substitutes the block's own value for a key the block declares as a
- * setting, and it defers a tag interior to a chunk to the next chunk's first sample. The build refuses the annotation
- * beside `UnfilteredTagPropagation` or `NoTagPropagation`.
- *
- * The annotation changes nothing on a block that fails `gr::block::kUnfilteredTagPropagationAdmissible` for another
- * reason, such as `Resampling<>`, `Stride<>` or a `forwardTags()` override. A block template whose variants differ in
- * these respects may declare it on every variant.
- */
-struct FilteredTagPropagation {};
 
 /**
  * @brief Drop the listed tag keys in the default forwarder and forward every other key.
  *
  * A block lists the keys whose values do not describe its output. A block that shifts the carrier frequency, for
- * instance, lists the keys that state a frequency estimate. A block forwarding every key still forwards the other keys
- * at the offset each tag arrived at. A key-filtered block drops a listed key even where it is an auto-forward key. A
- * listed key is dropped at the top level of a tag and inside the map its `trigger_meta_info` key holds. A
- * `forwardTags()` override publishes what it writes. The list reaches it only through `filterAndSubstituteTag()`. A
- * block composed at compile time drops the keys of every member. A block declares at most one list, and the build
- * refuses the annotation beside `UnfilteredTagPropagation`.
+ * instance, lists the keys that state a frequency estimate. A listed key is dropped at the top level of a tag and
+ * inside the map its `gr:trigger_meta_info` key holds. A `forwardTags()` override publishes what it writes. The list
+ * reaches it only through `filterAndSubstituteTag()`. A block composed at compile time drops the keys of every member.
+ * A block declares at most one list.
  *
- * @tparam Keys the short names of the dropped keys
+ * @tparam Keys the dropped keys
  */
 template<gr::meta::fixed_string... Keys>
 struct DroppedTagKeys {

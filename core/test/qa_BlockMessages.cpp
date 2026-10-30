@@ -69,7 +69,7 @@ inline void connect(gr::BlockLike auto& block, gr::MsgPortOut& toBlock, gr::MsgP
 
 inline void sendSettingsCtxSet(gr::MsgPortOut& toBlock, std::string_view context, std::uint64_t time, const gr::property_map& parameters) {
     gr::sendMessage<gr::message::Command::Set>(toBlock, "", gr::block::property::kSettingsCtx, //
-        gr::property_map{{gr::tag::CONTEXT.shortKey(), std::string(context)}, {gr::tag::CONTEXT_TIME.shortKey(), time}, {"parameters", parameters}}, "qa");
+        gr::property_map{{std::pmr::string(gr::settings::kContextField), std::string(context)}, {std::pmr::string(gr::settings::kContextTimeField), time}, {"parameters", parameters}}, "qa");
 }
 
 // the error replies among `messages` whose text contains `text`
@@ -182,7 +182,7 @@ const boost::ut::suite<"block message plumbing"> blockMessageTests = [] {
 
         const gr::Size_t nAutoUpdate = block.settings().getNAutoUpdateParameters();
         qa_block_messages::sendSettingsCtxSet(toBlock, "removed", later, parameters);
-        sendMessage<message::Command::Disconnect>(toBlock, "", block::property::kSettingsCtx, property_map{{tag::CONTEXT.shortKey(), std::string("removed")}, {tag::CONTEXT_TIME.shortKey(), later}}, "qa");
+        sendMessage<message::Command::Disconnect>(toBlock, "", block::property::kSettingsCtx, property_map{{std::pmr::string(gr::settings::kContextField), std::string("removed")}, {std::pmr::string(gr::settings::kContextTimeField), later}}, "qa");
         block.processScheduledMessages();
         expect(eq(qa_block_messages::countErrors(qa_block_messages::takeMessages(fromBlock)), 0UZ));
         expect(eq(block.settings().getNAutoUpdateParameters(), nAutoUpdate)) << "removing a context drops its auto-update entry";
@@ -230,7 +230,7 @@ const boost::ut::suite<"block message plumbing"> blockMessageTests = [] {
 
         for (std::size_t cycle = 0UZ; cycle < nCycles; ++cycle) {
             // the set for now prunes the set the block just activated, and the tag then reaches the pruned set
-            sendMessage<message::Command::Set>(toBlock, "", block::property::kActiveContext, property_map{{tag::CONTEXT.shortKey(), std::string("x")}}, "qa");
+            sendMessage<message::Command::Set>(toBlock, "", block::property::kActiveContext, property_map{{std::pmr::string(gr::settings::kContextField), std::string("x")}}, "qa");
             qa_block_messages::sendSettingsCtxSet(toBlock, "x", 0U, parameters);
             block.processScheduledMessages();
             expect(eq(qa_block_messages::countErrors(qa_block_messages::takeMessages(fromBlock)), 0UZ));

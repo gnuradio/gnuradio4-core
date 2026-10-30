@@ -533,6 +533,7 @@ namespace block::property {
 [[maybe_unused]] inline static const char* const kActiveContext    = "ActiveContext";    ///< retrieve and set active context
 [[maybe_unused]] inline const char* const        kSettingsCtx      = "SettingsCtx";      ///< retrieve/creates/remove a new stored context
 [[maybe_unused]] inline const char* const        kSettingsContexts = "SettingsContexts"; ///< retrieve/creates/remove a new stored context
+[[maybe_unused]] inline const char* const        kTagCouplings     = "TagCouplings";     ///< read or change the settings coupled to tag keys, @see SettingsBase::setTagCouplings
 
 } // namespace block::property
 
@@ -626,6 +627,7 @@ struct BlockBase {
     std::optional<Message> propertyCallbackActiveContext(std::string_view propertyName, Message message);
     std::optional<Message> propertyCallbackSettingsCtx(std::string_view propertyName, Message message);
     std::optional<Message> propertyCallbackSettingsContexts(std::string_view propertyName, Message message);
+    std::optional<Message> propertyCallbackTagCouplings(std::string_view propertyName, Message message);
     std::optional<Message> propertyCallbackMetaInformation(std::string_view propertyName, Message message);
     std::optional<Message> propertyCallbackUiConstraints(std::string_view propertyName, Message message);
     std::optional<Message> propertyCallbackSubgraphExport(std::string_view propertyName, Message message);
@@ -639,29 +641,6 @@ enum class Category {
     ScheduledBlockGroup    ///< Block with children that have a dedicated scheduler
 };
 
-/// the settings `Block<>` declares on every block's behalf, mirroring its own GR_MAKE_REFLECTABLE list; tag forwarding
-/// never substitutes a block's value for one of these, so an incoming key that happens to share a name keeps its value
-inline constexpr std::array<std::string_view, 8UZ> kFrameworkOwnedSettings{"input_chunk_size", "output_chunk_size", "stride", "disconnect_on_done", "compute_domain", "unique_name", "name", "ui_constraints"};
-
-/**
- * @brief Whether `TBlock` forwards every tag key and may declare `UnfilteredTagPropagation`.
- *
- * Forwarding every key promises that a tag arriving at input offset `t` leaves at output offset `t`. The predicate is
- * false for a block with any of:
- * - `Resampling<>` or `Stride<>`
- * - an asynchronous stream port
- * - a tag-propagation policy other than `UnfilteredTagPropagation`
- * - a `forwardTags()` override
- *
- * The predicate cannot check that the block keeps sample positions.
- */
-template<typename TBlock>
-constexpr bool kUnfilteredTagPropagationAdmissible =                                                                                  //
-    !TBlock::ResamplingControl::kEnabled && !TBlock::StrideControl::kEnabled                                                          //
-    && traits::block::stream_input_ports<TBlock>::template all_of<traits::port::is_synchronous>                                       //
-    && traits::block::stream_output_ports<TBlock>::template all_of<traits::port::is_synchronous>                                      //
-    && !TBlock::noTagPropagation && !TBlock::forwardTagPropagation && !TBlock::backwardTagPropagation && !TBlock::mergeTagPropagation //
-    && !TBlock::filteredTagPropagation && !TBlock::hasForwardTagsOverride();
 } // namespace block
 
 /**
@@ -747,6 +726,7 @@ constexpr bool kUnfilteredTagPropagationAdmissible =                            
  * - `kActiveContext`: Returns current active context and allows to set a new one
  * - `kSettingsCtx`: Manages Settings Contexts Add/Remove/Get
  * - `kSettingsContexts`: Returns all Contextxs
+ * - `kTagCouplings`: Get returns the settings coupled to tag keys; Set changes them, an empty key removing a coupling
  * - `kMetaInformation`: returns static meta-information (i.e. Annotated<> interfaces, constraints, etc...) (N.B. does not affect Block operation)
  * - `kUiConstraints`: returns user-defined UI constraints (N.B. does not affect Block operation)
  *
@@ -803,23 +783,28 @@ public:
     using AllowIncompleteFinalUpdate = ArgumentsTypeList::template find_or_default<is_incompleteFinalUpdatePolicy, IncompleteFinalUpdatePolicy<IncompleteFinalUpdateEnum::DROP>>;
     using DrawableControl            = ArgumentsTypeList::template find_or_default<is_drawable, Drawable<UICategory::None, "">>;
 
-    constexpr static bool noTagPropagation         = std::disjunction_v<std::is_same<NoTagPropagation, Arguments>...>;
-    constexpr static bool forwardTagPropagation    = std::disjunction_v<std::is_same<ForwardTagPropagation, Arguments>...>;
-    constexpr static bool backwardTagPropagation   = std::disjunction_v<std::is_same<BackwardTagPropagation, Arguments>...>;
-    constexpr static bool mergeTagPropagation      = std::disjunction_v<std::is_same<MergeTagPropagation, Arguments>...>;
-    constexpr static bool unfilteredTagPropagation = std::disjunction_v<std::is_same<UnfilteredTagPropagation, Arguments>...>;
-    constexpr static bool filteredTagPropagation   = std::disjunction_v<std::is_same<FilteredTagPropagation, Arguments>...>;
+    constexpr static bool noTagPropagation       = std::disjunction_v<std::is_same<NoTagPropagation, Arguments>...>;
+    constexpr static bool backwardTagPropagation = std::disjunction_v<std::is_same<BackwardTagPropagation, Arguments>...>;
 
-    /// whether the default forwarder keeps every key of every tag, less the keys listed in DroppedTagKeys. It does on a
-    /// block passing block::kUnfilteredTagPropagationAdmissible, which every block declaring UnfilteredTagPropagation
-    /// must pass. The predicate reads Derived's ports and its forwardTags(). Derived is complete only inside a function
-    /// body. The predicate is therefore evaluated there, not in the class body.
-    [[nodiscard]] static consteval bool forwardsEveryKey() noexcept { return block::kUnfilteredTagPropagationAdmissible<Derived>; }
+    /// whether the default forwarder places the tags of the samples a call consumed after the call, each at
+    /// floor(i * output_chunk_size / input_chunk_size): on a block declaring Resampling<> and supplying no
+    /// forwardTags(). The predicate reads Derived's forwardTags(). Derived is complete only inside a function body. The
+    /// predicate is therefore evaluated there, not in the class body.
+    [[nodiscard]] static consteval bool mapsTagsByChunkRatio() noexcept { return ResamplingControl::kEnabled && !hasForwardTagsOverride(); }
 
-    /// the input span retires, and the default forwarder reads, every tag of the chunk rather than only the tags at
-    /// its first sample: BackwardTagPropagation needs it to place an interior tag on the chunk that consumed it, a
-    /// block forwarding every key to leave it at the offset it arrived at
-    [[nodiscard]] static consteval bool hasWholeChunkTagWindow() noexcept { return backwardTagPropagation || forwardsEveryKey(); }
+    /// whether the default forwarder places each tag of a chunk at the offset it arrived at, before the call: on a
+    /// block with no Resampling<>, no Stride<>, no asynchronous stream port, no NoTagPropagation, no
+    /// BackwardTagPropagation and no forwardTags(). The predicate cannot check that the block keeps sample positions.
+    [[nodiscard]] static consteval bool keepsTagOffsets() noexcept {
+        return !ResamplingControl::kEnabled && !StrideControl::kEnabled                                      //
+               && traits::block::stream_input_ports<Derived>::template all_of<traits::port::is_synchronous>  //
+               && traits::block::stream_output_ports<Derived>::template all_of<traits::port::is_synchronous> //
+               && !noTagPropagation && !backwardTagPropagation && !hasForwardTagsOverride();
+    }
+
+    /// the input span retires, and the default forwarder reads, the tags of the whole chunk rather than only the tags
+    /// at its first sample: under BackwardTagPropagation, and where mapsTagsByChunkRatio() or keepsTagOffsets()
+    [[nodiscard]] static consteval bool hasWholeChunkTagWindow() noexcept { return backwardTagPropagation || mapsTagsByChunkRatio() || keepsTagOffsets(); }
 
     constexpr static block::Category blockCategory = block::Category::NormalBlock;
 
@@ -882,7 +867,6 @@ public:
     A<property_map, "ui-constraints", Doc<"store non-graph-processing information like UI block position etc.">>         ui_constraints;
     A<property_map, "meta-information", Doc<"store static non-graph-processing information like Annotated<> info etc.">> meta_information = initMetaInfo();
 
-    // these names are mirrored in gr::block::kFrameworkOwnedSettings, which keeps them out of tag-value substitution
     GR_MAKE_REFLECTABLE(Block, input_chunk_size, output_chunk_size, stride, disconnect_on_done, compute_domain, unique_name, name, ui_constraints);
 
     // TODO: C++26 make sure these are not reflected
@@ -1125,7 +1109,7 @@ public:
     /// span type carries the tag window it retires, and that window depends on this answer. The probe tries the spans
     /// of both windows.
     /// The probe misses an override with a deduced return type whose body reads the window.
-    /// checkBlockArgumentContracts() refuses such an override on a block forwarding every key.
+    /// checkBlockArgumentContracts() refuses such an override where the window depends on it.
     [[nodiscard]] static constexpr bool hasForwardTagsOverride() noexcept { return acceptsForwardTagsSpans<true>() || acceptsForwardTagsSpans<false>(); }
 
 private:
@@ -1161,22 +1145,10 @@ public:
         if constexpr (StrideControl::kEnabled) {
             static_assert(!kIsSourceBlock, "Stride is not available for source blocks. Remove 'Stride<>' from the block definition.");
         }
-        if constexpr (unfilteredTagPropagation) {
-            static_assert(!ResamplingControl::kEnabled, "UnfilteredTagPropagation is not available for a block declaring Resampling<>: a rate-changing block must map tag offsets itself in forwardTags().");
-            static_assert(!StrideControl::kEnabled, "UnfilteredTagPropagation is not available for a block declaring Stride<>: skipped or overlapping input leaves a consumed sample without an output sample at the same offset, so forwardTags() must map the offsets.");
-            static_assert(traits::block::stream_input_ports<Derived>::template all_of<traits::port::is_synchronous>, "UnfilteredTagPropagation is not available for a block with an asynchronous stream input port: the default forwarder never reads such a port, so nothing would be forwarded from it.");
-            static_assert(traits::block::stream_output_ports<Derived>::template all_of<traits::port::is_synchronous>, "UnfilteredTagPropagation is not available for a block with an asynchronous stream output port: the forwarded offset is derived from the synchronous sample count and means nothing on a port that publishes its own.");
-            static_assert(!noTagPropagation && !forwardTagPropagation && !backwardTagPropagation && !mergeTagPropagation && !filteredTagPropagation, "UnfilteredTagPropagation cannot be combined with another tag-propagation policy: each of the other five suppresses forwarding, moves the output offset the policy promises to preserve, or filters the keys the policy promises to keep.");
-            static_assert(!hasForwardTagsOverride(), "UnfilteredTagPropagation is not available for a block supplying forwardTags(): the override replaces the default forwarder entirely, so the policy would have no effect.");
-            static_assert(DroppedTagKeysControl::kKeys.empty(), "UnfilteredTagPropagation is not available for a block declaring DroppedTagKeys: the policy requires every key, and the annotation names keys the block drops.");
-            static_assert(block::kUnfilteredTagPropagationAdmissible<Derived>, "UnfilteredTagPropagation admissibility and the assertions above must state the same conditions.");
-        }
         static_assert((0UZ + ... + std::size_t{is_dropped_tag_keys<Arguments>::value}) <= 1UZ, "A block declares at most one DroppedTagKeys list: the block would drop the keys of one list and forward those of the others. Name every dropped key in one list.");
-        if constexpr (filteredTagPropagation) {
-            static_assert(!unfilteredTagPropagation && !noTagPropagation, "FilteredTagPropagation cannot be combined with UnfilteredTagPropagation or NoTagPropagation: the first requires every key, and the second forwards no tag.");
-        }
-        if constexpr (forwardsEveryKey()) {
-            static_assert(!acceptsPreparedForwardTagsSpans(), "A block forwarding every key calls a forwardTags() that hasForwardTagsOverride() does not see: the override deduces its return type from a body that reads the tag window. Declare the override's return type.");
+        static_assert(std::ranges::none_of(DroppedTagKeysControl::kKeys, [](std::string_view key) { return key.starts_with(':') || key.contains(' '); }), "a DroppedTagKeys key is domain:name, with no leading colon and no space");
+        if constexpr (mapsTagsByChunkRatio() || keepsTagOffsets()) {
+            static_assert(!acceptsPreparedForwardTagsSpans(), "A block calls a forwardTags() that hasForwardTagsOverride() does not see: the override deduces its return type from a body that reads the tag window. Declare the override's return type.");
         }
     }
 
@@ -1306,7 +1278,7 @@ public:
             if (input_chunk_size == output_chunk_size) {
                 return;
             }
-            auto it = parameters.find(gr::tag::SAMPLE_RATE.shortKey());
+            auto it = parameters.find(gr::tag::SAMPLE_RATE.key());
             if (it == parameters.end()) {
                 return;
             }
@@ -1316,33 +1288,15 @@ public:
         }
     }
 
-    /// keep the auto-forward keys of an incoming tag, or every key where forwardsEveryKey(), less the keys listed in
-    /// DroppedTagKeys, substituting this block's own current value for a key it declares as a setting, and on a
-    /// resampling block the rate it publishes at for the rate it is fed. A listed key is also dropped from the map a
-    /// trigger_meta_info key holds. The settings snapshot is taken lazily, and only where a key is actually owned. A tag
-    /// whose keys are none of this block's settings costs no copy.
-    [[nodiscard]] property_map filterAndSubstituteTag(const property_map& src, std::optional<property_map>& cachedSettings) {
-        [[maybe_unused]] const auto& autoForwardKeys = settings().autoForwardParameters();
-        const auto&                  blockSettings   = CtxSettings<Derived>::allWritableMembers();
-        property_map                 dst;
+    /// keep every key of an incoming tag less the keys listed in DroppedTagKeys, each with the value it arrived with. A
+    /// resampling block substitutes the rate it publishes at for the rate it is fed. A listed key is also dropped from
+    /// the map a trigger_meta_info key holds.
+    [[nodiscard]] property_map filterAndSubstituteTag(const property_map& src) {
+        property_map dst;
         for (const auto& [key, value] : src) {
-            auto shortKey = convert_string_domain(key);
-            if (std::ranges::contains(DroppedTagKeysControl::kKeys, shortKey)) {
+            const std::string_view keyView = key;
+            if (std::ranges::contains(DroppedTagKeysControl::kKeys, keyView)) {
                 continue;
-            }
-            if constexpr (!forwardsEveryKey()) {
-                if (!autoForwardKeys.contains(shortKey)) {
-                    continue;
-                }
-            }
-            if (blockSettings.contains(shortKey) && !std::ranges::contains(block::kFrameworkOwnedSettings, shortKey)) {
-                if (!cachedSettings) {
-                    cachedSettings.emplace(settings().get());
-                }
-                if (auto it = cachedSettings->find(key); it != cachedSettings->end()) {
-                    dst.insert_or_assign(key, it->second);
-                    continue;
-                }
             }
             if constexpr (!DroppedTagKeysControl::kKeys.empty()) {
                 if (const property_map* meta = value.get_if<property_map>(); meta != nullptr && key == gr::tag::TRIGGER_META_INFO) {
@@ -1364,16 +1318,35 @@ public:
         return dst;
     }
 
-    /// default tag forwarding — called by workInternal unless the user provides forwardTags()
+    /// the output index of the sample at input index inputIndex of a chunk, by the declared chunk ratio
+    [[nodiscard]] std::size_t outputIndexOf(std::size_t inputIndex) const noexcept {
+        if constexpr (ResamplingControl::kEnabled) {
+            const auto inputChunk = static_cast<std::size_t>(input_chunk_size.value);
+            return inputChunk == 0UZ ? inputIndex : inputIndex * static_cast<std::size_t>(output_chunk_size.value) / inputChunk;
+        } else {
+            return inputIndex;
+        }
+    }
+
+    /// default tag forwarding: workInternal() calls it unless the block supplies forwardTags()
     ///
     /// This function reads the window the input span retires. prepareStreams() builds that window with
-    /// consumeOnlyFirstTag = !hasWholeChunkTagWindow(). On a key-filtered block the span retires the tags at
-    /// relIndex <= 0, the tags that tags(1) returns. An input min_samples, or an input_chunk_size above one, can keep a
-    /// chunk from breaking at a tag. That tag stays in the buffer and returns in the next chunk at a negative relIndex.
-    /// It has not been forwarded yet. Clamping it to offset 0 publishes it once. Under BackwardTagPropagation, and
-    /// on a block forwarding every key, the span retires every tag of the consumed chunk. A block forwarding every key
-    /// publishes each tag at its own relIndex. A forwardTags() override reading a wider window than its policy retires
-    /// sees a deferred tag twice and must skip relIndex < 0.
+    /// consumeOnlyFirstTag = !hasWholeChunkTagWindow(). Where keepsTagOffsets(), the span retires every tag of the
+    /// chunk, and each leaves at its own relIndex. Under BackwardTagPropagation the span retires every tag of the
+    /// chunk, and each leaves at offset 0. On any other block without Resampling<>, the span retires the tags at
+    /// relIndex <= 0, the tags that tags(1) returns, and each leaves at offset 0. The framework ends a chunk at the next
+    /// tag, so a tag sits at the chunk's first sample. An input min_samples can keep a chunk from breaking at a tag.
+    /// That tag stays in the buffer and returns in the next chunk at a negative relIndex, and it leaves there, at
+    /// offset 0.
+    ///
+    /// Where mapsTagsByChunkRatio(), workInternal() calls this after the call, with processedIn the number of samples
+    /// the call consumed. A tag at relIndex i leaves at floor(i * output_chunk_size / input_chunk_size). The tags of the
+    /// samples the call did not consume stay on the input.
+    ///
+    /// The tags leave merged by index with the tags already in the output span. A forwarded tag precedes a tag already
+    /// there at the same index. A tag past the samples an output span publishes leaves at the end of what it publishes.
+    /// A forwardTags() override reading a wider window than the span retires sees a deferred tag twice and must skip
+    /// relIndex < 0.
     template<typename TInputSpans, typename TOutputSpans>
     void forwardInputTags(TInputSpans& inputSpans, TOutputSpans& outputSpans, std::size_t processedIn, std::optional<std::size_t> tagWindowOverride = {}) noexcept {
         if constexpr (noTagPropagation) {
@@ -1383,52 +1356,25 @@ public:
         // exists to retire a deferred interior tag
         const std::size_t tagWindow = tagWindowOverride.value_or(hasWholeChunkTagWindow() ? processedIn : 1UZ);
 
-        std::optional<property_map> cachedSettings;
-        auto                        filterAndSubstitute = [&](const property_map& src) { return filterAndSubstituteTag(src, cachedSettings); };
-
-        auto publishFiltered = [&](std::ptrdiff_t relIndex, const property_map& tagMap) {
-            auto forwarded = filterAndSubstitute(tagMap);
-            if (!forwarded.empty()) {
-                if constexpr (forwardsEveryKey()) {
-                    assert(relIndex >= 0 && "a chunk that retires every tag it forwards cannot be handed one back");
-                }
-                const auto offset = backwardTagPropagation ? 0UZ : static_cast<std::size_t>(std::max(std::ptrdiff_t(0), relIndex));
-                for_each_writer_span([&forwarded, offset](auto& out) { out.publishTag(forwarded, offset); }, outputSpans);
+        std::vector<std::pair<std::size_t, property_map>> forwarded; // output offset and forwarded map
+        auto                                              collect = [&](std::ptrdiff_t relIndex, const property_map& tagMap) {
+            auto map = filterAndSubstituteTag(tagMap);
+            if (!map.empty()) {
+                const std::size_t offset = backwardTagPropagation ? 0UZ : outputIndexOf(static_cast<std::size_t>(std::max(std::ptrdiff_t(0), relIndex)));
+                forwarded.emplace_back(offset, std::move(map));
             }
         };
-
-        if constexpr (mergeTagPropagation) {
-            // MergeTagPropagation: all auto-forward keys → one output tag at position 0
-            property_map merged;
-            for_each_reader_span(
-                [&tagWindow, &filterAndSubstitute, &merged](auto& in) {
-                    if (!in.isSync || !in.isConnected) {
-                        return;
-                    }
-                    for (const auto& [relIndex, tagMapRef] : in.tags(tagWindow)) {
-                        auto filtered = filterAndSubstitute(tagMapRef.get());
-                        for (auto& [key, value] : filtered) {
-                            merged.insert_or_assign(key, std::move(value));
-                        }
-                    }
-                },
-                inputSpans);
-            if (!merged.empty()) {
-                for_each_writer_span([&merged](auto& out) { out.publishTag(merged, 0); }, outputSpans);
-            }
-            return;
-        }
 
         constexpr std::size_t kNInputPorts = traits::block::stream_input_ports<Derived>::size;
 
         if constexpr (kNInputPorts <= 1) {
             for_each_reader_span(
-                [&tagWindow, &publishFiltered](auto& in) {
+                [&tagWindow, &collect](auto& in) {
                     if (!in.isSync || !in.isConnected) {
                         return;
                     }
                     for (const auto& [relIndex, tagMapRef] : in.tags(tagWindow)) {
-                        publishFiltered(relIndex, tagMapRef.get());
+                        collect(relIndex, tagMapRef.get());
                     }
                 },
                 inputSpans);
@@ -1439,7 +1385,7 @@ public:
             std::size_t                           nSeen = 0;
 
             for_each_reader_span(
-                [&tagWindow, &publishFiltered, &seen, &nSeen, kDedupCapacity](auto& in) {
+                [&tagWindow, &collect, &seen, &nSeen, kDedupCapacity](auto& in) {
                     if (!in.isSync || !in.isConnected) {
                         return;
                     }
@@ -1454,7 +1400,7 @@ public:
                             }
                         }
                         if (!duplicate) {
-                            publishFiltered(relIndex, map);
+                            collect(relIndex, map);
                             if (nSeen < kDedupCapacity) {
                                 seen[nSeen] = {relIndex, &map};
                             }
@@ -1463,16 +1409,51 @@ public:
                     }
                 },
                 inputSpans);
+            std::ranges::stable_sort(forwarded, std::ranges::less{}, &std::pair<std::size_t, property_map>::first); // each input's tags arrive in order, the inputs one after another
+        }
+        if (!forwarded.empty()) {
+            for_each_writer_span([&forwarded](auto& out) { publishMergedByIndex(out, forwarded); }, outputSpans);
         }
     }
 
+private:
+    /// publish the forwarded tags into the output span, merged by index with the tags already there
+    ///
+    /// A forwarded tag precedes a tag already there at the same index. A forwarded offset past the samples the span
+    /// publishes, or past its size before a call publishes, moves to that end.
+    static void publishMergedByIndex(auto& out, const std::vector<std::pair<std::size_t, property_map>>& forwarded) noexcept {
+        if (!out.isConnected) {
+            return;
+        }
+        const std::size_t end = out.isPublishRequested() ? out.nRequestedSamplesToPublish() : out.size();
+        std::vector<Tag>  present;
+        present.reserve(out.tagsPublished);
+        for (std::size_t i = 0UZ; i < out.tagsPublished; ++i) {
+            present.push_back(std::move(out.tags[i]));
+        }
+        out.tagsPublished = 0UZ;
+
+        auto presentIt           = present.begin();
+        auto publishPresentBelow = [&out, &presentIt, presentEnd = present.end()](std::size_t offset) {
+            for (; presentIt != presentEnd && presentIt->index - out.streamIndex < offset; ++presentIt) {
+                out.publishTag(std::move(presentIt->map), presentIt->index - out.streamIndex);
+            }
+        };
+        for (const auto& [forwardedOffset, map] : forwarded) {
+            const std::size_t offset = std::min(forwardedOffset, end);
+            publishPresentBelow(offset);
+            out.publishTag(map, offset);
+        }
+        publishPresentBelow(std::numeric_limits<std::size_t>::max());
+    }
+
+public:
     /// default forwarding of the tags a stream leaves at or past each synchronous input's read position
     ///
-    /// The input spans are those of prepareStreams<true>() and the output spans hold no samples, so every tag leaves at
-    /// output offset 0, the end-of-stream index. The key filter, the substitution, the multi-input dedup and the merge
-    /// rule are those of forwardInputTags(). The block's settings already hold the values these tags set, so a key the
-    /// block declares leaves with the value its last tag set. The end_of_stream key stays behind, as publishEoS()
-    /// publishes its own.
+    /// The input spans are those of prepareStreams<true>(), and the output spans hold no samples. Every tag leaves at
+    /// output offset 0, the end-of-stream index, in index order. The dropped keys, the sample-rate scaling and the
+    /// multi-input dedup are those of forwardInputTags(). Each key leaves with the value it arrived with. The
+    /// end-of-stream key stays behind, as publishEoS() publishes its own.
     template<typename TInputSpans, typename TOutputSpans>
     void forwardRemainingInputTags(TInputSpans& inputSpans, TOutputSpans& outputSpans) {
         if constexpr (noTagPropagation) {
@@ -1480,7 +1461,6 @@ public:
         }
         constexpr bool kDedup = traits::block::stream_input_ports<Derived>::size > 1;
 
-        std::optional<property_map>                       cachedSettings;
         const std::pmr::string                            endOfStream = static_cast<std::pmr::string>(gr::tag::END_OF_STREAM);
         std::vector<const Tag*>                           seen;
         std::vector<std::pair<std::size_t, property_map>> remaining; // input index and forwarded map
@@ -1499,7 +1479,7 @@ public:
                         }
                         seen.push_back(&tag);
                     }
-                    property_map forwarded = filterAndSubstituteTag(tag.map, cachedSettings);
+                    property_map forwarded = filterAndSubstituteTag(tag.map);
                     forwarded.erase(endOfStream);
                     if (!forwarded.empty()) {
                         remaining.emplace_back(tag.index, std::move(forwarded));
@@ -1509,33 +1489,23 @@ public:
             inputSpans);
         std::ranges::stable_sort(remaining, {}, &std::pair<std::size_t, property_map>::first);
 
-        if constexpr (mergeTagPropagation) {
-            property_map merged;
-            for (auto& [_, forwarded] : remaining) {
-                for (auto& [key, value] : forwarded) {
-                    merged.insert_or_assign(key, std::move(value));
-                }
-            }
-            if (!merged.empty()) {
-                for_each_writer_span([&merged](auto& out) { out.publishTag(merged, 0UZ); }, outputSpans);
-            }
-        } else {
-            for (const auto& [_, forwarded] : remaining) {
-                for_each_writer_span([&forwarded](auto& out) { out.publishTag(forwarded, 0UZ); }, outputSpans);
-            }
+        for (const auto& [_, forwarded] : remaining) {
+            for_each_writer_span([&forwarded](auto& out) { out.publishTag(forwarded, 0UZ); }, outputSpans);
         }
     }
 
     /// forward the tags a stream leaves at or past each input's read position to the end-of-stream index
     ///
-    /// The tags reach as far as the first end_of_stream tag on any synchronous input. Their settings and port meta
-    /// information are applied first, as the ordinary path applies a chunk's tags before it forwards them. A block with
-    /// a forwardTags() override is handed them there: the call passes processedIn 0, input spans of no samples whose
-    /// tags() holds each such tag at a relative index of 0 or more, and output spans of no samples on which offset 0 is
-    /// the end-of-stream index. tags() also holds, at a negative index, tags behind the read position that no span
-    /// retired, which an override must skip. The input's own end_of_stream tag is among the others, and an override
-    /// must drop that key, as publishEoS() publishes its own. Every other block forwards them through
-    /// forwardRemainingInputTags(). workInternal() calls this when an input's stream ends; a stop request forwards none.
+    /// The tags reach as far as the first end-of-stream tag on any synchronous input. Their settings and port meta
+    /// information are applied first, as the ordinary path applies a chunk's tags before it forwards them. The forward
+    /// map the block's settingsChanged() fills for them leaves after them, with any forward map no earlier call
+    /// published. A block with a forwardTags() override is handed them there: the call passes processedIn 0, input
+    /// spans of no samples whose tags() holds each such tag at a relative index of 0 or more, and output spans of no
+    /// samples on which offset 0 is the end-of-stream index. tags() also holds, at a negative index, tags behind the
+    /// read position that no span retired, which an override must skip. The input's own end-of-stream tag is among
+    /// the others, and an override must drop that key, as publishEoS() publishes its own. Every other block forwards
+    /// them through forwardRemainingInputTags(). workInternal() calls this when an input's stream ends; a stop request
+    /// forwards none.
     void forwardTagsAtEndOfStream() {
         if constexpr (traits::block::stream_input_ports<Derived>::size > 0 && traits::block::stream_output_ports<Derived>::size > 0) {
             std::size_t endIndex = std::numeric_limits<std::size_t>::max();
@@ -1570,18 +1540,22 @@ public:
                             continue;
                         }
                         settings().autoUpdate(Tag{0UZ, map});
-                        if (const auto res = port.metaInfo.update(map); !res.has_value()) {
+                        if (const auto res = port.metaInfo.updateFromTag(map); !res.has_value()) {
                             emitMessage("Block::forwardTagsAtEndOfStream - rejected tag", {{"error", res.error().message}});
                         }
                     }
                 },
                 inputPorts<PortType::STREAM>(&self()), endIn);
-            applyChangedSettings(false);
+            applyChangedSettings(true, &_pendingForwardParams);
 
             if constexpr (requires { self().forwardTags(endIn, endOut, 0UZ); }) {
                 self().forwardTags(endIn, endOut, 0UZ);
             } else {
                 forwardRemainingInputTags(endIn, endOut);
+            }
+            if (!_pendingForwardParams.empty()) {
+                for_each_writer_span([this](auto& out) { publishForwardParams(out, _pendingForwardParams); }, endOut);
+                _pendingForwardParams.clear();
             }
             publishSamples(0UZ, endOut);
             consumeReaders(0UZ, endIn);
@@ -1593,23 +1567,35 @@ public:
     void applyInputTagsFromPorts(TInputSpans& inputSpans, std::size_t untilLocalIndex = 1UZ) noexcept {
         // the window matches the one the span retires, or a tag retired without being read here would never reach
         // settings at all; an interior tag's settings take effect from the chunk's first sample, not from its own
-        const std::size_t tagWindow = hasWholeChunkTagWindow() ? untilLocalIndex : 1UZ;
+        applyInputTagsInWindow(inputSpans, hasWholeChunkTagWindow() ? untilLocalIndex : 1UZ);
+    }
 
+private:
+    /// apply settings and PortMetaInfo from the tags behind each input's read position and less than tagWindow samples
+    /// past it. A tag before firstIndex is left out.
+    template<typename TInputSpans>
+    void applyInputTagsInWindow(TInputSpans& inputSpans, std::size_t tagWindow, std::ptrdiff_t firstIndex = std::numeric_limits<std::ptrdiff_t>::min()) noexcept {
         for_each_reader_span(
-            [this, tagWindow](auto& in) {
+            [this, tagWindow, firstIndex](auto& in) {
                 if (!in.isSync || !in.isConnected) {
                     return;
                 }
                 for (const auto& [relIndex, tagMapRef] : in.tags(tagWindow)) {
+                    if (relIndex < firstIndex) {
+                        continue;
+                    }
                     settings().autoUpdate(Tag{relIndex < 0 ? 0UZ : static_cast<std::size_t>(relIndex), tagMapRef.get()});
                 }
             },
             inputSpans);
 
         for_each_port_and_reader_span(
-            [this, tagWindow]<PortLike TPort, ReaderSpanLike TReaderSpan>(TPort& port, TReaderSpan& span) {
-                for (const auto& [_, tagMapRef] : span.tags(tagWindow)) {
-                    if (const auto res = port.metaInfo.update(tagMapRef.get()); !res.has_value()) {
+            [this, tagWindow, firstIndex]<PortLike TPort, ReaderSpanLike TReaderSpan>(TPort& port, TReaderSpan& span) {
+                for (const auto& [relIndex, tagMapRef] : span.tags(tagWindow)) {
+                    if (relIndex < firstIndex) {
+                        continue;
+                    }
+                    if (const auto res = port.metaInfo.updateFromTag(tagMapRef.get()); !res.has_value()) {
                         emitMessage("Block::applyInputTagsFromPorts - rejected tag", {{"error", res.error().message}});
                     }
                 }
@@ -1617,6 +1603,7 @@ public:
             inputPorts<PortType::STREAM>(&self()), inputSpans);
     }
 
+public:
     void applyChangedSettings(bool publishForwardTags = true, property_map* capturedForwardParams = nullptr) {
         if (!settings().changed()) {
             return;
@@ -1707,6 +1694,35 @@ private:
                 }
             },
             ports);
+    }
+
+    /// skip the nSkip input samples a stride passes over between two chunks
+    ///
+    /// The default forwarder treats the skipped samples as a chunk that has no output samples. Their tags set the
+    /// block's settings and port meta information, go through the key drop and the substitution of forwardInputTags(),
+    /// and leave at offset 0. Offset 0 is the block's next output sample: the first output sample of the next chunk, or
+    /// the end-of-stream index. A skip that a call boundary splits forwards each part's tags in its own call. A block
+    /// with a forwardTags() override is handed these tags in the next chunk, at a negative relIndex.
+    void skipInputSamples(std::size_t nSkip) {
+        auto skipIn = prepareStreams(inputPorts<PortType::STREAM>(&self()), nSkip);
+        if constexpr (acceptsPreparedForwardTagsSpans()) {
+            for_each_reader_span([](auto& in) { in.consumeTags(0UZ); }, skipIn); // the tags stay for the next chunk
+        } else {
+            auto skipOut = prepareStreams(outputPorts<PortType::STREAM>(&self()), 0UZ);
+            applyChangedSettings(true, &_pendingForwardParams); // a setting changed since the call began keeps its forwarded parameters
+            applyInputTagsInWindow(skipIn, nSkip);
+            applyChangedSettings(true, &_pendingForwardParams);
+            forwardInputTags(skipIn, skipOut, nSkip, nSkip);
+            publishSamples(0UZ, skipOut);
+            for_each_reader_span(
+                [nSkip](auto& in) {
+                    if (in.isSync && in.isConnected) {
+                        in.consumeTags(nSkip);
+                    }
+                },
+                skipIn);
+        }
+        consumeReaders(nSkip, skipIn);
     }
 
 public:
@@ -2362,19 +2378,16 @@ public:
         bool        hasAsyncOut         = outputStreamCache.hasASyncAvailable();
 
         auto [hasTag, hasAnyTag, nextTag, nextEosTag, asyncEoS, draining, asyncOwed] = getNextTagAndEosPosition();
-        if constexpr (forwardTagPropagation) {
-            nextTag = std::numeric_limits<std::size_t>::max(); // don't break chunks at tags — tags carry forward
-        }
-        std::size_t       maxChunk                        = getMergedBlockLimit();
-        const std::size_t inputSkipBefore                 = inputSamplesToSkipBeforeNextChunk(std::min({maxSyncAvailableIn, nextTag, nextEosTag}));
-        const std::size_t nextTagAfterSkip                = nextTag > inputSkipBefore ? nextTag - inputSkipBefore : 0UZ;
-        const std::size_t availAfterSkip                  = maxSyncAvailableIn > inputSkipBefore ? maxSyncAvailableIn - inputSkipBefore : 0UZ;
-        const std::size_t eosAfterSkip                    = nextEosTag > inputSkipBefore ? nextEosTag - inputSkipBefore : 0UZ;
-        const std::size_t nextTagLimit                    = nextTagAfterSkip >= minSyncIn ? nextTagAfterSkip : std::numeric_limits<std::size_t>::max();
-        const std::size_t ensureMinimalDecimation         = nextTagLimit >= input_chunk_size ? nextTagLimit : static_cast<std::size_t>(input_chunk_size);
-        const std::size_t availableToProcess              = std::min({maxSyncIn, maxChunk, availAfterSkip, ensureMinimalDecimation, eosAfterSkip});
-        const std::size_t availableToPublish              = std::min({maxSyncOut, maxSyncAvailableOut});
-        auto [resampledIn, resampledOut, resampledStatus] = computeResampling(std::min(minSyncIn, nextEosTag), availableToProcess, minSyncOut, availableToPublish, requestedWork);
+        std::size_t       maxChunk                                                   = getMergedBlockLimit();
+        const std::size_t inputSkipBefore                                            = inputSamplesToSkipBeforeNextChunk(std::min(maxSyncAvailableIn, nextEosTag)); // a skip runs over tags; skipInputSamples() hands their tags on
+        const std::size_t nextTagAfterSkip                                           = nextTag > inputSkipBefore ? nextTag - inputSkipBefore : 0UZ;
+        const std::size_t availAfterSkip                                             = maxSyncAvailableIn > inputSkipBefore ? maxSyncAvailableIn - inputSkipBefore : 0UZ;
+        const std::size_t eosAfterSkip                                               = nextEosTag > inputSkipBefore ? nextEosTag - inputSkipBefore : 0UZ;
+        const std::size_t nextTagLimit                                               = nextTagAfterSkip >= minSyncIn ? nextTagAfterSkip : std::numeric_limits<std::size_t>::max();
+        const std::size_t ensureMinimalDecimation                                    = nextTagLimit >= input_chunk_size ? nextTagLimit : static_cast<std::size_t>(input_chunk_size);
+        const std::size_t availableToProcess                                         = std::min({maxSyncIn, maxChunk, availAfterSkip, ensureMinimalDecimation, eosAfterSkip});
+        const std::size_t availableToPublish                                         = std::min({maxSyncOut, maxSyncAvailableOut});
+        auto [resampledIn, resampledOut, resampledStatus]                            = computeResampling(std::min(minSyncIn, nextEosTag), availableToProcess, minSyncOut, availableToPublish, requestedWork);
         // the end of the synchronous inputs ends the block only when no async input holds min_samples or more items or
         // is still owed items
         const bool isEosPresent = !asyncOwed && (nextEosTag <= 0 || eosAfterSkip < minSyncIn || eosAfterSkip < input_chunk_size || output_chunk_size * (eosAfterSkip / input_chunk_size) < minSyncOut);
@@ -2459,7 +2472,7 @@ public:
     void applyInputTagsAndSettings(TInputSpans& inputSpans, std::size_t processedIn, bool hasAnyTag) {
         if (hasAnyTag) {
             applyInputTagsFromPorts(inputSpans, processedIn);
-            applyChangedSettings(false);
+            applyChangedSettings(true, &_pendingForwardParams);
         }
     }
 
@@ -2502,9 +2515,11 @@ public:
     void finaliseIO(TInputSpans& inputSpans, TOutputSpans& outputSpans, work::Status& userReturnStatus, std::size_t& processedIn, std::size_t processedOut, std::size_t resampledIn) {
         using enum gr::work::Status;
 
-        if (processedOut == 0) {
-            // if no data is published or consumed => do not publish any tags
+        if (traits::block::stream_output_ports<Derived>::size > 0UZ && processedOut == 0UZ) {
+            // if no data is published or consumed => do not publish any tags; the forwarded parameters wait for the next call
             for_each_writer_span([](auto& outSpan) { outSpan.tagsPublished = 0; }, outputSpans);
+        } else {
+            _pendingForwardParams.clear();
         }
 
         // a call that ends after the stop reached the block returns DONE, and an ERROR from the user's work stays ERROR
@@ -2535,13 +2550,36 @@ public:
                 }
             }
         }
+        if constexpr (mapsTagsByChunkRatio()) {
+            // the tags of the samples the call consumed leave now that the output count is known
+            std::size_t consumedIn = std::numeric_limits<std::size_t>::max();
+            for_each_reader_span(
+                [&consumedIn](auto& in) {
+                    if (in.isSync && in.isConnected) {
+                        consumedIn = std::min(consumedIn, in.isConsumeRequested() ? in.nRequestedSamplesToConsume() : 0UZ);
+                    }
+                },
+                inputSpans);
+            if (consumedIn != std::numeric_limits<std::size_t>::max() && consumedIn > 0UZ) {
+                // the settings took the tags at the first sample before the call, and take the other consumed ones here
+                applyInputTagsInWindow(inputSpans, consumedIn, 1);
+                property_map changedForward;
+                applyChangedSettings(true, &changedForward);
+                forwardInputTags(inputSpans, outputSpans, consumedIn);
+                if (!changedForward.empty()) {
+                    for_each_writer_span([&changedForward](auto& out) { publishForwardParams(out, changedForward); }, outputSpans);
+                }
+            }
+        }
 
         // if the block state changed to DONE, publish EOS tag on the next sample
         if (userReturnStatus == DONE) {
             emitErrorMessageIfAny("finaliseIO(): DONE -> REQUESTED_STOP", this->changeStateTo(lifecycle::State::REQUESTED_STOP));
             this->setAndNotifyState(lifecycle::State::STOPPED);
-            if (!forwardParams.empty()) {
-                for_each_writer_span([&forwardParams](auto& outSpan) { publishForwardParams(outSpan, forwardParams); }, outputSpans);
+            mergeForwardParams(_pendingForwardParams, std::move(forwardParams));
+            if (!_pendingForwardParams.empty()) {
+                for_each_writer_span([this](auto& outSpan) { publishForwardParams(outSpan, _pendingForwardParams); }, outputSpans);
+                _pendingForwardParams.clear();
             }
             publishEoS(outputSpans);
         } else if (userReturnStatus == ERROR && shuttingDown) {
@@ -2613,9 +2651,7 @@ public:
         SampleLimits limits = computeSampleLimits(requestedWork);
 
         if (limits.inputSkipBefore > 0) {
-            auto skipSpans = prepareStreams(inputPorts<PortType::STREAM>(&self()), limits.inputSkipBefore);
-            applyInputTagsFromPorts(skipSpans, limits.inputSkipBefore);
-            consumeReaders(limits.inputSkipBefore, skipSpans);
+            skipInputSamples(limits.inputSkipBefore);
         }
 
         const bool drainStalled = isDrainStalled(limits.draining); // evaluated before the test below, which would short-circuit past the bookkeeping
@@ -2701,17 +2737,17 @@ public:
         }
 
         applyChangedSettings(true, &_pendingForwardParams); // captures any further external settings change, published through the open spans below
-        applyInputTagsAndSettings(inputSpans, processedIn, limits.hasAnyTag);
+        // a block that maps tags by its chunk ratio applies the tags past the first sample after the call, once
+        applyInputTagsAndSettings(inputSpans, mapsTagsByChunkRatio() ? 1UZ : processedIn, limits.hasAnyTag);
 
         if constexpr (requires { self().forwardTags(inputSpans, outputSpans, processedIn); }) {
             self().forwardTags(inputSpans, outputSpans, processedIn);
-        } else {
+        } else if constexpr (!mapsTagsByChunkRatio()) {
             forwardInputTags(inputSpans, outputSpans, processedIn);
         }
 
-        if (!_pendingForwardParams.empty()) {
+        if (!_pendingForwardParams.empty()) { // the map stays pending for the next call when this call publishes no sample
             for_each_writer_span([this](auto& out) { publishForwardParams(out, _pendingForwardParams); }, outputSpans);
-            _pendingForwardParams.clear();
         }
 
         if constexpr (HasProcessOneFunction<Derived> && !HasProcessBulkFunction<Derived>) {

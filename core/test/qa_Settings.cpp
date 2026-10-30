@@ -12,6 +12,7 @@
 #include <format>
 #include <functional>
 #include <future>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -33,14 +34,17 @@
 /**
  * @brief Where a resampling block's sample_rate lives.
  *
- * A block's own settings hold the rate it is fed at. The chunk ratio belongs to the value it publishes — the
- * forwarded parameters and the tags it substitutes its own value into. Scaling the stored
- * value instead makes every further application scale again, so the rate drops further with each of the save/load or
- * re-apply cycles that a running graph performs routinely. The forwarded map therefore waits for an output span to
- * publish it into.
+ * A block's own settings hold the rate it is fed at. The chunk ratio belongs to the rate tag it passes on. Scaling the
+ * stored value instead makes every further application scale again, so the rate drops further with each of the
+ * save/load or re-apply cycles that a running graph performs routinely.
  *
  * The blocks are defined here: gnuradio4-core carries no standard block library, so a core test may not depend on one.
  */
+
+namespace qa_coupling {
+/// couples `setting` to the tag key `key` through the settings API
+inline void couple(gr::SettingsBase& settings, std::string_view setting, std::string_view key) { settings.setTagCouplings(gr::property_map{{std::pmr::string(setting), std::string(key)}}); }
+} // namespace qa_coupling
 
 namespace qa_settings {
 
@@ -103,7 +107,7 @@ struct RateTagSource : Block<RateTagSource> {
         }
         std::ranges::fill(outSpan | std::views::take(n), 1.0f);
         if (_emitted == 0UZ) {
-            outSpan.publishTag(property_map{{"sample_rate", kInputRate}}, 0UZ);
+            outSpan.publishTag(property_map{{gr::tag::SAMPLE_RATE.key(), kInputRate}}, 0UZ);
         }
         _emitted += n;
         outSpan.publish(n);
@@ -112,8 +116,6 @@ struct RateTagSource : Block<RateTagSource> {
 };
 
 inline constexpr std::size_t kStarvedCalls = 100UZ;
-inline constexpr std::size_t kDecayCalls   = 200UZ;
-inline constexpr std::size_t kCallsToZero  = 81UZ; ///< kInputRate scaled by the 4:1 chunk ratio once per call, in float
 
 /// a decimator recording every rate applied to it; its default differs from the rate it is
 /// constructed with, so the first application is a genuine change
@@ -136,7 +138,7 @@ struct WatchingDecimator : Block<WatchingDecimator, Resampling<>> {
     }
 
     void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings) {
-        if (newSettings.contains(gr::tag::SAMPLE_RATE.shortKey())) {
+        if (newSettings.contains(gr::tag::SAMPLE_RATE.name())) {
             appliedRates.push_back(sample_rate.value);
         }
     }
@@ -170,7 +172,7 @@ struct LateSource : Block<LateSource> {
         }
         std::ranges::fill(outSpan | std::views::take(n), 1.0f);
         if (_emitted == 0UZ) {
-            outSpan.publishTag(property_map{{"sample_rate", kInputRate}}, 0UZ);
+            outSpan.publishTag(property_map{{gr::tag::SAMPLE_RATE.key(), kInputRate}}, 0UZ);
         }
         _emitted += n;
         outSpan.publish(n);
@@ -198,7 +200,7 @@ struct RateTagSink : Block<RateTagSink> {
     }
 
     [[nodiscard]] static std::optional<float> rateOf(const property_map& map) {
-        auto it = map.find(gr::tag::SAMPLE_RATE.shortKey());
+        auto it = map.find(gr::tag::SAMPLE_RATE.key());
         if (it == map.end()) {
             return std::nullopt;
         }
@@ -208,6 +210,12 @@ struct RateTagSink : Block<RateTagSink> {
 };
 
 [[nodiscard]] float rateOf(const property_map& map) { return RateTagSink::rateOf(map).value_or(0.0f); }
+
+[[nodiscard]] float storedRateOf(const property_map& settingsMap) {
+    const auto   it    = settingsMap.find(gr::tag::SAMPLE_RATE.name());
+    const float* value = it != settingsMap.end() ? it->second.get_if<float>() : nullptr;
+    return value != nullptr ? *value : 0.0f;
+}
 
 inline constexpr std::size_t kTagStride   = 16UZ;
 inline constexpr std::size_t kShortStream = 512UZ;
@@ -238,7 +246,7 @@ struct RepeatingRateSource : Block<RepeatingRateSource> {
             outSpan[i]              = 1.0f;
             const std::size_t index = _emitted + i;
             if (index % kTagStride == 0UZ) {
-                outSpan.publishTag(property_map{{"sample_rate", index + kTagStride >= nSamples ? finalRate : kInputRate}}, i);
+                outSpan.publishTag(property_map{{gr::tag::SAMPLE_RATE.key(), index + kTagStride >= nSamples ? finalRate : kInputRate}}, i);
             }
         }
         _emitted += n;
@@ -321,7 +329,7 @@ struct TapsRecordingBlock : Block<TapsRecordingBlock> {
 }
 
 [[nodiscard]] std::string contextOf(const property_map& map) {
-    const auto it = map.find(gr::tag::CONTEXT.shortKey());
+    const auto it = map.find(gr::settings::kContextField);
     if (it == map.end()) {
         return {};
     }
@@ -470,7 +478,8 @@ struct RateStreamResult {
     source.nSamples  = nSamples;
     source.finalRate = finalRate;
     auto& middle     = flow.emplaceBlock<RateCountingBlock>();
-    auto& sink       = flow.emplaceBlock<RateTagSink>();
+    qa_coupling::couple(middle.settings(), "sample_rate", gr::tag::SAMPLE_RATE.key());
+    auto& sink = flow.emplaceBlock<RateTagSink>();
     expect(flow.connect<"out", "in">(source, middle).has_value());
     expect(flow.connect<"out", "in">(middle, sink).has_value());
 
@@ -708,7 +717,7 @@ const boost::ut::suite<"settings"> _settings = [] {
     using namespace boost::ut;
     using namespace qa_settings;
 
-    "a decimator keeps its input rate and forwards the output rate on every application"_test = [] {
+    "a decimator keeps its input rate and forwards no tag for it on every application"_test = [] {
         Decimator block = makeDecimator();
 
         const property_map rateUpdate{{"sample_rate", kInputRate}};
@@ -716,8 +725,8 @@ const boost::ut::suite<"settings"> _settings = [] {
             std::ignore       = block.settings().setStaged(rateUpdate);
             const auto result = block.settings().applyStagedParameters();
 
-            expect(eq(rateOf(result.forwardParameters), kOutputRate)) << std::format("application {} forwards the output rate", nApplication);
-            expect(eq(rateOf(block.settings().get()), kInputRate)) << std::format("application {} leaves the stored rate at the input rate", nApplication);
+            expect(result.forwardParameters.empty()) << std::format("application {} forwards the applied rate as a tag", nApplication);
+            expect(eq(storedRateOf(block.settings().get()), kInputRate)) << std::format("application {} leaves the stored rate at the input rate", nApplication);
             expect(eq(block.sample_rate.value, kInputRate)) << std::format("application {} leaves the member at the input rate", nApplication);
         }
     };
@@ -733,8 +742,9 @@ const boost::ut::suite<"settings"> _settings = [] {
             std::ignore              = block.settings().setStaged(saved);
             const auto result        = block.settings().applyStagedParameters();
 
-            expect(eq(rateOf(saved), kInputRate)) << std::format("cycle {} saves the input rate", nCycle);
-            expect(eq(rateOf(result.forwardParameters), kOutputRate)) << std::format("cycle {} forwards the output rate", nCycle);
+            expect(eq(storedRateOf(saved), kInputRate)) << std::format("cycle {} saves the input rate", nCycle);
+            expect(eq(block.sample_rate.value, kInputRate)) << std::format("cycle {} leaves the member at the input rate", nCycle);
+            expect(result.forwardParameters.empty()) << std::format("cycle {} forwards the applied rate as a tag", nCycle);
         }
     };
 
@@ -743,6 +753,7 @@ const boost::ut::suite<"settings"> _settings = [] {
         auto&     source = flow.emplaceBlock<RateTagSource>(property_map{{"name", std::string("src")}});
         auto&     middle = flow.emplaceBlock<Decimator>(property_map{{"name", std::string("mid")}, {"input_chunk_size", kDecimation}, {"output_chunk_size", gr::Size_t(1)}});
         auto&     sink   = flow.emplaceBlock<RateTagSink>(property_map{{"name", std::string("snk")}});
+        qa_coupling::couple(middle.settings(), "sample_rate", gr::tag::SAMPLE_RATE.key());
         expect(flow.connect<"out", "in">(source, middle).has_value());
         expect(flow.connect<"out", "in">(middle, sink).has_value());
 
@@ -785,31 +796,22 @@ const boost::ut::suite<"settings"> _settings = [] {
 
         expect(eq(source.idleCalls, kStarvedCalls)) << "the source must have driven the chain while it could publish nothing";
         expect(eq(middle.sample_rate.value, kInputRate)) << "a call that moves nothing must leave the block's own rate alone";
-        expect(eq(rateOf(middle.settings().get()), kInputRate)) << "and must leave the stored rate alone with it";
+        expect(eq(storedRateOf(middle.settings().get()), kInputRate)) << "and must leave the stored rate alone with it";
         expect(eq(middle.appliedRates.size(), 1UZ)) << "the rate it is built at applies once, not once per call that moved nothing";
         expect(std::ranges::all_of(middle.appliedRates, [](float rate) { return rate == kInputRate; })) << "the block must never be run at the rate it publishes at";
         expect(ge(sink.rates.size(), 1UZ)) << "the forwarded rate must still reach the sink once there is a span to publish into";
         expect(std::ranges::all_of(sink.rates, [](float rate) { return rate == kOutputRate; })) << "and that tag carries the output rate";
     };
 
-    "staging the forwarded rate back into a decimator decays it to zero"_test = [] {
+    "a rate tag's map staged into a decimator sets nothing"_test = [] {
         Decimator block = makeDecimator();
         std::ignore     = block.settings().setStaged({{"sample_rate", kInputRate}});
+        std::ignore     = block.settings().applyStagedParameters();
 
-        std::size_t nCallsToZero = 0UZ;
-        for (std::size_t nCall = 1UZ; nCall <= kDecayCalls && nCallsToZero == 0UZ; ++nCall) {
-            const auto result = block.settings().applyStagedParameters();
-            if (nCall == 1UZ) {
-                expect(eq(block.sample_rate.value, kInputRate)) << "the first application is the honest one";
-                expect(eq(rateOf(result.forwardParameters), kOutputRate)) << "and it forwards the output rate";
-            }
-            if (block.sample_rate.value == 0.0f) {
-                nCallsToZero = nCall;
-            }
-            std::ignore = block.settings().setStaged(result.forwardParameters);
-        }
-
-        expect(eq(nCallsToZero, kCallsToZero)) << "the chunk ratio applied once per call reaches zero in float";
+        const property_map refused = block.settings().setStaged(property_map{{std::pmr::string(gr::tag::SAMPLE_RATE.key()), kOutputRate}});
+        expect(refused.contains(gr::tag::SAMPLE_RATE.key())) << "the tag key is admitted as a setting";
+        std::ignore = block.settings().applyStagedParameters();
+        expect(eq(block.sample_rate.value, kInputRate)) << "the tag's rate reaches the block's own rate";
     };
 
     "an unchanged setting tag costs one apply however often it repeats"_test = [] {
@@ -1321,6 +1323,51 @@ struct ContextChangingSink : Block<ContextChangingSink> {
     work::Status processBulk(std::span<const float> /*input*/) { return work::Status::OK; }
 };
 
+inline constexpr std::string_view kCountKey      = "qa:count";
+inline constexpr std::string_view kTakenCountKey = "qa:count_taken";
+
+/// passes its input on and hands on each count it is given under kTakenCountKey; its settingsChanged() refuses a count
+/// of 0 after it filled the forward map
+struct RefusingForwarder : Block<RefusingForwarder> {
+    PortIn<float>  in{};
+    PortOut<float> out{};
+
+    gr::Size_t count = 4U;
+
+    GR_MAKE_REFLECTABLE(RefusingForwarder, in, out, count);
+
+    void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings, property_map& forwardSettings) {
+        if (!newSettings.contains("count")) {
+            return;
+        }
+        forwardSettings.insert_or_assign(std::pmr::string(kTakenCountKey), count);
+        if (count == 0U) {
+            throw gr::exception("count must be at least 1");
+        }
+    }
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
+};
+
+/// keeps every tag it receives
+struct TagRecordingSink : Block<TagRecordingSink> {
+    PortIn<float> in{};
+
+    GR_MAKE_REFLECTABLE(TagRecordingSink, in);
+
+    std::vector<Tag> tags;
+
+    work::Status processBulk(InputSpanLike auto& inSpan) {
+        for (const Tag& tag : inSpan.rawTags) {
+            tags.push_back(tag);
+        }
+        const std::size_t n = inSpan.size();
+        inSpan.consumeTags(n);
+        std::ignore = inSpan.consume(n);
+        return work::Status::OK;
+    }
+};
+
 constexpr std::string_view kRejectedSettings = "applyChangedSettings() - rejected settings";
 
 /// the refusals a port received, the plain messages apart from the errors
@@ -1354,8 +1401,9 @@ struct SinkRun {
 };
 
 /// runs a source that tags its first sample with `tag` through a block that declares no tag policy into a sink named
-/// `sinkName`. A Set message carries `set` to the sink when it is not empty. A reader takes the scheduler's messages
-/// when `readMessages` is true. With no reader a block's error ends the run.
+/// `sinkName`. The sink couples each key of `tag` to its setting of the same name. A Set message carries `set` to the
+/// sink when it is not empty. A reader takes the scheduler's messages when `readMessages` is true. With no reader a
+/// block's error ends the run.
 template<typename TSink>
 [[nodiscard]] SinkRun<TSink> runIntoSink(const std::string& sinkName, const property_map& tag, const property_map& set, bool readMessages) {
     using namespace boost::ut;
@@ -1364,6 +1412,9 @@ template<typename TSink>
     auto&     pass   = flow.emplaceBlock<UndeclaredPass>();
     auto&     sink   = flow.emplaceBlock<TSink>({{"name", sinkName}});
     source.tag       = tag;
+    for (const auto& [key, value] : tag) {
+        qa_coupling::couple(sink.settings(), key, key);
+    }
     expect(flow.connect<"out", "in">(source, pass).has_value());
     expect(flow.connect<"out", "in">(pass, sink).has_value());
 
@@ -1387,6 +1438,45 @@ template<typename TSink>
         run.reported = readRefusals(fromScheduler);
     }
     return run;
+}
+
+struct ForwarderRun {
+    std::expected<void, gr::Error> result;
+    gr::Size_t                     held = 0U;
+    std::vector<Tag>               tags{};
+    ReportedRefusals               reported{};
+};
+
+/// runs a source that tags its first sample with kCountKey = `count` through a RefusingForwarder that couples its count
+/// to kCountKey, into a sink that keeps every tag
+[[nodiscard]] ForwarderRun runThroughRefusingForwarder(gr::Size_t count) {
+    using namespace boost::ut;
+    gr::Graph flow;
+    auto&     source    = flow.emplaceBlock<FiniteTagSource>();
+    auto&     forwarder = flow.emplaceBlock<RefusingForwarder>({{"name", std::string("refusing_forwarder")}});
+    auto&     sink      = flow.emplaceBlock<TagRecordingSink>();
+    source.tag          = property_map{{std::pmr::string(kCountKey), count}};
+    qa_coupling::couple(forwarder.settings(), "count", kCountKey);
+    expect(flow.connect<"out", "in">(source, forwarder).has_value());
+    expect(flow.connect<"out", "in">(forwarder, sink).has_value());
+
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler;
+    gr::MsgPortIn                                                         fromScheduler;
+    expect(scheduler.msgOut.connect(fromScheduler).has_value());
+    expect(scheduler.exchange(std::move(flow)).has_value());
+
+    ForwarderRun run{.result = scheduler.runAndWait()};
+    run.held     = forwarder.count;
+    run.tags     = sink.tags;
+    run.reported = readRefusals(fromScheduler);
+    return run;
+}
+
+/// the tags of `tags` that carry `key`, in the order they arrived
+[[nodiscard]] std::vector<Tag> tagsWithKey(const std::vector<Tag>& tags, std::string_view key) {
+    std::vector<Tag> found;
+    std::ranges::copy_if(tags, std::back_inserter(found), [key](const Tag& tag) { return tag.map.contains(key); });
+    return found;
 }
 
 inline constexpr auto isEven       = [](const int& value) { return value % 2 == 0; };
@@ -1677,6 +1767,33 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
         expect(read.reported.errors.empty()) << "the refused tag value is reported as an error: " << read.reported.errors;
     };
 
+    "a coupled tag value settingsChanged() refuses leaves on the tag as it arrived, and the forward map stays behind"_test = [] {
+        const gr::Size_t initial = RefusingForwarder{}.count;
+        const gr::Size_t taken   = initial + 2U;
+
+        const ForwarderRun accepted = runThroughRefusingForwarder(taken);
+        expect(fatal(accepted.result.has_value()));
+        expect(eq(accepted.held, taken)) << "the coupled tag does not set the count";
+        const auto arrived = std::ranges::find_if(accepted.tags, [](const Tag& tag) { return tag.map.contains(kCountKey); });
+        const auto handed  = std::ranges::find_if(accepted.tags, [](const Tag& tag) { return tag.map.contains(kTakenCountKey); });
+        expect(fatal(arrived != accepted.tags.end() && handed != accepted.tags.end())) << "the sink misses the tag or the forward map";
+        expect(arrived < handed) << "the forward map leaves before the tag";
+        expect(eq(arrived->index, 0UZ) && eq(handed->index, 0UZ)) << "the tag and the forward map leave apart from the tagged sample";
+        expect(eq(arrived->map.at(std::pmr::string(kCountKey)).value_or(gr::Size_t{0U}), taken));
+        expect(eq(handed->map.at(std::pmr::string(kTakenCountKey)).value_or(gr::Size_t{0U}), taken));
+
+        const gr::Size_t   refused = 0U;
+        const ForwarderRun run     = runThroughRefusingForwarder(refused);
+        expect(fatal(run.result.has_value())) << "the refused tag value ends the run";
+        expect(eq(run.held, initial)) << "the refused value stays in the member";
+        expect(run.reported.plain.contains("block 'refusing_forwarder' refuses count = 0: count must be at least 1")) << "no plain message names the refused setting, got: " << run.reported.plain;
+        expect(run.reported.errors.empty()) << "the refused tag value is reported as an error: " << run.reported.errors;
+        const std::vector<Tag> counts = tagsWithKey(run.tags, kCountKey);
+        expect(fatal(eq(counts.size(), 1UZ)));
+        expect(eq(counts[0].map.at(std::pmr::string(kCountKey)).value_or(initial), refused)) << "the tag does not leave with the value it arrived with";
+        expect(tagsWithKey(run.tags, kTakenCountKey).empty()) << "the forward map of the refused change leaves";
+    };
+
     "a value a Set message stages and settingsChanged() refuses ends the run in the error"_test = [] {
         const gr::Size_t            initial = RefusingSink{}.count;
         const SinkRun<RefusingSink> run     = runIntoSink<RefusingSink>("refusing_sink", {}, {{"count", gr::Size_t{0U}}}, false);
@@ -1876,6 +1993,7 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
         block.applyChangedSettings();
         expect(fatal(eq(block.level, namedLevel))) << "the block does not take the named context's level";
 
+        qa_coupling::couple(block.settings(), "count", "count");
         block.settings().autoUpdate(Tag{0UZ, property_map{{std::pmr::string(gr::tag::RESET_DEFAULTS.key()), true}, {"count", gr::Size_t{0U}}}});
         block.applyChangedSettings();
         const ReportedRefusals reported = readRefusals(fromBlock);
@@ -1945,6 +2063,7 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
         gr::MsgPortIn        fromBlock;
         expect(block.msgOut.connect(fromBlock).has_value());
         block.init(std::make_shared<gr::Sequence>());
+        qa_coupling::couple(block.settings(), "gain", "gain");
 
         block.settings().autoUpdate(Tag{0UZ, property_map{{"gain", 2.0f}}});
         std::ignore = block.settings().setStaged({{"offset", 5.0f}});
@@ -1995,6 +2114,7 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
         gr::MsgPortIn fromBlock;
         expect(block.msgOut.connect(fromBlock).has_value());
         block.init(std::make_shared<gr::Sequence>());
+        qa_coupling::couple(block.settings(), "gain", "gain");
 
         block.settings().autoUpdate(Tag{0UZ, property_map{{"gain", 2.0f}}});
         std::ignore = block.settings().setStaged({{"gain", 3.0f}});
@@ -2067,8 +2187,8 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
         expect(refusal.contains("SignedGain: block 'm' refuses gain = ")) << "the second block's refusal is missing: " << refusal;
     };
 
-    "a reset_default tag in either key form restores the default and calls the block's reset() once"_test = [] {
-        for (const std::string_view key : {std::string_view(gr::tag::RESET_DEFAULTS.shortKey()), std::string_view(gr::tag::RESET_DEFAULTS.key())}) {
+    "a reset_default tag in either spelling of its key restores the default and calls the block's reset() once"_test = [] {
+        for (const std::string_view key : {std::string(gr::tag::RESET_DEFAULTS.key()), std::format(":{}", gr::tag::RESET_DEFAULTS.key())}) {
             CountingResetWithinLimits              block{property_map{{"name", std::string("gain_stage")}}};
             CtxSettings<CountingResetWithinLimits> settings{block};
             settings.init();
@@ -2103,7 +2223,7 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
 
         const std::size_t resetsBefore  = block.resets;
         const std::size_t changesBefore = block.changes;
-        settings.autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.shortKey()));
+        settings.autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.key()));
         settings.resetDefaults();
         expect(eq(block.gain.value, defaultGain)) << "the reset leaves the member off its default";
         expect(eq(block.resets, resetsBefore + 1UZ)) << "the staged reset and the call run reset() a number of times other than once";
@@ -2123,15 +2243,15 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
         expect(eq(block.gain.value, 0.5f)) << "the value to reset does not reach the member";
 
         const std::size_t resetsBefore = block.resets;
-        settings.autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.shortKey()));
+        settings.autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.key()));
         const ApplyStagedParametersResult result = settings.applyStagedParameters();
         expect(result.refusal.contains("refuses gain = 2")) << result.refusal;
         expect(eq(block.resets, resetsBefore)) << "the refused reset calls reset()";
         expect(eq(block.gain.value, 0.5f)) << "the refused default reaches the member";
     };
 
-    "a store_default tag in either key form makes the current values the ones a reset restores"_test = [] {
-        for (const std::string_view key : {std::string_view(gr::tag::STORE_DEFAULTS.shortKey()), std::string_view(gr::tag::STORE_DEFAULTS.key())}) {
+    "a store_default tag in either spelling of its key makes the current values the ones a reset restores"_test = [] {
+        for (const std::string_view key : {std::string(gr::tag::STORE_DEFAULTS.key()), std::format(":{}", gr::tag::STORE_DEFAULTS.key())}) {
             CountingResetWithinLimits              block{property_map{{"name", std::string("gain_stage")}}};
             CtxSettings<CountingResetWithinLimits> settings{block};
             settings.init();
@@ -2149,18 +2269,41 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
             std::ignore = settings.applyStagedParameters();
             expect(eq(block.gain.value, storedGain / 2.f)) << "the value set after the store does not reach the member";
 
-            settings.autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.shortKey()));
+            settings.autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.key()));
             std::ignore = settings.applyStagedParameters();
             expect(eq(block.gain.value, storedGain)) << "a reset after " << key << " restores a value other than the stored one";
         }
+    };
+
+    "a reset_default or store_default tag under the bare name acts on nothing"_test = [] {
+        CountingResetWithinLimits              block{property_map{{"name", std::string("gain_stage")}}};
+        CtxSettings<CountingResetWithinLimits> settings{block};
+        settings.init();
+        const float setGain = block.gain.value / 2.f;
+        std::ignore         = settings.set({{"gain", setGain}});
+        expect(settings.activateContext().has_value());
+        std::ignore = settings.applyStagedParameters();
+
+        const std::size_t resetsBefore = block.resets;
+        settings.autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.name()));
+        std::ignore = settings.applyStagedParameters();
+        expect(eq(block.gain.value, setGain)) << "a bare reset_default key restores the default";
+        expect(eq(block.resets, resetsBefore)) << "a bare reset_default key calls reset()";
+
+        settings.autoUpdate(flagTag(gr::tag::STORE_DEFAULTS.name()));
+        std::ignore = settings.applyStagedParameters();
+        settings.autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.key()));
+        std::ignore = settings.applyStagedParameters();
+        expect(neq(block.gain.value, setGain)) << "a bare store_default key stores the current values";
     };
 
     "a store_default tag stores the values the same tag carries"_test = [] {
         CountingResetWithinLimits              block{property_map{{"name", std::string("gain_stage")}}};
         CtxSettings<CountingResetWithinLimits> settings{block};
         settings.init();
+        qa_coupling::couple(settings, "gain", "gain");
         const float taggedGain = block.gain.value / 2.f;
-        settings.autoUpdate(Tag{0UZ, property_map{{"gain", taggedGain}, {std::pmr::string(gr::tag::STORE_DEFAULTS.shortKey()), true}}});
+        settings.autoUpdate(Tag{0UZ, property_map{{"gain", taggedGain}, {std::pmr::string(gr::tag::STORE_DEFAULTS.key()), true}}});
         std::ignore = settings.applyStagedParameters();
         expect(eq(block.gain.value, taggedGain)) << "the tagged value does not reach the member";
 
@@ -2168,7 +2311,7 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
         expect(settings.activateContext().has_value());
         std::ignore = settings.applyStagedParameters();
 
-        settings.autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.shortKey()));
+        settings.autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.key()));
         std::ignore = settings.applyStagedParameters();
         expect(eq(block.gain.value, taggedGain)) << "the store does not hold the value its own tag carries";
     };
@@ -2183,7 +2326,7 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
         block.newSeen.clear();
 
         std::ignore = block.settings().setStaged({{"fft_size", setSize}});
-        block.settings().autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.shortKey()));
+        block.settings().autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.key()));
         std::ignore = block.settings().applyStagedParameters();
         expect(eq(block.fft_size.value, setSize)) << "the value staged with the reset does not reach the member";
         for (const property_map& reported : block.newSeen) {
@@ -2202,7 +2345,7 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
         block.newSeen.clear();
 
         std::ignore = block.settings().setStaged({{"n_averages", 4U * defaultAverages}});
-        block.settings().autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.shortKey()));
+        block.settings().autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.key()));
         std::ignore = block.settings().applyStagedParameters();
         expect(eq(block.fft_size.value, defaultSize)) << "the reset leaves fft_size off its default";
         expect(eq(block.n_averages.value, 4U * defaultAverages)) << "the value staged with the reset does not reach the member";
@@ -2220,7 +2363,7 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
         const std::size_t resetsBefore  = block.resets;
         const bool        setValue      = !block.reset_default.value;
 
-        expect(block.settings().setStaged({{gr::tag::RESET_DEFAULTS.shortKey(), setValue}}).empty()) << "the setting is not admitted";
+        expect(block.settings().setStaged({{gr::tag::RESET_DEFAULTS.name(), setValue}}).empty()) << "the setting is not admitted";
         std::ignore = block.settings().applyStagedParameters();
         expect(eq(block.reset_default.value, setValue)) << "the value does not reach the member";
         expect(eq(block.changes, changesBefore + 1UZ)) << "settingsChanged() runs a number of times other than once";
@@ -2251,6 +2394,68 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
     };
 };
 
+namespace qa_follows_tag {
+using namespace gr;
+
+inline constexpr std::string_view kLevelKey = "foo:level";
+
+/// a sample rate, a level and a gain, none coupled to a tag key until a test couples it
+struct FollowingBlock : Block<FollowingBlock> {
+    PortIn<float>  in{};
+    PortOut<float> out{};
+
+    Annotated<float, "sample rate"> sample_rate = 1.f;
+    Annotated<float, "level">       level       = 0.f;
+    Annotated<float, "gain">        gain        = 1.f;
+
+    GR_MAKE_REFLECTABLE(FollowingBlock, in, out, sample_rate, level, gain);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
+};
+
+/// a gain, with a settingsChanged() that refuses every change while `refusing` is set
+struct RefusingFollowingBlock : Block<RefusingFollowingBlock> {
+    PortIn<float>  in{};
+    PortOut<float> out{};
+
+    Annotated<float, "gain"> gain = 1.f;
+
+    GR_MAKE_REFLECTABLE(RefusingFollowingBlock, in, out, gain);
+
+    bool refusing = false;
+
+    void settingsChanged(const property_map& /*oldSettings*/, const property_map& /*newSettings*/) {
+        if (refusing) {
+            throw gr::exception("the block refuses every change");
+        }
+    }
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
+};
+
+[[nodiscard]] Tag tagOf(std::string_view key, float value) { return Tag{0UZ, property_map{{std::pmr::string(key), value}}}; }
+
+/// couples sample_rate to gr:sample_rate and level to foo:level
+void coupleRateAndLevel(SettingsBase& settings) { settings.setTagCouplings({{"sample_rate", std::string(gr::tag::SAMPLE_RATE.key())}, {"level", std::string(kLevelKey)}}); }
+
+/// the key a setting is coupled to, empty for none
+[[nodiscard]] std::string keyOf(const SettingsBase& settings, std::string_view setting) {
+    const property_map table = settings.tagCouplings();
+    const auto         it    = table.find(setting);
+    return it != table.end() ? it->second.value_or(std::string()) : std::string();
+}
+
+/// the message setTagCouplings() throws for `couplings`, empty when it throws none
+[[nodiscard]] std::string couplingRefusal(SettingsBase& settings, const property_map& couplings) {
+    try {
+        settings.setTagCouplings(couplings);
+    } catch (const gr::exception& refused) {
+        return refused.message;
+    }
+    return {};
+}
+} // namespace qa_follows_tag
+
 const boost::ut::suite<"keys that follow tags"> autoUpdateKeyTests = [] {
     using namespace boost::ut;
     using namespace qa_refusals;
@@ -2259,6 +2464,7 @@ const boost::ut::suite<"keys that follow tags"> autoUpdateKeyTests = [] {
         LimitedGainAndOffset              block{property_map{{"name", std::string("gain_stage")}}};
         CtxSettings<LimitedGainAndOffset> settings{block};
         settings.init();
+        settings.setTagCouplings({{"gain", std::string("gain")}, {"offset", std::string("offset")}});
         const float       setGain = block.gain.value / 2.f;
         const SettingsCtx activeCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now() - std::chrono::milliseconds(1)), "x"};
         expect(settings.set({{"gain", setGain}}, activeCtx).empty());
@@ -2278,6 +2484,337 @@ const boost::ut::suite<"keys that follow tags"> autoUpdateKeyTests = [] {
         std::ignore = settings.applyStagedParameters();
         expect(eq(block.gain.value, setGain)) << "the tag overrides the key the context set explicitly";
         expect(eq(block.offset.value, taggedOffset)) << "the tag leaves a key that follows tags";
+    };
+
+    "a tag sets a setting only through the key the setting is coupled to"_test = [] {
+        using namespace qa_follows_tag;
+        FollowingBlock              coupled;
+        CtxSettings<FollowingBlock> coupledSettings{coupled};
+        FollowingBlock              uncoupled;
+        CtxSettings<FollowingBlock> uncoupledSettings{uncoupled};
+        coupledSettings.init();
+        uncoupledSettings.init();
+        coupleRateAndLevel(coupledSettings);
+
+        const float taggedRate = 2.f * coupled.sample_rate.value;
+        coupledSettings.autoUpdate(tagOf(gr::tag::SAMPLE_RATE.key(), taggedRate));
+        uncoupledSettings.autoUpdate(tagOf(gr::tag::SAMPLE_RATE.key(), taggedRate));
+        std::ignore = coupledSettings.applyStagedParameters();
+        std::ignore = uncoupledSettings.applyStagedParameters();
+        expect(eq(coupled.sample_rate.value, taggedRate)) << "the coupled setting does not take its key";
+        expect(neq(uncoupled.sample_rate.value, taggedRate)) << "a setting named sample_rate on a block with no coupling takes the gr: key";
+
+        const float bareValue = 2.f * taggedRate;
+        for (const std::string_view bareKey : {std::string_view(gr::tag::SAMPLE_RATE.name()), gr::tag::nameOf(kLevelKey), std::string_view("gain")}) {
+            coupledSettings.autoUpdate(tagOf(bareKey, bareValue));
+        }
+        std::ignore = coupledSettings.applyStagedParameters();
+        expect(eq(coupled.sample_rate.value, taggedRate)) << "a bare sample_rate key sets the setting coupled to gr:sample_rate";
+        expect(neq(coupled.level.value, bareValue)) << "a bare level key sets the setting coupled to foo:level";
+        expect(neq(coupled.gain.value, bareValue)) << "a key equal to an uncoupled setting's name sets it";
+
+        const float foreignLevel = coupled.level.value + 1.f;
+        coupledSettings.autoUpdate(tagOf(kLevelKey, foreignLevel));
+        std::ignore = coupledSettings.applyStagedParameters();
+        expect(eq(coupled.level.value, foreignLevel)) << "a setting is not coupled to a key in another domain";
+    };
+
+    "one key sets every setting coupled to it, and a setting follows one key"_test = [] {
+        using namespace qa_follows_tag;
+        FollowingBlock              block;
+        CtxSettings<FollowingBlock> settings{block};
+        settings.init();
+        settings.setTagCouplings({{"level", std::string(kLevelKey)}, {"gain", std::string(kLevelKey)}});
+        expect(eq(settings.tagCouplings().size(), 2UZ));
+
+        const float shared = block.gain.value + block.level.value + 1.f;
+        settings.autoUpdate(tagOf(kLevelKey, shared));
+        std::ignore = settings.applyStagedParameters();
+        expect(eq(block.level.value, shared) && eq(block.gain.value, shared)) << "the key does not set both settings coupled to it";
+
+        constexpr std::string_view kGainKey = "foo:gain";
+        settings.setTagCouplings({{"gain", std::string(kGainKey)}});
+        expect(eq(keyOf(settings, "gain"), std::string(kGainKey))) << "a second coupling does not replace the first";
+        const float levelOnly = shared + 1.f;
+        const float gainOnly  = shared + 2.f;
+        settings.autoUpdate(tagOf(kLevelKey, levelOnly));
+        settings.autoUpdate(tagOf(kGainKey, gainOnly));
+        std::ignore = settings.applyStagedParameters();
+        expect(eq(block.level.value, levelOnly)) << "the setting left on the key stops following it";
+        expect(eq(block.gain.value, gainOnly)) << "the setting moved to another key follows the key it left";
+
+        settings.setTagCouplings({{"gain", std::string()}, {"level", std::string(":") + std::string(gr::tag::nameOf(kLevelKey))}});
+        expect(eq(keyOf(settings, "gain"), std::string())) << "an empty key leaves the coupling in place";
+        expect(eq(keyOf(settings, "level"), std::string(gr::tag::nameOf(kLevelKey)))) << "a key with a leading colon is held in another spelling than the bare name";
+        settings.autoUpdate(tagOf(kGainKey, gainOnly + 1.f));
+        std::ignore = settings.applyStagedParameters();
+        expect(eq(block.gain.value, gainOnly)) << "a setting whose coupling is removed follows its old key";
+    };
+
+    "a coupling to a key the framework acts on, to a non-writable setting or to a malformed key is refused"_test = [] {
+        using namespace qa_follows_tag;
+        FollowingBlock              block;
+        CtxSettings<FollowingBlock> settings{block};
+        settings.init();
+        coupleRateAndLevel(settings);
+        const property_map before = settings.tagCouplings();
+
+        for (const std::string_view controlKey : gr::tag::kControlKeys) {
+            const std::string refusal = couplingRefusal(settings, {{"gain", std::string(controlKey)}});
+            expect(refusal.contains("gain") && refusal.contains(controlKey) && refusal.contains("acts on this key")) << "a coupling to " << controlKey << " is not refused by name: " << refusal;
+        }
+        for (const std::string_view setting : {std::string_view("unique_name"), std::string_view("no_such_setting")}) {
+            const std::string refusal = couplingRefusal(settings, {{std::pmr::string(setting), std::string("foo:x")}});
+            expect(refusal.contains(setting) && refusal.contains("no writable setting")) << "a coupling of " << setting << " is not refused by name: " << refusal;
+        }
+        for (const std::string_view malformed : {std::string_view(":"), std::string_view("gr:"), std::string_view("::x"), std::string_view("foo:a b"), std::string_view("foo:\tx")}) {
+            const std::string refusal = couplingRefusal(settings, {{"gain", std::string(malformed)}});
+            expect(refusal.contains("gain") && refusal.contains("not domain:name")) << "the malformed key '" << malformed << "' is not refused: " << refusal;
+        }
+        const std::string notText = couplingRefusal(settings, {{"gain", 42}});
+        expect(notText.contains("gain") && notText.contains("not a string")) << "a key that is not a string is not refused: " << notText;
+
+        const std::string mixed = couplingRefusal(settings, {{"gain", std::string("foo:gain")}, {"level", std::string(gr::tag::CONTEXT.key())}});
+        expect(!mixed.empty()) << "a batch with one refused entry is taken";
+        expect(settings.tagCouplings() == before) << "a refused call changes the table";
+    };
+
+    "a caller's set() stops a coupled setting following until a reset, and a reset keeps the table"_test = [] {
+        using namespace qa_follows_tag;
+        FollowingBlock              block;
+        CtxSettings<FollowingBlock> settings{block};
+        const float                 constructedLevel = block.level.value + 1.f;
+        settings.setInitBlockParameters({{"level", constructedLevel}});
+        settings.init();
+        coupleRateAndLevel(settings);
+        const property_map table       = settings.tagCouplings();
+        const float        defaultRate = block.sample_rate.value;
+        const float        setRate     = 2.f * defaultRate;
+        std::ignore                    = settings.set({{"sample_rate", setRate}});
+        expect(settings.activateContext().has_value());
+        std::ignore = settings.applyStagedParameters();
+
+        const float taggedLevel = constructedLevel + 1.f;
+        settings.autoUpdate(tagOf(gr::tag::SAMPLE_RATE.key(), 3.f * defaultRate));
+        settings.autoUpdate(tagOf(kLevelKey, taggedLevel));
+        std::ignore = settings.applyStagedParameters();
+        expect(eq(block.sample_rate.value, setRate)) << "the tag overrides the value the caller set after the coupling";
+        expect(eq(block.level.value, taggedLevel)) << "a setting the constructor's map set before the coupling does not follow its key";
+
+        settings.resetDefaults();
+        expect(eq(block.sample_rate.value, defaultRate)) << "the reset does not restore the default";
+        expect(settings.tagCouplings() == table) << "the reset changes the table";
+        const float taggedRate = 4.f * defaultRate;
+        settings.autoUpdate(tagOf(gr::tag::SAMPLE_RATE.key(), taggedRate));
+        std::ignore = settings.applyStagedParameters();
+        expect(eq(block.sample_rate.value, taggedRate)) << "a setting the caller set before the reset does not follow its key";
+    };
+
+    "a reset makes a coupled setting the caller set follow its key again"_test = [] {
+        using namespace qa_follows_tag;
+        FollowingBlock              block;
+        CtxSettings<FollowingBlock> settings{block};
+        settings.init();
+        coupleRateAndLevel(settings);
+        const float defaultRate = block.sample_rate.value;
+        const float setRate     = 2.f * defaultRate;
+        expect(settings.set({{"sample_rate", setRate}}).empty());
+        expect(settings.activateContext().has_value());
+        std::ignore = settings.applyStagedParameters();
+        expect(eq(block.sample_rate.value, setRate)) << "the caller's value does not reach the member";
+        expect(!settings.autoUpdateParameters().contains("sample_rate")) << "the caller's set() leaves the setting following";
+
+        settings.resetDefaults();
+        expect(settings.autoUpdateParameters().contains("sample_rate")) << "the reset leaves the setting out of the following set";
+        const float taggedRate = 3.f * defaultRate;
+        settings.autoUpdate(tagOf(gr::tag::SAMPLE_RATE.key(), taggedRate));
+        std::ignore = settings.applyStagedParameters();
+        expect(eq(block.sample_rate.value, taggedRate)) << "the tag after the reset does not set the setting the caller set";
+    };
+
+    "a reset makes a coupled setting the caller set in another context follow its key there again"_test = [] {
+        using namespace qa_follows_tag;
+        FollowingBlock              block;
+        CtxSettings<FollowingBlock> settings{block};
+        settings.init();
+        coupleRateAndLevel(settings);
+        const float       defaultRate = block.sample_rate.value;
+        const SettingsCtx other{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now() - std::chrono::milliseconds(1)), "x"};
+        expect(settings.set({{"sample_rate", 2.f * defaultRate}}, other).empty());
+        expect(!settings.autoUpdateParameters(other).contains("sample_rate")) << "the caller's set() in the other context leaves the setting following there";
+
+        settings.resetDefaults();
+        expect(settings.autoUpdateParameters(other).contains("sample_rate")) << "the reset leaves the setting out of the other context's following set";
+        expect(settings.activateContext(other).has_value());
+        std::ignore            = settings.applyStagedParameters();
+        const float taggedRate = 3.f * defaultRate;
+        settings.autoUpdate(tagOf(gr::tag::SAMPLE_RATE.key(), taggedRate));
+        std::ignore = settings.applyStagedParameters();
+        expect(eq(block.sample_rate.value, taggedRate)) << "in the other context the tag after the reset does not set the setting";
+    };
+
+    "a reset that settingsChanged() refuses leaves a coupled setting the caller set out of the following set"_test = [] {
+        using namespace qa_follows_tag;
+        constexpr std::string_view kGainKey = "foo:gain";
+        for (const bool byTag : {true, false}) {
+            const std::string_view              path = byTag ? "a reset_default tag" : "resetDefaults()";
+            RefusingFollowingBlock              block;
+            CtxSettings<RefusingFollowingBlock> settings{block};
+            settings.init();
+            settings.setTagCouplings({{"gain", std::string(kGainKey)}});
+            const float setGain = 2.f * block.gain.value;
+            expect(settings.set({{"gain", setGain}}).empty());
+            expect(settings.activateContext().has_value());
+            std::ignore = settings.applyStagedParameters();
+            expect(fatal(eq(block.gain.value, setGain))) << "the caller's value does not reach the member";
+
+            block.refusing = true;
+            std::string refusal;
+            try {
+                if (byTag) {
+                    settings.autoUpdate(Tag{0UZ, property_map{{std::pmr::string(gr::tag::RESET_DEFAULTS.key()), true}}});
+                    std::ignore = settings.applyStagedParameters();
+                } else {
+                    settings.resetDefaults();
+                }
+            } catch (const gr::exception& e) {
+                refusal = e.message;
+            }
+            block.refusing = false;
+            expect(fatal(refusal.contains("the block refuses every change"))) << path << "is not refused";
+            expect(eq(block.gain.value, setGain)) << "the refused reset changes the gain";
+            expect(!settings.autoUpdateParameters().contains("gain")) << "a refusal of" << path << "leaves the gain following its key";
+
+            settings.autoUpdate(tagOf(kGainKey, 3.f * setGain));
+            std::ignore = settings.applyStagedParameters();
+            expect(eq(block.gain.value, setGain)) << "after a refusal of" << path << "a tag changes the gain the caller set";
+        }
+    };
+
+    "a setting coupled before init() follows its key, whatever value the constructor's map gives it"_test = [] {
+        using namespace qa_follows_tag;
+        FollowingBlock              block;
+        CtxSettings<FollowingBlock> settings{block};
+        const float                 constructedRate = 2.f * block.sample_rate.value;
+        settings.setInitBlockParameters({{"sample_rate", constructedRate}});
+        coupleRateAndLevel(settings);
+        settings.init();
+        std::ignore = settings.applyStagedParameters();
+        expect(eq(block.sample_rate.value, constructedRate)) << "the constructor's value does not reach the member";
+        expect(settings.autoUpdateParameters().contains("sample_rate")) << "the constructor's value stops the coupled setting following";
+
+        const float taggedRate = 2.f * constructedRate;
+        settings.autoUpdate(tagOf(gr::tag::SAMPLE_RATE.key(), taggedRate));
+        std::ignore = settings.applyStagedParameters();
+        expect(eq(block.sample_rate.value, taggedRate)) << "the tag does not set a setting coupled before init()";
+    };
+
+    "init() leaves out of the following set a coupled setting the caller set in another context"_test = [] {
+        using namespace qa_follows_tag;
+        FollowingBlock              block;
+        CtxSettings<FollowingBlock> settings{block};
+        const float                 constructedRate = 2.f * block.sample_rate.value;
+        settings.setInitBlockParameters({{"sample_rate", constructedRate}});
+        coupleRateAndLevel(settings);
+        const SettingsCtx other{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now() - std::chrono::milliseconds(1)), "x"};
+        expect(settings.set({{"sample_rate", 3.f * constructedRate}}, other).empty());
+        settings.init();
+        expect(settings.autoUpdateParameters().contains("sample_rate")) << "the constructor's value stops the coupled setting following";
+        expect(!settings.autoUpdateParameters(other).contains("sample_rate")) << "init() makes the setting the caller set in the other context follow its key there";
+    };
+
+    "a context tag's gr:ctx_time selects the set of the context in effect at that time"_test = [] {
+        using namespace qa_follows_tag;
+        FollowingBlock              block;
+        CtxSettings<FollowingBlock> settings{block};
+        settings.init();
+        const auto          now       = std::chrono::system_clock::now();
+        const float         nowGain   = 2.f * block.gain.value;
+        const float         laterGain = 3.f * block.gain.value;
+        const std::uint64_t laterTime = gr::settings::convertTimePointToUint64Ns(now + std::chrono::hours(1));
+        expect(settings.set({{"gain", nowGain}}, SettingsCtx{gr::settings::convertTimePointToUint64Ns(now - std::chrono::milliseconds(1)), "x"}).empty());
+        expect(settings.set({{"gain", laterGain}}, SettingsCtx{laterTime, "x"}).empty());
+
+        settings.autoUpdate(Tag{0UZ, property_map{{gr::tag::CONTEXT.key(), std::string("x")}, {gr::tag::CONTEXT_TIME.key(), laterTime + 1U}}});
+        std::ignore = settings.applyStagedParameters();
+        expect(eq(block.gain.value, laterGain)) << "the tag does not select the set in effect at its gr:ctx_time";
+    };
+
+    "a context tag carrying only gr:trigger_time selects the context's set for now"_test = [] {
+        using namespace qa_follows_tag;
+        FollowingBlock              block;
+        CtxSettings<FollowingBlock> settings{block};
+        settings.init();
+        const auto          now       = std::chrono::system_clock::now();
+        const float         nowGain   = 2.f * block.gain.value;
+        const float         laterGain = 3.f * block.gain.value;
+        const std::uint64_t laterTime = gr::settings::convertTimePointToUint64Ns(now + std::chrono::hours(1));
+        expect(settings.set({{"gain", nowGain}}, SettingsCtx{gr::settings::convertTimePointToUint64Ns(now - std::chrono::milliseconds(1)), "x"}).empty());
+        expect(settings.set({{"gain", laterGain}}, SettingsCtx{laterTime, "x"}).empty());
+
+        settings.autoUpdate(Tag{0UZ, property_map{{gr::tag::CONTEXT.key(), std::string("x")}, {gr::tag::TRIGGER_TIME.key(), laterTime + 1U}}});
+        std::ignore = settings.applyStagedParameters();
+        expect(eq(block.gain.value, nowGain)) << "gr:trigger_time moves the context's activation";
+    };
+
+    "the framework writes no tag for an applied setting"_test = [] {
+        using namespace qa_follows_tag;
+        FollowingBlock              block;
+        CtxSettings<FollowingBlock> settings{block};
+        settings.init();
+        coupleRateAndLevel(settings);
+        const float setRate = 2.f * block.sample_rate.value;
+        std::ignore         = settings.set({{"sample_rate", setRate}, {"level", block.level.value + 1.f}, {"gain", 2.f * block.gain.value}});
+        expect(settings.activateContext().has_value());
+        const ApplyStagedParametersResult setResult = settings.applyStagedParameters();
+        expect(eq(block.sample_rate.value, setRate)) << "the caller's value is not applied";
+        expect(setResult.forwardParameters.empty()) << "a value a caller sets leaves as a tag";
+
+        FollowingBlock              tagged;
+        CtxSettings<FollowingBlock> taggedSettings{tagged};
+        taggedSettings.init();
+        coupleRateAndLevel(taggedSettings);
+        const float taggedRate = 3.f * tagged.sample_rate.value;
+        taggedSettings.autoUpdate(tagOf(gr::tag::SAMPLE_RATE.key(), taggedRate));
+        const ApplyStagedParametersResult tagResult = taggedSettings.applyStagedParameters();
+        expect(eq(tagged.sample_rate.value, taggedRate));
+        expect(tagResult.forwardParameters.empty()) << "a tag's value leaves as a second tag";
+    };
+
+    "a TagCouplings message sets and reads the table, and a refused coupling reaches the message output"_test = [] {
+        using namespace qa_follows_tag;
+        FollowingBlock block{property_map{{"name", std::string("follower")}}};
+        gr::MsgPortOut toBlock;
+        gr::MsgPortIn  fromBlock;
+        expect(fatal(toBlock.connect(block.msgIn).has_value()));
+        expect(fatal(block.msgOut.connect(fromBlock).has_value()));
+        block.init(std::make_shared<gr::Sequence>());
+
+        const property_map couplings{{"sample_rate", std::string(gr::tag::SAMPLE_RATE.key())}, {"level", std::string(kLevelKey)}};
+        gr::sendMessage<gr::message::Command::Set>(toBlock, "", gr::block::property::kTagCouplings, couplings);
+        gr::sendMessage<gr::message::Command::Get>(toBlock, "", gr::block::property::kTagCouplings, property_map{}, "read");
+        gr::sendMessage<gr::message::Command::Set>(toBlock, "", gr::block::property::kTagCouplings, property_map{{"gain", std::string(gr::tag::RESET_DEFAULTS.key())}});
+        block.processScheduledMessages();
+        expect(block.settings().tagCouplings() == couplings) << "the Set message does not reach the table";
+
+        std::optional<property_map> read;
+        std::string                 errors;
+        ReaderSpanLike auto         messages = fromBlock.streamReader().get<SpanReleasePolicy::ProcessAll>();
+        for (const gr::Message& message : messages) {
+            if (!message.data.has_value()) {
+                errors += message.data.error().message;
+            } else if (message.clientRequestID == "read") {
+                read = *message.data;
+            }
+        }
+        std::ignore = messages.consume(messages.size());
+        expect(read == std::optional<property_map>(couplings)) << "the Get message does not return the table";
+        expect(errors.contains("gain") && errors.contains(gr::tag::RESET_DEFAULTS.key())) << "the refused coupling does not reach the message output: " << errors;
+
+        const float taggedRate = 2.f * block.sample_rate.value;
+        block.settings().autoUpdate(tagOf(gr::tag::SAMPLE_RATE.key(), taggedRate));
+        std::ignore = block.settings().applyStagedParameters();
+        expect(eq(block.sample_rate.value, taggedRate)) << "the setting the message coupled does not follow its key";
     };
 };
 
@@ -2358,7 +2895,7 @@ const boost::ut::suite<"a reset whose callbacks read the settings"> resetCallbac
             }
             const bool returned = resetReturns(block, [byTag](SettingsReadingReset& target) {
                 if (byTag) {
-                    target.settings().autoUpdate(qa_refusals::flagTag(gr::tag::RESET_DEFAULTS.shortKey()));
+                    target.settings().autoUpdate(qa_refusals::flagTag(gr::tag::RESET_DEFAULTS.key()));
                     std::ignore = target.settings().applyStagedParameters();
                 } else {
                     target.processScheduledMessages();
@@ -2427,6 +2964,7 @@ const boost::ut::suite<"a value a callback stages during an apply"> callbackStag
         for (const StagingPath path : {StagingPath::resetTag, StagingPath::storeTag, StagingPath::contextActivation, StagingPath::resetCall}) {
             StagingCallbacks block;
             block.init(std::make_shared<gr::Sequence>());
+            qa_coupling::couple(block.settings(), "gain", "gain");
             const float defaultGain  = block.gain.value;
             const float stagedOffset = block.offset.value + 2.f;
             const float offsetBefore = block.offset.value;
@@ -2439,11 +2977,11 @@ const boost::ut::suite<"a value a callback stages during an apply"> callbackStag
 
             switch (path) {
             case StagingPath::resetTag:
-                block.settings().autoUpdate(qa_refusals::flagTag(gr::tag::RESET_DEFAULTS.shortKey()));
+                block.settings().autoUpdate(qa_refusals::flagTag(gr::tag::RESET_DEFAULTS.key()));
                 block.applyChangedSettings();
                 break;
             case StagingPath::storeTag:
-                block.settings().autoUpdate(Tag{0UZ, property_map{{std::pmr::string(gr::tag::STORE_DEFAULTS.shortKey()), true}, {"gain", 2.f * defaultGain}}});
+                block.settings().autoUpdate(Tag{0UZ, property_map{{std::pmr::string(gr::tag::STORE_DEFAULTS.key()), true}, {"gain", 2.f * defaultGain}}});
                 block.applyChangedSettings();
                 break;
             case StagingPath::contextActivation:

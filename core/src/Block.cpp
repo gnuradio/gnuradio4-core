@@ -29,6 +29,7 @@ void BlockBase::initStandardPropertyCallbacks() noexcept {
         {block::property::kActiveContext, &BlockBase::propertyCallbackActiveContext},
         {block::property::kSettingsCtx, &BlockBase::propertyCallbackSettingsCtx},
         {block::property::kSettingsContexts, &BlockBase::propertyCallbackSettingsContexts},
+        {block::property::kTagCouplings, &BlockBase::propertyCallbackTagCouplings},
         {block::property::kMetaInformation, &BlockBase::propertyCallbackMetaInformation},
         {block::property::kUiConstraints, &BlockBase::propertyCallbackUiConstraints},
     };
@@ -321,7 +322,7 @@ std::optional<Message> BlockBase::propertyCallbackActiveContext(std::string_view
         const auto& dataMap = message.data.value();
 
         std::string contextStr;
-        if (auto it = dataMap.find(gr::tag::CONTEXT.shortKey()); it != dataMap.end()) {
+        if (auto it = dataMap.find(gr::settings::kContextField); it != dataMap.end()) {
             if (const auto str = it->second.value_or(std::string_view{}); str.data()) {
                 contextStr = str;
             } else {
@@ -332,7 +333,7 @@ std::optional<Message> BlockBase::propertyCallbackActiveContext(std::string_view
         }
 
         std::uint64_t time = 0;
-        if (auto it = dataMap.find(gr::tag::CONTEXT_TIME.shortKey()); it != dataMap.end()) {
+        if (auto it = dataMap.find(gr::settings::kContextTimeField); it != dataMap.end()) {
             if (const std::uint64_t* timePtr = it->second.get_if<std::uint64_t>(); timePtr) {
                 time = *timePtr;
             }
@@ -351,9 +352,32 @@ std::optional<Message> BlockBase::propertyCallbackActiveContext(std::string_view
     if (message.cmd == Get || message.cmd == Set) {
         const auto& ctx = cbSettings().activeContext();
         message.data    = property_map{
-               {gr::tag::CONTEXT.shortKey(), ctx.context},  //
-               {gr::tag::CONTEXT_TIME.shortKey(), ctx.time} //
+               {std::pmr::string(gr::settings::kContextField), ctx.context}, //
+               {std::pmr::string(gr::settings::kContextTimeField), ctx.time} //
         };
+        return message;
+    }
+
+    throw gr::exception(std::format("block {} property {} does not implement command {}, msg: {}", cbUniqueName(), propertyName, message.cmd, message));
+}
+
+std::optional<Message> BlockBase::propertyCallbackTagCouplings(std::string_view propertyName, Message message) {
+    using enum gr::message::Command;
+    assert(propertyName == block::property::kTagCouplings);
+
+    if (message.cmd == Set) {
+        if (!message.data.has_value()) {
+            throw gr::exception(std::format("block {} (aka. {}) cannot set {} w/o data msg: {}", cbUniqueName(), cbName(), propertyName, message));
+        }
+        cbSettings().setTagCouplings(*message.data);
+        if (message.clientRequestID.empty()) {
+            return std::nullopt;
+        }
+        message.cmd  = Final;
+        message.data = cbSettings().tagCouplings();
+        return message;
+    } else if (message.cmd == Get) {
+        message.data = cbSettings().tagCouplings();
         return message;
     }
 
@@ -371,7 +395,7 @@ std::optional<Message> BlockBase::propertyCallbackSettingsCtx(std::string_view p
     const auto& dataMap = message.data.value();
 
     std::string contextStr;
-    if (auto it = dataMap.find(gr::tag::CONTEXT.shortKey()); it != dataMap.end()) {
+    if (auto it = dataMap.find(gr::settings::kContextField); it != dataMap.end()) {
         if (const auto str = it->second.value_or(std::string_view{}); str.data()) {
             contextStr = str;
         } else {
@@ -382,7 +406,7 @@ std::optional<Message> BlockBase::propertyCallbackSettingsCtx(std::string_view p
     }
 
     std::uint64_t time = 0;
-    if (auto it = dataMap.find(gr::tag::CONTEXT_TIME.shortKey()); it != dataMap.end()) {
+    if (auto it = dataMap.find(gr::settings::kContextTimeField); it != dataMap.end()) {
         if (const std::uint64_t* timePtr = it->second.get_if<std::uint64_t>(); timePtr) {
             time = *timePtr;
         }

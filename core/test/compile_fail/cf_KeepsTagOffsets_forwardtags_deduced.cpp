@@ -2,8 +2,8 @@
 
 #include <gnuradio-4.0/Graph.hpp>
 
-// The override deduces its return type from a body that reads the tag window, and the window depends on whether the
-// block has an override. The probe cannot see this override, and the work path still calls it.
+// On a 1:1 block the tag window depends on whether the block supplies forwardTags(). This override deduces its return
+// type from a body that reads the window. hasForwardTagsOverride() answers no for it, yet the work path calls it.
 struct DeducedForwarderBlock : gr::Block<DeducedForwarderBlock> {
     gr::PortIn<float>  in;
     gr::PortOut<float> out;

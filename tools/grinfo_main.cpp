@@ -562,9 +562,9 @@ struct Setting {
     std::string                   description;
     std::string                   documentation;
     std::string                   enumValues;
-    bool                          writable      = false;
-    bool                          autoForwarded = false;
-    bool                          visible       = true;
+    std::string                   tagKey; // the tag key the instance couples the setting to, empty for none
+    bool                          writable = false;
+    bool                          visible  = true;
 };
 
 enum class KeyOrigin : std::uint8_t { ThisProgram, BlockLibrary, Plugin, LinkedLibrary, NotAttributed };
@@ -712,7 +712,7 @@ void collectSettings(const gr::BlockModel& block, std::vector<Setting>& into) {
     const gr::property_map&      meta      = block.metaInformation();
     const gr::property_map       defaults  = settings.defaultParameters();
     const std::set<std::string>& writable  = settings.writableMembers();
-    const std::set<std::string>& forwarded = settings.autoForwardParameters();
+    const gr::property_map       couplings = settings.tagCouplings();
 
     std::set<std::string> names(writable.begin(), writable.end());
     for (const auto& [name, _] : defaults) {
@@ -731,7 +731,7 @@ void collectSettings(const gr::BlockModel& block, std::vector<Setting>& into) {
         setting.documentation = metaString(meta, name + "::documentation");
         setting.enumValues    = metaString(meta, name + "::enum_values");
         setting.writable      = writable.contains(name);
-        setting.autoForwarded = forwarded.contains(name);
+        setting.tagKey        = metaString(couplings, name);
         if (const auto visible = meta.find(name + "::visible"); visible != meta.cend()) {
             setting.visible = visible->second.value_or(true);
         }
@@ -1460,7 +1460,7 @@ void writeSetting(JsonWriter& json, const Setting& setting) {
     json.member("documentation", setting.documentation);
     json.member("enumValues", setting.enumValues);
     json.flag("writable", setting.writable);
-    json.flag("autoForwarded", setting.autoForwarded);
+    json.member("tagKey", setting.tagKey);
     json.flag("visible", setting.visible);
     json.flag("framework", std::ranges::contains(kFrameworkSettings, std::string_view(setting.name)));
     json.endObject();

@@ -131,7 +131,7 @@ applySettingsAndCheckLifecycle(requestedWork) → optional<Result>
 computeSampleLimits(requestedWork) → SampleLimits
     │  reads port caches, tag positions, resampling, chunk limits
     v
-[skip-before handling]  — stride: consume samples before the processing window
+[skip-before handling]  — stride: consume the skipped samples; the default forwarder forwards their tags
     v
 [EOS check]  — if end-of-stream, publish EOS and return DONE
     v

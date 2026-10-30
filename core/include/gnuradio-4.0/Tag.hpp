@@ -1,7 +1,9 @@
 #ifndef GNURADIO_TAG_HPP
 #define GNURADIO_TAG_HPP
 
+#include <algorithm>
 #include <exception> // for std::terminate
+#include <vector>
 
 #include <gnuradio-4.0/meta/formatter.hpp>
 #include <gnuradio-4.0/meta/reflection.hpp>
@@ -148,6 +150,52 @@ inline void updateMaps(const pmt::Value::Map& src, pmt::Value::Map& dest) {
 
 inline constexpr fixed_string GR_TAG_PREFIX = "gr:";
 
+namespace tag {
+/// the domain of a tag key: the text before its first colon, empty for a key with no colon
+[[nodiscard]] constexpr std::string_view domainOf(std::string_view key) noexcept {
+    const std::size_t colon = key.find(':');
+    return colon == std::string_view::npos ? std::string_view{} : key.substr(0UZ, colon);
+}
+
+/// the name of a tag key: the text after its first colon, the whole key for a key with no colon
+[[nodiscard]] constexpr std::string_view nameOf(std::string_view key) noexcept {
+    const std::size_t colon = key.find(':');
+    return colon == std::string_view::npos ? key : key.substr(colon + 1UZ);
+}
+
+/// the key in its one spelling: `:name` and `name` are one key in the default domain, spelled `name`
+[[nodiscard]] constexpr std::string_view canonicalKey(std::string_view key) noexcept { return key.starts_with(':') ? key.substr(1UZ) : key; }
+
+/// the domain of the keys GNU Radio's framework and its own blocks emit
+inline constexpr std::string_view kGrDomain = "gr";
+
+/// rewrites each top-level key with a leading colon to its canonical spelling; a key present in both spellings keeps
+/// the value of its canonical spelling
+inline void canonicalizeKeys(property_map& map) {
+    if (std::ranges::none_of(map, [](const auto& entry) { return entry.first.starts_with(':'); })) {
+        return;
+    }
+    std::vector<std::pair<std::pmr::string, pmt::Value>> moved;
+    for (auto it = map.begin(); it != map.end();) {
+        if (it->first.starts_with(':')) {
+            moved.emplace_back(std::pmr::string(canonicalKey(it->first), map.get_allocator().resource()), std::move(it->second));
+            it = map.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto& [key, value] : moved) {
+        map.try_emplace(std::move(key), std::move(value));
+    }
+}
+} // namespace tag
+
+/**
+ * @brief A tag key in the `gr:` domain, with its value type, unit and description.
+ *
+ * `key()` is the key a tag map holds, `gr:` and the name. `name()` is the name alone, for a setting, a field or a
+ * record that shares it. A string equals the constant when its canonical spelling is `key()`.
+ */
 template<fixed_string Key, typename PMT_TYPE, fixed_string Unit = "", fixed_string Description = "">
 class DefaultTag {
     constexpr static fixed_string _key = GR_TAG_PREFIX + Key;
@@ -156,7 +204,7 @@ public:
     using value_type = PMT_TYPE;
 
     [[nodiscard]] constexpr const char* key() const noexcept { return std::string_view(_key).data(); }
-    [[nodiscard]] constexpr const char* shortKey() const noexcept { return std::string_view(Key).data(); }
+    [[nodiscard]] constexpr const char* name() const noexcept { return std::string_view(Key).data(); }
     [[nodiscard]] constexpr const char* unit() const noexcept { return std::string_view(Unit).data(); }
     [[nodiscard]] constexpr const char* description() const noexcept { return std::string_view(Description).data(); }
 
@@ -171,31 +219,13 @@ public:
 };
 
 template<fixed_string Key, typename PMT_TYPE, fixed_string Unit, fixed_string Description, gr::meta::string_like TOtherString>
-constexpr std::strong_ordering operator<=>(const DefaultTag<Key, PMT_TYPE, Unit, Description>& dt, const TOtherString& str) noexcept {
-    if ((dt.shortKey() <=> str) == 0) {
-        return std::strong_ordering::equal; // shortKeys are equal
-    } else {
-        return dt.key() <=> str; // compare key()
-    }
-}
-
-template<fixed_string Key, typename PMT_TYPE, fixed_string Unit, fixed_string Description, gr::meta::string_like TOtherString>
-constexpr std::strong_ordering operator<=>(const TOtherString& str, const DefaultTag<Key, PMT_TYPE, Unit, Description>& dt) noexcept {
-    if ((str <=> dt.shortKey()) == std::strong_ordering::equal) {
-        return std::strong_ordering::equal; // shortKeys are equal
-    } else {
-        return str <=> dt.key(); // compare key()
-    }
-}
-
-template<fixed_string Key, typename PMT_TYPE, fixed_string Unit, fixed_string Description, gr::meta::string_like TOtherString>
 constexpr bool operator==(const DefaultTag<Key, PMT_TYPE, Unit, Description>& dt, const TOtherString& str) noexcept {
-    return (dt <=> std::string_view(str)) == 0;
+    return tag::canonicalKey(std::string_view(str)) == std::string_view(dt.key());
 }
 
 template<fixed_string Key, typename PMT_TYPE, fixed_string Unit, fixed_string Description, gr::meta::string_like TOtherString>
 constexpr bool operator==(const TOtherString& str, const DefaultTag<Key, PMT_TYPE, Unit, Description>& dt) noexcept {
-    return (std::string_view(str) <=> dt) == 0;
+    return dt == str;
 }
 
 namespace tag { // definition of default tags and names
@@ -207,7 +237,7 @@ inline EM_CONSTEXPR_STATIC DefaultTag<"signal_quantity", std::string, "", "signa
 inline EM_CONSTEXPR_STATIC DefaultTag<"signal_unit", std::string, "", "signal's physical SI unit"> SIGNAL_UNIT;
 inline EM_CONSTEXPR_STATIC DefaultTag<"signal_min", float, "a.u.", "signal physical max. (e.g. DAQ) limit"> SIGNAL_MIN;
 inline EM_CONSTEXPR_STATIC DefaultTag<"signal_max", float, "a.u.", "signal physical max. (e.g. DAQ) limit"> SIGNAL_MAX;
-inline EM_CONSTEXPR_STATIC DefaultTag<"n_dropped_samples", gr::Size_t, "", "number of dropped samples"> N_DROPPED_SAMPLES;
+inline EM_CONSTEXPR_STATIC DefaultTag<"n_dropped_samples", gr::Size_t, "", "number of dropped samples of the stream the tag was written on"> N_DROPPED_SAMPLES;
 inline EM_CONSTEXPR_STATIC DefaultTag<"frequency", double, "Hz", "signal center frequency"> FREQUENCY;
 inline EM_CONSTEXPR_STATIC DefaultTag<"rx_overflow", bool, "", "RX overflow indicator"> RX_OVERFLOW;
 inline EM_CONSTEXPR_STATIC DefaultTag<"trigger_name", std::string> TRIGGER_NAME;
@@ -216,7 +246,7 @@ inline EM_CONSTEXPR_STATIC DefaultTag<"trigger_offset", float, "s", "sample dela
 inline EM_CONSTEXPR_STATIC DefaultTag<"trigger_meta_info", property_map, "", "maps containing additional trigger information"> TRIGGER_META_INFO;
 inline EM_CONSTEXPR_STATIC DefaultTag<"local_time", uint64_t, "ns", "UTC-based time-stamp (host)"> LOCAL_TIME; // should be only in 'TRIGGER_META_INFO', used for metering sample vs. time propagation delays
 inline EM_CONSTEXPR_STATIC DefaultTag<"context", std::string, "", "multiplexing key to orchestrate node settings/behavioural changes"> CONTEXT;
-inline EM_CONSTEXPR_STATIC DefaultTag<"time", std::uint64_t, "", "multiplexing UTC-time in [ns] when ctx should be applied"> CONTEXT_TIME; // TODO: for backward compatibility -> rename to `ctx_time'
+inline EM_CONSTEXPR_STATIC DefaultTag<"ctx_time", std::uint64_t, "ns", "UTC time at which the tag's context takes effect"> CONTEXT_TIME;
 inline EM_CONSTEXPR_STATIC DefaultTag<"reset_default", bool, "", "reset block state to stored default"> RESET_DEFAULTS;
 inline EM_CONSTEXPR_STATIC DefaultTag<"store_default", bool, "", "store block settings as default"> STORE_DEFAULTS;
 inline EM_CONSTEXPR_STATIC DefaultTag<"end_of_stream", bool, "", "end of stream, receiver should change to DONE state"> END_OF_STREAM;
@@ -224,7 +254,8 @@ inline EM_CONSTEXPR_STATIC DefaultTag<"tx_sob", bool, "", "start of a transmit b
 inline EM_CONSTEXPR_STATIC DefaultTag<"tx_eob", bool, "", "end of a transmit burst, on the burst's last sample"> TX_EOB;
 inline EM_CONSTEXPR_STATIC DefaultTag<"tx_time", std::uint64_t, "ns", "UTC time at which the tagged sample, a burst's first, leaves the antenna"> TX_TIME;
 
-inline constexpr std::array<std::string_view, 22> kDefaultTags = {"sample_rate", "frequency", "signal_name", "num_channels", "signal_quantity", "signal_unit", "signal_min", "signal_max", "n_dropped_samples", "rx_overflow", "trigger_name", "trigger_time", "trigger_offset", "trigger_meta_info", "context", "time", "reset_default", "store_default", "end_of_stream", "tx_sob", "tx_eob", "tx_time"};
+/// the gr: keys the framework itself acts on in every block a tag reaches; no setting may be coupled to one
+inline constexpr std::array<std::string_view, 5> kControlKeys = {END_OF_STREAM.key(), RESET_DEFAULTS.key(), STORE_DEFAULTS.key(), CONTEXT.key(), CONTEXT_TIME.key()};
 
 template<typename T>
 inline void put(property_map& map, std::string_view key, T&& value) {
@@ -233,9 +264,9 @@ inline void put(property_map& map, std::string_view key, T&& value) {
 }
 
 template<typename T, fixed_string Key, typename PMT_TYPE, fixed_string Unit, fixed_string Description>
-inline void put(property_map& map, const DefaultTag<Key, PMT_TYPE, Unit, Description>& /*tag*/, T&& value) {
-    auto* res                       = map.get_allocator().resource();
-    map[std::pmr::string(Key, res)] = pmt::Value(std::forward<T>(value), res);
+inline void put(property_map& map, const DefaultTag<Key, PMT_TYPE, Unit, Description>& defaultTag, T&& value) {
+    auto* res                                    = map.get_allocator().resource();
+    map[std::pmr::string(defaultTag.key(), res)] = pmt::Value(std::forward<T>(value), res);
 }
 
 } // namespace tag

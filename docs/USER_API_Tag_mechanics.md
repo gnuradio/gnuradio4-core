@@ -1,7 +1,7 @@
 # Tag mechanics — User-API Reference
 
 Tags are key-value metadata attached to specific sample positions in a data stream. They carry
-signal descriptions (`sample_rate`, `signal_name`, ...), trigger events, context switches, and
+signal descriptions (`gr:sample_rate`, `gr:signal_name`, ...), trigger events, context switches, and
 user-defined metadata. Tags propagate through the graph alongside samples — the framework handles
 forwarding, settings synchronisation, and position tracking automatically unless the block opts out.
 
@@ -10,23 +10,25 @@ of annotated signal data.
 
 ## TL;DR
 
+- **Keys**: a tag key is `domain:name`. Only GNU Radio defines a new `gr:` key. Any block may write
+  or read a `gr:` key with the meaning GNU Radio gives it. A block's new keys go in its author's own
+  domain. A key with no colon is in the default domain, and `:name` and `name` are one key. The
+  constants in `gr::tag::` (`SAMPLE_RATE`, `TRIGGER_NAME`, ...) hold the `gr:` keys.
 - **processBulk**: read tags via `input.tags()` on the InputSpan. Publish via
-  `outSpan.publishTag(map, offset)`. The framework forwards every tag key across a block with
-  synchronous ports and no resampling, stride, tag-propagation policy or `forwardTags()` override.
-  Other blocks forward the standard keys alone. The block's author makes sure that a tag arriving
-  at input offset `t` belongs at output offset `t`.
+  `outSpan.publishTag(map, offset)`.
 - **processOne**: check `inputTagsPresent()`, read via `mergedInputTag()` (returns `const Tag&`, once
   per work call). Publish via `this->publishTag(map)` — the framework places it at the correct sample
   offset.
-- **Forwarding policies**: default (forward), `BackwardTagPropagation`, or `NoTagPropagation`.
-  `FilteredTagPropagation` keeps the standard keys alone on a block that would forward every key.
-  `DroppedTagKeys<"key", ...>` drops the listed keys and forwards the rest.
-  Override `forwardTags()` for full custom control.
-- A **negative `relIndex`** is a tag deferred out of an earlier chunk and not yet forwarded — not a
-  tag seen twice. A custom `forwardTags()` reading more than `tags(1)` is the one case where it is.
+- **Forwarding**: every block forwards every key of every tag, on the output sample its input sample
+  maps to. `DroppedTagKeys<"key", ...>` drops the listed keys. `NoTagPropagation` forwards nothing.
+  `BackwardTagPropagation` puts every tag of a chunk on the chunk's first output sample. Override
+  `forwardTags()` for full custom control.
+- **Settings**: a tag sets a setting only where the application or the graph couples the setting to
+  the tag's key: `settings().setTagCouplings()`, a graph file's `tag_couplings` or a `TagCouplings`
+  message. The framework writes no tag for a setting.
 - Tags are **never merged** across different positions or sources. No implicit data loss.
-- **Contexts** (`context` + `time` keys) switch entire settings presets per sample — a pipeline can
-  coherently shift between different operating modes.
+- **Contexts** (`gr:context` and `gr:ctx_time` keys) switch entire settings presets per sample — a
+  pipeline can coherently shift between different operating modes.
 
 ---
 
@@ -63,10 +65,10 @@ at sample 0):
             0  1  2  3  4  5  6  7
 ```
 
-Standard tag keys are defined in `gr::tag::` (`SAMPLE_RATE`, `SIGNAL_NAME`, ...). Any string key is
-valid. Standard keys cross every forwarding block and update downstream settings. Any other key
-crosses a block with synchronous ports and no resampling, stride, tag-propagation policy or
-`forwardTags()` override (see "Which keys a forwarded tag carries" below).
+Standard tag keys are defined in `gr::tag::` (`SAMPLE_RATE`, `SIGNAL_NAME`, ...) and are `gr:` keys.
+Any string key is valid. Every key crosses every block that forwards tags (see "Automatic tag
+forwarding" below). A key sets a downstream setting only where that block couples the setting to it
+(see the settings section below).
 
 ---
 
@@ -90,8 +92,13 @@ work::Status processBulk(InputSpanLike auto& input, OutputSpanLike auto& output)
 Use `input.tags(n)` to limit to tags within the first `n` samples. For raw access (manual
 consumption): `input.rawTags` is the underlying `ReaderSpan<Tag>`.
 
-A negative `relIndex` is a tag that lies before the current span — it was left in the tag buffer by
-an earlier chunk and has not been forwarded yet. See "Deferred tags and negative relative indices".
+A negative `relIndex` is a tag that lies before the current span. The input span retires only the
+tags at the chunk's first sample on a block with a `forwardTags()` override, and on a block with
+`Stride<>`, an asynchronous stream port or `NoTagPropagation` that declares neither `Resampling<>`
+nor `BackwardTagPropagation`. On such a block a tag inside an earlier chunk arrives this way in the
+next call (see "Where a forwarded tag lands"). On a block declaring `Stride<>` and supplying
+`forwardTags()`, the tags of the samples a stride skipped arrive this way too (see "Custom tag
+forwarding — `forwardTags()`").
 
 ### processOne
 
@@ -124,10 +131,14 @@ Publish directly on the OutputSpan:
 
 ```cpp
 work::Status processBulk(InputSpanLike auto& input, OutputSpanLike auto& output) {
-    output.publishTag({{"trigger_name", "peak_detected"}}, 42); // at sample offset 42
+    output.publishTag({{"my:event", "peak_detected"}}, 42); // at sample offset 42
     return work::Status::OK;
 }
 ```
+
+A block publishes the keys it defines in its author's own domain, here `my:`. Only GNU Radio
+defines a `gr:` key. Any block may publish one, `gr:trigger_name` for instance, with the meaning
+GNU Radio gives it.
 
 ### processOne
 
@@ -136,7 +147,7 @@ Use `this->publishTag()` — the framework determines the correct sample offset:
 ```cpp
 T processOne(T input) noexcept {
     if (input > threshold) {
-        this->publishTag({{"trigger_name", "threshold_crossed"}});
+        this->publishTag({{"my:event", "threshold_crossed"}});
     }
     return input;
 }
@@ -154,31 +165,51 @@ the attempt is refused, reported on `stderr` and the tag dropped, rather than re
 reservation and handing the downstream block ring slots nobody wrote. Publish through the span —
 `outSpan.publishTag(map, offset)` in `processBulk` — not through the port, and not via
 `this->publishTag(map)`, which goes to the ports directly outside processOne dispatch. The framework
-follows the same rule for the settings tags it forwards on your behalf, including a setting a block
-stages from inside its own `processBulk` before calling `requestStop()`: those parameters are applied
-and forwarded on that same work call, through the span it is already holding, just before the
-end-of-stream tag.
+follows the same rule for the forward map a block's `settingsChanged()` fills, including for a setting
+a block stages from inside its own `processBulk` before calling `requestStop()`: the setting is
+applied and the forward map published on that same work call, through the span it is already
+holding, just before the end-of-stream tag.
 
 ---
 
 ## Automatic tag forwarding
 
-The framework forwards tags from input to output automatically. The built-in policies below are
-selected via CRTP arguments. The first four choose where a forwarded tag lands, and the last two
-choose which keys it carries. For full custom control, override `forwardTags()` (see below).
+The framework forwards tags from input to output automatically. Every block forwards every key of
+every tag it reads, on every synchronous output. A block changes this in four ways:
 
-### Default (forward tag forwarding)
+- `DroppedTagKeys<"key", ...>` drops the listed keys and forwards the rest.
+- `BackwardTagPropagation` puts every tag of a chunk on the chunk's first output sample.
+- `NoTagPropagation` forwards no tag. The block publishes its own.
+- An override of `forwardTags()` replaces the default forwarder (see below).
+
+### Where a forwarded tag lands
 
 ```cpp
 struct MyBlock : gr::Block<MyBlock> { ... };
 ```
 
-The default policy breaks chunks at tag boundaries. On a key-filtered block it forwards only the tag
-at position 0 of each chunk. Tags at later positions within the chunk are NOT consumed — they carry
-over to the next chunk where they appear at position 0 (shifted forward). A block forwarding every
-key retires the whole chunk and forwards each tag at its own position. "Which keys a forwarded tag
-carries" below names the blocks of each kind. Each forwarded key is forwarded with value
-substitution (the block's current value replaces the tag value if modified).
+A block keeps tag offsets (`keepsTagOffsets()`) where it has only synchronous stream ports and
+declares none of `Resampling<>`, `Stride<>`, `NoTagPropagation`, `BackwardTagPropagation` or a
+`forwardTags()` override. Its default forwarder places every tag of the call's chunk at the tag's
+own offset, before the call. On a block with `Stride<>` or an asynchronous stream port, the
+framework ends a chunk at the next tag, so a tag sits on the first sample of its chunk, and the
+forwarder places it on the call's first output sample.
+
+| Block declares                              | A tag of a call leaves at                                                      |
+| ------------------------------------------- | ------------------------------------------------------------------------------ |
+| nothing, with only synchronous stream ports | its own offset                                                                 |
+| `Stride<>` or an asynchronous stream port   | the call's first output sample                                                 |
+| `Resampling<>`                              | output index `floor(i * output_chunk_size / input_chunk_size)`, after the call |
+| `BackwardTagPropagation`                    | output index 0, the chunk's first output sample                                |
+| `Stride<>`, skipped sample                  | the next chunk's first output sample, or the end-of-stream index               |
+
+On a block declaring `Resampling<>`, `i` is the tag's input index among the samples the call
+consumed. The forwarder places those tags after the call, merged by index with the block's own. The
+tags of the samples the call did not consume stay on the input for a later call. A tag past the
+samples an output span publishes leaves at the end of what it publishes. On a block declaring an
+overlapping `Stride<>`, the chunk that consumes a tag's sample forwards it, and a chunk that only
+reads the sample does not. When a stream ends, the tags at or past the block's read position, up to
+the first end-of-stream tag on any synchronous input, leave at the end-of-stream index.
 
 ```
   input:    ▽           ▼              ▽
@@ -190,89 +221,61 @@ substitution (the block's current value replaces the tag value if modified).
   chunk 2:              ├──────────────┤           processedIn=5  (▼ at 4, next tag at 9)
   chunk 3:                             ├─────┤     processedIn=2  (▽ at 9, end of data)
 
-  output:   ▽           ▼              ▽           tags forwarded at chunk start (offset 0)
+  output:   ▽           ▼              ▽           each tag at its own sample
 ```
 
-Each chunk starts at a tag and extends to the next tag (or end of available data). The tag is always
-at relIndex 0 of its chunk — at most one tagged sample per chunk, the rest are tag-free. This
-applies equally to processOne and processBulk blocks.
+`min_samples` on an input port and `input_chunk_size > 1` on a resampling block put a floor under
+the chunk. A tag closer than that to the chunk's start stays inside the chunk. A block that keeps
+tag offsets places it at its own offset, and its settings take effect from the chunk's first sample.
+On a resampling block the forwarder places it at its own mapped sample, and its settings take effect
+after the call that consumes it, once. On a block with `Stride<>` or an asynchronous stream port the
+tag stays on the input and returns in the next call at a negative relative index. It leaves there,
+once, on that call's first output sample, and its settings take effect from that call's first
+sample.
 
-Tags NOT at position 0 of their chunk are unconsumed and shift forward:
+A block that keeps tag offsets forwards the tags of the whole chunk before the call. Where it
+consumes fewer samples than the chunk holds, a tag the call did not consume leaves again at each
+later call that reads it. Where it publishes fewer samples than it consumes, a tag past what it
+publishes keeps its offset. A tag behind the read position that no span retired does not leave at
+the end of the stream.
 
-```
-  input:    ▽     ▼  ▽                         tags at 0, 2, 3
-            │     │  │
-  samples: ─┬──┬──┬──┬──┬──┬──┬──┬─
-            0  1  2  3  4  5  6  7
-
-  chunk 1:  ├─────┤                            processedIn=2  (▽ at 0, next tag at 2)
-                                               only tag at 0 consumed → ▽(3) stays in buffer
-  chunk 2:        ├──┤                         processedIn=1  (▼ at 2, next tag at 3)
-  chunk 3:           ├──────────────┤          processedIn=5  (▽ at 3, no more tags)
-
-  output:   ▽     ▼  ▽                         tags forwarded at position 0 of their chunk
-```
-
-### Deferred tags and negative relative indices
-
-A chunk cannot always be broken at a tag: `min_samples` on an input port and `input_chunk_size > 1`
-on a resampling block both put a floor under the chunk, and `ForwardTagPropagation` disables the
-break outright. The tag then stays interior to the chunk. On a key-filtered block the framework
-leaves it in the tag buffer. An input span retires only the tags at `relIndex <= 0`, the window the
-default forwarder reads with `tags(1)`. By the next chunk the stream position has passed
-that tag, so it appears again at a **negative** `relIndex`. A block forwarding every key retires the
-whole chunk instead and publishes an interior tag at its own offset. No tag returns to it at a
-negative `relIndex`.
-
-A negative `relIndex` therefore means "deferred, not yet forwarded". The default forwarder clamps it
-to output offset 0 and publishes it there: the tag's first and only publication, late by the distance
-it was carried. Dropping negative-index tags instead would silently lose every tag
-that could not become a chunk boundary — for a decimator with `input_chunk_size = 4` and tags at
-input samples 0, 1, 2, 5, 6 and 9, five of the six arrive this way (`core/test/qa_TagForwarding.cpp`
-measures both shapes).
+A 4:1 decimator (`Resampling<4, 1>`) that consumes every chunk it reads, with tags at input samples
+0, 1, 2, 5, 6 and 9:
 
 ```
-  input:    ▽  ▽  ▽                          tags at 0, 1, 2       input_chunk_size = 4
-            │  │  │
-  samples: ─┬──┬──┬──┬──┬──┬──┬──┬─
-            0  1  2  3  4  5  6  7
+  input:    ▽  ▽  ▽        ▽  ▽        ▽         input_chunk_size = 4
+            │  │  │        │  │        │
+  samples: ─┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬─
+            0  1  2  3  4  5  6  7  8  9  10 11
 
-  chunk 1:  ├───────────┤                    relIndex 0 forwarded, 1 and 2 stay in the buffer
-  chunk 2:              ├───────────┤        the same two now at relIndex -3 and -2,
-                                             both clamped to output offset 0
+  output:   ▽▽▽            ▽▽          ▽         floor(i / 4): 0, 0, 0, 1, 1, 2
+            │              │           │
+  samples: ─┬──────────────┬───────────┬─
+            0              1           2
 ```
 
-The carry is bounded by the stream: a tag deferred out of the last chunk has no next chunk to arrive
-in and goes down with the buffer.
+### The block author's part
 
-### Forward tag propagation (`ForwardTagPropagation`)
+The framework places a tag by the block's declarations alone. It cannot check sample positions.
+**A tag must belong at the output sample the table above gives it.** Nothing checks this rule. A
+block whose output samples do not stand there declares `NoTagPropagation` and publishes its own tags,
+or supplies `forwardTags()`. Such blocks are
 
-```cpp
-struct FFTBlock : gr::Block<FFTBlock, gr::ForwardTagPropagation, gr::Resampling<1024, 1024>> { ... };
-```
-
-For fixed-chunk blocks (FFT, filter banks): chunk size is NOT broken by tag positions. Tags at
-position 0 are forwarded immediately. Tags at other positions within the chunk are NOT consumed —
-they carry forward to the next chunk where they appear at position 0.
-
-```
-  input:    ▽        ▼                         tags at 0 and 3
-            │        │
-  samples: ─┬──┬──┬──┬──┬──┬──┬──┬──┬──┬─     input_chunk_size = 10
-            0  1  2  3  4  5  6  7  8  9
-
-  chunk:    ├─────────────────────────────┤     processedIn=10  (chunk NOT broken at tag 3)
-                                                ▽ at 0 forwarded, ▼ at 3 carries to next chunk
-```
+- a delay, which shifts every sample,
+- a block that drops samples without declaring `Resampling<>`, as one that keeps every Nth sample,
+- a block that reframes its input, as a packet framer or a deinterleaver,
+- a block with an asynchronous stream port, and
+- a rate change whose tags must account for a filter's group delay.
 
 ### Backward tag propagation (`BackwardTagPropagation`)
 
 ```cpp
-struct Decimator : gr::Block<Decimator, gr::BackwardTagPropagation> { ... };
+struct Spectrum : gr::Block<Spectrum, gr::BackwardTagPropagation, gr::Resampling<1024U, 1U>> { ... };
 ```
 
-ALL tags within the entire input chunk are forwarded, mapped to output position 0. All tags are
-consumed per chunk. Used by decimation blocks where multiple input samples map to one output sample.
+Every tag of the chunk leaves at the chunk's first output sample. A block whose output describes its
+whole input chunk, a spectrum or a DataSet for instance, declares it. On a block with an
+`output_chunk_size` of 1, the mapped placement gives the same result.
 
 ```
   input:    ▽     ▼  ▽
@@ -292,15 +295,6 @@ consumed per chunk. Used by decimation blocks where multiple input samples map t
             0
 ```
 
-### Merge tag propagation (`MergeTagPropagation`)
-
-```cpp
-struct MyBlock : gr::Block<MyBlock, gr::MergeTagPropagation> { ... };
-```
-
-All auto-forward keys from all input tags are merged into a single output tag at position 0.
-This mimics the legacy forwarding behaviour. Last key wins when tags have overlapping keys.
-
 ### No tag propagation (`NoTagPropagation`)
 
 ```cpp
@@ -308,113 +302,67 @@ struct MyBlock : gr::Block<MyBlock, gr::NoTagPropagation> { ... };
 ```
 
 The framework does not forward any tags. The block handles tag propagation entirely in `processBulk`
-or via a custom `forwardTags()` override.
+or via a custom `forwardTags()` override. A block composed at compile time (`MergeByIndex`, `Merge`,
+`SplitMergeCombine`, `FeedbackMergeByIndex`, `FeedbackMerge` and their tap variants) declares
+`NoTagPropagation` when any member does or supplies its own `forwardTags()`, as a tag passes through
+every member in series.
 
-### Which keys a forwarded tag carries (`UnfilteredTagPropagation`, `FilteredTagPropagation`, `DroppedTagKeys`)
+### Which keys a forwarded tag carries (`DroppedTagKeys`)
 
 ```cpp
-struct Plain : gr::Block<Plain> { ... };                                 // every key where admissible
-struct Checked : gr::Block<Checked, gr::UnfilteredTagPropagation> { ... }; // every key, or no build
-struct OptOut : gr::Block<OptOut, gr::FilteredTagPropagation> { ... };     // standard keys alone
-struct Shift : gr::Block<Shift, gr::DroppedTagKeys<"freq_est">> { ... };  // every key but freq_est
+struct Plain : gr::Block<Plain> { ... };                                // every key
+struct Shift : gr::Block<Shift, gr::DroppedTagKeys<"foo:freq_est">> { ... }; // every key but foo:freq_est
 ```
 
-The policies above decide _where_ a forwarded tag lands. The block's declarations decide _which
-keys_ it still carries. A tag propagates unless the framework has a reason to stop it. A block
-forwards every key of every tag, with no annotation, where it passes
-`gr::block::kUnfilteredTagPropagationAdmissible<TBlock>`. The predicate reads the block's
-declarations at compile time and holds for a block that
+A forwarded tag carries every key it arrived with, in every domain. The multi-input dedup is the
+same for every key.
 
-- declares neither `Resampling<>` nor `Stride<>`,
-- has only synchronous stream ports,
-- declares none of `NoTagPropagation`, `ForwardTagPropagation`, `BackwardTagPropagation`,
-  `MergeTagPropagation` and `FilteredTagPropagation`, and
-- supplies no `forwardTags()` of its own.
+`DroppedTagKeys<"key", ...>` is the opt-out. A block lists the keys whose values do not describe its
+output. A block that shifts the carrier frequency, for instance, lists the key that states a
+frequency estimate. The default forwarder drops each listed key, on every chunk and at the
+end-of-stream index, at the top level of a tag and inside the map a `gr:trigger_meta_info` key
+holds. A `forwardTags()` override publishes what it writes, and the list reaches it only through
+`filterAndSubstituteTag()`. A block composed at compile time drops the keys of every member. A block
+declares at most one list. A listed key matches the whole key, and a reserved key is listed as
+`gr:name`. The build refuses a listed key with a leading colon or a space.
 
-Every other block keeps only its auto-forward keys. Those are the reserved keys of `kDefaultTags`
-and any added through `settings().addAutoForwardParameters()`. The multi-input dedup and the merge
-rule are the same either way. A block composed at compile time forwards every key where each of its
-member blocks does, and the auto-forward keys alone otherwise. Such blocks are `MergeByIndex`,
-`Merge`, `SplitMergeCombine`, `FeedbackMergeByIndex`, `FeedbackMerge` and their tap variants.
-
-The same key rule holds when a stream ends. A tag at or past the block's read position, up to the
-first `end_of_stream` tag on any synchronous input, leaves at the end-of-stream index. On a block
-without a `forwardTags()` override, it carries the keys the block forwards on every chunk.
-
-The predicate reads the block's declarations alone. It cannot check sample positions. **A tag
-arriving at input offset `t` must belong at output offset `t`.** A block that shifts sample
-positions, an integer delay for instance, or drops them, as one that keeps every Nth sample does,
-passes the predicate. It must write its own `forwardTags()`.
-
-On a block forwarding every key, every tag of the consumed chunk leaves at the offset it arrived at,
-and the whole chunk is retired. An input `min_samples` above one forbids a chunk boundary at a tag
-closer than that to the chunk's start. A key-filtered block defers such an interior tag and
-republishes it at the next chunk's first sample. A block forwarding every key publishes it in its
-own chunk, at its own offset. The settings that tag carries take effect at the chunk's first
-sample. Those settings are in force a few samples before the forwarded tag.
-
-Value substitution works as it does elsewhere and reaches further: a key the block declares as a
-setting is forwarded with the block's own current value, whether or not that key is reserved. A key
-named after one of the settings `Block<>` declares for every block — `input_chunk_size`,
-`output_chunk_size`, `stride`, `disconnect_on_done`, `compute_domain`, `unique_name`, `name`,
-`ui_constraints` — is forwarded with the upstream value instead, because a tag using `name` for its
-own purpose must not be rewritten with the block's name.
+The framework fixes positions, not values. A key whose value a block's output invalidates is listed
+in `DroppedTagKeys` or rewritten in `forwardTags()`. One value changes on the way: on a block
+declaring `Resampling<>`, `gr:sample_rate` leaves scaled by the chunk ratio. A key a setting of the
+block is coupled to leaves with the value it arrived with, whatever the setting holds.
 
 ```
-  input tag:  {trigger_name: "burst", record_id: "r7", gain: 10}
+  input tag:  {gr:trigger_name: "burst", record_id: "r7", foo:gain: 10}
 
-  standard keys alone ─►  {trigger_name: "burst"}                    record_id and gain dropped
-  every key           ─►  {trigger_name: "burst", record_id: "r7",   record_id passes through,
-                           gain: 2}                                  gain substituted (the block owns it)
+  forwarded ─►  {gr:trigger_name: "burst", record_id: "r7",   every key passes as it arrived,
+                 foo:gain: 10}                                foo:gain included, though the block's
+                                                              gain setting is coupled to it
 ```
-
-`UnfilteredTagPropagation` changes nothing at run time on a block that passes the predicate. It
-turns the predicate into a requirement. A block that declares it and fails the predicate does not
-compile, in any build configuration. The assertion names the condition that failed. The
-`forwardTags()` clause reads `Block<>::hasForwardTagsOverride()`. It probes the override with the
-span tuples the work path passes, in both tag windows an input span can retire. An override
-constrained to those types is refused rather than admitted and then called. An override whose
-return type is deduced from a body that reads the tag window escapes the probe. The build refuses
-such an override on a block forwarding every key and asks for a declared return type.
-
-`FilteredTagPropagation` is the opt-out. A block that passes the predicate but whose output
-differs from what a non-reserved key describes declares it. The block then forwards the
-auto-forward keys alone and defers interior tags as a key-filtered block does. The build refuses the
-opt-out beside `UnfilteredTagPropagation` or `NoTagPropagation`. It changes nothing on a block that
-fails the predicate for another reason. A block template whose variants differ in whether they
-pass the predicate can therefore declare it on every variant.
-
-`DroppedTagKeys<"key", ...>` is the narrow opt-out. A block lists the keys whose values do not
-describe its output. A block that shifts the carrier frequency, for instance, lists the key that
-states a frequency estimate. The default forwarder drops each listed key, on every chunk and at the
-end-of-stream index, and keeps every other key it would keep without the annotation. It drops a
-listed key at the top level of a tag and inside the map a `trigger_meta_info` key holds. A block
-forwarding every key still forwards the rest at the offset each tag arrived at. A key-filtered block
-drops a listed key even where it is a standard key. A `forwardTags()` override publishes what it
-writes, and the list reaches it only through `filterAndSubstituteTag()`. A block composed at compile
-time drops the keys of every member. A block declares at most one list, and the build refuses the
-annotation beside `UnfilteredTagPropagation`.
-
-Tags drive settings, which a later section covers in full. A key that crosses a block also drives
-any downstream setting of the same name. That is the mechanism that makes `sample_rate` work,
-applied to a wider key set. Pick key names accordingly.
 
 ### Custom tag forwarding — `forwardTags()`
 
 For full control, override `forwardTags()` in your block. The framework calls it instead of the
 default forwarding logic, at three points:
 
-- for each chunk, with `processedIn` the number of samples the chunk consumed;
+- for each chunk, with `processedIn` the number of samples the chunk holds;
 - for the trailing span that `processEpilogue()` receives, on a block that has one;
 - once more when an input's stream ends, with `processedIn` 0.
 
 In that last call the input and output spans hold no samples. An input span's `tags()` holds the tags
-at or past the block's read position, up to the first `end_of_stream` tag on any synchronous input,
-at a relative index of 0 or more. The input's own `end_of_stream` tag is among them, and an override
+at or past the block's read position, up to the first end-of-stream tag on any synchronous input,
+at a relative index of 0 or more. The input's own end-of-stream tag is among them, and an override
 drops that key, since `publishEoS()` publishes the block's own. Tags behind the read position that no
 span retired appear at a negative index, and an override skips them. Offset 0 of an output span is
 the end-of-stream index. On a block with only synchronous ports and no `processEpilogue()`, the end
 call is the only call with `processedIn` 0.
+
+On a block declaring `Stride<>`, the override is not called for the samples a stride skips. Their
+tags stay in the input and reach the next chunk's call at a negative relative index. An override that
+reads a wider window than `tags(1)` sees these tags at `relIndex` from `-(stride - input_chunk_size)` to
+-1, and no earlier call has handed them over. It forwards them at offset 0 and skips only the tags
+before that range, which the previous chunk's call saw. When the stream ends before that chunk, they
+reach only the end call, at a negative index. The example below skips them there and does not forward
+them.
 
 The example adds a key to every tag it forwards, at a chunk and at the end of the stream:
 
@@ -447,14 +395,15 @@ struct MyBlock : gr::Block<MyBlock> {
 };
 ```
 
-`forwardTags` is detected via `requires` at compile time — no registration needed. The CRTP policy
-tags only affect the default implementation; a user `forwardTags` replaces it entirely.
+`forwardTags` is detected via `requires` at compile time — no registration needed.
+`BackwardTagPropagation` and `DroppedTagKeys` only affect the default implementation; a user
+`forwardTags` replaces it entirely.
 
-The retiring window does not follow the override. An input span still retires only `tags(1)`, so an
-override that reads a wider window — `in.tags(processedIn)`, `in.tags()`, `in.rawTags` — sees every
-deferred tag twice: once at its true positive offset in the chunk it lies in, and again at a negative
-offset in the chunk after that. Such an override must skip `relIndex < 0` and handle each tag where
-it lies:
+An override's input span retires only `tags(1)`, unless the block declares `BackwardTagPropagation`.
+An override that reads a wider window — `in.tags(processedIn)`, `in.tags()`, `in.rawTags` — sees
+every deferred tag twice: once at its true positive offset in the chunk it lies in, and again at a
+negative offset in the chunk after that. Such an override must skip `relIndex < 0` and handle each
+tag where it lies:
 
 ```cpp
 for (const auto& [relIndex, tagMapRef] : in.tags(processedIn)) {
@@ -467,12 +416,13 @@ for (const auto& [relIndex, tagMapRef] : in.tags(processedIn)) {
 
 ### Rate-changing blocks
 
-The default forwarding puts a tag at the output offset matching its input offset, which is only right
-at a ratio of one. A block that changes the sample rate must therefore override `forwardTags()` and
-map the offset itself. `gr::blocks::filter::RationalResampler` is the reference pattern: it maps each
-input offset by `floor(i*L/M + 1/2)`, skips `relIndex < 0`, and holds a tag whose output sample this
-call does not produce rather than moving it to an offset that is not its own, publishing it in the
-call that does produce that sample.
+On a block declaring `Resampling<>`, the default forwarder maps a tag at input index `i` of the
+samples a call consumed to `floor(i * output_chunk_size / input_chunk_size)`. A block that wants
+another mapping overrides `forwardTags()`. `gr::blocks::filter::RationalResampler` is the reference
+pattern: it maps each input offset by `floor(i*L/M + 1/2)`, skips `relIndex < 0`, and holds a tag
+whose output sample this call does not produce
+rather than moving it to an offset that is not its own, publishing it in the call that does produce
+that sample. Such a block calls `scaleSampleRateByChunkRatio()` on the tags it forwards.
 
 ---
 
@@ -510,34 +460,80 @@ the capacity are forwarded without dedup tracking (redundant but correct — no 
 
 ## Settings synchronisation
 
-Tags drive automatic settings updates. When a tag arrives with a key matching a block setting (e.g.,
-`sample_rate`), the framework calls `settings().autoUpdate(tag)` which stages the new value. The
-block's `settingsChanged(old, new)` callback fires before the next processing call.
+A tag sets a setting only where the setting is coupled to the tag's key. Blocks declare no coupling;
+the application or the graph sets it per block instance:
+
+```cpp
+auto& gain = graph.emplaceBlock<Gain>();
+gain.settings().setTagCouplings({{"sample_rate", std::string("gr:sample_rate")}});
+```
+
+When a tag carrying `gr:sample_rate` arrives, the framework calls `settings().autoUpdate(tag)`, which
+stages the value for `sample_rate`. The block's `settingsChanged(old, new)` callback fires before the
+next processing call. With no coupling, no setting takes any tag, whatever its name. The key may be in
+any domain: a block's setting may follow `foo:level` that an out-of-tree block writes.
 
 ```
   upstream                  downstream
   ┌──────────┐              ┌──────────┐
   │ TagSource│──▽───────────│ Gain     │
   │          │  tag:        │          │
-  │          │  {sr: 48k}   │ sr=48000 │    ← auto-updated from tag
+  │          │  {gr:sample_ │ sr=48000 │    ← sample_rate coupled to gr:sample_rate
+  │          │   rate: 48k} │          │
   └──────────┘              └──────────┘
 ```
 
-The set of auto-forwarded keys is `settings().autoForwardParameters()` — the standard tag keys
-(`kDefaultTags`), fixed when the block's settings are constructed. The accessor is read-only. It returns a `const` reference because `Block::forwardInputTags()` holds that
-reference for the whole forwarding loop of every work call and takes no lock; a set that changed
-while the graph was running would be a data race on the hot path.
+The coupling table maps a setting's name to a key. A setting follows at most one key, and one key
+may set several settings of a block. An entry with an empty key removes a coupling, and
+`settings().tagCouplings()` reads the table. The table belongs to the block: it holds in every
+context, and a reset leaves it as it is. The call refuses a name that is not a writable setting, a
+key that is not a string or not `domain:name`, and the five keys the framework acts on itself:
+`gr:end_of_stream`, `gr:reset_default`, `gr:store_default`, `gr:context` and `gr:ctx_time`. The
+exception names the block, the setting and the key, and the table stays as it was.
 
-A block forwarding every key carries a non-standard key downstream by itself. A key-filtered block
-that must carry one publishes the tag itself (see "Publishing tags" above) instead of adding the key
-to the forwarding set:
+A coupled setting
+
+- follows its key from the call that couples it, whatever set it before. The values the block's
+  `init()` applies from its constructor's map leave it following.
+- takes the key's value until a caller sets it with `set()`. A reset makes it follow its key again,
+  in every context. A reset that `settingsChanged()` refuses leaves it as it was.
+
+A graph file holds the table in a block's `tag_couplings` map, and the loader applies it after the
+block's `parameters`:
+
+```yaml
+blocks:
+  - id: Gain
+    parameters:
+      name: gain
+      sample_rate: !!float32 1000
+    tag_couplings:
+      sample_rate: "gr:sample_rate"
+```
+
+A `Set` to the block's `TagCouplings` property changes the table at run time, and a `Get` reads it.
+`grinfo` reports each setting's coupled key, read from the instance it inspects, as `tagKey`.
+
+The framework writes no tag for a setting, whether a caller or a tag set it. A block that hands a
+value downstream writes it into the forward map its `settingsChanged(old, new, forward)` receives,
+and the framework publishes that map on the block's outputs:
 
 ```cpp
-work::Status processBulk(InputSpanLike auto& input, OutputSpanLike auto& output) {
-    output.publishTag({{"my_custom_key", value}}, 0);
-    return work::Status::OK;
+void settingsChanged(const property_map&, const property_map& newSettings, property_map& forward) {
+    if (newSettings.contains("sample_rate")) {
+        forward.insert_or_assign(std::pmr::string(gr::tag::SAMPLE_RATE.key()), sample_rate);
+    }
 }
 ```
+
+When `settingsChanged()` throws on a batch whose values coupled tags alone carried, each setting
+takes back its earlier value and the block reports the refusal in a plain message. A batch that
+also holds a value from `set()`, a context or a reset is reported as an error. The block publishes
+none of the forward map the refusing call filled. The tag leaves with the value it arrived with.
+When the batch holds a reset, each coupled setting follows its key only when it did before the reset,
+even after a `setTagCouplings()` that the callback itself made before it threw. A coupling table the
+callback wrote with `setTagCouplings()` stays. A set the callback stored with `set()` stays, and its
+keys decide which settings follow.
 
 A block that republishes _every_ input tag itself, whatever its keys, declares `NoTagPropagation`.
 The framework then forwards no tag on its own:
@@ -562,18 +558,11 @@ struct Delay : gr::Block<Delay, gr::NoTagPropagation> {
 To rewrite or filter keys per tag rather than republish them all, override `forwardTags()` (see
 "Custom tag forwarding" above).
 
-### Init-time settings forwarding
+### `gr:sample_rate` and decimation/interpolation
 
-When a block is constructed with explicit settings (e.g.,
-`emplaceBlock<Gain>({{"sample_rate", 48000.f}})`), the changed settings are re-staged and forwarded
-as a tag in the first work call. This ensures downstream blocks receive the initial configuration
-without requiring an explicit tag from the source.
-
-### `sample_rate` and decimation/interpolation
-
-`sample_rate` receives special treatment in blocks with
-`input_chunk_size != output_chunk_size`. When the framework forwards `sample_rate`, it automatically
-adjusts the value based on the chunk ratio:
+`gr:sample_rate` receives special treatment in blocks with
+`input_chunk_size != output_chunk_size`. When the framework forwards `gr:sample_rate`, it
+automatically adjusts the value based on the chunk ratio:
 
 ```
   forwarded sample_rate = input sample_rate × (output_chunk_size / input_chunk_size)
@@ -598,10 +587,10 @@ Example — a 10× decimator:
            ─┴──┴─
 ```
 
-The ratio is applied wherever the rate is published — to the parameters a settings change forwards,
-and to the `sample_rate` a forwarded tag carries — so the block's own stored `sample_rate` stays at
-the rate it is fed. A block that declares no `sample_rate` of its own publishes the scaled value all
-the same. The decimation block only needs to set `input_chunk_size` in `settingsChanged`:
+The ratio is applied to the `gr:sample_rate` a forwarded tag carries, so the block's own stored
+`sample_rate` stays at the rate it is fed. A block with no `sample_rate` setting also publishes the
+scaled value. A block's own forward map leaves as the block wrote it. The decimation block only needs
+to set `input_chunk_size` in `settingsChanged`:
 
 ```cpp
 void settingsChanged(const property_map&, const property_map&) {
@@ -613,9 +602,9 @@ void settingsChanged(const property_map&, const property_map&) {
 
 ## Contexts — modal settings switching
 
-The `context` and `time` tag keys enable coherent pipeline-wide settings switching. A context is a
-named operating mode (e.g., `"calibration"`, `"measurement"`, `"beam_A"`) with an associated UTC
-timestamp.
+The `gr:context` and `gr:ctx_time` tag keys enable coherent pipeline-wide settings switching. A
+context is a named operating mode (e.g., `"calibration"`, `"measurement"`, `"beam_A"`) with an
+associated UTC timestamp.
 
 ### How contexts work
 
@@ -623,9 +612,9 @@ timestamp.
    `SettingsCtx{.time = ..., .context = "measurement"}`. The settings are stored (not yet applied)
    and associated with that context.
 
-2. **Activate via tag**: when a tag with `context` and/or `time` keys arrives at a block,
-   `autoUpdate` calls `activateContext(ctx)`. This looks up the best-matching stored settings for
-   that context and stages them.
+2. **Activate via tag**: when a tag with a `gr:context` key arrives at a block, `autoUpdate` calls
+   `activateContext(ctx)`. This looks up the best-matching stored settings for that context and
+   stages them.
 
 3. **Pipeline coherence**: the same context tag propagates through the graph. Each block activates
    its own stored settings for that context — the entire pipeline switches coherently at the tagged
@@ -636,8 +625,9 @@ timestamp.
   ┌───────────┐                 ┌────────────┐         ┌────────────┐
   │           │──▽──────────────│ ctx="cal"  │──▽──────│ ctx="cal"  │
   │  tag:     │   propagates    │ gain=0.5   │         │ filter=LP  │
-  │  {ctx:    │   through       │ (stored    │         │ (stored    │
-  │   "cal"}  │   graph         │  for "cal")│         │  for "cal")│
+  │  {gr:     │   through       │ (stored    │         │ (stored    │
+  │  context: │   graph         │  for "cal")│         │  for "cal")│
+  │   "cal"}  │                 │            │         │            │
   └───────────┘                 └────────────┘         └────────────┘
 
   Before tag:  gain=1.0, filter=BP      ← "default" context active
@@ -653,14 +643,14 @@ This mechanism is very powerful for:
 The context string is arbitrary — the user defines the operating modes. Settings for each context
 are stored independently and activated on demand.
 
-### `context` vs `time`
+### `gr:context` vs `gr:ctx_time`
 
-- `context` (string): the mode name — selects WHICH settings to apply
-- `time` (uint64, ns UTC): WHEN the settings should take effect — enables sample-accurate switching
-  synchronised across the pipeline
+- `gr:context` (string): the mode name — selects WHICH settings to apply
+- `gr:ctx_time` (uint64, ns UTC): selects the context's settings set in effect at that time
 
-Both are optional in a tag. A tag with only `context` activates immediately. A tag with both uses the
-timestamp for precise scheduling.
+A tag with only `gr:context` selects the set in effect now. A tag with both selects the set in
+effect at `gr:ctx_time`. The switch reads no other key: a trigger tag's `gr:trigger_time` beside
+`gr:context` does not move it. A block that stores no settings for the context ignores the tag.
 
 ---
 
@@ -669,108 +659,117 @@ timestamp for precise scheduling.
 Trigger tags mark events in the data stream — zero crossings, threshold exceedances, external timing
 events, etc. They use a standard key triplet (plus one optional key):
 
-| Key                 | Type            | Required | Description                                               |
-| ------------------- | --------------- | -------- | --------------------------------------------------------- |
-| `trigger_name`      | `std::string`   | yes      | event identifier (e.g., `"zero_crossing"`, `"beam_in"`)   |
-| `trigger_time`      | `uint64_t` (ns) | yes      | UTC timestamp of the event                                |
-| `trigger_offset`    | `float` (s)     | yes      | sub-sample time offset (compensating analog group delays) |
-| `trigger_meta_info` | `property_map`  | optional | additional key-value pairs (detector ID, amplitude, ...)  |
+| Key                    | Type            | Required | Description                                               |
+| ---------------------- | --------------- | -------- | --------------------------------------------------------- |
+| `gr:trigger_name`      | `std::string`   | yes      | event identifier (e.g., `"zero_crossing"`, `"beam_in"`)   |
+| `gr:trigger_time`      | `uint64_t` (ns) | yes      | UTC timestamp of the event                                |
+| `gr:trigger_offset`    | `float` (s)     | yes      | sub-sample time offset (compensating analog group delays) |
+| `gr:trigger_meta_info` | `property_map`  | optional | additional key-value pairs (detector ID, amplitude, ...)  |
 
-**These keys should always appear together** (except `trigger_meta_info` which is optional). A
-trigger tag without `trigger_time` or `trigger_offset` is incomplete.
+**These keys should always appear together** (except `gr:trigger_meta_info` which is optional). A
+trigger tag without `gr:trigger_time` or `gr:trigger_offset` is incomplete. The keys nested in
+`gr:trigger_meta_info` are free-form.
 
 ```
   trigger tag at sample 5:
   {
-      "trigger_name":      "beam_extraction",
-      "trigger_time":      1720000000000000000,    // UTC ns
-      "trigger_offset":    -0.000023,              // 23 µs before this sample
-      "trigger_meta_info": {
+      "gr:trigger_name":      "beam_extraction",
+      "gr:trigger_time":      1720000000000000000,    // UTC ns
+      "gr:trigger_offset":    -0.000023,              // 23 µs before this sample
+      "gr:trigger_meta_info": {
           "beam_id":    "PS_B1",
           "intensity":  2.3e12
       }
   }
 ```
 
-Trigger tags are auto-forwarded like any standard tag key. Downstream blocks (e.g.,
+Trigger tags are forwarded like any other tag. Downstream blocks (e.g.,
 `StreamToDataSet`) use the trigger matcher API to start/stop data acquisition windows based on
 trigger patterns.
 
 ---
 
-## Standard tag keys — `kDefaultTags`
+## Standard tag keys (`gr:`)
 
-All standard keys use the `gr:` prefix internally (e.g., `gr:sample_rate`) but are referenced by
-short key in code (`"sample_rate"`). Keys are aligned with the
-[SigMF](https://sigmf.org/) standard for interoperability.
+The keys below are `gr:` keys, which GNU Radio defines. Any block may write or read one with the
+meaning given here. Code names them through the constants in `gr::tag::`
+(`gr::tag::SAMPLE_RATE.key()` is `"gr:sample_rate"`, and `.name()` is `"sample_rate"`). A bare
+`sample_rate` is a key in the default domain and means nothing to the framework. Keys are aligned
+with the [SigMF](https://sigmf.org/) standard for interoperability. A `gr:` key's value has the
+type of its constant's `value_type`.
 
 ### Signal description
 
-| Key               | Type          | Unit | Purpose                                                               |
-| ----------------- | ------------- | ---- | --------------------------------------------------------------------- |
-| `sample_rate`     | `float`       | Hz   | sample rate of the stream. Auto-adjusted by decimation/interpolation. |
-| `signal_name`     | `std::string` |      | human-readable signal name (e.g., `"RF_pickup_H"`)                    |
-| `num_channels`    | `gr::Size_t`  |      | interleaved channel count (for multi-channel streams)                 |
-| `signal_quantity` | `std::string` |      | physical quantity (e.g., `"voltage"`, `"current"`)                    |
-| `signal_unit`     | `std::string` |      | SI unit (e.g., `"V"`, `"A"`)                                          |
-| `signal_min`      | `float`       | a.u. | physical minimum (e.g., DAQ range lower bound)                        |
-| `signal_max`      | `float`       | a.u. | physical maximum (e.g., DAQ range upper bound)                        |
+| Key                  | Type          | Unit | Purpose                                                               |
+| -------------------- | ------------- | ---- | --------------------------------------------------------------------- |
+| `gr:sample_rate`     | `float`       | Hz   | sample rate of the stream. Auto-adjusted by decimation/interpolation. |
+| `gr:frequency`       | `double`      | Hz   | center frequency of the stream                                        |
+| `gr:signal_name`     | `std::string` |      | human-readable signal name (e.g., `"RF_pickup_H"`)                    |
+| `gr:num_channels`    | `gr::Size_t`  |      | interleaved channel count (for multi-channel streams)                 |
+| `gr:signal_quantity` | `std::string` |      | physical quantity (e.g., `"voltage"`, `"current"`)                    |
+| `gr:signal_unit`     | `std::string` |      | SI unit (e.g., `"V"`, `"A"`)                                          |
+| `gr:signal_min`      | `float`       | a.u. | physical minimum (e.g., DAQ range lower bound)                        |
+| `gr:signal_max`      | `float`       | a.u. | physical maximum (e.g., DAQ range upper bound)                        |
 
 ### Data quality
 
-| Key                 | Type         | Purpose                                                       |
-| ------------------- | ------------ | ------------------------------------------------------------- |
-| `n_dropped_samples` | `gr::Size_t` | number of samples lost before this point (DAQ overflow, etc.) |
+| Key                    | Type         | Purpose                                                                           |
+| ---------------------- | ------------ | --------------------------------------------------------------------------------- |
+| `gr:n_dropped_samples` | `gr::Size_t` | number of samples lost before this point, counted on the stream it was written on |
+
+A rate change does not rescale `gr:n_dropped_samples`. Its readers count the tags.
 
 ### Triggers
 
-| Key                 | Type           | Unit | Purpose                    |
-| ------------------- | -------------- | ---- | -------------------------- |
-| `trigger_name`      | `std::string`  |      | event identifier           |
-| `trigger_time`      | `uint64_t`     | ns   | UTC timestamp of the event |
-| `trigger_offset`    | `float`        | s    | sub-sample time correction |
-| `trigger_meta_info` | `property_map` |      | additional event metadata  |
+| Key                    | Type           | Unit | Purpose                    |
+| ---------------------- | -------------- | ---- | -------------------------- |
+| `gr:trigger_name`      | `std::string`  |      | event identifier           |
+| `gr:trigger_time`      | `uint64_t`     | ns   | UTC timestamp of the event |
+| `gr:trigger_offset`    | `float`        | s    | sub-sample time correction |
+| `gr:trigger_meta_info` | `property_map` |      | additional event metadata  |
 
 ### Context switching
 
-| Key       | Type            | Purpose                                                      |
-| --------- | --------------- | ------------------------------------------------------------ |
-| `context` | `std::string`   | multiplexing key — selects which stored settings to activate |
-| `time`    | `uint64_t` (ns) | UTC timestamp for sample-accurate context activation         |
+| Key           | Type            | Purpose                                                      |
+| ------------- | --------------- | ------------------------------------------------------------ |
+| `gr:context`  | `std::string`   | multiplexing key — selects which stored settings to activate |
+| `gr:ctx_time` | `uint64_t` (ns) | UTC time at which the tag's context takes effect             |
 
 ### Lifecycle
 
-| Key             | Type   | Purpose                                                      |
-| --------------- | ------ | ------------------------------------------------------------ |
-| `reset_default` | `bool` | reset block settings to stored defaults                      |
-| `store_default` | `bool` | store current settings as new defaults                       |
-| `end_of_stream` | `bool` | signals end of data — downstream blocks transition to `DONE` |
+| Key                | Type   | Purpose                                                      |
+| ------------------ | ------ | ------------------------------------------------------------ |
+| `gr:reset_default` | `bool` | reset block settings to stored defaults                      |
+| `gr:store_default` | `bool` | store current settings as new defaults                       |
+| `gr:end_of_stream` | `bool` | signals end of data — downstream blocks transition to `DONE` |
 
-A block acts on a `reset_default` or `store_default` tag as it acts on a `Set` to its `ResetDefaults` or
-`StoreDefaults` property. Either key form acts, with or without the `gr:` prefix, and the value is not read.
+A block acts on a `gr:reset_default` or `gr:store_default` tag as it acts on a `Set` to its
+`ResetDefaults` or `StoreDefaults` property. The value is not read. A bare `reset_default` or
+`store_default` key acts on nothing.
 
-While the default context is active, a reset, by tag or by message, restores the default of each setting that `set()`
-changed in that context. A setting that a settings message changed, or that no call has set, follows tags, and a reset
-leaves it at its present value. With a named context active, a reset returns the block to the default context and
+While the default context is active, a reset, by tag or by message, restores the default of each
+setting that `set()` changed in that context, a value from the constructor's map included. A reset
+leaves a setting that a settings message changed, or that no call has set, at its present value.
+After a reset, every coupled setting follows its key again in every context, and the coupling table
+stays as it was. With a named context active, a reset returns the block to the default context and
 restores every default.
 
 A reset and the other keys of its tag apply as one change: the restored defaults, with the tag's own values over them.
 `settingsChanged()` hears of that change once. A `Set` to `ResetDefaults` that arrives while a reset tag waits to apply
 serves both, and the block's `reset()` runs once. A store runs after the other keys of its tag apply. The stored
-defaults then include the values the tag carries. The tag forwards downstream, and each block it reaches acts on it. A block that
-forwards only its auto-forward keys passes on the short key and drops the `gr:` key. A reset or store sent only in the
-`gr:` form reaches no block past it.
+defaults then include the values the tag carries. The tag forwards downstream, and each block it reaches acts on it.
+A graph builder who wants one block to act sends it a message, not a tag.
 
 ### Transmit bursts
 
-| Key       | Type       | Unit | Purpose                                                                  |
-| --------- | ---------- | ---- | ------------------------------------------------------------------------ |
-| `tx_sob`  | `bool`     |      | the tagged sample is the first of a transmit burst                       |
-| `tx_eob`  | `bool`     |      | the tagged sample is the last of a transmit burst                        |
-| `tx_time` | `uint64_t` | ns   | UTC time at which the tagged sample, a burst's first, leaves the antenna |
+| Key          | Type       | Unit | Purpose                                                                  |
+| ------------ | ---------- | ---- | ------------------------------------------------------------------------ |
+| `gr:tx_sob`  | `bool`     |      | the tagged sample is the first of a transmit burst                       |
+| `gr:tx_eob`  | `bool`     |      | the tagged sample is the last of a transmit burst                        |
+| `gr:tx_time` | `uint64_t` | ns   | UTC time at which the tagged sample, a burst's first, leaves the antenna |
 
-A transmit sink reads these; a receive graph's `trigger_time` is never read as a transmit time. The names are GNU
-Radio 3's; `tx_time` is one count of nanoseconds, as `trigger_time` is, where GNU Radio 3 carried whole and
+A transmit sink reads these; a receive graph's `gr:trigger_time` is never read as a transmit time. The names are GNU
+Radio 3's; `gr:tx_time` is one count of nanoseconds, as `gr:trigger_time` is, where GNU Radio 3 carried whole and
 fractional seconds.
 
 ---
@@ -779,8 +778,6 @@ fractional seconds.
 
 - `inputTagsPresent()` is a `bool` check — zero cost in the no-tag path.
 - `input.tags()` is a lazy view over the tag buffer — no allocation.
-- `settings().get()` (for value substitution during forwarding) is allocated lazily via
-  `std::optional` — only when a key the block itself declares as a setting is found in a tag.
 - The processOne dispatch loop checks `_outputTagPending` (a `bool`) per sample —
   branch-predicted, no overhead when no tags are published.
 - Single-input blocks skip multi-port dedup entirely (compile-time `if constexpr`).

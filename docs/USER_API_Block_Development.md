@@ -165,6 +165,12 @@ gr::Annotated<T, "snake_case_name", Doc<"...">, Unit<"[V]">, Visible, Limits<min
 | `Visible`          | show in UI settings panels                      |
 | `Limits<min, max>` | value range validation (compile-time constants) |
 
+A block declares no tag that sets a setting, and the framework infers nothing from a setting's name.
+The application or the graph couples a setting to a tag key per block instance, with
+`settings().setTagCouplings()`, a graph file's `tag_couplings` or a `TagCouplings` message. A block
+that hands a value downstream writes it into the forward map of `settingsChanged()`. The tag mechanics
+document (`USER_API_Tag_mechanics.md`) gives the full rules.
+
 ### Shorthand alias
 
 Blocks with many settings often define a local alias:
@@ -426,6 +432,12 @@ template<typename T>
 struct WindowedFFT : gr::Block<WindowedFFT<T>, gr::Stride<512U>> { ... };
 ```
 
+A stride longer than the chunk skips the samples between two chunks. The tags on them set the
+block's coupled settings. The default forwarder publishes them at the next chunk's first output
+sample, or at the end-of-stream index. A `forwardTags()` override receives them with the next chunk
+(see `USER_API_Tag_mechanics.md`). A stride shorter than the chunk reads a sample in two chunks. The
+chunk that consumes a tag's sample forwards it, once.
+
 Downstream examples: converter and filter blocks in `gnuradio4-blocks`.
 
 ## Lifecycle methods
@@ -507,11 +519,13 @@ callback refuses a batch that activates another context, the context active befo
 activation is active again. A batch that `removeContext()` staged keeps the context it falls
 back to. When `removeContext()` removed the context active before the activation, the default
 context is active instead. A reset activates the default context: when the callback refuses a
-batch with a reset, the context active before the batch is active again. A setting whose
+batch with a reset, the context active before the batch is active again. A coupled setting
+follows its tag key after that refusal only when it followed it before the reset. A set the
+callback stored with `set()` stays, and its keys decide which settings follow. A setting whose
 `Limits` refuse its value from `oldSettings` keeps the refused value. When tags alone carried
 every value in `newSettings`, the block reports the refusal in a plain message, as it reports a
 tag value outside a setting's `Limits`. Otherwise it reports the exception as an error on its
-message output.
+message output. The block publishes none of the forward map a refusing callback filled.
 
 ### 2-argument variant
 
@@ -531,10 +545,12 @@ void settingsChanged(const gr::property_map& oldSettings,
                      const gr::property_map& newSettings,
                      gr::property_map& forwardSettings) {
     if (newSettings.contains("sample_rate")) {
-        forwardSettings["sample_rate"] = sample_rate.value;
+        forwardSettings[gr::tag::SAMPLE_RATE.key()] = sample_rate.value;
     }
 }
 ```
+
+The framework publishes this map on the block's outputs. It writes no tag for a setting itself.
 
 ### Common patterns
 
@@ -570,7 +586,7 @@ A tag is a `{index, property_map}` pair attached to a specific sample position.
         const gr::Tag& tag = this->mergedInputTag();
         // read tag.map entries
     }
-    this->publishTag({{"trigger_name", "my_event"}}, 0UZ);  // publish at current sample
+    this->publishTag({{"my:event", "detected"}}, 0UZ);  // publish at current sample
     return input;
 }
 ```
@@ -596,8 +612,15 @@ gr::work::Status processBulk(gr::InputSpanLike auto& inSpan,
 
 ### Tag forwarding policy
 
-By default, tags from all input ports are merged and forwarded to all output ports automatically.
-To handle tags manually, disable default forwarding:
+By default, every tag from every synchronous input port is forwarded to every synchronous output
+port, with every key. On a block with only synchronous stream ports and without `Resampling<>` or
+`Stride<>`, a tag leaves at the offset it arrived at. On a block with `Stride<>` or an asynchronous
+stream port the framework ends a chunk at the next tag, and the tag leaves on the call's first
+output sample. A block declaring `Resampling<>` maps input index `i` of the samples a call consumed
+to `floor(i * output_chunk_size / input_chunk_size)`, after the call. `BackwardTagPropagation` puts
+every tag of a chunk on its first output sample. `DroppedTagKeys<"key", ...>` drops the listed keys.
+A block whose output samples do not stand where the framework puts a tag, a delay for instance,
+handles tags itself, with `forwardTags()` or with default forwarding disabled:
 
 ```cpp
 template<typename T>
@@ -646,20 +669,25 @@ struct MyAccumulator : gr::Block<MyAccumulator, gr::Resampling<1024, 1024, true>
 
 ### Standard tag keys
 
-| Key                             | Type          | Description                        |
-| ------------------------------- | ------------- | ---------------------------------- |
-| `"sample_rate"`                 | `float`       | signal sample rate [Hz]            |
-| `"signal_name"`                 | `std::string` | signal name                        |
-| `"signal_quantity"`             | `std::string` | physical quantity (e.g. "voltage") |
-| `"signal_unit"`                 | `std::string` | SI unit (e.g. "[V]")               |
-| `"signal_min"` / `"signal_max"` | `float`       | expected value range               |
-| `"trigger_name"`                | `std::string` | trigger identifier                 |
-| `"trigger_time"`                | `uint64_t`    | UTC timestamp [ns]                 |
-| `"trigger_offset"`              | `float`       | sample delay w.r.t. trigger [s]    |
-| `"context"`                     | `std::string` | multiplexing context key           |
-| `"end_of_stream"`               | `bool`        | end-of-stream marker               |
-| `"reset_default"`               | `bool`        | reset block to stored defaults     |
-| `"store_default"`               | `bool`        | store current settings as defaults |
+A tag key is `domain:name`. Only GNU Radio defines a new `gr:` key. Any block may write or read a
+`gr:` key with the meaning GNU Radio gives it. A block's new keys go in its author's own domain.
+The constants in `gr::tag::` hold the `gr:` keys.
+
+| Key                                   | Type          | Description                        |
+| ------------------------------------- | ------------- | ---------------------------------- |
+| `"gr:sample_rate"`                    | `float`       | signal sample rate [Hz]            |
+| `"gr:signal_name"`                    | `std::string` | signal name                        |
+| `"gr:signal_quantity"`                | `std::string` | physical quantity (e.g. "voltage") |
+| `"gr:signal_unit"`                    | `std::string` | SI unit (e.g. "[V]")               |
+| `"gr:signal_min"` / `"gr:signal_max"` | `float`       | expected value range               |
+| `"gr:trigger_name"`                   | `std::string` | trigger identifier                 |
+| `"gr:trigger_time"`                   | `uint64_t`    | UTC timestamp [ns]                 |
+| `"gr:trigger_offset"`                 | `float`       | sample delay w.r.t. trigger [s]    |
+| `"gr:context"`                        | `std::string` | multiplexing context key           |
+| `"gr:ctx_time"`                       | `uint64_t`    | time the context takes effect [ns] |
+| `"gr:end_of_stream"`                  | `bool`        | end-of-stream marker               |
+| `"gr:reset_default"`                  | `bool`        | reset block to stored defaults     |
+| `"gr:store_default"`                  | `bool`        | store current settings as defaults |
 
 Downstream examples: tag source, tag monitor, and clock source blocks in
 `gnuradio4-blocks`.

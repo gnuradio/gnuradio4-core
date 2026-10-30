@@ -157,11 +157,11 @@ constexpr std::size_t subblockChunkSize() {
 }
 
 template<typename TMember>
-consteval bool memberForwardsEveryKey() {
+consteval bool memberForwardsNoTag() {
     if constexpr (std::is_void_v<TMember>) {
-        return true;
+        return false;
     } else {
-        return TMember::forwardsEveryKey();
+        return TMember::noTagPropagation || TMember::hasForwardTagsOverride();
     }
 }
 
@@ -200,12 +200,13 @@ struct MergedBlockBaseOf<TComposed, DroppedTagKeys<>, TPolicy...> {
     using type = Block<TComposed, TPolicy...>;
 };
 
-/// a composed block forwards every key only where each member block does, and keeps the auto-forward keys otherwise.
-/// It drops every key a member lists in DroppedTagKeys. An optional member left out as void does not count.
+/// a composed block forwards no tag where a member declares NoTagPropagation or supplies its own forwardTags(), as a
+/// tag passes through every member in series. Otherwise it forwards every key less those a member lists in
+/// DroppedTagKeys. An optional member left out as void does not count.
 template<typename TComposed, typename... TMembers>
-using MergedBlockBase = std::conditional_t<(memberForwardsEveryKey<TMembers>() && ...),                                                 //
-    typename MergedBlockBaseOf<TComposed, typename JoinedDroppedTagKeys<typename MemberDroppedTagKeys<TMembers>::type...>::type>::type, //
-    typename MergedBlockBaseOf<TComposed, typename JoinedDroppedTagKeys<typename MemberDroppedTagKeys<TMembers>::type...>::type, FilteredTagPropagation>::type>;
+using MergedBlockBase = std::conditional_t<(memberForwardsNoTag<TMembers>() || ...),                                                                      //
+    typename MergedBlockBaseOf<TComposed, typename JoinedDroppedTagKeys<typename MemberDroppedTagKeys<TMembers>::type...>::type, NoTagPropagation>::type, //
+    typename MergedBlockBaseOf<TComposed, typename JoinedDroppedTagKeys<typename MemberDroppedTagKeys<TMembers>::type...>::type>::type>;
 
 /// common SIMD width of a pack of `meta::any_simd` inputs (they all share one width by construction);
 /// 0 -- i.e. the native width -- for any other pack.

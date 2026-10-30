@@ -45,10 +45,14 @@ struct start_recorder : gr::Block<start_recorder<T>> {
 
     [[nodiscard]] constexpr T processOne(T value) const noexcept { return value; }
 
-    void settingsChanged(const gr::property_map& /*oldSettings*/, const gr::property_map& newSettings) {
-        if (newSettings.contains("sample_rate") && !(sample_rate > 0.f)) {
+    void settingsChanged(const gr::property_map& /*oldSettings*/, const gr::property_map& newSettings, gr::property_map& forwardSettings) {
+        if (!newSettings.contains("sample_rate")) {
+            return;
+        }
+        if (!(sample_rate > 0.f)) {
             throw gr::exception(std::format("sample_rate {} is not positive", sample_rate));
         }
+        forwardSettings.insert_or_assign(std::pmr::string(gr::tag::SAMPLE_RATE.key()), sample_rate);
     }
 };
 

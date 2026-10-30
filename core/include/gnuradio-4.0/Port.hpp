@@ -207,8 +207,11 @@ Follows the ISO 80000-1:2022 Quantities and Units conventions:
 
     GR_MAKE_REFLECTABLE(PortMetaInfo, data_type, name, sample_rate, signal_name, signal_quantity, signal_unit, signal_min, signal_max);
 
-    // controls automatic (if set) or manual update of above parameters
-    std::set<std::string, std::less<>> auto_update{gr::tag::kDefaultTags.begin(), gr::tag::kDefaultTags.end()};
+    /// the `gr:` tag keys whose value a field of the same name takes from a tag
+    static constexpr std::array<std::string_view, 6> kTagKeys = {gr::tag::SAMPLE_RATE.key(), gr::tag::SIGNAL_NAME.key(), gr::tag::SIGNAL_QUANTITY.key(), gr::tag::SIGNAL_UNIT.key(), gr::tag::SIGNAL_MIN.key(), gr::tag::SIGNAL_MAX.key()};
+
+    // the names of the fields that update() and updateFromTag() set; reset() restores the names of kTagKeys
+    std::set<std::string, std::less<>> auto_update = defaultAutoUpdate();
 
     constexpr PortMetaInfo() noexcept = default;
     explicit PortMetaInfo(std::string_view dataTypeName) noexcept : data_type(dataTypeName) {};
@@ -224,9 +227,21 @@ Follows the ISO 80000-1:2022 Quantities and Units conventions:
      */
     void reset();
 
+    /// sets the fields that metaInfo names by field name
     [[nodiscard]] std::expected<void, Error> update(const property_map& metaInfo, const std::source_location location = std::source_location::current()) noexcept;
+    /// sets the fields that a tag names by `gr:` key; a key in another domain or with no domain sets nothing
+    [[nodiscard]] std::expected<void, Error> updateFromTag(const property_map& tagMap, const std::source_location location = std::source_location::current()) noexcept;
 
     [[nodiscard]] property_map get() const noexcept;
+
+private:
+    [[nodiscard]] static std::set<std::string, std::less<>> defaultAutoUpdate() {
+        std::set<std::string, std::less<>> names;
+        for (const std::string_view key : kTagKeys) {
+            names.emplace(gr::tag::nameOf(key));
+        }
+        return names;
+    }
 };
 
 template<class T>
@@ -733,7 +748,9 @@ struct Port {
                 }
             }
 #endif
-            tags[tagsPublished++] = {index, std::forward<TPropertyMap>(tagData)};
+            tags[tagsPublished] = {index, std::forward<TPropertyMap>(tagData)};
+            gr::tag::canonicalizeKeys(tags[tagsPublished].map);
+            ++tagsPublished;
         }
     }; // end of PortOutputSpan
     static_assert(WriterSpanLike<OutputSpan<gr::SpanReleasePolicy::ProcessAll, WriterSpanReservePolicy::Reserve>>);
@@ -1129,6 +1146,7 @@ public:
             if (!outTags.empty()) {
                 outTags[0].index = streamWriter().position() + tagOffset;
                 outTags[0].map   = std::forward<TPropertyMap>(tagData);
+                gr::tag::canonicalizeKeys(outTags[0].map);
                 outTags.publish(1UZ);
             } else {
                 ++nTagsDropped;
