@@ -1,0 +1,23 @@
+# A source of the rungraph fixture plugin feeding a 1:1 block and a decimator by four, each followed by a sink. Each
+# block records the largest call it made. The source ends the stream after n_samples, and the run ends on its own.
+blocks:
+  - id: test::chunk_source
+    parameters:
+      name: source
+  - id: test::chunk_recorder
+    parameters:
+      name: middle
+  - id: test::chunk_sink
+    parameters:
+      name: sink
+  - id: test::chunk_decimator
+    parameters:
+      name: decimator
+  - id: test::chunk_sink
+    parameters:
+      name: decimated
+connections:
+  - [source, out, middle, in]
+  - [middle, out, sink, in]
+  - [source, out, decimator, in]
+  - [decimator, out, decimated, in]
