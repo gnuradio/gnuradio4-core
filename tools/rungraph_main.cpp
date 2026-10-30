@@ -1,19 +1,23 @@
 // rungraph - load a graph file, run it, and report what the run was asked to report.
 //
-// No block, setting or connection is named in this file: the graph file names the blocks, the plugin directories
-// supply them, and the framework's own loader builds the graph, so a chain that changes needs no program rebuilt.
+// No block, setting or connection is named in this file. The graph file names the blocks, and the plugin directories
+// supply them through the program's own loader. gr::RuntimeGraph builds the graph and gr::Runtime runs it. A changed
+// chain needs no rebuilt program.
 
 #include <algorithm>
 #include <atomic>
 #include <charconv>
 #include <chrono>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
-#include <exception>
+#include <expected>
 #include <format>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <optional>
 #include <print>
@@ -22,17 +26,12 @@
 #include <sstream>
 #include <string>
 #include <string_view>
-#include <system_error>
-#include <thread>
-#include <tuple>
 #include <utility>
 #include <vector>
 
 #include <gnuradio-4.0/BlockRegistry.hpp>
-#include <gnuradio-4.0/Graph.hpp>
-#include <gnuradio-4.0/Graph_yaml_importer.hpp>
 #include <gnuradio-4.0/PluginLoader.hpp>
-#include <gnuradio-4.0/Scheduler.hpp>
+#include <gnuradio-4.0/Runtime.hpp>
 #include <gnuradio-4.0/YamlPmt.hpp>
 #include <gnuradio-4.0/formatter/ValueFormatter.hpp>
 
@@ -104,7 +103,7 @@ struct Setting {
 struct Options {
     std::string              graph; // the graph file, or "-" for standard input
     std::vector<std::string> pluginDirectories;
-    std::string              scheduler{gr::detail::kDefaultSchedulerKey};
+    std::string              scheduler{gr::Runtime::kDefaultScheduler};
     std::vector<std::string> show;          // the blocks whose settings are printed when the run ends
     std::vector<Setting>     settings;      // in command-line order, so that the last of a key wins
     double                   seconds = 0.0; // 0 runs until the graph ends or a signal arrives
@@ -262,28 +261,27 @@ void reportPlugins(const gr::PluginLoader& loader, const std::vector<std::string
     }
 }
 
-// One block's readable settings, one `name: key = value` line each, in key order.
+// One block's readable settings, one `label: key = value` line each, in key order, where `label` is the name --show
+// gave.
 //
-// A settings map holds what the last refresh put there, and the framework refreshes one when a settings change is
-// applied, so a block whose readable members move while it runs reports what it started with until it is asked. The
-// run is over by the time this is called, which is what makes such a member readable at all.
-void showSettings(gr::BlockModel& block) {
-    block.settings().updateActiveParameters();
+// A block's settings are those of its last settings change, and the run refreshes them when it ends. The run is over by
+// the time this is called, so a member that moved while the block ran is read as the block left it.
+void showSettings(std::string_view label, const gr::BlockHandle& block) {
     std::vector<std::pair<std::string, std::string>> lines;
-    for (const auto& [key, value] : block.settings().get()) {
+    for (const auto& [key, value] : block.get()) {
         lines.emplace_back(std::string(key.begin(), key.end()), std::format("{}", value));
     }
     std::ranges::sort(lines);
     for (const auto& [key, value] : lines) {
-        std::println("{}: {} = {}", block.name(), key, value);
+        std::println("{}: {} = {}", label, key, value);
     }
     std::fflush(stdout);
 }
 
 // the scheduler's settings, and the settings of each block named, which the graph file is read with
 struct StagedSettings {
-    gr::property_map  scheduler;
-    gr::BlockSettings blocks;
+    gr::property_map                                     scheduler;
+    std::map<std::string, gr::property_map, std::less<>> blocks;
 };
 
 // The settings the --set arguments stand for, or nothing when one of the values cannot be read or stands for more
@@ -314,73 +312,132 @@ struct StagedSettings {
     return staged;
 }
 
-// The reason a refusal or a failure gives: the message of a gr::exception, and the what() of any other exception or
-// of a gr::exception with an empty message. gr::exception::what() appends the file and line of the throw, a path on
-// the machine that built the library.
-[[nodiscard]] std::string_view reasonOf(const std::exception& error) {
-    if (const auto* refusal = dynamic_cast<const gr::exception*>(&error); refusal != nullptr && !refusal->message.empty()) {
-        return refusal->message;
+// Whether the registry holds a scheduler under `key`. A key it does not hold is reported with the keys it holds.
+[[nodiscard]] bool schedulerIsRegistered(const gr::PluginLoader& loader, std::string_view key) {
+    const std::vector<std::string> registered = loader.availableSchedulers();
+    if (std::ranges::contains(registered, key)) {
+        return true;
     }
-    return error.what();
+    std::println(stderr, "{}: no scheduler is registered as {}; the registered schedulers are:", kProgram, key);
+    for (const std::string& available : registered) {
+        std::println(stderr, "{}:   {}", kProgram, available);
+    }
+    return false;
 }
 
-// Applies the settings to the scheduler, before the graph reaches it and before the plan is built.
+// A scheduler is unusable when it cannot be built at all or when it refuses the settings --set gave it.
+enum class SchedulerProblem { cannotBuild, refusesSettings };
+
+// The scheduler registered under `key` built over an empty graph with these settings, as a handle, or the problem
+// that stops it. The probe's runtime is discarded when the function returns.
 //
-// The name is checked against the settings the scheduler declares first: a key outside that set is filed as meta
-// information by the settings map itself, and the run would then proceed as if the caller had asked for nothing.
-[[nodiscard]] bool applySchedulerSettings(gr::BlockModel& scheduler, const gr::property_map& settings) {
-    const std::set<std::string>& declared = scheduler.settings().writableMembers();
-    for (const auto& [key, value] : settings) {
-        if (!declared.contains(std::string(key.begin(), key.end()))) {
-            std::println(stderr, "{}: the scheduler declares no setting named '{}'", kProgram, std::string_view(key.data(), key.size()));
-            return false;
+// A setting the scheduler will not take is a command-line problem, and the answer is wanted before the graph file is
+// read. The scheduler is built without the settings first, to report a name it does not declare in the words of
+// `--help`. It is then built with the settings, which refuses a value that does not convert or falls outside its
+// limits. Without settings the first build is the only one.
+[[nodiscard]] std::expected<gr::BlockHandle, SchedulerProblem> probeScheduler(const std::shared_ptr<gr::PluginLoader>& loader, std::string_view key, const gr::property_map& settings) {
+    const auto probeOf = [&loader, key](const gr::property_map& parameters) -> std::expected<gr::Runtime, gr::RuntimeError> {
+        std::expected<gr::RuntimeGraph, gr::RuntimeError> empty = gr::RuntimeGraph::fromYaml(loader, "blocks: []\n");
+        if (!empty.has_value()) {
+            return std::unexpected(empty.error());
         }
-    }
-    try {
-        if (const gr::property_map refused = scheduler.settings().set(settings); !refused.empty()) {
-            std::println(stderr, "{}: the scheduler refused {}", kProgram, refused);
-            return false;
-        }
-    } catch (const std::exception& error) {
-        std::println(stderr, "{}: a scheduler setting could not be applied: {}", kProgram, reasonOf(error));
-        return false;
-    }
-    std::ignore = scheduler.settings().activateContext();
-    std::ignore = scheduler.settings().applyStagedParameters();
-    return true;
-}
+        return gr::Runtime::create(std::move(*empty), key, parameters);
+    };
 
-// The scheduler registered under `key`, or nothing when its factory throws or the registry holds no such key. An
-// unknown key is reported with the keys the registry holds.
-[[nodiscard]] std::shared_ptr<gr::SchedulerModel> schedulerOf(gr::PluginLoader& loader, std::string_view key) {
-    std::shared_ptr<gr::SchedulerModel> scheduler;
-    if (loader.isSchedulerAvailable(key)) {
-        try {
-            scheduler = loader.instantiateScheduler(key);
-        } catch (const std::exception& error) {
-            std::println(stderr, "{}: the scheduler {} could not be built: {}", kProgram, key, reasonOf(error));
-            return nullptr;
+    const std::expected<gr::Runtime, gr::RuntimeError> bare = probeOf({});
+    if (!bare.has_value()) {
+        std::println(stderr, "{}: the scheduler {} could not be built: {}", kProgram, key, bare.error().message);
+        return std::unexpected(SchedulerProblem::cannotBuild);
+    }
+    if (settings.empty()) {
+        return bare->scheduler();
+    }
+    const std::set<std::string> declared = bare->scheduler().writableMembers();
+    for (const auto& [name, value] : settings) {
+        if (!declared.contains(std::string(name.begin(), name.end()))) {
+            std::println(stderr, "{}: the scheduler declares no setting named '{}'", kProgram, std::string_view(name.data(), name.size()));
+            return std::unexpected(SchedulerProblem::refusesSettings);
         }
     }
-    if (scheduler == nullptr) {
-        std::println(stderr, "{}: no scheduler is registered as {}; the registered schedulers are:", kProgram, key);
-        for (const std::string& registered : loader.availableSchedulers()) {
-            std::println(stderr, "{}:   {}", kProgram, registered);
-        }
+    const std::expected<gr::Runtime, gr::RuntimeError> taken = probeOf(settings);
+    if (!taken.has_value()) {
+        std::println(stderr, "{}: a scheduler setting could not be applied: {}", kProgram, taken.error().message);
+        return std::unexpected(SchedulerProblem::refusesSettings);
     }
-    return scheduler;
+    return taken->scheduler();
 }
 
 // the scheduler chosen and each setting --set gave it, read back from the scheduler
-void reportScheduler(const gr::BlockModel& scheduler, std::string_view key, const gr::property_map& settings) {
+void reportScheduler(const gr::BlockHandle& scheduler, std::string_view key, const gr::property_map& settings) {
     std::println(stderr, "{}: scheduler {}", kProgram, key);
-    const gr::property_map active = scheduler.settings().get();
     for (const auto& [name, _] : settings) {
-        if (const auto found = active.find(name); found != active.end()) {
-            std::println(stderr, "{}: scheduler setting {} = {}", kProgram, std::string_view(name.data(), name.size()), found->second);
+        if (const std::optional<gr::pmt::Value> value = scheduler.get(std::string(name.begin(), name.end())); value.has_value()) {
+            std::println(stderr, "{}: scheduler setting {} = {}", kProgram, std::string_view(name.data(), name.size()), *value);
         }
     }
 }
+
+// The blocks --show names, or nothing when one of them is not in the graph; each missing name is reported. A handle
+// keeps its block when the graph moves into the runtime.
+[[nodiscard]] std::optional<std::vector<gr::BlockHandle>> shownBlocks(const gr::RuntimeGraph& graph, const std::vector<std::string>& names) {
+    std::vector<gr::BlockHandle> shown;
+    bool                         allFound = true;
+    for (const std::string& wanted : names) {
+        std::expected<gr::BlockHandle, gr::RuntimeError> found = graph.find(wanted);
+        if (found.has_value()) {
+            shown.push_back(std::move(*found));
+            continue;
+        }
+        allFound                 = false;
+        const bool nameIsInGraph = std::ranges::any_of(graph.blocks(), [&wanted](const gr::BlockHandle& block) { return block.name() == wanted || block.uniqueName() == wanted; });
+        if (nameIsInGraph) {
+            std::println(stderr, "{}: {}", kProgram, found.error().message);
+        } else {
+            std::println(stderr, "{}: the graph holds no block named {}", kProgram, wanted);
+        }
+    }
+    if (!allFound) {
+        return std::nullopt;
+    }
+    return shown;
+}
+
+// the errors a run reported: how many, and the first
+struct ReportedErrors {
+    std::size_t count = 0UZ;
+    // the first error's line, worded as the run's result words it, so a result that repeats it is not printed again
+    std::string first;
+};
+
+// The endpoint of the scheduler's report that a block ended the run with an error status. The block's own report
+// carries the reason, and the run's result holds it.
+constexpr std::string_view kRunEndedByBlockEndpoint = "error in the run";
+
+// Takes the errors reported since the last call into `errors` and prints the first of the run on one line, without the
+// location the report carries. The later ones are counted. The scheduler's notice that a block ended the run is not an
+// error of its own.
+void takeReportedErrors(gr::Runtime& runtime, ReportedErrors& errors) {
+    const std::string scheduler = runtime.scheduler().uniqueName();
+    for (std::vector<gr::RuntimeEvent> events = runtime.pollEvents(); !events.empty(); events = runtime.pollEvents()) {
+        for (const gr::RuntimeEvent& event : events) {
+            if (!event.isError || (event.source == scheduler && event.endpoint == kRunEndedByBlockEndpoint)) {
+                continue;
+            }
+            if (errors.count++ > 0UZ) {
+                continue;
+            }
+            if (event.source == scheduler) {
+                std::println(stderr, "{}: the scheduler reports an error on '{}': {}", kProgram, event.endpoint, event.text);
+                errors.first = event.text;
+            } else {
+                errors.first = std::format("block '{}' reports an error on '{}': {}", event.source, event.endpoint, event.text);
+                std::println(stderr, "{}: {}", kProgram, errors.first);
+            }
+        }
+    }
+}
+
+constexpr std::chrono::milliseconds kPollInterval{20};
 
 } // namespace
 
@@ -414,24 +471,25 @@ int main(int argc, char** argv) {
     const std::vector<std::string> directories = searchDirectories(options.pluginDirectories);
     std::vector<std::string>       keysBefore  = gr::globalBlockRegistry().keys();
     std::ranges::sort(keysBefore);
-    gr::PluginLoader loader(gr::globalBlockRegistry(), gr::globalSchedulerRegistry(), directories);
+    const auto loader = std::make_shared<gr::PluginLoader>(gr::globalBlockRegistry(), gr::globalSchedulerRegistry(), directories);
     if (options.verbose) {
-        reportPlugins(loader, directories, keysBefore);
+        reportPlugins(*loader, directories, keysBefore);
     }
 
-    // The scheduler is built after the loader, so that it and the blocks it holds are destroyed while the libraries
-    // they came from are still open. It is chosen and given its settings before the graph is read. An unknown key or a
-    // refused setting is reported as a command-line error.
-    const std::shared_ptr<gr::SchedulerModel> scheduler = schedulerOf(loader, options.scheduler);
-    if (scheduler == nullptr) {
+    // The scheduler key and its settings are checked before the graph file is read. A key the registry does not hold or
+    // a setting the scheduler refuses ends the program with status 2.
+    if (!schedulerIsRegistered(*loader, options.scheduler)) {
         return 2;
     }
-    if (!applySchedulerSettings(*scheduler->asBlockModel(), staged->scheduler)) {
-        std::print(stderr, "{}", kUsage);
+    const std::expected<gr::BlockHandle, SchedulerProblem> probed = probeScheduler(loader, options.scheduler, staged->scheduler);
+    if (!probed.has_value()) {
+        if (probed.error() == SchedulerProblem::refusesSettings) {
+            std::print(stderr, "{}", kUsage);
+        }
         return 2;
     }
     if (options.verbose) {
-        reportScheduler(*scheduler->asBlockModel(), options.scheduler, staged->scheduler);
+        reportScheduler(*probed, options.scheduler, staged->scheduler);
     }
 
     const std::optional<std::string> document = readGraph(options.graph);
@@ -439,72 +497,62 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Each block reads its --set values with the graph file's own. Its start() sees them. The loader refuses a graph
-    // file that names a key nothing supplies or a port that is not there. It also refuses a --set key the block does
-    // not declare, a value of the wrong type, and a --set for a block the file does not hold. Its message is printed as
-    // it arrives.
-    std::optional<gr::meta::indirect<gr::Graph>> graph;
-    try {
-        graph.emplace(gr::loadGrc(loader, *document, staged->blocks));
-    } catch (const std::exception& error) {
-        std::println(stderr, "{}: {} did not load: {}", kProgram, options.graph, reasonOf(error));
+    // Each block reads its --set values with the graph file's own. Its start() sees them. The reader refuses a graph
+    // file that names a key nothing supplies or a port that is not there. It also refuses a --set key the block does not
+    // declare, a value of the wrong type, and a --set for a block the file does not hold. Its message is printed as it
+    // arrives.
+    std::expected<gr::RuntimeGraph, gr::RuntimeError> graph = gr::RuntimeGraph::fromYaml(loader, *document, staged->blocks);
+    if (!graph.has_value()) {
+        std::println(stderr, "{}: {} did not load: {}", kProgram, options.graph, graph.error().message);
         return 1;
     }
 
-    // the blocks --show names are found before the graph is handed to the scheduler, because the handles stay valid
-    // over the move and the graph itself does not
-    std::vector<std::shared_ptr<gr::BlockModel>> shown;
-    bool                                         allFound = true;
-    for (const std::string& wanted : options.show) {
-        std::shared_ptr<gr::BlockModel> found;
-        gr::graph::forEachBlock<gr::block::Category::NormalBlock>(**graph, [&found, &wanted](const std::shared_ptr<gr::BlockModel>& block) {
-            if (block->name() == wanted) {
-                found = block;
-            }
-        });
-        if (found == nullptr) {
-            std::println(stderr, "{}: the graph holds no block named {}", kProgram, wanted);
-            allFound = false;
-            continue;
-        }
-        shown.push_back(std::move(found));
-    }
-    if (!allFound) {
+    std::optional<std::vector<gr::BlockHandle>> shown = shownBlocks(*graph, options.show);
+    if (!shown.has_value()) {
         return 1;
     }
 
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
 
-    scheduler->setGraph(std::move(**graph));
-
-    std::atomic<bool> finished{false};
-    std::atomic<bool> failed{false};
-    std::thread       runner([&scheduler, &finished, &failed] {
-        if (const auto result = scheduler->runAndWait(); !result.has_value()) {
-            std::println(stderr, "{}: the graph stopped: {}", kProgram, result.error().message);
-            failed.store(true, std::memory_order_relaxed);
-        }
-        finished.store(true, std::memory_order_relaxed);
-    });
-
-    const auto start = std::chrono::steady_clock::now();
-    while (!finished.load(std::memory_order_relaxed) && !gStopRequested.load(std::memory_order_relaxed)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        if (options.seconds > 0.0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >= options.seconds) {
-            break;
-        }
+    std::expected<gr::Runtime, gr::RuntimeError> runtime = gr::Runtime::create(std::move(*graph), options.scheduler, staged->scheduler);
+    if (!runtime.has_value()) {
+        std::println(stderr, "{}: the scheduler {} could not be built: {}", kProgram, options.scheduler, runtime.error().message);
+        return 2;
     }
-    const bool endedItself = finished.load(std::memory_order_relaxed);
+    if (const std::expected<void, gr::RuntimeError> started = runtime->start(); !started.has_value()) {
+        std::println(stderr, "{}: the graph stopped: {}", kProgram, started.error().message);
+        return 1;
+    }
+
+    const auto     start        = std::chrono::steady_clock::now();
+    const auto     boundReached = [&options, start] { return options.seconds > 0.0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >= options.seconds; };
+    ReportedErrors errors;
+    bool           endedItself = false;
+    while (!endedItself && errors.count == 0UZ && !gStopRequested.load(std::memory_order_relaxed) && !boundReached()) {
+        endedItself = runtime->waitFor(kPollInterval);
+        takeReportedErrors(*runtime, errors);
+    }
+    const bool stoppedOnError = errors.count > 0UZ && !endedItself;
     if (!endedItself) {
-        // a run that ended after the check refuses the transition, and the join below waits for it either way
-        std::ignore = scheduler->asBlockModel()->changeStateTo(gr::lifecycle::State::REQUESTED_STOP);
+        // the stop is requested once, and each later call waits for that same stop
+        while (!runtime->stopFor(kPollInterval)) {
+            takeReportedErrors(*runtime, errors);
+        }
     }
-    runner.join();
+    takeReportedErrors(*runtime, errors);
+    if (errors.count > 1UZ) {
+        std::println(stderr, "{}: {} more error(s) followed the first", kProgram, errors.count - 1UZ);
+    }
 
-    for (const std::shared_ptr<gr::BlockModel>& block : shown) {
-        showSettings(*block);
+    // a run the first error failed returns that error as its result, and the line is printed once
+    const std::expected<void, gr::RuntimeError> result = runtime->result();
+    if (!result.has_value() && result.error().message != errors.first) {
+        std::println(stderr, "{}: the graph stopped: {}", kProgram, result.error().message);
     }
-    std::println(stderr, "{}: {}", kProgram, endedItself ? "the graph ended on its own" : "the graph was stopped before it ended");
-    return failed.load(std::memory_order_relaxed) ? 1 : 0;
+    for (std::size_t i = 0UZ; i < shown->size(); ++i) {
+        showSettings(options.show[i], (*shown)[i]);
+    }
+    std::println(stderr, "{}: {}", kProgram, endedItself ? "the graph ended on its own" : (stoppedOnError ? "the graph was stopped on the first error reported" : "the graph was stopped before it ended"));
+    return result.has_value() && errors.count == 0UZ ? 0 : 1;
 }

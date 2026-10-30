@@ -57,16 +57,27 @@ if(TARGET rungraph)
     target_compile_definitions(
       qa_RunGraph PRIVATE GR_TOOLS_CORE_TEST_PLUGINS="${CMAKE_BINARY_DIR}/core/test/plugins"
                           GR_TOOLS_TEST_SCHEDULER_LIBRARY="${CMAKE_BINARY_DIR}/core/test/scheduler_library")
-    # the settings cases need GoodRegistryPlugin (good::identity and good::start_recorder), good_math_plugin (a plugin's
-    # scheduler) and scheduler_library (a scheduler from a shared object that is not a plugin)
+    # the cases read these files: GoodBasePlugin (good::fixed_source and good::cout_sink), GoodRegistryPlugin
+    # (good::identity and good::start_recorder), good_math_plugin (a plugin's scheduler), bad_plugin (the plugin
+    # --verbose reports as not loaded), scheduler_library (a scheduler from a shared object that is not a plugin), and
+    # scheduler_library_v1 and scheduler_library_unversioned (the two builds of it that are refused)
     add_dependencies(
       qa_RunGraph
       GoodBasePlugin
       GoodRegistryPlugin
       good_math_plugin
+      bad_plugin
       scheduler_library
       scheduler_library_v1
       scheduler_library_unversioned)
+
+    # one plugin, in a directory of its own, whose block reports an error while the graph runs
+    add_library(rungraph_fixture MODULE plugins/rungraph_fixture_plugin.cpp)
+    target_include_directories(rungraph_fixture PRIVATE ${CMAKE_BINARY_DIR}/include)
+    target_link_libraries(rungraph_fixture PRIVATE gnuradio-options gnuradio-core gnuradio-plugin)
+    set_target_properties(rungraph_fixture PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/fixture)
+    add_dependencies(qa_RunGraph rungraph_fixture)
+    target_compile_definitions(qa_RunGraph PRIVATE GR_TOOLS_FIXTURE_PLUGINS="${CMAKE_CURRENT_BINARY_DIR}/fixture")
   endif()
 endif()
 
