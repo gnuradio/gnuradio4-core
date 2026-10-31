@@ -134,9 +134,7 @@ const boost::ut::suite StateMachineTest = [] {
     };
 
     "StateMachine nominal State transitions -- non-atomic"_test = [&] { nominalTest.template operator()<gr::test::MockStateMachine<StorageType::NON_ATOMIC>>(); };
-    "StateMachine nominal State transitions -- atomic"_test     = [&] { // N.B. this workaround is needed because atomic are not copyable
-        nominalTest.template operator()<gr::test::MockStateMachine<StorageType::NON_ATOMIC>>();
-    };
+    "StateMachine nominal State transitions -- atomic"_test     = [&] { nominalTest.template operator()<gr::test::MockStateMachine<StorageType::ATOMIC>>(); };
 
     "StateMachine REQUESTED_PAUSE is not terminal"_test = [] {
         // a block that never reaches PAUSED (isBlocking() -> true) must still be stoppable and resumable
