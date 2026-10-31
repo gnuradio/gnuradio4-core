@@ -18,6 +18,9 @@ union Bar {
 enum Enum { A, B, C };
 
 enum class EnumClass { Foo, Bar };
+
+template<typename... Policies>
+struct Configurable {};
 } // namespace ns0
 
 const boost::ut::suite<"type name tests"> _type_name = [] {
@@ -90,6 +93,12 @@ const boost::ut::suite<"type name tests"> _type_name = [] {
 
         // some common STL types
         expect(eq(gr::meta::type_name<std::string>(), "string"s));
+    };
+
+    "gr::meta::type_name<T>() - an empty template argument list"_test = [] {
+        expect(eq(gr::meta::type_name<Configurable<>>(), "ns0::Configurable<>"s));
+        expect(eq(gr::meta::type_name<Foo<Configurable<>>>(), "ns0::Foo<ns0::Configurable<>>"s));
+        expect(eq(gr::meta::detail::makePortableTypeName("ns0::Configurable< >"), "ns0::Configurable<>"s));
     };
 };
 
