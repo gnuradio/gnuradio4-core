@@ -503,10 +503,10 @@ template<typename T>
 
 inline std::string makePortableTypeName(std::string_view name) {
     auto trimmed = [](std::string_view view) {
-        while (view.front() == ' ') {
+        while (view.starts_with(' ')) {
             view.remove_prefix(1);
         }
-        while (view.back() == ' ') {
+        while (view.ends_with(' ')) {
             view.remove_suffix(1);
         }
         return view;
@@ -608,7 +608,7 @@ inline std::string makePortableTypeName(std::string_view name) {
         return stripStdPrivates(std::string{name});
     }
     view.remove_suffix(1);
-    while (view.back() == ' ') {
+    while (view.ends_with(' ')) {
         view.remove_suffix(1);
     }
 
