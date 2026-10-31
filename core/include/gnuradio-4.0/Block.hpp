@@ -908,6 +908,11 @@ public:
     std::size_t    _nDrainStalls   = 0UZ;
     bool           _waitedOnOutput = false; // the last call returned INSUFFICIENT_OUTPUT_ITEMS
 
+    /// the read positions and the tag counts of the last staging of first-sample tags. A call at the same read positions
+    /// stages only the tags that arrived since. The sum identifies the positions, as synchronous inputs move together.
+    std::size_t              _stagedPositionSum = std::numeric_limits<std::size_t>::max();
+    std::vector<std::size_t> _nStagedTags; // per connected synchronous input, in port order
+
     // intermediate non-real-time<->real-time setting states
     CtxSettings<Derived> _settings;
 
@@ -1505,8 +1510,9 @@ public:
     /// read position that no span retired, which an override must skip. The input's own end-of-stream tag is among
     /// the others, and an override must drop that key, as publishEoS() publishes its own. Every other block forwards
     /// them through forwardRemainingInputTags(). workInternal() calls this when an input's stream ends; a stop request
-    /// forwards none.
-    void forwardTagsAtEndOfStream() {
+    /// forwards none. With firstSampleSettingsApplied, a tag at the read position sets no setting. workInternal() passes
+    /// it when the call applied those settings before it was sized and no epilogue has moved the read position since.
+    void forwardTagsAtEndOfStream(bool firstSampleSettingsApplied = false) {
         if constexpr (traits::block::stream_input_ports<Derived>::size > 0 && traits::block::stream_output_ports<Derived>::size > 0) {
             std::size_t endIndex = std::numeric_limits<std::size_t>::max();
             for_each_port(
@@ -1526,7 +1532,7 @@ public:
 
             const std::pmr::string endOfStream = static_cast<std::pmr::string>(gr::tag::END_OF_STREAM);
             for_each_port_and_reader_span(
-                [this, &endOfStream]<PortLike TPort, ReaderSpanLike TReaderSpan>(TPort& port, TReaderSpan& span) {
+                [this, &endOfStream, firstSampleSettingsApplied]<PortLike TPort, ReaderSpanLike TReaderSpan>(TPort& port, TReaderSpan& span) {
                     if (!span.isSync || !span.isConnected) {
                         return;
                     }
@@ -1539,7 +1545,9 @@ public:
                         if (map.empty()) {
                             continue;
                         }
-                        settings().autoUpdate(Tag{0UZ, map});
+                        if (!firstSampleSettingsApplied || tag.index > span.streamIndex) {
+                            settings().autoUpdate(Tag{0UZ, map});
+                        }
                         if (const auto res = port.metaInfo.updateFromTag(map); !res.has_value()) {
                             emitMessage("Block::forwardTagsAtEndOfStream - rejected tag", {{"error", res.error().message}});
                         }
@@ -1563,25 +1571,29 @@ public:
     }
 
     /// apply settings from per-port input tags and update PortMetaInfo — no merge, no intermediate storage
+    ///
+    /// With firstSampleSettingsApplied, a tag at or behind the read position sets no setting, and still updates the
+    /// PortMetaInfo.
     template<typename TInputSpans>
-    void applyInputTagsFromPorts(TInputSpans& inputSpans, std::size_t untilLocalIndex = 1UZ) noexcept {
+    void applyInputTagsFromPorts(TInputSpans& inputSpans, std::size_t untilLocalIndex = 1UZ, bool firstSampleSettingsApplied = false) noexcept {
         // the window matches the one the span retires, or a tag retired without being read here would never reach
         // settings at all; an interior tag's settings take effect from the chunk's first sample, not from its own
-        applyInputTagsInWindow(inputSpans, hasWholeChunkTagWindow() ? untilLocalIndex : 1UZ);
+        applyInputTagsInWindow(inputSpans, hasWholeChunkTagWindow() ? untilLocalIndex : 1UZ, std::numeric_limits<std::ptrdiff_t>::min(), firstSampleSettingsApplied);
     }
 
 private:
     /// apply settings and PortMetaInfo from the tags behind each input's read position and less than tagWindow samples
-    /// past it. A tag before firstIndex is left out.
+    /// past it. A tag before firstIndex is left out. With firstSampleSettingsApplied, a tag at or behind the read
+    /// position sets no setting.
     template<typename TInputSpans>
-    void applyInputTagsInWindow(TInputSpans& inputSpans, std::size_t tagWindow, std::ptrdiff_t firstIndex = std::numeric_limits<std::ptrdiff_t>::min()) noexcept {
+    void applyInputTagsInWindow(TInputSpans& inputSpans, std::size_t tagWindow, std::ptrdiff_t firstIndex = std::numeric_limits<std::ptrdiff_t>::min(), bool firstSampleSettingsApplied = false) noexcept {
         for_each_reader_span(
-            [this, tagWindow, firstIndex](auto& in) {
+            [this, tagWindow, firstIndex, firstSampleSettingsApplied](auto& in) {
                 if (!in.isSync || !in.isConnected) {
                     return;
                 }
                 for (const auto& [relIndex, tagMapRef] : in.tags(tagWindow)) {
-                    if (relIndex < firstIndex) {
+                    if (relIndex < firstIndex || (firstSampleSettingsApplied && relIndex <= 0)) {
                         continue;
                     }
                     settings().autoUpdate(Tag{relIndex < 0 ? 0UZ : static_cast<std::size_t>(relIndex), tagMapRef.get()});
@@ -2469,11 +2481,59 @@ public:
 
     /// apply input tags and settings from all sync ports
     template<typename TInputSpans>
-    void applyInputTagsAndSettings(TInputSpans& inputSpans, std::size_t processedIn, bool hasAnyTag) {
+    void applyInputTagsAndSettings(TInputSpans& inputSpans, std::size_t processedIn, bool hasAnyTag, bool firstSampleSettingsApplied) {
         if (hasAnyTag) {
-            applyInputTagsFromPorts(inputSpans, processedIn);
+            applyInputTagsFromPorts(inputSpans, processedIn, firstSampleSettingsApplied);
             applyChangedSettings(true, &_pendingForwardParams);
         }
+    }
+
+    /// stage the settings that the tags at or behind each synchronous input's read position carry
+    ///
+    /// workInternal() calls this before it sizes a call, so a tag at the call's first sample that changes
+    /// input_chunk_size, output_chunk_size, stride or a port's sample limits sizes that call. A call that moves no
+    /// sample leaves the tags on the input. At the same read positions the next call stages only the tags that arrived
+    /// since. Returns false when the read position lies inside a stride skip the call could not finish, where nothing
+    /// is staged.
+    bool stageFirstSampleTagSettings() {
+        if constexpr (StrideControl::kEnabled) {
+            if (stride.value != 0 && stride.value != input_chunk_size && strideCounter > 0) {
+                return false;
+            }
+        }
+        const auto forEachSyncInput = [this](auto&& visit) {
+            for_each_port(
+                [&visit]<PortLike TPort>(TPort& port) {
+                    if constexpr (std::remove_cvref_t<TPort>::kIsSynch) {
+                        if (port.isConnected()) {
+                            RandomAccessReaderSpanLike auto tagData = port.tagReader().get();
+                            std::ignore                             = tagData.consume(0UZ);
+                            const std::size_t readPosition          = port.streamReader().position();
+                            visit(readPosition, tagData | std::views::take_while([readPosition](const Tag& tag) { return tag.index <= readPosition; }));
+                        }
+                    }
+                },
+                inputPorts<PortType::STREAM>(&self()));
+        };
+
+        std::size_t positionSum = 0UZ;
+        forEachSyncInput([&positionSum](std::size_t readPosition, auto /*firstSampleTags*/) { positionSum += readPosition; });
+        const bool  samePositions = positionSum == _stagedPositionSum;
+        std::size_t input         = 0UZ;
+        forEachSyncInput([this, samePositions, &input](std::size_t /*readPosition*/, auto firstSampleTags) {
+            if (input == _nStagedTags.size()) {
+                _nStagedTags.push_back(0UZ);
+            }
+            const std::size_t nTags   = static_cast<std::size_t>(std::ranges::distance(firstSampleTags));
+            const std::size_t nStaged = samePositions ? std::min(_nStagedTags[input], nTags) : 0UZ;
+            for (const Tag& tag : firstSampleTags | std::views::drop(static_cast<std::ptrdiff_t>(nStaged))) {
+                settings().autoUpdate(Tag{0UZ, tag.map});
+            }
+            _nStagedTags[input] = nTags;
+            ++input;
+        });
+        _stagedPositionSum = positionSum;
+        return true;
     }
 
     /// a processBulk() that returns OK without consuming or publishing keeps the scheduler spinning: report the block once per stall
@@ -2653,12 +2713,21 @@ public:
         if (limits.inputSkipBefore > 0) {
             skipInputSamples(limits.inputSkipBefore);
         }
+        // a tag at the call's first sample sets its settings before the call is sized
+        const bool firstSampleSettingsApplied = limits.hasAnyTag && stageFirstSampleTagSettings();
+        if (firstSampleSettingsApplied && settings().changed()) {
+            applyChangedSettings(true, &_pendingForwardParams);
+            inputStreamCache.invalidateStatistic();
+            outputStreamCache.invalidateStatistic();
+            limits = computeSampleLimits(requestedWork);
+        }
 
         const bool drainStalled = isDrainStalled(limits.draining); // evaluated before the test below, which would short-circuit past the bookkeeping
         if (drainStalled) {
             notifyDrainStall();
         }
         if (limits.isEosPresent || lifecycle::isShuttingDown(this->state()) || limits.asyncEoS || drainStalled) {
+            bool readPositionSettingsApplied = firstSampleSettingsApplied;
             if constexpr (HasProcessEpilogueFunction<Derived>) {
                 inputStreamCache.invalidateStatistic();
                 // the epilogue is the block's only end-of-stream hook, so it runs once per stream
@@ -2675,7 +2744,7 @@ public:
                 // sequence the ordinary path runs, with the whole trailing span as the
                 // forward window because nothing after it can retire a deferred tag
                 applyChangedSettings(true, &_pendingForwardParams);
-                applyInputTagsAndSettings(epilogueIn, trailing, limits.hasAnyTag);
+                applyInputTagsAndSettings(epilogueIn, trailing, limits.hasAnyTag, firstSampleSettingsApplied);
                 if constexpr (requires { self().forwardTags(epilogueIn, epilogueOut, trailing); }) {
                     self().forwardTags(epilogueIn, epilogueOut, trailing);
                 } else {
@@ -2707,9 +2776,11 @@ public:
                     epilogueIn);
                 publishSamples(0UZ, epilogueOut); // publish only what the block explicitly requested via out.publish(n)
                 consumeReaders(trailing, epilogueIn);
+                // the tags at the new read position were not staged before the call
+                readPositionSettingsApplied = readPositionSettingsApplied && trailing == 0UZ;
             }
             if ((limits.isEosPresent || drainStalled) && !lifecycle::isShuttingDown(this->state())) {
-                forwardTagsAtEndOfStream();
+                forwardTagsAtEndOfStream(readPositionSettingsApplied);
             }
             emitErrorMessageIfAny("workInternal(): EOS tag arrived -> REQUESTED_STOP", this->changeStateTo(lifecycle::State::REQUESTED_STOP));
             publishEoS();
@@ -2738,7 +2809,7 @@ public:
 
         applyChangedSettings(true, &_pendingForwardParams); // captures any further external settings change, published through the open spans below
         // a block that maps tags by its chunk ratio applies the tags past the first sample after the call, once
-        applyInputTagsAndSettings(inputSpans, mapsTagsByChunkRatio() ? 1UZ : processedIn, limits.hasAnyTag);
+        applyInputTagsAndSettings(inputSpans, mapsTagsByChunkRatio() ? 1UZ : processedIn, limits.hasAnyTag, firstSampleSettingsApplied);
 
         if constexpr (requires { self().forwardTags(inputSpans, outputSpans, processedIn); }) {
             self().forwardTags(inputSpans, outputSpans, processedIn);
