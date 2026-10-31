@@ -317,11 +317,13 @@ const boost::ut::suite StateMachineTest = [] {
         gr::test::MockStateMachine<StorageType::ATOMIC> machine;
         expect(machine.state() == State::IDLE);
 
-        std::thread notifyThread([&machine]() {
+        bool        notifierChangedState = false;
+        bool        notifierSawNewState  = false;
+        std::thread notifyThread([&machine, &notifierChangedState, &notifierSawNewState]() {
             using namespace std::literals;
             std::this_thread::sleep_for(100ms);
-            expect(machine.changeStateTo(State::INITIALISED).has_value());
-            expect(machine.state() == State::INITIALISED);
+            notifierChangedState = machine.changeStateTo(State::INITIALISED).has_value();
+            notifierSawNewState  = machine.state() == State::INITIALISED;
         });
         expect(machine.state() == State::IDLE);
         machine.waitOnState(State::IDLE); // blocks here
@@ -329,6 +331,9 @@ const boost::ut::suite StateMachineTest = [] {
         if (notifyThread.joinable()) {
             notifyThread.join();
         }
+        // expect() is not thread-safe. The notifier thread's results are checked here, after the join.
+        expect(notifierChangedState);
+        expect(notifierSawNewState);
         // finished successful
     };
 
