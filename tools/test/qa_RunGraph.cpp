@@ -1,8 +1,11 @@
 #include <boost/ut.hpp>
 
+#include <algorithm>
 #include <array>
+#include <charconv>
 #include <cstdio>
 #include <format>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -28,6 +31,10 @@
  * - what --verbose reports, and that it reports the scheduler before the graph file is read
  * - a scheduler that cannot be built
  * - the errors a block and the scheduler report while the graph runs
+ * - each refusal of a setting and each failure at start or while running of the fixture's blocks, each with its status and its reason
+ * - a failure --expect-error expects, and one it does not
+ * - the settings --expect requires after the run, met and not met
+ * - the samples of each block's call, bounded by the scheduler setting max_work_items
  */
 namespace qa_rungraph {
 
@@ -127,6 +134,53 @@ constexpr std::string_view kSharedNameFile{GR_TOOLS_TEST_ASSETS "/shared_name.ya
     const std::size_t first = begin == std::string_view::npos ? 0UZ : begin + 1UZ;
     const std::size_t end   = output.find('\n', found);
     return output.substr(first, end == std::string_view::npos ? std::string_view::npos : end - first);
+}
+#endif
+
+#ifdef GR_TOOLS_CORE_TEST_PLUGINS
+constexpr std::string_view kRefusalFile{GR_TOOLS_TEST_ASSETS "/refusal.yaml"};
+constexpr std::string_view kWrongTypeFile{GR_TOOLS_TEST_ASSETS "/refusal_wrong_type.yaml"};
+constexpr std::string_view kOutOfLimitsFile{GR_TOOLS_TEST_ASSETS "/refusal_out_of_limits.yaml"};
+constexpr std::string_view kChunksFile{GR_TOOLS_TEST_ASSETS "/chunks.yaml"};
+
+// a graph of the fixture plugin; the bound is far beyond any failure, and a run that reaches it was not ended by one
+[[nodiscard]] std::vector<std::string> fixtureRun(std::string_view file) { return {"--graph", std::string(file), "--plugin-dir", GR_TOOLS_FIXTURE_PLUGINS, "--seconds", "10"}; }
+
+// the block that fails in the step `step` names
+[[nodiscard]] std::vector<std::string> failingIn(std::string_view step) {
+    std::vector<std::string> arguments = fixtureRun(kRefusalFile);
+    arguments.insert(arguments.end(), {"--set", std::format("refusal.fails_in={}", step)});
+    return arguments;
+}
+
+// The lines of `output` rungraph printed that hold `part`. A build without NDEBUG also prints a line of its own for
+// every gr::exception it constructs, with the source file and line of the throw; that line is not rungraph's.
+[[nodiscard]] std::vector<std::string_view> programLinesHolding(std::string_view output, std::string_view part) {
+    std::vector<std::string_view> lines;
+    for (std::size_t begin = 0UZ; begin < output.size();) {
+        const std::size_t      end  = output.find('\n', begin);
+        const std::string_view line = output.substr(begin, end == std::string_view::npos ? std::string_view::npos : end - begin);
+        if (line.starts_with("rungraph: ") && line.contains(part)) {
+            lines.push_back(line);
+        }
+        begin = end == std::string_view::npos ? output.size() : end + 1UZ;
+    }
+    return lines;
+}
+
+// the number --show printed after `marker`, such as "middle: largest_call = ", or nothing when no line holds one
+[[nodiscard]] std::optional<std::size_t> shownNumber(std::string_view output, std::string_view marker) {
+    const std::size_t found = output.find(marker);
+    if (found == std::string_view::npos) {
+        return std::nullopt;
+    }
+    const std::string_view digits = output.substr(found + marker.size());
+    std::size_t            value  = 0UZ;
+    const auto             parsed = std::from_chars(digits.data(), digits.data() + digits.size(), value);
+    if (parsed.ec != std::errc{} || parsed.ptr == digits.data()) {
+        return std::nullopt;
+    }
+    return value;
 }
 #endif
 
@@ -467,6 +521,237 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
         expect(eq(reported.exitCode, 1)) << reported.output;
         expect(reported.output.contains("rungraph: the scheduler reports an error on ")) << reported.output;
         expect(reported.output.contains("'nosuch'")) << "the scheduler's reason is not printed" << reported.output;
+    };
+
+    "each refusal and failure of the fixture blocks ends the run with status 1 and prints the block's reason once, without a source path"_test = [] {
+        struct Refusal {
+            std::string_view         path;
+            std::vector<std::string> arguments;
+            std::string_view         reason;
+        };
+        const std::vector<Refusal> refusals{
+            {"a graph file value of the wrong type", fixtureRun(kWrongTypeFile), R"(value "many" for key 'count' has wrong type)"},
+            {"a graph file value outside the limits", fixtureRun(kOutOfLimitsFile), "outside the limits [0, 1]"},
+            {"settingsChanged() throws", failingIn("settingsChanged"), "the fixture refuses its settings"},
+            {"start() throws", failingIn("start"), "the fixture refuses to start"},
+            {"processBulk() throws", failingIn("processBulk"), "the fixture fails in processBulk"},
+            {"work() returns ERROR", failingIn("work"), "its work() returned ERROR"},
+            {"an error on the message port", fixtureRun(kFaultFile), "the fixture reports a fault"},
+        };
+        for (const Refusal& refusal : refusals) {
+            const Result                        failed = run(refusal.arguments);
+            const std::vector<std::string_view> lines  = programLinesHolding(failed.output, refusal.reason);
+            expect(eq(failed.exitCode, 1)) << refusal.path << failed.output;
+            expect(eq(lines.size(), 1UZ)) << refusal.path << "prints its reason once" << failed.output;
+            for (const std::string_view line : lines) {
+                expect(!line.contains(".cpp:") && !line.contains(".hpp:")) << refusal.path << "names a source file" << failed.output;
+            }
+        }
+    };
+
+    "--expect-error ends a run that fails with each text it names with status 0"_test = [] {
+        std::vector<std::string> oneText = failingIn("start");
+        oneText.insert(oneText.end(), {"--expect-error", "refuses to start"});
+        const Result expectedFailure = run(oneText);
+        expect(eq(expectedFailure.exitCode, 0)) << expectedFailure.output;
+        expect(eq(programLinesHolding(expectedFailure.output, "the fixture refuses to start").size(), 1UZ)) << "the failure is still printed" << expectedFailure.output;
+        expect(expectedFailure.output.contains("rungraph: the run failed with each error --expect-error names")) << expectedFailure.output;
+
+        std::vector<std::string> twoTexts = failingIn("processBulk");
+        twoTexts.insert(twoTexts.end(), {"--expect-error", "the fixture", "--expect-error", "in processBulk"});
+        const Result both = run(twoTexts);
+        expect(eq(both.exitCode, 0)) << both.output;
+
+        std::vector<std::string> atLoad = fixtureRun(kWrongTypeFile);
+        atLoad.insert(atLoad.end(), {"--expect-error", "for key 'count' has wrong type"});
+        const Result loadFailure = run(atLoad);
+        expect(eq(loadFailure.exitCode, 0)) << "a failure at load counts" << loadFailure.output;
+
+        std::vector<std::string> fromMessagePort = fixtureRun(kFaultFile);
+        fromMessagePort.insert(fromMessagePort.end(), {"--expect-error", "reports a fault"});
+        const Result reported = run(fromMessagePort);
+        expect(eq(reported.exitCode, 0)) << "a reported error counts" << reported.output;
+    };
+
+    "--expect-error ends a run that does not fail, or fails without one of its texts, with status 1 and one line for each text missing"_test = [] {
+        std::vector<std::string> missingText = failingIn("start");
+        missingText.insert(missingText.end(), {"--expect-error", "refuses to start", "--expect-error", "no such reason"});
+        const Result otherReason = run(missingText);
+        expect(eq(otherReason.exitCode, 1)) << otherReason.output;
+        const std::vector<std::string_view> missing = programLinesHolding(otherReason.output, "expected an error holding");
+        expect(eq(missing.size(), 1UZ)) << "the text found is not reported" << otherReason.output;
+        for (const std::string_view line : missing) {
+            expect(line.contains("'no such reason', and the run failed with: ") && line.contains("the fixture refuses to start")) << "the line names the text and the failure" << otherReason.output;
+        }
+
+        std::vector<std::string> clean = settingsChainRun();
+        clean.insert(clean.end(), {"--set", "source.event_count=1000", "--expect-error", "some reason"});
+        const Result cleanRun = run(clean);
+        expect(eq(cleanRun.exitCode, 1)) << cleanRun.output;
+        expect(eq(programLinesHolding(cleanRun.output, "expected an error holding 'some reason', and the run ended without an error").size(), 1UZ)) << cleanRun.output;
+
+        const Result unusable = run({"--graph", "unread.yaml", "--expect-error", "some reason", "--no-such-option"});
+        expect(eq(unusable.exitCode, 2)) << "a command line that cannot be used is not a failure of the run" << unusable.output;
+
+        const Result refusedScheduler = run({"--graph", "unread.yaml", "--expect-error", "no_such_setting", "--set", "no_such_setting=1"});
+        expect(eq(refusedScheduler.exitCode, 2)) << refusedScheduler.output;
+    };
+
+    "--expect-error matches the reason of the error alone, not the words rungraph prints around it"_test = [] {
+        std::vector<std::string> fromEndpoint = failingIn("processBulk");
+        fromEndpoint.insert(fromEndpoint.end(), {"--expect-error", "invokeProcessBulk"});
+        const Result endpointOnly = run(fromEndpoint);
+        expect(eq(endpointOnly.exitCode, 1)) << "the endpoint is not part of the reason" << endpointOnly.output;
+        expect(eq(programLinesHolding(endpointOnly.output, "expected an error holding 'invokeProcessBulk'").size(), 1UZ)) << endpointOnly.output;
+
+        std::vector<std::string> fromFraming = failingIn("processBulk");
+        fromFraming.insert(fromFraming.end(), {"--expect-error", "reports an error on"});
+        expect(eq(run(fromFraming).exitCode, 1)) << "the words rungraph adds are not part of the reason";
+
+        std::vector<std::string> fromSchedulerFraming = boundedRun();
+        fromSchedulerFraming.insert(fromSchedulerFraming.end(), {"--set", "poolName=nosuch", "--expect-error", "the scheduler reports"});
+        expect(eq(run(fromSchedulerFraming).exitCode, 1)) << "the words rungraph adds to the scheduler's error are not part of the reason";
+    };
+
+    "--expect-error counts a --set the graph file refuses as a failure at load"_test = [] {
+        std::vector<std::string> unknownBlock = settingsChainRun();
+        unknownBlock.insert(unknownBlock.end(), {"--set", "no_such_block.event_count=1", "--expect-error", "the graph holds no block of that name"});
+        const Result refusedBlock = run(unknownBlock);
+        expect(eq(refusedBlock.exitCode, 0)) << refusedBlock.output;
+
+        std::vector<std::string> unknownKey = settingsChainRun();
+        unknownKey.insert(unknownKey.end(), {"--set", "source.no_such_key=1", "--expect-error", "declares no setting named 'no_such_key'"});
+        const Result refusedKey = run(unknownKey);
+        expect(eq(refusedKey.exitCode, 0)) << refusedKey.output;
+
+        std::vector<std::string> otherText = settingsChainRun();
+        otherText.insert(otherText.end(), {"--set", "no_such_block.event_count=1", "--expect-error", "some other reason"});
+        expect(eq(run(otherText).exitCode, 1)) << "the refusal is not the reason expected";
+    };
+
+    "--expect holds for a value the block holds after a run that ended on its own or at its bound"_test = [] {
+        std::vector<std::string> ended = settingsChainRun();
+        ended.insert(ended.end(), {"--set", "source.event_count=1000", "--expect", "source.event_count=1000"});
+        const Result endedRun = run(ended);
+        expect(eq(endedRun.exitCode, 0)) << endedRun.output;
+        expect(endedRun.output.contains("the graph ended on its own")) << endedRun.output;
+
+        std::vector<std::string> bounded = startChainRun();
+        bounded.insert(bounded.end(), {"--expect", "first.resource_at_start=named-in-the-graph-file", "--expect", "first.gain=1", "--expect", "first.sample_rate=1000"});
+        const Result boundedRun = run(bounded);
+        expect(eq(boundedRun.exitCode, 0)) << "a string, and a float given as an integer" << boundedRun.output;
+        expect(boundedRun.output.contains("the graph was stopped before it ended")) << boundedRun.output;
+
+        std::vector<std::string> byUniqueName = sharedNameRun();
+        byUniqueName.insert(byUniqueName.end(), {"--set", "left.event_count=1000", "--set", "right.event_count=2000", "--expect", "left.event_count=1000", "--expect", "right.event_count=2000"});
+        const Result uniqueRun = run(byUniqueName);
+        expect(eq(uniqueRun.exitCode, 0)) << uniqueRun.output;
+    };
+
+    "--expect reports each value that differs on one line and ends the run with status 1"_test = [] {
+        std::vector<std::string> arguments = settingsChainRun();
+        arguments.insert(arguments.end(), {"--set", "source.event_count=1000", "--expect", "source.event_count=999", "--expect", "source.event_count=1000.5", "--expect", "source.event_count=1000"});
+        const Result differs = run(arguments);
+        expect(eq(differs.exitCode, 1)) << differs.output;
+        expect(eq(programLinesHolding(differs.output, "rungraph: source.event_count is 1000, expected 999").size(), 1UZ)) << differs.output;
+        expect(eq(programLinesHolding(differs.output, "rungraph: source.event_count is 1000, expected 1000.5").size(), 1UZ)) << "a value the setting's type cannot hold differs" << differs.output;
+        expect(eq(programLinesHolding(differs.output, "source.event_count is").size(), 2UZ)) << "the value that holds is not reported" << differs.output;
+    };
+
+    "--expect compares a float within --expect-tolerance and a vector element by element"_test = [] {
+        std::vector<std::string> nearRate = startChainRun();
+        nearRate.insert(nearRate.end(), {"--expect", "first.sample_rate=1000.25"});
+        const Result exact = run(nearRate);
+        expect(eq(exact.exitCode, 1)) << "without a tolerance the values must be equal" << exact.output;
+        expect(eq(programLinesHolding(exact.output, "first.sample_rate is 1000, expected 1000.25").size(), 1UZ)) << exact.output;
+
+        nearRate.insert(nearRate.end(), {"--expect-tolerance", "0.5"});
+        const Result within = run(nearRate);
+        expect(eq(within.exitCode, 0)) << within.output;
+
+        std::vector<std::string> pattern = fixtureRun(kChunksFile);
+        pattern.insert(pattern.end(), {"--set", "source.pattern=!!float32 [0.5, 1.5, 2.5]"});
+        const auto expectPattern = [&pattern](std::string_view value) {
+            std::vector<std::string> arguments = pattern;
+            arguments.insert(arguments.end(), {"--expect", std::format("source.pattern={}", value)});
+            return run(arguments);
+        };
+        expect(eq(expectPattern("[0.5, 1.5, 2.5]").exitCode, 0)) << "each element read as the block's float";
+        const Result otherElement = expectPattern("[0.5, 1.5, 3.5]");
+        expect(eq(otherElement.exitCode, 1)) << otherElement.output;
+        expect(eq(programLinesHolding(otherElement.output, "source.pattern is [0.5, 1.5, 2.5], expected [0.5, 1.5, 3.5]").size(), 1UZ)) << "the line lists the elements of each" << otherElement.output;
+        expect(eq(expectPattern("[0.5, 1.5]").exitCode, 1)) << "a vector of another length differs";
+
+        std::vector<std::string> tenth = fixtureRun(kChunksFile);
+        tenth.insert(tenth.end(), {"--set", "source.pattern=!!float32 [0.1]", "--expect", "source.pattern=[0.1]"});
+        const Result inFloat = run(tenth);
+        expect(eq(inFloat.exitCode, 0)) << "0.1 reads as the block's float, which is not the double 0.1" << inFloat.output;
+    };
+
+    "--expect takes its block as --show does and refuses a name or a key the graph does not hold"_test = [] {
+        std::vector<std::string> noBlock = settingsChainRun();
+        noBlock.insert(noBlock.end(), {"--expect", "no_such_block.event_count=1"});
+        const Result refusedBlock = run(noBlock);
+        expect(eq(refusedBlock.exitCode, 1)) << refusedBlock.output;
+        expect(refusedBlock.output.contains("the graph holds no block named no_such_block")) << refusedBlock.output;
+
+        std::vector<std::string> noKey = settingsChainRun();
+        noKey.insert(noKey.end(), {"--expect", "source.no_such_key=1"});
+        const Result refusedKey = run(noKey);
+        expect(eq(refusedKey.exitCode, 1)) << refusedKey.output;
+        expect(refusedKey.output.contains("--expect names the setting 'no_such_key' of block 'source', and the block holds no setting of that name")) << refusedKey.output;
+        expect(!refusedKey.output.contains("the graph ended on its own")) << "the graph is not run" << refusedKey.output;
+
+        std::vector<std::string> shared = sharedNameRun();
+        shared.insert(shared.end(), {"--expect", "twin.event_count=1"});
+        const Result sharedName = run(shared);
+        expect(eq(sharedName.exitCode, 1)) << sharedName.output;
+        expect(sharedName.output.contains("'twin' is the name of 2 blocks")) << sharedName.output;
+
+        const Result withoutBlock = run({"--graph", "unread.yaml", "--expect", "event_count=1"});
+        expect(eq(withoutBlock.exitCode, 2)) << withoutBlock.output;
+        expect(withoutBlock.output.contains("--expect takes <block>.<key>=<value>, not 'event_count=1'")) << withoutBlock.output;
+
+        const Result negativeTolerance = run({"--graph", "unread.yaml", "--expect-tolerance", "-1"});
+        expect(eq(negativeTolerance.exitCode, 2)) << negativeTolerance.output;
+    };
+
+    "a run that failed reports its failure and compares no setting"_test = [] {
+        std::vector<std::string> arguments = unnamedResourceRun();
+        arguments.insert(arguments.end(), {"--expect", "first.sample_rate=1"});
+        const Result failed = run(arguments);
+        expect(eq(failed.exitCode, 1)) << failed.output;
+        expect(failed.output.contains("no resource to open")) << failed.output;
+        expect(!failed.output.contains("first.sample_rate is")) << "the setting is not compared" << failed.output;
+    };
+
+    "max_work_items bounds the samples of each block's call, a source's included, on each of the program's own schedulers"_test = [] {
+        constexpr std::size_t kSamples        = 1000UZ;
+        constexpr std::size_t kDecimatorChunk = 4UZ; // the decimator's input_chunk_size
+        for (const std::string_view key : kOwnSchedulers) {
+            for (const std::size_t bound : {1UZ, 7UZ}) {
+                std::vector<std::string> arguments = fixtureRun(kChunksFile);
+                arguments.insert(arguments.end(), {"--scheduler", std::string(key), "--set", std::format("max_work_items={}", bound), "--set", std::format("source.n_samples={}", kSamples), //
+                                                      "--expect", std::format("source.largest_call={}", bound), "--expect", std::format("sink.received={}", kSamples),                       //
+                                                      "--expect", std::format("decimated.received={}", kSamples / kDecimatorChunk), "--show", "middle", "--show", "sink", "--show", "decimator"});
+                const Result ran = run(arguments);
+                expect(eq(ran.exitCode, 0)) << key << bound << ran.output;
+                expect(ran.output.contains("the graph ended on its own")) << key << bound << ran.output;
+                for (const std::string_view marker : {"middle: largest_call = ", "sink: largest_call = "}) {
+                    const std::optional<std::size_t> largest = shownNumber(ran.output, marker);
+                    expect(largest.has_value() && *largest >= 1UZ && *largest <= bound) << key << marker << "exceeds" << bound << ran.output;
+                }
+                // a resampling block takes whole chunks: one when the bound is smaller, as many as fit when it is larger
+                const std::size_t decimatorCall = std::max(kDecimatorChunk, bound / kDecimatorChunk * kDecimatorChunk);
+                expect(eq(shownNumber(ran.output, "decimator: largest_call = ").value_or(0UZ), decimatorCall)) << key << bound << ran.output;
+            }
+        }
+
+        std::vector<std::string> unbounded = fixtureRun(kChunksFile);
+        unbounded.insert(unbounded.end(), {"--set", std::format("source.n_samples={}", kSamples), "--show", "source"});
+        const Result unboundedRun = run(unbounded);
+        expect(eq(unboundedRun.exitCode, 0)) << unboundedRun.output;
+        expect(shownNumber(unboundedRun.output, "source: largest_call = ").value_or(0UZ) > 7UZ) << "without the setting the source's call is not bounded" << unboundedRun.output;
     };
 #endif
 };
