@@ -56,6 +56,7 @@ set(_CORE_TESTS
     qa_TriggerMatcher
     qa_YamlPmt
     qa_PortableTypeName
+    qa_reader_writer_lock
     qa_thread_affinity
     qa_thread_pool
     qa_thread_pool_limit)
@@ -208,7 +209,8 @@ set(_CORE_DEADLOCK_TESTS
     qa_SchedulerExchange
     qa_SchedulerLifecycle
     qa_SchedulerStartStop
-    qa_SettingsConcurrency)
+    qa_SettingsConcurrency
+    qa_reader_writer_lock)
 if(GR_ENABLE_BLOCK_REGISTRY)
   list(APPEND _CORE_DEADLOCK_TESTS qa_grc)
 endif()
