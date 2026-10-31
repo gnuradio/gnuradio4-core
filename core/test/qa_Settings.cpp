@@ -465,6 +465,235 @@ struct RunningCounter {
     }
 };
 
+inline constexpr std::string_view kDecimationKey    = "test:decimation";
+inline constexpr std::string_view kInterpolationKey = "test:interpolation";
+
+/// keeps the first sample of every `decimation` and follows it with `interpolation` - 1 zeros. Its chunk ratio follows
+/// the two settings. A call whose spans do not hold whole chunks of that ratio is an error. nMisSizedCalls counts the
+/// calls refused that way; nResets counts reset() calls.
+struct RatioFollower : Block<RatioFollower, Resampling<>, Stride<>> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    Annotated<gr::Size_t, "decimation", Limits<1U, 64U>>    decimation    = 1U;
+    Annotated<gr::Size_t, "interpolation", Limits<1U, 64U>> interpolation = 1U;
+
+    GR_MAKE_REFLECTABLE(RatioFollower, in, out, decimation, interpolation);
+
+    std::size_t nMisSizedCalls = 0UZ;
+    std::size_t nResets        = 0UZ;
+
+    void reset() { ++nResets; }
+
+    work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
+        const std::size_t nDecimation    = decimation.value;
+        const std::size_t nInterpolation = interpolation.value;
+        const std::size_t nChunks        = inSpan.size() / nDecimation;
+        if (inSpan.size() != nChunks * nDecimation || outSpan.size() != nChunks * nInterpolation) {
+            ++nMisSizedCalls;
+            return work::Status::ERROR;
+        }
+        std::ranges::fill(outSpan, 0.f);
+        for (std::size_t chunk = 0UZ; chunk < nChunks; ++chunk) {
+            outSpan[chunk * nInterpolation] = inSpan[chunk * nDecimation];
+        }
+        return work::Status::OK;
+    }
+
+    void settingsChanged(const property_map& /*oldSettings*/, const property_map& /*newSettings*/) {
+        input_chunk_size  = decimation.value;
+        output_chunk_size = interpolation.value;
+    }
+};
+
+inline constexpr std::string_view kLevelKey      = "test:level";
+inline constexpr gr::Size_t       kEpilogueChunk = 4U;
+
+/// copies its input in chunks of kEpilogueChunk samples, and the samples short of a chunk at the stream's end through
+/// processEpilogue(). It holds `level` and does nothing with it.
+struct EpilogueLevelCopy : Block<EpilogueLevelCopy, Resampling<kEpilogueChunk, kEpilogueChunk, true>> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    Annotated<float, "level"> level = 0.f;
+
+    GR_MAKE_REFLECTABLE(EpilogueLevelCopy, in, out, level);
+
+    work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
+        std::ranges::copy(inSpan, outSpan.begin());
+        return work::Status::OK;
+    }
+
+    work::Status processEpilogue(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
+        const std::size_t n = std::min(inSpan.size(), outSpan.size());
+        std::ranges::copy(inSpan | std::views::take(n), outSpan.begin());
+        outSpan.publish(n);
+        return work::Status::OK;
+    }
+};
+
+struct TagAt {
+    std::size_t  index{};
+    property_map map{};
+    bool         pastLastSample = false; // published by the call whose samples end at its index, after its last sample
+};
+
+/// publishes the ramp 0, 1, 2, ... in calls of irregular length, each tag at its index. Once pauseAt samples are out,
+/// it publishes nothing for nPauseCalls calls.
+struct RampSource : Block<RampSource> {
+    PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(RampSource, out);
+
+    std::size_t        nSamples = 0UZ;
+    std::vector<TagAt> tagsToEmit; // ordered by index, each below nSamples; a tag past a last sample may sit at nSamples
+    std::size_t        pauseAt     = std::numeric_limits<std::size_t>::max();
+    std::size_t        nPauseCalls = 0UZ;
+
+    std::size_t _emitted = 0UZ;
+    std::size_t _nextTag = 0UZ;
+    std::size_t _nCalls  = 0UZ;
+    std::size_t _nPaused = 0UZ;
+
+    work::Status processBulk(OutputSpanLike auto& outSpan) {
+        static constexpr std::array<std::size_t, 4> kLengths{7UZ, 13UZ, 3UZ, 29UZ};
+
+        if (_emitted >= nSamples) {
+            outSpan.publish(0UZ);
+            return work::Status::DONE;
+        }
+        if (_emitted == pauseAt && _nPaused < nPauseCalls) {
+            ++_nPaused;
+            outSpan.publish(0UZ);
+            return work::Status::INSUFFICIENT_INPUT_ITEMS;
+        }
+        std::size_t n = std::min({kLengths[_nCalls++ % kLengths.size()], outSpan.size(), nSamples - _emitted});
+        if (_emitted < pauseAt) {
+            n = std::min(n, pauseAt - _emitted);
+        }
+        const auto pendingTags = tagsToEmit | std::views::drop(static_cast<std::ptrdiff_t>(_nextTag));
+        if (const auto pastEnd = std::ranges::find_if(pendingTags, &TagAt::pastLastSample); pastEnd != pendingTags.end()) {
+            n = std::min(n, pastEnd->index - _emitted);
+        }
+        if (n == 0UZ) {
+            outSpan.publish(0UZ);
+            return work::Status::INSUFFICIENT_OUTPUT_ITEMS;
+        }
+        for (std::size_t i = 0UZ; i < n; ++i) {
+            outSpan[i] = static_cast<float>(_emitted + i);
+        }
+        for (; _nextTag < tagsToEmit.size() && (tagsToEmit[_nextTag].index < _emitted + n || (tagsToEmit[_nextTag].pastLastSample && tagsToEmit[_nextTag].index == _emitted + n)); ++_nextTag) {
+            outSpan.publishTag(tagsToEmit[_nextTag].map, tagsToEmit[_nextTag].index - _emitted);
+        }
+        _emitted += n;
+        outSpan.publish(n);
+        return work::Status::OK;
+    }
+};
+
+struct SampleSink : Block<SampleSink> {
+    PortIn<float> in;
+
+    GR_MAKE_REFLECTABLE(SampleSink, in);
+
+    std::vector<float> samples;
+
+    work::Status processBulk(InputSpanLike auto& inSpan) {
+        samples.insert(samples.end(), inSpan.begin(), inSpan.end());
+        std::ignore = inSpan.consume(inSpan.size());
+        return work::Status::OK;
+    }
+};
+
+[[nodiscard]] property_map ratioTag(std::optional<gr::Size_t> nDecimation, std::optional<gr::Size_t> nInterpolation, bool resetDefaults = false) {
+    property_map map;
+    if (nDecimation.has_value()) {
+        map.insert_or_assign(std::pmr::string(kDecimationKey), *nDecimation);
+    }
+    if (nInterpolation.has_value()) {
+        map.insert_or_assign(std::pmr::string(kInterpolationKey), *nInterpolation);
+    }
+    if (resetDefaults) {
+        gr::tag::put(map, gr::tag::RESET_DEFAULTS, true);
+    }
+    return map;
+}
+
+/// what a RatioFollower with the given stride makes of the ramp 0 .. nSamples - 1. A chunk starts every `stride`
+/// samples, or every `decimation` samples for a stride of 0. A tag applies at the chunk that starts at its index, and
+/// each tag sits at a chunk start under the ratio before it. The samples after the last whole chunk yield nothing.
+[[nodiscard]] std::vector<float> expectedOutput(std::size_t nSamples, const std::vector<TagAt>& tags, std::size_t stride = 0UZ) {
+    std::vector<float> expected;
+    std::size_t        nDecimation    = 1UZ;
+    std::size_t        nInterpolation = 1UZ;
+    std::size_t        nextTag        = 0UZ;
+    for (std::size_t start = 0UZ;; start += stride != 0UZ ? stride : nDecimation) {
+        for (; nextTag < tags.size() && tags[nextTag].index == start; ++nextTag) {
+            if (tags[nextTag].map.contains(gr::tag::RESET_DEFAULTS.key())) {
+                nDecimation    = 1UZ;
+                nInterpolation = 1UZ;
+            }
+            if (const std::optional<gr::Size_t> value = sizeOf(tags[nextTag].map, kDecimationKey); value.has_value()) {
+                nDecimation = *value;
+            }
+            if (const std::optional<gr::Size_t> value = sizeOf(tags[nextTag].map, kInterpolationKey); value.has_value()) {
+                nInterpolation = *value;
+            }
+        }
+        if (start + nDecimation > nSamples) {
+            return expected;
+        }
+        expected.push_back(static_cast<float>(start));
+        expected.insert(expected.end(), nInterpolation - 1UZ, 0.f);
+    }
+}
+
+struct RatioRun {
+    bool               ran = false;
+    std::vector<float> samples;
+    std::size_t        nMisSizedCalls = 0UZ;
+    std::size_t        nResets        = 0UZ;
+};
+
+struct RatioStream {
+    std::size_t        nSamples = 0UZ;
+    std::vector<TagAt> tags;
+    gr::Size_t         stride      = 0U;
+    std::size_t        pauseAt     = std::numeric_limits<std::size_t>::max();
+    std::size_t        nPauseCalls = 0UZ;
+};
+
+[[nodiscard]] RatioRun runRatioStream(const RatioStream& stream) {
+    gr::Graph flow;
+    auto&     source   = flow.emplaceBlock<RampSource>(property_map{{"name", std::string("src")}});
+    source.nSamples    = stream.nSamples;
+    source.tagsToEmit  = stream.tags;
+    source.pauseAt     = stream.pauseAt;
+    source.nPauseCalls = stream.nPauseCalls;
+    auto& follower     = flow.emplaceBlock<RatioFollower>(property_map{{"name", std::string("ratio")}, {"stride", stream.stride}});
+    follower.settings().setTagCouplings(property_map{{"decimation", std::string(kDecimationKey)}, {"interpolation", std::string(kInterpolationKey)}});
+    auto& sink = flow.emplaceBlock<SampleSink>(property_map{{"name", std::string("snk")}});
+    if (!flow.connect<"out", "in">(source, follower).has_value() || !flow.connect<"out", "in">(follower, sink).has_value()) {
+        return {};
+    }
+
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+    if (!scheduler.exchange(std::move(flow)).has_value()) {
+        return {};
+    }
+    const bool ran = scheduler.runAndWait().has_value();
+    return {.ran = ran, .samples = sink.samples, .nMisSizedCalls = follower.nMisSizedCalls, .nResets = follower.nResets};
+}
+
+RatioRun expectRatioStream(const RatioStream& stream, std::string_view what) {
+    using namespace boost::ut;
+    RatioRun run = runRatioStream(stream);
+    expect(run.ran) << what << ": the run ends in an error";
+    expect(eq(run.nMisSizedCalls, 0UZ)) << what << ": a call is sized for a ratio other than the one at its first sample";
+    expect(run.samples == expectedOutput(stream.nSamples, stream.tags, stream.stride)) << what << ": the output differs from the ratio each tag sets from its sample on";
+    return run;
+}
+
 struct RateStreamResult {
     std::size_t nSettingsChanged;
     float       finalRate;
@@ -801,6 +1030,51 @@ const boost::ut::suite<"settings"> _settings = [] {
         expect(std::ranges::all_of(middle.appliedRates, [](float rate) { return rate == kInputRate; })) << "the block must never be run at the rate it publishes at";
         expect(ge(sink.rates.size(), 1UZ)) << "the forwarded rate must still reach the sink once there is a span to publish into";
         expect(std::ranges::all_of(sink.rates, [](float rate) { return rate == kOutputRate; })) << "and that tag carries the output rate";
+    };
+
+    "a tag that sets a block's chunk ratio sizes the call that starts at its sample"_test = [] {
+        expectRatioStream({.nSamples = 200UZ, .tags = {{10UZ, ratioTag(2U, {})}, {40UZ, ratioTag(4U, {})}, {80UZ, ratioTag(1U, {})}, {83UZ, ratioTag(3U, {})}}}, "decimation 1, 2, 4, 1, 3");
+        expectRatioStream({.nSamples = 120UZ, .tags = {{8UZ, ratioTag({}, 2U)}, {20UZ, ratioTag(2U, 3U)}, {60UZ, ratioTag(1U, 1U)}}}, "interpolation 2 from sample 8, 3 with decimation 2 from 20, 1:1 from 60");
+        expectRatioStream({.nSamples = 1600UZ, .tags = {{0UZ, ratioTag(8U, {})}, {800UZ, ratioTag(16U, {})}}}, "decimation 8 from the stream's first sample, 16 from sample 800");
+    };
+
+    "a tag on the first sample after a stride's skip sets the ratio of the call after the skip"_test = [] { expectRatioStream({.nSamples = 100UZ, .tags = {{0UZ, ratioTag(4U, {})}, {30UZ, ratioTag(2U, {})}, {60UZ, ratioTag(5U, 2U)}}, .stride = 10U}, "stride 10, decimation 4, 2, 5"); };
+
+    "a tag at the first sample of calls that move no sample sets its settings once"_test = [] {
+        const RatioStream stream{.nSamples = 100UZ, .tags = {{0UZ, ratioTag(4U, {})}, {4UZ, ratioTag(8U, {}, true)}}, .pauseAt = 7UZ, .nPauseCalls = 50UZ};
+        const RatioRun    run = expectRatioStream(stream, "decimation 4, then a reset and decimation 8 three samples before a pause");
+        expect(eq(run.nResets, 1UZ)) << "the reset runs once, not once per call that waits for the samples of its first chunk";
+    };
+
+    "a tag that reaches an unmoved read position after another sets only its own settings"_test = [] {
+        constexpr std::size_t kTagIndex = 20UZ;
+        const RatioStream     stream{.nSamples = 100UZ, .tags = {{.index = kTagIndex, .map = ratioTag(4U, {}, true), .pastLastSample = true}, {.index = kTagIndex, .map = ratioTag({}, 2U)}}, .pauseAt = kTagIndex, .nPauseCalls = 10UZ};
+        const RatioRun        run = expectRatioStream(stream, "a reset and decimation 4 at sample 20 ahead of a pause, then interpolation 2 at the same sample");
+        expect(eq(run.nResets, 1UZ)) << "the reset tag acts once, not again when the second tag arrives at its sample";
+    };
+
+    "a setting in a tag at the end-of-stream index applies after an epilogue takes the trailing samples"_test = [] {
+        constexpr float       kEndLevel = 7.f;
+        constexpr std::size_t kTrailing = 3UZ;
+        const std::size_t     nSamples  = 5UZ * kEpilogueChunk + kTrailing;
+        property_map          levelTag;
+        levelTag.insert_or_assign(std::pmr::string(kLevelKey), kEndLevel);
+
+        gr::Graph flow;
+        auto&     source  = flow.emplaceBlock<RampSource>(property_map{{"name", std::string("src")}});
+        source.nSamples   = nSamples;
+        source.tagsToEmit = {{.index = nSamples, .map = levelTag, .pastLastSample = true}};
+        auto& copier      = flow.emplaceBlock<EpilogueLevelCopy>(property_map{{"name", std::string("copy")}});
+        copier.settings().setTagCouplings(property_map{{"level", std::string(kLevelKey)}});
+        auto& sink = flow.emplaceBlock<SampleSink>(property_map{{"name", std::string("snk")}});
+        expect(fatal(flow.connect<"out", "in">(source, copier).has_value()));
+        expect(fatal(flow.connect<"out", "in">(copier, sink).has_value()));
+
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+        expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+        expect(scheduler.runAndWait().has_value()) << "the run ends without an error";
+        expect(eq(copier.level.value, kEndLevel)) << "the tag past the trailing samples sets the level";
+        expect(eq(sink.samples.size(), nSamples)) << "the epilogue passes the trailing samples on";
     };
 
     "a rate tag's map staged into a decimator sets nothing"_test = [] {
