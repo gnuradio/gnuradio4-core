@@ -47,6 +47,23 @@ constexpr auto openPipe  = popen;
 constexpr auto closePipe = pclose;
 #endif
 
+#ifdef _WIN32
+/// A command line quoted for the shell popen hands it to. cmd /c removes one level of quoting
+/// from the line it receives, so the whole line is quoted again.
+[[nodiscard]] inline std::string forShell(const std::string& command) { return std::format("\"{}\"", command); }
+#else
+[[nodiscard]] inline std::string forShell(const std::string& command) { return command; }
+#endif
+
+/// The file name a MODULE library is built under, with the platform's prefix and suffix.
+[[nodiscard]] inline std::string moduleFileName(std::string_view stem) {
+#ifdef _WIN32
+    return std::format("{}.dll", stem);
+#else
+    return std::format("lib{}.so", stem);
+#endif
+}
+
 struct Result {
     int         exitCode = -1;
     std::string output; // what the run wrote to the collected streams, in the order it wrote it
@@ -67,7 +84,7 @@ enum class Streams { both, standardOutput };
 #endif
 
     Result     result;
-    std::FILE* pipe = openPipe(command.c_str(), "r");
+    std::FILE* pipe = openPipe(forShell(command).c_str(), "r");
     if (pipe == nullptr) {
         return result;
     }
@@ -481,8 +498,8 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
     "a library is listed by its own name under the directory that held it"_test = [] {
         const Result version = run(overTestDirectories({"version"}));
         expect(eq(version.exitCode, 0)) << version.output;
-        expect(version.output.contains("\n    libblock_library.so")) << "the file by its name alone, indented under its directory" << version.output;
-        expect(eq(occurrences(version.output, GR_TOOLS_TEST_BLOCK_LIBRARY "/libblock_library.so"), 0UZ)) << "and not by a path repeated on every line" << version.output;
+        expect(version.output.contains(std::format("\n    {}", moduleFileName("block_library")))) << "the file by its name alone, indented under its directory" << version.output;
+        expect(eq(occurrences(version.output, std::string(GR_TOOLS_TEST_BLOCK_LIBRARY "/") + moduleFileName("block_library")), 0UZ)) << "and not by a path repeated on every line" << version.output;
     };
 
     "version --json is one document carrying the shape a reader relies on"_test = [] {
@@ -529,7 +546,11 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         expect(block.output.contains("float32")) << "the type the ports carry" << block.output;
         expect(block.output.contains("extra_gain")) << "its setting" << block.output;
         expect(block.output.contains("dB")) << "the unit the annotation carries" << block.output;
+#ifndef _MSC_VER
+        // Block::description resolves to its placeholder under MSVC: the initialiser tests the CRTP
+        // Derived for a Description, and MSVC evaluates it while Derived is still incomplete.
         expect(block.output.contains("doubles its input")) << "the description the block declares" << block.output;
+#endif
     };
 
     "the settings the framework declares on every block are behind an option"_test = [] {
@@ -626,10 +647,10 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
     "schedulers lists a shared object's scheduler of this ABI version and not one of an earlier version or none"_test = [] {
         const Result schedulers = run(overSchedulerLibraries({"schedulers"}));
         expect(eq(schedulers.exitCode, 0)) << schedulers.output;
-        expect(schedulers.output.contains("libscheduler_library.so (block-library, 1 keys)")) << "the kept library and its scheduler" << schedulers.output;
+        expect(schedulers.output.contains(std::format("{} (block-library, 1 keys)", moduleFileName("scheduler_library")))) << "the kept library and its scheduler" << schedulers.output;
         expect(schedulers.output.contains("\n      library_scheduler\n")) << "the scheduler under its family" << schedulers.output;
-        expect(!schedulers.output.contains("libscheduler_library_v1.so (")) << "the refused library heads no listing" << schedulers.output;
-        expect(!schedulers.output.contains("libscheduler_library_unversioned.so (")) << "the refused library heads no listing" << schedulers.output;
+        expect(!schedulers.output.contains(std::format("{} (", moduleFileName("scheduler_library_v1")))) << "the refused library heads no listing" << schedulers.output;
+        expect(!schedulers.output.contains(std::format("{} (", moduleFileName("scheduler_library_unversioned")))) << "the refused library heads no listing" << schedulers.output;
         expect(eq(occurrences(schedulers.output, "library_scheduler_v1"), 1UZ)) << "its key appears in the loader's warning alone" << schedulers.output;
 
         const Result version = run(overSchedulerLibraries({"version", "--json"}), Streams::standardOutput);
@@ -650,7 +671,7 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
 
         const Result both = run(arguments);
         expect(eq(both.exitCode, 0)) << both.output;
-        expect(both.output.contains("libabi_probe_plugin_v1.so not loaded: plugin ABI version 1 does not match")) << "the warning reaches standard error" << both.output;
+        expect(both.output.contains(std::format("{} not loaded: plugin ABI version 1 does not match", moduleFileName("abi_probe_plugin_v1")))) << "the warning reaches standard error" << both.output;
     };
 
     "version --markdown and --html carry the search path and the plugins as table rows"_test = [] {

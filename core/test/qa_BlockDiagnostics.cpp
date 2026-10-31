@@ -11,7 +11,32 @@
 #include <thread>
 
 #include <fcntl.h>
+#if defined(_WIN32)
+#include <io.h>
+#include <process.h>
+#include <sys/stat.h>
+#else
 #include <unistd.h>
+#endif
+
+namespace {
+// the few descriptor calls these captures need, under the names each CRT gives them
+#if defined(_WIN32)
+constexpr int kStdErrFd = 2;
+inline int    duplicateFd(int fd) { return ::_dup(fd); }
+inline int    replaceFd(int fd, int with) { return ::_dup2(fd, with); }
+inline int    closeFd(int fd) { return ::_close(fd); }
+inline int    currentProcessId() { return ::_getpid(); }
+inline int    openTruncatedForWrite(const std::filesystem::path& file) { return ::_wopen(file.c_str(), _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IWRITE); }
+#else
+constexpr int kStdErrFd = STDERR_FILENO;
+inline int    duplicateFd(int fd) { return ::dup(fd); }
+inline int    replaceFd(int fd, int with) { return ::dup2(fd, with); }
+inline int    closeFd(int fd) { return ::close(fd); }
+inline int    currentProcessId() { return ::getpid(); }
+inline int    openTruncatedForWrite(const std::filesystem::path& file) { return ::open(file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600); }
+#endif
+} // namespace
 
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/Scheduler.hpp>
@@ -39,16 +64,16 @@ inline constexpr auto kReportDeadline = std::chrono::seconds(4);
 
 /// stderr redirected into a file for the duration of a run, so that the run's own diagnostics can be read back
 struct StderrCapture {
-    std::filesystem::path path = std::filesystem::temp_directory_path() / std::format("qa_BlockDiagnostics.{}.err", ::getpid());
+    std::filesystem::path path = std::filesystem::temp_directory_path() / std::format("qa_BlockDiagnostics.{}.err", currentProcessId());
 
     int _savedFd = -1;
 
     StderrCapture() {
         std::fflush(stderr);
-        _savedFd            = ::dup(STDERR_FILENO);
-        const int captureFd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-        ::dup2(captureFd, STDERR_FILENO);
-        ::close(captureFd);
+        _savedFd            = duplicateFd(kStdErrFd);
+        const int captureFd = openTruncatedForWrite(path);
+        replaceFd(captureFd, kStdErrFd);
+        closeFd(captureFd);
     }
 
     StderrCapture(const StderrCapture&)            = delete;
@@ -56,8 +81,8 @@ struct StderrCapture {
 
     ~StderrCapture() {
         std::fflush(stderr);
-        ::dup2(_savedFd, STDERR_FILENO);
-        ::close(_savedFd);
+        replaceFd(_savedFd, kStdErrFd);
+        closeFd(_savedFd);
         std::filesystem::remove(path);
     }
 

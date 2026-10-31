@@ -1951,7 +1951,7 @@ template<typename TScheduler>
 void expectBlockingHooksFirst(gr::lifecycle::State request) {
     using namespace boost::ut;
     using enum gr::lifecycle::State;
-    constexpr bool kWorkerPerBlock = TScheduler::executionPolicy() == gr::scheduler::ExecutionPolicy::multiThreaded;
+    static constexpr bool kWorkerPerBlock = TScheduler::executionPolicy() == gr::scheduler::ExecutionPolicy::multiThreaded;
 
     auto           pool = fixedPool(kHookOrderPoolName, 8U);
     HookOrderProbe probe;
@@ -2410,8 +2410,8 @@ const boost::ut::suite<"a scheduler started on its own thread"> ownThreadStartTe
     // the parent's pool has a thread for each block of its graph. The sub-scheduler shares a job list with a block that
     // works, and its source fails only after a call of the parent to the sub-scheduler has returned
     "a sub-scheduler that fails after its parent's first call to it fails its parent's run"_test = [] {
-        constexpr std::string_view kParentPoolName = "qa_late_failure_cpu";
-        auto                       pool            = qa_sched::fixedPool(kParentPoolName, 3U);
+        static constexpr std::string_view kParentPoolName = "qa_late_failure_cpu";
+        auto                              pool            = qa_sched::fixedPool(kParentPoolName, 3U);
 
         std::atomic<bool>                 failureGate{false};
         const qa_sched::GatedSubScheduler inner = qa_sched::makeGatedSubScheduler(failureGate);
@@ -2453,8 +2453,8 @@ const boost::ut::suite<"a scheduler started on its own thread"> ownThreadStartTe
     // the parent's pool has two threads, and its job lists hold an endless chain and a finite chain. The sub-scheduler
     // shares its job list with the finite chain, and its source fails only after that chain has ended
     "a sub-scheduler that fails after the other blocks of its job list end fails its parent's run"_test = [] {
-        constexpr std::string_view kParentPoolName = "qa_ended_list_cpu";
-        auto                       pool            = qa_sched::fixedPool(kParentPoolName, 2U);
+        static constexpr std::string_view kParentPoolName = "qa_ended_list_cpu";
+        auto                              pool            = qa_sched::fixedPool(kParentPoolName, 2U);
 
         std::atomic<bool>                 failureGate{false};
         const qa_sched::GatedSubScheduler inner = qa_sched::makeGatedSubScheduler(failureGate);
@@ -2564,8 +2564,8 @@ const boost::ut::suite<"the pool of a scheduler started on its own thread"> ownT
     };
 
     "a scheduler started on its own thread runs its workers on the pool staged for it"_test = [] {
-        constexpr std::string_view kStagedPoolName = "qa_own_thread_staged_cpu";
-        auto                       pool            = qa_sched::fixedPool(kStagedPoolName, 2U);
+        static constexpr std::string_view kStagedPoolName = "qa_own_thread_staged_cpu";
+        auto                              pool            = qa_sched::fixedPool(kStagedPoolName, 2U);
         qa_sched::gObservedSamples.store(0UZ, std::memory_order_relaxed);
         gr::Graph flow;
         auto&     source = flow.emplaceBlock<qa_sched::EndlessSource>();
@@ -2617,10 +2617,10 @@ const boost::ut::suite<"settings staged on a scheduler"> stagedSchedulerSettings
     // the scheduler sizes its job lists on its pool when it initializes. A pool staged after that sizes the lists of the
     // run that the next start begins
     "a pool staged on an initialized scheduler sizes the next run's job lists"_test = [] {
-        constexpr std::string_view kInitialPoolName = "qa_initial_cpu";
-        constexpr std::string_view kStagedPoolName  = "qa_staged_cpu";
-        auto                       initialPool      = qa_sched::fixedPool(kInitialPoolName, 2U);
-        auto                       stagedPool       = qa_sched::fixedPool(kStagedPoolName, 1U);
+        static constexpr std::string_view kInitialPoolName = "qa_initial_cpu";
+        static constexpr std::string_view kStagedPoolName  = "qa_staged_cpu";
+        auto                              initialPool      = qa_sched::fixedPool(kInitialPoolName, 2U);
+        auto                              stagedPool       = qa_sched::fixedPool(kStagedPoolName, 1U);
 
         gr::Graph flow;
         auto&     source = flow.emplaceBlock<qa_sched::DoneSource>();
@@ -2691,7 +2691,7 @@ const boost::ut::suite<"stop requested during the start transient"> startStopRac
     using enum gr::lifecycle::State;
 
     "a stop landing inside start() still runs the blocks' stop lifecycle"_test = [] {
-        constexpr int nCycles = 64;
+        static constexpr int nCycles = 64;
 
         std::size_t nCyclesLeftActive  = 0UZ;
         std::size_t nCyclesInError     = 0UZ;
@@ -2754,7 +2754,7 @@ const boost::ut::suite<"stop requested before RUNNING"> preRunningStopTests = []
     "a stop straight to STOPPED while IDLE leaves the next runAndWait free to run"_test = [] { qa_sched::expectRunAfterStopBeforeEntry([](qa_sched::BlockingScheduler& scheduler) { expect(scheduler.changeStateTo(STOPPED).has_value()); }); };
 
     "a stop racing the startup transient after runAndWait is entered always releases runAndWait"_test = [] {
-        constexpr int nCycles = 12;
+        static constexpr int nCycles = 12;
 
         std::size_t nCyclesBlocked    = 0UZ;
         std::size_t nCyclesLeftActive = 0UZ;
@@ -2850,7 +2850,7 @@ const boost::ut::suite<"job lists sized to the free pool threads"> jobListSizing
     // lists. The second claims only the threads the first one's workers leave
     "a second scheduler started at once on a growable pool builds no more job lists than the free threads"_test = [] {
         using enum gr::lifecycle::State;
-        constexpr std::uint32_t kThreads = 4U;
+        static constexpr std::uint32_t kThreads = 4U;
 
         qa_sched::NamedPool pool(qa_sched::kDeferringPoolName, std::make_shared<qa_sched::DeferringPool>(kThreads));
 
@@ -3245,7 +3245,7 @@ const boost::ut::suite<"a blocking block reaches STOPPED when its scheduler stop
     // the stop lands between two work() calls at a point the test cannot choose. The case stops and restarts one
     // running graph many times and ends at the first restart that moves no sample
     "a blocking block of a running graph reaches STOPPED at every stop and runs after every restart"_test = [] {
-        constexpr std::size_t kCycles = 20UZ;
+        static constexpr std::size_t kCycles = 20UZ;
 
         gr::Graph flow;
         auto&     source = flow.emplaceBlock<qa_sched::BlockingSource>();
@@ -3288,7 +3288,7 @@ const boost::ut::suite<"a blocking block reaches STOPPED when its scheduler stop
     // deadline, for the job count that waitDone() waits for, and then calls waitDone(). The stop reaches the source
     // before the sink. The last worker to leave or the stop itself settles the blocking source before the wait ends
     "a stop hook on the caller's thread that waits for the workers returns, and the graph runs again after a restart"_test = [] {
-        constexpr int kRuns = 2;
+        static constexpr int kRuns = 2;
 
         gr::Graph flow;
         auto&     source = flow.emplaceBlock<qa_sched::BlockingSource>();
@@ -3589,7 +3589,7 @@ const boost::ut::suite<"watchdog lifetime"> watchdogTests = [] {
     using enum gr::lifecycle::State;
 
     "restarts inside one check interval leave a single watchdog"_test = [] {
-        constexpr std::size_t kCycles = 8UZ;
+        static constexpr std::size_t kCycles = 8UZ;
 
         // each run is held until every counted watchdog sleeps. Each restart then meets the earlier watchdog asleep in
         // its period. A restart that does not retire it leaves two watchdogs asleep, and the final wait for one fails.
@@ -3630,9 +3630,9 @@ const boost::ut::suite<"watchdog lifetime"> watchdogTests = [] {
         // delays of a loaded runner. A watchdog that leaves its sleep in slices of 100 ms instead of on the retirement
         // spends about 500 ms over the ten. A timeout_ms of 1 keeps every interval derived from timeout_ms short. The
         // destructor and a graph swap retire the watchdog the same way.
-        constexpr std::size_t kCycles  = 10UZ;
-        constexpr std::size_t kSamples = 4096UZ;
-        constexpr auto        kBound   = std::chrono::milliseconds(100);
+        static constexpr std::size_t kCycles  = 10UZ;
+        static constexpr std::size_t kSamples = 4096UZ;
+        static constexpr auto        kBound   = std::chrono::milliseconds(100);
 
         std::chrono::steady_clock::duration exitTime{};
         std::size_t                         nRetired = 0UZ;
@@ -3700,7 +3700,7 @@ const boost::ut::suite<"watchdog stall report"> watchdogStallTests = [] {
     using enum gr::lifecycle::State;
 
     "a stalled graph is reported once per stall on the scheduler's message port"_test = [] {
-        constexpr std::size_t kStalledPeriods = 2UZ;
+        static constexpr std::size_t kStalledPeriods = 2UZ;
 
         std::atomic<std::size_t> nReleased{0UZ};
         gr::Graph                flow;
@@ -3741,7 +3741,7 @@ const boost::ut::suite<"watchdog stall report"> watchdogStallTests = [] {
     };
 
     "a paused graph is not reported as stalled"_test = [] {
-        constexpr std::size_t kStalledPeriods = 2UZ;
+        static constexpr std::size_t kStalledPeriods = 2UZ;
 
         gr::Graph flow;
         auto&     source = flow.emplaceBlock<qa_sched::EndlessSource>();
@@ -3777,8 +3777,8 @@ const boost::ut::suite<"watchdog stall report"> watchdogStallTests = [] {
     };
 
     "a nested scheduler's stall report leaves a parent without a message reader running"_test = [] {
-        constexpr std::size_t kStalledPeriods = 2UZ;
-        qa_sched::gParentSamples              = 0UZ;
+        static constexpr std::size_t kStalledPeriods = 2UZ;
+        qa_sched::gParentSamples                     = 0UZ;
 
         gr::Graph innerFlow;
         auto&     innerSource = innerFlow.emplaceBlock<qa_sched::ReleasedSource>(); // never released: the nested graph stalls
@@ -3817,8 +3817,8 @@ const boost::ut::suite<"watchdog stall report"> watchdogStallTests = [] {
     // sub-scheduler's graph after each period that the parent's watchdog finds idle, which advances the parent's wake
     // count. The sub-scheduler exports no port, so only its own graph moves
     "a parent whose own blocks have ended reports no stall while its sub-scheduler's graph moves"_test = [] {
-        constexpr std::size_t kStalledPeriods = 4UZ;
-        constexpr std::size_t kReleases       = 3UZ * kStalledPeriods;
+        static constexpr std::size_t kStalledPeriods = 4UZ;
+        static constexpr std::size_t kReleases       = 3UZ * kStalledPeriods;
 
         std::atomic<std::size_t>                     nReleased{0UZ};
         qa_sched::ParentOfReleasedSubScheduler       parent = qa_sched::makeParentOfReleasedSubScheduler(nReleased);
@@ -3849,7 +3849,7 @@ const boost::ut::suite<"watchdog stall report"> watchdogStallTests = [] {
     };
 
     "a parent whose own blocks have ended reports the stall of its sub-scheduler's graph"_test = [] {
-        constexpr std::size_t kStalledPeriods = 2UZ;
+        static constexpr std::size_t kStalledPeriods = 2UZ;
 
         std::atomic<std::size_t>                     nReleased{0UZ}; // never released: the sub-scheduler's graph stalls
         qa_sched::ParentOfReleasedSubScheduler       parent = qa_sched::makeParentOfReleasedSubScheduler(nReleased);
@@ -4040,10 +4040,10 @@ const boost::ut::suite<"the zero-progress park"> zeroProgressParkTests = [] {
     // the park is left alone, and the trial times from call to call. A notify that ends the park brings
     // the next call in a fraction of the undisturbed park.
     "a producer's notify ends the park"_test = [] {
-        using Micros                       = std::chrono::duration<double, std::micro>;
-        constexpr std::size_t kTrials      = 25UZ;
-        constexpr std::size_t kMaxAttempts = 2000UZ;
-        constexpr auto        kSettle      = std::chrono::microseconds(100); // the worker reaches its park well inside this
+        using Micros                              = std::chrono::duration<double, std::micro>;
+        static constexpr std::size_t kTrials      = 25UZ;
+        static constexpr std::size_t kMaxAttempts = 2000UZ;
+        static constexpr auto        kSettle      = std::chrono::microseconds(100); // the worker reaches its park well inside this
 
         qa_sched::gOfferedSamples.store(0UZ);
         qa_sched::gPublishedOffers.store(0UZ);
@@ -4386,7 +4386,7 @@ const boost::ut::suite<"a message to a parked run"> parkedMessageTests = [] {
     // The requests around the swap request land before, during and after the graph exchange. After the swap the
     // retired graph's progress sequence is kept alive here, and a message must advance only the running graph's.
     "a message sent while a parked run replaces its graph is answered, and the retired graph's progress stays still"_test = [] {
-        constexpr std::size_t kAroundSwap = 40UZ;
+        static constexpr std::size_t kAroundSwap = 40UZ;
         qa_sched::gCountedSourceCalls.store(0UZ);
 
         qa_sched::BlockingScheduler scheduler(qa_sched::parkingSettings());
@@ -4440,7 +4440,7 @@ const boost::ut::suite<"a message to a parked run"> parkedMessageTests = [] {
     // Every message pass publishes a heartbeat from the worker's own thread. The heartbeat waits for the next pass, and
     // the run parks after each pass. The idle window is wall-clock time.
     "a heartbeat subscriber on a parked run leaves the run parked"_test = [] {
-        constexpr auto        kIdleWindow = std::chrono::milliseconds(2 * qa_sched::kParkTimeoutMs);
+        static constexpr auto kIdleWindow = std::chrono::milliseconds(2 * qa_sched::kParkTimeoutMs);
         constexpr std::size_t kCallBound  = 4UZ * static_cast<std::size_t>(kIdleWindow.count()) / qa_sched::kParkTimeoutMs; // four times one call per park
         qa_sched::gCountedSourceCalls.store(0UZ);
 
@@ -4480,7 +4480,7 @@ const boost::ut::suite<"a message to a parked run"> parkedMessageTests = [] {
     // heartbeat on the worker's thread with code from that object. The heartbeat waits for the next pass, as an
     // in-program block's does. The idle windows are wall-clock time
     "a heartbeat subscriber on a block from a shared object leaves the parked run parked"_test = [] {
-        constexpr auto        kIdleWindow = std::chrono::milliseconds(2 * qa_sched::kParkTimeoutMs);
+        static constexpr auto kIdleWindow = std::chrono::milliseconds(2 * qa_sched::kParkTimeoutMs);
         constexpr std::size_t kCallBound  = 4UZ * static_cast<std::size_t>(kIdleWindow.count()) / qa_sched::kParkTimeoutMs; // four times one call per park
         expect(fatal(qa_sched::loadCrossObjectLibrary())) << "the shared object did not load";
         qa_sched::gCountedSourceCalls.store(0UZ);
@@ -4561,14 +4561,14 @@ const boost::ut::suite<"workers that park"> parkingWorkerTests = [] {
 
     // Every pool case runs on a pool of its own with a thread for each job list the case needs. The default CPU pool
     // follows the host's core count and may hold fewer.
-    constexpr std::uint32_t kParkingThreads = 4U;
+    static constexpr std::uint32_t kParkingThreads = 4U;
 
     // A park lasts up to kParkTimeout. A worker that returns within kWakeBound, a third of the park, was therefore
     // woken. A message, an edit, a handoff or a pause must reach a parked worker within kPromptBound, a tenth of the
     // park. The watchdog's period lies beyond both.
-    constexpr auto         kParkTimeout = std::chrono::milliseconds(3000);
-    constexpr auto         kWakeBound   = kParkTimeout / 3;
-    constexpr auto         kPromptBound = kParkTimeout / 10;
+    static constexpr auto  kParkTimeout = std::chrono::milliseconds(3000);
+    static constexpr auto  kWakeBound   = kParkTimeout / 3;
+    static constexpr auto  kPromptBound = kParkTimeout / 10;
     const gr::property_map parkingSettings{{"timeout_ms", static_cast<gr::Size_t>(kParkTimeout.count())}, {"watchdog_timeout", gr::Size_t(60'000)}};
     const gr::property_map poolParkingSettings{{"timeout_ms", static_cast<gr::Size_t>(kParkTimeout.count())}, {"watchdog_timeout", gr::Size_t(60'000)}, {"poolName", std::string(qa_sched::kParkingPoolName)}};
 
@@ -4623,11 +4623,11 @@ const boost::ut::suite<"workers that park"> parkingWorkerTests = [] {
         qa_sched::PoolParkingScheduler scheduler(poolParkingSettings);
         expect(scheduler.exchange(std::move(flow)).has_value());
 
-        constexpr auto kQuietInterval = std::chrono::milliseconds(100);
-        bool           allParked      = false;
-        std::size_t    nCallsParked   = 0UZ;
-        std::size_t    nCallsLater    = 0UZ;
-        const bool     completed      = qa_sched::runAndWaitWithin(scheduler, qa_sched::kEventBound, [&] {
+        static constexpr auto kQuietInterval = std::chrono::milliseconds(100);
+        bool                  allParked      = false;
+        std::size_t           nCallsParked   = 0UZ;
+        std::size_t           nCallsLater    = 0UZ;
+        const bool            completed      = qa_sched::runAndWaitWithin(scheduler, qa_sched::kEventBound, [&] {
             allParked    = qa_sched::awaitParkedWorkers(scheduler, 2UZ);
             nCallsParked = source._nWorkCalls.load(std::memory_order_relaxed);
             std::this_thread::sleep_for(kQuietInterval);
@@ -4686,11 +4686,11 @@ const boost::ut::suite<"workers that park"> parkingWorkerTests = [] {
         qa_sched::PoolParkingScheduler scheduler(poolParkingSettings);
         expect(scheduler.exchange(std::move(flow)).has_value());
 
-        constexpr std::size_t kRounds   = 3UZ;
-        std::size_t           nArrived  = 0UZ;
-        bool                  allParked = true;
-        std::string           misses;
-        const bool            completed = qa_sched::runAndWaitWithin(scheduler, qa_sched::kEventBound, [&] {
+        static constexpr std::size_t kRounds   = 3UZ;
+        std::size_t                  nArrived  = 0UZ;
+        bool                         allParked = true;
+        std::string                  misses;
+        const bool                   completed = qa_sched::runAndWaitWithin(scheduler, qa_sched::kEventBound, [&] {
             for (std::size_t round = 1UZ; round <= kRounds; ++round) {
                 allParked = allParked && qa_sched::awaitParkedWorkers(scheduler, 1UZ);
                 nReleased.fetch_add(1UZ, std::memory_order_acq_rel);
@@ -5068,8 +5068,8 @@ const boost::ut::suite<"workers that park"> parkingWorkerTests = [] {
     // subscription restarts the idle back-off of the worker that reads it. The idle window opens once every worker has
     // parked, and it is wall-clock time.
     auto heartbeatLeavesPoolParked = [&](std::uint32_t nThreads) {
-        constexpr auto           kShortPark  = std::chrono::milliseconds(200);
-        constexpr auto           kIdleWindow = std::chrono::milliseconds(600);
+        static constexpr auto    kShortPark  = std::chrono::milliseconds(200);
+        static constexpr auto    kIdleWindow = std::chrono::milliseconds(600);
         const std::size_t        callBound   = 4UZ * nThreads * static_cast<std::size_t>(kIdleWindow / kShortPark); // four times one call per worker and park
         auto                     pool        = qa_sched::fixedPool(qa_sched::kParkingPoolName, nThreads);
         std::atomic<std::size_t> nReleased{0UZ};
@@ -5149,8 +5149,8 @@ const boost::ut::suite<"workers that park"> parkingWorkerTests = [] {
     // bound of calls in which nothing it waits on moved. Nothing else moves. A worker parked between those calls would
     // therefore call the relay once per park. Under multiThreaded the bound passes at the idle back-off's pace.
     auto untakenRemainderEnds = [&]<typename TScheduler>(std::string_view policyName) {
-        constexpr std::string_view kDrainPoolName = "qa_drain_cpu";
-        auto                       pool           = qa_sched::fixedPool(kDrainPoolName, 3U);
+        static constexpr std::string_view kDrainPoolName = "qa_drain_cpu";
+        auto                              pool           = qa_sched::fixedPool(kDrainPoolName, 3U);
 
         gr::Graph flow;
         auto&     source = flow.emplaceBlock<qa_sched::DoneSource>();
@@ -5242,7 +5242,7 @@ const boost::ut::suite<"a watchdog wake"> watchdogWakeTests = [] {
     // again, because the wake leaves the inactivity count where it was. The control runs with a watchdog period beyond
     // its window: its worker parks once after the inactivity count and stays parked
     "a watchdog wake does not reset the inactivity count"_test = [] {
-        constexpr std::size_t kWakes = 10UZ;
+        static constexpr std::size_t kWakes = 10UZ;
 
         const qa_sched::IdleRun woken   = qa_sched::runIdle(gr::Size_t(10), kWakes, {});
         const qa_sched::IdleRun control = qa_sched::runIdle(gr::Size_t(60'000), 0UZ, woken.elapsed);
@@ -5261,9 +5261,9 @@ const boost::ut::suite<"a watchdog wake"> watchdogWakeTests = [] {
     // next read. The case then repeats the attempt on a new run. After three such attempts the case prints that it
     // skipped its check.
     "a pause and a resume during a stall leave the stall report intact once RUNNING again"_test = [] {
-        constexpr std::size_t kStalledPeriods = 2UZ;
-        constexpr std::size_t kAttempts       = 3UZ;
-        constexpr auto        kPeriod         = std::chrono::milliseconds(100);
+        static constexpr std::size_t kStalledPeriods = 2UZ;
+        static constexpr std::size_t kAttempts       = 3UZ;
+        static constexpr auto        kPeriod         = std::chrono::milliseconds(100);
 
         auto attempt = [&](std::size_t nAttempt) {
             gr::Graph flow;
@@ -5800,7 +5800,7 @@ const boost::ut::suite<"a stop or a destruction during a deferred graph swap"> d
         // stop. That request finds the scheduler stopped and changes no state. A single-threaded scheduler runs the
         // swap and a restarted run inside the runner's call. Within the bound the runner's call returns, the swap
         // finishes and the scheduler reads STOPPED only when the swap honors the stop.
-        constexpr auto kBound = std::chrono::milliseconds(1000);
+        static constexpr auto kBound = std::chrono::milliseconds(1000);
 
         std::atomic<bool>                                     end{false};
         std::atomic<bool>                                     inSwap{false};
@@ -5864,7 +5864,7 @@ const boost::ut::suite<"a stop or a destruction during a deferred graph swap"> d
         // policy the swap runs inside the runner's call, and a destruction during that call is outside the scheduler's
         // contract. The case therefore runs under multiThreaded alone, where the runner's call has returned before the
         // swap.
-        constexpr auto kBound = std::chrono::milliseconds(1000);
+        static constexpr auto kBound = std::chrono::milliseconds(1000);
 
         std::atomic<bool>                                     end{false};
         std::atomic<bool>                                     resetEntered{false};
@@ -5906,8 +5906,8 @@ const boost::ut::suite<"a stop or a destruction during a deferred graph swap"> d
     };
 
     "a destruction stops a run that a deferred swap restarted before the destruction began"_test = []<typename TPolicy>() {
-        using TScheduler         = typename TPolicy::type;
-        constexpr bool kOnRunner = std::is_same_v<TScheduler, qa_sched::SerialScheduler> || std::is_same_v<TScheduler, qa_sched::BlockingScheduler>;
+        using TScheduler                = typename TPolicy::type;
+        static constexpr bool kOnRunner = std::is_same_v<TScheduler, qa_sched::SerialScheduler> || std::is_same_v<TScheduler, qa_sched::BlockingScheduler>;
 
         // timed on the wall clock. A worker requests a swap to a graph whose source runs until the test ends it. The
         // swap restarts the scheduler before the destruction begins, so the restart reads the destruction flag as unset.
@@ -5916,7 +5916,7 @@ const boost::ut::suite<"a stop or a destruction during a deferred graph swap"> d
         // restarted run inside the runner's call, and a destruction during that call is outside the scheduler's
         // contract. Under those policies the test stops the run, and the destruction begins after the runner's call
         // returned.
-        constexpr auto kBound = std::chrono::milliseconds(1000);
+        static constexpr auto kBound = std::chrono::milliseconds(1000);
 
         std::atomic<bool>                                     end{false};
         std::atomic<bool>                                     restartWorked{false};
@@ -6517,7 +6517,7 @@ template<typename TScheduler>
 void expectRequestFromOwnWorkReturns(gr::lifecycle::State request) {
     using namespace boost::ut;
     using enum gr::lifecycle::State;
-    constexpr bool kWorkerPerBlock = TScheduler::executionPolicy() == gr::scheduler::ExecutionPolicy::multiThreaded;
+    static constexpr bool kWorkerPerBlock = TScheduler::executionPolicy() == gr::scheduler::ExecutionPolicy::multiThreaded;
 
     auto pool         = fixedPool(kOwnRequestPoolName, 4U);
     auto probe        = std::make_unique<OwnRequestProbe>();

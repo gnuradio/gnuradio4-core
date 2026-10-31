@@ -369,7 +369,7 @@ const boost::ut::suite<"Port"> _portTests = [] { // NOSONAR (N.B. lambda size)
         const auto elapsed = std::chrono::steady_clock::now() - before;
 
         expect(eq(out.nEoSTagsLost, 1UZ)) << "a marker with nowhere to go must be counted as the terminal failure it is";
-        expect(lt(elapsed, std::chrono::milliseconds(50))) << "the marker path waited on a consumer that was never going to run";
+        expect(that % (elapsed < std::chrono::milliseconds(50))) << "the marker path waited on a consumer that was never going to run";
         std::ignore = tagReader.get<SpanReleasePolicy::ProcessAll>();
     };
 

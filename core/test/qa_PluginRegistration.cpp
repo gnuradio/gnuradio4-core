@@ -15,8 +15,6 @@
 #include <utility>
 #include <vector>
 
-#include <dlfcn.h>
-
 #include <gnuradio-4.0/Block.hpp>
 #include <gnuradio-4.0/BlockRegistry.hpp>
 #include <gnuradio-4.0/Graph.hpp>
@@ -51,14 +49,14 @@ using gr::testing::isMapped;
 // does. GoodRegistry and GoodBase define the same such symbols. GoodRegistry then provides them, and GoodBase unmaps
 // when it is closed.
 [[nodiscard]] bool openUniqueSymbolProvider() {
-    static void* const handle = dlopen(pluginFile("GoodRegistry").c_str(), RTLD_LAZY | RTLD_LOCAL);
+    static void* const handle = gr::detail::openSharedLibrary(pluginFile("GoodRegistry").c_str());
     return handle != nullptr;
 }
 
 // Opens the plugin of this ABI version for the rest of the run, ahead of any loader, for the same reason: every such
 // symbol of the two plugins the loader refuses is one this plugin defines too.
 [[nodiscard]] bool openAbiUniqueSymbolProvider() {
-    static void* const handle = dlopen(pluginFile("abi_probe_plugin.", abiPluginDirectory()).c_str(), RTLD_LAZY | RTLD_LOCAL);
+    static void* const handle = gr::detail::openSharedLibrary(pluginFile("abi_probe_plugin.", abiPluginDirectory()).c_str());
     return handle != nullptr;
 }
 
