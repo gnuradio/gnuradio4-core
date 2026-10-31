@@ -257,7 +257,9 @@ if(GR_ENABLE_BLOCK_REGISTRY AND INTERNAL_ENABLE_BLOCK_PLUGINS)
     block_library
     block_library_second
     block_library_duplicate
-    block_library_duplicate_second)
+    block_library_duplicate_second
+    ordinary_library
+    entry_point_only_plugin)
 
   # covers the default branch of globalPluginLoader(): it compiles its own copy of the loader's source, with the
   # installed plugin directory set to the directory of the test plugins, and runs with GNURADIO4_PLUGIN_DIRECTORIES

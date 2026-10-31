@@ -25,6 +25,7 @@
  * - a refused setting's reason, printed without the source file and line of the library
  * - the program's own scheduler, a plugin's and a shared object's, each chosen by its registry key
  * - a shared object's scheduler refused at an earlier plugin ABI version
+ * - what --verbose prints for a shared object that is neither a plugin nor a block library
  * - a command line that cannot be used
  * - a graph file that cannot be read
  * - the names --show and --set take for a block, and a name two blocks share
@@ -439,6 +440,18 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
         expect(eq(refused.exitCode, 2)) << refused.output;
         expect(refused.output.contains("no scheduler is registered as test::library_scheduler_v1")) << refused.output;
         expect(refused.output.contains("rungraph:   test::library_scheduler\n")) << "the list of keys includes the kept library's" << refused.output;
+    };
+
+    "--verbose names a shared object that is neither a plugin nor a block library as loaded"_test = [] {
+        std::vector<std::string> arguments = chainToItsEnd(kOwnSchedulers[0]);
+        arguments.emplace_back("--plugin-dir");
+        arguments.emplace_back(GR_TOOLS_TEST_ORDINARY_LIBRARY);
+
+        const Result ran = run(arguments);
+        expect(eq(ran.exitCode, 0)) << ran.output;
+        expect(ran.output.contains(std::format("rungraph: loaded {}/libordinary_library.so (no plugin entry point; this load registered nothing)\n", GR_TOOLS_TEST_ORDINARY_LIBRARY))) << ran.output;
+        expect(!ran.output.contains("libordinary_library.so did not load")) << ran.output;
+        expect(ran.output.contains("the graph ended on its own")) << ran.output;
     };
 
     "a block name the graph does not hold is refused"_test = [] {

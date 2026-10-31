@@ -121,6 +121,15 @@ add_non_blocklib_plugin(device_listing_foreign_scheduler_plugin)
 set_target_properties(device_listing_stale_plugin device_listing_foreign_scheduler_plugin
                       PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${TESTS_BINARY_PATH}/device_listing_stale)
 
+# A shared object that is neither a plugin nor a block library, and a file that exports gr_plugin_make without
+# gr_plugin_free, in a directory of their own. A load of that directory lists the first apart from the failed plugins
+# and reports the second among them.
+add_library(ordinary_library MODULE ordinary_library.cpp)
+target_link_libraries(ordinary_library PRIVATE gnuradio-options)
+add_non_blocklib_plugin(entry_point_only_plugin)
+set_target_properties(ordinary_library entry_point_only_plugin PROPERTIES LIBRARY_OUTPUT_DIRECTORY
+                                                                          ${TESTS_BINARY_PATH}/ordinary_library)
+
 # a name that reads as a shared object but is not one the scan opens; it is never dlopened, so an empty file suffices
 file(MAKE_DIRECTORY ${TESTS_BINARY_PATH}/block_library_skipped)
 file(TOUCH ${TESTS_BINARY_PATH}/block_library_skipped/libnotopened.so.1)

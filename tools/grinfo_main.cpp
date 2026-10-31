@@ -602,11 +602,12 @@ struct Instantiation {
     std::vector<Setting>     settings;
 };
 
-enum class FileKind : std::uint8_t { BlockLibrary, NotLoaded, NotOpened };
+enum class FileKind : std::uint8_t { BlockLibrary, OrdinaryLibrary, NotLoaded, NotOpened };
 
 [[nodiscard]] std::string_view nameOf(FileKind kind) {
     switch (kind) {
     case FileKind::BlockLibrary: return "block-library";
+    case FileKind::OrdinaryLibrary: return "ordinary-library";
     case FileKind::NotLoaded: return "not-loaded";
     case FileKind::NotOpened: return "not-opened";
     }
@@ -643,13 +644,14 @@ struct PluginFact {
 };
 
 struct Totals {
-    std::size_t blockKeys      = 0UZ;
-    std::size_t blockFamilies  = 0UZ;
-    std::size_t schedulerKeys  = 0UZ;
-    std::size_t blockLibraries = 0UZ;
-    std::size_t plugins        = 0UZ;
-    std::size_t filesNotLoaded = 0UZ;
-    std::size_t filesNotOpened = 0UZ;
+    std::size_t blockKeys         = 0UZ;
+    std::size_t blockFamilies     = 0UZ;
+    std::size_t schedulerKeys     = 0UZ;
+    std::size_t blockLibraries    = 0UZ;
+    std::size_t ordinaryLibraries = 0UZ;
+    std::size_t plugins           = 0UZ;
+    std::size_t filesNotLoaded    = 0UZ;
+    std::size_t filesNotOpened    = 0UZ;
 };
 
 // what one run of the program has to report, read once
@@ -1528,6 +1530,7 @@ void writeTotals(JsonWriter& json, const Totals& totals) {
     json.count("blockFamilies", totals.blockFamilies);
     json.count("schedulerKeys", totals.schedulerKeys);
     json.count("blockLibraries", totals.blockLibraries);
+    json.count("ordinaryLibraries", totals.ordinaryLibraries);
     json.count("plugins", totals.plugins);
     json.count("filesNotLoaded", totals.filesNotLoaded);
     json.count("filesNotOpened", totals.filesNotOpened);
@@ -1721,6 +1724,7 @@ constexpr std::array<Column, 5> kPluginColumns{Column{.header = "plugin"}, Colum
         {"block families", std::to_string(context.totals.blockFamilies)},
         {"scheduler keys", std::to_string(context.totals.schedulerKeys)},
         {"libraries", std::to_string(context.totals.blockLibraries)},
+        {"ordinary libraries", std::to_string(context.totals.ordinaryLibraries)},
         {"plugins", std::to_string(context.totals.plugins)},
         {"files not loaded", std::to_string(context.totals.filesNotLoaded)},
         {"files not opened", std::to_string(context.totals.filesNotOpened)},
@@ -2351,6 +2355,9 @@ int main(int argc, char** argv) {
         context.libraryFiles.emplace(canonicalPath(library.file));
         context.files.push_back({.file = library.file, .kind = FileKind::BlockLibrary, .blockRegistrations = library.nBlockRegistrations, .schedulerRegistrations = library.nSchedulerRegistrations, .reason = {}});
     }
+    for (const std::string& file : loader.ordinaryLibraries()) {
+        context.files.push_back({.file = file, .kind = FileKind::OrdinaryLibrary, .blockRegistrations = 0UZ, .schedulerRegistrations = 0UZ, .reason = {}});
+    }
     for (const auto& [file, reason] : loader.failedPlugins()) {
         context.files.push_back({.file = file, .kind = FileKind::NotLoaded, .blockRegistrations = 0UZ, .schedulerRegistrations = 0UZ, .reason = reason});
     }
@@ -2360,10 +2367,11 @@ int main(int argc, char** argv) {
     for (const auto& plugin : loader.plugins()) {
         context.plugins.push_back({.name = plugin->metadata.plugin_name, .author = plugin->metadata.plugin_author, .license = plugin->metadata.plugin_license, .version = plugin->metadata.plugin_version, .blocks = plugin->availableBlocks().size(), .schedulers = plugin->availableSchedulers().size()});
     }
-    context.totals.blockLibraries = loader.blockLibraries().size();
-    context.totals.plugins        = loader.plugins().size();
-    context.totals.filesNotLoaded = loader.failedPlugins().size();
-    context.totals.filesNotOpened = loader.skippedFiles().size();
+    context.totals.blockLibraries    = loader.blockLibraries().size();
+    context.totals.ordinaryLibraries = loader.ordinaryLibraries().size();
+    context.totals.plugins           = loader.plugins().size();
+    context.totals.filesNotLoaded    = loader.failedPlugins().size();
+    context.totals.filesNotOpened    = loader.skippedFiles().size();
 #endif
     std::ranges::sort(context.files, [](const FileFact& left, const FileFact& right) { return left.file < right.file; });
     std::ranges::sort(context.plugins, [](const PluginFact& left, const PluginFact& right) { return left.name < right.name; });
