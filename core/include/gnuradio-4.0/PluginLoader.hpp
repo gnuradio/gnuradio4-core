@@ -438,12 +438,17 @@ public:
     /// whether this handler holds the library's handle
     [[nodiscard]] bool isLoaded() const noexcept { return _dl_handle != nullptr; }
 
+    /// whether the handler found `gr_plugin_make` in the library it holds; false when it holds none
+    [[nodiscard]] bool hasPluginEntryPoint() const noexcept { return _dl_handle != nullptr && _create_fn != nullptr; }
+
     /**
      * @brief Gives up the unload: the library stays mapped for the lifetime of the process.
      *
      * A library whose static initializers registered blocks or schedulers leaves factory pointers into its own
      * code in the registries, and those outlive every handle to it. A plugin that a loader admits is kept the same way:
      * the blocks, schedulers, pools, tasks and compute providers that its code builds can outlive the loader.
+     * A shared object that is neither, and registered no block, scheduler or device listing, is kept as well: its
+     * static initializers may have registered a pool or a compute provider, and no registry removes those.
      */
     void keepMapped() noexcept { _keepMapped = true; }
 
@@ -495,6 +500,7 @@ private:
     std::vector<PluginHandler>                   _pluginHandlers;
     std::vector<BlockLibrary>                    _blockLibraries;
     std::vector<std::string>                     _skippedFiles;
+    std::vector<std::string>                     _ordinaryLibraries;
     std::unordered_map<std::string, std::string> _failedPlugins;
     std::unordered_set<std::string>              _loadedPluginFiles;
 
@@ -671,6 +677,9 @@ public:
                             handler.keepMapped();
                             _blockLibraries.push_back({.file = fileString, .nBlockRegistrations = blockRegistrations, .nSchedulerRegistrations = schedulerRegistrations});
                         }
+                    } else if (handler.isLoaded() && !handler.hasPluginEntryPoint()) {
+                        handler.keepMapped();
+                        _ordinaryLibraries.push_back(fileString);
                     } else {
                         handler.refuse(handler.status());
                         _failedPlugins[fileString] = handler.status();
@@ -690,6 +699,9 @@ public:
 
     /// directory entries whose name reads as a shared object but which the scan did not open, so that a directory of them is not indistinguishable from an empty one
     const std::vector<std::string>& skippedFiles() const { return _skippedFiles; }
+
+    /// the shared objects that loaded without `gr_plugin_make` and neither registered a block or scheduler nor offered a device listing, such as the libraries a plugin links against
+    const std::vector<std::string>& ordinaryLibraries() const { return _ordinaryLibraries; }
 
     const auto& failedPlugins() const { return _failedPlugins; }
 
@@ -792,6 +804,7 @@ private:
     detail::YamlDefinitionsLoader _yamlRegistry;
     BlockRegistry*                _registry;
     SchedulerRegistry*            _schedulerRegistry;
+    std::vector<std::string>      _ordinaryLibraries;
 
 public:
     PluginLoader(BlockRegistry& registry, SchedulerRegistry& scheduler_registry, std::span<const std::string> paths) : _yamlRegistry(paths), _registry(&registry), _schedulerRegistry(&scheduler_registry) {}
@@ -837,6 +850,9 @@ public:
 
     /// see the non-WASM PluginLoader::nSkippedAssets
     [[nodiscard]] std::size_t nSkippedAssets() const noexcept { return _yamlRegistry.nSkippedAssets(); }
+
+    /// empty: this loader opens no shared object
+    const std::vector<std::string>& ordinaryLibraries() const { return _ordinaryLibraries; }
 
     /// see the non-WASM PluginLoader::listDevices
     [[nodiscard]] DeviceList listDevices(Opening opening = Opening::Avoided) const { return detail::listDevices(gr::globalDeviceListingRegistry().listings(), opening); }

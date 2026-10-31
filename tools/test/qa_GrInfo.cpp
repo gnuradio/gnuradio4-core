@@ -28,6 +28,7 @@
  * - the scheduler listing
  * - scheduler libraries refused at an earlier plugin ABI version or at none
  * - a plugin refused for its plugin ABI version
+ * - a shared object that is neither a plugin nor a block library
  * - the attached units of the device families a block library and a plugin register
  * - a name nothing is registered under
  * - a command line that cannot be used
@@ -651,6 +652,20 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         const Result both = run(arguments);
         expect(eq(both.exitCode, 0)) << both.output;
         expect(both.output.contains("libabi_probe_plugin_v1.so not loaded: plugin ABI version 1 does not match")) << "the warning reaches standard error" << both.output;
+    };
+
+    "a shared object that is neither a plugin nor a block library is reported as an ordinary library and counted"_test = [] {
+        const Result text = run({"version", "--plugin-dir", GR_TOOLS_TEST_ORDINARY_LIBRARY}, Streams::standardOutput);
+        expect(eq(text.exitCode, 0)) << text.output;
+        expect(withSingleSpaces(text.output).contains("libordinary_library.so ordinary-library 0 0")) << "the file's row names its kind" << text.output;
+        expect(withSingleSpaces(text.output).contains("ordinary libraries 1 ")) << "the directory holds one such file" << text.output;
+
+        const Result json = run({"version", "--json", "--plugin-dir", GR_TOOLS_TEST_ORDINARY_LIBRARY}, Streams::standardOutput);
+        expect(eq(json.exitCode, 0)) << json.output;
+        expect(withSingleSpaces(json.output).contains("libordinary_library.so\", \"kind\": \"ordinary-library\"")) << "the file's entry names its kind" << json.output;
+        const std::size_t rows = occurrences(json.output, "\"kind\": \"ordinary-library\"");
+        expect(eq(rows, 1UZ)) << json.output;
+        expect(json.output.contains(std::format("\"ordinaryLibraries\": {},", rows))) << "the total counts the entries of that kind" << json.output;
     };
 
     "version --markdown and --html carry the search path and the plugins as table rows"_test = [] {

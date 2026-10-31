@@ -55,12 +55,17 @@ if(TARGET rungraph)
   set_tests_properties(qa_RunGraph PROPERTIES TIMEOUT 60)
   if(INTERNAL_ENABLE_BLOCK_PLUGINS)
     target_compile_definitions(
-      qa_RunGraph PRIVATE GR_TOOLS_CORE_TEST_PLUGINS="${CMAKE_BINARY_DIR}/core/test/plugins"
-                          GR_TOOLS_TEST_SCHEDULER_LIBRARY="${CMAKE_BINARY_DIR}/core/test/scheduler_library")
+      qa_RunGraph
+      PRIVATE GR_TOOLS_CORE_TEST_PLUGINS="${CMAKE_BINARY_DIR}/core/test/plugins"
+              GR_TOOLS_TEST_SCHEDULER_LIBRARY="${CMAKE_BINARY_DIR}/core/test/scheduler_library"
+              GR_TOOLS_TEST_ORDINARY_LIBRARY="${CMAKE_BINARY_DIR}/core/test/ordinary_library")
     # the cases read these files: GoodBasePlugin (good::fixed_source and good::cout_sink), GoodRegistryPlugin
     # (good::identity and good::start_recorder), good_math_plugin (a plugin's scheduler), bad_plugin (the plugin
-    # --verbose reports as not loaded), scheduler_library (a scheduler from a shared object that is not a plugin), and
-    # scheduler_library_v1 and scheduler_library_unversioned (the two builds of it that are refused)
+    # --verbose reports as not loaded), scheduler_library (a scheduler from a shared object that is not a plugin),
+    # scheduler_library_v1 and scheduler_library_unversioned (the two builds of it that are refused), and
+    # ordinary_library (a shared object that is neither a plugin nor a block library, which --verbose reports as
+    # loaded). entry_point_only_plugin shares that directory, so that the directory holds the same files whatever else
+    # was built.
     add_dependencies(
       qa_RunGraph
       GoodBasePlugin
@@ -69,7 +74,9 @@ if(TARGET rungraph)
       bad_plugin
       scheduler_library
       scheduler_library_v1
-      scheduler_library_unversioned)
+      scheduler_library_unversioned
+      ordinary_library
+      entry_point_only_plugin)
 
     # one plugin, in a directory of its own, whose block reports an error while the graph runs
     add_library(rungraph_fixture MODULE plugins/rungraph_fixture_plugin.cpp)
@@ -84,6 +91,7 @@ endif()
 # grinfo is tested as the program a caller runs, for the same reason. It is given core's own test plugins and, beside
 # them, the directory of shared objects that register blocks without being plugins, so that both kinds of file appear in
 # one report. One case is given the plugin ABI test directory, which holds a plugin built at plugin ABI version 1.
+# Another is given the directory of a shared object that is neither a plugin nor a block library.
 if(TARGET grinfo)
   add_ut_test(qa_GrInfo)
   target_compile_definitions(qa_GrInfo PRIVATE GR_TOOLS_GRINFO="$<TARGET_FILE:grinfo>")
@@ -96,6 +104,7 @@ if(TARGET grinfo)
               GR_TOOLS_TEST_BLOCK_LIBRARY="${CMAKE_BINARY_DIR}/core/test/block_library"
               GR_TOOLS_TEST_SCHEDULER_LIBRARY="${CMAKE_BINARY_DIR}/core/test/scheduler_library"
               GR_TOOLS_TEST_PLUGIN_ABI="${CMAKE_BINARY_DIR}/core/test/plugin_abi"
+              GR_TOOLS_TEST_ORDINARY_LIBRARY="${CMAKE_BINARY_DIR}/core/test/ordinary_library"
               GR_TOOLS_TEST_DOC_PROBE_LIBRARY="${CMAKE_BINARY_DIR}/core/test/doc_probe_library")
     add_dependencies(
       qa_GrInfo
@@ -111,7 +120,9 @@ if(TARGET grinfo)
       abi_probe_plugin
       abi_probe_plugin_v1
       abi_probe_plugin_foreign_scheduler
-      doc_probe_library)
+      doc_probe_library
+      ordinary_library
+      entry_point_only_plugin)
     # the device cases read a block library and a plugin that register device listings of invented units
     target_compile_definitions(qa_GrInfo
                                PRIVATE GR_TOOLS_TEST_DEVICE_LISTING="${CMAKE_BINARY_DIR}/core/test/device_listing")

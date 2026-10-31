@@ -36,6 +36,10 @@ constexpr std::string_view kDuplicateKey = "test::library_duplicate";
 
 [[nodiscard]] std::string pluginDirectory() { return std::string(TESTS_BINARY_PATH) + "/plugins"; }
 
+[[nodiscard]] std::string ordinaryLibraryDirectory() { return std::string(TESTS_BINARY_PATH) + "/ordinary_library"; }
+
+[[nodiscard]] bool namedIn(std::string_view file, std::string_view name) { return std::filesystem::path(file).filename().string().contains(name); }
+
 using gr::testing::isMapped;
 
 } // namespace qa_plugin_block_library
@@ -122,6 +126,33 @@ const boost::ut::suite<"PluginBlockLibrary"> pluginBlockLibraryTests = [] {
         constexpr std::string_view prefix = "Failed to load the plugin file: ";
         expect(failed->second.starts_with(prefix)) << failed->second;
         expect(gt(failed->second.size(), prefix.size())) << "the reason names what the linker refused";
+    };
+
+    "a shared object that is neither a plugin nor a block library is listed apart from the failed plugins"_test = [] {
+        const std::vector<std::string> directories{ordinaryLibraryDirectory()};
+        const PluginLoader             loader(gr::globalBlockRegistry(), gr::globalSchedulerRegistry(), directories);
+
+        expect(fatal(eq(loader.ordinaryLibraries().size(), 1UZ))) << "the directory holds one shared object that is not a plugin";
+        const std::string& ordinary = loader.ordinaryLibraries().front();
+        expect(namedIn(ordinary, "ordinary_library")) << ordinary;
+        expect(that % !loader.failedPlugins().contains(ordinary)) << "a library that is not a plugin did not fail to load";
+        expect(that % isMapped(ordinary)) << "the loader unmapped a library it listed";
+        expect(that % loader.blockLibraries().empty()) << "the library registered nothing";
+
+        const PluginLoader again(gr::globalBlockRegistry(), gr::globalSchedulerRegistry(), directories);
+        expect(that % (again.ordinaryLibraries() == loader.ordinaryLibraries())) << "a later loader lists the library the same way";
+        expect(that % !again.failedPlugins().contains(ordinary));
+    };
+
+    "a plugin without gr_plugin_free stays a failed plugin beside a library that is not a plugin"_test = [] {
+        const std::vector<std::string> directories{ordinaryLibraryDirectory()};
+        const PluginLoader             loader(gr::globalBlockRegistry(), gr::globalSchedulerRegistry(), directories);
+
+        const auto failed = std::ranges::find_if(loader.failedPlugins(), [](const auto& entry) { return namedIn(entry.first, "entry_point_only_plugin"); });
+        expect(fatal(failed != loader.failedPlugins().end())) << "a file with gr_plugin_make and no gr_plugin_free is a failure";
+        expect(eq(failed->second, std::string("Failed to load symbol gr_plugin_free")));
+        expect(eq(loader.failedPlugins().size(), 1UZ)) << "no other file of the directory fails";
+        expect(that % !std::ranges::any_of(loader.ordinaryLibraries(), [](const std::string& file) { return namedIn(file, "entry_point_only_plugin"); }));
     };
 
     "a name that reads as a shared object but is not opened is reported"_test = [] {

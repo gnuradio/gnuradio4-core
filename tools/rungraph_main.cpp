@@ -245,6 +245,9 @@ void reportPlugins(const gr::PluginLoader& loader, const std::vector<std::string
     for (const gr::PluginLoader::BlockLibrary& library : loader.blockLibraries()) {
         std::println(stderr, "{}: loaded {} ({} block registration(s))", kProgram, library.file, library.nBlockRegistrations);
     }
+    for (const std::string& file : loader.ordinaryLibraries()) {
+        std::println(stderr, "{}: loaded {} (no plugin entry point; this load registered nothing)", kProgram, file);
+    }
     for (const auto& [file, reason] : loader.failedPlugins()) {
         std::println(stderr, "{}: {} did not load: {}", kProgram, file, reason);
     }
