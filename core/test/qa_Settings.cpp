@@ -2454,6 +2454,71 @@ void coupleRateAndLevel(SettingsBase& settings) { settings.setTagCouplings({{"sa
     }
     return {};
 }
+
+/// publishes `nSamples` samples and puts `tag` on the sample at `tagIndex`
+struct IndexedTagSource : Block<IndexedTagSource> {
+    PortOut<float> out{};
+
+    GR_MAKE_REFLECTABLE(IndexedTagSource, out);
+
+    property_map tag{};
+    std::size_t  tagIndex = 0UZ;
+    std::size_t  nSamples = 0UZ;
+    std::size_t  nEmitted = 0UZ;
+
+    work::Status processBulk(OutputSpanLike auto& outSpan) {
+        const std::size_t n = std::min(outSpan.size(), nSamples - nEmitted);
+        std::fill_n(outSpan.begin(), n, 1.0f);
+        if (tagIndex >= nEmitted && tagIndex < nEmitted + n) {
+            outSpan.publishTag(tag, tagIndex - nEmitted);
+        }
+        nEmitted += n;
+        outSpan.publish(n);
+        return nEmitted == nSamples ? work::Status::DONE : work::Status::OK;
+    }
+};
+
+/// records its names setting at each sample it takes
+struct NamesRecordingSink : Block<NamesRecordingSink> {
+    PortIn<float> in{};
+
+    std::vector<std::string> names = {"untagged"};
+
+    GR_MAKE_REFLECTABLE(NamesRecordingSink, in, names);
+
+    std::vector<std::vector<std::string>> namesAtSample{};
+
+    work::Status processBulk(std::span<const float> input) {
+        namesAtSample.insert(namesAtSample.end(), input.size(), names);
+        return work::Status::OK;
+    }
+};
+
+/// the names separated by commas
+[[nodiscard]] std::string joined(const std::vector<std::string>& names) {
+    std::string text;
+    for (const std::string& name : names) {
+        text += text.empty() ? name : ", " + name;
+    }
+    return text;
+}
+
+/// the names a sink coupled to `key` held at each sample, when a source puts `tag` on sample `tagIndex` of `nSamples`
+[[nodiscard]] std::vector<std::vector<std::string>> namesFollowingTag(std::string_view key, const property_map& tag, std::size_t tagIndex, std::size_t nSamples) {
+    using namespace boost::ut;
+    Graph flow;
+    auto& source    = flow.emplaceBlock<IndexedTagSource>();
+    auto& sink      = flow.emplaceBlock<NamesRecordingSink>();
+    source.tag      = tag;
+    source.tagIndex = tagIndex;
+    source.nSamples = nSamples;
+    sink.settings().setTagCouplings(property_map{{"names", std::string(key)}});
+    expect(fatal(flow.connect<"out", "in">(source, sink).has_value()));
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+    expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+    expect(fatal(scheduler.runAndWait().has_value()));
+    return sink.namesAtSample;
+}
 } // namespace qa_follows_tag
 
 const boost::ut::suite<"keys that follow tags"> autoUpdateKeyTests = [] {
@@ -2815,6 +2880,42 @@ const boost::ut::suite<"keys that follow tags"> autoUpdateKeyTests = [] {
         block.settings().autoUpdate(tagOf(gr::tag::SAMPLE_RATE.key(), taggedRate));
         std::ignore = block.settings().applyStagedParameters();
         expect(eq(block.sample_rate.value, taggedRate)) << "the setting the message coupled does not follow its key";
+    };
+
+    "a list of strings coupled to a tag key takes the tag's list at the tag's sample"_test = [] {
+        using namespace qa_follows_tag;
+        constexpr std::string_view     kNamesKey = "foo:names";
+        const std::vector<std::string> tagged{"first", "second"};
+        Tensor<std::pmr::string>       textTensor(extents_from, {tagged.size()});
+        std::ranges::copy(tagged, textTensor.begin());
+        constexpr std::size_t kTagIndex = 5UZ;
+        constexpr std::size_t kSamples  = 2UZ * kTagIndex;
+
+        const std::vector<std::pair<std::string_view, pmt::Value>> carriers{{"Tensor<pmt::Value>", pmt::Value(tagged)}, {"Tensor<std::pmr::string>", pmt::Value(textTensor)}};
+
+        const std::vector<std::string> untagged = NamesRecordingSink{}.names;
+        for (const auto& [carrier, list] : carriers) {
+            const auto namesAtSample = namesFollowingTag(kNamesKey, property_map{{std::pmr::string(kNamesKey), list}}, kTagIndex, kSamples);
+            expect(fatal(eq(namesAtSample.size(), kSamples))) << carrier;
+            for (std::size_t i = 0UZ; i < kSamples; ++i) {
+                expect(namesAtSample[i] == (i < kTagIndex ? untagged : tagged)) << std::format("the list a {} carries: '{}' at sample {}, the tag at sample {}", carrier, joined(namesAtSample[i]), i, kTagIndex);
+            }
+        }
+    };
+
+    "a list of strings coupled to a tag key keeps its list when the tag's list holds an element that is no string"_test = [] {
+        using namespace qa_follows_tag;
+        constexpr std::string_view    kNamesKey = "foo:names";
+        constexpr std::size_t         kTagIndex = 5UZ;
+        constexpr std::size_t         kSamples  = 2UZ * kTagIndex;
+        const std::vector<pmt::Value> mixed{pmt::Value(std::string("first")), pmt::Value(1.f)};
+
+        const std::vector<std::string> untagged      = NamesRecordingSink{}.names;
+        const auto                     namesAtSample = namesFollowingTag(kNamesKey, property_map{{std::pmr::string(kNamesKey), pmt::Value(Tensor<pmt::Value>(mixed.begin(), mixed.end()))}}, kTagIndex, kSamples);
+        expect(fatal(eq(namesAtSample.size(), kSamples)));
+        for (std::size_t i = 0UZ; i < kSamples; ++i) {
+            expect(namesAtSample[i] == untagged) << std::format("a list with an element that is no string sets '{}' at sample {}, the tag at sample {}", joined(namesAtSample[i]), i, kTagIndex);
+        }
     };
 };
 
