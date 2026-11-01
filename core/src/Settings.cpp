@@ -40,6 +40,21 @@ BlockDescriptor::BlockDescriptor(const BlockHooks& blockHooks) : hooks(blockHook
 
 } // namespace settings
 
+namespace detail {
+std::optional<Tensor<pmt::Value>> stagedStringList(const pmt::Value& value) {
+    if (const auto* text = value.get_if<Tensor<std::pmr::string>>(); text != nullptr) {
+        Tensor<pmt::Value> list(extents_from, {text->size()});
+        std::ranges::transform(*text, list.begin(), [](const std::pmr::string& element) { return pmt::Value(element); });
+        return list;
+    }
+    const auto* elements = value.get_if<Tensor<pmt::Value>>();
+    if (elements == nullptr || !std::ranges::all_of(*elements, &pmt::Value::is_string)) {
+        return std::nullopt;
+    }
+    return *elements;
+}
+} // namespace detail
+
 namespace {
 // The reason a set for `ctx` would pass kMaxContexts or kMaxPendingSets, or nothing when it fits.
 // `forLaterTime` says the caller asked for a time after `now`; only such a set counts against kMaxPendingSets.

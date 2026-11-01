@@ -306,6 +306,10 @@ std::optional<std::string> setParameterImpl(std::string_view key, const pmt::Val
     }
 }
 
+// the Tensor<pmt::Value> that set() stages for a list-of-strings setting, from a Tensor<std::pmr::string> or from a
+// Tensor<pmt::Value> of strings; nothing for any other value
+[[nodiscard]] std::optional<Tensor<pmt::Value>> stagedStringList(const pmt::Value& value);
+
 template<typename Type>
 bool autoUpdateImpl(std::string_view key, const pmt::Value& value, const std::set<std::string>& autoUpdateParams, property_map& stagedParameters) {
     const auto keyStr = std::string(key);
@@ -331,10 +335,15 @@ bool autoUpdateImpl(std::string_view key, const pmt::Value& value, const std::se
             return true;
         }
     } else if constexpr (meta::array_or_vector_type<Type>) {
-        using TValue      = typename Type::value_type;
-        using TTensorElem = std::conditional_t<std::is_same_v<TValue, std::string> || std::is_same_v<TValue, std::pmr::string>, std::pmr::string, TValue>;
-        if (value.holds<Tensor<TTensorElem>>()) {
-            auto converted = pmt::convertTo<Tensor<TTensorElem>>(value);
+        using TValue = typename Type::value_type;
+        if constexpr (std::is_same_v<TValue, std::string> || std::is_same_v<TValue, std::pmr::string>) {
+            if (auto list = stagedStringList(value); list.has_value()) {
+                stagedParameters.insert_or_assign(keyPmr, std::move(*list));
+                return true;
+            }
+            return false;
+        } else if (value.holds<Tensor<TValue>>()) {
+            auto converted = pmt::convertTo<Tensor<TValue>>(value);
             if (converted.has_value()) {
                 stagedParameters.insert_or_assign(keyPmr, std::move(*converted));
                 return true;
