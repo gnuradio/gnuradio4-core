@@ -14,6 +14,8 @@ set(meta_public_headers
     include/gnuradio-4.0/meta/indirect.hpp
     include/gnuradio-4.0/meta/reflection.hpp
     include/gnuradio-4.0/meta/simd.hpp
+    include/gnuradio-4.0/meta/simd_elementary.hpp
+    include/gnuradio-4.0/meta/simd_math.hpp
     include/gnuradio-4.0/meta/typelist.hpp
     include/gnuradio-4.0/meta/utils.hpp)
 
