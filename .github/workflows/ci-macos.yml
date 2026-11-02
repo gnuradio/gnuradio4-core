@@ -84,7 +84,7 @@ jobs:
 
       - name: Execute tests
         working-directory: ${{ github.workspace }}/build
-        run: ctest --output-on-failure --timeout 120
+        run: ctest --output-on-failure --parallel "$(sysctl -n hw.logicalcpu)" --timeout 120
 
       - name: Execute main binary
         working-directory: ${{ github.workspace }}/build

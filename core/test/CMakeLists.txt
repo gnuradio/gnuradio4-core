@@ -192,6 +192,10 @@ if(GR_ENABLE_BLOCK_REGISTRY)
 endif()
 set_tests_properties(${_CORE_DEADLOCK_TESTS} PROPERTIES TIMEOUT 120)
 
+# two cases bound a block's reply to a parked run's settings request at a tenth of the park on the wall clock; with
+# other tests on the same CPUs the reply can exceed that bound
+set_tests_properties(qa_SchedulerLifecycle PROPERTIES RUN_SERIAL TRUE)
+
 # a thread that outlives a case stalls the case's wait on the thread count
 set_tests_properties(qa_thread_pool_limit PROPERTIES TIMEOUT 60)
 
