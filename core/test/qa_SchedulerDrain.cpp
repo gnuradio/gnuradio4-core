@@ -4,9 +4,12 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <format>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -446,6 +449,160 @@ struct TailDecimator : gr::Block<TailDecimator, gr::Resampling<kDecimation, 1U, 
     }
 };
 
+// keeps the first sample of each chunk and defines no epilogue. It requests its stop when stop_now turns true.
+struct ChunkDecimator : gr::Block<ChunkDecimator, gr::Resampling<kDecimation, 1U>> {
+    gr::PortIn<int>  in;
+    gr::PortOut<int> out;
+    bool             stop_now = false;
+
+    GR_MAKE_REFLECTABLE(ChunkDecimator, in, out, stop_now);
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& inSpan, gr::OutputSpanLike auto& outSpan) {
+        const std::size_t chunk = static_cast<std::size_t>(this->input_chunk_size);
+        for (std::size_t i = 0UZ; i < outSpan.size(); ++i) {
+            outSpan[i] = inSpan[i * chunk];
+        }
+        return gr::work::Status::OK;
+    }
+
+    void settingsChanged(const gr::property_map& /*oldSettings*/, const gr::property_map& /*newSettings*/) {
+        if (stop_now) {
+            this->requestStop();
+        }
+    }
+};
+
+// keeps the first sample of each chunk. Its stride of one sample makes its chunks overlap. It records the highest
+// sample value it was handed.
+struct StridedDecimator : gr::Block<StridedDecimator, gr::Resampling<kDecimation, 1U>, gr::Stride<1U>> {
+    gr::PortIn<int>  in;
+    gr::PortOut<int> out;
+
+    GR_MAKE_REFLECTABLE(StridedDecimator, in, out);
+
+    int _highestHanded = -1;
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& inSpan, gr::OutputSpanLike auto& outSpan) {
+        for (std::size_t i = 0UZ; i < inSpan.size(); ++i) {
+            _highestHanded = std::max(_highestHanded, inSpan[i]);
+        }
+        const std::size_t chunk = static_cast<std::size_t>(this->input_chunk_size);
+        for (std::size_t i = 0UZ; i < outSpan.size(); ++i) {
+            outSpan[i] = inSpan[i * chunk];
+        }
+        return gr::work::Status::OK;
+    }
+};
+
+// takes what the two inputs of its port collection hold together and counts it
+struct CollectionPairSink : gr::Block<CollectionPairSink> {
+    std::vector<gr::PortIn<int>> in;
+
+    GR_MAKE_REFLECTABLE(CollectionPairSink, in);
+
+    std::size_t _nReceived = 0UZ;
+
+    explicit CollectionPairSink(gr::property_map init = {}) : gr::Block<CollectionPairSink>(std::move(init)) { in.resize(2UZ); }
+
+    template<gr::InputSpanLike TInSpan>
+    gr::work::Status processBulk(const std::span<TInSpan>& inSpans) {
+        _nReceived += inSpans[0UZ].size();
+        return gr::work::Status::OK;
+    }
+};
+
+// takes everything its asynchronous input holds and counts it
+struct AsyncCountingSink : gr::Block<AsyncCountingSink> {
+    gr::PortIn<int, gr::Async> in;
+
+    GR_MAKE_REFLECTABLE(AsyncCountingSink, in);
+
+    std::size_t _nReceived = 0UZ;
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& inSpan) {
+        const std::size_t n = inSpan.size();
+        std::ignore         = inSpan.consume(n);
+        _nReceived += n;
+        return n > 0UZ ? gr::work::Status::OK : gr::work::Status::INSUFFICIENT_INPUT_ITEMS;
+    }
+};
+
+// consumes at most kConsumed samples per call and records how many it was handed. With _lowerMax set, it lowers
+// max_samples to kLoweredMax after its first call. With _minAfterSecondCall set, it sets max_samples to _defaultMax and
+// min_samples to _minAfterSecondCall after its second call.
+struct PartialConsumer : gr::Block<PartialConsumer> {
+    static constexpr std::size_t kConsumed   = 2UZ;
+    static constexpr std::size_t kLoweredMax = 2UZ;
+
+    gr::PortIn<int> in;
+
+    GR_MAKE_REFLECTABLE(PartialConsumer, in);
+
+    std::vector<std::size_t> _handed;
+    std::size_t              _defaultMax         = 0UZ;
+    std::size_t              _minAfterSecondCall = 0UZ;
+    bool                     _lowerMax           = false;
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& inSpan) {
+        _handed.push_back(inSpan.size());
+        std::ignore = inSpan.consume(std::min(inSpan.size(), kConsumed));
+        if (_lowerMax && _handed.size() == 1UZ) {
+            in.max_samples = kLoweredMax;
+        }
+        if (_handed.size() == 2UZ && _minAfterSecondCall > 0UZ) {
+            in.max_samples = _defaultMax;
+            in.min_samples = _minAfterSecondCall;
+        }
+        return gr::work::Status::OK;
+    }
+};
+
+// consumes one item per call and returns INSUFFICIENT_INPUT_ITEMS when it is handed none. It records how many items
+// it was handed and how many it consumed.
+struct AsyncPartialSink : gr::Block<AsyncPartialSink> {
+    gr::PortIn<int, gr::Async> in;
+
+    GR_MAKE_REFLECTABLE(AsyncPartialSink, in);
+
+    std::size_t _nHanded   = 0UZ;
+    std::size_t _nConsumed = 0UZ;
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& inSpan) {
+        _nHanded += inSpan.size();
+        const std::size_t n = std::min(inSpan.size(), 1UZ);
+        std::ignore         = inSpan.consume(n);
+        _nConsumed += n;
+        return n > 0UZ ? gr::work::Status::OK : gr::work::Status::INSUFFICIENT_INPUT_ITEMS;
+    }
+};
+
+// has a stride of 3 samples and no Resampling<>, so each call is handed all the input may give and the block's own
+// consume is the stride. It records how many samples it was handed. After its first call it lowers max_samples to
+// kLoweredMax, and after its second it sets max_samples to _defaultMax and min_samples to _minAfterSecondCall.
+struct StrideSink : gr::Block<StrideSink, gr::Stride<3U>> {
+    static constexpr std::size_t kLoweredMax = 2UZ;
+
+    gr::PortIn<int> in;
+
+    GR_MAKE_REFLECTABLE(StrideSink, in);
+
+    std::vector<std::size_t> _handed;
+    std::size_t              _defaultMax         = 0UZ;
+    std::size_t              _minAfterSecondCall = 0UZ;
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& inSpan) {
+        _handed.push_back(inSpan.size());
+        if (_handed.size() == 1UZ) {
+            in.max_samples = kLoweredMax;
+        }
+        if (_handed.size() == 2UZ) {
+            in.max_samples = _defaultMax;
+            in.min_samples = _minAfterSecondCall;
+        }
+        return gr::work::Status::OK;
+    }
+};
+
 // publishes its output ring and one sample more as fast as the ring takes them, then ends its stream
 struct RingPlusOneSource : gr::Block<RingPlusOneSource> {
     gr::PortOut<int> out;
@@ -729,7 +886,28 @@ constexpr std::string_view kDrainStallEndpoint = "drain stall";
     return reports;
 }
 
+constexpr std::string_view kDroppedTailEndpoint = "dropped tail";
+
+// takes every message waiting on the port and returns the dropped-tail notifications the named block sent
+[[nodiscard]] std::vector<gr::Message> takeDroppedTailReports(gr::MsgPortIn& port, std::string_view blockName) {
+    std::vector<gr::Message> reports;
+    auto                     messages = port.streamReader().get();
+    for (const gr::Message& message : messages) {
+        if (message.cmd == gr::message::Command::Notify && message.serviceName == blockName && message.endpoint == kDroppedTailEndpoint && message.data.has_value()) {
+            reports.push_back(message);
+        }
+    }
+    std::ignore = messages.consume(messages.size());
+    return reports;
+}
+
 [[nodiscard]] std::size_t reportedValue(const gr::Message& report, std::string_view key) { return report.data->at(std::pmr::string(key)).value_or<gr::Size_t>(0U); }
+
+// the text the report carries under the key, or an empty string
+[[nodiscard]] std::string reportedText(const gr::Message& report, std::string_view key) {
+    const auto entry = report.data->find(std::pmr::string(key));
+    return entry == report.data->end() ? std::string() : entry->second.value_or(std::string());
+}
 
 using SerialScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>;
 
@@ -765,6 +943,15 @@ template<typename TScheduler>
     }
     runner.join();
     return inTime;
+}
+
+// runs the graph on the scheduler and returns the dropped-tail notifications the named block sent to fromScheduler
+[[nodiscard]] std::vector<gr::Message> runAndTakeDroppedTailReports(SerialScheduler& scheduler, gr::MsgPortIn& fromScheduler, gr::Graph&& flow, std::string_view blockName) {
+    using namespace boost::ut;
+    expect(scheduler.msgOut.connect(fromScheduler).has_value());
+    expect(scheduler.exchange(std::move(flow)).has_value());
+    expect(runWithin(scheduler, std::chrono::duration_cast<std::chrono::milliseconds>(kRunBound))) << "the graph did not end";
+    return takeDroppedTailReports(fromScheduler, blockName);
 }
 
 // The relay holds its full input ring at the end of its stream. The decimator holds the relay's first sample, less than
@@ -1274,6 +1461,445 @@ const boost::ut::suite<"end-of-stream drain"> drainTests = [] {
         expect(eq(block._firstSpan, room)) << "the fuller output's span is not its room";
         expect(eq(block._secondSpan, room)) << "the emptier output's span is not the fuller one's room";
         expect(eq(secondDownstream.streamReader().available(), room));
+    };
+
+    "a block without an epilogue reports the tail its input's min_samples drops at the end of the stream"_test = [] {
+        constexpr std::size_t kItems  = 70UZ;
+        constexpr std::size_t kHeldTo = 16UZ;
+        for (const std::size_t minSamples : {kHeldTo, 1UZ}) {
+            gr::Graph flow;
+            auto&     source    = flow.emplaceBlock<qa_drain::CountedSource>();
+            auto&     copy      = flow.emplaceBlock<qa_drain::Passthrough>();
+            auto&     sink      = flow.emplaceBlock<qa_drain::CountingSink>();
+            source._nItems      = kItems;
+            source._maxPerCall  = kItems;
+            copy.in.min_samples = minSamples;
+            copy.in.max_samples = kHeldTo;
+            expect(flow.connect<"out", "in">(source, copy).has_value());
+            expect(flow.connect<"out", "in">(copy, sink).has_value());
+
+            qa_drain::SerialScheduler      scheduler;
+            gr::MsgPortIn                  fromScheduler;
+            const std::vector<gr::Message> reports  = qa_drain::runAndTakeDroppedTailReports(scheduler, fromScheduler, std::move(flow), copy.unique_name);
+            const std::size_t              nDropped = minSamples > 1UZ ? kItems % kHeldTo : 0UZ;
+            expect(eq(sink._nReceived, kItems - nDropped)) << std::format("min_samples {}: the sink does not receive the samples before the tail", minSamples);
+            expect(eq(reports.size(), nDropped > 0UZ ? 1UZ : 0UZ)) << std::format("min_samples {}: the dropped tail is not reported once", minSamples);
+            if (reports.size() == 1UZ) {
+                expect(eq(qa_drain::reportedValue(reports[0UZ], "samples_dropped"), nDropped));
+                expect(qa_drain::reportedText(reports[0UZ], "port") == copy.in.metaInfo.name.value) << "the report does not name the port";
+            }
+        }
+    };
+
+    "a decimator without an epilogue reports the partial chunk its input_chunk_size drops at the end of the stream"_test = [] {
+        constexpr std::size_t kChunks = 16UZ;
+        const std::size_t     nItems  = kChunks * qa_drain::kDecimation + qa_drain::kTail;
+        gr::Graph             flow;
+        auto&                 source    = flow.emplaceBlock<qa_drain::CountedSource>();
+        auto&                 decimator = flow.emplaceBlock<qa_drain::ChunkDecimator>();
+        auto&                 sink      = flow.emplaceBlock<qa_drain::CountingSink>();
+        source._nItems                  = nItems;
+        source._maxPerCall              = nItems;
+        decimator.in.min_samples        = 1UZ;
+        expect(flow.connect<"out", "in">(source, decimator).has_value());
+        expect(flow.connect<"out", "in">(decimator, sink).has_value());
+
+        qa_drain::SerialScheduler      scheduler;
+        gr::MsgPortIn                  fromScheduler;
+        const std::vector<gr::Message> reports = qa_drain::runAndTakeDroppedTailReports(scheduler, fromScheduler, std::move(flow), decimator.unique_name);
+        const std::size_t              chunk   = static_cast<std::size_t>(decimator.input_chunk_size);
+        expect(eq(sink._nReceived, nItems / chunk)) << "the sink does not receive one sample per whole chunk";
+        expect(fatal(eq(reports.size(), 1UZ))) << "the partial chunk is not reported once";
+        expect(eq(qa_drain::reportedValue(reports[0UZ], "samples_dropped"), nItems % chunk));
+        expect(qa_drain::reportedText(reports[0UZ], "port") == decimator.in.metaInfo.name.value) << "the report does not name the port";
+    };
+
+    "a block with two synchronous inputs reports the tail that the other input's larger min_samples drops"_test = [] {
+        constexpr std::size_t kItems     = 70UZ;
+        constexpr std::size_t kLargerMin = 16UZ;
+        gr::Graph             flow;
+        auto&                 firstSource  = flow.emplaceBlock<qa_drain::CountedSource>();
+        auto&                 secondSource = flow.emplaceBlock<qa_drain::CountedSource>();
+        auto&                 pair         = flow.emplaceBlock<qa_drain::SyncPairSink>();
+        for (qa_drain::CountedSource* source : {&firstSource, &secondSource}) {
+            source->_nItems     = kItems;
+            source->_maxPerCall = kItems;
+        }
+        pair.first.min_samples  = 1UZ;
+        pair.second.min_samples = kLargerMin;
+        pair.second.max_samples = kLargerMin; // each call takes kLargerMin samples from both inputs
+        expect(flow.connect<"out", "first">(firstSource, pair).has_value());
+        expect(flow.connect<"out", "second">(secondSource, pair).has_value());
+
+        qa_drain::SerialScheduler      scheduler;
+        gr::MsgPortIn                  fromScheduler;
+        const std::vector<gr::Message> reports  = qa_drain::runAndTakeDroppedTailReports(scheduler, fromScheduler, std::move(flow), pair.unique_name);
+        const std::size_t              nDropped = kItems % kLargerMin;
+        expect(eq(pair._nReceived, kItems - nDropped)) << "the block does not receive the samples before the tail";
+        expect(fatal(eq(reports.size(), 2UZ))) << "the tail of each input is not reported once";
+        expect(qa_drain::reportedText(reports[0UZ], "port") == pair.first.metaInfo.name.value) << "the first report does not name the first input";
+        expect(qa_drain::reportedText(reports[1UZ], "port") == pair.second.metaInfo.name.value) << "the second report does not name the second input";
+        for (const gr::Message& report : reports) {
+            expect(eq(qa_drain::reportedValue(report, "samples_dropped"), nDropped));
+        }
+    };
+
+    "a block whose output min_samples ends its stream reports the tail it was never handed"_test = [] {
+        constexpr std::size_t kItems  = 70UZ;
+        constexpr std::size_t kHeldTo = 16UZ;
+        gr::Graph             flow;
+        auto&                 source = flow.emplaceBlock<qa_drain::CountedSource>();
+        auto&                 copy   = flow.emplaceBlock<qa_drain::Passthrough>();
+        auto&                 sink   = flow.emplaceBlock<qa_drain::CountingSink>();
+        source._nItems               = kItems;
+        source._maxPerCall           = kItems;
+        copy.in.max_samples          = kHeldTo;
+        copy.out.min_samples         = kHeldTo;
+        expect(flow.connect<"out", "in">(source, copy).has_value());
+        expect(flow.connect<"out", "in">(copy, sink).has_value());
+
+        qa_drain::SerialScheduler      scheduler;
+        gr::MsgPortIn                  fromScheduler;
+        const std::vector<gr::Message> reports  = qa_drain::runAndTakeDroppedTailReports(scheduler, fromScheduler, std::move(flow), copy.unique_name);
+        const std::size_t              nDropped = kItems % kHeldTo;
+        expect(eq(sink._nReceived, kItems - nDropped)) << "the sink does not receive the whole output chunks";
+        expect(fatal(eq(reports.size(), 1UZ))) << "the tail is not reported once";
+        expect(eq(qa_drain::reportedValue(reports[0UZ], "samples_dropped"), nDropped));
+        expect(qa_drain::reportedText(reports[0UZ], "port") == copy.in.metaInfo.name.value) << "the report does not name the port";
+    };
+
+    "a block with two synchronous inputs of unequal length reports what each input holds at the end"_test = [] {
+        constexpr std::size_t kHeldTo = 16UZ;
+        for (const auto& [firstItems, secondItems] : {std::pair{70UZ, 60UZ}, std::pair{90UZ, 64UZ}}) {
+            gr::Graph flow;
+            auto&     firstSource    = flow.emplaceBlock<qa_drain::CountedSource>();
+            auto&     secondSource   = flow.emplaceBlock<qa_drain::CountedSource>();
+            auto&     pair           = flow.emplaceBlock<qa_drain::SyncPairSink>();
+            firstSource._nItems      = firstItems;
+            firstSource._maxPerCall  = firstItems;
+            secondSource._nItems     = secondItems;
+            secondSource._maxPerCall = secondItems;
+            pair.first.min_samples   = kHeldTo;
+            pair.second.min_samples  = kHeldTo;
+            pair.second.max_samples  = kHeldTo;
+            expect(flow.connect<"out", "first">(firstSource, pair).has_value());
+            expect(flow.connect<"out", "second">(secondSource, pair).has_value());
+
+            qa_drain::SerialScheduler      scheduler;
+            gr::MsgPortIn                  fromScheduler;
+            const std::vector<gr::Message> reports   = qa_drain::runAndTakeDroppedTailReports(scheduler, fromScheduler, std::move(flow), pair.unique_name);
+            const std::size_t              nReceived = std::min(firstItems, secondItems) / kHeldTo * kHeldTo;
+            expect(eq(pair._nReceived, nReceived)) << std::format("{} and {}: the block does not receive the whole chunks of the shorter input", firstItems, secondItems);
+            std::string expected; // "<port> <samples_dropped>; " for each input that holds samples, in port order
+            if (firstItems > nReceived) {
+                expected += std::format("{} {}; ", pair.first.metaInfo.name.value, firstItems - nReceived);
+            }
+            if (secondItems > nReceived) {
+                expected += std::format("{} {}; ", pair.second.metaInfo.name.value, secondItems - nReceived);
+            }
+            std::string reported;
+            for (const gr::Message& report : reports) {
+                reported += std::format("{} {}; ", qa_drain::reportedText(report, "port"), qa_drain::reportedValue(report, "samples_dropped"));
+            }
+            expect(eq(reported, expected)) << std::format("{} and {}: the reports are not one per input that holds samples, with what it holds", firstItems, secondItems);
+        }
+    };
+
+    "a block whose stream ends while another input has no end in view reports what that input holds"_test = [] {
+        constexpr std::size_t  kFirstItems  = 5UZ;
+        constexpr std::size_t  kSecondItems = 9UZ;
+        gr::PortOut<int>       firstUpstream;
+        gr::PortOut<int>       secondUpstream;
+        qa_drain::SyncPairSink block;
+        gr::MsgPortIn          fromBlock;
+        expect(fatal(firstUpstream.connect(block.first).has_value()));
+        expect(fatal(secondUpstream.connect(block.second).has_value()));
+        expect(block.msgOut.connect(fromBlock).has_value());
+        block.init(std::make_shared<gr::Sequence>());
+        qa_drain::publishSamples(firstUpstream, kFirstItems);
+        firstUpstream.publishEoSTag(gr::property_map{{gr::tag::END_OF_STREAM.key(), true}});
+        qa_drain::publishSamples(secondUpstream, kSecondItems);
+
+        gr::work::Result result;
+        for (std::size_t call = 0UZ; call < 4UZ && result.status != gr::work::Status::DONE; ++call) {
+            result = block.work();
+        }
+        expect(result.status == gr::work::Status::DONE) << "the end of the first input does not end the block";
+        expect(eq(block._nReceived, kFirstItems));
+        const std::vector<gr::Message> reports = qa_drain::takeDroppedTailReports(fromBlock, block.unique_name);
+        expect(fatal(eq(reports.size(), 1UZ))) << "the input without an end is not reported once";
+        expect(qa_drain::reportedText(reports[0UZ], "port") == block.second.metaInfo.name.value) << "the report does not name the input without an end";
+        expect(eq(qa_drain::reportedValue(reports[0UZ], "samples_dropped"), kSecondItems - kFirstItems));
+    };
+
+    "a block with overlapping chunks sends no report for the tail its last call was handed"_test = [] {
+        constexpr std::size_t kItems = 16UZ;
+        gr::Graph             flow;
+        auto&                 source    = flow.emplaceBlock<qa_drain::CountedSource>();
+        auto&                 decimator = flow.emplaceBlock<qa_drain::StridedDecimator>();
+        auto&                 sink      = flow.emplaceBlock<qa_drain::CountingSink>();
+        source._nItems                  = kItems;
+        source._maxPerCall              = kItems;
+        expect(flow.connect<"out", "in">(source, decimator).has_value());
+        expect(flow.connect<"out", "in">(decimator, sink).has_value());
+
+        qa_drain::SerialScheduler      scheduler;
+        gr::MsgPortIn                  fromScheduler;
+        const std::vector<gr::Message> reports = qa_drain::runAndTakeDroppedTailReports(scheduler, fromScheduler, std::move(flow), decimator.unique_name);
+        const std::size_t              chunk   = static_cast<std::size_t>(decimator.input_chunk_size);
+        expect(eq(decimator._highestHanded, static_cast<int>(kItems) - 1)) << "the last call was not handed the last sample";
+        expect(eq(sink._nReceived, kItems - chunk + 1UZ)) << "the sink does not receive one sample per chunk position";
+        expect(eq(reports.size(), 0UZ)) << "samples the last call was handed were reported as dropped";
+    };
+
+    "a block with a port collection names each input of the collection in its report"_test = [] {
+        constexpr std::size_t kItems  = 70UZ;
+        constexpr std::size_t kHeldTo = 16UZ;
+        gr::Graph             flow;
+        auto&                 firstSource  = flow.emplaceBlock<qa_drain::CountedSource>();
+        auto&                 secondSource = flow.emplaceBlock<qa_drain::CountedSource>();
+        auto&                 pair         = flow.emplaceBlock<qa_drain::CollectionPairSink>();
+        for (qa_drain::CountedSource* source : {&firstSource, &secondSource}) {
+            source->_nItems     = kItems;
+            source->_maxPerCall = kItems;
+        }
+        pair.in[1UZ].min_samples = kHeldTo;
+        pair.in[1UZ].max_samples = kHeldTo;
+        expect(fatal(flow.connect(firstSource, gr::PortDefinition("out"), pair, gr::PortDefinition("in#0")).has_value()));
+        expect(fatal(flow.connect(secondSource, gr::PortDefinition("out"), pair, gr::PortDefinition("in#1")).has_value()));
+
+        qa_drain::SerialScheduler      scheduler;
+        gr::MsgPortIn                  fromScheduler;
+        const std::vector<gr::Message> reports  = qa_drain::runAndTakeDroppedTailReports(scheduler, fromScheduler, std::move(flow), pair.unique_name);
+        const std::size_t              nDropped = kItems % kHeldTo;
+        expect(eq(pair._nReceived, kItems - nDropped)) << "the block does not receive the samples before the tail";
+        expect(fatal(eq(reports.size(), 2UZ))) << "the tail of each input is not reported once";
+        for (std::size_t index = 0UZ; index < reports.size(); ++index) {
+            expect(qa_drain::reportedText(reports[index], "port") == std::format("in#{}", index)) << std::format("report {} does not name the input as connect() takes it", index);
+            expect(eq(qa_drain::reportedValue(reports[index], "samples_dropped"), nDropped));
+        }
+    };
+
+    "an asynchronous input that ends with fewer items than its min_samples reports them"_test = [] {
+        constexpr std::size_t kItems = 1UZ;
+        for (const std::size_t minSamples : {kItems + 1UZ, kItems}) {
+            gr::PortOut<int>            upstream;
+            qa_drain::AsyncCountingSink block;
+            gr::MsgPortIn               fromBlock;
+            expect(fatal(upstream.connect(block.in).has_value()));
+            expect(block.msgOut.connect(fromBlock).has_value());
+            block.in.min_samples = minSamples;
+            block.init(std::make_shared<gr::Sequence>());
+            qa_drain::publishSamples(upstream, kItems);
+            upstream.publishEoSTag(gr::property_map{{gr::tag::END_OF_STREAM.key(), true}});
+
+            gr::work::Result result;
+            for (std::size_t call = 0UZ; call < 4UZ && result.status != gr::work::Status::DONE; ++call) {
+                result = block.work();
+            }
+            expect(result.status == gr::work::Status::DONE) << std::format("min_samples {}: the end of the input does not end the block", minSamples);
+            const std::size_t nDropped = kItems < minSamples ? kItems : 0UZ;
+            expect(eq(block._nReceived, kItems - nDropped)) << std::format("min_samples {}: the block does not receive the items it can be handed", minSamples);
+            const std::vector<gr::Message> reports = qa_drain::takeDroppedTailReports(fromBlock, block.unique_name);
+            expect(eq(reports.size(), nDropped > 0UZ ? 1UZ : 0UZ)) << std::format("min_samples {}: the items left are not reported once", minSamples);
+            if (reports.size() == 1UZ) {
+                expect(eq(qa_drain::reportedValue(reports[0UZ], "samples_dropped"), nDropped));
+                expect(qa_drain::reportedText(reports[0UZ], "port") == block.in.metaInfo.name.value) << "the report does not name the port";
+            }
+        }
+    };
+
+    "a block handed fewer samples than an earlier call was reports only the samples no call was handed"_test = [] {
+        constexpr std::size_t kItems = 10UZ;
+        for (const std::size_t nLate : {0UZ, 4UZ}) {
+            gr::PortOut<int>          upstream;
+            qa_drain::PartialConsumer block;
+            gr::MsgPortIn             fromBlock;
+            expect(fatal(upstream.connect(block.in).has_value()));
+            expect(block.msgOut.connect(fromBlock).has_value());
+            block._defaultMax = block.in.max_samples;
+            block._lowerMax   = true;
+            // after two calls the input holds kItems + nLate less two consumed chunks, which the raised minimum exceeds
+            const std::size_t nHeldAfterSecond = kItems + nLate - 2UZ * qa_drain::PartialConsumer::kConsumed;
+            block._minAfterSecondCall          = nHeldAfterSecond + 2UZ;
+            block.init(std::make_shared<gr::Sequence>());
+            qa_drain::publishSamples(upstream, kItems);
+
+            gr::work::Result result = block.work();
+            qa_drain::publishSamples(upstream, nLate);
+            upstream.publishEoSTag(gr::property_map{{gr::tag::END_OF_STREAM.key(), true}});
+            for (std::size_t call = 1UZ; call < 4UZ && result.status != gr::work::Status::DONE; ++call) {
+                result = block.work();
+            }
+            expect(result.status == gr::work::Status::DONE) << std::format("{} late samples: the end of the input does not end the block", nLate);
+            expect(fatal(eq(block._handed.size(), 2UZ))) << std::format("{} late samples: the block is not handed two spans", nLate);
+            expect(eq(block._handed[0UZ], kItems));
+            expect(eq(block._handed[1UZ], qa_drain::PartialConsumer::kLoweredMax)) << "the second call is not handed the lowered maximum";
+
+            // the first call was handed kItems samples and the two calls consumed two chunks: the samples handed past
+            // the read position are all but the ones the late publication added
+            const std::vector<gr::Message> reports = qa_drain::takeDroppedTailReports(fromBlock, block.unique_name);
+            expect(eq(reports.size(), nLate > 0UZ ? 1UZ : 0UZ)) << std::format("{} late samples: only the samples no call was handed are reported", nLate);
+            if (reports.size() == 1UZ) {
+                expect(eq(qa_drain::reportedValue(reports[0UZ], "samples_dropped"), nLate));
+            }
+        }
+    };
+
+    "a block whose stride skips past samples it was handed reports only the samples no call was handed"_test = [] {
+        constexpr std::size_t kItems = 10UZ;
+        for (const std::size_t nLate : {0UZ, 4UZ}) {
+            gr::PortOut<int>     upstream;
+            qa_drain::StrideSink block;
+            gr::MsgPortIn        fromBlock;
+            expect(fatal(upstream.connect(block.in).has_value()));
+            expect(block.msgOut.connect(fromBlock).has_value());
+            block._defaultMax = block.in.max_samples;
+            // no call after the second is handed a span: the raised minimum exceeds everything the input can hold
+            block._minAfterSecondCall = kItems + nLate + 1UZ;
+            block.init(std::make_shared<gr::Sequence>());
+            qa_drain::publishSamples(upstream, kItems);
+
+            gr::work::Result result = block.work();
+            qa_drain::publishSamples(upstream, nLate);
+            upstream.publishEoSTag(gr::property_map{{gr::tag::END_OF_STREAM.key(), true}});
+            for (std::size_t call = 1UZ; call < 4UZ && result.status != gr::work::Status::DONE; ++call) {
+                result = block.work();
+            }
+            expect(result.status == gr::work::Status::DONE) << std::format("{} late samples: the end of the input does not end the block", nLate);
+            expect(fatal(eq(block._handed.size(), 2UZ))) << std::format("{} late samples: the block is not handed two spans", nLate);
+            expect(eq(block._handed[0UZ], kItems));
+            expect(eq(block._handed[1UZ], qa_drain::StrideSink::kLoweredMax)) << "the second call is not handed the lowered maximum";
+
+            // the calls were handed the first kItems samples, whatever the stride skipped over: the late ones are the samples no call was handed
+            const std::vector<gr::Message> reports = qa_drain::takeDroppedTailReports(fromBlock, block.unique_name);
+            expect(eq(reports.size(), nLate > 0UZ ? 1UZ : 0UZ)) << std::format("{} late samples: only the samples no call was handed are reported", nLate);
+            if (reports.size() == 1UZ) {
+                expect(eq(qa_drain::reportedValue(reports[0UZ], "samples_dropped"), nLate)) << "the samples the stride skipped over are reported";
+            }
+        }
+    };
+
+    "an asynchronous input that consumes one of two items is reported nothing for the other at its end"_test = [] {
+        constexpr std::size_t      kItems = 2UZ;
+        gr::PortOut<int>           upstream;
+        qa_drain::AsyncPartialSink block;
+        gr::MsgPortIn              fromBlock;
+        expect(fatal(upstream.connect(block.in).has_value()));
+        expect(block.msgOut.connect(fromBlock).has_value());
+        block.in.min_samples = kItems;
+        block.init(std::make_shared<gr::Sequence>());
+        qa_drain::publishSamples(upstream, kItems);
+        upstream.publishEoSTag(gr::property_map{{gr::tag::END_OF_STREAM.key(), true}});
+
+        gr::work::Result result;
+        for (std::size_t call = 0UZ; call < 4UZ && result.status != gr::work::Status::DONE; ++call) {
+            result = block.work();
+        }
+        expect(result.status == gr::work::Status::DONE) << "the end of the input does not end the block";
+        expect(eq(block._nHanded, kItems)) << "the block is not handed both items";
+        expect(eq(block._nConsumed, 1UZ));
+        expect(eq(qa_drain::takeDroppedTailReports(fromBlock, block.unique_name).size(), 0UZ)) << "the item the call was handed and left is reported";
+    };
+
+    "a block restarted after a stop counts the samples handed past its read position from zero"_test = [] {
+        constexpr std::size_t     kItems     = 10UZ;
+        constexpr std::size_t     kMoreItems = 3UZ;
+        gr::PortOut<int>          upstream;
+        qa_drain::PartialConsumer block;
+        gr::MsgPortIn             fromBlock;
+        expect(fatal(upstream.connect(block.in).has_value()));
+        expect(block.msgOut.connect(fromBlock).has_value());
+        block.init(std::make_shared<gr::Sequence>());
+        expect(block.changeStateTo(RUNNING).has_value());
+        qa_drain::publishSamples(upstream, kItems);
+
+        // the first run's call is handed kItems samples and consumes kConsumed, which leaves the rest past the read position
+        expect(block.work().status != gr::work::Status::DONE);
+        expect(fatal(eq(block._handed.size(), 1UZ)));
+        expect(eq(block._handed[0UZ], kItems));
+        block.requestStop();
+        expect(block.work().status == gr::work::Status::DONE);
+        expect(block.state() == STOPPED);
+        expect(eq(qa_drain::takeDroppedTailReports(fromBlock, block.unique_name).size(), 0UZ)) << "a stop request is reported";
+
+        // a stopped block lets go of its input: the second run is fed through a new connection and needs one sample
+        // more than the kMoreItems it is fed
+        expect(block.changeStateTo(INITIALISED).has_value());
+        expect(block.changeStateTo(RUNNING).has_value());
+        expect(fatal(upstream.connect(block.in).has_value()));
+        block.in.min_samples = kMoreItems + 1UZ;
+        qa_drain::publishSamples(upstream, kMoreItems);
+        upstream.publishEoSTag(gr::property_map{{gr::tag::END_OF_STREAM.key(), true}});
+        gr::work::Result result;
+        for (std::size_t call = 0UZ; call < 4UZ && result.status != gr::work::Status::DONE; ++call) {
+            result = block.work();
+        }
+        expect(result.status == gr::work::Status::DONE) << "the end of the input does not end the restarted block";
+        expect(eq(block._handed.size(), 1UZ)) << "the restarted block is handed a span before its end";
+        const std::vector<gr::Message> reports = qa_drain::takeDroppedTailReports(fromBlock, block.unique_name);
+        expect(fatal(eq(reports.size(), 1UZ))) << "the restarted block does not report what its input holds";
+        expect(eq(qa_drain::reportedValue(reports[0UZ], "samples_dropped"), kMoreItems)) << "the restarted block subtracts samples its first run was handed";
+    };
+
+    "a block with an epilogue is handed its partial chunk and sends no dropped-tail report"_test = [] {
+        constexpr std::size_t kChunks = 16UZ;
+        const std::size_t     nItems  = kChunks * qa_drain::kDecimation + qa_drain::kTail;
+        gr::Graph             flow;
+        auto&                 source    = flow.emplaceBlock<qa_drain::CountedSource>();
+        auto&                 decimator = flow.emplaceBlock<qa_drain::TailDecimator>();
+        auto&                 sink      = flow.emplaceBlock<qa_drain::CountingSink>();
+        source._nItems                  = nItems;
+        source._maxPerCall              = nItems;
+        expect(flow.connect<"out", "in">(source, decimator).has_value());
+        expect(flow.connect<"out", "in">(decimator, sink).has_value());
+
+        qa_drain::SerialScheduler      scheduler;
+        gr::MsgPortIn                  fromScheduler;
+        const std::vector<gr::Message> reports = qa_drain::runAndTakeDroppedTailReports(scheduler, fromScheduler, std::move(flow), decimator.unique_name);
+        expect(eq(sink._nReceived, kChunks + 1UZ)) << "the epilogue did not write one sample for the partial chunk";
+        expect(eq(reports.size(), 0UZ)) << "a block with an epilogue reported a dropped tail";
+    };
+
+    "a decimator whose stream ends on a whole chunk sends no dropped-tail report"_test = [] {
+        constexpr std::size_t kChunks = 16UZ;
+        const std::size_t     nItems  = kChunks * qa_drain::kDecimation;
+        gr::Graph             flow;
+        auto&                 source    = flow.emplaceBlock<qa_drain::CountedSource>();
+        auto&                 decimator = flow.emplaceBlock<qa_drain::ChunkDecimator>();
+        auto&                 sink      = flow.emplaceBlock<qa_drain::CountingSink>();
+        source._nItems                  = nItems;
+        source._maxPerCall              = nItems;
+        expect(flow.connect<"out", "in">(source, decimator).has_value());
+        expect(flow.connect<"out", "in">(decimator, sink).has_value());
+
+        qa_drain::SerialScheduler      scheduler;
+        gr::MsgPortIn                  fromScheduler;
+        const std::vector<gr::Message> reports = qa_drain::runAndTakeDroppedTailReports(scheduler, fromScheduler, std::move(flow), decimator.unique_name);
+        expect(eq(sink._nReceived, kChunks)) << "the sink does not receive one sample per chunk";
+        expect(eq(reports.size(), 0UZ)) << "a stream of whole chunks reported a dropped tail";
+    };
+
+    "a decimator stopped with a partial chunk at the end of its stream sends no dropped-tail report"_test = [] {
+        for (const bool stopNow : {false, true}) {
+            gr::PortOut<int>         upstream;
+            qa_drain::ChunkDecimator block;
+            gr::PortIn<int>          downstream;
+            gr::MsgPortIn            fromBlock;
+            expect(fatal(upstream.connect(block.in).has_value()));
+            expect(fatal(block.out.connect(downstream).has_value()));
+            expect(block.msgOut.connect(fromBlock).has_value());
+            block.init(std::make_shared<gr::Sequence>());
+            qa_drain::publishSamples(upstream, qa_drain::kTail);
+            upstream.publishEoSTag(gr::property_map{{gr::tag::END_OF_STREAM.key(), true}});
+
+            std::ignore                   = block.settings().setStaged({{"stop_now", stopNow}});
+            const gr::work::Result result = block.work();
+
+            expect(result.status == gr::work::Status::DONE);
+            expect(block.state() == STOPPED);
+            expect(eq(qa_drain::takeDroppedTailReports(fromBlock, block.unique_name).size(), stopNow ? 0UZ : 1UZ)) << std::format("stop_now {}: the tail is reported without a stop request and not with one", stopNow);
+        }
     };
 
     "a graph ending on an error does not drain"_test = [] {

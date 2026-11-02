@@ -671,7 +671,14 @@ struct MyAccumulator : gr::Block<MyAccumulator, gr::Resampling<1024, 1024, true>
 - **Short span**: the epilogue writes at most `output.size()` samples. A block whose output cannot be split writes
   nothing into a short span.
 - **Call sequence**: called once, immediately before transitioning to `REQUESTED_STOP`.
-- **Without `processEpilogue()`**: trailing samples are silently dropped (existing behaviour).
+- **Without `processEpilogue()`**: trailing samples are dropped. At the end of a stream, the block sends one plain
+  message on its message output for each connected input, synchronous or asynchronous, that holds samples no call
+  was handed: endpoint `dropped tail`, with `port` and `samples_dropped`. The count is the samples in front of the
+  input's end-of-stream tag, or all the input holds when it has none, less those a `processBulk()` call was handed
+  past the input's read position and nothing has consumed since. An input without an end-of-stream tag reports what
+  it holds when the block stops. An input of a port collection is named `<name>#<index>`, the form
+  `connect()` takes. The block sends no message when it is stopping. A block that processes the tail defines
+  `processEpilogue()`.
 
 ### Standard tag keys
 

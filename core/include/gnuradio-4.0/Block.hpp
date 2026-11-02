@@ -913,6 +913,8 @@ public:
     std::size_t    _nEpilogueWaits = 0UZ;   // epilogue calls in a row that waited for room with nothing moved
     bool           _waitedOnOutput = false; // the last call returned INSUFFICIENT_OUTPUT_ITEMS
 
+    std::vector<std::size_t> _nHandedPastRead; // per connected input, in port order: samples past the read position that processBulk() calls were handed and nothing has consumed or skipped since
+
     /// the read positions and the tag counts of the last staging of first-sample tags. A call at the same read positions
     /// stages only the tags that arrived since. The sum identifies the positions, as synchronous inputs move together.
     std::size_t              _stagedPositionSum = std::numeric_limits<std::size_t>::max();
@@ -1740,6 +1742,19 @@ private:
                 skipIn);
         }
         consumeReaders(nSkip, skipIn);
+        std::size_t input = 0UZ; // the skip moves the read position past the samples it passes over, and each input's handed count drops by as many
+        for_each_port_and_reader_span(
+            [this, &input]<PortLike TPort, ReaderSpanLike TReaderSpan>(TPort& port, TReaderSpan& span) {
+                if (!port.isConnected()) {
+                    return;
+                }
+                if (input < _nHandedPastRead.size()) {
+                    const std::size_t nPassed = span.isConsumeRequested() ? span.nRequestedSamplesToConsume() : 0UZ;
+                    _nHandedPastRead[input]   = _nHandedPastRead[input] > nPassed ? _nHandedPastRead[input] - nPassed : 0UZ;
+                }
+                ++input;
+            },
+            inputPorts<PortType::STREAM>(&self()), skipIn);
     }
 
 public:
@@ -1821,8 +1836,8 @@ public:
         for_each_writer_span([&tagData](auto& outSpan) { outSpan.publishEoSTag(tagData, static_cast<std::size_t>(outSpan.nRequestedSamplesToPublish())); }, outputSpanTuple);
     }
 
-    // the state machine's transition. A block that starts counts no drain stall of an earlier run, and a block that
-    // resumes keeps its count
+    // the state machine's transition. A block that starts counts no drain stall and no handed samples of an earlier
+    // run, and a block that resumes keeps its counts
     [[nodiscard]] std::expected<void, Error> changeStateTo(lifecycle::State newState, const std::source_location location = std::source_location::current()) {
         if (newState == lifecycle::State::RUNNING && this->state() == lifecycle::State::INITIALISED) {
             _nDrainStalls     = 0UZ;
@@ -1830,6 +1845,7 @@ public:
             _drainStallHeld   = false;
             _nEpilogueWaits   = 0UZ;
             _epilogueWaitMark = DrainWatermark{};
+            _nHandedPastRead.clear();
         }
         return lifecycle::StateMachine<Derived>::changeStateTo(newState, location);
     }
@@ -2526,6 +2542,62 @@ public:
         emitMessage("drain stall", property_map{{"min_samples", static_cast<gr::Size_t>(minSamples)}, {"samples_left", static_cast<gr::Size_t>(nLeft)}});
     }
 
+    /// keeps, for each connected input, how many samples past its new read position a call was handed: the larger of
+    /// this call's extent and the earlier one, each less what this call consumed
+    template<typename TInputSpans>
+    void keepHandedPastRead(TInputSpans& inputSpans) {
+        std::size_t input = 0UZ;
+        for_each_port_and_reader_span(
+            [this, &input]<PortLike TPort, ReaderSpanLike TReaderSpan>(TPort& port, TReaderSpan& span) {
+                if (!port.isConnected()) {
+                    return;
+                }
+                if (input == _nHandedPastRead.size()) {
+                    _nHandedPastRead.push_back(0UZ);
+                }
+                const std::size_t nHanded      = span.size();
+                const std::size_t nConsumed    = span.isConsumeRequested() ? span.nRequestedSamplesToConsume() : 0UZ;
+                const std::size_t nPastRead    = nHanded > nConsumed ? nHanded - nConsumed : 0UZ;
+                const std::size_t nEarlierLeft = _nHandedPastRead[input] > nConsumed ? _nHandedPastRead[input] - nConsumed : 0UZ;
+                _nHandedPastRead[input]        = std::max(nPastRead, nEarlierLeft);
+                ++input;
+            },
+            inputPorts<PortType::STREAM>(&self()), inputSpans);
+    }
+
+    /// reports, at the end of the block's stream, each connected input that holds samples no processBulk() call was
+    /// handed: those in front of its end-of-stream tag or, on an input without one, all it holds when the block stops,
+    /// less those a call was handed past its read position and nothing has consumed or skipped since. The message names the
+    /// input, <name>#<index> for an input of a port collection, and the samples it drops.
+    void notifyDroppedTail() {
+        std::size_t input       = 0UZ;
+        const auto  reportInput = [this, &input](PortLike auto& port, std::string portName) {
+            if (!port.isConnected()) {
+                return;
+            }
+            const std::size_t nHeld   = samples_to_eos_tag(port).value_or(port.streamReader().available());
+            const std::size_t nHanded = input < _nHandedPastRead.size() ? _nHandedPastRead[input] : 0UZ;
+            ++input;
+            if (nHeld > nHanded) {
+                emitMessage("dropped tail", property_map{{"port", std::move(portName)}, {"samples_dropped", static_cast<gr::Size_t>(nHeld - nHanded)}});
+            }
+        };
+        gr::meta::tuple_for_each(
+            [&reportInput](auto&& portOrCollection) {
+                using ArgType = std::decay_t<decltype(portOrCollection)>;
+                if constexpr (traits::port::is_port_collection_v<ArgType>) {
+                    std::size_t index = 0UZ;
+                    for (auto& port : portOrCollection) {
+                        reportInput(port, std::format("{}#{}", port.metaInfo.name.value, index));
+                        ++index;
+                    }
+                } else {
+                    reportInput(portOrCollection, std::string(portOrCollection.metaInfo.name.value));
+                }
+            },
+            inputPorts<PortType::STREAM>(&self()));
+    }
+
     /// apply input tags and settings from all sync ports
     template<typename TInputSpans>
     void applyInputTagsAndSettings(TInputSpans& inputSpans, std::size_t processedIn, bool hasAnyTag, bool firstSampleSettingsApplied) {
@@ -2848,6 +2920,8 @@ public:
                 consumeReaders(trailing, epilogueIn);
                 // the tags at the new read position were not staged before the call
                 readPositionSettingsApplied = readPositionSettingsApplied && trailing == 0UZ;
+            } else if ((limits.isEosPresent || limits.asyncEoS) && !lifecycle::isShuttingDown(this->state())) {
+                notifyDroppedTail();
             }
             if ((limits.isEosPresent || drainStalled) && !lifecycle::isShuttingDown(this->state())) {
                 forwardTagsAtEndOfStream(readPositionSettingsApplied);
@@ -2931,6 +3005,9 @@ public:
         reportZeroProgressSpin(userReturnStatus, accountedIn, accountedOut);
         work::sanitiseProcessStatus(userReturnStatus, processedIn, processedOut);
         finaliseIO(inputSpans, outputSpans, userReturnStatus, processedIn, processedOut, limits.resampledIn);
+        if constexpr (HasProcessBulkFunction<Derived>) {
+            keepHandedPastRead(inputSpans);
+        }
 
         constexpr bool kIsSourceBlock = TInputTypes::size.value == 0;
         std::size_t    performedWork  = work::computePerformedWork(userReturnStatus, accountedIn, accountedOut, kIsSourceBlock);
