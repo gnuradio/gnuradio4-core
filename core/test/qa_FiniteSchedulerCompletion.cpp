@@ -13,16 +13,18 @@ struct Source : gr::Block<Source> {
     gr::PortIn<int, gr::Optional> clock;
     gr::PortOut<int>              out, second;
     GR_MAKE_REFLECTABLE(Source, clock, out, second);
-    std::size_t           limit = 20, produced = 0;
-    std::atomic<bool>     entered     = false;
-    bool                  failOnStart = false;
-    std::function<void()> onStop;
-    void                  stop() {
+    std::size_t              limit = 20, produced = 0;
+    std::atomic<bool>        entered     = false;
+    std::atomic<std::size_t> starts      = 0;
+    bool                     failOnStart = false;
+    std::function<void()>    onStop;
+    void                     stop() {
         if (onStop) {
             onStop();
         }
     }
     void start() {
+        ++starts;
         if (failOnStart) {
             throw gr::exception("source refused to start");
         }
@@ -82,6 +84,22 @@ struct DrainEditScheduler : gr::scheduler::Simple<Policy> {
         gr::Message       request;
         request.data = edge;
         return this->removeEdgeByMessage(request);
+    }
+};
+
+template<gr::scheduler::ExecutionPolicy Policy>
+struct EntryGateScheduler : gr::scheduler::Simple<Policy> {
+    using Base = gr::scheduler::Simple<Policy>;
+
+    std::atomic<bool> entryHeld    = false;
+    std::atomic<bool> releaseEntry = false;
+
+    explicit EntryGateScheduler(const gr::property_map& settings = {}) : Base(settings) { this->propertyCallbacks["holdAsyncEntry"] = static_cast<gr::BlockBase::PropertyCallback>(&EntryGateScheduler::holdAsyncEntry); }
+
+    std::optional<gr::Message> holdAsyncEntry(std::string_view, gr::Message) {
+        entryHeld = true;
+        releaseEntry.wait(false);
+        return std::nullopt;
     }
 };
 
@@ -363,19 +381,42 @@ void qualify() {
         }
     };
     "immediate stop cannot resurrect an async start"_test = [] {
-        for (int i = 0; i < 20; ++i) {
-            gr::Graph graph;
-            auto&     src = graph.emplaceBlock<Source>();
-            auto&     a   = graph.emplaceBlock<Sink>();
-            auto&     b   = graph.emplaceBlock<Sink>();
-            expect(graph.connect<"out", "in">(src, a).has_value());
-            expect(graph.connect<"second", "in">(src, b).has_value());
-            gr::SchedulerWrapper<gr::scheduler::Simple<Policy>> scheduler;
-            scheduler.setGraph(std::move(graph));
-            expect(scheduler.start().has_value());
-            scheduler.stop();
-            expect(scheduler.state() == gr::lifecycle::State::STOPPED);
+        gr::MsgPortOut requests;
+        gr::Graph      graph;
+        auto&          source = graph.emplaceBlock<Source>();
+        source.limit          = std::numeric_limits<std::size_t>::max();
+        auto& first           = graph.emplaceBlock<Sink>();
+        auto& second          = graph.emplaceBlock<Sink>();
+        expect(graph.connect<"out", "in">(source, first).has_value());
+        expect(graph.connect<"second", "in">(source, second).has_value());
+        gr::SchedulerWrapper<EntryGateScheduler<Policy>> scheduler;
+        scheduler.setGraph(std::move(graph));
+        auto& implementation = scheduler.blockRef();
+        expect(requests.connect(*scheduler.asBlockModel()->msgIn).has_value());
+        expect(implementation.changeStateTo(gr::lifecycle::State::INITIALISED).has_value());
+        // init() has already serviced its initial messages. The asynchronous
+        // entry now takes this message before attempting its RUNNING transition.
+        gr::sendMessage<gr::message::Command::Set>(requests, implementation.unique_name, "holdAsyncEntry", gr::property_map{});
+        expect(scheduler.start().has_value());
+        expect(wait([&] { return implementation.entryHeld.load(); }));
+        auto stopped = std::async(std::launch::async, [&] { scheduler.stop(); });
+        expect(wait([&] { return scheduler.state() == gr::lifecycle::State::STOPPED; }));
+        implementation.releaseEntry = true;
+        implementation.releaseEntry.notify_all();
+        const bool joined = stopped.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+        expect(joined) << "the accepted asynchronous start restarted after Stop";
+        if (!joined) {
+            // An unbounded resurrected run cannot complete on its own. Retire
+            // it without competing with the controller's join of the thread.
+            std::ignore = implementation.changeStateTo(gr::lifecycle::State::REQUESTED_STOP);
         }
+        stopped.get();
+        expect(scheduler.state() == gr::lifecycle::State::STOPPED);
+        expect(eq(source.starts.load(), 0UZ));
+        expect(!source.entered.load());
+        expect(eq(source.produced, 0UZ));
+        expect(eq(first.consumed, 0UZ));
+        expect(eq(second.consumed, 0UZ));
     };
 }
 int main() {
