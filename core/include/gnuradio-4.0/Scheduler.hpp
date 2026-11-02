@@ -1060,7 +1060,7 @@ public:
             // RUNNING is published before start() starts the children. Retry
             // after short waits until the worker dispatch makes them ready.
             if (workerStarted()) {
-                cancelDrainSources();
+                std::ignore = cancelDrainSources();
             }
             if (!runInProgress()) {
                 drained = true;
@@ -1202,15 +1202,26 @@ protected:
         return true;
     }
 
-    void cancelDrainSources() {
+    bool cancelDrainSources() {
+        // Work quiescence does not exclude message-driven graph edits. Try the
+        // message pass first, as graph edits do, and retry a busy pass on the next
+        // drain iteration. Never wait on a child's pass while holding its parent's.
+        if (!tryHoldMessagePass()) {
+            return false;
+        }
+        on_scope_exit releasePass = [this] { releaseMessagePass(); };
         requestWorkQuiescence();
-        std::vector<std::shared_ptr<SchedulerModel>> quiesced;
-        on_scope_exit                                release = [this, &quiesced] {
-            for (auto it = quiesced.rbegin(); it != quiesced.rend(); ++it) {
-                (*it)->releaseWorkQuiescence();
-            }
-            releaseWorkQuiescence();
-        };
+        on_scope_exit release = [this] { releaseWorkQuiescence(); };
+        // Quiesce before taking the lifecycle lock: a block's work() may itself
+        // request Stop. A start/stop sweep already holding the lock gets to finish.
+        std::unique_lock childLock(_childLifecycleMutex, std::try_to_lock);
+        if (!childLock.owns_lock()) {
+            return false;
+        }
+        if (!lifecycle::isActive(this->state())) {
+            return true;
+        }
+        bool       cancelled          = true;
         const auto connectedStream    = [](const DynamicPort& port) { return port.isConnected() && port::decodePortType(port.portMaskInfo()) == PortType::STREAM; };
         const auto hasConnectedStream = [&connectedStream](auto& ports) {
             return std::ranges::any_of(ports, [&connectedStream](auto& entry) {
@@ -1228,8 +1239,10 @@ protected:
         auto cancel = [&](auto&& self, auto& group) -> void {
             for (auto& block : group.blocks()) {
                 if (auto* scheduler = dynamic_cast<SchedulerModel*>(block.get())) {
-                    quiesced.emplace_back(block, scheduler);
-                    scheduler->requestWorkQuiescence();
+                    // Its worker also dispatches edits independently of ours.
+                    // Let it guard both its graph and any deeper schedulers.
+                    cancelled = scheduler->cancelDrainSources() && cancelled;
+                    continue;
                 }
                 if (!block->blocks().empty()) {
                     self(self, *block);
@@ -1260,6 +1273,7 @@ protected:
             }
         };
         cancel(cancel, *_graph);
+        return cancelled;
     }
 
     // the first block whose work() returned ERROR, or whose error a worker drained with no msgOut reader, since the
