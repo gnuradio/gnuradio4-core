@@ -110,6 +110,7 @@ jobs:
               -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
               ${{ steps.enable_sccache.outputs.CXX_LAUNCHER }} \
               ${{ steps.enable_sccache.outputs.C_LAUNCHER }} \
+              -DUSE_CCACHE=OFF \
               -DENABLE_COVERAGE=OFF \
               -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
               -DCMAKE_C_COMPILER=${{ matrix.cc }} \
@@ -127,6 +128,7 @@ jobs:
             -DDISABLE_EXTERNAL_DEPS_WARNINGS=ON \
             ${{ steps.enable_sccache.outputs.CXX_LAUNCHER }} \
             ${{ steps.enable_sccache.outputs.C_LAUNCHER }} \
+            -DUSE_CCACHE=OFF \
             -DCMAKE_BUILD_TYPE=${{ matrix.cmake-build-type }} \
             ${{ matrix.cmake_flags }}
 
@@ -273,6 +275,7 @@ jobs:
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
             ${{ steps.enable_sccache.outputs.CXX_LAUNCHER }} \
             ${{ steps.enable_sccache.outputs.C_LAUNCHER }} \
+            -DUSE_CCACHE=OFF \
             -DENABLE_COVERAGE=ON \
             -DADDRESS_SANITIZER=OFF
 
