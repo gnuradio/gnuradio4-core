@@ -77,9 +77,15 @@ struct SimdOps {
     static constexpr T    kTwoPowM      = static_cast<T>(UInt{1} << kMantissaBits); // 2^52, 2^23
     // clear_low leaves 21 significant bits of a double, 12 of a float
     static constexpr UInt kHighMask = ~((UInt{1} << (std::same_as<T, double> ? 32 : 12)) - 1);
+#if defined(__FP_FAST_FMAF)
+    // The target has a fused multiply-add: fmadd and fnmadd round once in float lanes, and the kernel
+    // takes its shorter fused forms. Double lanes keep the unfused forms, as fast or faster there.
+    static constexpr bool fused = std::same_as<T, float>;
+#else
     // fmadd's a * b + c may or may not be contracted, so the kernel takes its forms that are exact
     // unfused
     static constexpr bool fused = false;
+#endif
 
     SIMD_ELEMENTARY_INLINE static V    set(double x) noexcept { return V(static_cast<T>(x)); }
     SIMD_ELEMENTARY_INLINE static V    add(V a, V b) noexcept { return a + b; }
@@ -89,8 +95,8 @@ struct SimdOps {
     SIMD_ELEMENTARY_INLINE static V    min(V a, V b) noexcept { return stdx::min(a, b); }
     SIMD_ELEMENTARY_INLINE static V    max(V a, V b) noexcept { return stdx::max(a, b); }
     SIMD_ELEMENTARY_INLINE static V    sqrt(V a) noexcept { return stdx::sqrt(a); }
-    SIMD_ELEMENTARY_INLINE static V    fmadd(V a, V b, V c) noexcept { return a * b + c; }
-    SIMD_ELEMENTARY_INLINE static V    fnmadd(V a, V b, V c) noexcept { return c - a * b; }
+    SIMD_ELEMENTARY_INLINE static V    fmadd(V a, V b, V c) noexcept { return fused ? fmaLanes(a, b, c) : a * b + c; }
+    SIMD_ELEMENTARY_INLINE static V    fnmadd(V a, V b, V c) noexcept { return fused ? fmaLanes(-a, b, c) : c - a * b; }
     SIMD_ELEMENTARY_INLINE static M    lt(V a, V b) noexcept { return a < b; }
     SIMD_ELEMENTARY_INLINE static M    le(V a, V b) noexcept { return a <= b; }
     SIMD_ELEMENTARY_INLINE static M    eq(V a, V b) noexcept { return a == b; }
@@ -110,6 +116,15 @@ struct SimdOps {
     SIMD_ELEMENTARY_INLINE static V select(M m, V a, V b) noexcept {
         where(m, b) = a;
         return b;
+    }
+
+    // a b + c rounded once in each lane: GCC inlines std::fma and may call stdx::fma out of line
+    SIMD_ELEMENTARY_INLINE static V fmaLanes(V a, V b, V c) noexcept {
+        V r;
+        for (std::size_t i = 0UZ; i < V::size(); ++i) {
+            r[i] = std::fma(a[i], b[i], c[i]);
+        }
+        return r;
     }
 
     SIMD_ELEMENTARY_INLINE static U bitsOf(V x) noexcept { return vir::simd_bit_cast<U>(x); }
