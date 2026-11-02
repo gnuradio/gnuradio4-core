@@ -535,6 +535,87 @@ const boost::ut::suite<"integer into floating-point settings"> exactIntegerTests
     };
 };
 
+const boost::ut::suite<"out-of-range numbers into integer settings"> integerRangeTests = [] {
+    using namespace boost::ut;
+    using gr::pmt::convert_safely;
+
+    "an unsigned integer above a signed type's maximum is refused"_test = [] {
+        constexpr std::uint64_t unsignedMax = std::numeric_limits<std::uint64_t>::max();
+        expect(!convert_safely<std::int64_t>(unsignedMax).has_value()) << "uint64 max into int64";
+        expect(!convert_safely<std::int32_t>(unsignedMax).has_value()) << "uint64 max into int32";
+        expect(!convert_safely<std::int8_t>(unsignedMax).has_value()) << "uint64 max into int8";
+        expect(!convert_safely<std::uint32_t>(unsignedMax).has_value()) << "uint64 max into uint32";
+        expect(!convert_safely<std::int64_t>(static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) + 1U).has_value()) << "2^63 into int64";
+
+        constexpr std::int64_t signedMax = std::numeric_limits<std::int64_t>::max();
+        expect(convert_safely<std::int64_t>(static_cast<std::uint64_t>(signedMax)) == signedMax) << "int64 max held in a uint64";
+        expect(convert_safely<std::int32_t>(static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) == std::numeric_limits<std::int32_t>::max()) << "int32 max held in a uint64";
+    };
+
+    "a negative integer is refused by an unsigned type"_test = [] {
+        expect(!convert_safely<std::uint64_t>(std::numeric_limits<std::int64_t>::min()).has_value()) << "int64 min into uint64";
+        expect(!convert_safely<std::uint8_t>(std::int64_t{-1}).has_value()) << "-1 into uint8";
+    };
+
+    "a negative integer below a signed type's lowest value is refused"_test = [] {
+        constexpr std::int64_t int32Lowest = std::numeric_limits<std::int32_t>::lowest();
+        expect(convert_safely<std::int32_t>(int32Lowest) == std::numeric_limits<std::int32_t>::lowest()) << "int32 lowest held in an int64";
+        expect(!convert_safely<std::int32_t>(int32Lowest - 1).has_value()) << "int32 lowest - 1 into int32";
+        expect(!convert_safely<std::int32_t>(std::numeric_limits<std::int64_t>::min()).has_value()) << "int64 min into int32";
+    };
+
+    "a double at or above 2^digits is refused and the largest double below it converts"_test = [] {
+        constexpr double twoTo63 = 0x1p63;
+        constexpr double twoTo64 = 0x1p64;
+        expect(!convert_safely<std::int64_t>(twoTo63).has_value()) << "2^63 into int64";
+        expect(!convert_safely<std::uint64_t>(twoTo64).has_value()) << "2^64 into uint64";
+
+        const double belowTwoTo63 = std::nextafter(twoTo63, 0.0);
+        const double belowTwoTo64 = std::nextafter(twoTo64, 0.0);
+        expect(convert_safely<std::int64_t>(belowTwoTo63) == static_cast<std::int64_t>(belowTwoTo63)) << "largest double below 2^63 into int64";
+        expect(convert_safely<std::uint64_t>(belowTwoTo64) == static_cast<std::uint64_t>(belowTwoTo64)) << "largest double below 2^64 into uint64";
+        expect(convert_safely<std::uint64_t>(twoTo63) == (std::uint64_t{1} << 63U)) << "2^63 into uint64";
+        expect(convert_safely<std::int64_t>(-twoTo63) == std::numeric_limits<std::int64_t>::min()) << "-2^63 into int64";
+        expect(!convert_safely<std::int64_t>(std::nextafter(-twoTo63, -twoTo64)).has_value()) << "the double below -2^63 into int64";
+    };
+
+    "a float at or above 2^digits is refused and the largest float below it converts"_test = [] {
+        constexpr float twoTo31 = 0x1p31f;
+        constexpr float twoTo32 = 0x1p32f;
+        constexpr float twoTo63 = 0x1p63f;
+        constexpr float twoTo64 = 0x1p64f;
+        expect(!convert_safely<std::int32_t>(twoTo31).has_value()) << "2^31 into int32";
+        expect(!convert_safely<std::uint32_t>(twoTo32).has_value()) << "2^32 into uint32";
+        expect(!convert_safely<std::int64_t>(twoTo63).has_value()) << "2^63 into int64";
+        expect(!convert_safely<std::uint64_t>(twoTo64).has_value()) << "2^64 into uint64";
+
+        const float belowTwoTo31 = std::nextafter(twoTo31, 0.0f);
+        const float belowTwoTo32 = std::nextafter(twoTo32, 0.0f);
+        const float belowTwoTo63 = std::nextafter(twoTo63, 0.0f);
+        const float belowTwoTo64 = std::nextafter(twoTo64, 0.0f);
+        expect(convert_safely<std::int32_t>(belowTwoTo31) == static_cast<std::int32_t>(belowTwoTo31)) << "largest float below 2^31 into int32";
+        expect(convert_safely<std::uint32_t>(belowTwoTo32) == static_cast<std::uint32_t>(belowTwoTo32)) << "largest float below 2^32 into uint32";
+        expect(convert_safely<std::int64_t>(belowTwoTo63) == static_cast<std::int64_t>(belowTwoTo63)) << "largest float below 2^63 into int64";
+        expect(convert_safely<std::uint64_t>(belowTwoTo64) == static_cast<std::uint64_t>(belowTwoTo64)) << "largest float below 2^64 into uint64";
+    };
+
+    "a floating-point value that is not a finite integer is refused"_test = [] {
+        expect(!convert_safely<std::int64_t>(std::numeric_limits<double>::quiet_NaN()).has_value()) << "NaN";
+        expect(!convert_safely<std::int64_t>(std::numeric_limits<double>::infinity()).has_value()) << "infinity";
+        expect(!convert_safely<std::uint64_t>(-std::numeric_limits<double>::infinity()).has_value()) << "negative infinity";
+        expect(!convert_safely<std::int32_t>(1.5).has_value()) << "1.5";
+        expect(!convert_safely<std::uint32_t>(-0.5f).has_value()) << "-0.5";
+    };
+
+    "an integer setting refuses a value outside its type's range"_test = [] {
+        const auto fromUnsigned = gr::settings::convertParameter<std::int64_t>("count", pmt::Value(std::numeric_limits<std::uint64_t>::max()));
+        expect(!fromUnsigned.has_value() && fromUnsigned.error().contains("count")) << fromUnsigned.error_or("a value");
+
+        const auto fromDouble = gr::settings::convertParameter<std::uint64_t>("count", pmt::Value(0x1p64));
+        expect(!fromDouble.has_value() && fromDouble.error().contains("count")) << fromDouble.error_or("a value");
+    };
+};
+
 const boost::ut::suite<"staged type refusals"> stagedRefusalTests = [] {
     using namespace boost::ut;
 

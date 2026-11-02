@@ -75,6 +75,25 @@ template<std::unsigned_integral T>
     return val < 0 ? false : static_cast<unsigned long long>(val) <= static_cast<std::uint64_t>(std::numeric_limits<T>::max());
 }
 
+// compares the value itself with T's limits for any pair of integral types no wider than std::intmax_t,
+// bool and character types included
+template<std::integral T, std::integral S>
+requires(sizeof(S) <= sizeof(std::intmax_t) && sizeof(T) <= sizeof(std::intmax_t))
+[[nodiscard]] constexpr bool integerInRange(S value) noexcept {
+    if constexpr (std::is_signed_v<S>) {
+        if (value < 0) {
+            return std::is_signed_v<T> && static_cast<std::intmax_t>(value) >= static_cast<std::intmax_t>(std::numeric_limits<T>::lowest());
+        }
+    }
+    return static_cast<std::uintmax_t>(value) <= static_cast<std::uintmax_t>(std::numeric_limits<T>::max());
+}
+
+// 2^digits, one above the largest value of T: a power of two, exact in every floating-point type
+template<std::integral T, std::floating_point S>
+[[nodiscard]] constexpr S integerUpperLimit() noexcept {
+    return static_cast<S>(std::numeric_limits<T>::max() / 2 + 1) * S{2};
+}
+
 constexpr std::string_view trimAndCutComment(std::string_view input) {
     constexpr auto is_space = [](unsigned char ch) { return std::isspace(ch); };
 
@@ -187,7 +206,7 @@ template<class T, bool strictCheck = false, typename From>
             if constexpr (digitsS <= digitsT) {
                 return static_cast<T>(srcValue); // always safe
             } else {                             // range check
-                if (static_cast<std::int64_t>(srcValue) >= static_cast<std::int64_t>(std::numeric_limits<T>::lowest()) && static_cast<std::int64_t>(srcValue) <= static_cast<std::int64_t>(std::numeric_limits<T>::max())) {
+                if (detail::integerInRange<T>(srcValue)) {
                     return static_cast<T>(srcValue);
                 }
                 return std::unexpected(std::format("out-of-range integer conversion: {} not in [{}..{}]", srcValue, std::numeric_limits<T>::lowest(), std::numeric_limits<T>::max()));
@@ -243,7 +262,8 @@ template<class T, bool strictCheck = false, typename From>
             if (!std::isfinite(srcValue)) {
                 return std::unexpected(std::format("floating-point value {} is not finite (NaN/inf)", srcValue));
             }
-            if (srcValue < static_cast<S>(std::numeric_limits<T>::lowest()) || srcValue > static_cast<S>(std::numeric_limits<T>::max())) {
+            // lowest() is zero or a negative power of two, which S holds exactly
+            if (srcValue < static_cast<S>(std::numeric_limits<T>::lowest()) || srcValue >= detail::integerUpperLimit<T, S>()) {
                 return std::unexpected(std::format("floating-point value {} is outside [{}, {}]", srcValue, std::numeric_limits<T>::lowest(), std::numeric_limits<T>::max()));
             }
             if (srcValue != std::nearbyint(srcValue)) {
