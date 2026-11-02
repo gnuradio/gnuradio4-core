@@ -1870,9 +1870,9 @@ protected:
                 const std::size_t waitFrom      = isMultiThreaded(executionPolicy()) ? currentProgress : progressAfter;
                 inactiveCycleCount              = currentProgress == progressAfter ? inactiveCycleCount + 1UZ : 0UZ;
                 const bool parkDue              = isMultiThreaded(executionPolicy()) ? idleIterations >= kIdleBackoffPasses + pool_park_count : inactiveCycleCount > timeout_inactivity_count;
-                // A draining block that does not wait on its outputs ends after a bound of calls in which nothing it
-                // waits on moved. A parked worker would make one such call per park. The worker therefore does not park
-                // after a pass in which it called such a block.
+                // A draining block that does not wait on its outputs, and an epilogue waiting for room in its outputs,
+                // end after a bound of calls in which nothing they wait on moved. A parked worker would make one such
+                // call per park. The worker therefore does not park after a pass in which it called such a block.
                 const bool calledDrainingBlock = gr::detail::drainingCalls() != currentDraining;
 
                 // parking in a non-RUNNING state would delay the worker's next state read by up to timeout_ms, and a

@@ -652,7 +652,7 @@ struct MyAccumulator : gr::Block<MyAccumulator, gr::Resampling<1024, 1024, true>
 
     gr::work::Status processEpilogue(InputSpanLike auto& input, OutputSpanLike auto& output) noexcept {
         // trailing samples — input.size() < 1024
-        const auto n = input.size();
+        const auto n = std::min(input.size(), output.size()); // the span can be shorter than the tail
         std::copy_n(input.begin(), n, output.begin());
         std::ranges::fill(output.subspan(n), 0.f); // zero-pad remainder
         output.publish(output.size());              // explicit publish required
@@ -663,7 +663,13 @@ struct MyAccumulator : gr::Block<MyAccumulator, gr::Resampling<1024, 1024, true>
 
 - **Opt-in**: detected via `if constexpr` — zero cost for blocks without it.
 - **Output publishing**: call `output.publish(n)` explicitly; default is zero samples published.
-- **Output span size**: `max(trailing, output_chunk_size)`.
+- **Output span size**: `max(ceil(trailing * output_chunk_size / input_chunk_size), output_chunk_size)`, and at most
+  the size of the output ring, which can be shorter than the tail needs. The epilogue runs once the output has that
+  much room. When the blocks downstream take nothing for 1024 calls in a row, the span is the room the output has.
+- **Stop request**: when the block requests its own stop during a call, the span is the smaller of the request and
+  the room the output has. A stop the scheduler requests ends the block without the epilogue.
+- **Short span**: the epilogue writes at most `output.size()` samples. A block whose output cannot be split writes
+  nothing into a short span.
 - **Call sequence**: called once, immediately before transitioning to `REQUESTED_STOP`.
 - **Without `processEpilogue()`**: trailing samples are silently dropped (existing behaviour).
 
