@@ -13,6 +13,8 @@ jobs:
       cancel-in-progress: false
     container:
       image: "${{ matrix.image }}"
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 3
     strategy:
       fail-fast: false
       matrix:
@@ -241,6 +243,8 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/gnuradio/ci:ubuntu-24.04-4.0
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 3
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
         with:
