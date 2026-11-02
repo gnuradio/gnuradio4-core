@@ -1,6 +1,8 @@
 #include <atomic>
 #include <boost/ut.hpp>
 #include <chrono>
+#include <functional>
+#include <future>
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/Scheduler.hpp>
 #include <limits>
@@ -11,10 +13,16 @@ struct Source : gr::Block<Source> {
     gr::PortIn<int, gr::Optional> clock;
     gr::PortOut<int>              out, second;
     GR_MAKE_REFLECTABLE(Source, clock, out, second);
-    std::size_t       limit = 20, produced = 0;
-    std::atomic<bool> entered     = false;
-    bool              failOnStart = false;
-    void              start() {
+    std::size_t           limit = 20, produced = 0;
+    std::atomic<bool>     entered     = false;
+    bool                  failOnStart = false;
+    std::function<void()> onStop;
+    void                  stop() {
+        if (onStop) {
+            onStop();
+        }
+    }
+    void start() {
         if (failOnStart) {
             throw gr::exception("source refused to start");
         }
@@ -60,6 +68,23 @@ struct Sink : gr::Block<Sink> {
         return gr::work::Status::OK;
     }
 };
+template<gr::scheduler::ExecutionPolicy Policy>
+struct DrainEditScheduler : gr::scheduler::Simple<Policy> {
+    using gr::scheduler::Simple<Policy>::Simple;
+
+    // Expose a graph-edit attempt at a controlled thread boundary. A busy
+    // dispatcher leaves the request pending, as processScheduledMessages() does.
+    std::optional<std::expected<gr::property_map, gr::Error>> tryRemoveEdge(const gr::property_map& edge) {
+        if (!this->tryHoldMessagePass()) {
+            return std::nullopt;
+        }
+        gr::on_scope_exit release = [this] { this->releaseMessagePass(); };
+        gr::Message       request;
+        request.data = edge;
+        return this->removeEdgeByMessage(request);
+    }
+};
+
 template<gr::scheduler::ExecutionPolicy Policy>
 struct StartupGateScheduler : gr::scheduler::SchedulerBase<StartupGateScheduler<Policy>, Policy> {
     std::atomic<bool> entered  = false;
@@ -162,6 +187,58 @@ void qualify() {
         expect(eq(source.produced, first.consumed));
         expect(eq(source.produced, second.consumed));
         expect(scheduler.state() == gr::lifecycle::State::STOPPED);
+    };
+    "drain excludes graph edits until source cancellation has finished"_test = [] {
+        for (const bool nested : {false, true}) {
+            std::atomic<bool> sourceStopping = false;
+            std::atomic<bool> releaseStop    = false;
+            gr::Graph         graph;
+            auto&             source = graph.emplaceBlock<Source>();
+            source.limit             = std::numeric_limits<std::size_t>::max();
+            source.onStop            = [&] {
+                sourceStopping = true;
+                releaseStop.wait(false);
+            };
+            auto& first   = graph.emplaceBlock<Sink>();
+            auto& second  = graph.emplaceBlock<Sink>();
+            auto& removed = graph.emplaceBlock<Sink>();
+            expect(graph.connect<"out", "in">(source, first).has_value());
+            expect(graph.connect<"second", "in">(source, second).has_value());
+            expect(graph.connect<"out", "in">(source, removed).has_value());
+            using Scheduler = gr::SchedulerWrapper<DrainEditScheduler<Policy>>;
+            auto      inner = std::make_shared<Scheduler>();
+            Scheduler scheduler;
+            auto*     edited = &scheduler.blockRef();
+            if (nested) {
+                inner->setGraph(std::move(graph));
+                gr::Graph outer;
+                outer.addBlock(gr::SchedulerModel::asBlockModelPtr(inner));
+                scheduler.setGraph(std::move(outer));
+                edited = &inner->blockRef();
+            } else {
+                scheduler.setGraph(std::move(graph));
+            }
+            expect(scheduler.start().has_value());
+            expect(wait([&] { return first.entered.load(); }));
+            auto drain = std::async(std::launch::async, [&] { return scheduler.stopAfterDrain(std::chrono::seconds(2)); });
+            expect(wait([&] { return sourceStopping.load(); }));
+            using namespace gr::serialization_fields;
+            const gr::property_map edge{{std::pmr::string(EDGE_SOURCE_BLOCK), std::string(source.unique_name)}, {std::pmr::string(EDGE_SOURCE_PORT), std::string("out")}, {std::pmr::string(EDGE_DESTINATION_BLOCK), std::string(removed.unique_name)}, {std::pmr::string(EDGE_DESTINATION_PORT), std::string("in")}};
+            // Enter the real edge-edit handler from another controller, using
+            // the same message-pass claim as processScheduledMessages().
+            auto edit = std::async(std::launch::async, [&] { return edited->tryRemoveEdge(edge); });
+            expect(!edit.get().has_value()) << "the graph edit ran inside the held cancellation pass";
+            releaseStop = true;
+            releaseStop.notify_all();
+            expect(drain.get());
+            expect(eq(source.produced, first.consumed));
+            expect(eq(source.produced, second.consumed));
+            const auto response = edited->tryRemoveEdge(edge);
+            expect(response.has_value() && response->has_value());
+            if (response && *response) {
+                expect(eq(response->value().at("nEdgesRemoved").template value_or<gr::Size_t>(0), gr::Size_t{1}));
+            }
+        }
     };
     "an asynchronous run error is not also a start failure"_test = [] {
         gr::Graph graph;
