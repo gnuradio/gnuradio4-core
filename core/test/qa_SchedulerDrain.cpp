@@ -4,7 +4,9 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -389,10 +391,262 @@ struct Interpolator : gr::Block<Interpolator, gr::Resampling<1U, kInterpolation,
     }
 };
 
+constexpr gr::Size_t  kDecimation = 4U;
+constexpr std::size_t kTail       = 2UZ; // fewer samples than one chunk: the end of the stream hands them to the epilogue
+static_assert(kTail < kDecimation);
+
+// publishes kDecimation times its output ring and kTail more as fast as the ring takes them, then ends its stream
+struct TailSource : gr::Block<TailSource> {
+    gr::PortOut<int> out;
+
+    GR_MAKE_REFLECTABLE(TailSource, out);
+
+    std::size_t _nItems     = 0UZ;
+    std::size_t _nPublished = 0UZ;
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        if (_nItems == 0UZ) {
+            _nItems = kDecimation * out.bufferSize() + kTail;
+        }
+        const std::size_t n = std::min(outSpan.size(), _nItems - _nPublished);
+        for (std::size_t i = 0UZ; i < n; ++i) {
+            outSpan[i] = static_cast<int>(_nPublished + i);
+        }
+        outSpan.publish(n);
+        _nPublished += n;
+        return _nPublished == _nItems ? gr::work::Status::DONE : gr::work::Status::OK;
+    }
+};
+
+// keeps the first sample of each chunk. Its epilogue makes one sample from the partial chunk when its span has room.
+struct TailDecimator : gr::Block<TailDecimator, gr::Resampling<kDecimation, 1U, true>> {
+    gr::PortIn<int>  in;
+    gr::PortOut<int> out;
+
+    GR_MAKE_REFLECTABLE(TailDecimator, in, out);
+
+    std::size_t _epilogueSpan = 0UZ; // the output span the epilogue was handed
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& inSpan, gr::OutputSpanLike auto& outSpan) {
+        for (std::size_t i = 0UZ; i < outSpan.size(); ++i) {
+            outSpan[i] = inSpan[i * kDecimation];
+        }
+        return gr::work::Status::OK;
+    }
+
+    gr::work::Status processEpilogue(gr::InputSpanLike auto& inSpan, gr::OutputSpanLike auto& outSpan) {
+        _epilogueSpan = outSpan.size();
+        if (inSpan.size() > 0UZ && outSpan.size() > 0UZ) {
+            outSpan[0UZ] = inSpan[0UZ];
+            outSpan.publish(1UZ);
+        } else {
+            outSpan.publish(0UZ);
+        }
+        return gr::work::Status::OK;
+    }
+};
+
+// publishes its output ring and one sample more as fast as the ring takes them, then ends its stream
+struct RingPlusOneSource : gr::Block<RingPlusOneSource> {
+    gr::PortOut<int> out;
+
+    GR_MAKE_REFLECTABLE(RingPlusOneSource, out);
+
+    std::size_t _nItems     = 0UZ;
+    std::size_t _nPublished = 0UZ;
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        if (_nItems == 0UZ) {
+            _nItems = out.bufferSize() + 1UZ;
+        }
+        const std::size_t n = std::min(outSpan.size(), _nItems - _nPublished);
+        for (std::size_t i = 0UZ; i < n; ++i) {
+            outSpan[i] = static_cast<int>(_nPublished + i);
+        }
+        outSpan.publish(n);
+        _nPublished += n;
+        return _nPublished == _nItems ? gr::work::Status::DONE : gr::work::Status::OK;
+    }
+};
+
+// forwards the first sample it is handed and declines every later one. Its epilogue copies as much of its tail as its
+// span holds.
+struct FirstSampleRelay : gr::Block<FirstSampleRelay> {
+    gr::PortIn<int>  in;
+    gr::PortOut<int> out;
+
+    GR_MAKE_REFLECTABLE(FirstSampleRelay, in, out);
+
+    bool        _forwarded    = false;
+    std::size_t _epilogueTail = 0UZ; // the input span the epilogue was handed
+    std::size_t _epilogueSpan = 0UZ; // the output span the epilogue was handed
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& inSpan, gr::OutputSpanLike auto& outSpan) {
+        if (_forwarded || inSpan.size() == 0UZ || outSpan.size() == 0UZ) {
+            std::ignore = inSpan.consume(0UZ);
+            outSpan.publish(0UZ);
+            return gr::work::Status::INSUFFICIENT_INPUT_ITEMS;
+        }
+        _forwarded   = true;
+        outSpan[0UZ] = inSpan[0UZ];
+        std::ignore  = inSpan.consume(1UZ);
+        outSpan.publish(1UZ);
+        return gr::work::Status::OK;
+    }
+
+    gr::work::Status processEpilogue(gr::InputSpanLike auto& inSpan, gr::OutputSpanLike auto& outSpan) {
+        _epilogueTail       = inSpan.size();
+        _epilogueSpan       = outSpan.size();
+        const std::size_t n = std::min(inSpan.size(), outSpan.size());
+        for (std::size_t i = 0UZ; i < n; ++i) {
+            outSpan[i] = inSpan[i];
+        }
+        outSpan.publish(n);
+        return gr::work::Status::OK;
+    }
+};
+
+// writes each input sample kInterpolation times and requests its stop when stop_now turns true. Its epilogue writes
+// the copies of as many tail samples as its span holds. With _wholeTailOnly, it writes the copies of the whole tail
+// or nothing.
+struct TailInterpolator : gr::Block<TailInterpolator, gr::Resampling<1U, kInterpolation, true>> {
+    gr::PortIn<int>  in;
+    gr::PortOut<int> out;
+    bool             stop_now = false;
+
+    GR_MAKE_REFLECTABLE(TailInterpolator, in, out, stop_now);
+
+    bool        _wholeTailOnly   = false;
+    std::size_t _epilogueTail    = 0UZ; // the input samples the epilogue was handed
+    std::size_t _epilogueSpan    = 0UZ; // the output span the epilogue was handed
+    std::size_t _epilogueWritten = 0UZ;
+
+    void settingsChanged(const gr::property_map& /*oldSettings*/, const gr::property_map& /*newSettings*/) {
+        if (stop_now) {
+            this->requestStop();
+        }
+    }
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& inSpan, gr::OutputSpanLike auto& outSpan) {
+        for (std::size_t i = 0UZ; i < inSpan.size(); ++i) {
+            for (std::size_t k = 0UZ; k < kInterpolation; ++k) {
+                outSpan[i * kInterpolation + k] = inSpan[i];
+            }
+        }
+        return gr::work::Status::OK;
+    }
+
+    gr::work::Status processEpilogue(gr::InputSpanLike auto& inSpan, gr::OutputSpanLike auto& outSpan) {
+        _epilogueTail = inSpan.size();
+        _epilogueSpan = outSpan.size();
+        std::size_t n = std::min(inSpan.size(), outSpan.size() / kInterpolation);
+        if (_wholeTailOnly && n < inSpan.size()) {
+            n = 0UZ;
+        }
+        for (std::size_t i = 0UZ; i < n; ++i) {
+            for (std::size_t k = 0UZ; k < kInterpolation; ++k) {
+                outSpan[i * kInterpolation + k] = inSpan[i];
+            }
+        }
+        outSpan.publish(n * kInterpolation);
+        _epilogueWritten = n * kInterpolation;
+        return gr::work::Status::OK;
+    }
+};
+
+// connects the block between the two ports and returns the size of its output ring
+[[nodiscard]] std::size_t connectBetween(TailInterpolator& block, gr::PortOut<int>& upstream, gr::PortIn<int>& downstream) {
+    using namespace boost::ut;
+    expect(fatal(upstream.connect(block.in).has_value()));
+    expect(fatal(block.out.connect(downstream).has_value()));
+    block.init(std::make_shared<gr::Sequence>());
+    return block.out.bufferSize();
+}
+
+// publishes n samples on the port
+void publishSamples(gr::PortOut<int>& port, std::size_t n) {
+    auto span = port.reserve<gr::SpanReleasePolicy::ProcessAll>(n);
+    std::ranges::fill(span, 1);
+}
+
+// declines every chunk. A stream that ends leaves it draining until it stalls. Its epilogue fills as much of its span
+// as its tail's copies need.
+struct DecliningInterpolator : gr::Block<DecliningInterpolator, gr::Resampling<1U, kInterpolation, true>> {
+    gr::PortIn<int>  in;
+    gr::PortOut<int> out;
+
+    GR_MAKE_REFLECTABLE(DecliningInterpolator, in, out);
+
+    std::size_t _epilogueSpan = 0UZ; // the output span the epilogue was handed
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& inSpan, gr::OutputSpanLike auto& outSpan) {
+        std::ignore = inSpan.consume(0UZ);
+        outSpan.publish(0UZ);
+        return gr::work::Status::INSUFFICIENT_INPUT_ITEMS;
+    }
+
+    gr::work::Status processEpilogue(gr::InputSpanLike auto& inSpan, gr::OutputSpanLike auto& outSpan) {
+        _epilogueSpan       = outSpan.size();
+        const std::size_t n = std::min(inSpan.size() * kInterpolation, outSpan.size());
+        std::fill_n(outSpan.begin(), n, 1);
+        outSpan.publish(n);
+        return gr::work::Status::OK;
+    }
+};
+
+// copies its input to two outputs and requests its stop when stop_now turns true. Its epilogue copies as many tail
+// samples as its spans hold.
+struct TwoOutputTail : gr::Block<TwoOutputTail> {
+    gr::PortIn<int>  in;
+    gr::PortOut<int> first;
+    gr::PortOut<int> second;
+    bool             stop_now = false;
+
+    GR_MAKE_REFLECTABLE(TwoOutputTail, in, first, second, stop_now);
+
+    bool        _epilogueRan = false;
+    std::size_t _firstSpan   = 0UZ; // the output spans the epilogue was handed
+    std::size_t _secondSpan  = 0UZ;
+
+    void settingsChanged(const gr::property_map& /*oldSettings*/, const gr::property_map& /*newSettings*/) {
+        if (stop_now) {
+            this->requestStop();
+        }
+    }
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& inSpan, gr::OutputSpanLike auto& firstSpan, gr::OutputSpanLike auto& secondSpan) {
+        std::ranges::copy(inSpan, firstSpan.begin());
+        std::ranges::copy(inSpan, secondSpan.begin());
+        return gr::work::Status::OK;
+    }
+
+    gr::work::Status processEpilogue(gr::InputSpanLike auto& inSpan, gr::OutputSpanLike auto& firstSpan, gr::OutputSpanLike auto& secondSpan) {
+        _epilogueRan        = true;
+        _firstSpan          = firstSpan.size();
+        _secondSpan         = secondSpan.size();
+        const std::size_t n = std::min({inSpan.size(), firstSpan.size(), secondSpan.size()});
+        std::copy_n(inSpan.begin(), n, firstSpan.begin());
+        std::copy_n(inSpan.begin(), n, secondSpan.begin());
+        firstSpan.publish(n);
+        secondSpan.publish(n);
+        return gr::work::Status::OK;
+    }
+};
+
+// the stream index of the first end-of-stream tag the port holds
+[[nodiscard]] std::optional<std::size_t> endOfStreamIndex(gr::PortIn<int>& port) {
+    for (const gr::Tag& tag : port.tagReader().get()) {
+        if (tag.map.contains(gr::tag::END_OF_STREAM.key())) {
+            return tag.index;
+        }
+    }
+    return std::nullopt;
+}
+
 constexpr std::size_t kDrainStallCalls = 1024UZ; // idle calls after which a block with its input's end in view ends
 constexpr std::size_t kLateCalls       = 2UZ * kDrainStallCalls;
 
-// takes nothing on its first kLateCalls calls and everything after them, like a consumer busy for a long time in one
+// takes nothing on its first _nLateCalls calls and everything after them, like a consumer busy for a long time in one
 // call. With _nTakenWhenFull set, it takes that many items the first time it finds its ring full and leaves its
 // producer that much room. It counts the calls it declines after the source has published its last item.
 struct LateSink : gr::Block<LateSink> {
@@ -402,6 +656,7 @@ struct LateSink : gr::Block<LateSink> {
 
     const RingAndAHalfSource* _source         = nullptr;
     std::size_t               _nTakenWhenFull = 0UZ;
+    std::size_t               _nLateCalls     = kLateCalls;
 
     bool        _tookWhenFull              = false;
     std::size_t _nCalls                    = 0UZ;
@@ -413,7 +668,7 @@ struct LateSink : gr::Block<LateSink> {
     gr::work::Status processBulk(gr::InputSpanLike auto& inSpan) {
         _nCalls++;
         _ringSize = in.bufferSize();
-        if (_nCalls <= kLateCalls) {
+        if (_nCalls <= _nLateCalls) {
             if (_nTakenWhenFull > 0UZ && !_tookWhenFull && inSpan.size() == _ringSize) {
                 _tookWhenFull = true;
                 _nReceived += _nTakenWhenFull;
@@ -510,6 +765,36 @@ template<typename TScheduler>
     }
     runner.join();
     return inTime;
+}
+
+// The relay holds its full input ring at the end of its stream. The decimator holds the relay's first sample, less than
+// one chunk. The relay's output then has room for one sample less than the relay's tail. Its epilogue waits for that
+// room until the wait stalls and is then handed the room the output has.
+template<typename TScheduler>
+void expectEpilogueWaitEndsUnderScheduler() {
+    using namespace boost::ut;
+    gr::Graph flow;
+    auto&     source    = flow.emplaceBlock<RingPlusOneSource>();
+    auto&     relay     = flow.emplaceBlock<FirstSampleRelay>();
+    auto&     decimator = flow.emplaceBlock<TailDecimator>();
+    auto&     sink      = flow.emplaceBlock<CountingSink>();
+    expect(flow.connect<"out", "in">(source, relay).has_value());
+    expect(flow.connect<"out", "in">(relay, decimator).has_value());
+    expect(flow.connect<"out", "in">(decimator, sink).has_value());
+
+    TScheduler scheduler;
+    // a worker parked once per waiting call would take longer than the bound
+    const std::size_t parkedWaitMs = std::size_t{scheduler.timeout_ms.value} * kDrainStallCalls;
+    const std::size_t boundMs      = static_cast<std::size_t>(std::chrono::duration_cast<std::chrono::milliseconds>(kRunBound).count());
+    expect(fatal(gt(parkedWaitMs, boundMs)));
+    expect(scheduler.exchange(std::move(flow)).has_value());
+    expect(runWithin(scheduler, std::chrono::duration_cast<std::chrono::milliseconds>(kRunBound))) << "the epilogue's wait for room held the graph open";
+
+    const std::size_t ring = relay.out.bufferSize();
+    expect(eq(relay._epilogueTail, source.out.bufferSize())) << "the relay's input ring was not full at its end";
+    expect(eq(relay._epilogueSpan, ring - 1UZ)) << "the epilogue was not handed the room the output has";
+    const std::size_t nDecimated = 1UZ + relay._epilogueSpan;
+    expect(eq(sink._nReceived, (nDecimated + kDecimation - 1UZ) / kDecimation)) << "the samples the relay wrote did not all reach the sink";
 }
 
 } // namespace qa_drain
@@ -794,6 +1079,201 @@ const boost::ut::suite<"end-of-stream drain"> drainTests = [] {
         expect(gt(sink._nWaitsWithEndInView, qa_drain::kDrainStallCalls)) << "the sink's input end was not in view for long while it waited";
         expect(eq(sink._nReceived, qa_drain::kBurst)) << "the sink was ended while it waited on its device";
         expect(qa_drain::takeDrainStallReports(fromScheduler, sink.unique_name).empty());
+    };
+
+    "a block whose output is full at the end of its stream runs its epilogue once the output has room"_test = [] {
+        gr::Graph flow;
+        auto&     source    = flow.emplaceBlock<qa_drain::TailSource>();
+        auto&     decimator = flow.emplaceBlock<qa_drain::TailDecimator>();
+        auto&     sink      = flow.emplaceBlock<qa_drain::LateSink>();
+        sink._nLateCalls    = qa_drain::kDrainStallCalls / 2UZ; // fewer calls than the epilogue waits on outputs that do not move
+        expect(flow.connect<"out", "in">(source, decimator).has_value());
+        expect(flow.connect<"out", "in">(decimator, sink).has_value());
+
+        qa_drain::SerialScheduler scheduler;
+        expect(scheduler.exchange(std::move(flow)).has_value());
+        expect(qa_drain::runWithin(scheduler, std::chrono::duration_cast<std::chrono::milliseconds>(qa_drain::kSlowConsumerBound))) << "the graph did not end";
+
+        const std::size_t nExpected = (source._nItems + qa_drain::kDecimation - 1UZ) / qa_drain::kDecimation;
+        expect(eq(sink._nLargestDeclined, sink._ringSize)) << "the decimator's output never filled while the sink declined";
+        expect(eq(decimator._epilogueSpan, (qa_drain::kTail + qa_drain::kDecimation - 1UZ) / qa_drain::kDecimation)) << "the epilogue was not handed the span it asked for";
+        expect(eq(sink._nReceived, nExpected)) << "the sample the epilogue makes from the tail was lost";
+    };
+
+    "a block stopped with less room in its output than its tail needs is handed that room and writes within it"_test = [] {
+        gr::PortOut<int>           upstream;
+        gr::PortIn<int>            downstream;
+        qa_drain::TailInterpolator block;
+        const std::size_t          ring  = qa_drain::connectBetween(block, upstream, downstream);
+        const std::size_t          nTail = ring / 2UZ;
+        const std::size_t          room  = ring / 4UZ;
+        const std::size_t          held  = ring - room;
+        expect(fatal(lt(room, nTail * qa_drain::kInterpolation))) << "the room holds the whole tail";
+        qa_drain::publishSamples(upstream, nTail);
+        qa_drain::publishSamples(block.out, held);
+
+        std::ignore                   = block.settings().setStaged({{"stop_now", true}});
+        const gr::work::Result result = block.work();
+
+        expect(result.status == gr::work::Status::DONE);
+        expect(block.state() == STOPPED);
+        expect(eq(block._epilogueTail, nTail));
+        expect(eq(block._epilogueSpan, room)) << "the epilogue was not handed the room its output has";
+        expect(eq(block._epilogueWritten, room - room % qa_drain::kInterpolation));
+        expect(eq(downstream.streamReader().available(), held + block._epilogueWritten)) << "the output does not hold what the epilogue wrote";
+    };
+
+    "a block that writes nothing into a short span on a stop request ends its stream"_test = [] {
+        gr::PortOut<int>           upstream;
+        gr::PortIn<int>            downstream;
+        qa_drain::TailInterpolator block;
+        block._wholeTailOnly    = true;
+        const std::size_t ring  = qa_drain::connectBetween(block, upstream, downstream);
+        const std::size_t nTail = ring / 2UZ;
+        const std::size_t room  = ring / 4UZ;
+        const std::size_t held  = ring - room;
+        expect(fatal(lt(room, nTail * qa_drain::kInterpolation))) << "the room holds the whole tail";
+        qa_drain::publishSamples(upstream, nTail);
+        qa_drain::publishSamples(block.out, held);
+
+        std::ignore                   = block.settings().setStaged({{"stop_now", true}});
+        const gr::work::Result result = block.work();
+
+        expect(result.status == gr::work::Status::DONE);
+        expect(block.state() == STOPPED);
+        expect(eq(block._epilogueSpan, room)) << "the epilogue was not handed the room its output has";
+        expect(eq(block._epilogueWritten, 0UZ));
+        expect(eq(downstream.streamReader().available(), held)) << "the output holds samples the epilogue did not write";
+        expect(qa_drain::endOfStreamIndex(downstream) == std::optional<std::size_t>(held)) << "the end of the stream does not follow the last sample written";
+    };
+
+    "a block whose tail needs more than its output ring is handed the whole ring"_test = [] {
+        gr::PortOut<int>           upstream;
+        gr::PortIn<int>            downstream;
+        qa_drain::TailInterpolator block;
+        const std::size_t          ring  = qa_drain::connectBetween(block, upstream, downstream);
+        const std::size_t          nTail = ring - ring / 4UZ;
+        expect(fatal(lt(nTail, upstream.bufferSize()))) << "the input ring does not hold the tail";
+        expect(fatal(gt(nTail * qa_drain::kInterpolation, ring))) << "the output ring holds the whole tail";
+        qa_drain::publishSamples(upstream, nTail);
+        upstream.publishEoSTag(gr::property_map{{gr::tag::END_OF_STREAM.key(), true}});
+        block.in.min_samples = nTail + 1UZ; // the stream ends before the block can take its tail
+
+        const gr::work::Result result = block.work();
+
+        expect(result.status == gr::work::Status::DONE) << "the block waits for room its output can never have";
+        expect(eq(block._epilogueTail, nTail));
+        expect(eq(block._epilogueSpan, ring)) << "the epilogue was not handed the whole ring";
+        expect(eq(downstream.streamReader().available(), ring - ring % qa_drain::kInterpolation)) << "the output does not hold what the epilogue wrote";
+    };
+
+    "a block whose epilogue waits on a downstream block holding back a partial chunk ends its stream"_test = [] {
+        gr::PortOut<int>           upstream;
+        qa_drain::TailInterpolator interpolator;
+        qa_drain::TailDecimator    decimator;
+        gr::PortIn<int>            downstream;
+        expect(fatal(upstream.connect(interpolator.in).has_value()));
+        expect(fatal(interpolator.out.connect(decimator.in).has_value()));
+        expect(fatal(decimator.out.connect(downstream).has_value()));
+        interpolator.init(std::make_shared<gr::Sequence>());
+        decimator.init(std::make_shared<gr::Sequence>());
+        const std::size_t ring = interpolator.out.bufferSize();
+
+        // one sample makes kInterpolation, fewer than the decimator's chunk: it holds them until its stream ends
+        qa_drain::publishSamples(upstream, 1UZ);
+        std::ignore                = interpolator.work();
+        std::ignore                = decimator.work();
+        const std::size_t heldBack = decimator.in.streamReader().available();
+        expect(fatal(eq(heldBack, std::size_t{qa_drain::kInterpolation}))) << "the decimator does not hold back the partial chunk";
+
+        const std::size_t nTail = ring - ring / 4UZ; // needs more than the ring, so the request is the whole ring
+        qa_drain::publishSamples(upstream, nTail);
+        upstream.publishEoSTag(gr::property_map{{gr::tag::END_OF_STREAM.key(), true}});
+        interpolator.in.min_samples = nTail + 1UZ;
+
+        std::size_t nCalls = 0UZ;
+        bool        ended  = false;
+        while (!ended && nCalls < 4UZ * qa_drain::kDrainStallCalls) {
+            ended       = interpolator.work().status == gr::work::Status::DONE;
+            std::ignore = decimator.work();
+            nCalls++;
+        }
+        expect(ended) << "the epilogue waits for room the downstream block never makes";
+        expect(gt(nCalls, qa_drain::kDrainStallCalls)) << "the epilogue did not wait for the outputs to drain";
+        expect(eq(interpolator._epilogueSpan, ring - heldBack)) << "the epilogue was not handed the room the output has";
+        std::ignore = decimator.work();
+        expect(decimator.state() == STOPPED) << "the end of the stream did not reach the downstream block";
+    };
+
+    "a block whose epilogue waits for room ends its stream within the bound under singleThreadedBlocking"_test = [] { qa_drain::expectEpilogueWaitEndsUnderScheduler<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking>>(); };
+
+    "a block whose epilogue waits for room ends its stream within the bound under multiThreadedBlocking"_test = [] { qa_drain::expectEpilogueWaitEndsUnderScheduler<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreadedBlocking>>(); };
+
+    "a drain stall held while the epilogue waits for room is reported once, and the epilogue runs once room appears"_test = [] {
+        gr::PortOut<int>                upstream;
+        qa_drain::DecliningInterpolator block;
+        gr::PortIn<int>                 downstream;
+        gr::MsgPortIn                   fromBlock;
+        expect(fatal(upstream.connect(block.in).has_value()));
+        expect(fatal(block.out.connect(downstream).has_value()));
+        expect(block.msgOut.connect(fromBlock).has_value());
+        block.init(std::make_shared<gr::Sequence>());
+        const std::size_t ring  = block.out.bufferSize();
+        const std::size_t nTail = 16UZ;
+        const std::size_t room  = nTail; // less than the nTail * kInterpolation the epilogue asks for
+        qa_drain::publishSamples(block.out, ring - room);
+        qa_drain::publishSamples(upstream, nTail);
+        upstream.publishEoSTag(gr::property_map{{gr::tag::END_OF_STREAM.key(), true}});
+
+        // the stall comes after kDrainStallCalls calls. The calls after it wait, fewer than the epilogue's own limit.
+        std::size_t nDone    = 0UZ;
+        std::size_t nReports = 0UZ;
+        for (std::size_t i = 0UZ; i < qa_drain::kDrainStallCalls + qa_drain::kDrainStallCalls / 2UZ; ++i) {
+            nDone += block.work().status == gr::work::Status::DONE ? 1UZ : 0UZ;
+            nReports += qa_drain::takeDrainStallReports(fromBlock, block.unique_name).size();
+        }
+        expect(eq(nDone, 0UZ)) << "the epilogue ran without room for its request";
+        expect(eq(nReports, 1UZ)) << "the stall was not reported once while the epilogue waited";
+
+        {
+            auto taken  = downstream.streamReader().get();
+            std::ignore = taken.consume(taken.size());
+        }
+        expect(block.work().status == gr::work::Status::DONE) << "the epilogue did not run on the first call with room";
+        expect(eq(block._epilogueSpan, nTail * qa_drain::kInterpolation));
+        expect(eq(qa_drain::takeDrainStallReports(fromBlock, block.unique_name).size(), 0UZ)) << "the stall was reported again";
+    };
+
+    "a block with two outputs waits for room in the fuller one, and on a stop request takes its room on both"_test = [] {
+        gr::PortOut<int>        upstream;
+        gr::PortIn<int>         firstDownstream;
+        gr::PortIn<int>         secondDownstream;
+        qa_drain::TwoOutputTail block;
+        expect(fatal(upstream.connect(block.in).has_value()));
+        expect(fatal(block.first.connect(firstDownstream).has_value()));
+        expect(fatal(block.second.connect(secondDownstream).has_value()));
+        block.init(std::make_shared<gr::Sequence>());
+        const std::size_t ring  = block.first.bufferSize();
+        const std::size_t nTail = ring / 2UZ;
+        const std::size_t room  = ring / 4UZ;
+        expect(fatal(lt(room, nTail)));
+        expect(fatal(ge(block.second.bufferSize(), nTail)));
+        qa_drain::publishSamples(block.first, ring - room);
+        qa_drain::publishSamples(upstream, nTail);
+        upstream.publishEoSTag(gr::property_map{{gr::tag::END_OF_STREAM.key(), true}});
+        block.in.min_samples = nTail + 1UZ; // the stream ends before the block can take its tail
+
+        const gr::work::Result waited = block.work();
+        expect(waited.status == gr::work::Status::INSUFFICIENT_OUTPUT_ITEMS) << "the epilogue did not wait for room in the fuller output";
+        expect(!block._epilogueRan);
+        expect(eq(block.in.streamReader().available(), nTail)) << "the waiting epilogue consumed its tail";
+
+        std::ignore                   = block.settings().setStaged({{"stop_now", true}});
+        const gr::work::Result result = block.work();
+        expect(result.status == gr::work::Status::DONE);
+        expect(eq(block._firstSpan, room)) << "the fuller output's span is not its room";
+        expect(eq(block._secondSpan, room)) << "the emptier output's span is not the fuller one's room";
+        expect(eq(secondDownstream.streamReader().available(), room));
     };
 
     "a graph ending on an error does not drain"_test = [] {

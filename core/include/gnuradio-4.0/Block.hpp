@@ -904,8 +904,13 @@ public:
         [[nodiscard]] constexpr bool operator==(const DrainWatermark&) const noexcept = default;
     };
 
+    static constexpr std::size_t kStallLimit = 1024UZ; // calls in a row with nothing moved that end a wait
+
     DrainWatermark _drainMark{};
     std::size_t    _nDrainStalls   = 0UZ;
+    bool           _drainStallHeld = false; // a drain stall whose epilogue waits for room in the outputs
+    DrainWatermark _epilogueWaitMark{};
+    std::size_t    _nEpilogueWaits = 0UZ;   // epilogue calls in a row that waited for room with nothing moved
     bool           _waitedOnOutput = false; // the last call returned INSUFFICIENT_OUTPUT_ITEMS
 
     /// the read positions and the tag counts of the last staging of first-sample tags. A call at the same read positions
@@ -1820,8 +1825,11 @@ public:
     // resumes keeps its count
     [[nodiscard]] std::expected<void, Error> changeStateTo(lifecycle::State newState, const std::source_location location = std::source_location::current()) {
         if (newState == lifecycle::State::RUNNING && this->state() == lifecycle::State::INITIALISED) {
-            _nDrainStalls = 0UZ;
-            _drainMark    = DrainWatermark{};
+            _nDrainStalls     = 0UZ;
+            _drainMark        = DrainWatermark{};
+            _drainStallHeld   = false;
+            _nEpilogueWaits   = 0UZ;
+            _epilogueWaitMark = DrainWatermark{};
         }
         return lifecycle::StateMachine<Derived>::changeStateTo(newState, location);
     }
@@ -2443,11 +2451,31 @@ public:
         return waiting;
     }
 
+    struct SyncOutputRoom {
+        std::size_t ring = std::numeric_limits<std::size_t>::max(); // the smallest ring
+        std::size_t free = std::numeric_limits<std::size_t>::max(); // the least free space
+    };
+
+    /// the smallest ring and the least free space of the connected synchronous outputs. Both are the maximum of
+    /// std::size_t when the block has none.
+    [[nodiscard]] SyncOutputRoom syncOutputRoom() {
+        SyncOutputRoom room;
+        for_each_port(
+            [&room]<PortLike TPort>(TPort& port) {
+                if constexpr (std::remove_cvref_t<TPort>::kIsSynch) {
+                    if (port.isConnected()) {
+                        room.ring = std::min(room.ring, port.bufferSize());
+                        room.free = std::min(room.free, port.streamWriter().available());
+                    }
+                }
+            },
+            outputPorts<PortType::STREAM>(&self()));
+        return room;
+    }
+
     /// A draining block keeps running so that it can emit what it holds. The block is stalled when nothing it waits on
     /// has moved for kStallLimit calls in a row. A block waiting on its outputs starts the count again.
     [[nodiscard]] bool isDrainStalled(bool isDraining) {
-        constexpr std::size_t kStallLimit = 1024UZ;
-
         if (!isDraining || isWaitingOnOutput()) {
             _nDrainStalls = 0UZ;
             _drainMark    = DrainWatermark{};
@@ -2461,6 +2489,19 @@ public:
         }
         _nDrainStalls++;
         return _nDrainStalls >= kStallLimit;
+    }
+
+    /// true when the epilogue has waited for room in the outputs for kStallLimit calls in a row with nothing moved. A
+    /// call with nothing moved counts as a draining call.
+    [[nodiscard]] bool isEpilogueWaitStalled() {
+        if (const DrainWatermark mark = drainWatermark(); mark != _epilogueWaitMark) {
+            _epilogueWaitMark = mark;
+            _nEpilogueWaits   = 0UZ;
+            return false;
+        }
+        ++detail::drainingCalls();
+        _nEpilogueWaits++;
+        return _nEpilogueWaits >= kStallLimit;
     }
 
     /// reports the end of a stalled block: the largest min_samples of its connected inputs and the most samples one
@@ -2722,8 +2763,10 @@ public:
             limits = computeSampleLimits(requestedWork);
         }
 
-        const bool drainStalled = isDrainStalled(limits.draining); // evaluated before the test below, which would short-circuit past the bookkeeping
-        if (drainStalled) {
+        // evaluated before the test below, which would short-circuit past the bookkeeping. A stall held while the
+        // epilogue waits for room is reported once.
+        const bool drainStalled = _drainStallHeld || isDrainStalled(limits.draining);
+        if (drainStalled && !_drainStallHeld) {
             notifyDrainStall();
         }
         if (limits.isEosPresent || lifecycle::isShuttingDown(this->state()) || limits.asyncEoS || drainStalled) {
@@ -2737,9 +2780,30 @@ public:
                 const std::size_t available = inputStreamCache.maxSyncAvailable();
                 const std::size_t trailing  = available == gr::undefined_size ? 0UZ : available;
 
-                const std::size_t epilogueOutSize = std::max<std::size_t>((input_chunk_size > 0) ? (trailing * output_chunk_size + input_chunk_size - 1) / input_chunk_size : trailing, output_chunk_size);
-                auto              epilogueIn      = prepareStreams(inputPorts<PortType::STREAM>(&self()), trailing);
-                auto              epilogueOut     = prepareStreams(outputPorts<PortType::STREAM>(&self()), epilogueOutSize);
+                // the request is at most the smallest output ring. On a stop request it is at most the room the
+                // outputs have, and the epilogue runs at once. Any other block returns INSUFFICIENT_OUTPUT_ITEMS until
+                // its outputs have room for the request. After kStallLimit such calls with nothing moved, it takes
+                // the room the outputs have.
+                const bool           stopping        = lifecycle::isShuttingDown(this->state());
+                const SyncOutputRoom outputRoom      = syncOutputRoom();
+                const std::size_t    requestedOut    = std::min(std::max<std::size_t>((input_chunk_size > 0) ? (trailing * output_chunk_size + input_chunk_size - 1) / input_chunk_size : trailing, output_chunk_size), outputRoom.ring);
+                const bool           takesRoom       = stopping || (outputRoom.free < requestedOut && isEpilogueWaitStalled());
+                const std::size_t    epilogueOutSize = takesRoom ? std::min(requestedOut, outputRoom.free) : requestedOut;
+                if (outputRoom.free < epilogueOutSize) {
+                    _drainStallHeld = drainStalled;
+                    return {requestedWork, 0UZ, INSUFFICIENT_OUTPUT_ITEMS};
+                }
+                auto epilogueIn  = prepareStreams(inputPorts<PortType::STREAM>(&self()), trailing);
+                auto epilogueOut = prepareStreams(outputPorts<PortType::STREAM>(&self()), epilogueOutSize);
+                if (!stopping) {
+                    if (const work::Status status = preparedStreamsStatus(epilogueIn, epilogueOut, trailing, epilogueOutSize); status != OK) {
+                        publishSamples(0UZ, epilogueOut);
+                        consumeReaders(0UZ, epilogueIn);
+                        _drainStallHeld = drainStalled;
+                        return {requestedWork, 0UZ, status};
+                    }
+                }
+                _drainStallHeld = false;
                 // tags ride the tail like any chunk's: the same settings-and-forward
                 // sequence the ordinary path runs, with the whole trailing span as the
                 // forward window because nothing after it can retire a deferred tag
