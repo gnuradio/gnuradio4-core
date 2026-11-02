@@ -182,7 +182,7 @@ jobs:
           DISABLE_SENSITIVE_TESTS: 1 # disables tests which are sensitive to execution speed and will not run with instrumented code
         working-directory: ${{runner.workspace}}/build
         shell: bash
-        run: ctest --output-on-failure
+        run: ctest --output-on-failure --parallel "$(nproc)"
 
       - name: execute native main binary
         if: matrix.cmake_wrapper == null
