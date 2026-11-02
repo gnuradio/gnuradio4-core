@@ -71,7 +71,8 @@ concept DataSetLike = TensorLikeV2<T> && requires(T t, const std::size_t n_items
     // axis layout:
     requires std::is_same_v<decltype(t.axis_names), std::vector<std::string>>;
     requires std::is_same_v<decltype(t.axis_units), std::vector<std::string>>;
-    requires std::is_same_v<decltype(t.axis_values), std::vector<std::vector<typename T::value_type>>>;
+    typename T::axis_value_type;
+    requires std::is_same_v<decltype(t.axis_values), std::vector<std::vector<typename T::axis_value_type>>>;
 
     // signal data storage
     requires std::is_same_v<decltype(t.signal_names), std::vector<std::string>>;
@@ -85,9 +86,15 @@ concept DataSetLike = TensorLikeV2<T> && requires(T t, const std::size_t n_items
     requires std::is_same_v<decltype(t.timing_events), std::vector<std::vector<std::pair<std::ptrdiff_t, gr::pmt::Value::Map>>>>;
 };
 
-template<typename T>
+// TAxis is the type of the axis coordinates and is deliberately independent of the sample type T:
+// how a signal was sampled is not a property of what was measured. A time axis in seconds needs a
+// fractional type even when the samples are integers, while an index axis is correctly an integer
+// even when the samples are not. It defaults to T so that existing declarations keep their current
+// meaning; state it explicitly whenever the axis is not in the same domain as the samples.
+template<typename T, typename TAxis = T>
 struct DataSet {
     using value_type           = T;
+    using axis_value_type      = TAxis;
     using tensor_layout_type   = std::variant<LayoutRight, LayoutLeft, std::string>;
     using pmt_map              = gr::property_map;
     using idx_pmt_map          = std::pair<std::ptrdiff_t, pmt_map>;
@@ -95,9 +102,9 @@ struct DataSet {
     std::int64_t timestamp     = 0;   // UTC timestamp [ns]; optional — 0 means unset, and a consumer must not derive a time from it
 
     // axis layout:
-    std::vector<std::string>    axis_names{};  // axis quantity, e.g. time, frequency, …
-    std::vector<std::string>    axis_units{};  // axis base SI-unit
-    std::vector<std::vector<T>> axis_values{}; // explicit axis values
+    std::vector<std::string>        axis_names{};  // axis quantity, e.g. time, frequency, …
+    std::vector<std::string>        axis_units{};  // axis base SI-unit
+    std::vector<std::vector<TAxis>> axis_values{}; // explicit axis values
 
     // signal data layout:
     std::vector<std::int32_t> extents{}; // extents[dim0_size, dim1_size, …] i.e. [axis_values[0].size(), axis_values[1].size(), …]
@@ -118,13 +125,13 @@ struct DataSet {
 
     [[nodiscard]] std::size_t nDimensions() const noexcept { return extents.size(); }
 
-    [[nodiscard]] std::size_t        axisCount() const noexcept { return axis_names.size(); }
-    [[nodiscard]] std::string&       axisName(std::size_t axisIdx = 0UZ) { return axis_names[_axCheck(axis_names, axisIdx)]; }
-    [[nodiscard]] std::string_view   axisName(std::size_t axisIdx = 0UZ) const { return axis_names[_axCheck(axis_names, axisIdx)]; }
-    [[nodiscard]] std::string&       axisUnit(std::size_t axisIdx = 0UZ) { return axis_units[_axCheck(axis_units, axisIdx)]; }
-    [[nodiscard]] std::string_view   axisUnit(std::size_t axisIdx = 0UZ) const { return axis_units[_axCheck(axis_units, axisIdx)]; }
-    [[nodiscard]] std::span<T>       axisValues(std::size_t axisIdx = 0UZ) { return axis_values[_axCheck(axis_values, axisIdx)]; }
-    [[nodiscard]] std::span<const T> axisValues(std::size_t axisIdx = 0UZ) const { return axis_values[_axCheck(axis_values, axisIdx)]; }
+    [[nodiscard]] std::size_t            axisCount() const noexcept { return axis_names.size(); }
+    [[nodiscard]] std::string&           axisName(std::size_t axisIdx = 0UZ) { return axis_names[_axCheck(axis_names, axisIdx)]; }
+    [[nodiscard]] std::string_view       axisName(std::size_t axisIdx = 0UZ) const { return axis_names[_axCheck(axis_names, axisIdx)]; }
+    [[nodiscard]] std::string&           axisUnit(std::size_t axisIdx = 0UZ) { return axis_units[_axCheck(axis_units, axisIdx)]; }
+    [[nodiscard]] std::string_view       axisUnit(std::size_t axisIdx = 0UZ) const { return axis_units[_axCheck(axis_units, axisIdx)]; }
+    [[nodiscard]] std::span<TAxis>       axisValues(std::size_t axisIdx = 0UZ) { return axis_values[_axCheck(axis_values, axisIdx)]; }
+    [[nodiscard]] std::span<const TAxis> axisValues(std::size_t axisIdx = 0UZ) const { return axis_values[_axCheck(axis_values, axisIdx)]; }
 
     [[nodiscard]] constexpr std::size_t size() const noexcept { return signal_names.size(); }
     [[nodiscard]] std::string&          signalName(std::size_t signalIdx = 0UZ) { return signal_names[_idxCheck(signal_names, signalIdx)]; }
@@ -183,6 +190,8 @@ private:
 static_assert(DataSetLike<DataSet<std::byte>>, "DataSet<std::byte> concept conformity");
 static_assert(DataSetLike<DataSet<float>>, "DataSet<float> concept conformity");
 static_assert(DataSetLike<DataSet<double>>, "DataSet<double> concept conformity");
+static_assert(DataSetLike<DataSet<std::int32_t, double>>, "DataSet with an axis type distinct from its sample type");
+static_assert(std::is_same_v<DataSet<float>::axis_value_type, float>, "the axis type defaults to the sample type");
 
 template<typename T>
 struct Packet {
