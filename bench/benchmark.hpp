@@ -20,6 +20,10 @@
 #include <unordered_map>
 #include <variant>
 
+// Boost.UT exports itself as a module where the compiler advertises modules, which plain header inclusion cannot take
+#ifndef BOOST_UT_DISABLE_MODULE
+#define BOOST_UT_DISABLE_MODULE
+#endif
 #include <boost/ut.hpp>
 
 #if __has_include(<unistd.h>)  && __has_include(<sys/ioctl.h>)  && __has_include(<sys/syscall.h>) && __has_include(<linux/perf_event.h>) && !defined(BENCHMARK_NO_PERF_COUNTER)

@@ -566,18 +566,7 @@ requires std::is_enum_v<E>
 
 #else // fallback: magic_enum with optional gr::meta::detail::EnumTraits<E> override for hot enums
 
-#ifdef __GNUC__
-#pragma GCC diagnostic push // ignore warnings from external lib we can't control
-#ifndef __clang__
-#pragma GCC diagnostic ignored "-Wuseless-cast"
-#endif
-#pragma GCC diagnostic ignored "-Wsign-conversion"
-#endif
-#include <magic_enum.hpp>
-#include <magic_enum_utility.hpp>
-#ifdef __GNUC__
-#pragma GCC diagnostic pop
-#endif
+#include <gnuradio-4.0/meta/MagicEnum.hpp>
 
 namespace gr::meta {
 

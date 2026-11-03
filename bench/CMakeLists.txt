@@ -2,6 +2,7 @@ add_library(ut-benchmark INTERFACE benchmark.hpp)
 add_library(gnuradio4::ut-benchmark ALIAS ut-benchmark)
 target_include_directories(ut-benchmark INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
                                                   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+target_link_libraries(ut-benchmark INTERFACE ut)
 install(TARGETS ut-benchmark EXPORT gnuradio4Targets)
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/benchmark.hpp DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 

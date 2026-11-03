@@ -15,7 +15,6 @@ repos:
     rev: v18.1.8
     hooks:
       - id: clang-format
-        exclude: ^third_party/
   - repo: https://github.com/JoC0de/pre-commit-prettier
     rev: "v3.8.1"
     hooks:

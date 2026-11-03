@@ -19,19 +19,7 @@
 #include <gnuradio-4.0/Value.hpp>
 #include <gnuradio-4.0/ValueHelper.hpp>
 
-#ifdef __GNUC__
-// ignore warning from external libraries we don't control
-#pragma GCC diagnostic push
-#ifndef __clang__
-#pragma GCC diagnostic ignored "-Wuseless-cast"
-#endif
-#pragma GCC diagnostic ignored "-Wsign-conversion"
-#endif
-#include <magic_enum.hpp>
-#include <magic_enum_utility.hpp>
-#ifdef __GNUC__
-#pragma GCC diagnostic pop
-#endif
+#include <gnuradio-4.0/meta/MagicEnum.hpp>
 
 namespace gr::pmt {
 
