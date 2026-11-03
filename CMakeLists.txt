@@ -667,9 +667,10 @@ add_subdirectory(bench) # custom ut addon for microbenchmarking
 add_subdirectory(core)
 add_subdirectory(meta)
 
-# after core, because the tool's test is built over core's own test plugins. It is a command-line program, which a
-# browser runtime has no way to invoke, so a WASM build leaves it out.
-if(ENABLE_TOOLS AND NOT EMSCRIPTEN)
+# after core, because the tools' tests are built over core's own test plugins. The programs find their blocks in
+# plugins, and a WASM build has no plugin system: it builds only the gnuradio-rungraph library, for a program that links
+# its block families.
+if(ENABLE_TOOLS)
   add_subdirectory(tools)
 endif()
 
