@@ -36,6 +36,11 @@ if(GR_ENABLE_BLOCK_REGISTRY)
   install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 endif()
 
+# under Emscripten the library is built alone, without the programs and their tests
+if(EMSCRIPTEN)
+  return()
+endif()
+
 # graphdoc and the headers it shares with its test. It is an ordinary consumer of the installed headers: nothing here is
 # compiled into the libraries. Its document is read from the graph file, so it is built whether or not the registry is
 # on.
