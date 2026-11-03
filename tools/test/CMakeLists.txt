@@ -92,6 +92,15 @@ if(TARGET rungraph)
   endif()
 endif()
 
+# gr::tools::runGraph called twice in the test's own process, with core's test blocks compiled into it
+if(TARGET gnuradio-rungraph)
+  add_ut_test(qa_RunGraphLibrary)
+  target_link_libraries(qa_RunGraphLibrary PRIVATE gnuradio-rungraph)
+  target_include_directories(qa_RunGraphLibrary PRIVATE ${PROJECT_SOURCE_DIR}/core/test/plugins)
+  target_compile_definitions(qa_RunGraphLibrary PRIVATE GR_TOOLS_TEST_ASSETS="${GR_TOOLS_TEST_ASSETS}")
+  set_tests_properties(qa_RunGraphLibrary PROPERTIES TIMEOUT 60)
+endif()
+
 # grinfo is tested as the program a caller runs, for the same reason. It is given core's own test plugins and, beside
 # them, the directory of shared objects that register blocks without being plugins, so that both kinds of file appear in
 # one report. One case is given the plugin ABI test directory, which holds a plugin built at plugin ABI version 1.
