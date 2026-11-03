@@ -88,6 +88,15 @@ Merge types live in `<gnuradio-4.0/BlockMerging.hpp>` (explicit include required
 #include <gnuradio-4.0/BlockMerging.hpp>
 ```
 
+Every merge type follows the same tag and settings rules.
+
+A merged block forwards no tag when a member declares `NoTagPropagation` or its own
+`forwardTags()`. Otherwise it forwards every tag key that no member lists in
+`DroppedTagKeys`. A member sees no input tag, and a tag a member publishes is dropped:
+a block that reads or publishes tags does not work as a member.
+
+The settings rules are under [Settings forwarding](#settings-forwarding).
+
 ### `Merge` — two blocks in series
 
 Connects an output port of the left block to an input port of the right block:
@@ -104,7 +113,7 @@ auto& chain = graph.emplaceBlock<Chain>();
 ```
 
 The merged block exposes all ports from both sub-blocks **except** the connected
-pair. Settings are forwarded via nested property_map keys `"leftBlock"` and `"rightBlock"`.
+pair.
 
 ### `SplitMergeCombine` — fan-out topology
 
@@ -186,19 +195,38 @@ graph.connect<"out", "in">(source, filter)
 
 ### Settings forwarding
 
-Merged blocks accept nested settings via sub-block keys:
+A merged block does not declare its members' settings. A graph file that names, for a
+merged block, a member's setting other than the keys every block has is refused, and
+`set()` returns the key unapplied. The keys every block has, such as `name`, are the
+merged block's own; a `name` set on the merged block is passed on to the members, except
+the Monitor of a `FeedbackMerge`.
+
+The constructor's map reaches the members: a flat key goes to every member, except the
+Monitor of a `FeedbackMerge`, and the map under a sub-block key goes to that member
+alone. The merged block itself takes no key from this map, `name` included:
+`{{"name", "chain"}}` names both members `chain` and the merged block keeps its type
+name. A key that no member declares is ignored without an error, where `emplaceBlock` of
+a single block throws. A member can also be reached directly, for example with `path<I>()`
+on `SplitMergeCombine`.
 
 ```cpp
 // MergeByIndex: keys "leftBlock" and "rightBlock"
-chain.settings().set({{"leftBlock", property_map{{"gain", 2.0f}}},
-                      {"rightBlock", property_map{{"gain", 3.0f}}}});
+using Chain = gr::MergeByIndex<Scale<float, 2>, 0, Scale<float, 3>, 0>;
+auto& chain = graph.emplaceBlock<Chain>({{"leftBlock", property_map{{"gain", 2.0f}}},
+                                         {"rightBlock", property_map{{"gain", 3.0f}}}});
 
 // SplitMergeCombine: keys "path0", "path1", ...
-fanout.settings().set({{"path0", property_map{{"gain", 2.0f}}}});
+auto& fanout = graph.emplaceBlock<FanOut>({{"path0", property_map{{"gain", 2.0f}}}});
 
-// FeedbackMerge: keys "forward" and "feedback"
-iir.settings().set({{"feedback", property_map{{"gain", 0.95f}}}});
+// FeedbackMerge: keys "forward", "feedback" and "monitor";
+// a flat key goes to forward and feedback only
+auto& iir = graph.emplaceBlock<IIR>({{"feedback", property_map{{"gain", 0.95f}}}});
 ```
+
+A block meant for graph files declares the settings it exposes, holds the merged block
+and, in `settingsChanged`, passes each setting on to a member with the member's
+`settings().setStaged()` and `applyStagedParameters()`; `set()` on a member stores the
+value without applying it.
 
 ---
 
