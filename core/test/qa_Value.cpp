@@ -6,7 +6,7 @@
 #include <atomic>
 #include <complex>
 #include <cstdint>
-#include <magic_enum.hpp>
+#include <gnuradio-4.0/meta/MagicEnum.hpp>
 #include <memory_resource>
 #include <ostream>
 #include <string>

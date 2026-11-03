@@ -25,7 +25,7 @@ ENV JAVA_HOME=/opt/java/openjdk \
 # && wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | apt-key add - && add-apt-repository 'deb http://apt.llvm.org/mantic/ llvm-toolchain-mantic-18 main'
 # && wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null | gpg --dearmor - | tee /usr/share/keyrings/kitware-archive-keyring.gpg >/dev/null && echo 'deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ jammy main' | tee -a /etc/apt/sources.list.d/kitware.list >/dev/null
 RUN apt-get update -y \
-    && apt-get install --no-install-recommends -qqy wget gpg ca-certificates software-properties-common bash file locales python3-pip npm sudo cmake git make ninja-build clang-20 clang-tools-20 libc++-20-dev libc++abi-20-dev libclang-20-dev libclang-rt-20-dev libomp-20-dev llvm-20-dev lld-20 gdb lldb-20 gcc-14 g++-14 gcc-15 g++-15 ccache mold libcpp-httplib-dev libcurl4-openssl-dev libngtcp2-dev libnghttp2-dev libnghttp3-dev libonnxruntime-dev libonnxruntime1.21 libonnxruntime-providers onnxruntime-tools libsoundio-dev libegl1-mesa-dev libgl-dev pkg-config \
+    && apt-get install --no-install-recommends -qqy wget gpg ca-certificates software-properties-common bash file locales python3-pip npm sudo cmake git make ninja-build clang-20 clang-tools-20 libc++-20-dev libc++abi-20-dev libclang-20-dev libclang-rt-20-dev libomp-20-dev llvm-20-dev lld-20 gdb lldb-20 gcc-14 g++-14 gcc-15 g++-15 ccache mold libcurl4-openssl-dev libngtcp2-dev libnghttp2-dev libnghttp3-dev libonnxruntime-dev libonnxruntime1.21 libonnxruntime-providers onnxruntime-tools libsoundio-dev libegl1-mesa-dev libgl-dev pkg-config \
     && locale-gen en_US.UTF-8 && echo 'LANG="en_US.UTF-8"'>/etc/default/locale \
     && useradd -m -g users user \
     && echo user ALL=\(root\) NOPASSWD:ALL > /etc/sudoers.d/user && chmod 0440 /etc/sudoers.d/user \
@@ -103,6 +103,30 @@ RUN apt-get update && \
     apt-get update && \
     apt-get install -y libcpr-dev
 
+# Install the third-party dependencies (Boost.UT, cpp-httplib, magic_enum, vir-simd) via the gr-deps superbuild, once
+# for native builds and once into the Emscripten sysroot, where the Emscripten toolchain file roots its package
+# searches. All of them are header-only with architecture-independent package files, so the host compiler configures
+# both.
+ARG GR_DEPS_REPOSITORY=https://github.com/johnwparent/gnuradio4-superbuild.git
+ARG GR_DEPS_REF=f23ee97613a606c8f70cdd6a40a8ade47e7ce9ad
+ENV GR_DEPS_PREFIX=/opt/gr-deps
+
+RUN . ${EMSDK_HOME}/emsdk_env.sh \
+ && export CC=gcc CXX=g++ \
+ && emscripten_sysroot="$(em-config CACHE)/sysroot" \
+ && git clone ${GR_DEPS_REPOSITORY} /tmp/gr-deps \
+ && git -C /tmp/gr-deps checkout ${GR_DEPS_REF} \
+ && cmake -S /tmp/gr-deps -B /tmp/gr-deps/build-native -G Ninja \
+      -DCMAKE_INSTALL_PREFIX=${GR_DEPS_PREFIX} \
+      -DENABLE_PYTHON3=OFF \
+ && cmake --build /tmp/gr-deps/build-native \
+ && cmake -S /tmp/gr-deps -B /tmp/gr-deps/build-emscripten -G Ninja \
+      -DCMAKE_INSTALL_PREFIX="${emscripten_sysroot}" \
+      -DENABLE_PYTHON3=OFF \
+ && cmake --build /tmp/gr-deps/build-emscripten \
+ && rm -rf /tmp/gr-deps
+
+ENV CMAKE_PREFIX_PATH=${GR_DEPS_PREFIX}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}
 ENV PATH="${ACPP_INSTALL_PREFIX}/bin:${PATH}"
 
 USER user

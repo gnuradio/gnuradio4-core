@@ -21,33 +21,14 @@ set(GR_RULES_TEST_FORWARDED
     CMAKE_MAKE_PROGRAM
     CMAKE_PREFIX_PATH
     CMAKE_FIND_ROOT_PATH
+    magic_enum_DIR
     ut_DIR
+    vir-simd_DIR
     httplib_DIR)
-if(GR_USE_FETCHCONTENT_DEPS)
-  # The fixture takes the fetched sources and configures them in its own tree.
-  set(FETCHCONTENT_SOURCE_DIR_UT "${ut_SOURCE_DIR}")
-  set(FETCHCONTENT_SOURCE_DIR_VIR-SIMD "${vir-simd_SOURCE_DIR}")
-  list(
-    APPEND
-    GR_RULES_TEST_FORWARDED
-    FETCHCONTENT_SOURCE_DIR_UT
-    FETCHCONTENT_SOURCE_DIR_VIR-SIMD)
-else()
-  list(
-    APPEND
-    GR_RULES_TEST_FORWARDED
-    GR_BOOST_UT_INCLUDE_DIR
-    vir-simd_SOURCE_DIR)
-endif()
 set(GR_RULES_TEST_CACHE_TEXT "")
 foreach(_option ENABLE_TESTING ENABLE_EXAMPLES ENABLE_TOOLS)
   string(APPEND GR_RULES_TEST_CACHE_TEXT "set(${_option} OFF CACHE BOOL \"\")\n")
 endforeach()
-set(_fetch OFF)
-if(GR_USE_FETCHCONTENT_DEPS)
-  set(_fetch ON)
-endif()
-string(APPEND GR_RULES_TEST_CACHE_TEXT "set(GR_USE_FETCHCONTENT_DEPS ${_fetch} CACHE BOOL \"\")\n")
 foreach(_name IN LISTS GR_RULES_TEST_FORWARDED)
   if(${_name})
     string(APPEND GR_RULES_TEST_CACHE_TEXT "set(${_name} [==[${${_name}}]==] CACHE STRING \"\")\n")
