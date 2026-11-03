@@ -18,9 +18,10 @@ As the installation and packaging matures, these instructions are expected to be
   - GCC ≥ 14.2 (Linux)
 - Git
 - pkg-config
-- Boost.UT development package or installed headers
-- cpp-httplib development package
-- vir-simd headers
+- magic_enum >= 0.9.3
+- vir-simd >= 0.4.4
+- Boost.UT >= 2.3.1, only when building tests and benchmarks
+- cpp-httplib >= 0.18.1, only when building tests natively
 - Python 3 (optional)
 
 Verify tool versions:
@@ -80,6 +81,10 @@ Downstream repositories should configure with:
 cmake -S . -B build -DCMAKE_PREFIX_PATH="$HOME/gr4-core"
 ```
 
+The installed package finds magic_enum and vir-simd for every consumer. A consumer that configures with
+`ENABLE_TESTING` set also needs Boost.UT (>= 2.3.1), because the installed `UnitTestHelper.hpp` and
+`gnuradio4::ut-benchmark` include it.
+
 For CI or containerized downstream development, use the published core SDK image
 instead of a local install. See [docs/ci/sdk-image.md](docs/ci/sdk-image.md).
 
@@ -87,12 +92,12 @@ instead of a local install. See [docs/ci/sdk-image.md](docs/ci/sdk-image.md).
 
 ```bash
 sudo apt update
-sudo apt install -y cmake g++ git libcpp-httplib-dev pkg-config python3 python3-dev
+sudo apt install -y cmake g++ git pkg-config python3 python3-dev
 ```
 
-Ubuntu 24.04 does not package all native dependencies used by the default core build. Install Boost.UT and vir-simd
-from source or use the GNU Radio CI builder image. For an explicit online fallback, configure with
-`-DGR_USE_FETCHCONTENT_DEPS=ON`.
+Ubuntu 24.04 does not package all native dependencies used by the default core build. Install magic_enum
+(>= 0.9.3), vir-simd (>= 0.4.4) and, for tests, Boost.UT (>= 2.3.1) and cpp-httplib (>= 0.18.1) from source, and pass their install prefix in `CMAKE_PREFIX_PATH`. The
+[gr-deps superbuild](https://github.com/johnwparent/gnuradio4-superbuild) builds all four into one prefix.
 
 ## macOS via Homebrew
 
