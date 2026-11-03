@@ -1,0 +1,948 @@
+// rungraph - load a graph file, run it, and report what the run was asked to report. gr::tools::runGraph takes main's
+// arguments and returns the exit status.
+//
+// No block, setting or connection is named in this file. The graph file names the blocks. The block registry supplies
+// them, from the block libraries the program links and from the plugins of the searched directories. gr::RuntimeGraph
+// builds the graph and gr::Runtime runs it. A changed chain needs no rebuilt program.
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <charconv>
+#include <chrono>
+#include <cmath>
+#include <complex>
+#include <csignal>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <expected>
+#include <format>
+#include <fstream>
+#include <functional>
+#include <iostream>
+#include <iterator>
+#include <map>
+#include <memory>
+#include <optional>
+#include <print>
+#include <set>
+#include <span>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <tuple>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#include <gnuradio-4.0/tools/RunGraph.hpp>
+
+#include <gnuradio-4.0/BlockRegistry.hpp>
+#include <gnuradio-4.0/PluginLoader.hpp>
+#include <gnuradio-4.0/PmtTypeHelpers.hpp>
+#include <gnuradio-4.0/Runtime.hpp>
+#include <gnuradio-4.0/YamlPmt.hpp>
+#include <gnuradio-4.0/config.hpp>
+#include <gnuradio-4.0/formatter/ValueFormatter.hpp>
+
+#include "ShippedSchedulers.hpp"
+
+namespace {
+
+constexpr std::string_view kProgram = "rungraph";
+
+constexpr std::string_view kUsage = R"(rungraph - run a GNU Radio 4 graph file
+
+Usage: rungraph --graph <file> [options]
+
+  --graph <file>     the graph to run, in the GRC YAML dialect; - reads it from standard input
+)"
+#ifdef INTERNAL_ENABLE_BLOCK_PLUGINS
+                                    R"(  --plugin-dir <dir> a directory to load plugins and block libraries from; repeatable
+)"
+#else
+                                    R"(  --plugin-dir <dir> a directory to read YAML block definitions from; repeatable
+)"
+#endif
+                                    R"(  --scheduler <key>  the registry key of the scheduler that runs the graph;
+                     gr::scheduler::Simple<singleThreaded> without it
+  --seconds <s>      stop the graph after <s> seconds; without it the run ends when the graph does
+  --show <name>      print the settings of the block named <name> when the run ends; repeatable
+  --set, -s <key>=<value>
+                     set one setting before the run; repeatable
+  --expect <block>.<key>=<value>
+                     require the setting <key> of <block> to hold <value> when the run ends; repeatable
+  --expect-tolerance <abs>
+                     the difference a floating-point --expect value may have; 0 without it
+  --expect-error <text>
+                     require the run to fail with an error whose reason holds <text>; repeatable
+)"
+#ifdef INTERNAL_ENABLE_BLOCK_PLUGINS
+                                    R"(  --verbose          list what each plugin directory loaded, the keys it brought and the scheduler
+)"
+#else
+                                    R"(  --verbose          list what each directory defined, the keys it brought and the scheduler
+)"
+#endif
+                                    R"(  --help, -h         this text
+
+)"
+#ifdef INTERNAL_ENABLE_BLOCK_PLUGINS
+                                    R"(The blocks come from the directories named by --plugin-dir, from GNURADIO4_PLUGIN_DIRECTORIES,
+the colon-separated list the framework's own plugin loader reads, and from the plugin directory
+of this installation, which is always searched.)"
+#else
+                                    R"(The blocks come from the block libraries linked into this program, which loads no plugins.
+From the directories named by --plugin-dir, by GNURADIO4_PLUGIN_DIRECTORIES and the plugin
+directory of this installation it reads only the YAML block definitions an index.yaml
+lists.)"
+#endif
+                                    R"( A directory named twice is searched once.
+
+rungraph registers core's Simple scheduler under one key per execution policy:
+gr::scheduler::Simple<singleThreaded> runs every block on one thread,
+gr::scheduler::Simple<multiThreaded> spreads the blocks over the threads of the processing pool,
+gr::scheduler::Simple<singleThreadedBlocking> runs on one thread and sleeps while no block
+makes progress, and gr::scheduler::Simple<multiThreadedBlocking> spreads the blocks over the
+pool's threads, each of which sleeps while its own blocks make no progress.)"
+#ifdef INTERNAL_ENABLE_BLOCK_PLUGINS
+                                    R"( A plugin or a block
+library in the searched directories may register more, and grinfo schedulers lists them all. A
+)"
+#else
+                                    R"(
+A )"
+#endif
+                                    R"(key the registry does not hold is refused with the list of the keys it holds.
+
+A settings map holds what the last refresh put there, so the settings --show prints are read
+after the run has ended and the block has been asked to refresh them: a counter a block keeps
+as a readable member is then current as of the last sample it processed.
+
+A bare key of --set names a setting of the scheduler --scheduler chose, and a key of the form
+<block>.<key> names a setting of the one top-level block whose unique_name or name is <block>;
+a <block> two blocks carry is refused. The split is at the last dot before the '=', so a block
+name may hold a dot and a setting key never does. rungraph reads the value the way a graph file's
+parameter value is read, so a type tag applies: -s timeout_ms=50,
+-s 'shift.frequency_shift=!!float32 -100000'. One --set carries one setting, and a value that
+holds a second key is refused. The last --set of a key wins.
+
+The scheduler setting max_work_items bounds the samples of each block's call on the Simple
+schedulers: the input samples of a block that has inputs, the output samples of a source.
+-s max_work_items=1 and -s max_work_items=7 run one graph at two call sizes. The bound does not
+hold for every call. An Async port takes every sample available, whatever the bound. A port's
+min_samples and a block's input_chunk_size raise a call to that many samples. A block with a
+stride takes one chunk per call. Without a stride, a block whose input_chunk_size is larger than
+the bound takes one chunk per call, and a smaller one takes the whole chunks that fit within it.
+A nested graph's blocks run under its own scheduler's max_work_items.
+
+--expect names its block as --show does and reads its value as --set does. The block's settings
+are read as --show reads them, after a run that ended on its own or was stopped by --seconds or
+a signal; a run that failed reports its failure and compares nothing. A number compares in the
+type of the block's setting: a value the setting's type cannot hold differs, and a floating-point
+value may differ by the --expect-tolerance. A vector compares element by element. Each value
+that differs is printed on one line with the block, the key, the value the block holds and the
+value expected.
+
+With --expect-error the graph has to fail while its file is loaded, while it starts or while it
+runs, and each <text> has to be part of the error's own reason. A run that does not fail, or fails
+without one of the texts, is reported on one line for each text, naming what was expected and
+what happened.
+
+SIGINT and SIGTERM stop the graph as a --seconds bound does.
+
+Exit status is 0 when the run stopped cleanly and each --expect held, and when the run failed
+with each error --expect-error names. It is 1 when the graph could not be read, loaded or run,
+when a --set, --show or --expect names a block or a block setting the graph does not hold,
+when an --expect does not hold and when an --expect-error is not met. With --expect-error, a
+--set the graph file refuses counts as a failure at load. It is 2 when the command
+line could not be used, a scheduler the registry does not hold or cannot build and a scheduler
+setting the scheduler does not declare included.
+)";
+
+std::atomic<bool> gStopRequested{false};
+
+extern "C" {
+static void onSignal(int) { gStopRequested.store(true, std::memory_order_relaxed); }
+}
+
+// Sets onSignal as the handler of SIGINT and SIGTERM, and puts back the handlers it replaced when it goes out of scope.
+struct SignalHandlers {
+    using Handler = decltype(std::signal(SIGINT, SIG_DFL));
+
+    Handler previousInterrupt = std::signal(SIGINT, onSignal);
+    Handler previousTerminate = std::signal(SIGTERM, onSignal);
+
+    SignalHandlers()                                 = default;
+    SignalHandlers(const SignalHandlers&)            = delete;
+    SignalHandlers& operator=(const SignalHandlers&) = delete;
+
+    ~SignalHandlers() {
+        if (previousInterrupt != SIG_ERR) {
+            std::signal(SIGINT, previousInterrupt);
+        }
+        if (previousTerminate != SIG_ERR) {
+            std::signal(SIGTERM, previousTerminate);
+        }
+    }
+};
+
+// one --set
+struct Setting {
+    std::string block; // the block the setting belongs to; empty names the scheduler
+    std::string key;
+    std::string value; // the text after the '=', read as a graph file's parameter value is read
+};
+
+struct Options {
+    std::string              graph; // the graph file, or "-" for standard input
+    std::vector<std::string> pluginDirectories;
+    std::string              scheduler{gr::Runtime::kDefaultScheduler};
+    std::vector<std::string> show;            // the blocks whose settings are printed when the run ends
+    std::vector<Setting>     settings;        // in command-line order, so that the last of a key wins
+    std::vector<Setting>     expectations;    // the values the blocks must hold when the run ends
+    std::vector<std::string> expectedErrors;  // the texts the reason of the run's failure must hold
+    double                   tolerance = 0.0; // the difference a floating-point expectation may have
+    double                   seconds   = 0.0; // 0 runs until the graph ends or a signal arrives
+    bool                     verbose   = false;
+    bool                     help      = false;
+};
+
+// a run bound, or nothing when the text is not one positive number
+[[nodiscard]] std::optional<double> secondsOf(std::string_view text) {
+    double     value  = 0.0;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() || !(value > 0.0)) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+// a tolerance, or nothing when the text is not one finite number of zero or more
+[[nodiscard]] std::optional<double> toleranceOf(std::string_view text) {
+    double     value  = 0.0;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() || !std::isfinite(value) || value < 0.0) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+// one <key>=<value>, or nothing when the text is not one; a key carrying a dot names a block and the key under it
+[[nodiscard]] std::optional<Setting> settingOf(std::string_view text) {
+    const std::size_t assignment = text.find('=');
+    if (assignment == std::string_view::npos || assignment == 0UZ) {
+        return std::nullopt;
+    }
+    const std::string_view target = text.substr(0UZ, assignment);
+    const std::string_view value  = text.substr(assignment + 1UZ);
+    const std::size_t      dot    = target.rfind('.');
+    if (dot == std::string_view::npos) {
+        return Setting{std::string(), std::string(target), std::string(value)};
+    }
+    if (dot == 0UZ || dot + 1UZ == target.size()) {
+        return std::nullopt;
+    }
+    return Setting{std::string(target.substr(0UZ, dot)), std::string(target.substr(dot + 1UZ)), std::string(value)};
+}
+
+// the command line, or nothing when it cannot be used; every refusal is reported as it is found
+[[nodiscard]] std::optional<Options> parse(std::span<const std::string_view> arguments) {
+    Options options;
+    for (std::size_t index = 0UZ; index < arguments.size();) {
+        const std::string_view argument = arguments[index];
+        if (argument == "--help" || argument == "-h") {
+            options.help = true;
+            ++index;
+            continue;
+        }
+        if (argument == "--verbose") {
+            options.verbose = true;
+            ++index;
+            continue;
+        }
+        // the option is recognized before its value is asked for, so that an unknown option in the last position is
+        // reported as unknown rather than as one missing a value
+        constexpr std::array<std::string_view, 10UZ> kTakesValue{"--graph", "--plugin-dir", "--scheduler", "--show", "--seconds", "--set", "-s", "--expect", "--expect-tolerance", "--expect-error"};
+        if (!std::ranges::contains(kTakesValue, argument)) {
+            std::println(stderr, "{}: unknown option '{}'", kProgram, argument);
+            return std::nullopt;
+        }
+        if (index + 1UZ >= arguments.size()) {
+            std::println(stderr, "{}: {} needs a value", kProgram, argument);
+            return std::nullopt;
+        }
+        const std::string_view value = arguments[index + 1UZ];
+        index += 2UZ;
+        if (argument == "--graph") {
+            options.graph.assign(value);
+        } else if (argument == "--plugin-dir") {
+            options.pluginDirectories.emplace_back(value);
+        } else if (argument == "--scheduler") {
+            options.scheduler.assign(value);
+        } else if (argument == "--show") {
+            options.show.emplace_back(value);
+        } else if (argument == "--set" || argument == "-s") {
+            std::optional<Setting> setting = settingOf(value);
+            if (!setting.has_value()) {
+                std::println(stderr, "{}: --set takes <key>=<value> or <block>.<key>=<value>, not '{}'", kProgram, value);
+                return std::nullopt;
+            }
+            options.settings.push_back(std::move(*setting));
+        } else if (argument == "--expect") {
+            std::optional<Setting> expectation = settingOf(value);
+            if (!expectation.has_value() || expectation->block.empty()) {
+                std::println(stderr, "{}: --expect takes <block>.<key>=<value>, not '{}'", kProgram, value);
+                return std::nullopt;
+            }
+            options.expectations.push_back(std::move(*expectation));
+        } else if (argument == "--expect-tolerance") {
+            const std::optional<double> tolerance = toleranceOf(value);
+            if (!tolerance.has_value()) {
+                std::println(stderr, "{}: --expect-tolerance takes one number of zero or more, not '{}'", kProgram, value);
+                return std::nullopt;
+            }
+            options.tolerance = *tolerance;
+        } else if (argument == "--expect-error") {
+            if (value.empty()) {
+                std::println(stderr, "{}: --expect-error takes the text the reason must hold, not an empty one", kProgram);
+                return std::nullopt;
+            }
+            options.expectedErrors.emplace_back(value);
+        } else {
+            const std::optional<double> seconds = secondsOf(value);
+            if (!seconds.has_value()) {
+                std::println(stderr, "{}: --seconds takes one positive number of seconds, not '{}'", kProgram, value);
+                return std::nullopt;
+            }
+            options.seconds = *seconds;
+        }
+    }
+    if (!options.help && options.graph.empty()) {
+        std::println(stderr, "{}: --graph names the graph file to run", kProgram);
+        return std::nullopt;
+    }
+    return options;
+}
+
+// the graph file's text, or nothing when it could not be read
+[[nodiscard]] std::optional<std::string> readGraph(const std::string& path) {
+    std::ostringstream text;
+    if (path == "-") {
+        text << std::cin.rdbuf();
+        return text.str();
+    }
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        std::println(stderr, "{}: {} could not be read", kProgram, path);
+        return std::nullopt;
+    }
+    text << file.rdbuf();
+    return text.str();
+}
+
+// where the blocks are looked for, in the order the directories are searched
+[[nodiscard]] std::vector<std::string> searchDirectories(const std::vector<std::string>& fromCommandLine) {
+    std::vector<std::string> directories;
+    auto                     add = [&directories](std::string_view directory) {
+        if (!directory.empty() && std::ranges::find(directories, directory) == directories.end()) {
+            directories.emplace_back(directory);
+        }
+    };
+    for (const std::string& directory : fromCommandLine) {
+        add(directory);
+    }
+    if (const char* environment = std::getenv("GNURADIO4_PLUGIN_DIRECTORIES"); environment != nullptr) {
+        const std::string_view list(environment);
+        for (std::size_t start = 0UZ; start < list.size();) {
+            const std::size_t separator = list.find(':', start);
+            const std::size_t end       = separator == std::string_view::npos ? list.size() : separator;
+            add(list.substr(start, end - start));
+            start = end + 1UZ;
+        }
+    }
+    add(GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY);
+    return directories;
+}
+
+// what the directories held: the files that loaded, the files that did not, and the block keys they brought
+void reportPlugins(const gr::PluginLoader& loader, const std::vector<std::string>& directories, const std::vector<std::string>& keysBefore) {
+    for (const std::string& directory : directories) {
+        std::println(stderr, "{}: searching {}", kProgram, directory);
+    }
+    for (const gr::PluginLoader::BlockLibrary& library : loader.blockLibraries()) {
+        std::println(stderr, "{}: loaded {} ({} block registration(s))", kProgram, library.file, library.nBlockRegistrations);
+    }
+    for (const std::string& file : loader.ordinaryLibraries()) {
+        std::println(stderr, "{}: loaded {} (no plugin entry point; this load registered nothing)", kProgram, file);
+    }
+    for (const auto& [file, reason] : loader.failedPlugins()) {
+        std::println(stderr, "{}: {} did not load: {}", kProgram, file, reason);
+    }
+    for (const std::string& file : loader.skippedFiles()) {
+        std::println(stderr, "{}: {} was not opened; its name only reads as a shared object", kProgram, file);
+    }
+    std::vector<std::string> available = loader.availableBlocks();
+    std::ranges::sort(available);
+    std::vector<std::string> added;
+    std::ranges::set_difference(available, keysBefore, std::back_inserter(added));
+    std::println(stderr, "{}: the load brought {} block key(s):", kProgram, added.size());
+    for (const std::string& key : added) {
+        std::println(stderr, "{}:   {}", kProgram, key);
+    }
+}
+
+// One block's readable settings, one `label: key = value` line each, in key order, where `label` is the name --show
+// gave.
+//
+// A block's settings are those of its last settings change, and the run refreshes them when it ends. The run is over by
+// the time this is called, so a member that moved while the block ran is read as the block left it.
+void showSettings(std::string_view label, const gr::BlockHandle& block) {
+    std::vector<std::pair<std::string, std::string>> lines;
+    for (const auto& [key, value] : block.get()) {
+        lines.emplace_back(std::string(key.begin(), key.end()), std::format("{}", value));
+    }
+    std::ranges::sort(lines);
+    for (const auto& [key, value] : lines) {
+        std::println("{}: {} = {}", label, key, value);
+    }
+    std::fflush(stdout);
+}
+
+// the scheduler's settings, and the settings of each block named, which the graph file is read with
+struct StagedSettings {
+    gr::property_map                                     scheduler;
+    std::map<std::string, gr::property_map, std::less<>> blocks;
+};
+
+// The value of one --set or --expect, named by `option`, or nothing when the value cannot be read or stands for more
+// than the key it was given for.
+//
+// The pair becomes a one-entry YAML document and the framework's own reader gives the value its type, so the text after
+// the '=' means here what the same text means as a parameter of a graph file: a bare `true` is a boolean, a bare number
+// an integer, and a tagged `!!float32 1.5` a float. The document has to come back holding that one key alone: text
+// carrying a second line would otherwise stand for a key the caller never wrote.
+[[nodiscard]] std::optional<gr::pmt::Value> valueOf(std::string_view option, const Setting& setting) {
+    const auto parsed = gr::pmt::yaml::deserialize(std::format("{}: {}", setting.key, setting.value));
+    if (!parsed.has_value()) {
+        std::println(stderr, "{}: the value of {} {} could not be read: {}", kProgram, option, setting.key, parsed.error().message);
+        return std::nullopt;
+    }
+    if (parsed->size() != 1UZ || std::string_view(parsed->begin()->first) != setting.key) {
+        std::println(stderr, "{}: {} takes one value for one key, and the value of {} {} holds more than one key", kProgram, option, option, setting.key);
+        return std::nullopt;
+    }
+    return parsed->begin()->second;
+}
+
+// The settings the --set arguments stand for, or nothing when one of the values cannot be read. A later setting of a
+// key overwrites an earlier one.
+[[nodiscard]] std::optional<StagedSettings> stagedSettingsOf(const std::vector<Setting>& settings) {
+    StagedSettings staged;
+    for (const Setting& setting : settings) {
+        std::optional<gr::pmt::Value> value = valueOf("--set", setting);
+        if (!value.has_value()) {
+            return std::nullopt;
+        }
+        gr::property_map& target = setting.block.empty() ? staged.scheduler : staged.blocks[setting.block];
+        target.insert_or_assign(std::pmr::string(setting.key), std::move(*value));
+    }
+    return staged;
+}
+
+// one --expect: the block, the setting and the value it must hold when the run ends
+struct Expectation {
+    std::string    block;
+    std::string    key;
+    gr::pmt::Value value;
+};
+
+// the values the --expect arguments stand for, or nothing when one of them cannot be read
+[[nodiscard]] std::optional<std::vector<Expectation>> expectationsOf(const std::vector<Setting>& settings) {
+    std::vector<Expectation> expectations;
+    for (const Setting& setting : settings) {
+        std::optional<gr::pmt::Value> value = valueOf("--expect", setting);
+        if (!value.has_value()) {
+            return std::nullopt;
+        }
+        expectations.push_back(Expectation{setting.block, setting.key, std::move(*value)});
+    }
+    return expectations;
+}
+
+// Calls `fn` with the identity of the number type `type` names, and returns what it returns. Returns false for a type
+// that is not a number.
+template<typename Fn>
+[[nodiscard]] bool withNumberType(gr::pmt::Value::ValueType type, Fn&& fn) {
+    using enum gr::pmt::Value::ValueType;
+    switch (type) {
+    case Int8: return fn(std::type_identity<std::int8_t>{});
+    case Int16: return fn(std::type_identity<std::int16_t>{});
+    case Int32: return fn(std::type_identity<std::int32_t>{});
+    case Int64: return fn(std::type_identity<std::int64_t>{});
+    case UInt8: return fn(std::type_identity<std::uint8_t>{});
+    case UInt16: return fn(std::type_identity<std::uint16_t>{});
+    case UInt32: return fn(std::type_identity<std::uint32_t>{});
+    case UInt64: return fn(std::type_identity<std::uint64_t>{});
+    case Float32: return fn(std::type_identity<float>{});
+    case Float64: return fn(std::type_identity<double>{});
+    case ComplexFloat32: return fn(std::type_identity<std::complex<float>>{});
+    case ComplexFloat64: return fn(std::type_identity<std::complex<double>>{});
+    default: return false;
+    }
+}
+
+// `value` as a double
+template<typename T>
+[[nodiscard]] double asDouble(T value) {
+    if constexpr (std::is_same_v<T, double>) {
+        return value;
+    } else {
+        return static_cast<double>(value);
+    }
+}
+
+// Whether `expected`, read as a T, equals `received`. A value a T cannot hold differs. A floating-point value may differ
+// by `tolerance`, and a NaN equals a NaN. A complex value may lie within `tolerance` of the one expected.
+template<typename T>
+[[nodiscard]] bool equalAs(const T& received, const gr::pmt::Value& expected, double tolerance) {
+    const std::expected<T, std::string> converted = gr::pmt::convert_numerically<T>(expected);
+    if (!converted.has_value()) {
+        return false;
+    }
+    if (received == *converted) {
+        return true;
+    }
+    if constexpr (std::is_floating_point_v<T>) {
+        return (std::isnan(received) && std::isnan(*converted)) || asDouble(std::abs(received - *converted)) <= tolerance;
+    } else if constexpr (!std::is_integral_v<T>) {
+        return asDouble(std::abs(received - *converted)) <= tolerance;
+    } else {
+        return false;
+    }
+}
+
+// the elements of a vector value, each as a value of its own; nothing for a value that is not a vector of numbers or
+// of values
+[[nodiscard]] std::optional<std::vector<gr::pmt::Value>> elementsOf(const gr::pmt::Value& value) {
+    if (!value.is_tensor()) {
+        return std::nullopt;
+    }
+    if (const gr::Tensor<gr::pmt::Value>* list = value.get_if<gr::Tensor<gr::pmt::Value>>(); list != nullptr) {
+        return std::vector<gr::pmt::Value>(list->data(), list->data() + list->size());
+    }
+    std::optional<std::vector<gr::pmt::Value>> elements;
+    std::ignore = withNumberType(value.value_type(), [&value, &elements]<typename T>(std::type_identity<T>) {
+        const gr::Tensor<T>* tensor = value.get_if<gr::Tensor<T>>();
+        if (tensor == nullptr) {
+            return false;
+        }
+        elements.emplace();
+        for (const T& element : std::span(tensor->data(), tensor->size())) {
+            elements->emplace_back(element);
+        }
+        return true;
+    });
+    return elements;
+}
+
+// Compares the value a block holds with the value expected: a number in the block's type, a vector element by element,
+// and any other value by its type and content.
+[[nodiscard]] bool holdsExpected(const gr::pmt::Value& received, const gr::pmt::Value& expected, double tolerance) {
+    if (received.is_tensor()) {
+        const std::optional<std::vector<gr::pmt::Value>> receivedElements = elementsOf(received);
+        const std::optional<std::vector<gr::pmt::Value>> expectedElements = elementsOf(expected);
+        if (receivedElements.has_value() && expectedElements.has_value()) {
+            return std::ranges::equal(*receivedElements, *expectedElements, [tolerance](const gr::pmt::Value& r, const gr::pmt::Value& e) { return holdsExpected(r, e, tolerance); });
+        }
+        return received == expected;
+    }
+    bool equal = false;
+    if (withNumberType(received.value_type(), [&]<typename T>(std::type_identity<T>) {
+            const T* number = received.get_if<T>();
+            equal           = number != nullptr && equalAs(*number, expected, tolerance);
+            return number != nullptr;
+        })) {
+        return equal;
+    }
+    return received == expected;
+}
+
+// Whether the registry holds a scheduler under `key`. A key it does not hold is reported with the keys it holds.
+[[nodiscard]] bool schedulerIsRegistered(const gr::PluginLoader& loader, std::string_view key) {
+    const std::vector<std::string> registered = loader.availableSchedulers();
+    if (std::ranges::contains(registered, key)) {
+        return true;
+    }
+    std::println(stderr, "{}: no scheduler is registered as {}; the registered schedulers are:", kProgram, key);
+    for (const std::string& available : registered) {
+        std::println(stderr, "{}:   {}", kProgram, available);
+    }
+    return false;
+}
+
+// A scheduler is unusable when it cannot be built at all or when it refuses the settings --set gave it.
+enum class SchedulerProblem { cannotBuild, refusesSettings };
+
+// The scheduler registered under `key` built over an empty graph with these settings, as a handle, or the problem
+// that stops it. The probe's runtime is discarded when the function returns.
+//
+// A setting the scheduler will not take is a command-line problem, and the answer is wanted before the graph file is
+// read. The scheduler is built without the settings first, to report a name it does not declare in the words of
+// `--help`. It is then built with the settings, which refuses a value that does not convert or falls outside its
+// limits. Without settings the first build is the only one.
+[[nodiscard]] std::expected<gr::BlockHandle, SchedulerProblem> probeScheduler(const std::shared_ptr<gr::PluginLoader>& loader, std::string_view key, const gr::property_map& settings) {
+    const auto probeOf = [&loader, key](const gr::property_map& parameters) -> std::expected<gr::Runtime, gr::RuntimeError> {
+        std::expected<gr::RuntimeGraph, gr::RuntimeError> empty = gr::RuntimeGraph::fromYaml(loader, "blocks: []\n");
+        if (!empty.has_value()) {
+            return std::unexpected(empty.error());
+        }
+        return gr::Runtime::create(std::move(*empty), key, parameters);
+    };
+
+    const std::expected<gr::Runtime, gr::RuntimeError> bare = probeOf({});
+    if (!bare.has_value()) {
+        std::println(stderr, "{}: the scheduler {} could not be built: {}", kProgram, key, bare.error().message);
+        return std::unexpected(SchedulerProblem::cannotBuild);
+    }
+    if (settings.empty()) {
+        return bare->scheduler();
+    }
+    const std::set<std::string> declared = bare->scheduler().writableMembers();
+    for (const auto& [name, value] : settings) {
+        if (!declared.contains(std::string(name.begin(), name.end()))) {
+            std::println(stderr, "{}: the scheduler declares no setting named '{}'", kProgram, std::string_view(name.data(), name.size()));
+            return std::unexpected(SchedulerProblem::refusesSettings);
+        }
+    }
+    const std::expected<gr::Runtime, gr::RuntimeError> taken = probeOf(settings);
+    if (!taken.has_value()) {
+        std::println(stderr, "{}: a scheduler setting could not be applied: {}", kProgram, taken.error().message);
+        return std::unexpected(SchedulerProblem::refusesSettings);
+    }
+    return taken->scheduler();
+}
+
+// the scheduler chosen and each setting --set gave it, read back from the scheduler
+void reportScheduler(const gr::BlockHandle& scheduler, std::string_view key, const gr::property_map& settings) {
+    std::println(stderr, "{}: scheduler {}", kProgram, key);
+    for (const auto& [name, _] : settings) {
+        if (const std::optional<gr::pmt::Value> value = scheduler.get(std::string(name.begin(), name.end())); value.has_value()) {
+            std::println(stderr, "{}: scheduler setting {} = {}", kProgram, std::string_view(name.data(), name.size()), *value);
+        }
+    }
+}
+
+// The blocks --show names, or nothing when one of them is not in the graph; each missing name is reported. A handle
+// keeps its block when the graph moves into the runtime.
+[[nodiscard]] std::optional<std::vector<gr::BlockHandle>> shownBlocks(const gr::RuntimeGraph& graph, const std::vector<std::string>& names) {
+    std::vector<gr::BlockHandle> shown;
+    bool                         allFound = true;
+    for (const std::string& wanted : names) {
+        std::expected<gr::BlockHandle, gr::RuntimeError> found = graph.find(wanted);
+        if (found.has_value()) {
+            shown.push_back(std::move(*found));
+            continue;
+        }
+        allFound                 = false;
+        const bool nameIsInGraph = std::ranges::any_of(graph.blocks(), [&wanted](const gr::BlockHandle& block) { return block.name() == wanted || block.uniqueName() == wanted; });
+        if (nameIsInGraph) {
+            std::println(stderr, "{}: {}", kProgram, found.error().message);
+        } else {
+            std::println(stderr, "{}: the graph holds no block named {}", kProgram, wanted);
+        }
+    }
+    if (!allFound) {
+        return std::nullopt;
+    }
+    return shown;
+}
+
+// The text of an error without the ` at <file>:<line>` a gr::exception's what() ends with, where `where` is the file the
+// error names. A text without it is returned as it is.
+[[nodiscard]] std::string withoutLocation(std::string_view text, std::string_view where) {
+    const std::size_t colon = text.rfind(':');
+    if (where.empty() || colon == std::string_view::npos || colon + 1UZ == text.size()) {
+        return std::string(text);
+    }
+    const auto isDigit = [](char c) { return c >= '0' && c <= '9'; };
+    if (!std::ranges::all_of(text.substr(colon + 1UZ), isDigit)) {
+        return std::string(text);
+    }
+    const std::string      location = std::format(" at {}", where);
+    const std::string_view head     = text.substr(0UZ, colon);
+    if (!head.ends_with(location)) {
+        return std::string(text);
+    }
+    return std::string(head.substr(0UZ, head.size() - location.size()));
+}
+
+// the errors a run reported: how many, and the first
+struct ReportedErrors {
+    std::size_t count = 0UZ;
+    // the first error's line, worded as the run's result words it, so a result that repeats it is not printed again
+    std::string first;
+    // the first error's own reason, which --expect-error matches
+    std::string firstReason;
+};
+
+// The endpoint of the scheduler's report that a block ended the run with an error status. The block's own report
+// carries the reason, and the run's result holds it.
+constexpr std::string_view kRunEndedByBlockEndpoint = "error in the run";
+
+// Takes the errors reported since the last call into `errors` and prints the first of the run on one line, without the
+// location the report carries. The later ones are counted. The scheduler's notice that a block ended the run is not an
+// error of its own.
+void takeReportedErrors(gr::Runtime& runtime, ReportedErrors& errors) {
+    const std::string scheduler = runtime.scheduler().uniqueName();
+    for (std::vector<gr::RuntimeEvent> events = runtime.pollEvents(); !events.empty(); events = runtime.pollEvents()) {
+        for (const gr::RuntimeEvent& event : events) {
+            if (!event.isError || (event.source == scheduler && event.endpoint == kRunEndedByBlockEndpoint)) {
+                continue;
+            }
+            if (errors.count++ > 0UZ) {
+                continue;
+            }
+            const std::string text = withoutLocation(event.text, event.where);
+            errors.firstReason     = text;
+            if (event.source == scheduler) {
+                std::println(stderr, "{}: the scheduler reports an error on '{}': {}", kProgram, event.endpoint, text);
+                errors.first = text;
+            } else {
+                errors.first = std::format("block '{}' reports an error on '{}': {}", event.source, event.endpoint, text);
+                std::println(stderr, "{}: {}", kProgram, errors.first);
+            }
+        }
+    }
+}
+
+// The status of a run that failed with `reasons`, the error lines printed for it: 1, or 0 when each text of
+// --expect-error is part of one of them. A text that is not is reported with the first reason.
+[[nodiscard]] int failedRunStatus(const std::vector<std::string>& expectedErrors, const std::vector<std::string>& reasons) {
+    if (expectedErrors.empty()) {
+        return 1;
+    }
+    bool allFound = true;
+    for (const std::string& text : expectedErrors) {
+        if (std::ranges::any_of(reasons, [&text](const std::string& reason) { return reason.contains(text); })) {
+            continue;
+        }
+        allFound = false;
+        std::println(stderr, "{}: expected an error holding '{}', and the run failed with: {}", kProgram, text, reasons.empty() ? std::string("no reason") : reasons.front());
+    }
+    if (allFound) {
+        std::println(stderr, "{}: the run failed with each error --expect-error names", kProgram);
+    }
+    return allFound ? 0 : 1;
+}
+
+// A value as text. A floating-point number takes the shortest text that reads back to the same number, and a vector
+// lists its elements.
+[[nodiscard]] std::string describe(const gr::pmt::Value& value) {
+    if (const std::optional<std::vector<gr::pmt::Value>> elements = elementsOf(value); elements.has_value()) {
+        std::string text = "[";
+        for (std::size_t i = 0UZ; i < elements->size(); ++i) {
+            text += std::format("{}{}", i == 0UZ ? "" : ", ", describe((*elements)[i]));
+        }
+        return text + "]";
+    }
+    if (const float* single = value.get_if<float>(); single != nullptr) {
+        return std::format("{}", *single);
+    }
+    if (const double* wide = value.get_if<double>(); wide != nullptr) {
+        return std::format("{}", *wide);
+    }
+    return std::format("{}", value);
+}
+
+// Compares each block's setting with the value expected of it and reports each one that differs on one line. Returns
+// false when one differs.
+[[nodiscard]] bool expectationsHold(const std::vector<Expectation>& expectations, const std::vector<gr::BlockHandle>& blocks, double tolerance) {
+    bool allHold = true;
+    for (std::size_t i = 0UZ; i < expectations.size(); ++i) {
+        const Expectation&                  expectation = expectations[i];
+        const std::optional<gr::pmt::Value> received    = blocks[i].get(expectation.key);
+        if (!received.has_value()) {
+            std::println(stderr, "{}: {}.{} is not set, expected {}", kProgram, expectation.block, expectation.key, describe(expectation.value));
+            allHold = false;
+        } else if (!holdsExpected(*received, expectation.value, tolerance)) {
+            std::println(stderr, "{}: {}.{} is {}, expected {}", kProgram, expectation.block, expectation.key, describe(*received), describe(expectation.value));
+            allHold = false;
+        }
+    }
+    return allHold;
+}
+
+// The blocks the --expect arguments name, or nothing when one of them is not in the graph or does not hold the key;
+// each refusal is reported.
+[[nodiscard]] std::optional<std::vector<gr::BlockHandle>> expectedBlocks(const gr::RuntimeGraph& graph, const std::vector<Expectation>& expectations) {
+    std::vector<std::string> names;
+    for (const Expectation& expectation : expectations) {
+        names.push_back(expectation.block);
+    }
+    std::optional<std::vector<gr::BlockHandle>> blocks = shownBlocks(graph, names);
+    if (!blocks.has_value()) {
+        return std::nullopt;
+    }
+    bool allHeld = true;
+    for (std::size_t i = 0UZ; i < expectations.size(); ++i) {
+        if (!(*blocks)[i].get(expectations[i].key).has_value()) {
+            std::println(stderr, "{}: --expect names the setting '{}' of block '{}', and the block holds no setting of that name", kProgram, expectations[i].key, expectations[i].block);
+            allHeld = false;
+        }
+    }
+    if (!allHeld) {
+        return std::nullopt;
+    }
+    return blocks;
+}
+
+constexpr std::chrono::milliseconds kPollInterval{20};
+
+} // namespace
+
+namespace gr::tools {
+
+int runGraph(int argc, const char* const* argv) {
+    gStopRequested.store(false, std::memory_order_relaxed); // a signal to an earlier call does not stop this one
+
+    std::vector<std::string_view> arguments;
+    arguments.reserve(static_cast<std::size_t>(argc > 1 ? argc - 1 : 0));
+    for (int i = 1; i < argc; ++i) {
+        arguments.emplace_back(argv[i]);
+    }
+
+    const std::optional<Options> parsed = parse(arguments);
+    if (!parsed.has_value()) {
+        std::print(stderr, "{}", kUsage);
+        return 2;
+    }
+    const Options& options = *parsed;
+    if (options.help) {
+        std::print("{}", kUsage);
+        return 0;
+    }
+
+    const std::optional<StagedSettings> staged = stagedSettingsOf(options.settings);
+    if (!staged.has_value()) {
+        std::print(stderr, "{}", kUsage);
+        return 2;
+    }
+    const std::optional<std::vector<Expectation>> expectations = expectationsOf(options.expectations);
+    if (!expectations.has_value()) {
+        std::print(stderr, "{}", kUsage);
+        return 2;
+    }
+
+    // registers the program's own schedulers before the loader runs. A library the loader opens can then replace one
+    // under the same key.
+    gr::detail::registerShippedSchedulers();
+    const std::vector<std::string> directories = searchDirectories(options.pluginDirectories);
+    std::vector<std::string>       keysBefore  = gr::globalBlockRegistry().keys();
+    std::ranges::sort(keysBefore);
+    const auto loader = std::make_shared<gr::PluginLoader>(gr::globalBlockRegistry(), gr::globalSchedulerRegistry(), directories);
+    if (options.verbose) {
+        reportPlugins(*loader, directories, keysBefore);
+    }
+
+    // The scheduler key and its settings are checked before the graph file is read. A key the registry does not hold or
+    // a setting the scheduler refuses ends the program with status 2.
+    if (!schedulerIsRegistered(*loader, options.scheduler)) {
+        return 2;
+    }
+    const std::expected<gr::BlockHandle, SchedulerProblem> probed = probeScheduler(loader, options.scheduler, staged->scheduler);
+    if (!probed.has_value()) {
+        if (probed.error() == SchedulerProblem::refusesSettings) {
+            std::print(stderr, "{}", kUsage);
+        }
+        return 2;
+    }
+    if (options.verbose) {
+        reportScheduler(*probed, options.scheduler, staged->scheduler);
+    }
+
+    const std::optional<std::string> document = readGraph(options.graph);
+    if (!document.has_value()) {
+        return 1;
+    }
+
+    // Each block reads its --set values with the graph file's own. Its start() sees them. The reader refuses a graph
+    // file that names a key nothing supplies or a port that is not there. It also refuses a --set key the block does not
+    // declare, a value of the wrong type, and a --set for a block the file does not hold. Its message is printed as it
+    // arrives.
+    std::expected<gr::RuntimeGraph, gr::RuntimeError> graph = gr::RuntimeGraph::fromYaml(loader, *document, staged->blocks);
+    if (!graph.has_value()) {
+        const std::string reason = withoutLocation(graph.error().message, graph.error().where);
+        std::println(stderr, "{}: {} did not load: {}", kProgram, options.graph, reason);
+        return failedRunStatus(options.expectedErrors, {reason});
+    }
+
+    std::optional<std::vector<gr::BlockHandle>> shown    = shownBlocks(*graph, options.show);
+    std::optional<std::vector<gr::BlockHandle>> compared = expectedBlocks(*graph, *expectations);
+    if (!shown.has_value() || !compared.has_value()) {
+        return 1;
+    }
+
+    const SignalHandlers signalHandlers;
+
+    std::expected<gr::Runtime, gr::RuntimeError> runtime = gr::Runtime::create(std::move(*graph), options.scheduler, staged->scheduler);
+    if (!runtime.has_value()) {
+        std::println(stderr, "{}: the scheduler {} could not be built: {}", kProgram, options.scheduler, runtime.error().message);
+        return 2;
+    }
+    if (const std::expected<void, gr::RuntimeError> started = runtime->start(); !started.has_value()) {
+        const std::string reason = withoutLocation(started.error().message, started.error().where);
+        std::println(stderr, "{}: the graph stopped: {}", kProgram, reason);
+        return failedRunStatus(options.expectedErrors, {reason});
+    }
+
+    const auto     start        = std::chrono::steady_clock::now();
+    const auto     boundReached = [&options, start] { return options.seconds > 0.0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >= options.seconds; };
+    ReportedErrors errors;
+    bool           endedItself = false;
+    while (!endedItself && errors.count == 0UZ && !gStopRequested.load(std::memory_order_relaxed) && !boundReached()) {
+        endedItself = runtime->waitFor(kPollInterval);
+        takeReportedErrors(*runtime, errors);
+    }
+    const bool stoppedOnError = errors.count > 0UZ && !endedItself;
+    if (!endedItself) {
+        // the stop is requested once, and each later call waits for that same stop
+        while (!runtime->stopFor(kPollInterval)) {
+            takeReportedErrors(*runtime, errors);
+        }
+    }
+    takeReportedErrors(*runtime, errors);
+    if (errors.count > 1UZ) {
+        std::println(stderr, "{}: {} more error(s) followed the first", kProgram, errors.count - 1UZ);
+    }
+
+    // a run the first error failed returns that error as its result, and the line is printed once
+    const std::expected<void, gr::RuntimeError> result = runtime->result();
+    std::vector<std::string>                    reasons;
+    if (!errors.firstReason.empty()) {
+        reasons.push_back(errors.firstReason);
+    }
+    if (!result.has_value()) {
+        if (std::string reason = withoutLocation(result.error().message, result.error().where); reason != errors.first) {
+            std::println(stderr, "{}: the graph stopped: {}", kProgram, reason);
+            reasons.push_back(std::move(reason));
+        }
+    }
+    for (std::size_t i = 0UZ; i < shown->size(); ++i) {
+        showSettings(options.show[i], (*shown)[i]);
+    }
+    std::println(stderr, "{}: {}", kProgram, endedItself ? "the graph ended on its own" : (stoppedOnError ? "the graph was stopped on the first error reported" : "the graph was stopped before it ended"));
+    if (!result.has_value() || errors.count > 0UZ) {
+        return failedRunStatus(options.expectedErrors, reasons);
+    }
+
+    // a run that did not fail misses each expected error, and its settings are compared
+    for (const std::string& text : options.expectedErrors) {
+        std::println(stderr, "{}: expected an error holding '{}', and the run ended without an error", kProgram, text);
+    }
+    const bool held = expectationsHold(*expectations, *compared, options.tolerance);
+    return options.expectedErrors.empty() && held ? 0 : 1;
+}
+
+} // namespace gr::tools
