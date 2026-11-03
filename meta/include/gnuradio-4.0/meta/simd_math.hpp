@@ -180,6 +180,15 @@ struct SimdOps {
 
 #undef SIMD_ELEMENTARY_INLINE
 
+// SIMD_ELEMENTARY_NOCLONE marks each K::f below. GCC 14 to 16 at -O3 may clone a K::f for a constant
+// vector argument, as for atan2(x, simd(0.7f)) called twice, and stop with an internal compiler error
+// in the clone where the kernel reads the constant's bits as integers.
+#if defined(__GNUC__) && !defined(__clang__)
+#define SIMD_ELEMENTARY_NOCLONE [[gnu::noclone]]
+#else
+#define SIMD_ELEMENTARY_NOCLONE
+#endif
+
 // K::f<E> on x: E at double accuracy for double lanes; for float lanes, at float accuracy in float,
 // or, where L asks, on the lanes widened to double, narrowed once.
 template<typename K, FloatLanes L, typename V, typename... TMore>
@@ -217,7 +226,7 @@ struct Exp {
         return exp(a);
     }
     template<typename E>
-    static typename E::V f(typename E::V a) noexcept {
+    SIMD_ELEMENTARY_NOCLONE static typename E::V f(typename E::V a) noexcept {
         return E::exp(a);
     }
 };
@@ -229,7 +238,7 @@ struct Sinh {
         return sinh(a);
     }
     template<typename E>
-    static typename E::V f(typename E::V a) noexcept {
+    SIMD_ELEMENTARY_NOCLONE static typename E::V f(typename E::V a) noexcept {
         return E::sinh(a);
     }
 };
@@ -241,7 +250,7 @@ struct Cosh {
         return cosh(a);
     }
     template<typename E>
-    static typename E::V f(typename E::V a) noexcept {
+    SIMD_ELEMENTARY_NOCLONE static typename E::V f(typename E::V a) noexcept {
         return E::cosh(a);
     }
 };
@@ -253,7 +262,7 @@ struct Tanh {
         return tanh(a);
     }
     template<typename E>
-    static typename E::V f(typename E::V a) noexcept {
+    SIMD_ELEMENTARY_NOCLONE static typename E::V f(typename E::V a) noexcept {
         return E::tanh(a);
     }
 };
@@ -265,7 +274,7 @@ struct Log {
         return log(a);
     }
     template<typename E>
-    static typename E::V f(typename E::V a) noexcept {
+    SIMD_ELEMENTARY_NOCLONE static typename E::V f(typename E::V a) noexcept {
         return E::log(a);
     }
 };
@@ -277,7 +286,7 @@ struct Log2 {
         return log2(a);
     }
     template<typename E>
-    static typename E::V f(typename E::V a) noexcept {
+    SIMD_ELEMENTARY_NOCLONE static typename E::V f(typename E::V a) noexcept {
         return E::log2(a);
     }
 };
@@ -289,7 +298,7 @@ struct Log10 {
         return log10(a);
     }
     template<typename E>
-    static typename E::V f(typename E::V a) noexcept {
+    SIMD_ELEMENTARY_NOCLONE static typename E::V f(typename E::V a) noexcept {
         return E::log10(a);
     }
 };
@@ -301,7 +310,7 @@ struct Sin {
         return sin(a);
     }
     template<typename E>
-    static typename E::V f(typename E::V a) noexcept {
+    SIMD_ELEMENTARY_NOCLONE static typename E::V f(typename E::V a) noexcept {
         return E::template sin<Sin>(a);
     }
 };
@@ -313,7 +322,7 @@ struct Cos {
         return cos(a);
     }
     template<typename E>
-    static typename E::V f(typename E::V a) noexcept {
+    SIMD_ELEMENTARY_NOCLONE static typename E::V f(typename E::V a) noexcept {
         return E::template cos<Cos>(a);
     }
 };
@@ -325,7 +334,7 @@ struct Tan {
         return tan(a);
     }
     template<typename E>
-    static typename E::V f(typename E::V a) noexcept {
+    SIMD_ELEMENTARY_NOCLONE static typename E::V f(typename E::V a) noexcept {
         return E::template tan<Tan>(a);
     }
 };
@@ -337,7 +346,7 @@ struct Atan {
         return atan(a);
     }
     template<typename E>
-    static typename E::V f(typename E::V a) noexcept {
+    SIMD_ELEMENTARY_NOCLONE static typename E::V f(typename E::V a) noexcept {
         return E::atan(a);
     }
 };
@@ -349,7 +358,7 @@ struct Atan2 {
         return atan2(a, b);
     }
     template<typename E>
-    static typename E::V f(typename E::V a, typename E::V b) noexcept {
+    SIMD_ELEMENTARY_NOCLONE static typename E::V f(typename E::V a, typename E::V b) noexcept {
         return E::atan2(a, b);
     }
 };
@@ -361,7 +370,7 @@ struct Hypot {
         return hypot(a, b);
     }
     template<typename E>
-    static typename E::V f(typename E::V a, typename E::V b) noexcept {
+    SIMD_ELEMENTARY_NOCLONE static typename E::V f(typename E::V a, typename E::V b) noexcept {
         return E::hypot(a, b);
     }
 };
@@ -373,10 +382,12 @@ struct Pow {
         return pow(a, b);
     }
     template<typename E>
-    static typename E::V f(typename E::V a, typename E::V b) noexcept {
+    SIMD_ELEMENTARY_NOCLONE static typename E::V f(typename E::V a, typename E::V b) noexcept {
         return E::pow(a, b);
     }
 };
+
+#undef SIMD_ELEMENTARY_NOCLONE
 
 } // namespace detail::elementary_impl
 
