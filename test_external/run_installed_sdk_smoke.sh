@@ -27,3 +27,9 @@ core_only_build_dir="${build_dir}/installed-sdk-core-only"
 cmake -S "${script_dir}/core_only_consumer" -B "${core_only_build_dir}" -DCMAKE_PREFIX_PATH="${install_prefix}"
 cmake --build "${core_only_build_dir}"
 timeout 60 "${core_only_build_dir}/core_only_consumer"
+
+# a graph-file runner over gnuradio4::gnuradio-rungraph runs a graph that ends on its own
+rungraph_build_dir="${build_dir}/installed-sdk-rungraph"
+cmake -S "${script_dir}/rungraph_consumer" -B "${rungraph_build_dir}" -DCMAKE_PREFIX_PATH="${install_prefix}"
+cmake --build "${rungraph_build_dir}"
+timeout 60 "${rungraph_build_dir}/rungraph_consumer" --graph "${script_dir}/rungraph_consumer/counted_source_to_sink.yaml"
