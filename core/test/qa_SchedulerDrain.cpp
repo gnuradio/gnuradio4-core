@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <format>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -984,6 +985,32 @@ void expectEpilogueWaitEndsUnderScheduler() {
     expect(eq(sink._nReceived, (nDecimated + kDecimation - 1UZ) / kDecimation)) << "the samples the relay wrote did not all reach the sink";
 }
 
+// a source whose per-sample processOne publishes a tag at sample _tagAt of a call and requests a stop at sample _stopAt
+struct MarkingSource : gr::Block<MarkingSource> {
+    gr::PortOut<int> out;
+
+    GR_MAKE_REFLECTABLE(MarkingSource, out);
+
+    static constexpr std::size_t kNever = std::numeric_limits<std::size_t>::max();
+
+    std::size_t _tagAt  = kNever;
+    std::size_t _stopAt = kNever;
+    std::size_t _next   = 0UZ;
+
+    int processOne() {
+        const std::size_t sample = _next++;
+        if (sample == _tagAt) {
+            this->publishTag(gr::property_map{{"marker", 1}}, 0UZ);
+        }
+        if (sample == _stopAt) {
+            this->requestStop();
+        }
+        return static_cast<int>(sample);
+    }
+};
+
+constexpr std::size_t kMarkedCall = 4096UZ;
+
 } // namespace qa_drain
 
 const boost::ut::suite<"end-of-stream drain"> drainTests = [] {
@@ -1917,6 +1944,48 @@ const boost::ut::suite<"end-of-stream drain"> drainTests = [] {
         expect(scheduler.state() == ERROR) << "a failing block drives the scheduler to ERROR";
         expect(eq(relay._nForwarded, qa_drain::kItemsBeforeFailure)) << "the failed block was kept running to empty its queue";
         expect(le(sink._nReceived, qa_drain::kItemsBeforeFailure));
+    };
+
+    "a tag published from processOne at sample 100 ends the call after 101 samples"_test = [] {
+        constexpr std::size_t kTagAt = 100UZ;
+
+        gr::PortIn<int>         downstream;
+        qa_drain::MarkingSource source;
+        expect(source.out.connect(downstream).has_value());
+        source.init(std::make_shared<gr::Sequence>());
+        source._tagAt = kTagAt;
+
+        const auto result = source.work(qa_drain::kMarkedCall);
+        expect(eq(result.performed_work, kTagAt + 1UZ)) << "the call ends at the sample that published the tag";
+
+        auto out = downstream.get<gr::SpanReleasePolicy::ProcessAll>(downstream.streamReader().available());
+        expect(eq(out.size(), kTagAt + 1UZ));
+        std::vector<std::size_t> indices;
+        for (const gr::Tag& entry : out.rawTags) {
+            if (entry.map.contains("marker")) {
+                indices.push_back(entry.index);
+            }
+        }
+        expect(indices == std::vector<std::size_t>{kTagAt}) << "the tag lands at the sample that published it";
+        for (std::size_t i = 0UZ; i < out.size(); ++i) {
+            expect(eq(out[i], static_cast<int>(i))) << "sample " << i << " is the one processOne returned";
+        }
+        std::ignore = out.consume(out.size());
+    };
+
+    "a stop requested from processOne at sample 50 publishes 51 samples"_test = [] {
+        constexpr std::size_t kStopAt = 50UZ;
+
+        gr::PortIn<int>         downstream;
+        qa_drain::MarkingSource source;
+        expect(source.out.connect(downstream).has_value());
+        source.init(std::make_shared<gr::Sequence>());
+        source._stopAt = kStopAt;
+        expect(source.changeStateTo(RUNNING).has_value());
+
+        const auto result = source.work(qa_drain::kMarkedCall);
+        expect(result.status == gr::work::Status::DONE);
+        expect(eq(downstream.streamReader().available(), kStopAt + 1UZ)) << "the call publishes up to the sample that requested the stop";
     };
 };
 
