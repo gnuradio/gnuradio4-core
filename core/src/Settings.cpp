@@ -822,7 +822,20 @@ void CtxSettingsBase::autoUpdate(const Tag& tag) {
 
     SettingsCtx ctx;
     if (tagCtx != std::nullopt) {
-        const auto bestMatchSettingsCtx = activateContextImpl(tagCtx.value());
+        const property_map                       stagedBefore         = _stagedParameters;
+        const std::set<std::string, std::less<>> taggedBefore         = _taggedKeys;
+        const bool                               activatedBefore      = _contextActivated;
+        const auto                               bestMatchSettingsCtx = activateContextImpl(tagCtx.value());
+        // the values the tag's activation stages, and the context it names, count as staged by the tag
+        for (const auto& [key, value] : _stagedParameters) {
+            const auto before = stagedBefore.find(key);
+            if (before == stagedBefore.end() || before->second != value || taggedBefore.contains(std::string_view(key))) {
+                _taggedKeys.emplace(std::string_view(key));
+            }
+        }
+        if (_contextActivated && !activatedBefore) {
+            _taggedKeys.emplace(settings::kContextField);
+        }
         if (bestMatchSettingsCtx == std::nullopt) {
             ctx = _activeCtx;
         } else {

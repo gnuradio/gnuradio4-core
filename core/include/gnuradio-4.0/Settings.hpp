@@ -78,8 +78,8 @@ struct ApplyStagedParametersResult {
     property_map appliedParameters;
     property_map failedParameters; // staged values the block's setter or its settingsChanged() rejected -- neither applied nor forwarded
     std::string  refusal;          // the block, the key, the value and the reason of each failed parameter; empty when none failed
-    std::string  tagRefusal;       // the part of `refusal` whose values a tag staged
-    std::string  untaggedRefusal;  // the rest of `refusal`: values setStaged(), a context or a reset staged
+    std::string  tagRefusal;       // the part of `refusal` whose values a tag staged, the set of a context a gr:context tag activates included
+    std::string  untaggedRefusal;  // the rest of `refusal`: values setStaged(), a reset or a context activated other than by a tag staged
 };
 
 namespace detail {
@@ -187,9 +187,10 @@ std::string enumToString(T&& enum_value) {
  * its tag key only when it did before the reset, even when the callback called `setTagCouplings()` before it threw. The
  * refusal puts back which settings follow their keys; a coupling table the callback wrote with `setTagCouplings()`
  * stays. A set the callback stored with `set()` stays, and its keys decide which settings follow. A member whose limits
- * refuse its value from `oldSettings` keeps the refused value. When tags alone staged every value in `newSettings`, the
- * apply returns the refusal in `refusal` and `tagRefusal`, as it returns a tag value the limits refuse. Otherwise the
- * exception reaches the caller.
+ * refuse its value from `oldSettings` keeps the refused value. A `gr:context` tag stages the context it activates and
+ * the values of that context's stored set. When tags alone staged every value in `newSettings`, the apply returns the
+ * refusal in `refusal` and `tagRefusal`, as it returns a tag value the limits refuse. Otherwise the exception reaches
+ * the caller.
  */
 template<typename BlockType>
 concept HasSettingsChangedCallback = requires(BlockType* block, const property_map& oldSettings, property_map& newSettings) {
@@ -891,7 +892,7 @@ protected:
     std::optional<SettingsCtx>                                                       _contextBeforeActivation{}; ///< active before the first activation since the last apply; a refused apply makes it active again while the activated context is still active
     std::optional<std::map<SettingsCtx, std::set<std::string>>>                      _autoUpdateBeforeReset{};   ///< the keys that followed tags in each set before a reset made every coupled setting follow; a refused apply puts them back
     property_map                                                                     _stagedParameters{};
-    std::set<std::string, std::less<>>                                               _taggedKeys{};   ///< the keys of `_stagedParameters` whose value a tag staged last
+    std::set<std::string, std::less<>>                                               _taggedKeys{};   ///< the keys of `_stagedParameters` whose value a tag staged last, and `context` when a tag activated a context
     std::map<std::string, std::string, std::less<>>                                  _tagCouplings{}; ///< setting name to the tag key that sets it
     property_map                                                                     _activeParameters{};
 
