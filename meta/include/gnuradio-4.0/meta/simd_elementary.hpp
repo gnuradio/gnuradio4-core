@@ -28,8 +28,8 @@
  *   fused                        constexpr bool: fmadd and fnmadd round once
  *   lt le eq (V, V) -> M; isnan(V) -> M
  *   mand mor (M, M) -> M; mandnot(a, b) -> a and not b; any(M) -> bool
- *   all_within(x, lo, hi) -> bool    for float lanes: every lane in [lo, hi], 0 < lo <= hi, false
- *                                for a NaN, with no flag raised
+ *   all_within(x, lo, hi) -> bool    every lane in [lo, hi], 0 < lo <= hi, false for a NaN, with
+ *                                no flag raised
  *   select(m, a, b)              a where m, b elsewhere
  *   abs(x), copysign(x, y), flip(x, m)  |x|; the magnitude of x with the sign of y; x negated in m
  *   signbit(x) -> M              the sign bit set, -0 and negative NaNs included
@@ -45,6 +45,8 @@
  *   clear_low(x)                 x with the low 32 bits of its significand cleared for double, the
  *                                low 12 for float: 21 and 12 significant bits left
  *   fallback<F>(x, r, m)         F::template s<T>(x) in the lanes of m, r elsewhere
+ *   lookup(t, j)                 double lanes only: t[j mod N] in each lane, for a table t of N
+ *                                doubles, N a power of two, and integer values j, |j| < 2^31
  *
  * Each function reduces its argument to a short interval, evaluates a minimax polynomial there and
  * rebuilds the result; the reductions carry their rounding error as a second term where it would
@@ -88,6 +90,9 @@ struct elementary_coefficients<double> {
     static constexpr double atan[] = {-0.016275458996732155, 0.03652017151966706, -0.04976337584023659, 0.05833425742322207, -0.06661049245392378, 0.07691873673192567, -0.09090886961794904, 0.11111110398249423, -0.1428571427232845, 0.19999999999874357, -0.3333333333333292};
     // e^r - 1 = r + r^2 q(r), |r| <= ln(2) / 2
     static constexpr double expm1[] = {1.768754469601459e-09, 2.5105038460189987e-08, 2.756789641389999e-07, 2.755725583595051e-06, 2.4801574612705713e-05, 0.0001984126987447036, 0.0013888888895538189, 0.008333333333326238, 0.04166666666665246, 0.1666666666666667, 0.5000000000000001};
+    // e^r - 1 = r + r^2 q(r), |r| <= ln(2) / 128: the Taylor coefficients, whose truncation stays
+    // below 2^-64 of e^r there
+    static constexpr double expm1_64[] = {0.001388888888888889, 0.008333333333333333, 0.041666666666666664, 0.16666666666666666, 0.5};
     // 2 atanh s = 2 s + s^3 q(s^2), |s| <= (sqrt 2 - 1) / (sqrt 2 + 1)
     static constexpr double log[] = {0.14794434284852379, 0.15314196978553518, 0.18183558810672482, 0.2222219867502825, 0.2857142874144069, 0.39999999999418706, 0.6666666666666734};
     // sinh x = x + x^3 q(x^2), |x| <= 1
@@ -120,6 +125,12 @@ struct elementary_splits<double> {
     static constexpr double ln2_hi = 0.6931471806019545, ln2_lo = -4.2009150726810846e-11;
     // e^x is 0 below exp_min and infinite above exp_max; e^x / 2 above half_exp_max
     static constexpr double exp_min = -746, exp_max = 711, half_exp_max = 711;
+    // exp's reduction by ln(2) / 64: |k| below 2^17 between exp_min and exp_max
+    static constexpr double log2e_64  = 92.33248261689366;
+    static constexpr double ln2_64_hi = 0x1.62e42fefa0000p-7, ln2_64_lo = 0x1.cf79abc9e3b3ap-46;
+    // 2^(j / 64) = exp2_64_hi[j] + exp2_64_lo[j], the second part below 2^-53 of the first
+    static constexpr double exp2_64_hi[] = {0x1.0000000000000p+0, 0x1.02c9a3e778061p+0, 0x1.059b0d3158574p+0, 0x1.0874518759bc8p+0, 0x1.0b5586cf9890fp+0, 0x1.0e3ec32d3d1a2p+0, 0x1.11301d0125b51p+0, 0x1.1429aaea92de0p+0, 0x1.172b83c7d517bp+0, 0x1.1a35beb6fcb75p+0, 0x1.1d4873168b9aap+0, 0x1.2063b88628cd6p+0, 0x1.2387a6e756238p+0, 0x1.26b4565e27cddp+0, 0x1.29e9df51fdee1p+0, 0x1.2d285a6e4030bp+0, 0x1.306fe0a31b715p+0, 0x1.33c08b26416ffp+0, 0x1.371a7373aa9cbp+0, 0x1.3a7db34e59ff7p+0, 0x1.3dea64c123422p+0, 0x1.4160a21f72e2ap+0, 0x1.44e086061892dp+0, 0x1.486a2b5c13cd0p+0, 0x1.4bfdad5362a27p+0, 0x1.4f9b2769d2ca7p+0, 0x1.5342b569d4f82p+0, 0x1.56f4736b527dap+0, 0x1.5ab07dd485429p+0, 0x1.5e76f15ad2148p+0, 0x1.6247eb03a5585p+0, 0x1.6623882552225p+0, 0x1.6a09e667f3bcdp+0, 0x1.6dfb23c651a2fp+0, 0x1.71f75e8ec5f74p+0, 0x1.75feb564267c9p+0, 0x1.7a11473eb0187p+0, 0x1.7e2f336cf4e62p+0, 0x1.82589994cce13p+0, 0x1.868d99b4492edp+0, 0x1.8ace5422aa0dbp+0, 0x1.8f1ae99157736p+0, 0x1.93737b0cdc5e5p+0, 0x1.97d829fde4e50p+0, 0x1.9c49182a3f090p+0, 0x1.a0c667b5de565p+0, 0x1.a5503b23e255dp+0, 0x1.a9e6b5579fdbfp+0, 0x1.ae89f995ad3adp+0, 0x1.b33a2b84f15fbp+0, 0x1.b7f76f2fb5e47p+0, 0x1.bcc1e904bc1d2p+0, 0x1.c199bdd85529cp+0, 0x1.c67f12e57d14bp+0, 0x1.cb720dcef9069p+0, 0x1.d072d4a07897cp+0, 0x1.d5818dcfba487p+0, 0x1.da9e603db3285p+0, 0x1.dfc97337b9b5fp+0, 0x1.e502ee78b3ff6p+0, 0x1.ea4afa2a490dap+0, 0x1.efa1bee615a27p+0, 0x1.f50765b6e4540p+0, 0x1.fa7c1819e90d8p+0};
+    static constexpr double exp2_64_lo[] = {0x0.0p+0, -0x1.19083535b085dp-56, 0x1.d73e2a475b465p-55, 0x1.186be4bb284ffp-57, 0x1.8a62e4adc610bp-54, 0x1.03a1727c57b53p-59, -0x1.6c51039449b3ap-54, -0x1.32fbf9af1369ep-54, -0x1.19041b9d78a76p-55, 0x1.e5b4c7b4968e4p-55, 0x1.e016e00a2643cp-54, 0x1.dc775814a8495p-55, 0x1.9b07eb6c70573p-54, 0x1.2bd339940e9d9p-55, 0x1.612e8afad1255p-55, 0x1.0024754db41d5p-54, 0x1.6f46ad23182e4p-55, 0x1.32721843659a6p-54, -0x1.63aeabf42eae2p-54, -0x1.5e436d661f5e3p-56, 0x1.ada0911f09ebcp-55, -0x1.ef3691c309278p-58, 0x1.89b7a04ef80d0p-59, 0x1.3c1a3b69062f0p-56, 0x1.d4397afec42e2p-56, -0x1.4b309d25957e3p-54, -0x1.07abe1db13cadp-55, 0x1.9bb2c011d93adp-54, 0x1.6324c054647adp-54, 0x1.ba6f93080e65ep-54, -0x1.383c17e40b497p-54, -0x1.bb60987591c34p-54, -0x1.bdd3413b26456p-54, -0x1.bbe3a683c88abp-57, -0x1.16e4786887a99p-55, -0x1.0245957316dd3p-54, -0x1.41577ee04992fp-55, 0x1.05d02ba15797ep-56, -0x1.d4c1dd41532d8p-54, -0x1.fc6f89bd4f6bap-54, 0x1.6e9f156864b27p-54, 0x1.5cc13a2e3976cp-55, -0x1.75fc781b57ebcp-57, -0x1.d185b7c1b85d1p-54, 0x1.c7c46b071f2bep-56, -0x1.359495d1cd533p-54, -0x1.d2f6edb8d41e1p-54, 0x1.0fac90ef7fd31p-54, 0x1.7a1cd345dcc81p-54, -0x1.2805e3084d708p-57, -0x1.5584f7e54ac3bp-56, 0x1.23dd07a2d9e84p-55, 0x1.11065895048ddp-55, 0x1.2884dff483cadp-54, 0x1.503cbd1e949dbp-56, -0x1.cbc3743797a9cp-54, 0x1.2ed02d75b3707p-55, 0x1.c2300696db532p-54, -0x1.1a5cd4f184b5cp-54, 0x1.39e8980a9cc8fp-55, -0x1.e9c23179c2893p-54, 0x1.dc7f486a4b6b0p-54, 0x1.9d3e12dd8a18bp-54, 0x1.74853f3a5931ep-55};
     // times the 21 bits of clear_low
     static constexpr double ivln2_hi = 1.4426950407214463, ivln2_lo = 1.6751713164886512e-10;
     static constexpr double ivln10_hi = 0.4342944818781689, ivln10_lo = 2.5082946711645275e-11;
@@ -266,7 +277,10 @@ struct elementary {
     // ln 2) and ln 2 in two parts, the first short enough that k times it is exact; e^r - 1 from
     // the polynomial, and e^x = 2^k + 2^k (e^r - 1), rounded once. 2^k is two factors, each a
     // normal power of two, so that k may reach past the exponent range and the second product
-    // rounds again only for a subnormal result.
+    // rounds again only for a subnormal result. At double accuracy exp, sinh and cosh reduce by ln(2) / 64
+    // instead: x = (64 m + j) ln(2) / 64 + r with j in [0, 64) and |r| <= ln(2) / 128 up to
+    // rounding, and e^x = 2^m 2^(j/64) e^r, 2^(j/64) from a table in two parts, which leaves a
+    // polynomial of half the length.
 
     // e^r - 1 in float lanes
     SIMD_ELEMENTARY_INLINE static V expm1_lean(V r) noexcept { return O::fmadd(O::mul(r, r), horner(r, L::expm1), r); }
@@ -293,13 +307,36 @@ struct elementary {
         r = O::fnmadd(k, c(S::ln2_lo), r);
     }
 
+    // double: 2^(j/64) e^r, and m. k = round(64 x / ln 2), m = floor(k / 64), computed as
+    // round(k / 64 - 63/128), which meets no tie, and j = k - 64 m, each exact; j leaves [0, 64)
+    // only in another rounding mode, where lookup takes j mod 64 and the result is off by a factor
+    // of 2. 2^(j/64) e^r = hi + (lo + hi (e^r - 1)), where lo (e^r - 1) falls below 2^-60 of the
+    // result: one rounding of note, the last addition's.
+    SIMD_ELEMENTARY_INLINE static V exp_table(V x, V& m) noexcept {
+        const V k  = O::round(O::mul(x, c(S::log2e_64)));
+        V       r  = O::fnmadd(k, c(S::ln2_64_hi), x);
+        r          = O::fnmadd(k, c(S::ln2_64_lo), r);
+        m          = O::round(O::sub(O::mul(k, c(1. / 64)), c(63. / 128)));
+        const V j  = O::fnmadd(m, c(64), k);
+        const V hi = O::lookup(S::exp2_64_hi, j);
+        const V lo = O::lookup(S::exp2_64_lo, j);
+        const V em = O::fmadd(O::mul(r, r), horner(r, C::expm1_64), r);
+        return O::add(hi, O::fmadd(hi, em, lo));
+    }
+
     // e^x for x in [exp_min, half_exp_max], where the result is already zero or infinite beyond;
     // the reduction keeps k within twice the exponent range.
     SIMD_ELEMENTARY_INLINE static V exp_clamped(V x, V bias) noexcept {
-        const V k = O::round(O::mul(x, c(S::log2e)));
-        V       r = O::fnmadd(k, c(S::ln2_hi), x);
-        r         = O::fnmadd(k, c(S::ln2_lo), r);
-        if constexpr (lean) {
+        if constexpr (!lean && !widened) {
+            V       m;
+            const V t  = exp_table(x, m);
+            const V kb = O::add(m, bias);
+            // as below
+            const V k1 = O::round_cvt(O::mul(kb, c(0.5)));
+            return O::mul(O::mul(O::pow2(k1), t), O::pow2(O::sub(kb, k1)));
+        } else if constexpr (lean) {
+            V k, r;
+            exp_reduce(x, k, r);
             // float lanes: the shorter polynomial, and 2^k as 2^k1, k1 clamped to the normal range,
             // times the normal power of two left over
             const V em = expm1_lean(r);
@@ -308,8 +345,10 @@ struct elementary {
             const V s1 = O::pow2(k1);
             return O::mul(O::fmadd(s1, em, s1), O::pow2(O::sub(kb, k1)));
         } else {
-            // Horner's rule here: exp's budget below 1 ulp leaves no room for the two chains' extra
-            // rounding
+            V k, r;
+            exp_reduce(x, k, r);
+            // float accuracy in double lanes. Horner's rule here: a budget below 1 ulp leaves no
+            // room for the two chains' extra rounding
             const V em = O::fmadd(O::mul(r, r), horner(r, C::expm1), r);
             const V kb = O::add(k, bias);
             // any integer near kb / 2 gives the same result; round_cvt keeps MSVC's double exp
@@ -318,6 +357,19 @@ struct elementary {
             const V s1 = O::pow2(k1);
             return O::mul(O::fmadd(s1, em, s1), O::pow2(O::sub(kb, k1)));
         }
+    }
+
+    // e^x in double lanes for |x| <= 708, where the result and 2^k are normal: 2^k as one factor.
+    // tanh keeps the polynomial exp, as the table costs it more than it saves. Float lanes use
+    // exp_normal or exp_clamped.
+    SIMD_ELEMENTARY_INLINE static V exp_poly_normal(V x) noexcept
+    requires(!lean)
+    {
+        V k, r;
+        exp_reduce(x, k, r);
+        const V em = O::fmadd(O::mul(r, r), horner(r, C::expm1), r);
+        const V s  = O::pow2(k);
+        return O::fmadd(s, em, s);
     }
 
     // The forms below, named with a trailing underscore, take no NaN: the functions at the end
@@ -379,9 +431,15 @@ struct elementary {
         const V a     = O::abs(x);
         const V small = O::select(O::lt(a, c(0x1p-28)), x, odd_poly(x, a, 0.75, C::tanh));
         // below 2^-60 as in exp_arg
-        const V m     = O::select(O::lt(a, c(0x1p-60)), O::select(O::eq(a, c(0)), a, c(0x1p-60)), O::min(a, c(20.)));
-        const V a2    = O::add(m, m);
-        const V e2    = exp_clamped(a2, c(0));
+        const V m  = O::select(O::lt(a, c(0x1p-60)), O::select(O::eq(a, c(0)), a, c(0x1p-60)), O::min(a, c(20.)));
+        const V a2 = O::add(m, m);
+        const V e2 = [&] {
+            if constexpr (lean) {
+                return exp_clamped(a2, c(0));
+            } else {
+                return exp_poly_normal(a2);
+            }
+        }();
         const V large = O::copysign(O::sub(c(1), O::div(c(2), O::add(e2, c(1)))), x);
         return O::select(O::lt(a, c(0.75)), small, large);
     }
@@ -1163,10 +1221,11 @@ struct elementary {
 
     SIMD_ELEMENTARY_INLINE static V nan_free(M nan, V x, double value) noexcept { return O::select(nan, c(value), x); }
 
-    // Float lanes take a shorter path when every lane's argument lies where no special value,
-    // flag or fallback needs a select: the same operations without them, which give the full
-    // form's value unless the compiler contracts a product into a sum across statements (GCC's
-    // -ffp-contract=fast), where a lane may differ by an ulp within the bound.
+    // Float lanes, and double exp, sinh and cosh, take a shorter path when every lane's
+    // argument lies where no special value, flag or fallback needs a select: the same operations
+    // without them, which give the full form's value unless the compiler contracts a product into a
+    // sum across statements (GCC's -ffp-contract=fast), where a lane may differ by an ulp within the
+    // bound.
     SIMD_ELEMENTARY_INLINE static bool all_within(V a, double lo, double hi) noexcept { return O::all_within(a, lo, hi); }
 
     SIMD_ELEMENTARY_INLINE static V exp(V x) noexcept {
@@ -1174,13 +1233,20 @@ struct elementary {
             if (all_within(O::abs(x), 0x1p-60, 87)) {
                 return exp_normal(x);
             }
+        } else if constexpr (!widened) {
+            // up to |x| = 708, where the result and 2^m are normal: 2^m as one factor
+            if (all_within(O::abs(x), 0x1p-60, 708)) {
+                V       m;
+                const V t = exp_table(x, m);
+                return O::mul(O::pow2(m), t);
+            }
         }
         const M nan = O::isnan(x);
         return O::select(nan, x, exp_(nan_free(nan, x, 0)));
     }
 
-    // sinh and cosh up to |x| = 86, where e^|x| / 2 <= 2^124 keeps 1 / (4 h) normal; from 20 on h
-    // -+ 1 / (4 h) rounds to h, which the full forms take there
+    // float sinh and cosh up to |x| = 86, where e^|x| / 2 <= 2^124 keeps 1 / (4 h) normal. In float
+    // and double lanes h -+ 1 / (4 h) rounds to h from |x| = 20 on, which the full forms take there
     SIMD_ELEMENTARY_INLINE static V sinh(V x) noexcept {
         if constexpr (lean) {
             const V a = O::abs(x);
@@ -1193,6 +1259,20 @@ struct elementary {
                 const V small = O::fmadd(O::mul(m, z), poly(z, C::sinh), m);
                 return O::copysign(O::select(O::lt(a, c(1)), small, O::sub(h, O::div(c(0.25), h))), x);
             }
+        } else if constexpr (!widened) {
+            // double up to |x| = 708: h = e^|x| / 2 is 2^(m - 1) times exp_table's value, and the
+            // division takes h no larger than 2^60, as in sinh_
+            const V a = O::abs(x);
+            if (all_within(a, 0x1p-28, 708)) {
+                V       m;
+                const V t     = exp_table(a, m);
+                const V h     = O::mul(O::pow2(O::sub(m, c(1))), t);
+                const V s     = O::min(a, c(1));
+                const V z     = O::mul(s, s);
+                const V small = O::fmadd(O::mul(s, z), poly(z, C::sinh), s);
+                const V large = O::sub(h, O::div(c(0.25), O::min(h, c(0x1p60))));
+                return O::copysign(O::select(O::lt(a, c(1)), small, large), x);
+            }
         }
         const M nan = O::isnan(x);
         return O::select(nan, x, sinh_(nan_free(nan, x, 0)));
@@ -1204,6 +1284,15 @@ struct elementary {
             if (all_within(a, 0x1p-60, 86)) {
                 const V h = half_exp_normal(a);
                 return O::add(h, O::div(c(0.25), h));
+            }
+        } else if constexpr (!widened) {
+            // double up to |x| = 708, as in sinh
+            const V a = O::abs(x);
+            if (all_within(a, 0x1p-60, 708)) {
+                V       m;
+                const V t = exp_table(a, m);
+                const V h = O::mul(O::pow2(O::sub(m, c(1))), t);
+                return O::add(h, O::div(c(0.25), O::min(h, c(0x1p60))));
             }
         }
         const M nan = O::isnan(x);
