@@ -38,6 +38,7 @@
 // an exact subnormal result, and under GCC sin, cos, tan and atan may raise underflow for a vector
 // whose lanes all hold one argument of magnitude below 2^-30; double hypot and pow raise what the
 // simd library's forms raise. The vector forms assume the default rounding mode, round to nearest.
+// In another mode double exp, sinh and cosh may be off by a factor of 2 and overflow early.
 // Both arguments of the two-argument functions have one type.
 
 namespace gr::meta {
@@ -128,6 +129,16 @@ struct SimdOps {
             r[i] = std::fma(a[i], b[i], c[i]);
         }
         return r;
+    }
+
+    // t[j mod N] in each lane, for integer values j with |j| < 2^31 in double lanes and N a power
+    // of two. The lanes are built in place: through a copy to an array, g++ at x86-64-v3 made
+    // double exp slower than the polynomial form without the table.
+    template<std::size_t N>
+    requires((N & (N - 1UZ)) == 0UZ)
+    SIMD_ELEMENTARY_INLINE static V lookup(const double (&t)[N], V j) noexcept {
+        const auto idx = stdx::static_simd_cast<stdx::rebind_simd_t<std::int32_t, V>>(j) & static_cast<std::int32_t>(N - 1UZ);
+        return V([&](auto i) { return t[static_cast<std::size_t>(idx[i])]; });
     }
 
     SIMD_ELEMENTARY_INLINE static U bitsOf(V x) noexcept { return vir::simd_bit_cast<U>(x); }
