@@ -1827,6 +1827,37 @@ struct ForwarderRun {
     return run;
 }
 
+constexpr std::string_view kRefusedContext = "refused";
+
+/// runs a source that tags its first sample with gr:context = kRefusedContext into a RefusingSink whose set for that
+/// context holds a count of 0. A reader takes the scheduler's messages when `readMessages` is true.
+[[nodiscard]] SinkRun<RefusingSink> runContextTagIntoRefusingSink(bool readMessages) {
+    using namespace boost::ut;
+    gr::Graph flow;
+    auto&     source = flow.emplaceBlock<FiniteTagSource>();
+    auto&     sink   = flow.emplaceBlock<RefusingSink>({{"name", std::string("refusing_sink")}});
+    source.tag       = property_map{{gr::tag::CONTEXT.key(), std::string(kRefusedContext)}};
+    const SettingsCtx refusedCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), std::string(kRefusedContext)};
+    expect(sink.settings().set({{"count", gr::Size_t{0U}}}, refusedCtx).empty());
+    expect(flow.connect<"out", "in">(source, sink).has_value());
+
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler;
+    gr::MsgPortIn                                                         fromScheduler;
+    if (readMessages) {
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+    }
+    expect(scheduler.exchange(std::move(flow)).has_value());
+
+    SinkRun<RefusingSink> run{.result = scheduler.runAndWait()};
+    run.held      = sink.held();
+    run.nReceived = sink.nReceived;
+    run.nSent     = source.nSamples;
+    if (readMessages) {
+        run.reported = readRefusals(fromScheduler);
+    }
+    return run;
+}
+
 /// the tags of `tags` that carry `key`, in the order they arrived
 [[nodiscard]] std::vector<Tag> tagsWithKey(const std::vector<Tag>& tags, std::string_view key) {
     std::vector<Tag> found;
@@ -2183,6 +2214,87 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
         expect(readRefusals(fromBlock).errors.contains("count must be at least 1")) << "activating the refused context again does not reach the callback";
         expect(eq(block.count, held));
         expect(block.settings().activeContext() == earlierCtx) << "the refused context stays active after a second refusal";
+    };
+
+    "a gr:context tag whose activation settingsChanged() refuses is reported in a plain message, and the earlier context stays active"_test = [] {
+        RefusingSink  block{property_map{{"name", std::string("refusing_stage")}}};
+        gr::MsgPortIn fromBlock;
+        expect(block.msgOut.connect(fromBlock).has_value());
+        block.init(std::make_shared<gr::Sequence>());
+
+        const gr::Size_t  held       = block.count;
+        const SettingsCtx earlierCtx = block.settings().activeContext();
+        const SettingsCtx refusedCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), std::string(kRefusedContext)};
+        expect(block.settings().set({{"count", gr::Size_t{0U}}}, refusedCtx).empty());
+        block.settings().autoUpdate(Tag{0UZ, property_map{{gr::tag::CONTEXT.key(), std::string(kRefusedContext)}}});
+        block.applyChangedSettings();
+
+        const ReportedRefusals reported = readRefusals(fromBlock);
+        expect(reported.plain.contains("count must be at least 1")) << "no plain message names the refusal, got: " << reported.plain;
+        expect(reported.errors.empty()) << "the refused activation is reported as an error: " << reported.errors;
+        expect(eq(block.count, held)) << "the refused value stays in the member";
+        expect(block.settings().activeContext() == earlierCtx) << "the refused context stays active";
+    };
+
+    "a number outside an integer setting's range never enters a context's set, and the gr:context tag that activates the set reports nothing"_test = [] {
+        RefusingSink  block{property_map{{"name", std::string("refusing_stage")}}};
+        gr::MsgPortIn fromBlock;
+        expect(block.msgOut.connect(fromBlock).has_value());
+        block.init(std::make_shared<gr::Sequence>());
+
+        const gr::Size_t    held       = block.count;
+        const float         level      = 2.f * block.level;
+        const std::uint64_t outOfRange = std::numeric_limits<std::uint64_t>::max();
+        const SettingsCtx   rangedCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), std::string("ranged")};
+        expect(setRefusal(block.settings(), {{"count", outOfRange}}, rangedCtx).contains("count")) << "set() stores a count outside its range";
+        expect(block.settings().set({{"level", level}}, rangedCtx).empty());
+        const std::optional<pmt::Value> stored = block.settings().getStored("count", rangedCtx);
+        expect(!stored.has_value() || stored->value_or(gr::Size_t{0U}) == held) << "the context's set holds the refused count";
+
+        block.settings().autoUpdate(Tag{0UZ, property_map{{gr::tag::CONTEXT.key(), std::string("ranged")}}});
+        block.applyChangedSettings();
+
+        const ReportedRefusals reported = readRefusals(fromBlock);
+        expect(reported.plain.empty()) << "the activation reports a refusal: " << reported.plain;
+        expect(reported.errors.empty()) << "the activation reports an error: " << reported.errors;
+        expect(eq(block.count, held)) << "the refused count reaches the member";
+        expect(eq(block.level, level)) << "the context's level is not applied";
+        expect(block.settings().activeContext() == rangedCtx) << "the tag's context is not active";
+    };
+
+    "a batch holding a gr:context tag's activation and a setStaged() value ends in the error when refused"_test = [] {
+        RefusingSink  block{property_map{{"name", std::string("refusing_stage")}}};
+        gr::MsgPortIn fromBlock;
+        expect(block.msgOut.connect(fromBlock).has_value());
+        block.init(std::make_shared<gr::Sequence>());
+
+        const gr::Size_t  heldCount = block.count;
+        const float       heldLevel = block.level;
+        const SettingsCtx refusedCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), std::string(kRefusedContext)};
+        expect(block.settings().set({{"count", gr::Size_t{0U}}}, refusedCtx).empty());
+        std::ignore = block.settings().setStaged({{"level", 2.f * heldLevel}});
+        block.settings().autoUpdate(Tag{0UZ, property_map{{gr::tag::CONTEXT.key(), std::string(kRefusedContext)}}});
+        block.applyChangedSettings();
+
+        const ReportedRefusals reported = readRefusals(fromBlock);
+        expect(reported.errors.contains("count must be at least 1")) << "the refusal does not reach the error output, got: " << reported.errors;
+        expect(reported.plain.empty()) << "the refusal of a mixed batch is reported in a plain message: " << reported.plain;
+        expect(eq(block.count, heldCount)) << "the refused count reaches the member";
+        expect(eq(block.level, heldLevel)) << "the refused level reaches the member";
+    };
+
+    "a gr:context tag whose activation settingsChanged() refuses leaves the run going"_test = [] {
+        const gr::Size_t initial = RefusingSink{}.count;
+
+        const SinkRun<RefusingSink> unread = runContextTagIntoRefusingSink(false);
+        expect(unread.result.has_value()) << "the refused activation ends the run: " << (unread.result.has_value() ? std::string() : unread.result.error().message);
+        expect(eq(unread.held, initial)) << "the refused value stays in the member";
+        expect(eq(unread.nReceived, unread.nSent)) << "the sink misses samples";
+
+        const SinkRun<RefusingSink> read = runContextTagIntoRefusingSink(true);
+        expect(read.result.has_value());
+        expect(read.reported.plain.contains("block 'refusing_sink' refuses")) << "no plain message names the refusal, got: " << read.reported.plain;
+        expect(read.reported.errors.empty()) << "the refused activation is reported as an error: " << read.reported.errors;
     };
 
     "a refused batch that removeContext() staged keeps the context it falls back to"_test = [] {
