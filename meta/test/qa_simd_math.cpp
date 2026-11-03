@@ -251,6 +251,24 @@ const boost::ut::suite<"simd elementary functions"> simdMathTests = [] {
         }
     } | std::tuple<stdx::native_simd<float>, stdx::fixed_size_simd<float, 7>, stdx::native_simd<double>, stdx::fixed_size_simd<double, 7>>{};
 
+    // GCC at -O3 may clone a function for a constant vector argument. GCC 14 to 16 stop with an internal
+    // error on such a clone of atan2's K::f.
+    "a constant second argument gives the result of the same value at run time"_test = []<typename V>(const V&) {
+        using T                 = typename V::value_type;
+        volatile T  sevenTenths = T(0.7);
+        const V     runTime(static_cast<T>(sevenTenths));
+        std::size_t differ = 0UZ;
+        for (int i = 0; i < 64; ++i) {
+            const V    x([i](std::size_t lane) { return static_cast<T>(i - 32) / T(16) + static_cast<T>(lane) / T(64); });
+            const auto count = [&](const V& constant, const V& variable) { differ += static_cast<std::size_t>(stdx::popcount(constant != variable)); };
+            count(gr::meta::atan2(x, V(T(0.7))), gr::meta::atan2(x, runTime));
+            count(gr::meta::atan2(-x, V(T(0.7))), gr::meta::atan2(-x, runTime));
+            count(gr::meta::hypot(x, V(T(0.7))), gr::meta::hypot(x, runTime));
+            count(gr::meta::pow(x * x + T(1), V(T(0.7))), gr::meta::pow(x * x + T(1), runTime));
+        }
+        expect(eq(differ, 0UZ));
+    } | std::tuple<stdx::native_simd<float>, stdx::fixed_size_simd<float, 7>, stdx::native_simd<double>, stdx::fixed_size_simd<double, 7>>{};
+
     "an integer argument is refused"_test = [] {
         static_assert(!TakesExp<int>);
         static_assert(TakesExp<double>);
