@@ -9,6 +9,15 @@
 #define GR_HAS_SYCL 1
 #endif
 
+// MSVC parses the arguments of __has_feature(...) even where the macro is not defined, so the test is nested
+#if defined(__SANITIZE_THREAD__)
+#define GR_THREAD_SANITIZER 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define GR_THREAD_SANITIZER 1
+#endif
+#endif
+
 #ifndef forceinline
 #ifdef _MSC_VER
 #define forceinline __forceinline
@@ -158,7 +167,7 @@ template<typename T>
 inline void atomicThreadFence() noexcept {
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
     // x86 TSO: all stores are release stores — fence is a no-op
-#elif defined(__SANITIZE_THREAD__) || (defined(__has_feature) && __has_feature(thread_sanitizer))
+#elif defined(GR_THREAD_SANITIZER)
     // TSAN doesn't instrument std::atomic_thread_fence; use an atomic store to make the ordering visible
     alignas(sizeof(std::size_t)) static std::size_t tsanDummy = 0;
     gr::atomic_ref(tsanDummy).store_release(1);
