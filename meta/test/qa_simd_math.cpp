@@ -4,8 +4,11 @@
 #include <cmath>
 #include <concepts>
 #include <cstddef>
+#include <format>
+#include <initializer_list>
 #include <limits>
 #include <random>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -15,19 +18,23 @@ namespace qa_simd_math {
 
 namespace stdx = gr::meta::stdx;
 
-// The largest error over the arguments in ulp of the result, against a reference of higher
-// precision (double for float, long double for double), and the number of special results (NaN,
-// an infinity, a zero) that are not the C library's exactly: the same NaN-ness, infinity or sign.
+// The largest error in ulp of the result over the arguments, against a reference (double for
+// float, long double for double). worst holds the arguments, the result and the reference rounded
+// to double at that error, in hex. mismatches counts the special results (NaN, an infinity, a
+// zero) that are not the C library's exactly: the same NaN-ness, infinity or sign.
 struct Accuracy {
-    long double maxUlp     = 0;
-    long double worstArg   = 0;
+    long double maxUlp = 0;
+    std::string worst;
     std::size_t mismatches = 0;
 };
 
-// A long double no wider than double makes the double reference the C library's double function,
-// with an error of its own of up to about 1 ulp beside the function's.
+// The double reference is the C library's double function when long double is no wider than
+// double, as on arm64 macOS and under MSVC. The C standard does not bound that function's error,
+// and Apple's tan has given a result several ulp from the correctly rounded one. The check on
+// those targets allows 4 ulp beyond each double bound and still fails a gross error. The bounds
+// themselves are checked where long double is wider.
 template<typename T>
-constexpr double kReferenceSlack = (sizeof(T) == sizeof(double) && std::numeric_limits<long double>::digits <= 53) ? 1.0 : 0.0;
+constexpr double kReferenceSlack = (sizeof(T) == sizeof(double) && std::numeric_limits<long double>::digits <= 53) ? 4.0 : 0.0;
 
 template<typename T>
 long double ulpOf(long double reference) {
@@ -48,15 +55,19 @@ bool sameSpecial(T got, T want) {
 }
 
 template<typename T>
-void accumulate(Accuracy& accuracy, T arg, T got, long double want) {
+void accumulate(Accuracy& accuracy, std::initializer_list<T> args, T got, long double want) {
     if (!std::isfinite(want) || want == 0 || !std::isfinite(got)) {
         accuracy.mismatches += static_cast<std::size_t>(!sameSpecial(got, static_cast<T>(want)));
         return;
     }
     const long double error = std::fabs(static_cast<long double>(got) - want) / ulpOf<T>(want);
     if (error > accuracy.maxUlp) {
-        accuracy.maxUlp   = error;
-        accuracy.worstArg = static_cast<long double>(arg);
+        accuracy.maxUlp = error;
+        accuracy.worst  = "at";
+        for (T arg : args) {
+            accuracy.worst += std::format(" {:a}", arg);
+        }
+        accuracy.worst += std::format(": {:a} against {:a}", got, static_cast<double>(want));
     }
 }
 
@@ -68,7 +79,7 @@ Accuracy measure(const std::vector<typename V::value_type>& args, F function, R 
         V       x([&](std::size_t lane) { return args[std::min(i + lane, args.size() - 1UZ)]; });
         const V result = function(x);
         for (std::size_t lane = 0UZ; lane < V::size() && i + lane < args.size(); ++lane) {
-            accumulate<T>(accuracy, x[lane], result[lane], reference(x[lane]));
+            accumulate<T>(accuracy, {x[lane]}, result[lane], reference(x[lane]));
         }
     }
     return accuracy;
@@ -84,7 +95,7 @@ Accuracy measure2(const std::vector<typename V::value_type>& first, const std::v
         const V    b  = at(second);
         const V    r  = function(a, b);
         for (std::size_t lane = 0UZ; lane < V::size() && i + lane < first.size(); ++lane) {
-            accumulate<T>(accuracy, a[lane], r[lane], reference(a[lane], b[lane]));
+            accumulate<T>(accuracy, {a[lane], b[lane]}, r[lane], reference(a[lane], b[lane]));
         }
     }
     return accuracy;
@@ -174,7 +185,7 @@ void checkAll() {
     std::mt19937_64  rng(20261030);
 
     const auto check = [](std::string_view name, const Accuracy& accuracy, double bound) {
-        expect(le(accuracy.maxUlp, static_cast<long double>(bound + kReferenceSlack<T>))) << name << "at" << static_cast<double>(accuracy.worstArg);
+        expect(le(accuracy.maxUlp, static_cast<long double>(bound + kReferenceSlack<T>))) << name << accuracy.worst;
         expect(eq(accuracy.mismatches, 0UZ)) << name << "special values";
     };
 
