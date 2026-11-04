@@ -1047,23 +1047,24 @@ public:
 
     // External controllers cancel sources, then wait for the actual run, whether
     // it was driven directly by runAndWait() or by SchedulerWrapper::start().
-    // Only the downstream drain has a deadline; lifecycle hooks must cooperate.
+    // Work quiescence and downstream draining share a deadline; lifecycle hooks must cooperate.
     bool stopAfterDrain(std::chrono::milliseconds timeout) {
         using enum lifecycle::State;
-        const auto deadline = std::chrono::steady_clock::now() + timeout;
-        bool       drained  = false;
+        const auto deadline         = std::chrono::steady_clock::now() + timeout;
+        bool       drained          = false;
+        bool       sourcesCancelled = false;
         while (true) {
             if (!runInProgress()) {
-                drained = true;
+                drained = this->state() != ERROR && !runEndingBlock().has_value();
                 break;
             }
             // RUNNING is published before start() starts the children. Retry
             // after short waits until the worker dispatch makes them ready.
-            if (workerStarted()) {
-                std::ignore = cancelDrainSources();
+            if (!sourcesCancelled && workerStarted()) {
+                sourcesCancelled = cancelDrainSources(deadline);
             }
             if (!runInProgress()) {
-                drained = true;
+                drained = this->state() != ERROR && !runEndingBlock().has_value();
                 break;
             }
             const auto now = std::chrono::steady_clock::now();
@@ -1202,7 +1203,7 @@ protected:
         return true;
     }
 
-    bool cancelDrainSources() {
+    bool cancelDrainSources(std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) {
         // Work quiescence does not exclude message-driven graph edits. Try the
         // message pass first, as graph edits do, and retry a busy pass on the next
         // drain iteration. Never wait on a child's pass while holding its parent's.
@@ -1210,16 +1211,11 @@ protected:
             return false;
         }
         on_scope_exit releasePass = [this] { releaseMessagePass(); };
-        requestWorkQuiescence();
-        on_scope_exit release = [this] { releaseWorkQuiescence(); };
-        // Quiesce before taking the lifecycle lock: a block's work() may itself
-        // request Stop. A start/stop sweep already holding the lock gets to finish.
-        std::unique_lock childLock(_childLifecycleMutex, std::try_to_lock);
-        if (!childLock.owns_lock()) {
-            return false;
-        }
         if (!lifecycle::isActive(this->state())) {
             return true;
+        }
+        if (!workerStarted()) {
+            return false;
         }
         bool       cancelled          = true;
         const auto connectedStream    = [](const DynamicPort& port) { return port.isConnected() && port::decodePortType(port.portMaskInfo()) == PortType::STREAM; };
@@ -1236,12 +1232,39 @@ protected:
                     entry);
             });
         };
+        const auto isSource = [&hasConnectedStream](auto& block) { return !hasConnectedStream(block.dynamicInputPorts()) && hasConnectedStream(block.dynamicOutputPorts()); };
+        // Blocking sources need their stop hook to release work(). Their own
+        // work call publishes EOS after it returns, including its last samples.
+        {
+            std::unique_lock childLock(_childLifecycleMutex, std::try_to_lock);
+            if (!childLock.owns_lock()) {
+                return false;
+            }
+            graph::forEachBlock<TransparentBlockGroup>(*_graph, [&](auto& block) {
+                if (block->blockCategory() != ScheduledBlockGroup && block->isBlocking() && isSource(*block) && lifecycle::isActive(block->state())) {
+                    std::ignore = block->changeStateTo(lifecycle::State::REQUESTED_STOP);
+                }
+            });
+        }
+        std::ignore           = gr::atomic_ref(_nWorkQuiescenceRequests).fetch_add_seq_cst(1UZ);
+        on_scope_exit release = [this] { releaseWorkQuiescence(); };
+        while (gr::atomic_ref(_nWorkersInWork).load_acquire() != 0UZ) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        // A work call may request Stop, so take this lock only after quiescence.
+        std::unique_lock childLock(_childLifecycleMutex, std::try_to_lock);
+        if (!childLock.owns_lock()) {
+            return false;
+        }
         auto cancel = [&](auto&& self, auto& group) -> void {
             for (auto& block : group.blocks()) {
                 if (auto* scheduler = dynamic_cast<SchedulerModel*>(block.get())) {
                     // Its worker also dispatches edits independently of ours.
                     // Let it guard both its graph and any deeper schedulers.
-                    cancelled = scheduler->cancelDrainSources() && cancelled;
+                    cancelled = scheduler->cancelDrainSources(deadline) && cancelled;
                     continue;
                 }
                 if (!block->blocks().empty()) {
@@ -1250,7 +1273,7 @@ protected:
                 }
                 // Optional unconnected clock/message inputs do not make a
                 // stream source a consumer. Keep every source output at EOS.
-                if (!hasConnectedStream(block->dynamicInputPorts()) && hasConnectedStream(block->dynamicOutputPorts()) && lifecycle::isActive(block->state())) {
+                if (isSource(*block) && lifecycle::isActive(block->state())) {
                     if (block->changeStateTo(lifecycle::State::REQUESTED_STOP)) {
                         for (auto& entry : block->dynamicOutputPorts()) {
                             std::visit(
@@ -1268,6 +1291,8 @@ protected:
                                 },
                                 entry);
                         }
+                    } else {
+                        cancelled = false;
                     }
                 }
             }
@@ -1557,15 +1582,33 @@ protected:
 
     // ends a start or a resume that cannot complete. The children that did start are stopped. The reason is kept for
     // startError() and runAndWait(). The scheduler enters ERROR, which only a reset leaves, and its stop() retires the
-    // workers of a resumed run. A start returns without spawning a worker, and no run loop then exists to settle the
-    // state later.
+    // workers of a resumed or partially started run, including starts with no worker to settle the state later.
     void failStart(Error reason) {
         _startError = std::move(reason);
-        graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) { stopChild(*block, "failStart() -> LifecycleState"); });
+        // Moving an active scheduler to ERROR invokes stop(), which releases
+        // blocking children before quiescing workers. If ERROR was already
+        // published by a lifecycle exception, that transition cannot run stop().
+        if (!lifecycle::isActive(this->state())) {
+            stop();
+        }
         this->emitErrorMessageIfAny("failStart() -> LifecycleState -> ERROR", this->changeStateTo(lifecycle::State::ERROR));
     }
 
     void start() {
+        // Catch before Lifecycle publishes ERROR so parents see the reason and
+        // the normal stop sweep also retires partially dispatched workers.
+        try {
+            startImpl();
+        } catch (const gr::exception& error) {
+            failStartAndReport(Error{error.what(), error.sourceLocation, error.errorTime});
+        } catch (const std::exception& error) {
+            failStartAndReport(Error{error.what()});
+        } catch (...) {
+            failStartAndReport(Error{"unknown scheduler startup exception"});
+        }
+    }
+
+    void startImpl() {
         using enum gr::lifecycle::State;
         if (isOnOwnWorkerThread()) {
             deferStart();
