@@ -8,7 +8,7 @@
 #include <limits>
 #include <thread>
 #include <type_traits>
-namespace {
+namespace finite_scheduler_completion {
 struct Source : gr::Block<Source> {
     gr::PortIn<int, gr::Optional> clock;
     gr::PortOut<int>              out, second;
@@ -132,10 +132,11 @@ bool wait(const auto& predicate) {
     }
     return true;
 }
-} // namespace
+} // namespace finite_scheduler_completion
 template<gr::scheduler::ExecutionPolicy Policy>
 void qualify() {
     using namespace boost::ut;
+    using namespace finite_scheduler_completion;
     "async finite completion settles state and drains both output ports"_test = [] {
         for (const std::size_t count : {1UZ, 20UZ, 10000UZ}) {
             gr::Graph graph;
@@ -377,7 +378,7 @@ void qualify() {
             expect(wait([&] { return first.entered.load(); }));
             scheduler.stop();
             auto tags = first.in.tagReader().get(first.in.tagReader().available());
-            expect(std::ranges::none_of(tags, [](const auto& tag) { return tag.map.contains(static_cast<std::pmr::string>(gr::tag::END_OF_STREAM)); }));
+            expect(std::ranges::none_of(tags, [](const auto& streamTag) { return streamTag.map.contains(static_cast<std::pmr::string>(gr::tag::END_OF_STREAM)); }));
         }
     };
     "immediate stop cannot resurrect an async start"_test = [] {
