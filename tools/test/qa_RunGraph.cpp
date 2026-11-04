@@ -14,6 +14,8 @@
 #include <sys/wait.h>
 #endif
 
+#include "TestEnvironment.hpp"
+
 /**
  * rungraph, driven as the program a caller runs.
  *
@@ -71,7 +73,7 @@ struct Result {
 
 // runs the tool with `arguments` and collects what it wrote and the status it exited with
 [[nodiscard]] Result run(const std::vector<std::string>& arguments) {
-    std::string command = std::format("\"{}\"", GR_TOOLS_RUNGRAPH);
+    std::string command = std::format("\"{}\"", fromEnvironment("GR_TOOLS_RUNGRAPH"));
     for (const std::string& argument : arguments) {
         command += std::format(" \"{}\"", argument);
     }
@@ -104,33 +106,25 @@ struct Result {
     return count;
 }
 
-#ifdef GR_TOOLS_CORE_TEST_PLUGINS
-constexpr std::string_view kGraphFile{GR_TOOLS_TEST_ASSETS "/source_to_sink.yaml"};
-constexpr std::string_view kSettingsChainFile{GR_TOOLS_TEST_ASSETS "/settings_chain.yaml"};
-constexpr std::string_view kStartChainFile{GR_TOOLS_TEST_ASSETS "/start_chain.yaml"};
-constexpr std::string_view kUnnamedResourceFile{GR_TOOLS_TEST_ASSETS "/unnamed_resource_chain.yaml"};
-
+#ifdef GR_TOOLS_WITH_CORE_TEST_PLUGINS
 // the graph, the plugins that supply its blocks, and a bound short enough for a test
-[[nodiscard]] std::vector<std::string> boundedRun() { return {"--graph", std::string(kGraphFile), "--plugin-dir", GR_TOOLS_CORE_TEST_PLUGINS, "--seconds", "0.5"}; }
+[[nodiscard]] std::vector<std::string> boundedRun() { return {"--graph", assetPath("source_to_sink.yaml"), "--plugin-dir", fromEnvironment("GR_TOOLS_CORE_TEST_PLUGINS"), "--seconds", "0.5"}; }
 
 // the same, over the chain whose two middle blocks open a resource when they start
-[[nodiscard]] std::vector<std::string> startChainRun() { return {"--graph", std::string(kStartChainFile), "--plugin-dir", GR_TOOLS_CORE_TEST_PLUGINS, "--seconds", "0.5"}; }
+[[nodiscard]] std::vector<std::string> startChainRun() { return {"--graph", assetPath("start_chain.yaml"), "--plugin-dir", fromEnvironment("GR_TOOLS_CORE_TEST_PLUGINS"), "--seconds", "0.5"}; }
 
 // the same, over a chain whose middle block names no resource and fails to start
-[[nodiscard]] std::vector<std::string> unnamedResourceRun() { return {"--graph", std::string(kUnnamedResourceFile), "--plugin-dir", GR_TOOLS_CORE_TEST_PLUGINS, "--seconds", "0.5"}; }
-
-constexpr std::string_view kFaultFile{GR_TOOLS_TEST_ASSETS "/fault.yaml"};
-constexpr std::string_view kSharedNameFile{GR_TOOLS_TEST_ASSETS "/shared_name.yaml"};
+[[nodiscard]] std::vector<std::string> unnamedResourceRun() { return {"--graph", assetPath("unnamed_resource_chain.yaml"), "--plugin-dir", fromEnvironment("GR_TOOLS_CORE_TEST_PLUGINS"), "--seconds", "0.5"}; }
 
 // the graph of the block that reports one error, over the fixture plugin; the bound is far beyond the report, and a
 // run that reaches it was not stopped by the error
-[[nodiscard]] std::vector<std::string> faultRun() { return {"--graph", std::string(kFaultFile), "--plugin-dir", GR_TOOLS_FIXTURE_PLUGINS, "--seconds", "10"}; }
+[[nodiscard]] std::vector<std::string> faultRun() { return {"--graph", assetPath("fault.yaml"), "--plugin-dir", fromEnvironment("GR_TOOLS_FIXTURE_PLUGINS"), "--seconds", "10"}; }
 
 // the graph of two sources that share a name, each with a unique_name
-[[nodiscard]] std::vector<std::string> sharedNameRun() { return {"--graph", std::string(kSharedNameFile), "--plugin-dir", GR_TOOLS_CORE_TEST_PLUGINS, "--seconds", "5"}; }
+[[nodiscard]] std::vector<std::string> sharedNameRun() { return {"--graph", assetPath("shared_name.yaml"), "--plugin-dir", fromEnvironment("GR_TOOLS_CORE_TEST_PLUGINS"), "--seconds", "5"}; }
 
 // the same, over the four-block chain the settings cases set a value on
-[[nodiscard]] std::vector<std::string> settingsChainRun() { return {"--graph", std::string(kSettingsChainFile), "--plugin-dir", GR_TOOLS_CORE_TEST_PLUGINS, "--seconds", "0.5"}; }
+[[nodiscard]] std::vector<std::string> settingsChainRun() { return {"--graph", assetPath("settings_chain.yaml"), "--plugin-dir", fromEnvironment("GR_TOOLS_CORE_TEST_PLUGINS"), "--seconds", "0.5"}; }
 
 // the chain on the scheduler named by `key`. A count on its source bounds the chain, and the run ends by itself.
 [[nodiscard]] std::vector<std::string> chainToItsEnd(std::string_view key) {
@@ -155,18 +149,13 @@ constexpr std::string_view kSharedNameFile{GR_TOOLS_TEST_ASSETS "/shared_name.ya
 }
 #endif
 
-#ifdef GR_TOOLS_CORE_TEST_PLUGINS
-constexpr std::string_view kRefusalFile{GR_TOOLS_TEST_ASSETS "/refusal.yaml"};
-constexpr std::string_view kWrongTypeFile{GR_TOOLS_TEST_ASSETS "/refusal_wrong_type.yaml"};
-constexpr std::string_view kOutOfLimitsFile{GR_TOOLS_TEST_ASSETS "/refusal_out_of_limits.yaml"};
-constexpr std::string_view kChunksFile{GR_TOOLS_TEST_ASSETS "/chunks.yaml"};
-
+#ifdef GR_TOOLS_WITH_CORE_TEST_PLUGINS
 // a graph of the fixture plugin; the bound is far beyond any failure, and a run that reaches it was not ended by one
-[[nodiscard]] std::vector<std::string> fixtureRun(std::string_view file) { return {"--graph", std::string(file), "--plugin-dir", GR_TOOLS_FIXTURE_PLUGINS, "--seconds", "10"}; }
+[[nodiscard]] std::vector<std::string> fixtureRun(std::string_view file) { return {"--graph", std::string(file), "--plugin-dir", fromEnvironment("GR_TOOLS_FIXTURE_PLUGINS"), "--seconds", "10"}; }
 
 // the block that fails in the step `step` names
 [[nodiscard]] std::vector<std::string> failingIn(std::string_view step) {
-    std::vector<std::string> arguments = fixtureRun(kRefusalFile);
+    std::vector<std::string> arguments = fixtureRun(assetPath("refusal.yaml"));
     arguments.insert(arguments.end(), {"--set", std::format("refusal.fails_in={}", step)});
     return arguments;
 }
@@ -273,7 +262,7 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
         expect(missing.output.contains("could not be read")) << missing.output;
     };
 
-#ifdef GR_TOOLS_CORE_TEST_PLUGINS
+#ifdef GR_TOOLS_WITH_CORE_TEST_PLUGINS
     "a run of a graph that does not end by itself is bounded by --seconds and stops cleanly"_test = [] {
         const Result bounded = run(boundedRun());
         expect(eq(bounded.exitCode, 0)) << bounded.output;
@@ -435,7 +424,7 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
         expect(ran.output.contains("the graph ended on its own")) << ran.output;
         expect(ran.output.contains("source: event_count = 1000")) << ran.output;
 
-        const Result refused = run({"--graph", "unread.yaml", "--plugin-dir", GR_TOOLS_CORE_TEST_PLUGINS, "--scheduler", "no::such::Scheduler"});
+        const Result refused = run({"--graph", "unread.yaml", "--plugin-dir", fromEnvironment("GR_TOOLS_CORE_TEST_PLUGINS"), "--scheduler", "no::such::Scheduler"});
         expect(eq(refused.exitCode, 2)) << refused.output;
         expect(refused.output.contains("good::GoodMathScheduler")) << "the list of keys includes the plugin's" << refused.output;
     };
@@ -443,7 +432,7 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
     "a shared object's scheduler of this ABI version runs the chain to its end, one of an earlier version or none is refused"_test = [] {
         std::vector<std::string> arguments = chainToItsEnd("test::library_scheduler");
         arguments.emplace_back("--plugin-dir");
-        arguments.emplace_back(GR_TOOLS_TEST_SCHEDULER_LIBRARY);
+        arguments.emplace_back(fromEnvironment("GR_TOOLS_TEST_SCHEDULER_LIBRARY"));
 
         const Result ran = run(arguments);
         expect(eq(ran.exitCode, 0)) << ran.output;
@@ -453,7 +442,7 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
         expect(ran.output.contains(std::format("{} did not load: scheduler test::library_scheduler_v1 has plugin ABI version 1, which does not match the host's plugin ABI version", moduleFileName("scheduler_library_v1")))) << "the refusal is reported as a failed plugin is" << ran.output;
         expect(ran.output.contains(std::format("{} did not load: scheduler test::library_scheduler_unversioned carries no plugin ABI version", moduleFileName("scheduler_library_unversioned")))) << "the refusal is reported as a failed plugin is" << ran.output;
 
-        const Result refused = run({"--graph", "unread.yaml", "--plugin-dir", GR_TOOLS_TEST_SCHEDULER_LIBRARY, "--scheduler", "test::library_scheduler_v1"});
+        const Result refused = run({"--graph", "unread.yaml", "--plugin-dir", fromEnvironment("GR_TOOLS_TEST_SCHEDULER_LIBRARY"), "--scheduler", "test::library_scheduler_v1"});
         expect(eq(refused.exitCode, 2)) << refused.output;
         expect(refused.output.contains("no scheduler is registered as test::library_scheduler_v1")) << refused.output;
         expect(refused.output.contains("rungraph:   test::library_scheduler\n")) << "the list of keys includes the kept library's" << refused.output;
@@ -462,11 +451,11 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
     "--verbose names a shared object that is neither a plugin nor a block library as loaded"_test = [] {
         std::vector<std::string> arguments = chainToItsEnd(kOwnSchedulers[0]);
         arguments.emplace_back("--plugin-dir");
-        arguments.emplace_back(GR_TOOLS_TEST_ORDINARY_LIBRARY);
+        arguments.emplace_back(fromEnvironment("GR_TOOLS_TEST_ORDINARY_LIBRARY"));
 
         const Result ran = run(arguments);
         expect(eq(ran.exitCode, 0)) << ran.output;
-        expect(ran.output.contains(std::format("rungraph: loaded {}/libordinary_library.so (no plugin entry point; this load registered nothing)\n", GR_TOOLS_TEST_ORDINARY_LIBRARY))) << ran.output;
+        expect(ran.output.contains(std::format("rungraph: loaded {}/libordinary_library.so (no plugin entry point; this load registered nothing)\n", fromEnvironment("GR_TOOLS_TEST_ORDINARY_LIBRARY")))) << ran.output;
         expect(!ran.output.contains("libordinary_library.so did not load")) << ran.output;
         expect(ran.output.contains("the graph ended on its own")) << ran.output;
     };
@@ -487,20 +476,20 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
 
         const Result verbose = run(arguments);
         expect(eq(verbose.exitCode, 0)) << verbose.output;
-        expect(verbose.output.contains(std::format("rungraph: searching {}\n", GR_TOOLS_CORE_TEST_PLUGINS))) << verbose.output;
+        expect(verbose.output.contains(std::format("rungraph: searching {}\n", fromEnvironment("GR_TOOLS_CORE_TEST_PLUGINS")))) << verbose.output;
         expect(verbose.output.contains("libbad_plugin.so did not load: ")) << "the plugin that fails is reported with its reason" << verbose.output;
         expect(verbose.output.contains("rungraph:   good::fixed_source<float32>\n")) << "a key a plugin of the directory brought is listed" << verbose.output;
     };
 
     "--verbose reports the scheduler before the graph file is read"_test = [] {
-        const Result unread = run({"--graph", "unread.yaml", "--plugin-dir", GR_TOOLS_CORE_TEST_PLUGINS, "--verbose", "--set", "timeout_ms=37"});
+        const Result unread = run({"--graph", "unread.yaml", "--plugin-dir", fromEnvironment("GR_TOOLS_CORE_TEST_PLUGINS"), "--verbose", "--set", "timeout_ms=37"});
         expect(eq(unread.exitCode, 1)) << unread.output;
         expect(unread.output.contains("rungraph: scheduler gr::scheduler::Simple<singleThreaded>\n")) << unread.output;
         expect(unread.output.contains("rungraph: scheduler setting timeout_ms = 37")) << unread.output;
     };
 
     "a scheduler that cannot be built is refused without the usage text"_test = [] {
-        const Result refused = run({"--graph", "unread.yaml", "--plugin-dir", GR_TOOLS_FIXTURE_PLUGINS, "--scheduler", "fixture::UnbuildableScheduler"});
+        const Result refused = run({"--graph", "unread.yaml", "--plugin-dir", fromEnvironment("GR_TOOLS_FIXTURE_PLUGINS"), "--scheduler", "fixture::UnbuildableScheduler"});
         expect(eq(refused.exitCode, 2)) << refused.output;
         expect(refused.output.contains("could not be built: the fixture scheduler cannot be built")) << refused.output;
         expect(!refused.output.contains("Usage: rungraph")) << "a command line the program could not use was reported as unusable" << refused.output;
@@ -560,13 +549,13 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
             std::string_view         reason;
         };
         const std::vector<Refusal> refusals{
-            {"a graph file value of the wrong type", fixtureRun(kWrongTypeFile), R"(value "many" for key 'count' has wrong type)"},
-            {"a graph file value outside the limits", fixtureRun(kOutOfLimitsFile), "outside the limits [0, 1]"},
+            {"a graph file value of the wrong type", fixtureRun(assetPath("refusal_wrong_type.yaml")), R"(value "many" for key 'count' has wrong type)"},
+            {"a graph file value outside the limits", fixtureRun(assetPath("refusal_out_of_limits.yaml")), "outside the limits [0, 1]"},
             {"settingsChanged() throws", failingIn("settingsChanged"), "the fixture refuses its settings"},
             {"start() throws", failingIn("start"), "the fixture refuses to start"},
             {"processBulk() throws", failingIn("processBulk"), "the fixture fails in processBulk"},
             {"work() returns ERROR", failingIn("work"), "its work() returned ERROR"},
-            {"an error on the message port", fixtureRun(kFaultFile), "the fixture reports a fault"},
+            {"an error on the message port", fixtureRun(assetPath("fault.yaml")), "the fixture reports a fault"},
         };
         for (const Refusal& refusal : refusals) {
             const Result                        failed = run(refusal.arguments);
@@ -592,12 +581,12 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
         const Result both = run(twoTexts);
         expect(eq(both.exitCode, 0)) << both.output;
 
-        std::vector<std::string> atLoad = fixtureRun(kWrongTypeFile);
+        std::vector<std::string> atLoad = fixtureRun(assetPath("refusal_wrong_type.yaml"));
         atLoad.insert(atLoad.end(), {"--expect-error", "for key 'count' has wrong type"});
         const Result loadFailure = run(atLoad);
         expect(eq(loadFailure.exitCode, 0)) << "a failure at load counts" << loadFailure.output;
 
-        std::vector<std::string> fromMessagePort = fixtureRun(kFaultFile);
+        std::vector<std::string> fromMessagePort = fixtureRun(assetPath("fault.yaml"));
         fromMessagePort.insert(fromMessagePort.end(), {"--expect-error", "reports a fault"});
         const Result reported = run(fromMessagePort);
         expect(eq(reported.exitCode, 0)) << "a reported error counts" << reported.output;
@@ -699,7 +688,7 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
         const Result within = run(nearRate);
         expect(eq(within.exitCode, 0)) << within.output;
 
-        std::vector<std::string> pattern = fixtureRun(kChunksFile);
+        std::vector<std::string> pattern = fixtureRun(assetPath("chunks.yaml"));
         pattern.insert(pattern.end(), {"--set", "source.pattern=!!float32 [0.5, 1.5, 2.5]"});
         const auto expectPattern = [&pattern](std::string_view value) {
             std::vector<std::string> arguments = pattern;
@@ -712,7 +701,7 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
         expect(eq(programLinesHolding(otherElement.output, "source.pattern is [0.5, 1.5, 2.5], expected [0.5, 1.5, 3.5]").size(), 1UZ)) << "the line lists the elements of each" << otherElement.output;
         expect(eq(expectPattern("[0.5, 1.5]").exitCode, 1)) << "a vector of another length differs";
 
-        std::vector<std::string> tenth = fixtureRun(kChunksFile);
+        std::vector<std::string> tenth = fixtureRun(assetPath("chunks.yaml"));
         tenth.insert(tenth.end(), {"--set", "source.pattern=!!float32 [0.1]", "--expect", "source.pattern=[0.1]"});
         const Result inFloat = run(tenth);
         expect(eq(inFloat.exitCode, 0)) << "0.1 reads as the block's float, which is not the double 0.1" << inFloat.output;
@@ -760,7 +749,7 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
         constexpr std::size_t kDecimatorChunk = 4UZ; // the decimator's input_chunk_size
         for (const std::string_view key : kOwnSchedulers) {
             for (const std::size_t bound : {1UZ, 7UZ}) {
-                std::vector<std::string> arguments = fixtureRun(kChunksFile);
+                std::vector<std::string> arguments = fixtureRun(assetPath("chunks.yaml"));
                 arguments.insert(arguments.end(), {"--scheduler", std::string(key), "--set", std::format("max_work_items={}", bound), "--set", std::format("source.n_samples={}", kSamples), //
                                                       "--expect", std::format("source.largest_call={}", bound), "--expect", std::format("sink.received={}", kSamples),                       //
                                                       "--expect", std::format("decimated.received={}", kSamples / kDecimatorChunk), "--show", "middle", "--show", "sink", "--show", "decimator"});
@@ -777,7 +766,7 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
             }
         }
 
-        std::vector<std::string> unbounded = fixtureRun(kChunksFile);
+        std::vector<std::string> unbounded = fixtureRun(assetPath("chunks.yaml"));
         unbounded.insert(unbounded.end(), {"--set", std::format("source.n_samples={}", kSamples), "--show", "source"});
         const Result unboundedRun = run(unbounded);
         expect(eq(unboundedRun.exitCode, 0)) << unboundedRun.output;
