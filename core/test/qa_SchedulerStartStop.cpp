@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <expected>
 #include <memory>
+#include <memory_resource>
 #include <mutex>
 #include <span>
 #include <string>
@@ -299,7 +300,124 @@ inline std::vector<std::string> requestIds(std::span<const gr::Message> messages
     return ids;
 }
 
+// a source of ones with a message output that no edge takes
+struct EventingSource : gr::Block<EventingSource> {
+    gr::PortOut<float> out;
+    gr::MsgPortOut     events;
+
+    GR_MAKE_REFLECTABLE(EventingSource, out, events);
+
+    [[nodiscard]] constexpr float processOne() const noexcept { return 1.0f; }
+};
+
+// a sink with a mandatory input, an optional input and a message input
+struct ReferencedSink : gr::Block<ReferencedSink> {
+    gr::PortIn<float>               in;
+    gr::PortIn<float, gr::Optional> reference;
+    gr::MsgPortIn                   commands;
+
+    GR_MAKE_REFLECTABLE(ReferencedSink, in, reference, commands);
+
+    gr::work::Status processBulk(gr::InputSpanLike auto&, gr::InputSpanLike auto&) { return gr::work::Status::OK; }
+};
+
+// a sink with a mandatory synchronous input and a mandatory asynchronous input
+struct AuxiliarySink : gr::Block<AuxiliarySink> {
+    gr::PortIn<float>            data;
+    gr::PortIn<float, gr::Async> aux;
+
+    GR_MAKE_REFLECTABLE(AuxiliarySink, data, aux);
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& dataSpan, gr::InputSpanLike auto& auxSpan) {
+        std::ignore = dataSpan.consume(dataSpan.size());
+        std::ignore = auxSpan.consume(auxSpan.size());
+        return gr::work::Status::OK;
+    }
+};
+
+// a sink whose two mandatory inputs are one collection, "in#0" and "in#1"
+struct PairSink : gr::Block<PairSink> {
+    std::vector<gr::PortIn<float>> in = std::vector<gr::PortIn<float>>(2UZ);
+
+    GR_MAKE_REFLECTABLE(PairSink, in);
+
+    template<gr::InputSpanLike TInSpan>
+    gr::work::Status processBulk(const std::span<TInSpan>&) {
+        return gr::work::Status::OK;
+    }
+};
+
+// starts the scheduler, takes the messages it published on msgOut by then and stops it. The result holds the data of
+// each notification on kInputWithoutEdge
+[[nodiscard]] std::vector<gr::property_map> inputsWithoutEdgeAtStart(TestScheduler& scheduler) {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+    gr::MsgPortIn fromScheduler;
+    expect(fatal(scheduler.msgOut.connect(fromScheduler).has_value()));
+    expect(fatal(scheduler.changeStateTo(INITIALISED).has_value()));
+    expect(fatal(scheduler.changeStateTo(RUNNING).has_value()));
+
+    std::vector<gr::property_map> reports;
+    auto                          messages = fromScheduler.streamReader().get();
+    for (const gr::Message& message : messages) {
+        if (message.endpoint == gr::scheduler::property::kInputWithoutEdge && message.data.has_value()) {
+            reports.push_back(*message.data);
+        }
+    }
+    std::ignore = messages.consume(messages.size());
+
+    expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+    expect(awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
+    return reports;
+}
+
+[[nodiscard]] bool namesPort(const gr::property_map& report, std::string_view blockName, std::string_view portName) {
+    const auto block = report.find(std::pmr::string("block"));
+    const auto port  = report.find(std::pmr::string("port"));
+    return block != report.end() && port != report.end() && block->second.value_or(std::string_view{}) == blockName && port->second.value_or(std::string_view{}) == portName;
+}
+
 } // namespace qa_start_stop
+
+const boost::ut::suite<"inputs without an edge at start"> inputsWithoutEdgeTests = [] {
+    using namespace boost::ut;
+
+    "a mandatory input without an edge is named at start, and the run starts"_test = [] {
+        gr::Graph flow;
+        auto&     source   = flow.emplaceBlock<qa_start_stop::EventingSource>();
+        auto&     sink     = flow.emplaceBlock<qa_start_stop::ReferencedSink>();
+        auto&     pair     = flow.emplaceBlock<qa_start_stop::PairSink>();
+        auto&     stranded = flow.emplaceBlock<qa_start_stop::ReferencedSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+        expect(flow.connect(source, gr::PortDefinition{"out"}, pair, gr::PortDefinition{"in#0"}).has_value());
+        const std::string strandedName(stranded.unique_name);
+        const std::string pairName(pair.unique_name);
+
+        qa_start_stop::TestScheduler scheduler;
+        expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+        const std::vector<gr::property_map> reports = qa_start_stop::inputsWithoutEdgeAtStart(scheduler);
+
+        expect(eq(reports.size(), 2UZ)) << "one report for each mandatory input without an edge";
+        expect(std::ranges::any_of(reports, [&](const gr::property_map& report) { return qa_start_stop::namesPort(report, strandedName, "in"); })) << "the stranded block's input is not named";
+        expect(std::ranges::any_of(reports, [&](const gr::property_map& report) { return qa_start_stop::namesPort(report, pairName, "in#1"); })) << "the open member of the collection is not named";
+    };
+
+    "a graph with open optional inputs, an open asynchronous input and open message ports names nothing at start"_test = [] {
+        gr::Graph flow;
+        auto&     source    = flow.emplaceBlock<qa_start_stop::EventingSource>();
+        auto&     sink      = flow.emplaceBlock<qa_start_stop::ReferencedSink>();
+        auto&     pair      = flow.emplaceBlock<qa_start_stop::PairSink>();
+        auto&     auxiliary = flow.emplaceBlock<qa_start_stop::AuxiliarySink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+        expect(flow.connect<"out", "data">(source, auxiliary).has_value());
+        expect(flow.connect(source, gr::PortDefinition{"out"}, pair, gr::PortDefinition{"in#0"}).has_value());
+        expect(flow.connect(source, gr::PortDefinition{"out"}, pair, gr::PortDefinition{"in#1"}).has_value());
+
+        qa_start_stop::TestScheduler scheduler;
+        expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+        expect(qa_start_stop::inputsWithoutEdgeAtStart(scheduler).empty()) << "an optional input, an asynchronous input or a message port was named";
+    };
+};
 
 const boost::ut::suite<"stop requested during the start transient"> startStopRaceTests = [] {
     using namespace boost::ut;
