@@ -185,7 +185,7 @@ void qualify() {
     const auto policyTest = [](std::string_view name) {
         static std::deque<std::string> names;
         names.push_back(std::format("{} / {}", name, gr::meta::enumName(Policy).value_or("unknown")));
-        return boost::ut::test(names.back());
+        return boost::ut::test(std::string_view{names.back()});
     };
     policyTest("drain releases blocking sources and times out blocking consumers, including nested graphs") = [] {
         for (bool nested : {false, true}) {
