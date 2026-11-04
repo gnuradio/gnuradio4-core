@@ -19,6 +19,7 @@
 #include <gnuradio-4.0/BlockRegistry.hpp>
 #include <gnuradio-4.0/tools/RunGraph.hpp>
 
+#include "TestEnvironment.hpp"
 #include "good_base_plugin.hpp"
 
 /**
@@ -29,8 +30,6 @@
  */
 
 namespace {
-
-constexpr std::string_view kGraphFile{GR_TOOLS_TEST_ASSETS "/source_to_sink.yaml"};
 
 using SignalHandler = decltype(std::signal(SIGINT, SIG_DFL));
 
@@ -107,7 +106,7 @@ const boost::ut::suite<"rungraph library"> runGraphLibraryTests = [] {
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
             }
         });
-        const Call        first = callRunGraph({"--graph", std::string(kGraphFile)});
+        const Call        first = callRunGraph({"--graph", assetPath("source_to_sink.yaml")});
         firstReturned.store(true);
         interrupter.join();
         expect(eq(first.exitCode, 0)) << first.output;
@@ -118,7 +117,7 @@ const boost::ut::suite<"rungraph library"> runGraphLibraryTests = [] {
         expect(interruptAfter == onHostSignal) << "the SIGINT handler the call replaced is back";
         expect(terminateAfter == onHostSignal) << "the SIGTERM handler the call replaced is back";
 
-        const Call second = callRunGraph({"--graph", std::string(kGraphFile), "--set", "source.event_count=100"});
+        const Call second = callRunGraph({"--graph", assetPath("source_to_sink.yaml"), "--set", "source.event_count=100"});
         expect(eq(second.exitCode, 0)) << second.output;
         expect(second.output.contains("rungraph: the graph ended on its own")) << "the signal to the first call does not stop the second" << second.output;
     };

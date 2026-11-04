@@ -5,9 +5,15 @@ target_link_libraries(qa_GraphDoc PRIVATE gnuradio-doctools)
 # A refusal is the status the command exits with and the line it prints, neither of which is visible from inside the
 # process, so the cases that cover one run the built program over a file they write in this directory.
 add_dependencies(qa_GraphDoc graphdoc)
-target_compile_definitions(
-  qa_GraphDoc PRIVATE GR_TOOLS_TEST_ASSETS="${GR_TOOLS_TEST_ASSETS}" GR_TOOLS_GRAPHDOC="$<TARGET_FILE:graphdoc>"
-                      GR_TOOLS_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}")
+# The paths reach the test through its environment, so the test's own definitions hold none of the directories it was
+# built in.
+set_property(
+  TEST qa_GraphDoc
+  APPEND
+  PROPERTY ENVIRONMENT
+           "GR_TOOLS_TEST_ASSETS=${GR_TOOLS_TEST_ASSETS}"
+           "GR_TOOLS_GRAPHDOC=$<TARGET_FILE:graphdoc>"
+           "GR_TOOLS_TEST_SCRATCH=${CMAKE_CURRENT_BINARY_DIR}")
 
 # A reader reviews the whole document, so the pinned documents are compared as files rather than asserted piecewise: a
 # formatting change then shows up as a diff of the document itself. They carry the `.expected` extension because the
@@ -52,16 +58,22 @@ add_option_handling_tests(graphdoc)
 # plugins are.
 if(TARGET rungraph)
   add_ut_test(qa_RunGraph)
-  target_compile_definitions(qa_RunGraph PRIVATE GR_TOOLS_TEST_ASSETS="${GR_TOOLS_TEST_ASSETS}"
-                                                 GR_TOOLS_RUNGRAPH="$<TARGET_FILE:rungraph>")
+  set_property(
+    TEST qa_RunGraph
+    APPEND
+    PROPERTY ENVIRONMENT "GR_TOOLS_TEST_ASSETS=${GR_TOOLS_TEST_ASSETS}" "GR_TOOLS_RUNGRAPH=$<TARGET_FILE:rungraph>")
   add_dependencies(qa_RunGraph rungraph)
   set_tests_properties(qa_RunGraph PROPERTIES TIMEOUT 60)
   if(INTERNAL_ENABLE_BLOCK_PLUGINS)
-    target_compile_definitions(
-      qa_RunGraph
-      PRIVATE GR_TOOLS_CORE_TEST_PLUGINS="${CMAKE_BINARY_DIR}/core/test/plugins"
-              GR_TOOLS_TEST_SCHEDULER_LIBRARY="${CMAKE_BINARY_DIR}/core/test/scheduler_library"
-              GR_TOOLS_TEST_ORDINARY_LIBRARY="${CMAKE_BINARY_DIR}/core/test/ordinary_library")
+    target_compile_definitions(qa_RunGraph PRIVATE GR_TOOLS_WITH_CORE_TEST_PLUGINS)
+    set_property(
+      TEST qa_RunGraph
+      APPEND
+      PROPERTY ENVIRONMENT
+               "GR_TOOLS_CORE_TEST_PLUGINS=${CMAKE_BINARY_DIR}/core/test/plugins"
+               "GR_TOOLS_TEST_SCHEDULER_LIBRARY=${CMAKE_BINARY_DIR}/core/test/scheduler_library"
+               "GR_TOOLS_TEST_ORDINARY_LIBRARY=${CMAKE_BINARY_DIR}/core/test/ordinary_library"
+               "GR_TOOLS_FIXTURE_PLUGINS=${CMAKE_CURRENT_BINARY_DIR}/fixture")
     # the cases read these files: GoodBasePlugin (good::fixed_source and good::cout_sink), GoodRegistryPlugin
     # (good::identity and good::start_recorder), good_math_plugin (a plugin's scheduler), bad_plugin (the plugin
     # --verbose reports as not loaded), scheduler_library (a scheduler from a shared object that is not a plugin),
@@ -88,7 +100,6 @@ if(TARGET rungraph)
     target_link_libraries(rungraph_fixture PRIVATE gnuradio-options gnuradio-core gnuradio-plugin)
     set_target_properties(rungraph_fixture PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/fixture)
     add_dependencies(qa_RunGraph rungraph_fixture)
-    target_compile_definitions(qa_RunGraph PRIVATE GR_TOOLS_FIXTURE_PLUGINS="${CMAKE_CURRENT_BINARY_DIR}/fixture")
   endif()
 endif()
 
@@ -97,7 +108,10 @@ if(TARGET gnuradio-rungraph)
   add_ut_test(qa_RunGraphLibrary)
   target_link_libraries(qa_RunGraphLibrary PRIVATE gnuradio-rungraph)
   target_include_directories(qa_RunGraphLibrary PRIVATE ${PROJECT_SOURCE_DIR}/core/test/plugins)
-  target_compile_definitions(qa_RunGraphLibrary PRIVATE GR_TOOLS_TEST_ASSETS="${GR_TOOLS_TEST_ASSETS}")
+  set_property(
+    TEST qa_RunGraphLibrary
+    APPEND
+    PROPERTY ENVIRONMENT "GR_TOOLS_TEST_ASSETS=${GR_TOOLS_TEST_ASSETS}")
   set_tests_properties(qa_RunGraphLibrary PROPERTIES TIMEOUT 60)
 endif()
 
@@ -107,18 +121,25 @@ endif()
 # Another is given the directory of a shared object that is neither a plugin nor a block library.
 if(TARGET grinfo)
   add_ut_test(qa_GrInfo)
-  target_compile_definitions(qa_GrInfo PRIVATE GR_TOOLS_GRINFO="$<TARGET_FILE:grinfo>")
+  set_property(
+    TEST qa_GrInfo
+    APPEND
+    PROPERTY ENVIRONMENT "GR_TOOLS_GRINFO=$<TARGET_FILE:grinfo>")
   add_dependencies(qa_GrInfo grinfo)
   set_tests_properties(qa_GrInfo PROPERTIES TIMEOUT 60)
   if(INTERNAL_ENABLE_BLOCK_PLUGINS)
-    target_compile_definitions(
-      qa_GrInfo
-      PRIVATE GR_TOOLS_CORE_TEST_PLUGINS="${CMAKE_BINARY_DIR}/core/test/plugins"
-              GR_TOOLS_TEST_BLOCK_LIBRARY="${CMAKE_BINARY_DIR}/core/test/block_library"
-              GR_TOOLS_TEST_SCHEDULER_LIBRARY="${CMAKE_BINARY_DIR}/core/test/scheduler_library"
-              GR_TOOLS_TEST_PLUGIN_ABI="${CMAKE_BINARY_DIR}/core/test/plugin_abi"
-              GR_TOOLS_TEST_ORDINARY_LIBRARY="${CMAKE_BINARY_DIR}/core/test/ordinary_library"
-              GR_TOOLS_TEST_DOC_PROBE_LIBRARY="${CMAKE_BINARY_DIR}/core/test/doc_probe_library")
+    target_compile_definitions(qa_GrInfo PRIVATE GR_TOOLS_WITH_CORE_TEST_PLUGINS)
+    set_property(
+      TEST qa_GrInfo
+      APPEND
+      PROPERTY ENVIRONMENT
+               "GR_TOOLS_CORE_TEST_PLUGINS=${CMAKE_BINARY_DIR}/core/test/plugins"
+               "GR_TOOLS_TEST_BLOCK_LIBRARY=${CMAKE_BINARY_DIR}/core/test/block_library"
+               "GR_TOOLS_TEST_SCHEDULER_LIBRARY=${CMAKE_BINARY_DIR}/core/test/scheduler_library"
+               "GR_TOOLS_TEST_PLUGIN_ABI=${CMAKE_BINARY_DIR}/core/test/plugin_abi"
+               "GR_TOOLS_TEST_ORDINARY_LIBRARY=${CMAKE_BINARY_DIR}/core/test/ordinary_library"
+               "GR_TOOLS_TEST_DOC_PROBE_LIBRARY=${CMAKE_BINARY_DIR}/core/test/doc_probe_library"
+               "GR_TOOLS_TEST_DEVICE_LISTING=${CMAKE_BINARY_DIR}/core/test/device_listing")
     add_dependencies(
       qa_GrInfo
       GoodBasePlugin
@@ -137,8 +158,6 @@ if(TARGET grinfo)
       ordinary_library
       entry_point_only_plugin)
     # the device cases read a block library and a plugin that register device listings of invented units
-    target_compile_definitions(qa_GrInfo
-                               PRIVATE GR_TOOLS_TEST_DEVICE_LISTING="${CMAKE_BINARY_DIR}/core/test/device_listing")
     add_dependencies(qa_GrInfo device_listing_library device_listing_plugin)
   endif()
 endif()

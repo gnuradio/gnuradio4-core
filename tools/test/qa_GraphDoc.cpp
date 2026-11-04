@@ -19,6 +19,7 @@
 #include <gnuradio-4.0/config.hpp>
 
 #include "GraphDoc.hpp"
+#include "TestEnvironment.hpp"
 
 #ifdef GR_ENABLE_BLOCK_REGISTRY
 #include <complex>
@@ -45,7 +46,7 @@ namespace qa_graphdoc {
 using namespace gr::tools;
 
 [[nodiscard]] std::string fixture() {
-    std::ifstream      input(std::string(GR_TOOLS_TEST_ASSETS) + "/nested_graph.yaml", std::ios::binary);
+    std::ifstream      input(assetPath("nested_graph.yaml"), std::ios::binary);
     std::ostringstream contents;
     contents << input.rdbuf();
     return contents.str();
@@ -157,14 +158,14 @@ struct Run {
 /// `options` ahead of the file. A refusal is the status the command exits with and the line it
 /// prints, and a test reads neither from inside this process.
 [[nodiscard]] Run describe(std::string_view fileName, std::string_view yaml, std::string_view options = {}) {
-    const std::string path = std::format("{}/{}", GR_TOOLS_TEST_SCRATCH, fileName);
+    const std::string path = std::format("{}/{}", fromEnvironment("GR_TOOLS_TEST_SCRATCH"), fileName);
     {
         std::ofstream file(path, std::ios::binary);
         file << yaml;
     }
 
     Run               result;
-    const std::string command = std::format("\"{}\" --format md {} \"{}\" 2>&1", GR_TOOLS_GRAPHDOC, options, path);
+    const std::string command = std::format("\"{}\" --format md {} \"{}\" 2>&1", fromEnvironment("GR_TOOLS_GRAPHDOC"), options, path);
     std::FILE*        pipe    = openPipe(forShell(command).c_str(), "r");
     if (pipe == nullptr) {
         return result;
@@ -646,7 +647,7 @@ const boost::ut::suite<"GraphDoc"> graphDocTests = [] {
 
 #ifdef GR_ENABLE_BLOCK_REGISTRY
     "graphdoc's output holds the document alone when a definition refuses"_test = [] {
-        const std::filesystem::path root = std::filesystem::path(GR_TOOLS_TEST_SCRATCH) / "refusing_definition_root";
+        const std::filesystem::path root = std::filesystem::path(fromEnvironment("GR_TOOLS_TEST_SCRATCH")) / "refusing_definition_root";
         std::filesystem::create_directories(root);
         {
             std::ofstream index(root / "index.yaml");
