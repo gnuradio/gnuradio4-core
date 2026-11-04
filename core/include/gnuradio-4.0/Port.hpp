@@ -1335,7 +1335,7 @@ private:
     }
 
     // Keep model's vtable unchanged. A port compiled without this capability
-    // cannot publish a drain marker, and the caller can fall back to a stop.
+    // cannot publish a drain marker; draining may then reach its deadline.
     struct GNURADIO_EXPORT EndOfStreamAccess {
         virtual ~EndOfStreamAccess();
         [[nodiscard]] virtual bool publishEoS() noexcept = 0;

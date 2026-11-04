@@ -53,8 +53,8 @@
 // scheduler reads the `msgIn` and `msgOut` ports of a plugin's block through typed pointers, and the layout of a port
 // crosses the boundary too. `SchedulerModel::start()` returns the refusal of a start as a `std::expected`, and a host
 // reads it from a plugin's scheduler. `SchedulerModel::stopAfterDrain()` and `cancelDrainSources()` add virtual entries;
-// plugins built without them must be rebuilt before the host can invoke drain.
-#define GR_PLUGIN_CURRENT_ABI_VERSION 11
+// cancelDrainSources() takes the shared drain deadline. Older plugins must be rebuilt.
+#define GR_PLUGIN_CURRENT_ABI_VERSION 12
 
 namespace gr {
 
