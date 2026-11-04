@@ -515,7 +515,8 @@ public:
     std::pair<std::shared_ptr<BlockModel>, std::shared_ptr<BlockModel>> replaceBlock(std::string_view uniqueName, std::string_view type, const property_map& properties);
 
     // returns the edges the new one displaced from its stream input. An edge into a message input that an edge already
-    // takes is refused before the ports are connected, and the error names both edges
+    // takes is refused before the ports are connected, and the error names both edges. After the connection, the
+    // unconnected optional outputs of both blocks are sized as connectPendingEdges() sizes them
     [[nodiscard]] std::expected<std::vector<Edge>, Error> emplaceEdge(std::string_view sourceBlock, std::string sourcePort, std::string_view destinationBlock, //
         std::string destinationPort, [[maybe_unused]] const std::size_t minBufferSize, [[maybe_unused]] const std::int32_t weight, std::string_view edgeName) {
         auto sourceBlockIt = std::ranges::find_if(_blocks, [&sourceBlock](const auto& block) { return block->uniqueName() == sourceBlock; });
@@ -558,6 +559,8 @@ public:
 
         std::vector<Edge> displaced = removeEdgesDisplacedBy(newEdge);
         _edges.push_back(std::move(newEdge));
+        sizeUnconnectedOptionalOutputs(**sourceBlockIt);
+        sizeUnconnectedOptionalOutputs(**destinationBlockIt);
         return displaced;
     }
 
@@ -971,7 +974,9 @@ public:
     // item sizing may include it, yet only connected ports are resized to their edge
     // size: left at the default capacity, a span request beyond that capacity returns an
     // empty span in a release build with nothing signaled, silently throttling the block
-    // to zero — so it is sized with the block's largest connected output
+    // to zero — so it is sized with the block's largest connected synchronous stream output.
+    // With no such output connected, the block's input alone sets its chunk, and the port
+    // holds that chunk
     static void sizeUnconnectedOptionalOutputs(BlockModel& block) {
         auto forEachOutputPort = [&block](auto&& fn) {
             for (auto& portOrCollection : block.dynamicOutputPorts()) {
@@ -986,21 +991,43 @@ public:
         };
         std::size_t maxConnectedSize = 0UZ;
         forEachOutputPort([&maxConnectedSize](gr::DynamicPort& port) {
-            if (port.isConnected()) {
+            if (port.isConnected() && port.isSynchronous() && port::decodePortType(port.portMaskInfo()) == PortType::STREAM) {
                 maxConnectedSize = std::max(maxConnectedSize, port.bufferSize());
             }
         });
-        if (maxConnectedSize == 0UZ) {
-            return;
-        }
-        forEachOutputPort([maxConnectedSize](gr::DynamicPort& port) {
-            if (!port.isConnected() && port.isSynchronous() && port.isOptional() && port.bufferSize() < maxConnectedSize) {
-                std::ignore = port.resizeBuffer(maxConnectedSize);
+        const std::size_t targetSize = maxConnectedSize > 0UZ ? maxConnectedSize : largestOutputChunk(block);
+        forEachOutputPort([targetSize](gr::DynamicPort& port) {
+            if (!port.isConnected() && port.isSynchronous() && port.isOptional() && port.bufferSize() < targetSize) {
+                std::ignore = port.resizeBuffer(targetSize);
             }
         });
     }
 
 private:
+    // the most output samples one work() call of a block can ask for when no output limits it: the largest buffer of a
+    // connected synchronous input, scaled by output_chunk_size / input_chunk_size, or one output_chunk_size, whichever is
+    // larger
+    [[nodiscard]] static std::size_t largestOutputChunk(BlockModel& block) {
+        const gr::Ratio   ratio        = block.resamplingRatio();
+        const std::size_t inputChunk   = static_cast<std::size_t>(std::max(ratio.numerator, std::int32_t{1}));
+        const std::size_t outputChunk  = static_cast<std::size_t>(std::max(ratio.denominator, std::int32_t{1}));
+        std::size_t       largestInput = 0UZ;
+        for (auto& portOrCollection : block.dynamicInputPorts()) {
+            auto consider = [&largestInput](gr::DynamicPort& port) {
+                if (port.isConnected() && port.isSynchronous()) {
+                    largestInput = std::max(largestInput, port.bufferSize());
+                }
+            };
+            if (auto* port = std::get_if<gr::DynamicPort>(&portOrCollection)) {
+                consider(*port);
+            } else {
+                std::ranges::for_each(std::get<BlockModel::NamedPortCollection>(portOrCollection).ports, consider);
+            }
+        }
+        const std::size_t inputChunks = (largestInput + inputChunk - 1UZ) / inputChunk;
+        return std::max(inputChunks * outputChunk, outputChunk);
+    }
+
     // an input reads only the ring it was connected to last: a second edge into it leaves the first one listed with no
     // reader
     [[nodiscard]] std::expected<void, Error> checkInputFree(const Edge& newEdge, PortType type, std::source_location location = std::source_location::current()) const {

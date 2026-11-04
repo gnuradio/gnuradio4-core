@@ -174,6 +174,77 @@ struct MonitoredSource : gr::Block<MonitoredSource> {
     }
 };
 
+// an edge sixteen times the default buffer of a port, and a run of four such buffers
+constexpr std::size_t kWideEdgeSize   = 16UZ * gr::PortOut<float>::kDefaultBufferSize;
+constexpr std::size_t kWideRunSamples = 4UZ * kWideEdgeSize;
+
+// emits kWideRunSamples samples, as many per call as its output takes, and then reports DONE
+struct WideRunSource : gr::Block<WideRunSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(WideRunSource, out);
+
+    std::size_t _nProduced = 0UZ;
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        const std::size_t n = std::min(outSpan.size(), kWideRunSamples - _nProduced);
+        std::ranges::fill_n(outSpan.begin(), static_cast<std::ptrdiff_t>(n), 1.0f);
+        outSpan.publish(n);
+        _nProduced += n;
+        return _nProduced == kWideRunSamples ? gr::work::Status::DONE : gr::work::Status::OK;
+    }
+};
+
+// a stage whose only stream outputs are two optional ones, beside a message output. It takes every input sample it is
+// given, copies to both outputs what their spans hold, counts the calls whose output spans were shorter than the input
+// span and keeps the size of the largest input span
+struct OptionalOutputsStage : gr::Block<OptionalOutputsStage> {
+    gr::PortIn<float>                in;
+    gr::PortOut<float, gr::Optional> monitor;
+    gr::PortOut<float, gr::Optional> trace;
+    gr::MsgPortOut                   events;
+
+    GR_MAKE_REFLECTABLE(OptionalOutputsStage, in, monitor, trace, events);
+
+    std::size_t _nConsumed   = 0UZ;
+    std::size_t _nPublished  = 0UZ;
+    std::size_t _nShortCalls = 0UZ;
+    std::size_t _largestIn   = 0UZ;
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& inSpan, gr::OutputSpanLike auto& monitorSpan, gr::OutputSpanLike auto& traceSpan) {
+        _largestIn          = std::max(_largestIn, inSpan.size());
+        const std::size_t n = std::min({inSpan.size(), monitorSpan.size(), traceSpan.size()});
+        if (n < inSpan.size()) {
+            ++_nShortCalls;
+        }
+        std::ranges::copy_n(inSpan.begin(), static_cast<std::ptrdiff_t>(n), monitorSpan.begin());
+        std::ranges::copy_n(inSpan.begin(), static_cast<std::ptrdiff_t>(n), traceSpan.begin());
+        monitorSpan.publish(n);
+        traceSpan.publish(n);
+        _nConsumed += inSpan.size();
+        _nPublished += n;
+        return gr::work::Status::OK;
+    }
+};
+
+constexpr gr::Size_t kOptionalInterpolation = 4U;
+
+// writes each input sample kOptionalInterpolation times to its only output, an optional one
+struct OptionalOutputInterpolator : gr::Block<OptionalOutputInterpolator, gr::Resampling<1U, kOptionalInterpolation, true>> {
+    gr::PortIn<float>                in;
+    gr::PortOut<float, gr::Optional> monitor;
+
+    GR_MAKE_REFLECTABLE(OptionalOutputInterpolator, in, monitor);
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& inSpan, gr::OutputSpanLike auto& monitorSpan) {
+        for (std::size_t i = 0UZ; i < inSpan.size(); ++i) {
+            std::ranges::fill_n(monitorSpan.begin() + static_cast<std::ptrdiff_t>(i * kOptionalInterpolation), kOptionalInterpolation, inSpan[i]);
+        }
+        monitorSpan.publish(inSpan.size() * kOptionalInterpolation);
+        return gr::work::Status::OK;
+    }
+};
+
 // resolvable only through a test-local registry, never the global one, so a lookup that
 // succeeds proves which loader served it
 struct LoaderCanary : gr::Block<LoaderCanary> {
@@ -1558,6 +1629,50 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(eq(source.monitor.bufferSize(), source.out.bufferSize())) << "a span request past the default capacity returns empty with nothing signaled";
     };
 
+    "a block whose only outputs are unconnected optional ones takes chunks of its whole input edge"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_edit::WideRunSource>();
+        auto&     stage  = flow.emplaceBlock<qa_edit::OptionalOutputsStage>();
+        expect(flow.connect<"out", "in">(source, stage, gr::EdgeParameters{.minBufferSize = qa_edit::kWideEdgeSize}).has_value());
+
+        gr::scheduler::Simple<> scheduler;
+        expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+        expect(fatal(scheduler.runAndWait().has_value()));
+
+        expect(gt(stage._largestIn, gr::PortOut<float>::kDefaultBufferSize)) << "no input span was larger than the default buffer";
+        expect(eq(stage._nShortCalls, 0UZ)) << "a call got an output span shorter than its input";
+        expect(eq(stage._nConsumed, qa_edit::kWideRunSamples));
+        expect(eq(stage._nPublished, stage._nConsumed)) << "samples were taken from the input and never written";
+    };
+
+    "a connected message output leaves the open optional outputs sized for the whole input edge"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_edit::WideRunSource>();
+        auto&     stage  = flow.emplaceBlock<qa_edit::OptionalOutputsStage>();
+        auto&     sink   = flow.emplaceBlock<qa_edit::MessageSink>();
+        expect(flow.connect<"out", "in">(source, stage, gr::EdgeParameters{.minBufferSize = qa_edit::kWideEdgeSize}).has_value());
+        expect(flow.connect<"out", "in">(source, sink, gr::EdgeParameters{.minBufferSize = qa_edit::kWideEdgeSize}).has_value());
+        expect(flow.connect(stage, gr::PortDefinition{"events"}, sink, gr::PortDefinition{"cmd"}).has_value());
+
+        gr::scheduler::Simple<> scheduler;
+        expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+        expect(fatal(scheduler.runAndWait().has_value()));
+
+        expect(gt(stage._largestIn, gr::PortOut<float>::kDefaultBufferSize)) << "no input span was larger than the default buffer";
+        expect(eq(stage._nShortCalls, 0UZ)) << "the message ring was taken for a connected stream output";
+        expect(eq(stage._nConsumed, qa_edit::kWideRunSamples));
+        expect(eq(stage._nPublished, stage._nConsumed)) << "samples were taken from the input and never written";
+    };
+
+    "an interpolating block's unconnected optional output holds its input edge times the ratio"_test = [] {
+        gr::Graph flow;
+        auto&     source       = flow.emplaceBlock<qa_edit::Source>();
+        auto&     interpolator = flow.emplaceBlock<qa_edit::OptionalOutputInterpolator>();
+        expect(flow.connect<"out", "in">(source, interpolator).has_value());
+        expect(flow.connectPendingEdges());
+        expect(ge(interpolator.monitor.bufferSize(), interpolator.in.bufferSize() * qa_edit::kOptionalInterpolation)) << "the output cannot take one call's output for a full input buffer";
+    };
+
     "an edge naming no memory resource gets the buffer's own default"_test = [] {
         gr::Graph flow;
         auto&     source = flow.emplaceBlock<qa_edit::Source>();
@@ -1850,6 +1965,35 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         expect(!added.in.isConnected()) << "the removed consumer is still connected";
         expect(fatal(kept.in.isConnected())) << "the kept consumer lost its connection";
         expect(eq(kept.in.streamReader().available(), kWritten)) << "the kept consumer does not see the source's samples";
+    };
+
+    "an emplaced edge into a block whose only outputs are optional sizes them for the edge"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_edit::Source>();
+        auto&     kept   = flow.emplaceBlock<qa_edit::Sink>();
+        auto&     stage  = flow.emplaceBlock<qa_edit::OptionalOutputsStage>();
+        expect(flow.connect<"out", "in">(source, kept, gr::EdgeParameters{.minBufferSize = qa_edit::kWideEdgeSize}).has_value());
+        expect(fatal(flow.connectPendingEdges()));
+        const auto emplaced = flow.emplaceEdge(source.unique_name, "out", stage.unique_name, "in", gr::undefined_size, 0, "tap");
+        expect(fatal(emplaced.has_value())) << "the edge could not be emplaced: " << (emplaced.has_value() ? std::string{} : emplaced.error().message);
+        expect(fatal(stage.in.isConnected())) << "the emplaced edge did not connect its consumer";
+
+        expect(gt(stage.in.bufferSize(), gr::PortOut<float>::kDefaultBufferSize)) << "the edge is not wider than the default buffer";
+        expect(ge(stage.monitor.bufferSize(), stage.in.bufferSize())) << "an open optional output cannot take one call for a full input buffer";
+        expect(ge(stage.trace.bufferSize(), stage.in.bufferSize())) << "an open optional output cannot take one call for a full input buffer";
+    };
+
+    "an emplaced edge from a source sizes its open optional output with the newly connected sibling"_test = [] {
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_edit::DualSource>();
+        auto&     sink   = flow.emplaceBlock<qa_edit::Sink>();
+        expect(fatal(source.out.resizeBuffer(qa_edit::kWideEdgeSize).has_value()));
+        const auto emplaced = flow.emplaceEdge(source.unique_name, "out", sink.unique_name, "in", gr::undefined_size, 0, "first");
+        expect(fatal(emplaced.has_value())) << "the edge could not be emplaced: " << (emplaced.has_value() ? std::string{} : emplaced.error().message);
+        expect(fatal(source.out.isConnected())) << "the emplaced edge did not connect the source";
+
+        expect(gt(source.out.bufferSize(), gr::PortOut<float>::kDefaultBufferSize)) << "the connected output is not wider than the default buffer";
+        expect(eq(source.monitor.bufferSize(), source.out.bufferSize())) << "the open optional output is not sized with its connected sibling";
     };
 
     "an edge refused at a taken input leaves the source's connected sibling its buffer, and so does one added there and removed again"_test = [] {
