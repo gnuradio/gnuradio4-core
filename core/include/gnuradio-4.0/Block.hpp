@@ -2323,7 +2323,13 @@ public:
                     invokeUserProvidedFunction("invokeProcessOneSimd", [&userReturnStatus, &inputSpans, &outputSpans, &kWidth, &processedIn, this] noexcept(HasNoexceptProcessOneFunction<Derived>) { userReturnStatus = invokeProcessOneSimd(inputSpans, outputSpans, kWidth, processedIn); });
                 } else if constexpr (HasConstProcessOneFunction<Derived>) {
                     if constexpr (traits::block::can_processOne_simd<Derived>) {
-                        constexpr auto kWidth = meta::cw<std::min(kMaxWidth, meta::simdize<typename TInputTypes::template apply<std::tuple>>::size() * std::size_t(4))>;
+#if defined(__clang__) && defined(VIR_HAVE_VIR_SIMD)
+                        // under Clang, vir-simd uses its own SIMD types, whose operators build each result through a generator constructor; at 32 lanes Clang does not inline that constructor, and every operation becomes a call that computes one scalar lane at a time through memory
+                        constexpr std::size_t kMaxProcessOneWidth = 16UZ;
+#else
+                        constexpr std::size_t kMaxProcessOneWidth = kMaxWidth;
+#endif
+                        constexpr auto kWidth = meta::cw<std::min(kMaxProcessOneWidth, meta::simdize<typename TInputTypes::template apply<std::tuple>>::size() * std::size_t(4))>;
                         invokeUserProvidedFunction("invokeProcessOneSimd", [&userReturnStatus, &inputSpans, &outputSpans, &kWidth, &processedIn, this] noexcept(HasNoexceptProcessOneFunction<Derived>) { userReturnStatus = invokeProcessOneSimd(inputSpans, outputSpans, kWidth, processedIn); });
                     } else {
                         invokeUserProvidedFunction("invokeProcessOnePure", [&userReturnStatus, &inputSpans, &outputSpans, &processedIn, this] noexcept(HasNoexceptProcessOneFunction<Derived>) { userReturnStatus = invokeProcessOnePure(inputSpans, outputSpans, processedIn); });
