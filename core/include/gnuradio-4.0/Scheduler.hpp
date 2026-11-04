@@ -73,6 +73,8 @@ inline static const char* const kEdgeRemoved   = "EdgeRemoved";
 inline static const char* const kGraphGRC           = "GraphGRC";
 inline static const char* const kSchedulerInspect   = "SchedulerInspect";
 inline static const char* const kSchedulerInspected = "SchedulerInspected";
+
+inline static const char* const kInputWithoutEdge = "InputWithoutEdge"; // names a mandatory synchronous input that no edge feeds
 } // namespace property
 
 enum class ExecutionPolicy {
@@ -1244,6 +1246,39 @@ protected:
         return unconnected;
     }
 
+    // A mandatory synchronous input that no edge feeds never receives a sample, and its block never runs. One
+    // notification on msgOut names each such input with its block. The start goes on: an edit of the running graph may
+    // connect the input. The report is a notification, not an error, since a parent scheduler turns an error from a
+    // child into an exception when nothing reads its msgOut.
+    void reportInputsWithoutEdge() {
+        graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](const std::shared_ptr<BlockModel>& block) {
+            if (block->blockCategory() != NormalBlock) {
+                return;
+            }
+            auto reportIfWithoutEdge = [this, &block](gr::DynamicPort& port, std::string portName) {
+                if (port::decodePortType(port.portMaskInfo()) != PortType::STREAM || !port.isSynchronous() || port.isOptional() || port.isConnected()) {
+                    return;
+                }
+                Message message;
+                message.cmd         = message::Command::Notify;
+                message.serviceName = this->unique_name;
+                message.endpoint    = property::kInputWithoutEdge;
+                message.data        = property_map{{"block", std::string(block->uniqueName())}, {"port", std::move(portName)}};
+                publishOnOwnWriter(std::move(message));
+            };
+            for (auto& portOrCollection : block->dynamicInputPorts()) {
+                if (auto* port = std::get_if<gr::DynamicPort>(&portOrCollection)) {
+                    reportIfWithoutEdge(*port, port->metaInfo.name.value);
+                    continue;
+                }
+                auto& collection = std::get<BlockModel::NamedPortCollection>(portOrCollection);
+                for (std::size_t index = 0UZ; index < collection.ports.size(); ++index) {
+                    reportIfWithoutEdge(collection.ports[index], std::format("{}#{}", collection.name, index));
+                }
+            }
+        });
+    }
+
     // names each edge with its blocks, its ports and the state that kept it from connecting
     [[nodiscard]] static Error unconnectedEdgesError(const std::vector<Edge>& unconnected) {
         std::string edges;
@@ -1472,6 +1507,7 @@ protected:
             failStart(std::move(reason));
             return;
         }
+        reportInputsWithoutEdge();
         if (this->state() == IDLE) {
             if (auto result = this->changeStateTo(INITIALISED); !result) { // Need to go to INITIALISED first
                 this->emitErrorMessage("start()", result.error());
