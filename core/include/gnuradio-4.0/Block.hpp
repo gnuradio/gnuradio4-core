@@ -574,6 +574,13 @@ struct BlockBase {
     SubgraphExportHandler _subgraphExportHandler = nullptr;
     void*                 _subgraphExportContext = nullptr;
 
+    // Hook for GraphWrapper to intercept staged settings on a recipe composite: exported
+    // parameter changes re-evaluate the recipe's expressions before the remainder reaches the
+    // wrapped block's own staged-settings handler
+    using RecipeParameterHandler                   = std::optional<Message> (*)(void* context, Message);
+    RecipeParameterHandler _recipeParameterHandler = nullptr;
+    void*                  _recipeParameterContext = nullptr;
+
     std::map<std::string, PropertyCallback>      propertyCallbacks;
     std::map<std::string, std::set<std::string>> propertySubscriptions;
 
@@ -631,6 +638,7 @@ struct BlockBase {
     std::optional<Message> propertyCallbackMetaInformation(std::string_view propertyName, Message message);
     std::optional<Message> propertyCallbackUiConstraints(std::string_view propertyName, Message message);
     std::optional<Message> propertyCallbackSubgraphExport(std::string_view propertyName, Message message);
+    std::optional<Message> propertyCallbackRecipeStagedSettings(std::string_view propertyName, Message message);
 };
 
 namespace block {

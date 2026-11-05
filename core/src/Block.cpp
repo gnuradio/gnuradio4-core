@@ -560,6 +560,13 @@ std::optional<Message> BlockBase::propertyCallbackSubgraphExport([[maybe_unused]
     return std::nullopt;
 }
 
+std::optional<Message> BlockBase::propertyCallbackRecipeStagedSettings(std::string_view propertyName, Message message) {
+    if (_recipeParameterHandler != nullptr) {
+        return _recipeParameterHandler(_recipeParameterContext, std::move(message));
+    }
+    return propertyCallbackStagedSettings(propertyName, std::move(message));
+}
+
 namespace detail {
 
 Error primePortNotIdleError(std::size_t portIdx, std::size_t nSamples, std::source_location loc) { return Error(std::format("primePort({}, {}) - block must not be in RUNNING state", portIdx, nSamples), loc); }
