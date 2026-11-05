@@ -26,6 +26,7 @@
 
 #include "../SharedState.hpp"
 #include "../WaitStrategy.hpp"
+#include "SubnormalFlush.hpp"
 #include "thread_affinity.hpp"
 
 #include <gnuradio-4.0/meta/formatter.hpp>
@@ -371,6 +372,7 @@ class BasicThreadPool {
     const TaskType        _taskType;
     std::atomic<uint32_t> _minThreads;
     std::atomic<uint32_t> _maxThreads;
+    std::atomic_bool      _flushSubnormals = true;
 
 public:
     std::chrono::microseconds sleepDuration     = std::chrono::milliseconds(1);
@@ -431,6 +433,13 @@ public:
         wakeAllWorkers();
         joinAllThreads();
     }
+
+    // Each worker sets the subnormal flush (thread::setSubnormalFlush()) on its own thread when it starts, and again
+    // before its next task after setFlushSubnormals() changes it. The flush is on by default. A task that changes the
+    // flush must restore it before it returns, as thread::SubnormalFlushScope does. A task that leaves the flush changed
+    // passes it to the next task on that worker.
+    [[nodiscard]] bool flushesSubnormals() const noexcept { return _flushSubnormals.load(std::memory_order_acquire); }
+    void               setFlushSubnormals(bool flush) noexcept { _flushSubnormals.store(flush, std::memory_order_release); }
 
     [[nodiscard]] bool isShutdown() const { return _shutdown; }
 
@@ -829,12 +838,18 @@ private:
         // _numThreads and _numIdleWorkers are raised in addWorker(). addWorker() holds _threadListMutex until it has set
         // the name, scheduling and affinity of this thread, and the worker takes no task before then.
         { std::scoped_lock constraintsSet(_threadListMutex); }
+        bool flushing = flushesSubnormals();
+        thread::setSubnormalFlush(flushing);
         auto             lastUsed = std::chrono::steady_clock::now();
         std::unique_lock lock(_waitMutex);
         while (true) {
             if (!isShutdown()) {
                 if (TaskQueue::TaskContainer currentTaskContainer = popTask(); !currentTaskContainer.empty()) {
                     lock.unlock();
+                    if (const bool requested = flushesSubnormals(); requested != flushing) {
+                        thread::setSubnormalFlush(requested);
+                        flushing = requested;
+                    }
                     auto& currentTask = currentTaskContainer.front();
                     runTask(currentTask, threadID);
                     // execute dependent children
