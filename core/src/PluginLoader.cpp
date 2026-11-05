@@ -62,20 +62,13 @@ std::optional<std::string> whyNotWritable(const std::filesystem::path& directory
 
 } // namespace
 
-DataCacheDirectory dataCacheDirectory(std::string_view compiled) {
-    DataCacheDirectory chosen{.path = {}, .origin = DataCacheDirectory::Origin::None, .compiled = std::string(compiled), .whyNotCompiled = {}, .user = {}, .whyNotUser = {}};
+DataCacheDirectory dataCacheDirectory() {
+    DataCacheDirectory chosen{.path = {}, .origin = DataCacheDirectory::Origin::None, .user = {}, .whyNotUser = {}};
     if (const char* environment = std::getenv("GR_DATA_CACHE_DIR"); environment != nullptr && *environment != '\0') {
         chosen.path   = environment;
         chosen.origin = DataCacheDirectory::Origin::Environment;
         return chosen;
     }
-    const std::optional<std::string> compiledRefused = whyNotWritable(chosen.compiled);
-    if (!compiledRefused.has_value()) {
-        chosen.path   = chosen.compiled;
-        chosen.origin = DataCacheDirectory::Origin::Compiled;
-        return chosen;
-    }
-    chosen.whyNotCompiled = *compiledRefused;
 
     std::filesystem::path user;
     if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg != nullptr && std::filesystem::path(xdg).is_absolute()) {

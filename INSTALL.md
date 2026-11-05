@@ -58,21 +58,12 @@ ctest --test-dir build --output-on-failure
 cmake --install build --prefix "$HOME/gr4-core"
 ```
 
-The plugin loader keeps its cached data in a data cache directory whose path
-is compiled in. A build configured with `CMAKE_INSTALL_PREFIX` uses
-`lib/gnuradio4/cache` under the installation's state directory, which
-GNUInstallDirs sets (`<prefix>/var` for most prefixes, `/var` for `/usr`,
-`/var/opt/<name>` for `/opt/<name>`). A build configured without it uses
-`gnuradio_cache` in the build tree. The `GR_DATA_CACHE_DIR` CMake variable
-sets another path at configure time, and the `GR_DATA_CACHE_DIR` environment
-variable overrides the path at run time. A package build should set
-`CMAKE_INSTALL_PREFIX` to its `CPACK_PACKAGING_INSTALL_PREFIX`, so the
-package compiles the data cache path of the prefix it installs to.
-When the running user cannot use the compiled directory, the loader uses the
-user's cache directory, `gnuradio4/cache` under `$XDG_CACHE_HOME` or else
-under `$HOME/.cache`, and prints a note that names it and the reason. With
-neither directory, caching is off. An empty `GR_DATA_CACHE_DIR` environment
-variable counts as unset. `grinfo version` reports the directory in use.
+The plugin loader keeps its cached data in a data cache directory that no
+build compiles in. The `GR_DATA_CACHE_DIR` environment variable names it when
+it is set and not empty. Otherwise the loader uses the user's cache directory,
+`gnuradio4/cache` under `$XDG_CACHE_HOME` or else under `$HOME/.cache`. When
+neither can be used, caching is off and the loader prints a warning that names
+the reason. `grinfo version` reports the directory in use.
 
 Downstream repositories should configure with:
 

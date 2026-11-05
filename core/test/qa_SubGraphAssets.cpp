@@ -59,20 +59,6 @@ public:
     EnvironmentVariable& operator=(const EnvironmentVariable&) = delete;
 };
 
-// makes a directory the working directory for the length of a case, and puts back the one it found
-class WorkingDirectory {
-    std::filesystem::path _found = std::filesystem::current_path();
-
-public:
-    explicit WorkingDirectory(const std::filesystem::path& directory) { std::filesystem::current_path(directory); }
-    ~WorkingDirectory() {
-        std::error_code ignored;
-        std::filesystem::current_path(_found, ignored);
-    }
-    WorkingDirectory(const WorkingDirectory&)            = delete;
-    WorkingDirectory& operator=(const WorkingDirectory&) = delete;
-};
-
 gr::PluginLoader makeLoader(const std::vector<std::string>& paths) {
     static gr::BlockRegistry     registry;
     static gr::SchedulerRegistry schedulerRegistry;
@@ -342,35 +328,40 @@ const boost::ut::suite AssetsLoadingTests = [] {
         std::filesystem::remove_all(root);
     };
 
-    // The compiled path of the arms without the variable is a directory the process may make, so the case holds for a
-    // build whose own compiled path the process cannot use.
-    "the cache directory is GR_DATA_CACHE_DIR from the environment when set and not empty, else the compiled path"_test = [] {
-        using Origin                         = gr::DataCacheDirectory::Origin;
-        const std::filesystem::path root     = std::filesystem::temp_directory_path() / "gr4_qa_cache_override";
-        const std::string           override = (root / "override").string();
-        const std::string           compiled = (root / "compiled").string();
+    // The user's cache directory is a tree of the case's own, so the case holds wherever it runs.
+    "the cache directory is GR_DATA_CACHE_DIR from the environment when set and not empty, else the user's cache"_test = [] {
+        using Origin                        = gr::DataCacheDirectory::Origin;
+        namespace fs                        = std::filesystem;
+        const fs::path            root      = fs::temp_directory_path() / "gr4_qa_cache_override";
+        const std::string         override  = (root / "override").string();
+        const std::string         userCache = (root / "xdg" / "gnuradio4" / "cache").string();
+        const EnvironmentVariable xdgVariable("XDG_CACHE_HOME", (root / "xdg").string());
         {
             const EnvironmentVariable variable("GR_DATA_CACHE_DIR", override);
-            expect(eq(gr::detail::YamlDefinitionsLoader::assetsCacheDir(), override)) << "the environment must override the compiled path";
-            expect(eq(gr::dataCacheDirectory(compiled).path, override));
+            expect(eq(gr::detail::YamlDefinitionsLoader::assetsCacheDir(), override)) << "the environment must override the user's cache";
+            expect(eq(gr::dataCacheDirectory().path, override));
+            expect(gr::dataCacheDirectory().origin == Origin::Environment);
         }
         {
             const EnvironmentVariable    empty("GR_DATA_CACHE_DIR", std::string());
-            const gr::DataCacheDirectory chosen = gr::dataCacheDirectory(compiled);
-            expect(chosen.origin == Origin::Compiled) << "an empty variable counts as unset";
-            expect(eq(chosen.path, compiled));
+            const gr::DataCacheDirectory chosen = gr::dataCacheDirectory();
+            expect(chosen.origin == Origin::User) << "an empty variable counts as unset";
+            expect(eq(chosen.path, userCache));
         }
         const EnvironmentVariable    variable("GR_DATA_CACHE_DIR", std::nullopt);
-        const gr::DataCacheDirectory chosen = gr::dataCacheDirectory(compiled);
-        expect(chosen.origin == Origin::Compiled) << "without the variable the compiled path must apply";
-        expect(eq(chosen.path, compiled));
-        expect(override != compiled) << "the two arms must name different directories";
+        const gr::DataCacheDirectory chosen = gr::dataCacheDirectory();
+        expect(chosen.origin == Origin::User) << "without the variable the user's cache applies";
+        expect(eq(chosen.path, userCache)) << "the default is gnuradio4/cache under XDG_CACHE_HOME, no compiled path";
+        expect(eq(chosen.user, userCache));
+        expect(chosen.whyNotUser.empty()) << chosen.whyNotUser;
+        expect(override != userCache) << "the two arms must name different directories";
+        expect(!fs::exists(root)) << "the choice made a directory";
     };
 
-    // Each arm names a compiled directory in a tree of its own: one under a regular file, one under a directory the
-    // process may not write to, one under a broken symbolic link, and one the process may make. The case makes the
-    // asset_cache subdirectory of a chosen directory, as the loader does.
-    "the user's cache directory takes over when the compiled one cannot be made, and GR_DATA_CACHE_DIR overrides both"_test = [] {
+    // Each arm points the user's cache at a tree of its own: under a regular file, under a directory the process may not
+    // write to, under a broken symbolic link, and under HOME. The case makes the asset_cache subdirectory of a chosen
+    // directory, as the loader does.
+    "no directory is chosen when the user's cache cannot be made, and a named one is taken as given"_test = [] {
         using Origin              = gr::DataCacheDirectory::Origin;
         namespace fs              = std::filesystem;
         const fs::path  root      = fs::temp_directory_path() / "gr4_qa_cache_fallback";
@@ -378,117 +369,85 @@ const boost::ut::suite AssetsLoadingTests = [] {
         const fs::path  locked    = root / "locked";
         const fs::path  xdg       = root / "xdg";
         const fs::path  home      = root / "home";
-        const fs::path  makeable  = root / "compiled" / "cache";
-        const fs::path  underFile = file / "cache";
-        const fs::path  underLock = locked / "cache";
         const fs::path  xdgCache  = xdg / "gnuradio4" / "cache";
         const fs::path  homeCache = home / ".cache" / "gnuradio4" / "cache";
         const fs::path  dangling  = root / "dangling";
         std::error_code ignored;
         fs::remove_all(root, ignored);
         fs::create_directories(locked);
-        std::ofstream(file) << "a file where the compiled directory's parent would be\n";
+        std::ofstream(file) << "a file where the cache directory's parent would be\n";
         fs::create_symlink(root / "absent", dangling);
 
         const EnvironmentVariable variable("GR_DATA_CACHE_DIR", std::nullopt);
-        const EnvironmentVariable xdgVariable("XDG_CACHE_HOME", xdg.string());
         const EnvironmentVariable homeVariable("HOME", home.string());
 
-        const gr::DataCacheDirectory compiled = gr::dataCacheDirectory(makeable.string());
-        expect(compiled.origin == Origin::Compiled) << "the instrument: a compiled directory that can be made is taken";
-        expect(eq(compiled.path, makeable.string()));
-        expect(compiled.whyNotCompiled.empty()) << compiled.whyNotCompiled;
-        expect(!fs::exists(makeable)) << "the choice made a directory";
-        std::error_code madeCompiled;
-        fs::create_directories(fs::path(compiled.path) / "asset_cache", madeCompiled);
-        expect(!madeCompiled) << madeCompiled.message();
-
-        const gr::DataCacheDirectory fromXdg = gr::dataCacheDirectory(underFile.string());
-        expect(fromXdg.origin == Origin::User);
-        expect(eq(fromXdg.path, xdgCache.string())) << "the user's cache directory is under XDG_CACHE_HOME";
-        expect(eq(fromXdg.compiled, underFile.string()));
-        expect(eq(fromXdg.whyNotCompiled, std::format("{} is not a directory", file.string())));
-        std::error_code madeXdg;
-        fs::create_directories(fs::path(fromXdg.path) / "asset_cache", madeXdg);
-        expect(!madeXdg) << madeXdg.message();
-
-        const gr::DataCacheDirectory fromLink = gr::dataCacheDirectory((dangling / "cache").string());
-        expect(fromLink.origin == Origin::User) << "a directory cannot be made under a broken symbolic link";
-        expect(eq(fromLink.path, xdgCache.string()));
-        expect(eq(fromLink.whyNotCompiled, std::format("{} is a broken symbolic link", dangling.string())));
+        {
+            const EnvironmentVariable    xdgVariable("XDG_CACHE_HOME", xdg.string());
+            const gr::DataCacheDirectory fromXdg = gr::dataCacheDirectory();
+            expect(fromXdg.origin == Origin::User) << "the instrument: a cache directory that can be made is taken";
+            expect(eq(fromXdg.path, xdgCache.string())) << "the user's cache directory is under XDG_CACHE_HOME";
+            expect(!fs::exists(xdgCache)) << "the choice made a directory";
+            std::error_code madeXdg;
+            fs::create_directories(fs::path(fromXdg.path) / "asset_cache", madeXdg);
+            expect(!madeXdg) << madeXdg.message();
+        }
 
         {
             const EnvironmentVariable    noXdg("XDG_CACHE_HOME", std::nullopt);
-            const gr::DataCacheDirectory fromHome = gr::dataCacheDirectory(underFile.string());
+            const gr::DataCacheDirectory fromHome = gr::dataCacheDirectory();
             expect(fromHome.origin == Origin::User);
             expect(eq(fromHome.path, homeCache.string())) << "without XDG_CACHE_HOME the user's cache directory is under HOME";
+        }
+
+        {
+            const EnvironmentVariable    relativeXdg("XDG_CACHE_HOME", "relative/cache");
+            const gr::DataCacheDirectory fromHome = gr::dataCacheDirectory();
+            expect(eq(fromHome.path, homeCache.string())) << "a relative XDG_CACHE_HOME is ignored";
+        }
+
+        {
+            const EnvironmentVariable    link("XDG_CACHE_HOME", dangling.string());
+            const gr::DataCacheDirectory none = gr::dataCacheDirectory();
+            expect(none.origin == Origin::None) << "a directory cannot be made under a broken symbolic link";
+            expect(none.path.empty());
+            expect(eq(none.whyNotUser, std::format("{} is a broken symbolic link", dangling.string())));
         }
 
         fs::permissions(locked, fs::perms::owner_read | fs::perms::owner_exec);
         if (std::ofstream(locked / "probe")) {
             std::println("the process writes to a directory without write permission; the unwritable-directory arm has no subject here");
         } else {
-            const gr::DataCacheDirectory fromLocked = gr::dataCacheDirectory(underLock.string());
-            expect(fromLocked.origin == Origin::User);
-            expect(eq(fromLocked.path, xdgCache.string()));
-            expect(fromLocked.whyNotCompiled.starts_with(std::format("{}: ", locked.string()))) << fromLocked.whyNotCompiled;
+            const EnvironmentVariable    lockedXdg("XDG_CACHE_HOME", locked.string());
+            const gr::DataCacheDirectory fromLocked = gr::dataCacheDirectory();
+            expect(fromLocked.origin == Origin::None);
+            expect(fromLocked.whyNotUser.starts_with(std::format("{}: ", locked.string()))) << fromLocked.whyNotUser;
         }
         fs::permissions(locked, fs::perms::owner_all, ignored);
 
         {
             const EnvironmentVariable    blockedXdg("XDG_CACHE_HOME", (file / "xdg").string());
-            const gr::DataCacheDirectory none = gr::dataCacheDirectory(underFile.string());
-            expect(none.origin == Origin::None) << "neither directory can be made";
+            const gr::DataCacheDirectory none = gr::dataCacheDirectory();
+            expect(none.origin == Origin::None) << "the user's cache cannot be made";
             expect(none.path.empty());
             expect(eq(none.user, (file / "xdg" / "gnuradio4" / "cache").string()));
             expect(eq(none.whyNotUser, std::format("{} is not a directory", file.string())));
-        }
 
-        {
             const EnvironmentVariable    named("GR_DATA_CACHE_DIR", (file / "named").string());
-            const gr::DataCacheDirectory fromEnvironment = gr::dataCacheDirectory(underFile.string());
+            const gr::DataCacheDirectory fromEnvironment = gr::dataCacheDirectory();
             expect(fromEnvironment.origin == Origin::Environment) << "the variable is taken as given, whether or not it can be made";
             expect(eq(fromEnvironment.path, (file / "named").string()));
-            expect(fromEnvironment.whyNotCompiled.empty()) << "the compiled directory was never considered";
+            expect(fromEnvironment.user.empty()) << "the user's cache was never considered";
         }
-
-        fs::remove_all(root, ignored);
-    };
-
-    // The working directory is a tree of the case's own, and with HOME and XDG_CACHE_HOME unset a refused compiled path
-    // selects no directory at all.
-    "a relative compiled cache directory is taken under the working directory, whether it exists or not"_test = [] {
-        using Origin         = gr::DataCacheDirectory::Origin;
-        namespace fs         = std::filesystem;
-        const fs::path  root = fs::temp_directory_path() / "gr4_qa_cache_relative";
-        std::error_code ignored;
-        fs::remove_all(root, ignored);
-        fs::create_directories(root / "existing" / "cache");
-        std::ofstream(root / "file") << "a file where the compiled directory's parent would be\n";
 
         {
-            const WorkingDirectory    workingDirectory(root);
-            const EnvironmentVariable variable("GR_DATA_CACHE_DIR", std::nullopt);
-            const EnvironmentVariable xdgVariable("XDG_CACHE_HOME", std::nullopt);
-            const EnvironmentVariable homeVariable("HOME", std::nullopt);
-
-            for (const std::string relative : {"existing/cache", "missing/cache", "cache"}) {
-                const gr::DataCacheDirectory chosen = gr::dataCacheDirectory(relative);
-                expect(chosen.origin == Origin::Compiled) << relative << ": " << chosen.whyNotCompiled;
-                expect(eq(chosen.path, relative));
-                expect(chosen.whyNotCompiled.empty()) << chosen.whyNotCompiled;
-            }
-            expect(!fs::exists(root / "missing")) << "the choice made a directory";
-            std::error_code made;
-            fs::create_directories(fs::path("missing/cache") / "asset_cache", made);
-            expect(!made) << made.message();
-            expect(fs::is_directory(root / "missing" / "cache" / "asset_cache")) << "the relative directory is made under the working directory";
-
-            const gr::DataCacheDirectory refused = gr::dataCacheDirectory("file/cache");
-            expect(refused.origin == Origin::None) << "the instrument: a relative directory under a regular file cannot be made";
-            expect(refused.path.empty());
-            expect(eq(refused.whyNotCompiled, std::string("file is not a directory")));
+            const EnvironmentVariable    noXdg("XDG_CACHE_HOME", std::nullopt);
+            const EnvironmentVariable    noHome("HOME", std::nullopt);
+            const gr::DataCacheDirectory none = gr::dataCacheDirectory();
+            expect(none.origin == Origin::None) << "neither XDG_CACHE_HOME nor HOME names a directory";
+            expect(none.user.empty());
+            expect(!none.whyNotUser.empty());
         }
+
         fs::remove_all(root, ignored);
     };
 

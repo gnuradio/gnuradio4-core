@@ -618,7 +618,6 @@ enum class FileKind : std::uint8_t { BlockLibrary, OrdinaryLibrary, NotLoaded, N
     using enum gr::DataCacheDirectory::Origin;
     switch (origin) {
     case Environment: return "environment";
-    case Compiled: return "compiled";
     case User: return "user";
     case None: return "none";
     }
@@ -1563,8 +1562,7 @@ void reportVersionAsJson(const Context& context) {
     const gr::DataCacheDirectory dataCache = gr::dataCacheDirectory();
     json.member("dataCacheDirectory", dataCache.path);
     json.member("dataCacheOrigin", nameOf(dataCache.origin));
-    json.member("compiledDataCacheDirectory", dataCache.compiled);
-    json.member("whyNotCompiledDataCacheDirectory", dataCache.whyNotCompiled);
+    json.member("whyNotUserDataCacheDirectory", dataCache.whyNotUser);
     json.endObject();
 
     json.key("directories");
@@ -1625,17 +1623,16 @@ void reportVersionAsJson(const Context& context) {
     return rest.empty() ? std::string(".") : std::string(rest);
 }
 
-// The data cache directory in use for the report, with what chose it when that is not the compiled path: the
-// environment variable, or the user's cache directory and why the compiled one cannot be used.
+// The data cache directory in use for the report, with what chose it: the environment variable or the user's cache
+// directory, and when neither can be used, why not.
 [[nodiscard]] std::string dataCacheFact(const gr::DataCacheDirectory& dataCache) {
     using enum gr::DataCacheDirectory::Origin;
     switch (dataCache.origin) {
     case Environment: return std::format("{}, from GR_DATA_CACHE_DIR", dataCache.path);
-    case Compiled: return underPrefix(dataCache.path, GR_TOOLS_INSTALLED_PREFIX);
-    case User: return std::format("{}, the user's cache directory; the compiled {} cannot be used: {}", dataCache.path, dataCache.compiled, dataCache.whyNotCompiled);
+    case User: return std::format("{}, the user's cache directory", dataCache.path);
     case None: break;
     }
-    return std::format("none, caching is off; the compiled {} cannot be used: {}; {}", dataCache.compiled, dataCache.whyNotCompiled, dataCache.user.empty() ? dataCache.whyNotUser : std::format("the user's {} cannot be used: {}", dataCache.user, dataCache.whyNotUser));
+    return std::format("none, caching is off; {}", dataCache.user.empty() ? dataCache.whyNotUser : std::format("the user's {} cannot be used: {}", dataCache.user, dataCache.whyNotUser));
 }
 
 // the files of one directory under the directory's own line, by the name that tells them apart
