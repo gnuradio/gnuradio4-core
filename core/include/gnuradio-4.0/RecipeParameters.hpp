@@ -166,6 +166,18 @@ namespace detail {
 
 inline constexpr std::size_t kMaxExpressionDepth = 64;
 
+/// What the '=' sentinel makes of one string scalar. A run of backslashes before '=' loses exactly one backslash, so
+/// every literal spelling stays expressible wherever an expression may appear.
+enum class SentinelKind : std::uint8_t { plainText, escapedLiteral, expression };
+
+[[nodiscard]] inline SentinelKind sentinelOf(std::string_view text) noexcept {
+    const std::size_t backslashes = text.find_first_not_of('\\');
+    if (backslashes != std::string_view::npos && backslashes > 0UZ && text[backslashes] == '=') {
+        return SentinelKind::escapedLiteral;
+    }
+    return text.starts_with("=") ? SentinelKind::expression : SentinelKind::plainText;
+}
+
 struct Parser {
     std::string_view                      text;
     std::size_t                           position = 0;
@@ -624,6 +636,13 @@ namespace detail {
     return values;
 }
 
+/// One element of a sequence-valued setting: an expression to evaluate, or a value spelled
+/// literally beside the expressions in the same sequence.
+struct SequenceElement {
+    std::optional<Expression> expression;
+    pmt::Value                literal;
+};
+
 /// One derived interior setting: which block (as a name path from the composite's interior
 /// downward, through nested subgraphs), which setting, and the expression that derives it.
 struct Binding {
@@ -633,6 +652,10 @@ struct Binding {
     /// Set instead of `expression` when the setting takes a parameter's value unchanged: a string or a vector
     /// carries no arithmetic, so what a recipe can do with one is hand it through.
     std::optional<std::size_t> substituted;
+    /// Set instead of `expression` when the setting is a sequence with derived elements. A setting is staged
+    /// whole, so the binding carries the whole sequence and rebuilds it on every change; one binding per key
+    /// keeps the transaction and the refusal exactly as they are for a scalar.
+    std::vector<SequenceElement> sequence;
 };
 
 /// The value a binding produces for one set of parameter values.
@@ -642,6 +665,22 @@ struct Binding {
             return std::unexpected(gr::Error("recipe_parameter_index: a substituted parameter is out of range"));
         }
         return values[*binding.substituted];
+    }
+    if (!binding.sequence.empty()) {
+        std::vector<pmt::Value> elements;
+        elements.reserve(binding.sequence.size());
+        for (const SequenceElement& element : binding.sequence) {
+            if (!element.expression.has_value()) {
+                elements.push_back(element.literal);
+                continue;
+            }
+            auto evaluated = evaluate(*element.expression, values);
+            if (!evaluated.has_value()) {
+                return std::unexpected(evaluated.error());
+            }
+            elements.push_back(std::move(*evaluated));
+        }
+        return pmt::Value(Tensor<pmt::Value>(elements.begin(), elements.end()));
     }
     return evaluate(binding.expression, values);
 }
