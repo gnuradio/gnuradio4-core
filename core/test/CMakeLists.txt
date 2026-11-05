@@ -51,6 +51,7 @@ set(_CORE_TESTS
     qa_SettingsConcurrency
     qa_SettingsTable
     qa_SubnormalFlush
+    qa_RecipeParameters
     qa_TagForwarding
     qa_TagStore
     qa_TagPropagation
