@@ -1,3 +1,19 @@
+# An installed tool reaches the libraries of its install tree through a run path relative to its own directory, so it
+# runs without a library path in the environment. A library directory given as an absolute path outside the prefix is
+# not followed. The run path of a tool in the build tree stays the one CMake sets, and a packager's CMAKE_INSTALL_RPATH
+# is appended.
+file(
+  RELATIVE_PATH
+  _gr_tools_bin_to_lib
+  "${CMAKE_INSTALL_FULL_BINDIR}"
+  "${CMAKE_INSTALL_FULL_LIBDIR}")
+if(APPLE)
+  set(GR_TOOLS_INSTALL_RPATH "@loader_path/${_gr_tools_bin_to_lib}")
+else()
+  set(GR_TOOLS_INSTALL_RPATH "$ORIGIN/${_gr_tools_bin_to_lib}")
+endif()
+list(APPEND GR_TOOLS_INSTALL_RPATH ${CMAKE_INSTALL_RPATH})
+
 # graphdoc and the headers it shares with its test. It is an ordinary consumer of the installed headers: nothing here is
 # compiled into the libraries. Its document is read from the graph file, so it is built whether or not the registry is
 # on.
@@ -13,6 +29,7 @@ if(TARGET gnuradio-plugin)
 endif()
 # where this installation puts its plugins, which the tool searches whatever the caller and the environment name
 target_compile_definitions(graphdoc PRIVATE GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY="${GR_INSTALLED_PLUGIN_DIRECTORY}")
+set_target_properties(graphdoc PROPERTIES INSTALL_RPATH "${GR_TOOLS_INSTALL_RPATH}")
 install(TARGETS graphdoc RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # rungraph, a consumer of the installed headers and of one internal header: it is not compiled into the libraries. It
@@ -27,6 +44,7 @@ if(GR_ENABLE_BLOCK_REGISTRY)
   endif()
   # where this installation puts its plugins, which the tool searches whatever the caller and the environment name
   target_compile_definitions(rungraph PRIVATE GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY="${GR_INSTALLED_PLUGIN_DIRECTORY}")
+  set_target_properties(rungraph PROPERTIES INSTALL_RPATH "${GR_TOOLS_INSTALL_RPATH}")
   install(TARGETS rungraph RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
@@ -45,6 +63,7 @@ if(GR_ENABLE_BLOCK_REGISTRY)
   target_compile_definitions(
     grinfo PRIVATE GR_TOOLS_CORE_VERSION="${PROJECT_VERSION}" GR_TOOLS_INSTALLED_PREFIX="${CMAKE_INSTALL_PREFIX}"
                    GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY="${GR_INSTALLED_PLUGIN_DIRECTORY}")
+  set_target_properties(grinfo PROPERTIES INSTALL_RPATH "${GR_TOOLS_INSTALL_RPATH}")
   install(TARGETS grinfo RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
