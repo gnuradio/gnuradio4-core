@@ -15,7 +15,9 @@
 #include <concepts>
 #include <condition_variable>
 #include <cstdlib>
+#include <filesystem>
 #include <format>
+#include <fstream>
 #include <functional>
 #include <iterator>
 #include <latch>
@@ -405,6 +407,48 @@ inline std::optional<float> floatAt(const property_map& map, const std::string& 
 
 inline bool sameTags(const std::vector<TagRecord>& lhs, const std::vector<TagRecord>& rhs) {
     return std::ranges::equal(lhs, rhs, [](const TagRecord& a, const TagRecord& b) { return a.index == b.index && a.map == b.map; });
+}
+
+/// a definitions root holding one recipe, `qa::LevelRecipe`, in a temporary directory; its exported parameter `level`
+/// has no default and is required
+struct LevelRecipeRoot {
+    std::filesystem::path path = std::filesystem::temp_directory_path() / "gr4_qa_erased_runtime_recipe";
+
+    LevelRecipeRoot() {
+        std::filesystem::remove_all(path);
+        std::filesystem::create_directories(path);
+        std::ofstream(path / "index.yaml") << "assets:\n  - file: level_recipe.yaml\n    created: \"2024-01-01-00:00:00\"\n    modified: \"2024-01-01-00:00:00\"\n    block_type: qa::LevelRecipe\n";
+        std::ofstream(path / "level_recipe.yaml") << R"yaml(definition_metadata:
+  block_type: qa::LevelRecipe
+blocks:
+  - id: SUBGRAPH
+    parameters:
+      name: level_recipe
+    exported_parameters:
+      - name: level
+        type: float32
+    graph:
+      blocks:
+        - id: "qa::Scale"
+          parameters:
+            name: inner
+            gain: "=level"
+      exported_ports:
+        - [inner, INPUT, in, in]
+        - [inner, OUTPUT, out, out]
+)yaml";
+    }
+
+    LevelRecipeRoot(const LevelRecipeRoot&)            = delete;
+    LevelRecipeRoot& operator=(const LevelRecipeRoot&) = delete;
+
+    ~LevelRecipeRoot() { std::filesystem::remove_all(path); }
+};
+
+/// a graph holding one `qa::Scale` named `scale`, over a loader that reads `root`
+inline std::expected<RuntimeGraph, RuntimeError> recipeGraph(const LevelRecipeRoot& root) {
+    auto loader = std::make_shared<PluginLoader>(globalBlockRegistry(), globalSchedulerRegistry(), std::vector<std::string>{root.path.string()});
+    return RuntimeGraph::fromYaml(std::move(loader), "blocks:\n  - id: qa::Scale\n    parameters:\n      name: scale\n");
 }
 
 } // namespace qa_runtime
@@ -1335,6 +1379,42 @@ const boost::ut::suite<"refusals return"> refusalTests = [] {
     using namespace boost::ut;
     using namespace gr;
     using namespace qa_runtime;
+
+    "a recipe missing a required parameter is reported with its reason, not as an unknown type"_test = [] {
+        registerTestBlocks();
+        const LevelRecipeRoot root;
+        auto                  graph = recipeGraph(root);
+        expect(fatal(graph.has_value())) << messageOf(graph);
+
+        const auto refused = graph->emplace("qa::LevelRecipe", "recipe");
+        expect(fatal(!refused.has_value())) << "a recipe missing a required parameter was built";
+        expect(!refused.error().message.contains("unknown block type")) << refused.error().message;
+        expect(refused.error().message.contains("level")) << refused.error().message;
+        expect(eq(graph->blocks(RuntimeGraph::Recursive::No).size(), 1UZ)) << "a refused recipe joined the graph";
+
+        expect(graph->emplace("qa::LevelRecipe", "recipe", {{"level", 2.0f}}).has_value()) << "the recipe with its parameter is built";
+    };
+
+    // the recipe is built from the parameters its definition exports and takes the other keys as settings
+    "a recipe takes its exported parameter and a setting its definition does not export"_test = [] {
+        registerTestBlocks();
+        const LevelRecipeRoot root;
+        auto                  graph = recipeGraph(root);
+        expect(fatal(graph.has_value())) << messageOf(graph);
+
+        const auto refused = graph->emplace("qa::LevelRecipe", "refused", {{"level", 2.0f}, {"compute_domain", 7.0f}});
+        expect(fatal(!refused.has_value())) << "a setting of the wrong type was taken";
+        expect(refused.error().message.contains("compute_domain")) << refused.error().message;
+        expect(eq(graph->blocks(RuntimeGraph::Recursive::No).size(), 1UZ)) << "a recipe whose setting was refused joined the graph";
+
+        const auto recipe = graph->emplace("qa::LevelRecipe", "recipe", {{"level", 2.0f}, {"disconnect_on_done", false}});
+        expect(fatal(recipe.has_value())) << messageOf(recipe);
+        const std::optional<pmt::Value> disconnects = recipe->get(std::string("disconnect_on_done"));
+        expect(disconnects.has_value() && !disconnects->value_or(true)) << "the setting the recipe does not export is not in force";
+        const auto inner = graph->find("inner");
+        expect(fatal(inner.has_value())) << messageOf(inner);
+        expect(eq(floatAt(inner->get(), "gain").value_or(0.0f), 2.0f)) << "the exported parameter did not reach the interior setting";
+    };
 
     "a staged value the block cannot convert is an error, not an exception"_test = [] {
         registerTestBlocks();

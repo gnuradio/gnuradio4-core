@@ -132,7 +132,8 @@ public:
 
     /// Builds a block of `type` through the graph's loader, names it and adds it. A type the loader does not know is an
     /// error naming the type. A known type that cannot be built is an error with the loader's reason. A parameter the
-    /// block does not declare or refuses is an error carrying the block's refusal. A scheduler type is an error: a nested
+    /// block does not declare or refuses is an error carrying the block's refusal. A recipe takes the parameters its
+    /// definition exports when it is built and the other keys as settings. A scheduler type is an error: a nested
     /// scheduler comes from a graph document through `fromYaml()`.
     [[nodiscard]] std::expected<BlockHandle, RuntimeError> emplace(std::string_view type, std::string_view name, property_map parameters = {});
 
