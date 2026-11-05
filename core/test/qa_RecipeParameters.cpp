@@ -115,7 +115,7 @@ const boost::ut::suite<"RecipeParameters"> recipeParameterTests = [] {
 
         const std::vector<gr::pmt::Value> values{gr::pmt::Value(std::pmr::string("gardner")), gr::pmt::Value(std::vector<std::int32_t>{-2, 0, 3}), gr::pmt::Value(48000.0)};
 
-        const gr::recipe::Binding substituted{.namePath = {"inner"}, .settingKey = "detector", .expression = {}, .substituted = 0UZ};
+        const gr::recipe::Binding substituted{.namePath = {"inner"}, .settingKey = "detector", .expression = {}, .substituted = 0UZ, .sequence = {}};
         const auto                bound = gr::recipe::bindingValue(substituted, std::span<const gr::pmt::Value>(values));
         expect(bound.has_value());
         const auto* text = bound->get_if<std::pmr::string>();
@@ -124,13 +124,13 @@ const boost::ut::suite<"RecipeParameters"> recipeParameterTests = [] {
             expect(eq(std::string_view(*text), std::string_view("gardner")));
         }
 
-        const gr::recipe::Binding vectorBound{.namePath = {"inner"}, .settingKey = "carriers", .expression = {}, .substituted = 1UZ};
+        const gr::recipe::Binding vectorBound{.namePath = {"inner"}, .settingKey = "carriers", .expression = {}, .substituted = 1UZ, .sequence = {}};
         const auto                carriers = gr::recipe::bindingValue(vectorBound, std::span<const gr::pmt::Value>(values));
         expect(carriers.has_value());
         expect(carriers->get_if<gr::Tensor<std::int32_t>>() != nullptr) << "the sequence arrives whole";
 
         // an index past the values is a refusal rather than a read off the end
-        const gr::recipe::Binding outOfRange{.namePath = {"inner"}, .settingKey = "x", .expression = {}, .substituted = 9UZ};
+        const gr::recipe::Binding outOfRange{.namePath = {"inner"}, .settingKey = "x", .expression = {}, .substituted = 9UZ, .sequence = {}};
         expect(!gr::recipe::bindingValue(outOfRange, std::span<const gr::pmt::Value>(values)).has_value());
     };
 
@@ -167,7 +167,7 @@ const boost::ut::suite<"RecipeParameters"> recipeParameterTests = [] {
         }
 
         const std::vector<gr::pmt::Value> values{gr::pmt::Value(false), gr::pmt::Value(48000.0)};
-        const gr::recipe::Binding         toggle{.namePath = {"inner"}, .settingKey = "enabled", .expression = {}, .substituted = 0UZ};
+        const gr::recipe::Binding         toggle{.namePath = {"inner"}, .settingKey = "enabled", .expression = {}, .substituted = 0UZ, .sequence = {}};
         const auto                        bound = gr::recipe::bindingValue(toggle, std::span<const gr::pmt::Value>(values));
         expect(bound.has_value());
         const auto* flag = bound->get_if<bool>();
@@ -338,11 +338,12 @@ struct RecipeScale : gr::Block<RecipeScale> {
     gr::PortIn<float>  in;
     gr::PortOut<float> out;
 
-    gr::Annotated<float, "gain">        gain  = 1.0f;
-    gr::Annotated<float, "rate">        rate  = 0.0f;
-    gr::Annotated<std::string, "label"> label = "";
+    gr::Annotated<float, "gain">              gain  = 1.0f;
+    gr::Annotated<float, "rate">              rate  = 0.0f;
+    gr::Annotated<std::string, "label">       label = "";
+    gr::Annotated<std::vector<float>, "taps"> taps{};
 
-    GR_MAKE_REFLECTABLE(RecipeScale, in, out, gain, rate, label);
+    GR_MAKE_REFLECTABLE(RecipeScale, in, out, gain, rate, label, taps);
 
     explicit RecipeScale(gr::property_map init = {}) : gr::Block<RecipeScale>(std::move(init)) {}
 
@@ -407,6 +408,89 @@ blocks:
         - [inner, INPUT, in, in]
         - [inner, OUTPUT, out, out]
 )yaml";
+
+constexpr std::string_view kEdgeSizedRecipe = R"yaml(
+blocks:
+  - id: SUBGRAPH
+    parameters:
+      name: sized
+    exported_parameters:
+      - name: sample_rate
+        type: float32
+    graph:
+      blocks:
+        - id: "qa::RecipeScale"
+          parameters:
+            name: first
+        - id: "qa::RecipeScale"
+          parameters:
+            name: second
+      connections:
+        -
+          - "first"
+          - "out"
+          - "second"
+          - "in"
+          - "=sample_rate * 0.05"
+      exported_ports:
+        - [first, INPUT, in, in]
+        - [second, OUTPUT, out, out]
+)yaml";
+
+constexpr std::string_view kUnsizedEdgeRecipe = R"yaml(
+blocks:
+  - id: SUBGRAPH
+    parameters:
+      name: unsized
+    graph:
+      blocks:
+        - id: "qa::RecipeScale"
+          parameters:
+            name: first
+        - id: "qa::RecipeScale"
+          parameters:
+            name: second
+      connections:
+        -
+          - "first"
+          - "out"
+          - "second"
+          - "in"
+          - "one hundred thousand"
+      exported_ports:
+        - [first, INPUT, in, in]
+        - [second, OUTPUT, out, out]
+)yaml";
+
+constexpr std::string_view kDerivedTapsRecipe = R"yaml(
+blocks:
+  - id: SUBGRAPH
+    parameters:
+      name: shaped
+    exported_parameters:
+      - name: peak
+        type: float32
+    graph:
+      blocks:
+        - id: "qa::RecipeScale"
+          parameters:
+            name: inner
+            taps:
+              - "=peak"
+              - "=peak / 2"
+              - !!float32 0.25
+      exported_ports:
+        - [inner, INPUT, in, in]
+        - [inner, OUTPUT, out, out]
+)yaml";
+
+[[nodiscard]] std::size_t interiorEdgeBufferSize(const std::shared_ptr<gr::BlockModel>& composite) {
+    if (composite == nullptr || composite->graph() == nullptr || composite->graph()->edges().empty()) {
+        expect(false) << "the definition must produce a composite with an interior edge";
+        return 0UZ;
+    }
+    return composite->graph()->edges().front().minBufferSize();
+}
 
 [[nodiscard]] std::shared_ptr<gr::BlockModel> interiorBlock(const std::shared_ptr<gr::BlockModel>& composite) {
     // expect() does not abort, so a broken composite must be answered with null, never a dereference
@@ -592,6 +676,149 @@ blocks:
         if (gainAfter != stagedAfter.end()) {
             const double stagedGain = gr::recipe::detail::doubleOf(gainAfter->second).value_or(0.0);
             expect(eq(static_cast<float>(stagedGain), static_cast<float>(96000.0 / (2.0 * std::numbers::pi * 5000.0)))) << "deviation stood at its last committed value through the refusal";
+        }
+    };
+
+    "a connection's buffer size derives from an exported parameter"_test = [] {
+        registerRecipeTestBlock();
+        auto       loader  = recipeTestLoader();
+        const auto def     = definitionFrom(kEdgeSizedRecipe);
+        const auto sizedAt = [&](float rate) {
+            gr::property_map parameters;
+            parameters["sample_rate"] = rate;
+            const auto composite      = gr::detail::instantiateBlockFromYamlDefinition(loader, def, parameters);
+            expect(composite.has_value()) << (composite.has_value() ? "" : composite.error().message);
+            return composite.has_value() ? interiorEdgeBufferSize(*composite) : 0UZ;
+        };
+        expect(eq(sizedAt(2000000.0f), 100000UZ)) << "5 % of the rate in samples, not the loader's default size";
+        expect(eq(sizedAt(2400000.0f), 120000UZ)) << "the edge follows the rate the recipe was instantiated at";
+        expect(eq(sizedAt(1000010.0f), 50001UZ)) << "a fractional minimum rises to the next whole sample";
+    };
+
+    "a buffer size that is not a positive sample count leaves the size to the framework"_test = [] {
+        constexpr std::string_view kFourElementRecipe = R"yaml(
+blocks:
+  - id: SUBGRAPH
+    parameters:
+      name: plain
+    graph:
+      blocks:
+        - id: "qa::RecipeScale"
+          parameters:
+            name: first
+        - id: "qa::RecipeScale"
+          parameters:
+            name: second
+      connections:
+        - [first, out, second, in]
+      exported_ports:
+        - [first, INPUT, in, in]
+        - [second, OUTPUT, out, out]
+)yaml";
+        registerRecipeTestBlock();
+        auto       loader = recipeTestLoader();
+        const auto plain  = gr::detail::instantiateBlockFromYamlDefinition(loader, definitionFrom(kFourElementRecipe), {});
+        expect(fatal(plain.has_value())) << (plain.has_value() ? "" : plain.error().message);
+        const std::size_t frameworkSize = interiorEdgeBufferSize(*plain);
+
+        gr::property_map zero;
+        zero["sample_rate"] = 0.0f;
+        const auto unsized  = gr::detail::instantiateBlockFromYamlDefinition(loader, definitionFrom(kEdgeSizedRecipe), zero);
+        expect(unsized.has_value()) << (unsized.has_value() ? "" : unsized.error().message);
+        if (unsized.has_value()) {
+            expect(eq(interiorEdgeBufferSize(*unsized), frameworkSize)) << "a derived size of zero samples takes the size of an edge that names none";
+        }
+
+        const auto text = gr::detail::instantiateBlockFromYamlDefinition(loader, definitionFrom(kUnsizedEdgeRecipe), {});
+        expect(text.has_value()) << (text.has_value() ? "" : text.error().message);
+        if (text.has_value()) {
+            expect(eq(interiorEdgeBufferSize(*text), frameworkSize)) << "a fifth element that is neither number nor expression takes the size of an edge that names none";
+        }
+    };
+
+    "an expression in a context's parameters or a tag coupling is refused by name"_test = [] {
+        const auto definitionWith = [](std::string_view entry) {
+            return definitionFrom(std::string(R"yaml(
+blocks:
+  - id: SUBGRAPH
+    parameters:
+      name: literal
+    exported_parameters:
+      - name: sample_rate
+        type: float32
+    graph:
+      blocks:
+        - id: "qa::RecipeScale"
+          parameters:
+            name: inner
+)yaml") + std::string(entry));
+        };
+        registerRecipeTestBlock();
+        auto             loader = recipeTestLoader();
+        gr::property_map parameters;
+        parameters["sample_rate"] = 48000.0f;
+
+        const auto coupled = gr::detail::instantiateBlockFromYamlDefinition(loader, definitionWith("          tag_couplings:\n            rate: \"=sample_rate\"\n"), parameters);
+        expect(!coupled.has_value()) << "an expression in tag_couplings is not evaluated, and is refused";
+        if (!coupled.has_value()) {
+            expect(coupled.error().message.contains("tag_couplings") && coupled.error().message.contains("=sample_rate")) << coupled.error().message;
+        }
+
+        const auto contextual = gr::detail::instantiateBlockFromYamlDefinition(loader, definitionWith("          ctx_parameters:\n            - context: tuned\n              time: 0\n              parameters:\n                gain: \"=sample_rate\"\n"), parameters);
+        expect(!contextual.has_value()) << "an expression in ctx_parameters is not evaluated, and is refused";
+        if (!contextual.has_value()) {
+            expect(contextual.error().message.contains("ctx_parameters")) << contextual.error().message;
+        }
+    };
+
+    "a vector setting's elements derive from expressions and re-derive live"_test = [] {
+        registerRecipeTestBlock();
+        auto             loader = recipeTestLoader();
+        const auto       def    = definitionFrom(kDerivedTapsRecipe);
+        gr::property_map parameters;
+        parameters["peak"]   = 0.5f;
+        const auto composite = gr::detail::instantiateBlockFromYamlDefinition(loader, def, parameters);
+        expect(composite.has_value()) << (composite.has_value() ? "" : composite.error().message);
+        if (!composite.has_value()) {
+            return;
+        }
+        const auto inner = interiorBlock(*composite);
+        if (inner == nullptr) {
+            return;
+        }
+
+        const auto taps = inner->settings().get("taps");
+        expect(taps.has_value());
+        const auto* derived = taps.has_value() ? taps->get_if<gr::Tensor<float>>() : nullptr;
+        expect(derived != nullptr) << "the derived sequence reaches the setting in the member's own element type";
+        if (derived != nullptr) {
+            expect(eq(derived->size(), 3UZ));
+            expect(eq((*derived)[0], 0.5f));
+            expect(eq((*derived)[1], 0.25f));
+            expect(eq((*derived)[2], 0.25f)) << "a literal element beside the expressions is carried unchanged";
+        }
+
+        auto* wrapper = dynamic_cast<gr::GraphWrapper<gr::Graph>*>(composite->get());
+        expect(wrapper != nullptr) << "a parameterized composite carries the binding machinery";
+        if (wrapper == nullptr) {
+            return;
+        }
+        gr::property_map change;
+        change["peak"]     = 0.8f;
+        const auto applied = wrapper->applyRecipeParameters(change);
+        expect(applied.has_value()) << (applied.has_value() ? "" : applied.error().message);
+        const auto staged = inner->settings().stagedParameters();
+        const auto tapsIt = staged.find("taps");
+        expect(tapsIt != staged.end()) << "the whole sequence is staged, because a setting is staged whole";
+        if (tapsIt != staged.end()) {
+            const auto* stagedTaps = tapsIt->second.get_if<gr::Tensor<float>>();
+            expect(stagedTaps != nullptr);
+            if (stagedTaps != nullptr) {
+                expect(eq(stagedTaps->size(), 3UZ));
+                expect(eq((*stagedTaps)[0], 0.8f));
+                expect(eq((*stagedTaps)[1], 0.4f)) << "every derived element re-evaluates against the changed parameter";
+                expect(eq((*stagedTaps)[2], 0.25f));
+            }
         }
     };
 
