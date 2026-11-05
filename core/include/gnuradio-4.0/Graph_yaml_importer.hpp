@@ -11,6 +11,7 @@
 
 #include <gnuradio-4.0/meta/indirect.hpp>
 
+#include <gnuradio-4.0/RecipeParameters.hpp>
 #include <gnuradio-4.0/YamlPmt.hpp>
 
 #include "BlockModel.hpp"
@@ -636,10 +637,157 @@ inline constexpr std::array<std::string_view, 13> grcYamlKeyOrder{"id", "name", 
 
 inline std::string saveGrc(PluginLoader& loader, const gr::Graph& rootGraph) { return pmt::yaml::serialize(detail::saveGraphToMap(loader, rootGraph), grcYamlKeyOrder); }
 
-inline std::expected<std::shared_ptr<gr::BlockModel>, gr::Error> detail::instantiateBlockFromYamlDefinition(PluginLoader& loader, const detail::YamlDefinitionsLoader::Definition& def) noexcept {
+namespace detail {
+
+/// the exported_parameters list of a definition's SUBGRAPH entry, as declarations
+inline std::expected<std::vector<recipe::ParameterDeclaration>, gr::Error> readRecipeDeclarations(const property_map& blockEntry) {
+    std::vector<recipe::ParameterDeclaration> declarations;
+    const auto                                listIt = blockEntry.find("exported_parameters");
+    if (listIt == blockEntry.end()) {
+        return declarations;
+    }
+    const auto* list = listIt->second.get_if<Tensor<pmt::Value>>();
+    if (list == nullptr) {
+        return std::unexpected(gr::Error("recipe_expression_parse: exported_parameters is not a list"));
+    }
+    for (const auto& entryValue : *list) {
+        const auto* entry = entryValue.get_if<property_map>();
+        if (entry == nullptr) {
+            return std::unexpected(gr::Error("recipe_expression_parse: an exported_parameters entry is not a map"));
+        }
+        recipe::ParameterDeclaration declaration;
+        for (const auto& [key, value] : *entry) {
+            const std::string_view keyView(key);
+            if (keyView == "name") {
+                declaration.name = std::string(value.value_or(std::string_view{}));
+            } else if (keyView == "type") {
+                declaration.type = std::string(value.value_or(std::string_view{}));
+            } else if (keyView == "default") {
+                declaration.defaultValue = value;
+            } else if (keyView == "doc") {
+                declaration.doc = std::string(value.value_or(std::string_view{}));
+            }
+        }
+        if (declaration.name.empty() || declaration.type.empty()) {
+            return std::unexpected(gr::Error("recipe_expression_parse: an exported parameter needs a name and a type"));
+        }
+        declarations.push_back(std::move(declaration));
+    }
+    return declarations;
+}
+
+/// walks block entries at any nesting depth: a parameters value spelled "=expr" is evaluated
+/// against the recipe's declarations and replaced with the result; "\=text" unescapes to the
+/// literal "=text"
+inline std::expected<void, gr::Error> evaluateRecipeExpressions(Tensor<pmt::Value>& blocks, std::span<const recipe::ParameterDeclaration> declarations, std::span<const pmt::Value> values) {
+    for (std::size_t index = 0; index < blocks.size(); ++index) {
+        auto* blockEntry = blocks[index].get_if<property_map>();
+        if (blockEntry == nullptr) {
+            continue;
+        }
+        if (const auto parametersIt = blockEntry->find("parameters"); parametersIt != blockEntry->end()) {
+            if (auto* parameters = parametersIt->second.get_if<property_map>(); parameters != nullptr) {
+                for (auto& [key, value] : *parameters) {
+                    const auto* text = value.get_if<std::pmr::string>();
+                    if (text == nullptr) {
+                        continue;
+                    }
+                    const std::string_view textView(*text);
+                    // a leading run of backslashes before '=' loses exactly one backslash, so
+                    // every literal spelling stays expressible: "\=x" -> "=x", "\\=x" -> "\=x"
+                    const std::size_t backslashes = textView.find_first_not_of('\\');
+                    if (backslashes != std::string_view::npos && backslashes > 0 && textView[backslashes] == '=') {
+                        value = std::pmr::string(textView.substr(1));
+                        continue;
+                    }
+                    if (!textView.starts_with("=")) {
+                        continue;
+                    }
+                    // `=name` naming a string, boolean or vector parameter hands that value through unchanged. Those
+                    // types carry no arithmetic and have no grammar over them: a recipe substitutes such a value
+                    // and does nothing else with it. Every other expression takes the numeric path.
+                    const std::string_view     reference = textView.substr(1);
+                    std::optional<std::size_t> substituted;
+                    for (std::size_t declared = 0UZ; declared < declarations.size(); ++declared) {
+                        if (std::string_view(declarations[declared].name) == reference && recipe::detail::substitutedTypeWord(declarations[declared].type)) {
+                            substituted = declared;
+                            break;
+                        }
+                    }
+                    if (substituted.has_value()) {
+                        value = values[*substituted];
+                        continue;
+                    }
+
+                    const auto expression = recipe::parseExpression(reference, declarations);
+                    if (!expression.has_value()) {
+                        return std::unexpected(expression.error());
+                    }
+                    auto result = recipe::evaluate(*expression, values);
+                    if (!result.has_value()) {
+                        return std::unexpected(result.error());
+                    }
+                    value = std::move(*result);
+                }
+            }
+        }
+        if (const auto graphIt = blockEntry->find("graph"); graphIt != blockEntry->end()) {
+            if (auto* graphMap = graphIt->second.get_if<property_map>(); graphMap != nullptr) {
+                if (const auto interiorIt = graphMap->find("blocks"); interiorIt != graphMap->end()) {
+                    if (auto* interior = interiorIt->second.get_if<Tensor<pmt::Value>>(); interior != nullptr) {
+                        if (auto walked = evaluateRecipeExpressions(*interior, declarations, values); !walked.has_value()) {
+                            return walked;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return {};
+}
+
+} // namespace detail
+
+inline std::expected<std::shared_ptr<gr::BlockModel>, gr::Error> detail::instantiateBlockFromYamlDefinition(PluginLoader& loader, const detail::YamlDefinitionsLoader::Definition& def, const property_map& parameters) noexcept {
     try {
+        // the expressions of a copy of the definition are evaluated against the declarations overlaid with the caller's
+        // parameters before the graph loader runs, so the loader reads literal values alone
+        property_map definition = def.definition;
+
+        std::vector<recipe::ParameterDeclaration> declarations;
+        Tensor<pmt::Value>*                       blocksList = nullptr;
+        if (const auto blocksIt = definition.find("blocks"); blocksIt != definition.end()) {
+            blocksList = blocksIt->second.get_if<Tensor<pmt::Value>>();
+        }
+        if (blocksList != nullptr) {
+            for (std::size_t index = 0; index < blocksList->size(); ++index) {
+                const auto* blockEntry = (*blocksList)[index].get_if<property_map>();
+                if (blockEntry != nullptr && blockEntry->contains("graph")) {
+                    auto read = readRecipeDeclarations(*blockEntry);
+                    if (!read.has_value()) {
+                        return std::unexpected(read.error());
+                    }
+                    declarations = std::move(*read);
+                    break;
+                }
+            }
+        }
+
+        if (auto valid = recipe::validateDeclarations(declarations); !valid.has_value()) {
+            return std::unexpected(valid.error());
+        }
+        auto values = recipe::resolveParameters(declarations, parameters);
+        if (!values.has_value()) {
+            return std::unexpected(values.error());
+        }
+        if (blocksList != nullptr) {
+            if (auto evaluatedAll = evaluateRecipeExpressions(*blocksList, declarations, *values); !evaluatedAll.has_value()) {
+                return std::unexpected(evaluatedAll.error());
+            }
+        }
+
         gr::Graph tempGraph;
-        detail::loadGraphFromMap(loader, tempGraph, def.definition);
+        detail::loadGraphFromMap(loader, tempGraph, definition);
         auto blocks = tempGraph.blocks();
         if (blocks.empty()) {
             return std::unexpected(gr::Error{"YAML definition produced no blocks"});
