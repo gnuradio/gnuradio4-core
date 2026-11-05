@@ -24,6 +24,7 @@
 #include <gnuradio-4.0/Profiler.hpp>
 #include <gnuradio-4.0/SharedState.hpp>
 #include <gnuradio-4.0/meta/reflection.hpp>
+#include <gnuradio-4.0/thread/SubnormalFlush.hpp>
 #include <gnuradio-4.0/thread/thread_pool.hpp>
 
 #ifdef __EMSCRIPTEN__
@@ -466,8 +467,9 @@ public:
     Annotated<std::string, "pool name", Doc<"default pool name">>                                                                                           poolName                        = std::string(gr::thread_pool::kDefaultCpuPoolId);
     Annotated<std::size_t, "max_work_items", Doc<"number of work items per work scheduling interval (controls latency)">>                                   max_work_items                  = std::numeric_limits<std::size_t>::max(); // TODO: check whether we can keep this std::size_t or more consistently to gr::Size_t
     Annotated<property_map, "sched_settings", Doc<"scheduler implementation specific settings">>                                                            sched_settings{};
+    Annotated<bool, "flush_subnormals", Doc<"subnormals read and written as zero on this scheduler's own workers">>                                         flush_subnormals = true;
 
-    GR_MAKE_REFLECTABLE(SchedulerBase, timeout_ms, watchdog_timeout, timeout_inactivity_count, process_stream_to_message_ratio, pool_park_count, max_work_items, poolName, sched_settings);
+    GR_MAKE_REFLECTABLE(SchedulerBase, timeout_ms, watchdog_timeout, timeout_inactivity_count, process_stream_to_message_ratio, pool_park_count, max_work_items, poolName, sched_settings, flush_subnormals);
 
     constexpr static block::Category blockCategory = block::Category::ScheduledBlockGroup;
 
@@ -1810,8 +1812,16 @@ protected:
     }
 
     // a scheduler's own poolWorker() takes the run's generation as a third parameter or omits it. A worker without the
-    // generation ends only when it observes an inactive state
+    // generation ends only when it observes an inactive state. The worker runs with the flush that flush_subnormals
+    // sets, on a pool thread or, under a single-threaded policy, on the thread that started the run. The thread gets its
+    // earlier flush back when the worker returns.
     void dispatchWorker(std::size_t runnerID, std::shared_ptr<JobLists> jobList, std::size_t generation) {
+        const gr::thread_pool::thread::detail::SubnormalFlushScope subnormalFlush(flush_subnormals.value);
+        runWorker(runnerID, std::move(jobList), generation);
+    }
+
+    // never inlined: the arithmetic of the blocks stays between the edges of the flush set by dispatchWorker()
+    GR_SUBNORMAL_NOINLINE void runWorker(std::size_t runnerID, std::shared_ptr<JobLists> jobList, std::size_t generation) {
         if constexpr (requires(Derived& d, std::shared_ptr<JobLists> list) { d.poolWorker(0UZ, list, 0UZ); }) {
             static_cast<Derived*>(this)->poolWorker(runnerID, std::move(jobList), generation);
         } else {
