@@ -1,6 +1,7 @@
 #include <boost/ut.hpp>
 
 #include <limits>
+#include <map>
 #include <numbers>
 #include <string>
 #include <vector>
@@ -443,8 +444,43 @@ struct RecipeScale : gr::Block<RecipeScale> {
     [[nodiscard]] float processOne(float sample) const noexcept { return gain * sample; }
 };
 
+/// what one interior block's settingsChanged saw, kept by block name because the block itself
+/// lives inside the composite and is reachable only as a BlockModel
+struct SettingsChangedRecord {
+    std::size_t              calls = 0UZ;
+    std::vector<std::string> keys;
+};
+
+[[nodiscard]] std::map<std::string, SettingsChangedRecord>& recipeWatches() {
+    static std::map<std::string, SettingsChangedRecord> watches;
+    return watches;
+}
+
+struct RecipeWatched : gr::Block<RecipeWatched> {
+    gr::PortIn<float>  in;
+    gr::PortOut<float> out;
+
+    gr::Annotated<float, "gain"> gain = 1.0f;
+    gr::Annotated<float, "rate"> rate = 0.0f;
+
+    GR_MAKE_REFLECTABLE(RecipeWatched, in, out, gain, rate);
+
+    explicit RecipeWatched(gr::property_map init = {}) : gr::Block<RecipeWatched>(std::move(init)) {}
+
+    [[nodiscard]] float processOne(float sample) const noexcept { return gain * sample; }
+
+    void settingsChanged(const gr::property_map& /*oldSettings*/, const gr::property_map& newSettings) {
+        SettingsChangedRecord& record = recipeWatches()[std::string(this->name)];
+        ++record.calls;
+        record.keys.clear();
+        for (const auto& [key, value] : newSettings) {
+            record.keys.emplace_back(key);
+        }
+    }
+};
+
 void registerRecipeTestBlock() {
-    static const bool registered = [] { return gr::globalBlockRegistry().insert<RecipeScale>("=qa::RecipeScale"); }();
+    static const bool registered = [] { return gr::globalBlockRegistry().insert<RecipeScale>("=qa::RecipeScale") && gr::globalBlockRegistry().insert<RecipeWatched>("=qa::RecipeWatched"); }();
     expect(registered) << "the test block must reach the global registry";
 }
 
@@ -601,6 +637,32 @@ blocks:
           - "second"
           - "in"
           - "=clamp(sample_rate * 0.05, 32768, 4194304)"
+      exported_ports:
+        - [first, INPUT, in, in]
+        - [second, OUTPUT, out, out]
+)yaml";
+
+constexpr std::string_view kTwoBoundBlocksRecipe = R"yaml(
+blocks:
+  - id: SUBGRAPH
+    parameters:
+      name: watched
+    exported_parameters:
+      - name: sample_rate
+        type: float32
+      - name: level
+        type: float32
+    graph:
+      blocks:
+        - id: "qa::RecipeWatched"
+          parameters:
+            name: first
+            gain: "=level"
+            rate: "=sample_rate"
+        - id: "qa::RecipeWatched"
+          parameters:
+            name: second
+            gain: "=sample_rate / 2"
       exported_ports:
         - [first, INPUT, in, in]
         - [second, OUTPUT, out, out]
@@ -1000,6 +1062,138 @@ blocks:
         expect(gainIt != staged.end()) << "the clamped derivation re-evaluates through the binding";
         if (gainIt != staged.end()) {
             expect(eq(static_cast<float>(gr::recipe::detail::doubleOf(gainIt->second).value_or(0.0)), 100000.0f)) << "the new rate falls between the bounds";
+        }
+    };
+
+    "only the derived values that moved are staged"_test = [] {
+        registerRecipeTestBlock();
+        auto             loader = recipeTestLoader();
+        const auto       def    = definitionFrom(kTwoBoundBlocksRecipe);
+        gr::property_map parameters;
+        parameters["sample_rate"] = 48000.0f;
+        parameters["level"]       = 1.0f;
+        const auto composite      = gr::detail::instantiateBlockFromYamlDefinition(loader, def, parameters);
+        expect(composite.has_value()) << (composite.has_value() ? "" : composite.error().message);
+        if (!composite.has_value()) {
+            return;
+        }
+        auto*      wrapper = dynamic_cast<gr::GraphWrapper<gr::Graph>*>(composite->get());
+        const auto first   = interiorBlockNamed(*composite, "first");
+        const auto second  = interiorBlockNamed(*composite, "second");
+        expect(wrapper != nullptr);
+        if (wrapper == nullptr || first == nullptr || second == nullptr) {
+            return;
+        }
+        const auto settle = [&] {
+            std::ignore = first->settings().applyStagedParameters();
+            std::ignore = second->settings().applyStagedParameters();
+            recipeWatches().clear();
+        };
+
+        gr::property_map unchanged;
+        unchanged["level"] = 1.0f;
+        expect(wrapper->applyRecipeParameters(unchanged).has_value());
+        expect(!first->settings().stagedParameters().empty() && !second->settings().stagedParameters().empty()) << "the first application after a load stages every bound key";
+        settle();
+
+        gr::property_map change;
+        change["level"]    = 2.0f;
+        const auto applied = wrapper->applyRecipeParameters(change);
+        expect(applied.has_value()) << (applied.has_value() ? "" : applied.error().message);
+        const auto stagedFirst = first->settings().stagedParameters();
+        expect(eq(stagedFirst.size(), 1UZ)) << "only the key whose derived value moved is staged";
+        expect(stagedFirst.contains("gain")) << "and it is the moved key";
+        expect(second->settings().stagedParameters().empty()) << "the block whose bindings did not move is not staged at all";
+
+        std::ignore = first->settings().applyStagedParameters();
+        std::ignore = second->settings().applyStagedParameters();
+        expect(eq(recipeWatches()["second"].calls, 0UZ)) << "so its settingsChanged is never called";
+        expect(eq(recipeWatches()["first"].calls, 1UZ));
+        expect(eq(recipeWatches()["first"].keys.size(), 1UZ)) << "the block that moved sees the moved key alone";
+        if (recipeWatches()["first"].keys.size() == 1UZ) {
+            expect(eq(recipeWatches()["first"].keys.front(), std::string("gain")));
+        }
+
+        recipeWatches().clear();
+        expect(wrapper->applyRecipeParameters(change).has_value()) << "the same value again";
+        expect(first->settings().stagedParameters().empty() && second->settings().stagedParameters().empty()) << "a parameter restated at its own value stages nothing";
+        std::ignore = first->settings().applyStagedParameters();
+        std::ignore = second->settings().applyStagedParameters();
+        expect(eq(recipeWatches()["first"].calls, 0UZ));
+        expect(eq(recipeWatches()["second"].calls, 0UZ));
+    };
+
+    "a block staged by a change another block refused is restaged by the next change"_test = [] {
+        constexpr std::string_view kPartlyRefusedRecipe = R"yaml(
+blocks:
+  - id: SUBGRAPH
+    parameters:
+      name: partly
+    exported_parameters:
+      - name: level
+        type: float32
+      - name: count
+        type: int64
+    graph:
+      blocks:
+        - id: "qa::RecipeWatched"
+          parameters:
+            name: first
+            gain: "=level"
+        - id: "qa::RecipeWatched"
+          parameters:
+            name: second
+            gain: "=count"
+      exported_ports:
+        - [first, INPUT, in, in]
+        - [second, OUTPUT, out, out]
+)yaml";
+        registerRecipeTestBlock();
+        auto             loader = recipeTestLoader();
+        gr::property_map parameters;
+        parameters["level"]  = 1.0f;
+        parameters["count"]  = std::int64_t{1};
+        const auto composite = gr::detail::instantiateBlockFromYamlDefinition(loader, definitionFrom(kPartlyRefusedRecipe), parameters);
+        expect(composite.has_value()) << (composite.has_value() ? "" : composite.error().message);
+        if (!composite.has_value()) {
+            return;
+        }
+        auto*      wrapper = dynamic_cast<gr::GraphWrapper<gr::Graph>*>(composite->get());
+        const auto first   = interiorBlockNamed(*composite, "first");
+        const auto second  = interiorBlockNamed(*composite, "second");
+        expect(wrapper != nullptr);
+        if (wrapper == nullptr || first == nullptr || second == nullptr) {
+            return;
+        }
+        const auto settle = [&] {
+            std::ignore = first->settings().applyStagedParameters();
+            std::ignore = second->settings().applyStagedParameters();
+        };
+        gr::property_map initial;
+        initial["level"] = 1.0f;
+        expect(wrapper->applyRecipeParameters(initial).has_value());
+        settle();
+
+        // 2^24 + 1 has more significant bits than a float32 holds, so the second block refuses its gain
+        gr::property_map refusedChange;
+        refusedChange["level"] = 2.0f;
+        refusedChange["count"] = std::int64_t{16777217};
+        const auto refused     = wrapper->applyRecipeParameters(refusedChange);
+        expect(!refused.has_value()) << "the second block refuses the derived gain";
+        if (!refused.has_value()) {
+            expect(refused.error().message.contains("second")) << refused.error().message;
+        }
+        expect(first->settings().stagedParameters().contains("gain")) << "the first block was staged before the refusal";
+        settle();
+        const auto appliedGain = first->settings().get("gain");
+        expect(appliedGain.has_value() && appliedGain->value_or(0.0f) == 2.0f) << "and applied the refused change's value";
+
+        expect(wrapper->applyRecipeParameters(initial).has_value());
+        const auto restaged = first->settings().stagedParameters();
+        const auto gainIt   = restaged.find("gain");
+        expect(gainIt != restaged.end()) << "the change back to the committed value restages the first block";
+        if (gainIt != restaged.end()) {
+            expect(eq(static_cast<float>(gr::recipe::detail::doubleOf(gainIt->second).value_or(0.0)), 1.0f));
         }
     };
 

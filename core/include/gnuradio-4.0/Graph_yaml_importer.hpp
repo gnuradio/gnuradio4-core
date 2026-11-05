@@ -943,7 +943,7 @@ inline std::expected<std::shared_ptr<gr::BlockModel>, gr::Error> detail::instant
             // scheduler-managed composite has no GraphWrapper to carry the bindings, so its parameters apply at
             // instantiation only.
             if (auto* wrapper = dynamic_cast<GraphWrapper<gr::Graph>*>(blocks.front().get()); wrapper != nullptr) {
-                if (auto attached = wrapper->attachRecipeBindings({.declarations = std::move(declarations), .bindings = std::move(bindings), .values = std::move(*values)}); !attached.has_value()) {
+                if (auto attached = wrapper->attachRecipeBindings({.declarations = std::move(declarations), .bindings = std::move(bindings), .values = std::move(*values), .lastStaged = {}}); !attached.has_value()) {
                     return std::unexpected(attached.error());
                 }
             }
