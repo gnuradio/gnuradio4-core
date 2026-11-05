@@ -474,6 +474,127 @@ const boost::ut::suite<"RecipeDefinitions"> recipeDefinitionTests = [] {
         expect(refusal.error().message.contains("recipe_unknown_parameter")) << refusal.error().message;
     };
 
+    "an unnamed nested subgraph holding a derived setting is refused at load"_test = [] {
+        constexpr std::string_view kUnnamedNestedRecipe = R"yaml(
+blocks:
+  - id: SUBGRAPH
+    parameters:
+      name: outer
+    exported_parameters:
+      - name: level
+        type: float32
+    graph:
+      blocks:
+        - id: SUBGRAPH
+          graph:
+            blocks:
+              - id: "qa::RecipeScale"
+                parameters:
+                  name: inner
+                  gain: "=level"
+)yaml";
+        registerRecipeTestBlock();
+        auto             loader = recipeTestLoader();
+        gr::property_map parameters;
+        parameters["level"] = 2.0f;
+        const auto refusal  = gr::detail::instantiateBlockFromYamlDefinition(loader, definitionFrom(kUnnamedNestedRecipe), parameters);
+        expect(!refusal.has_value()) << "a binding path through an unnamed subgraph cannot be resolved";
+        if (!refusal.has_value()) {
+            expect(refusal.error().message.contains("nested subgraph") && refusal.error().message.contains("needs a name")) << refusal.error().message;
+        }
+    };
+
+    "a live change beyond float32 refuses naming the parameter, and the one at the edge applies"_test = [] {
+        registerRecipeTestBlock();
+        auto             loader = recipeTestLoader();
+        const auto       def    = definitionFrom(kParameterizedRecipe);
+        gr::property_map parameters;
+        parameters["sample_rate"] = 48000.0f;
+        parameters["deviation"]   = 2500.0f;
+        const auto composite      = gr::detail::instantiateBlockFromYamlDefinition(loader, def, parameters);
+        expect(composite.has_value()) << (composite.has_value() ? "" : composite.error().message);
+        if (!composite.has_value()) {
+            return;
+        }
+        auto* wrapper = dynamic_cast<gr::GraphWrapper<gr::Graph>*>(composite->get());
+        expect(wrapper != nullptr);
+        if (wrapper == nullptr) {
+            return;
+        }
+        gr::property_map beyond;
+        beyond["deviation"] = 1e300;
+        const auto refused  = wrapper->applyRecipeParameters(beyond);
+        expect(!refused.has_value()) << "1e300 does not fit the float32 deviation";
+        if (!refused.has_value()) {
+            expect(refused.error().message.contains("deviation") && refused.error().message.contains("float32")) << refused.error().message;
+        }
+        gr::property_map atEdge;
+        atEdge["deviation"] = static_cast<double>(std::numeric_limits<float>::max());
+        const auto applied  = wrapper->applyRecipeParameters(atEdge);
+        expect(applied.has_value()) << (applied.has_value() ? "" : applied.error().message);
+    };
+
+    "a live parameter change re-evaluates and stages; a refusal leaves the values standing"_test = [] {
+        registerRecipeTestBlock();
+        auto             loader = recipeTestLoader();
+        const auto       def    = definitionFrom(kParameterizedRecipe);
+        gr::property_map parameters;
+        parameters["sample_rate"] = 48000.0f;
+        parameters["deviation"]   = 2500.0f;
+        const auto composite      = gr::detail::instantiateBlockFromYamlDefinition(loader, def, parameters);
+        expect(composite.has_value()) << (composite.has_value() ? "" : composite.error().message);
+        if (!composite.has_value()) {
+            return;
+        }
+        auto* wrapper = dynamic_cast<gr::GraphWrapper<gr::Graph>*>(composite->get());
+        expect(wrapper != nullptr) << "a parameterized composite carries the binding machinery";
+        const auto inner = interiorBlock(*composite);
+        if (wrapper == nullptr || inner == nullptr) {
+            return;
+        }
+
+        gr::property_map change;
+        change["deviation"] = 5000.0f;
+        const auto applied  = wrapper->applyRecipeParameters(change);
+        expect(applied.has_value()) << (applied.has_value() ? "" : applied.error().message);
+        const auto staged = inner->settings().stagedParameters();
+        const auto gainIt = staged.find("gain");
+        expect(gainIt != staged.end()) << "the derived setting is staged on the interior block";
+        if (gainIt != staged.end()) {
+            // setStaged converts to the member's own float; read whichever numeric arrived
+            const double stagedGain = gr::recipe::detail::doubleOf(gainIt->second).value_or(0.0);
+            expect(eq(static_cast<float>(stagedGain), static_cast<float>(48000.0 / (2.0 * std::numbers::pi * 5000.0)))) << "re-evaluated with the changed parameter";
+        }
+
+        gr::property_map unknown;
+        unknown["bandwidth"] = 1.0f;
+        expect(!wrapper->applyRecipeParameters(unknown).has_value()) << "an undeclared parameter refuses";
+
+        gr::property_map mistyped;
+        mistyped["deviation"]  = std::pmr::string("wide");
+        const auto refusedType = wrapper->applyRecipeParameters(mistyped);
+        expect(!refusedType.has_value()) << "a live value its declared type cannot hold refuses";
+        if (!refusedType.has_value()) {
+            expect(refusedType.error().message.contains("float32")) << refusedType.error().message;
+        }
+
+        gr::property_map zero;
+        zero["deviation"] = 0.0f;
+        expect(!wrapper->applyRecipeParameters(zero).has_value()) << "a non-finite derivation refuses the change whole";
+
+        gr::property_map next;
+        next["sample_rate"]    = 96000.0f;
+        const auto nextApplied = wrapper->applyRecipeParameters(next);
+        expect(nextApplied.has_value()) << (nextApplied.has_value() ? "" : nextApplied.error().message);
+        const auto stagedAfter = inner->settings().stagedParameters();
+        const auto gainAfter   = stagedAfter.find("gain");
+        expect(gainAfter != stagedAfter.end());
+        if (gainAfter != stagedAfter.end()) {
+            const double stagedGain = gr::recipe::detail::doubleOf(gainAfter->second).value_or(0.0);
+            expect(eq(static_cast<float>(stagedGain), static_cast<float>(96000.0 / (2.0 * std::numbers::pi * 5000.0)))) << "deviation stood at its last committed value through the refusal";
+        }
+    };
+
     "a literal definition is untouched, and parameters against it are refused"_test = [] {
         registerRecipeTestBlock();
         auto       loader    = recipeTestLoader();

@@ -6,6 +6,7 @@
 #include <gnuradio-4.0/Buffer.hpp>
 #include <gnuradio-4.0/CircularBuffer.hpp>
 #include <gnuradio-4.0/Port.hpp>
+#include <gnuradio-4.0/RecipeParameters.hpp>
 #include <gnuradio-4.0/Sequence.hpp>
 #include <gnuradio-4.0/meta/reflection.hpp>
 #include <gnuradio-4.0/meta/typelist.hpp>
@@ -340,7 +341,159 @@ public:
     [[nodiscard]] gr::property_map exportedInputPorts() final { return exportedPortsFor(_exportedInputPortsForBlock); }
     [[nodiscard]] gr::property_map exportedOutputPorts() final { return exportedPortsFor(_exportedOutputPortsForBlock); }
 
+    /// Attaches a recipe's live parameter machinery: the composite's exported parameters
+    /// become stageable settings whose changes re-evaluate the recipe's expressions and stage
+    /// the derived values onto the interior blocks. Every binding target must resolve now, so
+    /// a broken recipe refuses at attach rather than at its first live change.
+    [[nodiscard]] std::expected<void, Error> attachRecipeBindings(recipe::AttachedBindings bindings) {
+        for (const auto& binding : bindings.bindings) {
+            if (auto target = resolveRecipeTarget(binding.namePath); !target.has_value()) {
+                return std::unexpected(target.error());
+            }
+        }
+        _recipeBindings                                                 = std::make_unique<recipe::AttachedBindings>(std::move(bindings));
+        this->_block._recipeParameterHandler                            = &GraphWrapper::recipeParameterHandler;
+        this->_block._recipeParameterContext                            = this;
+        this->_block.propertyCallbacks[block::property::kStagedSetting] = &BlockBase::propertyCallbackRecipeStagedSettings;
+        return {};
+    }
+
+    /// Applies exported-parameter changes: trial-evaluates every binding against the updated
+    /// values, stages the derived settings onto the interior blocks, and commits the values.
+    /// An undeclared name, a value of the wrong type or a failed evaluation refuses the change
+    /// before any block is staged. When an interior block refuses its settings, the blocks
+    /// staged before it keep the new values, the running parameter values stand, and the
+    /// bindings of the staged blocks are restaged by the next change.
+    [[nodiscard]] std::expected<void, Error> applyRecipeParameters(const property_map& changed) {
+        if (_recipeBindings == nullptr) {
+            return std::unexpected(Error("no recipe bindings attached"));
+        }
+        recipe::AttachedBindings& attached = *_recipeBindings;
+        std::vector<pmt::Value>   trial    = attached.values;
+        for (const auto& [name, value] : changed) {
+            bool declared = false;
+            for (std::size_t index = 0; index < attached.declarations.size(); ++index) {
+                if (std::string_view(attached.declarations[index].name) == std::string_view(name)) {
+                    if (auto agrees = recipe::checkParameterValue(attached.declarations[index], value); !agrees.has_value()) {
+                        return std::unexpected(agrees.error());
+                    }
+                    trial[index] = value;
+                    declared     = true;
+                    break;
+                }
+            }
+            if (!declared) {
+                return std::unexpected(Error(std::format("recipe_unknown_parameter: '{}'", recipe::detail::printableEcho(name))));
+            }
+        }
+        struct StagedTarget {
+            BlockModel*  block;
+            property_map derived;
+        };
+        std::vector<StagedTarget> staged;
+        for (const auto& binding : attached.bindings) {
+            auto result = recipe::bindingValue(binding, std::span<const pmt::Value>(trial));
+            if (!result.has_value()) {
+                return std::unexpected(result.error());
+            }
+            auto target = resolveRecipeTarget(binding.namePath);
+            if (!target.has_value()) {
+                return std::unexpected(target.error());
+            }
+            auto existing = std::ranges::find_if(staged, [&](const StagedTarget& entry) { return entry.block == *target; });
+            if (existing == staged.end()) {
+                staged.push_back({.block = *target, .derived = {}});
+                existing = std::prev(staged.end());
+            }
+            existing->derived[convert_string_domain(binding.settingKey)] = std::move(*result);
+        }
+        for (auto& [interiorBlock, derived] : staged) {
+            if (auto refused = stageDerived(*interiorBlock, derived); !refused.has_value()) {
+                return std::unexpected(refused.error());
+            }
+        }
+        attached.values = std::move(trial);
+        return {};
+    }
+
+    [[nodiscard]] const recipe::AttachedBindings* recipeBindings() const noexcept { return _recipeBindings.get(); }
+
 private:
+    std::unique_ptr<recipe::AttachedBindings> _recipeBindings;
+
+    // stages one interior block's derived settings; a value the block does not take is refused with the block's reason
+    [[nodiscard]] static std::expected<void, Error> stageDerived(BlockModel& block, const property_map& derived) {
+        try {
+            if (property_map notSet = block.settings().setStaged(derived); !notSet.empty()) {
+                return std::unexpected(Error(std::format("recipe_expression_conversion: interior block '{}' has no setting for a derived value", recipe::detail::printableEcho(block.name()))));
+            }
+        } catch (const gr::exception& refusal) {
+            return std::unexpected(Error(std::format("recipe_expression_conversion: interior block '{}' refused a derived staged setting: {}", recipe::detail::printableEcho(block.name()), refusal.message)));
+        }
+        return {};
+    }
+
+    // templated on the graph type so the body is checked at instantiation, where gr::Graph is
+    // complete; this header defines GraphWrapper ahead of Graph
+    template<typename TGraph = gr::Graph>
+    [[nodiscard]] std::expected<BlockModel*, Error> resolveRecipeTarget(std::span<const std::string> namePath) {
+        if (namePath.empty()) {
+            return std::unexpected(Error("a recipe binding needs a target name path"));
+        }
+        TGraph*     level = this->graph();
+        BlockModel* found = nullptr;
+        for (std::size_t depth = 0; depth < namePath.size(); ++depth) {
+            found = nullptr;
+            for (const auto& candidate : level->blocks()) {
+                if (std::string_view(candidate->name()) != std::string_view(namePath[depth])) {
+                    continue;
+                }
+                if (found != nullptr) {
+                    return std::unexpected(Error(std::format("recipe binding target '{}' is ambiguous", recipe::detail::printableEcho(namePath[depth]))));
+                }
+                found = candidate.get();
+            }
+            if (found == nullptr) {
+                return std::unexpected(Error(std::format("recipe binding target '{}' not found", recipe::detail::printableEcho(namePath[depth]))));
+            }
+            if (depth + 1 < namePath.size()) {
+                level = found->graph();
+                if (level == nullptr) {
+                    return std::unexpected(Error(std::format("recipe binding target '{}' is not a subgraph", recipe::detail::printableEcho(namePath[depth]))));
+                }
+            }
+        }
+        return found;
+    }
+
+    static std::optional<Message> recipeParameterHandler(void* context, Message message) {
+        auto* wrapper = static_cast<GraphWrapper*>(context);
+        if (message.cmd != message::Command::Set || !message.data.has_value() || wrapper->_recipeBindings == nullptr) {
+            return wrapper->_block.propertyCallbackStagedSettings(block::property::kStagedSetting, std::move(message));
+        }
+        property_map recipeKeys;
+        property_map remaining;
+        for (const auto& [key, value] : *message.data) {
+            const bool declared                      = std::ranges::any_of(wrapper->_recipeBindings->declarations, [&](const auto& declaration) { return std::string_view(declaration.name) == std::string_view(key); });
+            (declared ? recipeKeys : remaining)[key] = value;
+        }
+        if (!recipeKeys.empty()) {
+            if (auto applied = wrapper->applyRecipeParameters(recipeKeys); !applied.has_value()) {
+                message.data = std::unexpected(applied.error());
+                return message;
+            }
+        }
+        if (!remaining.empty() || recipeKeys.empty()) {
+            message.data = std::move(remaining);
+            return wrapper->_block.propertyCallbackStagedSettings(block::property::kStagedSetting, std::move(message));
+        }
+        if (!message.clientRequestID.empty()) {
+            message.cmd  = message::Command::Final;
+            message.data = std::move(recipeKeys);
+            return message;
+        }
+        return std::nullopt;
+    }
     std::expected<DynamicPort*, Error> findPortInBlock(std::string_view uniqueBlockName, PortDirection portDirection, std::string_view portName, std::source_location location = std::source_location::current()) {
         const auto& asGraph = [this] -> const auto& {
             if constexpr (requires { this->blockRef().graph(); }) {
