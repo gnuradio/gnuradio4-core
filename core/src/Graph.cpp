@@ -1,6 +1,7 @@
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/Graph_yaml_importer.hpp>
 #include <gnuradio-4.0/PluginLoader.hpp>
+#include <gnuradio-4.0/RecipeInstantiation.hpp>
 
 namespace gr {
 
@@ -19,7 +20,26 @@ Graph::Graph(property_map settings) : gr::Block<Graph>(std::move(settings)), _pl
         // resolvable inside the subgraph
         auto subGraphModel = std::unique_ptr<BlockModel>(std::make_unique<GraphWrapper<Graph>>(Graph(*_pluginLoader, std::move(initialSettings))).release());
         return addBlock(std::move(subGraphModel));
-    } else if (std::shared_ptr<BlockModel> block_load = _pluginLoader->instantiate(type, initialSettings); block_load) {
+    }
+
+    // A block built from a YAML definition takes only the parameters the definition exports, since its interior is
+    // derived from them, and refuses any other key by name, the caller's `name` included. The exported parameters
+    // travel with the instantiation; the label goes through setName(), as the reader applies a file's label, and the
+    // remaining keys load as settings before the block joins the graph. A refused setting throws, and the graph keeps
+    // the blocks it held. A registered or plugin-provided type declares nothing and takes its whole map.
+    detail::RecipeParameterSplit split = detail::splitRecipeParameters(*_pluginLoader, type, std::move(initialSettings));
+    if (split.fromDefinition) {
+        std::expected<std::shared_ptr<BlockModel>, Error> composite = detail::instantiateRecipe(*_pluginLoader, type, detail::remainingName(split), split);
+        if (!composite.has_value()) {
+            throw gr::exception(composite.error().message, composite.error().sourceLocation);
+        }
+        if (*composite) {
+            return addBlock(std::move(*composite));
+        }
+    }
+
+    initialSettings = std::move(split.remaining);
+    if (std::shared_ptr<BlockModel> block_load = _pluginLoader->instantiate(type, initialSettings); block_load) {
         const std::shared_ptr<BlockModel>& newBlock = addBlock(block_load);
         return newBlock;
     } else if (std::shared_ptr<SchedulerModel> scheduler_load = _pluginLoader->instantiateScheduler(type, initialSettings); scheduler_load) {
@@ -39,7 +59,19 @@ std::pair<std::shared_ptr<BlockModel>, std::shared_ptr<BlockModel>> Graph::repla
     }
     const std::shared_ptr<BlockModel> replaced = *found;
 
-    std::shared_ptr<BlockModel> newBlock = _pluginLoader->instantiate(type, properties);
+    // the replacement is built as emplaceBlock() builds a new block
+    std::shared_ptr<BlockModel>  newBlock;
+    detail::RecipeParameterSplit split = detail::splitRecipeParameters(*_pluginLoader, type, properties);
+    if (split.fromDefinition) {
+        std::expected<std::shared_ptr<BlockModel>, Error> composite = detail::instantiateRecipe(*_pluginLoader, type, detail::remainingName(split), split);
+        if (!composite.has_value()) {
+            throw gr::exception(composite.error().message, composite.error().sourceLocation);
+        }
+        newBlock = std::move(*composite);
+    }
+    if (!newBlock) {
+        newBlock = _pluginLoader->instantiate(type, split.remaining);
+    }
     if (!newBlock) {
         throw gr::exception(std::format("Can not create block {}", type));
     }

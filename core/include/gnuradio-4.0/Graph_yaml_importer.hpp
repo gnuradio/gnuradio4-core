@@ -11,6 +11,7 @@
 
 #include <gnuradio-4.0/meta/indirect.hpp>
 
+#include <gnuradio-4.0/RecipeInstantiation.hpp>
 #include <gnuradio-4.0/RecipeParameters.hpp>
 #include <gnuradio-4.0/YamlPmt.hpp>
 
@@ -269,7 +270,9 @@ inline property_map readEntryParameters(const property_map& grcBlock, const Bloc
 /// Loads `parameters`, the entry's `ctx_parameters` and its `tag_couplings` into the block's settings and activates the
 /// default context. `tag_couplings` maps a setting's name to the tag key that sets it.
 inline void loadEntrySettings(BlockModel& block, const property_map& grcBlock, const property_map& parameters, const BlockIdentity& identity) {
-    block.settings().loadParametersFromPropertyMap(parameters);
+    if (auto loaded = loadRemainingSettings(block, identity.name, identity.type, parameters); !loaded.has_value()) {
+        throw gr::exception(loaded.error().message, loaded.error().sourceLocation);
+    }
 
     if (auto it = grcBlock.find("ctx_parameters"); it != grcBlock.end()) {
         const auto parametersCtx = checked_access_ptr<const Tensor<pmt::Value>, false>{it->second.get_if<Tensor<pmt::Value>>()};
@@ -421,12 +424,20 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
             schedulerParams.erase("name");
             fromFile = mergedParameters(&fromFile, &schedulerParams);
         }
-        const property_map* given      = settingsByPosition[position];
-        const property_map  parameters = mergedParameters(&fromFile, given);
+        const property_map* given = settingsByPosition[position];
+
+        // a recipe takes its exported parameters when the composite is built and has no setting of those names, so
+        // they go with the instantiation and leave the settings map. Every other key loads as a setting. A block that is
+        // not built from a definition declares none.
+        const auto          split      = splitRecipeParameters(loader, blockType, mergedParameters(&fromFile, given));
+        const property_map& parameters = split.remaining;
 
         std::shared_ptr<BlockModel> currentBlock;
         if (!isSubgraph) {
-            const auto instantiated = loader.instantiateOrError(blockType, parameters);
+            // A registered block is constructed with its whole map, so that its constructor sees the values it runs
+            // with. A definition takes only its exported parameters.
+            const property_map& constructedWith = split.fromDefinition ? split.exported : parameters;
+            const auto          instantiated    = loader.instantiateOrError(blockType, constructedWith);
             if (!instantiated.has_value()) {
                 throw gr::exception(std::format("Unable to create block '{}' of type '{}': {}", blockName, blockType, instantiated.error().message));
             }
@@ -443,8 +454,10 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
             currentBlock = std::make_shared<GraphWrapper<gr::Graph>>(gr::Graph(loader, parameters));
         }
 
-        // the settings take the map once, below, and Settings::init() does not apply the constructor's copy again
-        currentBlock->settings().setInitBlockParameters({});
+        if (!split.fromDefinition) {
+            // the settings take the map once, below, and Settings::init() does not apply the constructor's copy again
+            currentBlock->settings().setInitBlockParameters({});
+        }
         checkDeclared(currentBlock->settings().writableMembers(), blockName, currentBlock->typeName(), parameters);
 
         currentBlock->setName(blockName);
@@ -639,44 +652,6 @@ inline std::string saveGrc(PluginLoader& loader, const gr::Graph& rootGraph) { r
 
 namespace detail {
 
-/// the exported_parameters list of a definition's SUBGRAPH entry, as declarations
-inline std::expected<std::vector<recipe::ParameterDeclaration>, gr::Error> readRecipeDeclarations(const property_map& blockEntry) {
-    std::vector<recipe::ParameterDeclaration> declarations;
-    const auto                                listIt = blockEntry.find("exported_parameters");
-    if (listIt == blockEntry.end()) {
-        return declarations;
-    }
-    const auto* list = listIt->second.get_if<Tensor<pmt::Value>>();
-    if (list == nullptr) {
-        return std::unexpected(gr::Error("recipe_expression_parse: exported_parameters is not a list"));
-    }
-    for (const auto& entryValue : *list) {
-        const auto* entry = entryValue.get_if<property_map>();
-        if (entry == nullptr) {
-            return std::unexpected(gr::Error("recipe_expression_parse: an exported_parameters entry is not a map"));
-        }
-        recipe::ParameterDeclaration declaration;
-        for (const auto& [key, value] : *entry) {
-            const std::string_view keyView(key);
-            const std::string_view valueView = value.value_or(std::string_view{});
-            if (keyView == "name" && !valueView.empty()) {
-                declaration.name.assign(valueView);
-            } else if (keyView == "type" && !valueView.empty()) {
-                declaration.type.assign(valueView);
-            } else if (keyView == "default") {
-                declaration.defaultValue = value;
-            } else if (keyView == "doc" && !valueView.empty()) {
-                declaration.doc.assign(valueView);
-            }
-        }
-        if (declaration.name.empty() || declaration.type.empty()) {
-            return std::unexpected(gr::Error("recipe_expression_parse: an exported parameter needs a name and a type"));
-        }
-        declarations.push_back(std::move(declaration));
-    }
-    return declarations;
-}
-
 /// walks block entries at any nesting depth: a parameters value spelled "=expr" is evaluated
 /// against the recipe's declarations and replaced with the result; "\=text" unescapes to the
 /// literal "=text". Below the composite's own level each evaluated expression is also
@@ -797,24 +772,15 @@ inline std::expected<std::shared_ptr<gr::BlockModel>, gr::Error> detail::instant
         // parameters before the graph loader runs, so the loader reads literal values alone
         property_map definition = def.definition;
 
-        std::vector<recipe::ParameterDeclaration> declarations;
-        Tensor<pmt::Value>*                       blocksList = nullptr;
+        Tensor<pmt::Value>* blocksList = nullptr;
         if (const auto blocksIt = definition.find("blocks"); blocksIt != definition.end()) {
             blocksList = blocksIt->second.get_if<Tensor<pmt::Value>>();
         }
-        if (blocksList != nullptr) {
-            for (std::size_t index = 0; index < blocksList->size(); ++index) {
-                const auto* blockEntry = (*blocksList)[index].get_if<property_map>();
-                if (blockEntry != nullptr && blockEntry->contains("graph")) {
-                    auto read = readRecipeDeclarations(*blockEntry);
-                    if (!read.has_value()) {
-                        return std::unexpected(read.error());
-                    }
-                    declarations = std::move(*read);
-                    break;
-                }
-            }
+        auto read = recipeDeclarationsOf(definition);
+        if (!read.has_value()) {
+            return std::unexpected(read.error());
         }
+        std::vector<recipe::ParameterDeclaration> declarations = std::move(*read);
 
         if (auto valid = recipe::validateDeclarations(declarations); !valid.has_value()) {
             return std::unexpected(valid.error());
