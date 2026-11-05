@@ -1,5 +1,6 @@
 #include <boost/ut.hpp>
 
+#include <limits>
 #include <numbers>
 #include <string>
 #include <vector>
@@ -32,8 +33,16 @@ namespace {
 [[nodiscard]] double evaluated(std::string_view source, const std::vector<gr::pmt::Value>& values) {
     const auto expression = parseExpression(source, nbfmDeclarations());
     expect(expression.has_value()) << source;
+    // expect() does not abort, so a refusal must be answered with a value that fails every
+    // comparison after it, never with a dereference of the error
+    if (!expression.has_value()) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
     const auto result = evaluate(*expression, values);
     expect(result.has_value()) << source;
+    if (!result.has_value()) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
     // integer-mode expressions return an int64 value; read whichever numeric arrived
     return gr::recipe::detail::doubleOf(*result).value_or(0.0);
 }
@@ -54,6 +63,90 @@ const boost::ut::suite<"RecipeParameters"> recipeParameterTests = [] {
         expect(eq(evaluated("-sample_rate + 1", values), -3.0));
         expect(eq(evaluated("tau_circle / 2", values), std::numbers::pi));
         expect(eq(evaluated("sample_rate / deviation / 2", values), 1.0)) << "division is left-associative";
+    };
+
+    "clamp holds a derived value between its bounds"_test = [] {
+        const std::vector<gr::pmt::Value> values{gr::pmt::Value(2000000.0f), gr::pmt::Value(2500.0f), gr::pmt::Value(7.5e-05)};
+        expect(eq(evaluated("clamp(sample_rate * 0.05, 32768, 4194304)", values), 100000.0)) << "between the bounds the value stands";
+        expect(eq(evaluated("clamp(sample_rate * 0.05, 200000, 4194304)", values), 200000.0)) << "below the low bound the low bound stands";
+        expect(eq(evaluated("clamp(sample_rate * 0.05, 32768, 50000)", values), 50000.0)) << "above the high bound the high bound stands";
+        expect(eq(evaluated("clamp(-sample_rate, -1, 1) + clamp(1, 0, 2)", values), 0.0)) << "a call is a factor like any other";
+        expect(eq(evaluated("clamp(clamp(sample_rate, 0, 100), 0, 10)", values), 10.0)) << "an argument is a whole expression, calls included";
+
+        const std::vector<ParameterDeclaration> integral{{.name = "n", .type = "int64", .defaultValue = std::nullopt, .doc = ""}};
+        const auto                              expression = parseExpression("clamp(n, 32768, 4194304)", integral);
+        expect(expression.has_value());
+        if (!expression.has_value()) {
+            return;
+        }
+        expect(expression->integerMode) << "an all-integral clamp stays on the int64 path";
+        const std::vector<gr::pmt::Value> big{gr::pmt::Value(std::int64_t{9007199254740993})};
+        const auto                        bounded = evaluate(*expression, big);
+        expect(bounded.has_value());
+        if (bounded.has_value()) {
+            expect(eq(bounded->value_or(std::int64_t{}), std::int64_t{4194304})) << "the high bound holds without a trip through a double";
+        }
+    };
+
+    "clamp refuses a wrong arity, a non-numeric argument and unordered bounds"_test = [] {
+        const auto arity = parseExpression("clamp(sample_rate, 1)", nbfmDeclarations());
+        expect(!arity.has_value());
+        expect(arity.error().message.contains("recipe_expression_parse")) << arity.error().message;
+        expect(arity.error().message.contains("clamp takes 3 arguments")) << arity.error().message;
+        expect(!parseExpression("clamp(sample_rate, 1, 2, 3)", nbfmDeclarations()).has_value()) << "a fourth argument is refused too";
+        expect(!parseExpression("clamp()", nbfmDeclarations()).has_value());
+        expect(!parseExpression("clamp(sample_rate, 1, 2", nbfmDeclarations()).has_value()) << "an unclosed call is refused";
+
+        const auto unknownFunction = parseExpression("ceil(sample_rate)", nbfmDeclarations());
+        expect(!unknownFunction.has_value());
+        expect(unknownFunction.error().message.contains("unknown function")) << unknownFunction.error().message;
+        expect(unknownFunction.error().message.contains("clamp")) << "the refusal names the vocabulary it has";
+
+        const std::vector<ParameterDeclaration> withText{
+            {.name = "label", .type = "string", .defaultValue = std::nullopt, .doc = ""},
+            {.name = "rate", .type = "float64", .defaultValue = std::nullopt, .doc = ""},
+        };
+        const auto text = parseExpression("clamp(label, 0, 1)", withText);
+        expect(!text.has_value()) << "a call argument is an expression, so a non-numeric parameter is refused there too";
+        if (!text.has_value()) {
+            expect(text.error().message.contains("cannot appear in an expression")) << text.error().message;
+        }
+
+        const std::vector<gr::pmt::Value> values{gr::pmt::Value(2000000.0f), gr::pmt::Value(2500.0f), gr::pmt::Value(7.5e-05)};
+        const auto                        unordered = parseExpression("clamp(sample_rate, 4194304, 32768)", nbfmDeclarations());
+        expect(unordered.has_value()) << "the bounds' order is a value question, not a grammar one";
+        if (unordered.has_value()) {
+            const auto refused = evaluate(*unordered, values);
+            expect(!refused.has_value());
+            if (!refused.has_value()) {
+                expect(refused.error().message.contains("recipe_expression_domain")) << refused.error().message;
+            }
+        }
+
+        const auto unboundedArgument = parseExpression("clamp(1 / 0, 0, 1)", nbfmDeclarations());
+        expect(unboundedArgument.has_value());
+        if (unboundedArgument.has_value()) {
+            expect(!evaluate(*unboundedArgument, values).has_value()) << "a division by zero is refused even where clamp would bound it";
+        }
+
+        const std::vector<ParameterDeclaration> integral{{.name = "n", .type = "int64", .defaultValue = std::nullopt, .doc = ""}};
+        const auto                              unorderedIntegers = parseExpression("clamp(n, 10, 1)", integral);
+        expect(unorderedIntegers.has_value() && unorderedIntegers->integerMode);
+        if (unorderedIntegers.has_value()) {
+            const std::vector<gr::pmt::Value> one{gr::pmt::Value(std::int64_t{5})};
+            const auto                        refusedIntegers = evaluate(*unorderedIntegers, one);
+            expect(!refusedIntegers.has_value()) << "the int64 path refuses the same bounds";
+            if (!refusedIntegers.has_value()) {
+                expect(refusedIntegers.error().message.contains("recipe_expression_domain")) << refusedIntegers.error().message;
+            }
+        }
+
+        const std::vector<ParameterDeclaration> shadow{{.name = "clamp", .type = "float32", .defaultValue = std::nullopt, .doc = ""}};
+        const auto                              shadowed = validateDeclarations(shadow);
+        expect(!shadowed.has_value()) << "a parameter may not shadow the dialect's own function name";
+        if (!shadowed.has_value()) {
+            expect(shadowed.error().message.contains("recipe_reserved_parameter")) << shadowed.error().message;
+        }
     };
 
     "a bare parameter reference is plain forwarding"_test = [] {
@@ -484,12 +577,55 @@ blocks:
         - [inner, OUTPUT, out, out]
 )yaml";
 
+constexpr std::string_view kClampedRecipe = R"yaml(
+blocks:
+  - id: SUBGRAPH
+    parameters:
+      name: clamped
+    exported_parameters:
+      - name: sample_rate
+        type: float32
+    graph:
+      blocks:
+        - id: "qa::RecipeScale"
+          parameters:
+            name: first
+            gain: "=clamp(sample_rate * 0.05, 32768, 4194304)"
+        - id: "qa::RecipeScale"
+          parameters:
+            name: second
+      connections:
+        -
+          - "first"
+          - "out"
+          - "second"
+          - "in"
+          - "=clamp(sample_rate * 0.05, 32768, 4194304)"
+      exported_ports:
+        - [first, INPUT, in, in]
+        - [second, OUTPUT, out, out]
+)yaml";
+
 [[nodiscard]] std::size_t interiorEdgeBufferSize(const std::shared_ptr<gr::BlockModel>& composite) {
     if (composite == nullptr || composite->graph() == nullptr || composite->graph()->edges().empty()) {
         expect(false) << "the definition must produce a composite with an interior edge";
         return 0UZ;
     }
     return composite->graph()->edges().front().minBufferSize();
+}
+
+[[nodiscard]] std::shared_ptr<gr::BlockModel> interiorBlockNamed(const std::shared_ptr<gr::BlockModel>& composite, std::string_view name) {
+    if (composite == nullptr || composite->graph() == nullptr) {
+        expect(false) << "the definition must produce a composite";
+        return nullptr;
+    }
+    for (const auto& candidate : composite->graph()->blocks()) {
+        if (candidate->name() == name) {
+            return candidate;
+        }
+    }
+    expect(false) << name << " is not an interior block of the composite";
+    return nullptr;
 }
 
 [[nodiscard]] std::shared_ptr<gr::BlockModel> interiorBlock(const std::shared_ptr<gr::BlockModel>& composite) {
@@ -819,6 +955,51 @@ blocks:
                 expect(eq((*stagedTaps)[1], 0.4f)) << "every derived element re-evaluates against the changed parameter";
                 expect(eq((*stagedTaps)[2], 0.25f));
             }
+        }
+    };
+
+    "a clamped edge holds its bounds at every rate, and the derived setting re-evaluates live"_test = [] {
+        registerRecipeTestBlock();
+        auto       loader  = recipeTestLoader();
+        const auto def     = definitionFrom(kClampedRecipe);
+        const auto builtAt = [&](float rate) { //
+            gr::property_map parameters;
+            parameters["sample_rate"] = rate;
+            const auto composite      = gr::detail::instantiateBlockFromYamlDefinition(loader, def, parameters);
+            expect(composite.has_value()) << (composite.has_value() ? "" : composite.error().message);
+            return composite;
+        };
+        const auto sizedAt = [&](float rate) {
+            const auto composite = builtAt(rate);
+            return composite.has_value() ? interiorEdgeBufferSize(*composite) : 0UZ;
+        };
+        expect(eq(sizedAt(2000000.0f), 100000UZ)) << "between the bounds the rate rule stands";
+        expect(eq(sizedAt(96000.0f), 32768UZ)) << "a low rate takes the floor, not 5 % of itself";
+        expect(eq(sizedAt(200000000.0f), 4194304UZ)) << "a high rate takes the ceiling";
+
+        const auto composite = builtAt(96000.0f);
+        if (!composite.has_value()) {
+            return;
+        }
+        const auto first   = interiorBlockNamed(*composite, "first");
+        auto*      wrapper = dynamic_cast<gr::GraphWrapper<gr::Graph>*>(composite->get());
+        expect(wrapper != nullptr) << "a parameterized composite carries the binding machinery";
+        if (first == nullptr || wrapper == nullptr) {
+            return;
+        }
+        const auto gain = first->settings().get("gain");
+        expect(gain.has_value());
+        expect(eq(gain->value_or(float{}), 32768.0f)) << "the floor reached the interior setting";
+
+        gr::property_map change;
+        change["sample_rate"] = 2000000.0f;
+        const auto applied    = wrapper->applyRecipeParameters(change);
+        expect(applied.has_value()) << (applied.has_value() ? "" : applied.error().message);
+        const auto staged = first->settings().stagedParameters();
+        const auto gainIt = staged.find("gain");
+        expect(gainIt != staged.end()) << "the clamped derivation re-evaluates through the binding";
+        if (gainIt != staged.end()) {
+            expect(eq(static_cast<float>(gr::recipe::detail::doubleOf(gainIt->second).value_or(0.0)), 100000.0f)) << "the new rate falls between the bounds";
         }
     };
 
