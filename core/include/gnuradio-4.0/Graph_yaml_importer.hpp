@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <limits>
 #include <map>
 #include <optional>
 #include <ranges>
@@ -11,6 +13,8 @@
 
 #include <gnuradio-4.0/meta/indirect.hpp>
 
+#include <gnuradio-4.0/RecipeInstantiation.hpp>
+#include <gnuradio-4.0/RecipeParameters.hpp>
 #include <gnuradio-4.0/YamlPmt.hpp>
 
 #include "BlockModel.hpp"
@@ -268,7 +272,9 @@ inline property_map readEntryParameters(const property_map& grcBlock, const Bloc
 /// Loads `parameters`, the entry's `ctx_parameters` and its `tag_couplings` into the block's settings and activates the
 /// default context. `tag_couplings` maps a setting's name to the tag key that sets it.
 inline void loadEntrySettings(BlockModel& block, const property_map& grcBlock, const property_map& parameters, const BlockIdentity& identity) {
-    block.settings().loadParametersFromPropertyMap(parameters);
+    if (auto loaded = loadRemainingSettings(block, identity.name, identity.type, parameters); !loaded.has_value()) {
+        throw gr::exception(loaded.error().message, loaded.error().sourceLocation);
+    }
 
     if (auto it = grcBlock.find("ctx_parameters"); it != grcBlock.end()) {
         const auto parametersCtx = checked_access_ptr<const Tensor<pmt::Value>, false>{it->second.get_if<Tensor<pmt::Value>>()};
@@ -311,6 +317,25 @@ inline void loadEntrySettings(BlockModel& block, const property_map& grcBlock, c
     if (const auto failed = block.settings().activateContext(); failed == std::nullopt) {
         throw gr::exception("Settings for context could not be activated");
     }
+}
+
+/// The fifth element of a connection is the edge's minimum buffer size in samples. An integral value is the size. A
+/// positive, finite floating value, which a recipe expression produces when it divides, rises to the next whole sample.
+/// Any other value leaves the size to the framework.
+[[nodiscard]] inline std::size_t edgeBufferSizeOf(const pmt::Value& element) {
+    std::size_t minBufferSize = std::numeric_limits<std::size_t>::max();
+    pmt::ValueVisitor([&minBufferSize]<typename TValue>(const TValue& value) {
+        if constexpr (std::is_same_v<TValue, std::size_t>) {
+            minBufferSize = value;
+        } else if constexpr (std::is_integral_v<TValue>) {
+            minBufferSize = static_cast<std::size_t>(value);
+        } else if constexpr (std::is_floating_point_v<TValue>) {
+            if (std::isfinite(value) && value > TValue{0} && static_cast<double>(value) < static_cast<double>(std::numeric_limits<std::size_t>::max())) {
+                minBufferSize = static_cast<std::size_t>(std::ceil(static_cast<double>(value)));
+            }
+        }
+    }).visit(element);
+    return minBufferSize;
 }
 
 inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGraph, gr::property_map yaml, const BlockSettings& overrides = {}, std::source_location location = std::source_location::current()) {
@@ -420,12 +445,20 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
             schedulerParams.erase("name");
             fromFile = mergedParameters(&fromFile, &schedulerParams);
         }
-        const property_map* given      = settingsByPosition[position];
-        const property_map  parameters = mergedParameters(&fromFile, given);
+        const property_map* given = settingsByPosition[position];
+
+        // a recipe takes its exported parameters when the composite is built and has no setting of those names, so
+        // they go with the instantiation and leave the settings map. Every other key loads as a setting. A block that is
+        // not built from a definition declares none.
+        const auto          split      = splitRecipeParameters(loader, blockType, mergedParameters(&fromFile, given));
+        const property_map& parameters = split.remaining;
 
         std::shared_ptr<BlockModel> currentBlock;
         if (!isSubgraph) {
-            const auto instantiated = loader.instantiateOrError(blockType, parameters);
+            // A registered block is constructed with its whole map, so that its constructor sees the values it runs
+            // with. A definition takes only its exported parameters.
+            const property_map& constructedWith = split.fromDefinition ? split.exported : parameters;
+            const auto          instantiated    = loader.instantiateOrError(blockType, constructedWith);
             if (!instantiated.has_value()) {
                 throw gr::exception(std::format("Unable to create block '{}' of type '{}': {}", blockName, blockType, instantiated.error().message));
             }
@@ -442,8 +475,10 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
             currentBlock = std::make_shared<GraphWrapper<gr::Graph>>(gr::Graph(loader, parameters));
         }
 
-        // the settings take the map once, below, and Settings::init() does not apply the constructor's copy again
-        currentBlock->settings().setInitBlockParameters({});
+        if (!split.fromDefinition) {
+            // the settings take the map once, below, and Settings::init() does not apply the constructor's copy again
+            currentBlock->settings().setInitBlockParameters({});
+        }
         checkDeclared(currentBlock->settings().writableMembers(), blockName, currentBlock->typeName(), parameters);
 
         currentBlock->setName(blockName);
@@ -537,16 +572,7 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
                 throw gr::exception(std::format("connection failed: {}", r.error().message));
             }
         } else {
-            std::size_t minBufferSize{};
-            pmt::ValueVisitor([&minBufferSize]<typename TValue>(const TValue& value) {
-                if constexpr (std::is_same_v<TValue, std::size_t>) {
-                    minBufferSize = value;
-                } else if constexpr (std::is_integral_v<TValue>) {
-                    minBufferSize = static_cast<std::size_t>(value);
-                } else {
-                    minBufferSize = std::numeric_limits<std::size_t>::max();
-                }
-            }).visit(connection[4]);
+            const std::size_t minBufferSize = edgeBufferSizeOf(connection[4]);
 
             if (auto r = resultGraph.connect(src.block, src.port_definition, dst.block, dst.port_definition, EdgeParameters{.minBufferSize = minBufferSize, .weight = graph::defaultWeight, .name = graph::defaultEdgeName}, location); !r) {
                 throw gr::exception(std::format("connection failed: {}", r.error().message));
@@ -636,13 +662,291 @@ inline constexpr std::array<std::string_view, 13> grcYamlKeyOrder{"id", "name", 
 
 inline std::string saveGrc(PluginLoader& loader, const gr::Graph& rootGraph) { return pmt::yaml::serialize(detail::saveGraphToMap(loader, rootGraph), grcYamlKeyOrder); }
 
-inline std::expected<std::shared_ptr<gr::BlockModel>, gr::Error> detail::instantiateBlockFromYamlDefinition(PluginLoader& loader, const detail::YamlDefinitionsLoader::Definition& def) noexcept {
+namespace detail {
+
+/// A sequence-valued parameter derives element by element: every "=expr" element is evaluated
+/// and replaces itself in the document, and the sequence stays type-erased, so the settings
+/// conversion gives it the member's own element type by the rule a literal sequence follows.
+/// The returned program is empty unless at least one element really was an expression.
+[[nodiscard]] inline std::expected<std::vector<recipe::SequenceElement>, gr::Error> evaluateSequenceElements(Tensor<pmt::Value>& sequence, std::span<const recipe::ParameterDeclaration> declarations, std::span<const pmt::Value> values) {
+    std::vector<recipe::SequenceElement> program;
+    program.reserve(sequence.size());
+    bool derived = false;
+    for (std::size_t index = 0UZ; index < sequence.size(); ++index) {
+        pmt::Value& element = sequence[index];
+        const auto* text    = element.get_if<std::pmr::string>();
+        if (text != nullptr) {
+            const std::string_view textView(*text);
+            const auto             sentinel = recipe::detail::sentinelOf(textView);
+            if (sentinel == recipe::detail::SentinelKind::escapedLiteral) {
+                element = std::pmr::string(textView.substr(1UZ));
+            } else if (sentinel == recipe::detail::SentinelKind::expression) {
+                // an element is a number, so it takes the arithmetic path only: a parameter of a
+                // substituted type refuses here by the grammar's own message
+                auto expression = recipe::parseExpression(textView.substr(1UZ), declarations);
+                if (!expression.has_value()) {
+                    return std::unexpected(expression.error());
+                }
+                auto result = recipe::evaluate(*expression, values);
+                if (!result.has_value()) {
+                    return std::unexpected(result.error());
+                }
+                element = std::move(*result);
+                program.push_back({.expression = std::move(*expression), .literal = {}});
+                derived = true;
+                continue;
+            }
+        }
+        program.push_back({.expression = std::nullopt, .literal = element});
+    }
+    if (!derived) {
+        return std::vector<recipe::SequenceElement>{};
+    }
+    return program;
+}
+
+/// The fifth element of a connection is the edge's buffer size, and spelled "=expr" it derives
+/// like any other value. It joins no live binding: an edge is built once when the graph loads,
+/// so a later parameter change re-sizes nothing.
+[[nodiscard]] inline std::expected<void, gr::Error> evaluateConnectionBufferSizes(Tensor<pmt::Value>& connections, std::span<const recipe::ParameterDeclaration> declarations, std::span<const pmt::Value> values) {
+    for (std::size_t index = 0UZ; index < connections.size(); ++index) {
+        auto* connection = connections[index].get_if<Tensor<pmt::Value>>();
+        if (connection == nullptr || connection->size() < 5UZ) {
+            continue;
+        }
+        pmt::Value& element = (*connection)[4UZ];
+        const auto* text    = element.get_if<std::pmr::string>();
+        if (text == nullptr) {
+            continue;
+        }
+        const std::string_view textView(*text);
+        if (recipe::detail::sentinelOf(textView) != recipe::detail::SentinelKind::expression) {
+            continue;
+        }
+        auto expression = recipe::parseExpression(textView.substr(1UZ), declarations);
+        if (!expression.has_value()) {
+            return std::unexpected(expression.error());
+        }
+        auto result = recipe::evaluate(*expression, values);
+        if (!result.has_value()) {
+            return std::unexpected(result.error());
+        }
+        element = std::move(*result);
+    }
+    return {};
+}
+
+/// the first string spelled "=expr" anywhere in `value`, a map or list walked whole
+[[nodiscard]] inline std::optional<std::string> firstRecipeExpressionIn(const pmt::Value& value) {
+    if (const auto* text = value.get_if<std::pmr::string>(); text != nullptr) {
+        return recipe::detail::sentinelOf(*text) == recipe::detail::SentinelKind::expression ? std::optional<std::string>(std::string(*text)) : std::nullopt;
+    }
+    if (const auto* map = value.get_if<property_map>(); map != nullptr) {
+        for (const auto& [key, item] : *map) {
+            if (auto found = firstRecipeExpressionIn(item); found.has_value()) {
+                return found;
+            }
+        }
+    }
+    if (const auto* list = value.get_if<Tensor<pmt::Value>>(); list != nullptr) {
+        for (const pmt::Value& item : *list) {
+            if (auto found = firstRecipeExpressionIn(item); found.has_value()) {
+                return found;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+/// walks block entries at any nesting depth: a parameters value spelled "=expr" is evaluated
+/// against the recipe's declarations and replaced with the result; "\=text" unescapes to the
+/// literal "=text". A sequence-valued parameter derives element by element and a connection's
+/// buffer size derives the same way. Below the composite's own level each evaluated expression
+/// is also collected as a live binding, addressed by the block-name path from the interior
+/// downward, so a later parameter change can re-evaluate and re-stage it.
+// GCC's -Wnull-dereference reports the inlined std::string copies through push_back here
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wnull-dereference"
+inline std::expected<void, gr::Error> evaluateRecipeExpressions(Tensor<pmt::Value>& blocks, std::span<const recipe::ParameterDeclaration> declarations, std::span<const pmt::Value> values, //
+    std::vector<recipe::Binding>& outBindings, std::vector<std::string>& namePath, bool insideComposite) {
+    for (std::size_t index = 0; index < blocks.size(); ++index) {
+        auto* blockEntry = blocks[index].get_if<property_map>();
+        if (blockEntry == nullptr) {
+            continue;
+        }
+        // only `parameters` takes expressions; a context's parameters and the tag couplings are read as written
+        for (const std::string_view literalKey : {std::string_view("ctx_parameters"), std::string_view("tag_couplings")}) {
+            if (const auto literalIt = blockEntry->find(std::pmr::string(literalKey)); literalIt != blockEntry->end()) {
+                if (auto found = firstRecipeExpressionIn(literalIt->second); found.has_value()) {
+                    return std::unexpected(gr::Error(std::format("recipe_expression_parse: '{}' in {} is not evaluated; an expression belongs in parameters", recipe::detail::printableEcho(*found), literalKey)));
+                }
+            }
+        }
+        std::string blockName;
+        if (const auto parametersIt = blockEntry->find("parameters"); parametersIt != blockEntry->end()) {
+            if (auto* parameters = parametersIt->second.get_if<property_map>(); parameters != nullptr) {
+                if (const auto nameIt = parameters->find("name"); nameIt != parameters->end()) {
+                    if (const std::string_view nameView = nameIt->second.value_or(std::string_view{}); !nameView.empty()) {
+                        blockName.assign(nameView);
+                    }
+                }
+                for (auto& [key, value] : *parameters) {
+                    if (auto* sequence = value.get_if<Tensor<pmt::Value>>(); sequence != nullptr) {
+                        auto program = evaluateSequenceElements(*sequence, declarations, values);
+                        if (!program.has_value()) {
+                            return std::unexpected(program.error());
+                        }
+                        if (!program->empty() && insideComposite) {
+                            if (blockName.empty()) {
+                                return std::unexpected(gr::Error(std::format("recipe_expression_parse: the block holding a derived '{}' sequence needs a name so the elements can re-evaluate live", recipe::detail::printableEcho(key))));
+                            }
+                            std::vector<std::string> path = namePath;
+                            path.push_back(blockName);
+                            outBindings.push_back({.namePath = std::move(path), .settingKey = std::string(key), .expression = {}, .substituted = std::nullopt, .sequence = std::move(*program)});
+                        }
+                        continue;
+                    }
+                    const auto* text = value.get_if<std::pmr::string>();
+                    if (text == nullptr) {
+                        continue;
+                    }
+                    const std::string_view textView(*text);
+                    const auto             sentinel = recipe::detail::sentinelOf(textView);
+                    if (sentinel == recipe::detail::SentinelKind::escapedLiteral) {
+                        value = std::pmr::string(textView.substr(1));
+                        continue;
+                    }
+                    if (sentinel != recipe::detail::SentinelKind::expression) {
+                        continue;
+                    }
+                    // `=name` naming a string, boolean or vector parameter hands that value through unchanged. Those
+                    // types carry no arithmetic and have no grammar over them: a recipe substitutes such a value
+                    // and does nothing else with it. Every other expression takes the numeric path.
+                    const std::string_view     reference = textView.substr(1);
+                    std::optional<std::size_t> substituted;
+                    for (std::size_t declared = 0UZ; declared < declarations.size(); ++declared) {
+                        if (std::string_view(declarations[declared].name) == reference && recipe::detail::substitutedTypeWord(declarations[declared].type)) {
+                            substituted = declared;
+                            break;
+                        }
+                    }
+                    if (substituted.has_value()) {
+                        if (insideComposite) {
+                            if (blockName.empty()) {
+                                return std::unexpected(gr::Error(std::format("recipe_expression_parse: the block holding '={}' needs a name so the parameter can re-substitute live", recipe::detail::printableEcho(reference))));
+                            }
+                            std::vector<std::string> path = namePath;
+                            path.push_back(blockName);
+                            outBindings.push_back({.namePath = std::move(path), .settingKey = std::string(key), .expression = {}, .substituted = substituted, .sequence = {}});
+                        }
+                        value = values[*substituted];
+                        continue;
+                    }
+
+                    auto expression = recipe::parseExpression(reference, declarations);
+                    if (!expression.has_value()) {
+                        return std::unexpected(expression.error());
+                    }
+                    auto result = recipe::evaluate(*expression, values);
+                    if (!result.has_value()) {
+                        return std::unexpected(result.error());
+                    }
+                    if (insideComposite) {
+                        if (blockName.empty()) {
+                            return std::unexpected(gr::Error(std::format("recipe_expression_parse: the block holding '={}' needs a name so the expression can re-evaluate live", recipe::detail::printableEcho(expression->source))));
+                        }
+                        std::vector<std::string> path = namePath;
+                        path.push_back(blockName);
+                        outBindings.push_back({.namePath = std::move(path), .settingKey = std::string(key), .expression = *expression, .substituted = std::nullopt, .sequence = {}});
+                    }
+                    value = std::move(*result);
+                }
+            }
+        }
+        if (const auto graphIt = blockEntry->find("graph"); graphIt != blockEntry->end()) {
+            if (auto* graphMap = graphIt->second.get_if<property_map>(); graphMap != nullptr) {
+                if (const auto interiorIt = graphMap->find("blocks"); interiorIt != graphMap->end()) {
+                    if (auto* interior = interiorIt->second.get_if<Tensor<pmt::Value>>(); interior != nullptr) {
+                        // descending into the composite's interior starts the bindable region;
+                        // one level further down the interior block's name joins the path
+                        if (insideComposite) {
+                            namePath.push_back(blockName);
+                        }
+                        const std::size_t nBindingsBefore = outBindings.size();
+                        auto              walked          = evaluateRecipeExpressions(*interior, declarations, values, outBindings, namePath, true);
+                        if (insideComposite) {
+                            namePath.pop_back();
+                        }
+                        if (!walked.has_value()) {
+                            return walked;
+                        }
+                        if (insideComposite && blockName.empty() && outBindings.size() > nBindingsBefore) {
+                            return std::unexpected(gr::Error("recipe_expression_parse: a nested subgraph holding a derived setting needs a name so the setting can re-evaluate live"));
+                        }
+                    }
+                }
+                if (const auto connectionsIt = graphMap->find("connections"); connectionsIt != graphMap->end()) {
+                    if (auto* connections = connectionsIt->second.get_if<Tensor<pmt::Value>>(); connections != nullptr) {
+                        if (auto sized = evaluateConnectionBufferSizes(*connections, declarations, values); !sized.has_value()) {
+                            return sized;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return {};
+}
+#pragma GCC diagnostic pop
+
+} // namespace detail
+
+inline std::expected<std::shared_ptr<gr::BlockModel>, gr::Error> detail::instantiateBlockFromYamlDefinition(PluginLoader& loader, const detail::YamlDefinitionsLoader::Definition& def, const property_map& parameters) noexcept {
     try {
+        // the expressions of a copy of the definition are evaluated against the declarations overlaid with the caller's
+        // parameters before the graph loader runs, so the loader reads literal values alone
+        property_map definition = def.definition;
+
+        Tensor<pmt::Value>* blocksList = nullptr;
+        if (const auto blocksIt = definition.find("blocks"); blocksIt != definition.end()) {
+            blocksList = blocksIt->second.get_if<Tensor<pmt::Value>>();
+        }
+        auto read = recipeDeclarationsOf(definition);
+        if (!read.has_value()) {
+            return std::unexpected(read.error());
+        }
+        std::vector<recipe::ParameterDeclaration> declarations = std::move(*read);
+
+        if (auto valid = recipe::validateDeclarations(declarations); !valid.has_value()) {
+            return std::unexpected(valid.error());
+        }
+        auto values = recipe::resolveParameters(declarations, parameters);
+        if (!values.has_value()) {
+            return std::unexpected(values.error());
+        }
+        std::vector<recipe::Binding> bindings;
+        if (blocksList != nullptr) {
+            std::vector<std::string> namePath;
+            if (auto evaluatedAll = evaluateRecipeExpressions(*blocksList, declarations, *values, bindings, namePath, false); !evaluatedAll.has_value()) {
+                return std::unexpected(evaluatedAll.error());
+            }
+        }
+
         gr::Graph tempGraph;
-        detail::loadGraphFromMap(loader, tempGraph, def.definition);
+        detail::loadGraphFromMap(loader, tempGraph, definition);
         auto blocks = tempGraph.blocks();
         if (blocks.empty()) {
             return std::unexpected(gr::Error{"YAML definition produced no blocks"});
+        }
+        if (!declarations.empty()) {
+            // a parameter change on the composite re-evaluates the expressions and stages the results. A
+            // scheduler-managed composite has no GraphWrapper to carry the bindings, so its parameters apply at
+            // instantiation only.
+            if (auto* wrapper = dynamic_cast<GraphWrapper<gr::Graph>*>(blocks.front().get()); wrapper != nullptr) {
+                if (auto attached = wrapper->attachRecipeBindings({.declarations = std::move(declarations), .bindings = std::move(bindings), .values = std::move(*values), .lastStaged = {}}); !attached.has_value()) {
+                    return std::unexpected(attached.error());
+                }
+            }
         }
         return blocks.front();
     } catch (const gr::exception& e) {

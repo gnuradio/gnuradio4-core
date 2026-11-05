@@ -7,6 +7,7 @@
 #include <gnuradio-4.0/Message.hpp>
 #include <gnuradio-4.0/PluginLoader.hpp>
 #include <gnuradio-4.0/Port.hpp>
+#include <gnuradio-4.0/RecipeInstantiation.hpp>
 #include <gnuradio-4.0/SchedulerModel.hpp>
 #include <gnuradio-4.0/YamlPmt.hpp>
 
@@ -372,7 +373,9 @@ std::expected<BlockHandle, RuntimeError> RuntimeGraph::emplace(std::string_view 
 
     std::shared_ptr<BlockModel> model;
     try {
-        std::expected<std::shared_ptr<BlockModel>, gr::Error> built = loader.instantiateOrError(type, parameters);
+        // a recipe is built from its exported parameters and loads the rest as settings, as Graph::emplaceBlock() does
+        const detail::RecipeParameterSplit                    split = detail::splitRecipeParameters(loader, type, std::move(parameters));
+        std::expected<std::shared_ptr<BlockModel>, gr::Error> built = split.fromDefinition ? detail::instantiateRecipe(loader, type, name, split) : loader.instantiateOrError(type, split.remaining);
         if (!built.has_value()) {
             return std::unexpected(localError(std::format("block type '{}' could not be built: {}", type, built.error().message), where));
         }

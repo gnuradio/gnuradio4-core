@@ -9,7 +9,10 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <filesystem>
 #include <format>
+#include <fstream>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -309,6 +312,83 @@ inline std::string describeDifference(const gr::property_map& lhs, const gr::pro
         if (!lhs.contains(key)) {
             return std::format("{}/{} appeared", path, std::string(key));
         }
+    }
+    return {};
+}
+
+/**
+ * A definitions root carrying one recipe, written to a temporary directory.
+ *
+ * A recipe reaches a graph file only through a PluginLoader's definition roots, and its interior
+ * gain is derived from `gain_factor`, which is declared without a default and is therefore
+ * required: the composite cannot be built until the value is known.
+ */
+struct RecipeAssetRoot {
+    std::filesystem::path path = std::filesystem::temp_directory_path() / "gr4_qa_grc_recipe";
+
+    RecipeAssetRoot() {
+        std::filesystem::remove_all(path);
+        std::filesystem::create_directories(path);
+        std::ofstream index(path / "index.yaml");
+        index << "assets:\n  - file: gain_recipe.yaml\n    created: \"2024-01-01-00:00:00\"\n    modified: \"2024-01-15-10:00:00\"\n    block_type: qa::GainRecipe\n";
+        std::ofstream asset(path / "gain_recipe.yaml");
+        asset << R"yaml(definition_metadata:
+  block_type: qa::GainRecipe
+blocks:
+  - id: SUBGRAPH
+    parameters:
+      name: gain_recipe
+    exported_parameters:
+      - name: gain_factor
+        type: float32
+    graph:
+      blocks:
+        - id: "qa::Scale"
+          parameters:
+            name: inner
+            gain: "=gain_factor"
+      exported_ports:
+        - [inner, INPUT, in, in]
+        - [inner, OUTPUT, out, out]
+)yaml";
+    }
+
+    RecipeAssetRoot(const RecipeAssetRoot&)            = delete;
+    RecipeAssetRoot& operator=(const RecipeAssetRoot&) = delete;
+
+    ~RecipeAssetRoot() { std::filesystem::remove_all(path); }
+};
+
+/// a loader over its own registry, so the recipe's interior id resolves without the global one
+inline gr::PluginLoader recipeLoader(const std::vector<std::string>& roots) {
+    static BlockRegistry     registry;
+    static SchedulerRegistry schedulers;
+    static const bool        registered = registry.insert<Scale>("=qa::Scale");
+    boost::ut::expect(registered) << "the interior block must reach the recipe loader's registry";
+    return PluginLoader(registry, schedulers, roots);
+}
+
+/// the unique names of the graph's blocks in insertion order, comma separated
+inline std::string blockNames(const gr::Graph& graph) {
+    std::string names;
+    for (const std::shared_ptr<BlockModel>& block : graph.blocks()) {
+        names += std::format("{}{}", names.empty() ? "" : ", ", block->uniqueName());
+    }
+    return names;
+}
+
+/// `disconnect_on_done` as the block's settings read it, true when it is missing
+inline bool disconnectsOnDone(const BlockModel& block) {
+    const std::optional<gr::pmt::Value> value = block.settings().get("disconnect_on_done");
+    return !value.has_value() || value->value_or(true);
+}
+
+/// the message of the gr::exception `call` throws, empty when it throws none
+inline std::string refusalOf(const std::function<void()>& call) {
+    try {
+        call();
+    } catch (const gr::exception& refusal) {
+        return refusal.message;
     }
     return {};
 }
@@ -790,6 +870,204 @@ connections:
         if (!read.has_value()) {
             expect(read.error().message.contains("count")) << read.error().message;
         }
+    };
+
+    // a recipe derives its interior from the exported parameters. The reader therefore supplies them
+    // at instantiation rather than staging them after the block exists
+    "a graph file names a recipe and supplies its required parameter"_test = [] {
+        const RecipeAssetRoot assets;
+        auto                  loader = recipeLoader({assets.path.string()});
+
+        const std::string document = R"yaml(blocks:
+  - id: qa::GainRecipe
+    parameters:
+      name: demod
+      gain_factor: !!float32 3.5
+)yaml";
+
+        auto loaded = gr::loadGrc(loader, document);
+        expect(eq(loaded->blocks().size(), 1UZ));
+        const std::shared_ptr<BlockModel>& composite = loaded->blocks().front();
+        expect(composite->graph() != nullptr) << "the recipe must come back as a composite";
+        if (composite->graph() == nullptr || composite->graph()->blocks().empty()) {
+            expect(false) << "the composite carries no interior block";
+            return;
+        }
+
+        expect(eq(std::string(composite->name()), std::string("demod"))) << "the file's own name did not reach the block";
+        expect(!composite->metaInformation().contains("gain_factor")) << "a recipe parameter must not be left behind as meta_information";
+
+        const auto gain = composite->graph()->blocks().front()->settings().get("gain");
+        expect(gain.has_value());
+        expect(eq(gain->value_or(float{}), 3.5f)) << "the supplied parameter did not reach the interior setting";
+    };
+
+    "a graph file that omits a recipe's required parameter names the block and the parameter"_test = [] {
+        const RecipeAssetRoot assets;
+        auto                  loader = recipeLoader({assets.path.string()});
+
+        const std::string document = R"yaml(blocks:
+  - id: qa::GainRecipe
+    parameters:
+      name: demod
+)yaml";
+
+        std::string reported;
+        try {
+            const auto loaded = gr::loadGrc(loader, document);
+            expect(loaded->blocks().empty()) << "a recipe without its required parameter must not load";
+        } catch (const gr::exception& e) {
+            reported = e.message;
+        }
+        expect(reported.contains("demod")) << reported;
+        expect(reported.contains("qa::GainRecipe")) << reported;
+        expect(reported.contains("gain_factor")) << reported;
+    };
+
+    // emplaceBlock hands a recipe its exported parameters and applies the caller's `name` as the label
+    "emplaceBlock names a recipe and supplies its required parameter"_test = [] {
+        const RecipeAssetRoot assets;
+        auto                  loader = recipeLoader({assets.path.string()});
+
+        gr::Graph                          graph(loader);
+        const std::shared_ptr<BlockModel>& composite = graph.emplaceBlock("qa::GainRecipe", {{"name", std::string("demod")}, {"gain_factor", 3.5f}});
+
+        expect(composite->graph() != nullptr) << "the recipe must come back as a composite";
+        if (composite->graph() == nullptr || composite->graph()->blocks().empty()) {
+            expect(false) << "the composite carries no interior block";
+            return;
+        }
+
+        expect(eq(std::string(composite->name()), std::string("demod"))) << "the caller's name did not reach the block";
+        expect(!composite->metaInformation().contains("gain_factor")) << "a recipe parameter must not be left behind as meta_information";
+
+        const auto gain = composite->graph()->blocks().front()->settings().get("gain");
+        expect(gain.has_value());
+        expect(eq(gain->value_or(float{}), 3.5f)) << "the supplied parameter did not reach the interior setting";
+    };
+
+    "emplaceBlock without a recipe's required parameter names the block and the parameter"_test = [] {
+        const RecipeAssetRoot assets;
+        auto                  loader = recipeLoader({assets.path.string()});
+
+        gr::Graph   graph(loader);
+        std::string reported;
+        try {
+            graph.emplaceBlock("qa::GainRecipe", {{"name", std::string("demod")}});
+            expect(false) << "a recipe without its required parameter must not be placed";
+        } catch (const gr::exception& e) {
+            reported = e.message;
+        }
+        expect(reported.contains("demod")) << reported;
+        expect(reported.contains("qa::GainRecipe")) << reported;
+        expect(reported.contains("gain_factor")) << reported;
+    };
+
+    // replaceBlock builds the recipe as emplaceBlock does
+    "replaceBlock puts a recipe in the place of a block and supplies its required parameter"_test = [] {
+        const RecipeAssetRoot assets;
+        auto                  loader = recipeLoader({assets.path.string()});
+
+        gr::Graph         graph(loader);
+        const std::string replacedName(graph.emplaceBlock("qa::Scale", {{"name", std::string("scale")}, {"gain", 2.0f}})->uniqueName());
+
+        const auto [oldBlock, composite] = graph.replaceBlock(replacedName, "qa::GainRecipe", {{"name", std::string("demod")}, {"gain_factor", 3.5f}});
+
+        expect(composite->graph() != nullptr) << "the recipe must come back as a composite";
+        if (composite->graph() == nullptr || composite->graph()->blocks().empty()) {
+            expect(false) << "the composite carries no interior block";
+            return;
+        }
+
+        expect(eq(std::string(composite->name()), std::string("demod"))) << "the caller's name did not reach the block";
+        expect(!composite->metaInformation().contains("gain_factor")) << "a recipe parameter must not be left behind as meta_information";
+
+        const auto gain = composite->graph()->blocks().front()->settings().get("gain");
+        expect(gain.has_value());
+        expect(eq(gain->value_or(float{}), 3.5f)) << "the supplied parameter did not reach the interior setting";
+    };
+
+    "replaceBlock without a recipe's required parameter names the block and the parameter"_test = [] {
+        const RecipeAssetRoot assets;
+        auto                  loader = recipeLoader({assets.path.string()});
+
+        gr::Graph         graph(loader);
+        const std::string replacedName(graph.emplaceBlock("qa::Scale", {{"name", std::string("scale")}})->uniqueName());
+
+        std::string reported;
+        try {
+            std::ignore = graph.replaceBlock(replacedName, "qa::GainRecipe", {{"name", std::string("demod")}});
+            expect(false) << "a recipe without its required parameter must not replace a block";
+        } catch (const gr::exception& e) {
+            reported = e.message;
+        }
+        expect(reported.contains("demod")) << reported;
+        expect(reported.contains("qa::GainRecipe")) << reported;
+        expect(reported.contains("gain_factor")) << reported;
+    };
+
+    // the composite takes the settings its definition does not export before it joins the graph, so a refused value
+    // leaves the graph with the blocks it held
+    "emplaceBlock with a setting a recipe refuses leaves the recipe out of the graph"_test = [] {
+        const RecipeAssetRoot assets;
+        auto                  loader = recipeLoader({assets.path.string()});
+        gr::Graph             graph(loader);
+        std::ignore                     = graph.emplaceBlock("qa::Scale", {{"name", std::string("before")}});
+        const std::size_t nBlocksBefore = graph.blocks().size();
+        const std::string namesBefore   = blockNames(graph);
+
+        const std::string refused = refusalOf([&] { std::ignore = graph.emplaceBlock("qa::GainRecipe", {{"name", std::string("demod")}, {"gain_factor", 3.5f}, {"compute_domain", 7.0f}}); });
+        expect(refused.contains("'demod'") && refused.contains("qa::GainRecipe") && refused.contains("compute_domain")) << "the refusal names the block, its type and the key: " << refused;
+        expect(eq(graph.blocks().size(), nBlocksBefore)) << "the refused recipe joined the graph";
+        expect(eq(blockNames(graph), namesBefore));
+
+        const std::shared_ptr<BlockModel>& accepted = graph.emplaceBlock("qa::GainRecipe", {{"name", std::string("demod")}, {"gain_factor", 3.5f}, {"disconnect_on_done", false}});
+        expect(eq(graph.blocks().size(), nBlocksBefore + 1UZ)) << "a recipe with settings it takes joins the graph";
+        expect(!disconnectsOnDone(*accepted)) << "a setting the recipe does not export is in force once the recipe is in the graph";
+    };
+
+    "replaceBlock with a setting a recipe refuses leaves the replaced block in place"_test = [] {
+        const RecipeAssetRoot assets;
+        auto                  loader = recipeLoader({assets.path.string()});
+        gr::Graph             graph(loader);
+        std::ignore = graph.emplaceBlock("qa::Scale", {{"name", std::string("before")}});
+        const std::string replacedName(graph.emplaceBlock("qa::Scale", {{"name", std::string("scale")}})->uniqueName());
+        const std::size_t nBlocksBefore = graph.blocks().size();
+        const std::string namesBefore   = blockNames(graph);
+
+        const std::string refused = refusalOf([&] { std::ignore = graph.replaceBlock(replacedName, "qa::GainRecipe", {{"name", std::string("demod")}, {"gain_factor", 3.5f}, {"compute_domain", 7.0f}}); });
+        expect(refused.contains("'demod'") && refused.contains("qa::GainRecipe") && refused.contains("compute_domain")) << "the refusal names the block, its type and the key: " << refused;
+        expect(eq(graph.blocks().size(), nBlocksBefore));
+        expect(eq(blockNames(graph), namesBefore)) << "the block to be replaced left the graph";
+
+        const auto [oldBlock, composite] = graph.replaceBlock(replacedName, "qa::GainRecipe", {{"name", std::string("demod")}, {"gain_factor", 3.5f}, {"disconnect_on_done", false}});
+        expect(eq(std::string(oldBlock->uniqueName()), replacedName)) << "a recipe with settings it takes replaces the block";
+        expect(eq(graph.blocks().size(), nBlocksBefore));
+        expect(!disconnectsOnDone(*composite)) << "a setting the recipe does not export is in force once the recipe is in the graph";
+    };
+
+    "a graph file with a setting a recipe refuses leaves the recipe out of the graph"_test = [] {
+        const RecipeAssetRoot assets;
+        auto                  loader = recipeLoader({assets.path.string()});
+        gr::Graph             graph(loader);
+        std::ignore                     = graph.emplaceBlock("qa::Scale", {{"name", std::string("before")}});
+        const std::size_t nBlocksBefore = graph.blocks().size();
+        const std::string namesBefore   = blockNames(graph);
+
+        const auto document = [](std::string_view setting) {
+            const auto parsed = gr::pmt::yaml::deserialize(std::format("blocks:\n  - id: qa::GainRecipe\n    parameters:\n      name: demod\n      gain_factor: !!float32 3.5\n      {}\n", setting));
+            expect(parsed.has_value()) << "the fixture document must parse";
+            return parsed.has_value() ? *parsed : gr::property_map{};
+        };
+        const std::string refused = refusalOf([&] { std::ignore = gr::detail::loadGraphFromMap(loader, graph, document("compute_domain: 7")); });
+        expect(refused.contains("'demod'") && refused.contains("qa::GainRecipe") && refused.contains("compute_domain")) << "the refusal names the block, its type and the key: " << refused;
+        expect(eq(graph.blocks().size(), nBlocksBefore)) << "the refused recipe joined the graph";
+        expect(eq(blockNames(graph), namesBefore));
+
+        const std::string accepted = refusalOf([&] { std::ignore = gr::detail::loadGraphFromMap(loader, graph, document("disconnect_on_done: false")); });
+        expect(accepted.empty()) << "a recipe with settings it takes loads: " << accepted;
+        expect(fatal(graph.blocks().size() == nBlocksBefore + 1UZ)) << "and joins the graph";
+        expect(!disconnectsOnDone(*graph.blocks().back())) << "a setting the recipe does not export is in force once the recipe is in the graph";
     };
 
     // the two connections name the one input by name and by index
