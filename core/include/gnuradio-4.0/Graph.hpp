@@ -363,7 +363,10 @@ public:
     /// An undeclared name, a value of the wrong type or a failed evaluation refuses the change
     /// before any block is staged. When an interior block refuses its settings, the blocks
     /// staged before it keep the new values, the running parameter values stand, and the
-    /// bindings of the staged blocks are restaged by the next change.
+    /// bindings of the staged blocks are restaged by the next change. Only the bindings
+    /// whose derived value moved are staged, so an interior block's settingsChanged names the
+    /// keys that actually changed and not every key the recipe binds to it; a block whose
+    /// bindings all held their value is not staged at all.
     [[nodiscard]] std::expected<void, Error> applyRecipeParameters(const property_map& changed) {
         if (_recipeBindings == nullptr) {
             return std::unexpected(Error("no recipe bindings attached"));
@@ -387,12 +390,19 @@ public:
             }
         }
         struct StagedTarget {
-            BlockModel*  block;
-            property_map derived;
+            BlockModel*              block;
+            property_map             derived;
+            std::vector<std::size_t> bindingIndices;
         };
         std::vector<StagedTarget> staged;
-        for (const auto& binding : attached.bindings) {
-            auto result = recipe::bindingValue(binding, std::span<const pmt::Value>(trial));
+        if (attached.lastStaged.size() != attached.bindings.size()) {
+            attached.lastStaged.assign(attached.bindings.size(), std::nullopt);
+        }
+        std::vector<std::optional<pmt::Value>> derivedNow;
+        derivedNow.reserve(attached.bindings.size());
+        for (std::size_t index = 0; index < attached.bindings.size(); ++index) {
+            const recipe::Binding& binding = attached.bindings[index];
+            auto                   result  = recipe::bindingValue(binding, std::span<const pmt::Value>(trial));
             if (!result.has_value()) {
                 return std::unexpected(result.error());
             }
@@ -400,19 +410,33 @@ public:
             if (!target.has_value()) {
                 return std::unexpected(target.error());
             }
+            derivedNow.push_back(*result);
+            const std::optional<pmt::Value>& last = attached.lastStaged[index];
+            if (last.has_value() && recipe::derivedValuesAgree(*last, *result)) {
+                continue;
+            }
             auto existing = std::ranges::find_if(staged, [&](const StagedTarget& entry) { return entry.block == *target; });
             if (existing == staged.end()) {
-                staged.push_back({.block = *target, .derived = {}});
+                staged.push_back({.block = *target, .derived = {}, .bindingIndices = {}});
                 existing = std::prev(staged.end());
             }
             existing->derived[convert_string_domain(binding.settingKey)] = std::move(*result);
+            existing->bindingIndices.push_back(index);
         }
-        for (auto& [interiorBlock, derived] : staged) {
-            if (auto refused = stageDerived(*interiorBlock, derived); !refused.has_value()) {
+        for (const StagedTarget& target : staged) {
+            if (auto refused = stageDerived(*target.block, target.derived); !refused.has_value()) {
+                // a block staged before this one holds a value the record lacks; with its record empty, every binding
+                // staged here is staged again by the following application
+                for (const StagedTarget& cleared : staged) {
+                    for (const std::size_t bindingIndex : cleared.bindingIndices) {
+                        attached.lastStaged[bindingIndex].reset();
+                    }
+                }
                 return std::unexpected(refused.error());
             }
         }
-        attached.values = std::move(trial);
+        attached.lastStaged = std::move(derivedNow);
+        attached.values     = std::move(trial);
         return {};
     }
 
