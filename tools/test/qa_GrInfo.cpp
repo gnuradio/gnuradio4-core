@@ -460,11 +460,12 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         const std::string fromVariable = "gr4_qa_grinfo_cache, from GR_DATA_CACHE_DIR";
         {
             const EnvironmentVariable unset("GR_DATA_CACHE_DIR", std::nullopt);
-            const Result              compiled = run({"version", "--json"});
-            expect(eq(compiled.exitCode, 0)) << compiled.output;
-            expect(compiled.output.contains("\"dataCacheOrigin\": \"")) << "the instrument: the report names an origin" << compiled.output;
-            expect(!compiled.output.contains("\"dataCacheOrigin\": \"environment\"")) << "without the variable the origin is not the environment" << compiled.output;
-            expect(!compiled.output.contains(named)) << compiled.output;
+            const EnvironmentVariable xdg("XDG_CACHE_HOME", (std::filesystem::temp_directory_path() / "gr4_qa_grinfo_xdg").string());
+            const Result              user = run({"version", "--json"});
+            expect(eq(user.exitCode, 0)) << user.output;
+            expect(user.output.contains("\"dataCacheOrigin\": \"user\"")) << "without the variable the origin is the user's cache" << user.output;
+            expect(user.output.contains("gr4_qa_grinfo_xdg/gnuradio4/cache")) << user.output;
+            expect(!user.output.contains(named)) << user.output;
 
             const Result text = run({"version"});
             expect(eq(text.exitCode, 0)) << text.output;

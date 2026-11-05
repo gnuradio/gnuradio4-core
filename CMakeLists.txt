@@ -251,20 +251,6 @@ set(GR_QA_OPTIMIZATION_LEVEL
     "-O1"
     CACHE STRING "Optimization level for test executables in optimized build types (empty = build-type default)")
 
-# A build for a chosen install prefix places the data cache under the installation's state directory. A build without
-# one places it in the build tree. The GR_DATA_CACHE_DIR environment variable overrides the compiled path at run time. A
-# compiled path the running user cannot make gives way to the user's cache directory (gr::dataCacheDirectory()).
-if(NOT DEFINED GR_DATA_CACHE_DIR)
-  if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
-    set(_gr_data_cache_default "${CMAKE_CURRENT_BINARY_DIR}/gnuradio_cache")
-  else()
-    set(_gr_data_cache_default "${CMAKE_INSTALL_FULL_LOCALSTATEDIR}/lib/gnuradio4/cache")
-  endif()
-  set(GR_DATA_CACHE_DIR
-      "${_gr_data_cache_default}"
-      CACHE PATH "Writeable system path where GR should store its cached data (for example, /var/lib/gnuradio4/cache)")
-endif()
-
 set(GR_MAX_WASM_THREAD_COUNT
     60
     CACHE STRING "Max number of threads for WASM pthread pool")
