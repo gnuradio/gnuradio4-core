@@ -164,8 +164,8 @@ if(GR_ENABLE_BLOCK_REGISTRY)
       COMMAND
         ${CMAKE_CURRENT_SOURCE_DIR}/check_runtime_cascade.sh ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/../include ${CMAKE_CURRENT_BINARY_DIR}/../include
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../meta/include ${vir-simd_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/magic_enum)
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../meta/include $<TARGET_PROPERTY:vir-simd::vir-simd,INTERFACE_INCLUDE_DIRECTORIES>
+        $<TARGET_PROPERTY:magic_enum::magic_enum,INTERFACE_INCLUDE_DIRECTORIES>)
     set_tests_properties(
       qa_RuntimeCascade
       PROPERTIES ENVIRONMENT

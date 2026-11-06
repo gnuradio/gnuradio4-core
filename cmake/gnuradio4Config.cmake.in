@@ -2,6 +2,23 @@
 
 include(CMakeFindDependencyMacro)
 
+find_dependency(magic_enum 0.9.3 CONFIG)
+find_dependency(vir-simd CONFIG)
+
+# vir-simd installs no version file, so its minimum is checked from its header
+include("${CMAKE_CURRENT_LIST_DIR}/VirSimdVersion.cmake")
+gr_require_vir_simd_version(0.4.4 REASON_VARIABLE _gr_vir_simd_problem)
+if(_gr_vir_simd_problem)
+  set(gnuradio4_FOUND FALSE)
+  set(gnuradio4_NOT_FOUND_MESSAGE "${_gr_vir_simd_problem}")
+  return()
+endif()
+
+# the installed UnitTestHelper.hpp and gnuradio4::ut-benchmark include Boost.UT, so a consumer that builds tests needs it
+if(ENABLE_TESTING)
+  find_dependency(ut 2.3.1 CONFIG)
+endif()
+
 # Optional transitive dependencies of exported targets.
 if(@ENABLE_TBB@)
   find_dependency(TBB)
