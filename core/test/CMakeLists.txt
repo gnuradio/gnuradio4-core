@@ -280,8 +280,8 @@ if(GR_ENABLE_BLOCK_REGISTRY AND INTERNAL_ENABLE_BLOCK_PLUGINS)
     APPEND
     PROPERTY ENVIRONMENT_MODIFICATION "GNURADIO4_PLUGIN_DIRECTORIES=unset:")
   target_link_libraries(qa_PluginGlobalDefault PRIVATE gnuradio-core gnuradio-blocklib-core gnuradio-plugin)
-  target_compile_definitions(qa_PluginGlobalDefault
-                             PRIVATE GR_INSTALLED_PLUGIN_DIRECTORY="${CMAKE_CURRENT_BINARY_DIR}/plugins")
+  # relative to global_default_cwd, where the test runs, so the test compiles in no path of its own
+  target_compile_definitions(qa_PluginGlobalDefault PRIVATE GR_INSTALLED_PLUGIN_DIRECTORY="../plugins")
   add_dependencies(
     qa_PluginGlobalDefault
     GoodBasePlugin

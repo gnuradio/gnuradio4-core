@@ -18,6 +18,8 @@
 #include <sys/wait.h>
 #endif
 
+#include "TestEnvironment.hpp"
+
 /**
  * grinfo, driven as the program a caller runs.
  *
@@ -74,7 +76,7 @@ enum class Streams { both, standardOutput };
 
 // runs the tool with `arguments` and collects what it wrote to `streams` and the status it exited with
 [[nodiscard]] Result run(const std::vector<std::string>& arguments, Streams streams = Streams::both) {
-    std::string command = std::format("\"{}\"", GR_TOOLS_GRINFO);
+    std::string command = std::format("\"{}\"", fromEnvironment("GR_TOOLS_GRINFO"));
     for (const std::string& argument : arguments) {
         command += std::format(" \"{}\"", argument);
     }
@@ -348,15 +350,15 @@ constexpr std::array<std::string_view, 5> kExternalReferences{"<script", "<link"
 // directory from another
 [[nodiscard]] std::string_view tailOf(std::string_view path, std::size_t count) { return path.size() <= count ? path : path.substr(path.size() - count); }
 
-#ifdef GR_TOOLS_CORE_TEST_PLUGINS
+#ifdef GR_TOOLS_WITH_CORE_TEST_PLUGINS
 // the two directories core's own tests build: one of plugins, one of shared objects that register blocks without
 // being plugins
 [[nodiscard]] std::vector<std::string> overTestDirectories(const std::vector<std::string>& arguments) {
     std::vector<std::string> all(arguments);
     all.emplace_back("--plugin-dir");
-    all.emplace_back(GR_TOOLS_CORE_TEST_PLUGINS);
+    all.emplace_back(fromEnvironment("GR_TOOLS_CORE_TEST_PLUGINS"));
     all.emplace_back("--plugin-dir");
-    all.emplace_back(GR_TOOLS_TEST_BLOCK_LIBRARY);
+    all.emplace_back(fromEnvironment("GR_TOOLS_TEST_BLOCK_LIBRARY"));
     return all;
 }
 
@@ -365,17 +367,17 @@ constexpr std::array<std::string_view, 5> kExternalReferences{"<script", "<link"
 [[nodiscard]] std::vector<std::string> overSchedulerLibraries(const std::vector<std::string>& arguments) {
     std::vector<std::string> all(arguments);
     all.emplace_back("--plugin-dir");
-    all.emplace_back(GR_TOOLS_TEST_SCHEDULER_LIBRARY);
+    all.emplace_back(fromEnvironment("GR_TOOLS_TEST_SCHEDULER_LIBRARY"));
     return all;
 }
 #endif
 
-#ifdef GR_TOOLS_TEST_DEVICE_LISTING
+#ifdef GR_TOOLS_WITH_CORE_TEST_PLUGINS
 // the directory of a block library and a plugin that register device listings of invented units
 [[nodiscard]] std::vector<std::string> overDeviceListings(const std::vector<std::string>& arguments) {
     std::vector<std::string> all(arguments);
     all.emplace_back("--plugin-dir");
-    all.emplace_back(GR_TOOLS_TEST_DEVICE_LISTING);
+    all.emplace_back(fromEnvironment("GR_TOOLS_TEST_DEVICE_LISTING"));
     return all;
 }
 
@@ -484,12 +486,12 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         expect(withSingleSpaces(text.output).contains(fromVariable)) << text.output;
     };
 
-#ifdef GR_TOOLS_CORE_TEST_PLUGINS
+#ifdef GR_TOOLS_WITH_CORE_TEST_PLUGINS
     "version names the directories searched and what they held"_test = [] {
         const Result version = run(overTestDirectories({"version"}));
         expect(eq(version.exitCode, 0)) << version.output;
-        expect(version.output.contains(tailOf(GR_TOOLS_CORE_TEST_PLUGINS, 30UZ))) << "the directory it was given" << version.output;
-        expect(version.output.contains(tailOf(GR_TOOLS_TEST_BLOCK_LIBRARY, 30UZ))) << "the directory it was given" << version.output;
+        expect(version.output.contains(tailOf(fromEnvironment("GR_TOOLS_CORE_TEST_PLUGINS"), 30UZ))) << "the directory it was given" << version.output;
+        expect(version.output.contains(tailOf(fromEnvironment("GR_TOOLS_TEST_BLOCK_LIBRARY"), 30UZ))) << "the directory it was given" << version.output;
         expect(version.output.contains("block-library")) << "a shared object that registers without being a plugin" << version.output;
         expect(version.output.contains("block_library")) << "and the file it is" << version.output;
         expect(version.output.contains("not-loaded")) << "the plugin whose ABI version does not match" << version.output;
@@ -501,7 +503,7 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         const Result version = run(overTestDirectories({"version"}));
         expect(eq(version.exitCode, 0)) << version.output;
         expect(version.output.contains(std::format("\n    {}", moduleFileName("block_library")))) << "the file by its name alone, indented under its directory" << version.output;
-        expect(eq(occurrences(version.output, std::string(GR_TOOLS_TEST_BLOCK_LIBRARY "/") + moduleFileName("block_library")), 0UZ)) << "and not by a path repeated on every line" << version.output;
+        expect(eq(occurrences(version.output, fromEnvironment("GR_TOOLS_TEST_BLOCK_LIBRARY") + "/" + moduleFileName("block_library")), 0UZ)) << "and not by a path repeated on every line" << version.output;
     };
 
     "version --json is one document carrying the shape a reader relies on"_test = [] {
@@ -512,7 +514,7 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         for (const std::string_view key : {"\"framework\"", "\"directories\"", "\"libraries\"", "\"plugins\"", "\"schedulers\"", "\"totals\"", "\"blockKeys\""}) {
             expect(version.output.contains(key)) << key << version.output;
         }
-        expect(version.output.contains(GR_TOOLS_CORE_TEST_PLUGINS)) << "a path the text report cut is whole here" << version.output;
+        expect(version.output.contains(fromEnvironment("GR_TOOLS_CORE_TEST_PLUGINS"))) << "a path the text report cut is whole here" << version.output;
         expect(version.output.contains("\"origin\": \"option\"")) << "the directory came from the command line" << version.output;
         expect(version.output.contains("\"kind\": \"block-library\"")) << "the kinds are an enumeration" << version.output;
     };
@@ -665,7 +667,7 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
     };
 
     "a plugin refused for its plugin ABI version is reported on standard error and not in the document"_test = [] {
-        const std::vector<std::string> arguments{"blocks", "--markdown", "--plugin-dir", GR_TOOLS_TEST_PLUGIN_ABI};
+        const std::vector<std::string> arguments{"blocks", "--markdown", "--plugin-dir", fromEnvironment("GR_TOOLS_TEST_PLUGIN_ABI")};
         const Result                   document = run(arguments, Streams::standardOutput);
         expect(eq(document.exitCode, 0)) << document.output;
         expect(document.output.starts_with("# grinfo blocks\n")) << "the document opens standard output" << document.output;
@@ -677,12 +679,12 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
     };
 
     "a shared object that is neither a plugin nor a block library is reported as an ordinary library and counted"_test = [] {
-        const Result text = run({"version", "--plugin-dir", GR_TOOLS_TEST_ORDINARY_LIBRARY}, Streams::standardOutput);
+        const Result text = run({"version", "--plugin-dir", fromEnvironment("GR_TOOLS_TEST_ORDINARY_LIBRARY")}, Streams::standardOutput);
         expect(eq(text.exitCode, 0)) << text.output;
         expect(withSingleSpaces(text.output).contains("libordinary_library.so ordinary-library 0 0")) << "the file's row names its kind" << text.output;
         expect(withSingleSpaces(text.output).contains("ordinary libraries 1 ")) << "the directory holds one such file" << text.output;
 
-        const Result json = run({"version", "--json", "--plugin-dir", GR_TOOLS_TEST_ORDINARY_LIBRARY}, Streams::standardOutput);
+        const Result json = run({"version", "--json", "--plugin-dir", fromEnvironment("GR_TOOLS_TEST_ORDINARY_LIBRARY")}, Streams::standardOutput);
         expect(eq(json.exitCode, 0)) << json.output;
         expect(withSingleSpaces(json.output).contains("libordinary_library.so\", \"kind\": \"ordinary-library\"")) << "the file's entry names its kind" << json.output;
         const std::size_t rows = occurrences(json.output, "\"kind\": \"ordinary-library\"");
@@ -694,13 +696,13 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         const Result markdown = run(overTestDirectories({"version", "--markdown"}), Streams::standardOutput);
         expect(eq(markdown.exitCode, 0)) << markdown.output;
         expect(markdown.output.starts_with("# grinfo version\n")) << "the command is the title" << markdown.output;
-        expect(hasRenderedRow(markdown.output, {GR_TOOLS_CORE_TEST_PLUGINS, "option", "searched"})) << "a directory row, its path whole" << markdown.output;
+        expect(hasRenderedRow(markdown.output, {fromEnvironment("GR_TOOLS_CORE_TEST_PLUGINS"), "option", "searched"})) << "a directory row, its path whole" << markdown.output;
         expect(markdown.output.contains("| Good Math Plugin | v1 | MIT | 4 | 1 |")) << "a plugin row" << markdown.output;
         expect(markdown.output.contains("- gr::scheduler::Simple\\<singleThreaded\\>\n")) << "a scheduler key, its brackets escaped" << markdown.output;
 
         const Result html = run(overTestDirectories({"version", "--html"}), Streams::standardOutput);
         expect(eq(html.exitCode, 0)) << html.output;
-        expect(html.output.contains(std::format("<tr><td>{}</td><td>option</td><td>searched</td></tr>", GR_TOOLS_CORE_TEST_PLUGINS))) << html.output;
+        expect(html.output.contains(std::format("<tr><td>{}</td><td>option</td><td>searched</td></tr>", fromEnvironment("GR_TOOLS_CORE_TEST_PLUGINS")))) << html.output;
         expect(html.output.contains("<tr><td>Good Math Plugin</td><td>v1</td><td>MIT</td><td>4</td><td>1</td></tr>")) << html.output;
     };
 
@@ -837,10 +839,10 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         expect(cellsOf("| a | b\\|c |  |") == std::vector<std::string>{"a", "b\\|c", ""}) << "a row split at its unescaped bars";
     };
 
-#ifdef GR_TOOLS_TEST_DOC_PROBE_LIBRARY
+#ifdef GR_TOOLS_WITH_CORE_TEST_PLUGINS
     "a string default keeps its characters in the Markdown cell, the HTML cell and the JSON document"_test = [] {
         const std::string written  = "*literal* &lt;";
-        const Result      markdown = run({"block", "probe::Stage", "--markdown", "--plugin-dir", GR_TOOLS_TEST_DOC_PROBE_LIBRARY}, Streams::standardOutput);
+        const Result      markdown = run({"block", "probe::Stage", "--markdown", "--plugin-dir", fromEnvironment("GR_TOOLS_TEST_DOC_PROBE_LIBRARY")}, Streams::standardOutput);
         expect(eq(markdown.exitCode, 0)) << markdown.output;
         const std::optional<std::string> row = lineStartingWith(markdown.output, "| label | string | ");
         expect(fatal(row.has_value())) << "the setting's row" << markdown.output;
@@ -848,11 +850,11 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         expect(fatal(ge(cells.size(), 3UZ))) << *row;
         expect(eq(renderedCell(cells[2]).value_or("(markup)"), std::format("\"{}\"", written))) << "the default as a renderer shows it" << *row;
 
-        const Result html = run({"block", "probe::Stage", "--html", "--plugin-dir", GR_TOOLS_TEST_DOC_PROBE_LIBRARY}, Streams::standardOutput);
+        const Result html = run({"block", "probe::Stage", "--html", "--plugin-dir", fromEnvironment("GR_TOOLS_TEST_DOC_PROBE_LIBRARY")}, Streams::standardOutput);
         expect(eq(html.exitCode, 0)) << html.output;
         expect(html.output.contains("<td>label</td><td>string</td><td>&quot;*literal* &amp;lt;&quot;</td>")) << html.output;
 
-        const Result json = run({"block", "probe::Stage", "--json", "--plugin-dir", GR_TOOLS_TEST_DOC_PROBE_LIBRARY}, Streams::standardOutput);
+        const Result json = run({"block", "probe::Stage", "--json", "--plugin-dir", fromEnvironment("GR_TOOLS_TEST_DOC_PROBE_LIBRARY")}, Streams::standardOutput);
         expect(eq(json.exitCode, 0)) << json.output;
         expect(json.output.contains(std::format("\"default\": \"{}\"", written))) << json.output;
     };
@@ -862,7 +864,7 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
     "every id of blocks --verbose is unique and each link reaches its own block's section"_test = [] {
         for (const bool html : {false, true}) {
             const std::string_view form     = html ? "--html" : "--markdown";
-            const Result           document = run({"blocks", "--verbose", std::string(form), "--plugin-dir", GR_TOOLS_TEST_DOC_PROBE_LIBRARY}, Streams::standardOutput);
+            const Result           document = run({"blocks", "--verbose", std::string(form), "--plugin-dir", fromEnvironment("GR_TOOLS_TEST_DOC_PROBE_LIBRARY")}, Streams::standardOutput);
             expect(eq(document.exitCode, 0)) << document.output;
 
             std::vector<std::string> ids = linkTargets(document.output, html ? " id=\"" : "<a id=\"", "\"");
@@ -885,7 +887,7 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
     };
 #endif
 
-#ifdef GR_TOOLS_TEST_DEVICE_LISTING
+#ifdef GR_TOOLS_WITH_CORE_TEST_PLUGINS
     "devices lists the units of every loaded family under its word, and why a family listed none"_test = [] {
         const Result devices = run(overDeviceListings({"devices"}));
         expect(eq(devices.exitCode, 0)) << devices.output;
@@ -960,7 +962,7 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
 
     "devices over plugins that register no listing names none of the test families"_test = [] {
         const EnvironmentVariable unset("GNURADIO4_PLUGIN_DIRECTORIES", std::nullopt);
-        const Result              devices = run({"devices", "--plugin-dir", GR_TOOLS_CORE_TEST_PLUGINS});
+        const Result              devices = run({"devices", "--plugin-dir", fromEnvironment("GR_TOOLS_CORE_TEST_PLUGINS")});
         expect(eq(devices.exitCode, 0)) << devices.output;
         for (const std::string_view family : {"fakelibrary", "fakeopening", "fakethrowing", "fakeempty", "fakeplugin"}) {
             expect(!devices.output.contains(family)) << family << devices.output;
