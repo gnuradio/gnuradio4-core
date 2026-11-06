@@ -902,17 +902,17 @@ struct elementary {
             const V half = O::select(O::lt(c(0x1p126), den), c(0.5), c(1));
             const V nh   = O::mul(O::select(mid, nu, c(0)), half);
             const V dh   = O::mul(O::select(mid, du, c(0)), half);
-            V       n, nl, d, dl;
-            two_sum(nh, O::mul(dh, c(-1)), n, nl);
-            two_sum(nh, dh, d, dl);
-            n            = O::select(mid, n, nu);
-            nl           = O::select(mid, nl, c(0));
-            d            = O::select(mid, d, du);
-            dl           = O::select(mid, dl, c(0));
-            const V u    = O::div(n, d);
-            const M tiny = O::lt(O::abs(u), c(0x1p-28)); // atan u rounds to u; u^3 would underflow
-            const V uu   = O::select(tiny, c(0), u);
-            const V de   = O::select(tiny, c(1), d);
+            // fast two-sums, exact since 0 <= nh <= dh: minus + nl is nh - dh and plus + dl is nh + dh
+            const V minus = O::sub(nh, dh);
+            const V plus  = O::add(nh, dh);
+            const V n     = O::select(mid, minus, nu);
+            const V nl    = O::select(mid, O::sub(nh, O::add(minus, dh)), c(0));
+            const V d     = O::select(mid, plus, du);
+            const V dl    = O::select(mid, O::sub(nh, O::sub(plus, dh)), c(0));
+            const V u     = O::div(n, d);
+            const M tiny  = O::lt(O::abs(u), c(0x1p-28)); // atan u rounds to u; u^3 would underflow
+            const V uu    = O::select(tiny, c(0), u);
+            const V de    = O::select(tiny, c(1), d);
             V       q, qn;
             two_prod(uu, de, q, qn); // uu de = q - qn
             const V ulo = O::div(O::add(O::add(O::sub(O::select(tiny, c(0), n), q), qn), O::fnmadd(uu, dl, O::select(tiny, c(0), nl))), de);
