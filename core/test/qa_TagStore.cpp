@@ -221,6 +221,13 @@ template<typename TBuffer>
 } // namespace qa_tag_store
 
 #ifndef QA_TAG_STORE_NO_DEALLOCATION_HOOK
+// these operators pair malloc with free. GCC can inline one of them into a function that both allocates and deletes.
+// -Wmismatched-new-delete then pairs the inlined malloc or free with the other operator's call and reports a matched pair
+// as mismatched
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
 void* operator new(std::size_t bytes) {
     if (void* allocated = std::malloc(bytes == 0UZ ? 1UZ : bytes)) {
         return allocated;
@@ -236,6 +243,9 @@ void operator delete(void* allocated) noexcept {
 }
 
 void operator delete(void* allocated, std::size_t) noexcept { ::operator delete(allocated); }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 #endif
 
 const boost::ut::suite<"segmented tag store"> _tagStoreTests = [] {
