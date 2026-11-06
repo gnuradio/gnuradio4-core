@@ -1115,10 +1115,14 @@ public:
         return {};
     }
 
+    // blocks until every worker has released its count. The wait parks on the count's own condition variable. An
+    // atomic wait can share its wait slot with the graph's progress sequence, and each work call that moves samples
+    // would then wake this thread. Each release notifies the count, and timeout_ms, at least 1 ms, bounds each wait.
     void waitDone() {
-        [[maybe_unused]] const auto pe = _profilerHandler->startCompleteEvent("scheduler_base.waitDone");
+        [[maybe_unused]] const auto pe      = _profilerHandler->startCompleteEvent("scheduler_base.waitDone");
+        const auto                  timeout = std::chrono::milliseconds(std::max(timeout_ms.value, gr::Size_t{1U}));
         for (std::size_t nRunning = _nRunningJobs->value(); nRunning > 0UZ; nRunning = _nRunningJobs->value()) {
-            _nRunningJobs->wait(nRunning);
+            _nRunningJobs->waitUntil(nRunning, std::chrono::steady_clock::now() + timeout);
         }
     }
 
