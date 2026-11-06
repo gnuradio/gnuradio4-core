@@ -230,6 +230,21 @@ template<typename... Ts>
 /**
  * @brief Compile-time block merging: fuse processOne chains, bypassing runtime buffers.
  *
+ * The merged block forwards no tag when a member declares NoTagPropagation or its own forwardTags(). Otherwise it
+ * forwards every tag key that no member lists in DroppedTagKeys. A member sees no input tag, and a tag a member
+ * publishes is dropped: a block that reads or publishes tags does not work as a member.
+ *
+ * The merged block does not declare its members' settings. A member's setting other than the keys every block has is
+ * not reachable from a graph file or from a run-time set(); a "name" set on the merged block is passed on to the
+ * members, except the Monitor of a FeedbackMerge. The constructor's map reaches the members: a flat key goes to both,
+ * and the maps under "leftBlock" and "rightBlock" go to one each. The merged block itself takes no key from this map,
+ * "name" included. A key that no member declares is ignored without an error. A member can also be reached directly,
+ * through the public _leftBlock and _rightBlock here or path<I>() on SplitMergeCombine. A block meant for graph files
+ * declares the settings it exposes and stages each on the member, with the member's settings().setStaged() and
+ * applyStagedParameters(); set() on a member stores the value without applying it.
+ *
+ * SplitMergeCombine, FeedbackMerge and FeedbackMergeWithTap follow the same rules.
+ *
  * @code
  * // name-based:  Scale("out") -> Adder("in1")
  * auto m1 = Merge<Scale<2>, "out", Adder<>, "in1">();
@@ -489,6 +504,9 @@ struct SplitMergeCombineTraits {
  * Optional OutputSigns prescribe per-path sign/weight before summation:
  *   SplitMergeCombine<PathA, PathB>                         — all signs = +1
  *   SplitMergeCombine<OutputSigns<+1.0f, -1.0f>, PathA, PathB>  — PathA: +1, PathB: -1
+ *
+ * Tags and settings follow the rules at MergeByIndex. The constructor's map takes the keys "path0", "path1", ...
+ * for one path each, and a flat key goes to every path.
  */
 template<typename... Args>
 struct SplitMergeCombine;
@@ -810,6 +828,9 @@ public:
  *    └─────────────┤          │<───────────┘
  *                  └──────────┘
  *                  Monitor (optional)
+ *
+ * The tag and settings rules are stated at MergeByIndex. The constructor's map takes the keys "forward", "feedback"
+ * and "monitor"; a flat key goes to the forward and feedback blocks only.
  */
 template<BlockLike Forward, std::size_t ForwardOutputPortIndex, //
     BlockLike Feedback, std::size_t FeedbackOutputPortIndex,    //
@@ -871,6 +892,7 @@ using FeedbackMerge = FeedbackMergeByIndex<                                     
  *    │                         └────┘      │
  *    └──────────────────<──────────────────┘
  *
+ * Tags and settings follow FeedbackMerge, including the keys of the constructor's map.
  */
 template<BlockLike Forward, std::size_t ForwardOutputPortIndex, //
     BlockLike Feedback, std::size_t FeedbackOutputPortIndex,    //
