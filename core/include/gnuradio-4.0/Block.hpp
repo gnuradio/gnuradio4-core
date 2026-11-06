@@ -2208,10 +2208,23 @@ public:
             std::size_t  processedOut;
         };
 
+        // Indexing a writer span re-reads its reservation through the writer on every access.
+        // The reservations stay fixed during the call, and the loop indexes these plain views.
+        const auto toPlainSpans = [](auto& spans) {
+            return meta::tuple_transform(
+                []<typename TSpan>(TSpan& span) {
+                    using TElement = std::remove_reference_t<decltype(*span.data())>;
+                    return std::span<TElement>(span.data(), span.size());
+                },
+                spans);
+        };
+        auto inputPlainSpans  = toPlainSpans(inputSpans);
+        auto outputPlainSpans = toPlainSpans(outputSpans);
+
         _inProcessOneDispatch                      = true;
         std::size_t nOutSamplesBeforeRequestedStop = 0UZ;
         for (std::size_t i = 0UZ; i < nSamplesToProcess; ++i) {
-            auto results = std::apply([this, i](auto&... inputs) { return this->invoke_processOne(inputs[i]...); }, inputSpans);
+            auto results = std::apply([this, i](auto&... inputs) { return this->invoke_processOne(inputs[i]...); }, inputPlainSpans);
             meta::tuple_for_each(
                 [i]<typename R>(auto& output_range, R&& result) {
                     if constexpr (meta::array_or_vector_type<std::remove_cvref<decltype(result)>>) {
@@ -2222,7 +2235,7 @@ public:
                         output_range[i] = std::forward<R>(result);
                     }
                 },
-                outputSpans, results);
+                outputPlainSpans, results);
             nOutSamplesBeforeRequestedStop++;
             if (_outputTagPending) [[unlikely]] {
                 for_each_writer_span([this, i](auto& out) { out.publishTag(_pendingOutputTag, i); }, outputSpans);
