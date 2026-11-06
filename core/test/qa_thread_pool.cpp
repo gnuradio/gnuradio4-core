@@ -975,6 +975,100 @@ const boost::ut::suite<"gr::thread_pool Manager WASM"> _wasm = [] {
         validate_split(50000UZ, 4UZ); // upper-bound stress test
     };
 
+#if not defined(__EMSCRIPTEN__)
+    "computeDefaultThreadSplit gives one CPU-bound thread per allowed CPU"_test = [] {
+        using namespace gr::thread_pool::detail;
+        constexpr std::size_t kReserve = 4UZ;
+
+        std::vector<std::string> mismatches;
+        for (const std::size_t threadLimit : {8UZ, 20UZ, 50000UZ}) {
+            const std::size_t cpuCap = std::max((threadLimit - kReserve) / 2UZ, 1UZ); // half the threads the thread limit leaves after the reserve
+            for (const std::size_t allowedCpus : {0UZ, 1UZ, 2UZ, 3UZ, 8UZ, 20UZ, 64UZ}) {
+                const ThreadSplit threadSplit     = computeDefaultThreadSplit(threadLimit, kReserve, allowedCpus);
+                const std::size_t expectedThreads = std::min(std::max(allowedCpus, 1UZ), cpuCap);
+                if (threadSplit.cpuThreadsMax != expectedThreads || threadSplit.cpuThreadsMin != expectedThreads) {
+                    mismatches.push_back(std::format("limit {} allowed {}: cpu [{}, {}], expected {}", threadLimit, allowedCpus, threadSplit.cpuThreadsMin, threadSplit.cpuThreadsMax, expectedThreads));
+                }
+            }
+        }
+        expect(mismatches.empty()) << gr::join(mismatches, "; ");
+    };
+#endif
+
+#if defined(_POSIX_VERSION) && not defined(__EMSCRIPTEN__) && not defined(__APPLE__)
+    "computeDefaultThreadSplit follows the calling thread's affinity mask"_test = [] {
+        using namespace gr::thread_pool::detail;
+        cpu_set_t original;
+        expect(fatal(eq(sched_getaffinity(0, sizeof(cpu_set_t), &original), 0)));
+
+        // the default split under masks of the first one and two allowed CPUs, the original restored after
+        std::vector<std::size_t> setCounts;
+        std::vector<std::size_t> cpuThreads;
+        cpu_set_t                subset;
+        CPU_ZERO(&subset);
+        for (std::size_t cpu = 0UZ; cpu < static_cast<std::size_t>(CPU_SETSIZE) && setCounts.size() < 2UZ; ++cpu) {
+            if (!CPU_ISSET(cpu, &original)) {
+                continue;
+            }
+            CPU_SET(cpu, &subset);
+            if (sched_setaffinity(0, sizeof(cpu_set_t), &subset) != 0) {
+                break;
+            }
+            setCounts.push_back(static_cast<std::size_t>(CPU_COUNT(&subset)));
+            cpuThreads.push_back(computeDefaultThreadSplit(50000UZ, 4UZ).cpuThreadsMax);
+        }
+        const int restored = sched_setaffinity(0, sizeof(cpu_set_t), &original);
+
+        expect(eq(restored, 0)) << "the original mask is restored";
+        expect(eq(setCounts.size(), std::min(static_cast<std::size_t>(CPU_COUNT(&original)), 2UZ))) << "the narrowed masks are accepted";
+        expect(cpuThreads == setCounts) << std::format("mask counts {{{}}} gave CPU-bound threads {{{}}}", gr::join(setCounts, ", "), gr::join(cpuThreads, ", "));
+    };
+
+    "computeDefaultThreadSplit counts the mask of a wide thread while the main thread is pinned"_test = [] {
+        using namespace gr::thread_pool::detail;
+        // the pool's workers inherit the mask of the thread that builds the pool, so the split counts that thread's mask
+        const pid_t mainThread = getpid(); // the main thread's id equals the process id
+        cpu_set_t   original;
+        expect(fatal(eq(sched_getaffinity(mainThread, sizeof(cpu_set_t), &original), 0)));
+        const std::size_t nOriginal    = static_cast<std::size_t>(CPU_COUNT(&original));
+        const std::size_t expectedWide = std::min(nOriginal, std::max((50000UZ - 4UZ) / 2UZ, 1UZ)); // half the threads the thread limit leaves after the reserve
+
+        cpu_set_t firstCpu;
+        CPU_ZERO(&firstCpu);
+        for (std::size_t cpu = 0UZ; cpu < static_cast<std::size_t>(CPU_SETSIZE); ++cpu) {
+            if (CPU_ISSET(cpu, &original)) {
+                CPU_SET(cpu, &firstCpu);
+                break;
+            }
+        }
+
+        // the asking thread starts before the pin and keeps the original mask
+        std::binary_semaphore mainPinned{0};
+        std::size_t           askerMaskCount = 0UZ;
+        std::size_t           askerThreads   = 0UZ;
+        std::thread           asker([&] {
+            mainPinned.acquire();
+            cpu_set_t askerMask;
+            if (sched_getaffinity(0, sizeof(cpu_set_t), &askerMask) == 0) {
+                askerMaskCount = static_cast<std::size_t>(CPU_COUNT(&askerMask));
+            }
+            askerThreads = computeDefaultThreadSplit(50000UZ, 4UZ).cpuThreadsMax;
+        });
+
+        const int pinned = sched_setaffinity(mainThread, sizeof(cpu_set_t), &firstCpu);
+        mainPinned.release();
+        asker.join();
+        const std::size_t mainThreads = computeDefaultThreadSplit(50000UZ, 4UZ).cpuThreadsMax;
+        const int         restored    = sched_setaffinity(mainThread, sizeof(cpu_set_t), &original);
+
+        expect(eq(pinned, 0)) << "the main thread is pinned to one CPU";
+        expect(eq(restored, 0)) << "the original mask is restored";
+        expect(eq(askerMaskCount, nOriginal)) << "the asking thread keeps the original mask";
+        expect(eq(askerThreads, expectedWide)) << std::format("a thread with {} CPUs got {} CPU-bound threads while the main thread was pinned to one", nOriginal, askerThreads);
+        expect(eq(mainThreads, 1UZ)) << "the pinned main thread gets one CPU-bound thread";
+    };
+#endif
+
     "Manager: respects thread limit and budget"_test = [] {
         using namespace gr::thread_pool;
 

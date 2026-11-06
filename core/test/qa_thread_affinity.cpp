@@ -116,6 +116,37 @@ const boost::ut::suite ThreadAffinityTests = [] {
         expect(throws<std::system_error>([&] { thread::setProcessAffinity(threadMapOn, -1); }));
     };
 
+    "allowed CPU count follows the calling thread's affinity mask"_test = [] {
+        using namespace gr::thread_pool;
+        cpu_set_t original;
+        expect(fatal(eq(sched_getaffinity(0, sizeof(cpu_set_t), &original), 0)));
+        const std::size_t nOriginal = static_cast<std::size_t>(CPU_COUNT(&original));
+        expect(eq(thread::getAllowedCpuCount(), nOriginal));
+
+        // narrow the mask to its first one and two CPUs, then restore it
+        std::vector<std::size_t> setCounts;
+        std::vector<std::size_t> reportedCounts;
+        cpu_set_t                subset;
+        CPU_ZERO(&subset);
+        for (std::size_t cpu = 0UZ; cpu < static_cast<std::size_t>(CPU_SETSIZE) && setCounts.size() < 2UZ; ++cpu) {
+            if (!CPU_ISSET(cpu, &original)) {
+                continue;
+            }
+            CPU_SET(cpu, &subset);
+            if (sched_setaffinity(0, sizeof(cpu_set_t), &subset) != 0) {
+                break;
+            }
+            setCounts.push_back(static_cast<std::size_t>(CPU_COUNT(&subset)));
+            reportedCounts.push_back(thread::getAllowedCpuCount());
+        }
+        const int restored = sched_setaffinity(0, sizeof(cpu_set_t), &original);
+
+        expect(eq(restored, 0)) << "the original mask is restored";
+        expect(eq(setCounts.size(), std::min(nOriginal, 2UZ))) << "the narrowed masks are accepted";
+        expect(reportedCounts == setCounts) << std::format("mask counts {{{}}} reported as {{{}}}", gr::join(setCounts, ", "), gr::join(reportedCounts, ", "));
+        expect(eq(thread::getAllowedCpuCount(), nOriginal));
+    };
+
     "ProcessName"_test = [] {
         using namespace gr::thread_pool;
         expect(!thread::getProcessName().empty()) << "Process name shouldn't be empty";

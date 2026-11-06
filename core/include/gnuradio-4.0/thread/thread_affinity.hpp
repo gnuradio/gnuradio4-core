@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <charconv>
 #include <cstring>
 #include <format>
@@ -340,6 +341,33 @@ inline std::vector<bool> getProcessAffinity(const int pid = detail::getPid()) {
 #else
 inline std::vector<bool> getProcessAffinity(const int /*pid*/ = -1) {
     return std::vector<bool>(std::thread::hardware_concurrency()); // cannot set affinity for non-posix threads
+}
+#endif
+
+// number of CPUs in the calling thread's affinity mask (as set by taskset or a container's cpuset), which the threads it starts inherit; at least one.
+// hardware_concurrency() where the platform reports no mask or the call fails
+#if defined(_POSIX_VERSION) && not defined(__EMSCRIPTEN__) && not defined(__APPLE__)
+inline std::size_t getAllowedCpuCount() {
+    cpu_set_t cpuSet;
+    if (sched_getaffinity(0, sizeof(cpu_set_t), &cpuSet) != 0) {
+        return std::max(1U, std::thread::hardware_concurrency());
+    }
+    return static_cast<std::size_t>(std::max(1, CPU_COUNT(&cpuSet)));
+}
+#elif defined(_WIN32)
+inline std::size_t getAllowedCpuCount() {
+    const std::size_t hardware    = std::max(1U, std::thread::hardware_concurrency());
+    DWORD_PTR         processMask = 0;
+    DWORD_PTR         systemMask  = 0;
+    // both masks cover one processor group; on a machine with more groups they do not describe the whole process
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &processMask, &systemMask) || static_cast<std::size_t>(std::popcount(systemMask)) != hardware) {
+        return hardware;
+    }
+    return std::max(1UZ, static_cast<std::size_t>(std::popcount(processMask)));
+}
+#else
+inline std::size_t getAllowedCpuCount() {
+    return std::max(1U, std::thread::hardware_concurrency());
 }
 #endif
 
