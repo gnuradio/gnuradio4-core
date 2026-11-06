@@ -1000,21 +1000,21 @@ struct ThreadSplit {
     std::size_t threadReserve;
 };
 
-inline ThreadSplit computeDefaultThreadSplit(std::size_t threadLimit = gr::thread_pool::thread::getThreadLimit(), std::size_t reserve = 4UZ) {
+inline ThreadSplit computeDefaultThreadSplit(std::size_t threadLimit = gr::thread_pool::thread::getThreadLimit(), std::size_t reserve = 4UZ, std::size_t allowedCpus = gr::thread_pool::thread::getAllowedCpuCount()) {
     const std::size_t usable = (threadLimit > reserve) ? threadLimit - std::clamp(reserve, 0UZ, threadLimit) : 1UZ;
 
 #ifdef __EMSCRIPTEN__
     // conservative choice: minimise CPU-bound usage for WASM to guarantee IO availability
     const std::size_t cpuMin = 0UZ;
-    const std::size_t cpuMax = std::clamp(usable / 4UZ, 1UZ, static_cast<std::size_t>(std::thread::hardware_concurrency()));
+    const std::size_t cpuMax = std::clamp(usable / 4UZ, 1UZ, std::max(allowedCpus, 1UZ));
     const std::size_t ioMin  = 0UZ;
     const std::size_t ioMax  = std::max<std::size_t>(1UZ, usable - cpuMax);
 #else
-    const std::size_t hardware = std::max(1u, std::thread::hardware_concurrency());
-    const std::size_t cpuMax   = std::clamp(static_cast<std::size_t>(hardware), 1UZ, std::max(usable / 2UZ, 1UZ));
-    const std::size_t cpuMin   = cpuMax;
-    const std::size_t ioMin    = 1UZ;
-    const std::size_t ioMax    = usable > cpuMax ? std::max<std::size_t>(usable - cpuMax, 1UZ) : 1UZ;
+    // one CPU-bound thread per CPU the process may run on, at most half the threads the thread limit (ulimit -u) leaves after the reserve; more threads than CPUs take turns on them
+    const std::size_t cpuMax = std::clamp(allowedCpus, 1UZ, std::max(usable / 2UZ, 1UZ));
+    const std::size_t cpuMin = cpuMax;
+    const std::size_t ioMin  = 1UZ;
+    const std::size_t ioMax  = usable > cpuMax ? std::max<std::size_t>(usable - cpuMax, 1UZ) : 1UZ;
 #endif
 
     return ThreadSplit{.cpuThreadsMin = cpuMin, .cpuThreadsMax = cpuMax, .ioThreadsMin = ioMin, .ioThreadsMax = ioMax, .threadReserve = reserve};
@@ -1032,7 +1032,7 @@ inline ThreadSplit computeDefaultThreadSplit(std::size_t threadLimit = gr::threa
  * <br>
  * It comes pre-initialised with two default pools:
  * <ul>
- *   <li> <code>"default_cpu"</code> &rarr; CPU-bound thread pool based on available hardware concurrency
+ *   <li> <code>"default_cpu"</code> &rarr; CPU-bound thread pool with one thread per CPU the process may run on; under a low thread limit (ulimit -u), at most half the threads that limit leaves after the reserve
  *   <li> <code>"default_io"</code>  &rarr; IO-bound thread pool with up to 128 threads
  * </ul>
  *
