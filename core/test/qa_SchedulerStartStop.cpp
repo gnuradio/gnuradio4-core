@@ -711,4 +711,41 @@ const boost::ut::suite<"the stream-to-message ratio"> messageRatioTests = [] {
     };
 };
 
+const boost::ut::suite<"the caller of runAndWait() during a run"> callerWaitTests = [] {
+    using namespace boost::ut;
+
+    // a timeout_ms of an hour bounds each of the caller's waits far beyond the case. Within the case only the
+    // notification of the worker that leaves last ends the wait
+    "the caller parks on the job count during the run and returns once the last worker has left"_test = [] {
+        constexpr gr::Size_t kHourMs = 3'600'000U;
+
+        gr::Graph flow;
+        auto&     source = flow.emplaceBlock<qa_start_stop::OnesSource>();
+        auto&     sink   = flow.emplaceBlock<qa_start_stop::CountingSink>();
+        expect(flow.connect<"out", "in">(source, sink).has_value());
+
+        qa_start_stop::JobCountProbe scheduler(gr::property_map{{"timeout_ms", kHourMs}});
+        expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+        const std::shared_ptr<gr::Sequence> runningJobs = scheduler.runningJobs().lock();
+
+        std::atomic<bool> returned{false};
+        std::thread       caller([&scheduler, &returned] {
+            std::ignore = scheduler.runAndWait();
+            returned.store(true, std::memory_order_release);
+        });
+
+        const bool parked = qa_start_stop::awaitCondition([&runningJobs] { return runningJobs->nTimedWaiters() == 1U; });
+        expect(parked) << "the caller of runAndWait() did not park in the job count's timed wait during the run";
+
+        scheduler.requestStop();
+        const bool returnedAfterLastWorker = qa_start_stop::awaitCondition([&returned] { return returned.load(std::memory_order_acquire); });
+        expect(returnedAfterLastWorker) << "runAndWait() did not return after the last worker left";
+        if (!returnedAfterLastWorker) { // a notification on the count once it reads zero ends the caller's wait
+            expect(qa_start_stop::awaitCondition([&runningJobs] { return runningJobs->value() == 0UZ; })) << "a worker kept its count after the stop";
+            runningJobs->notify_all();
+        }
+        caller.join();
+    };
+};
+
 int main() { /* tests are statically registered */ }
