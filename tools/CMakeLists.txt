@@ -14,6 +14,33 @@ else()
 endif()
 list(APPEND GR_TOOLS_INSTALL_RPATH ${CMAKE_INSTALL_RPATH})
 
+# rungraph's body, as a library: gr::tools::runGraph takes main's arguments and returns the exit status. It builds its
+# graph by name, which needs the registry, and is built only with it. A program that links its block families instead of
+# loading plugins, as under Emscripten, calls it from its own main. Its source includes core's internal
+# ShippedSchedulers.hpp through a private include directory. The installed RunGraph.hpp does not include it, and a
+# consumer needs no path into core/src.
+if(GR_ENABLE_BLOCK_REGISTRY)
+  add_library(gnuradio-rungraph STATIC RunGraph.cpp)
+  add_library(gnuradio4::gnuradio-rungraph ALIAS gnuradio-rungraph)
+  target_include_directories(gnuradio-rungraph PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+                                                      $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+  target_include_directories(gnuradio-rungraph PRIVATE ${PROJECT_SOURCE_DIR}/core/src)
+  target_link_libraries(gnuradio-rungraph PUBLIC gnuradio-options gnuradio-core gnuradio-blocklib-core)
+  # where this installation puts its plugins, which the tool searches whatever the caller and the environment name
+  target_compile_definitions(gnuradio-rungraph
+                             PRIVATE GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY="${GR_INSTALLED_PLUGIN_DIRECTORY}")
+  install(
+    TARGETS gnuradio-rungraph
+    EXPORT gnuradio4Targets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+  install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+endif()
+
+# under Emscripten the library is built alone, without the programs and their tests
+if(EMSCRIPTEN)
+  return()
+endif()
+
 # graphdoc and the headers it shares with its test. It is an ordinary consumer of the installed headers: nothing here is
 # compiled into the libraries. Its document is read from the graph file, so it is built whether or not the registry is
 # on.
@@ -32,24 +59,19 @@ target_compile_definitions(graphdoc PRIVATE GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY=
 set_target_properties(graphdoc PROPERTIES INSTALL_RPATH "${GR_TOOLS_INSTALL_RPATH}")
 install(TARGETS graphdoc RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
-# rungraph, a consumer of the installed headers and of one internal header: it is not compiled into the libraries. It
-# builds its graph by name, which needs the registry, so it follows it. It also includes core's internal
-# ShippedSchedulers.hpp through a private include directory.
+# rungraph, the program over gnuradio-rungraph
 if(GR_ENABLE_BLOCK_REGISTRY)
   add_executable(rungraph rungraph_main.cpp)
-  target_include_directories(rungraph PRIVATE ${PROJECT_SOURCE_DIR}/core/src)
-  target_link_libraries(rungraph PRIVATE gnuradio-options gnuradio-core gnuradio-blocklib-core)
+  target_link_libraries(rungraph PRIVATE gnuradio-rungraph)
   if(TARGET gnuradio-plugin)
     target_link_libraries(rungraph PRIVATE gnuradio-plugin)
   endif()
-  # where this installation puts its plugins, which the tool searches whatever the caller and the environment name
-  target_compile_definitions(rungraph PRIVATE GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY="${GR_INSTALLED_PLUGIN_DIRECTORY}")
   set_target_properties(rungraph PROPERTIES INSTALL_RPATH "${GR_TOOLS_INSTALL_RPATH}")
   install(TARGETS rungraph RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
-# grinfo, a consumer of the installed headers and of ShippedSchedulers.hpp as rungraph is. It reports the registered
-# blocks, which only a build with the registry has.
+# grinfo, a consumer of the installed headers and of ShippedSchedulers.hpp as gnuradio-rungraph is. It reports the
+# registered blocks, which only a build with the registry has.
 if(GR_ENABLE_BLOCK_REGISTRY)
   add_executable(grinfo grinfo_main.cpp)
   target_include_directories(grinfo PRIVATE ${PROJECT_SOURCE_DIR}/core/src)

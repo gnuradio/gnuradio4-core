@@ -796,11 +796,22 @@ public:
 // PluginLoader on WASM is just a wrapper on BlockRegistry to provide the
 // same API as proper PluginLoader
 class PluginLoader {
+public:
+    /// see the non-WASM PluginLoader::BlockLibrary
+    struct BlockLibrary {
+        std::string file;
+        std::size_t nBlockRegistrations     = 0UZ;
+        std::size_t nSchedulerRegistrations = 0UZ;
+    };
+
 private:
-    detail::YamlDefinitionsLoader _yamlRegistry;
-    BlockRegistry*                _registry;
-    SchedulerRegistry*            _schedulerRegistry;
-    std::vector<std::string>      _ordinaryLibraries;
+    detail::YamlDefinitionsLoader                _yamlRegistry;
+    BlockRegistry*                               _registry;
+    SchedulerRegistry*                           _schedulerRegistry;
+    std::vector<BlockLibrary>                    _blockLibraries;
+    std::vector<std::string>                     _skippedFiles;
+    std::vector<std::string>                     _ordinaryLibraries;
+    std::unordered_map<std::string, std::string> _failedPlugins;
 
 public:
     PluginLoader(BlockRegistry& registry, SchedulerRegistry& scheduler_registry, std::span<const std::string> paths) : _yamlRegistry(paths), _registry(&registry), _schedulerRegistry(&scheduler_registry) {}
@@ -847,8 +858,17 @@ public:
     /// see the non-WASM PluginLoader::nSkippedAssets
     [[nodiscard]] std::size_t nSkippedAssets() const noexcept { return _yamlRegistry.nSkippedAssets(); }
 
+    /// empty: no shared object registers blocks through this loader
+    const std::vector<BlockLibrary>& blockLibraries() const { return _blockLibraries; }
+
+    /// empty: this loader scans no directory for shared objects
+    const std::vector<std::string>& skippedFiles() const { return _skippedFiles; }
+
     /// empty: this loader opens no shared object
     const std::vector<std::string>& ordinaryLibraries() const { return _ordinaryLibraries; }
+
+    /// empty: this loader loads no plugin
+    const std::unordered_map<std::string, std::string>& failedPlugins() const { return _failedPlugins; }
 
     /// see the non-WASM PluginLoader::listDevices
     [[nodiscard]] DeviceList listDevices(Opening opening = Opening::Avoided) const { return detail::listDevices(gr::globalDeviceListingRegistry().listings(), opening); }

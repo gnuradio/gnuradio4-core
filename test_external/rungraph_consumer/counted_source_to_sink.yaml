@@ -1,0 +1,12 @@
+# The graph the rungraph consumer runs: the source counts up and stops after event_count samples, and the run ends on
+# its own.
+blocks:
+  - id: good::fixed_source<float32>
+    parameters:
+      name: source
+      event_count: 1000
+  - id: good::cout_sink<float32>
+    parameters:
+      name: sink
+connections:
+  - [source, out, sink, in]
