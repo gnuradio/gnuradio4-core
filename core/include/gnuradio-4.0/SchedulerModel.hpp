@@ -72,15 +72,10 @@ public:
     virtual void releaseWorkQuiescence()        = 0;
 
     // Cancel stream sources, let accepted downstream input reach EOS, then join.
-    // false means the run failed or the drain deadline required immediate stop.
-    // The deadline bounds quiescence and downstream draining; stop hooks remain cooperative.
+    // false means the run failed or exceeded the deadline. Sources finish on their
+    // own workers. A silent blocking source cannot observe the flag until its work
+    // returns, so it reaches the deadline and then uses the ordinary Stop hooks.
     virtual bool stopAfterDrain(std::chrono::milliseconds timeout) = 0;
-
-    // One source-cancellation pass under this scheduler's own graph and lifecycle
-    // guards. A containing scheduler delegates here instead of walking our graph.
-    // false means startup, work or an editor is busy, or cancellation is unsupported;
-    // the containing drain retries until its deadline, then falls back to Stop.
-    virtual bool cancelDrainSources(std::chrono::steady_clock::time_point = std::chrono::steady_clock::time_point::max()) { return false; }
 };
 
 // A scheduler that holds a nested scheduler and exports its ports hands it the progress sequences of the graphs beyond
@@ -175,8 +170,6 @@ public:
         }
         return drained;
     }
-
-    bool cancelDrainSources(std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) override { return this->blockRef().cancelDrainSources(deadline); }
 
     std::thread _schedulerThread;
 
