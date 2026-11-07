@@ -979,7 +979,7 @@ const boost::ut::suite<"scheduler graph exchange"> schedulerExchangeTests = [] {
     } | std::tuple<std::type_identity<qa_exchange::SerialScheduler>, std::type_identity<qa_exchange::BlockingScheduler>, std::type_identity<qa_exchange::TestScheduler>>{};
 
     // The source's worker holds in the source's message handler while the sink's worker handles the batch. It leaves
-    // its loop once the replacement is recorded, and the reset in the batch waits for it. The replacement still waits
+    // its handler once the replacement requests stop, and the reset in the batch waits for its worker. The replacement still waits
     // unclaimed at that reset. The worker that handles the batch claims it with the start, and the new graph runs.
     "a worker that leaves while another worker handles a replacement does not claim it"_test = [] {
         qa_exchange::gFirstGraphSamples  = 0UZ;
@@ -991,17 +991,16 @@ const boost::ut::suite<"scheduler graph exchange"> schedulerExchangeTests = [] {
         gr::MsgPortOut                    toScheduler;
         expect(toScheduler.connect(scheduler.msgIn).has_value());
         std::atomic<bool>           holding{false};
+        std::atomic<bool>           releaseHandler{false};
         qa_exchange::SwapRequester* holder = nullptr;
         {
             gr::Graph flow;
             auto&     sink   = flow.emplaceBlock<qa_exchange::FirstSink>();
             auto&     source = flow.emplaceBlock<qa_exchange::SwapRequester>();
             expect(flow.connect<"out", "in">(source, sink).has_value());
-            source._onSwapRequest = [&scheduler, &holding] {
+            source._onSwapRequest = [&holding, &releaseHandler] {
                 holding.store(true);
-                for (std::size_t i = 0UZ; i < 3000UZ && scheduler.pendingExchange() == qa_exchange::PendingAtReset::none; ++i) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                }
+                releaseHandler.wait(false);
             };
             holder = &source; // the wrapper holding it lives on the heap, so this survives the move
             expect(scheduler.exchange(std::move(flow)).has_value());
@@ -1014,6 +1013,13 @@ const boost::ut::suite<"scheduler graph exchange"> schedulerExchangeTests = [] {
         qa_exchange::requestSwap(*holder);
         expect(qa_exchange::awaitFlag(holding)) << "the source's worker never held";
         qa_exchange::sendReplacementAndStart(toScheduler, scheduler.unique_name, std::move(yaml));
+        // Child handlers participate in work quiescence. Stop must wait for this
+        // handler before exchange() can record the pending replacement. Release
+        // on the actual stop request, never on a timeout waiting for that record.
+        const bool stopRequested = qa_exchange::awaitState(scheduler, REQUESTED_STOP);
+        releaseHandler.store(true);
+        releaseHandler.notify_all();
+        expect(fatal(stopRequested)) << "replacement never requested stop";
         expect(qa_exchange::awaitCount(qa_exchange::gSecondGraphSamples, 1UZ)) << "the start after the replacement never ran the new graph";
         expect(scheduler.state() == RUNNING) << "the scheduler left RUNNING";
         expect(scheduler._pendingAtFirstReset.load() == qa_exchange::PendingAtReset::waiting) << "the worker that left during the batch claimed the replacement";

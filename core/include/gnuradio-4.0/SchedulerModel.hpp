@@ -5,7 +5,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -20,6 +22,29 @@ struct Graph;
 
 template<typename TSelf, typename TSubGraph>
 class GraphWrapper;
+
+class CompositionEditor;
+
+// A branch capability belongs to one scheduler instance. Copies share its removal state; the handle
+// keeps no blocks or scheduler alive. Native edits that replace/remove a member invalidate removal.
+class CompositionBranch {
+public:
+    struct State {
+        std::weak_ptr<void>                    owner;
+        std::vector<std::weak_ptr<BlockModel>> blocks;
+        bool                                   removed = false; // accessed only under the owning scheduler's message pass
+    };
+
+private:
+    std::shared_ptr<State> _state;
+    friend class CompositionEditor;
+};
+
+struct CompositionResult {
+    CompositionBranch branch;
+    // Native reader/writer positions explicitly captured by the callback while work is quiescent.
+    std::vector<std::pair<std::string, std::size_t>> positions;
+};
 
 class SchedulerModel {
 public:
@@ -78,6 +103,13 @@ public:
     // A paused graph resumes to drain. Calls from this scheduler's workers or
     // lifecycle hooks throw; joining requires an external controller thread.
     virtual bool stopAfterDrain(std::chrono::milliseconds timeout) = 0;
+
+    // Synchronous, additive composition on an executing graph. The editor is valid only during the
+    // callback. Do not re-enter scheduler lifecycle, composition, or synchronous message waits there.
+    // The owner must keep the SchedulerModel alive for the duration of calls (as for start/stop).
+    // Unsupported scheduler implementations reject the operation without invoking the callback.
+    [[nodiscard]] virtual std::expected<CompositionResult, Error> compose(const std::function<void(CompositionEditor&)>&) { return std::unexpected(Error("scheduler does not support guarded composition")); }
+    [[nodiscard]] virtual std::expected<void, Error>              removeBranch(const CompositionBranch&) { return std::unexpected(Error("scheduler does not support guarded branch removal")); }
 };
 
 // A scheduler that holds a nested scheduler and exports its ports hands it the progress sequences of the graphs beyond
@@ -106,7 +138,10 @@ public:
     SchedulerWrapper& operator=(SchedulerWrapper&& other)      = delete;
 
     // members are destroyed before bases, so a joinable _schedulerThread here would terminate the process
-    ~SchedulerWrapper() override { stop(); }
+    ~SchedulerWrapper() override {
+        std::lock_guard lock(_compositionCallsMutex);
+        stop();
+    }
 
     // A graph calls init() on each block it adds, and a scheduler calls it on each nested scheduler at its start. The
     // scheduler's own init() takes no progress sequence and runs when the scheduler initializes its graph. The wrapper
@@ -148,6 +183,23 @@ public:
 
     [[nodiscard]] std::optional<Error> startError() const override { return this->blockRef().startError(); }
 
+    [[nodiscard]] std::expected<CompositionResult, Error> compose(const std::function<void(CompositionEditor&)>& callback) override {
+        std::lock_guard lock(_compositionCallsMutex);
+        if constexpr (requires { this->blockRef().compose(callback); }) {
+            return this->blockRef().compose(callback);
+        } else {
+            return std::unexpected(Error("scheduler does not support guarded composition"));
+        }
+    }
+    [[nodiscard]] std::expected<void, Error> removeBranch(const CompositionBranch& branch) override {
+        std::lock_guard lock(_compositionCallsMutex);
+        if constexpr (requires { this->blockRef().removeBranch(branch); }) {
+            return this->blockRef().removeBranch(branch);
+        } else {
+            return std::unexpected(Error("scheduler does not support guarded branch removal"));
+        }
+    }
+
     void requestWorkQuiescence() override { this->blockRef().requestWorkQuiescence(); }
     void requestQuiescenceOfOtherWork() override { this->blockRef().requestQuiescenceOfOtherWork(); }
     void releaseWorkQuiescence() override { this->blockRef().releaseWorkQuiescence(); }
@@ -176,10 +228,17 @@ public:
     std::thread _schedulerThread;
 
 private:
+    std::recursive_mutex       _compositionCallsMutex; // waits for scoped editors before wrapper teardown
     std::atomic<bool>          _asyncThreadDone{true};
     std::expected<void, Error> startOnOwnThread(bool requireWorkerCapacity) {
         using enum gr::lifecycle::State;
         auto& sched = this->blockRef();
+
+        if constexpr (requires { sched.compositionInconsistent(); }) {
+            if (sched.compositionInconsistent()) {
+                return std::unexpected(Error("execution quarantined after failed composition rollback; rebuild scheduler"));
+            }
+        }
 
         if (sched.state() == RUNNING) {
             return {};

@@ -32,6 +32,104 @@
 #include <emscripten/threading.h>
 #endif
 
+namespace gr {
+
+// A scoped additive editor: existing blocks can supply outputs but can never be destinations.
+// There is deliberately no Graph& or Scheduler* accessor. References must not escape the callback.
+class CompositionEditor {
+    Graph&                                           _graph;
+    std::size_t                                      _first;
+    std::vector<std::pair<std::string, std::size_t>> _positions;
+    bool                                             _failed = false;
+
+    bool owns(const std::shared_ptr<BlockModel>& block) const { return std::ranges::contains(_graph.blocks().subspan(_first), block); }
+
+public:
+    explicit CompositionEditor(Graph& graph) : _graph(graph), _first(graph.blocks().size()) {}
+    CompositionEditor(const CompositionEditor&)            = delete;
+    CompositionEditor& operator=(const CompositionEditor&) = delete;
+
+    template<BlockLike T>
+    T& emplaceBlock(property_map settings = {}) {
+        try {
+            // Groups require recursive ownership/adoption semantics, outside this additive leaf API.
+            if constexpr (T::blockCategory == block::Category::ScheduledBlockGroup || T::blockCategory == block::Category::TransparentBlockGroup) {
+                throw gr::exception("composition accepts leaf blocks only");
+            }
+            return _graph.emplaceBlock<T>(std::move(settings));
+        } catch (...) {
+            _failed = true;
+            throw;
+        }
+    }
+
+    void connect(const std::shared_ptr<BlockModel>& source, PortDefinition output, const std::shared_ptr<BlockModel>& destination, PortDefinition input) {
+        try {
+            if (!std::ranges::contains(_graph.blocks(), source) || !owns(destination)) {
+                throw gr::exception("composition connections must target a new branch input and use graph-owned endpoints");
+            }
+            auto src = source->dynamicOutputPort(output);
+            auto dst = destination->dynamicInputPort(input);
+            if (!src || !dst || !port::isStream((*src)->portMaskInfo()) || !port::isStream((*dst)->portMaskInfo())) {
+                throw gr::exception("composition requires valid stream ports");
+            }
+            // Never resize or restart an existing source. A live attachment needs its existing ring.
+            if (!owns(source) && (!(*src)->isConnected() || source->state() != lifecycle::State::RUNNING)) {
+                throw gr::exception("attachment source must be running with an existing reader");
+            }
+            if (auto result = _graph.connect(source, std::move(output), destination, std::move(input)); !result) {
+                throw gr::exception(result.error().message);
+            }
+            if (_graph.applyEdgeConnection(_graph.edges().back()) != Edge::EdgeState::Connected) {
+                throw gr::exception("composition edge could not be connected");
+            }
+        } catch (...) {
+            _failed = true;
+            throw;
+        }
+    }
+
+    template<BlockLike S, BlockLike D>
+    void connect(S& source, PortDefinition output, D& destination, PortDefinition input) {
+        auto src = graph::findBlock(_graph, source);
+        auto dst = graph::findBlock(_graph, destination);
+        if (!src || !dst) {
+            _failed = true;
+            throw gr::exception("composition endpoint does not belong to graph");
+        }
+        connect(*src, std::move(output), *dst, std::move(input));
+    }
+
+    // Use after connect(). Returns the actual native cursor, never a host-time estimate.
+    template<PortLike P>
+    std::size_t position(std::string label, const P& port) {
+        const std::size_t value = [&] {
+            if constexpr (requires { port.streamReader(); }) {
+                return port.streamReader().position();
+            } else {
+                return port.streamWriter().position();
+            }
+        }();
+        _positions.emplace_back(std::move(label), value);
+        return value;
+    }
+
+    static CompositionBranch makeBranch(const std::shared_ptr<void>& owner, std::span<std::shared_ptr<BlockModel>> blocks) {
+        CompositionBranch branch;
+        branch._state        = std::make_shared<CompositionBranch::State>();
+        branch._state->owner = owner;
+        for (const auto& block : blocks) {
+            branch._state->blocks.emplace_back(block);
+        }
+        return branch;
+    }
+    static std::shared_ptr<CompositionBranch::State> branchState(const CompositionBranch& branch, const std::shared_ptr<void>& owner) { return branch._state && branch._state->owner.lock() == owner ? branch._state : nullptr; }
+
+    bool failed() const { return _failed; }
+    auto takePositions() { return std::move(_positions); }
+};
+} // namespace gr
+
 // Under Windows windows.h defines ERROR as 0.  This messes the ERROR function work::status::ERROR.
 #ifdef _WIN32
 #ifdef ERROR
@@ -149,7 +247,9 @@ protected:
     const TaskExecutor*                    _jobListsPool = nullptr; // the pool the job lists were last sized on
     std::shared_ptr<gr::Sequence>          _nRunningJobs = std::make_shared<gr::Sequence>();
     std::recursive_mutex                   _executionOrderMutex; // only used when modifying and copying the graph->local job list
-    std::shared_ptr<JobLists>              _executionOrder     = std::make_shared<JobLists>();
+    std::shared_ptr<JobLists>              _executionOrder   = std::make_shared<JobLists>();
+    std::shared_ptr<void>                  _compositionOwner = std::make_shared<int>(0);
+    std::atomic<bool>                      _compositionInconsistent{false};
     inline static thread_local const void* _lifecycleScheduler = nullptr;
     std::mutex                             _childLifecycleMutex; // serializes the sweeps of start() and stop() and the ReplaceBlock and EmplaceEdge edits; a worker never takes it to count itself
     std::mutex                             _workersInLoopMutex;  // guards _nWorkersInLoop; no block's stop() hook runs under it
@@ -610,6 +710,141 @@ public:
         WorkQuiescenceGuard(const WorkQuiescenceGuard&)            = delete;
         WorkQuiescenceGuard& operator=(const WorkQuiescenceGuard&) = delete;
     };
+
+    // Serialize with native edit dispatch through the existing message-pass claim, then quiesce
+    // before taking the lifecycle sweep lock: a worker stopping from work() must be able to finish.
+    [[nodiscard]] std::expected<CompositionResult, Error> compose(const std::function<void(CompositionEditor&)>& callback) {
+        auto result = composeGuarded(callback);
+        if (_compositionInconsistent.load() && this->state() != lifecycle::State::ERROR) {
+            failStartAndReport(Error("composition rollback failed; execution quarantined"));
+        }
+        return result;
+    }
+
+private:
+    [[nodiscard]] std::expected<CompositionResult, Error> composeGuarded(const std::function<void(CompositionEditor&)>& callback) {
+        if (workingScheduler() == static_cast<const void*>(this) || holdsMessagePass()) {
+            return std::unexpected(Error("composition cannot re-enter scheduler work or message dispatch"));
+        }
+        const bool    held = awaitMessagePass();
+        on_scope_exit pass = [this, held] {
+            if (held) {
+                releaseMessagePass();
+            }
+        };
+        WorkQuiescenceGuard quiescence(this);
+        std::lock_guard     childLock(_childLifecycleMutex);
+        if (this->state() != lifecycle::State::RUNNING || !hasOpenAdoptionList()) {
+            return std::unexpected(Error("composition requires a running scheduler with an open worker list"));
+        }
+        const auto        generation = runGeneration();
+        const auto        first      = _graph->blocks().size();
+        CompositionEditor editor(*_graph);
+        try {
+            callback(editor);
+            if (editor.failed()) {
+                throw gr::exception("composition callback suppressed an editor failure");
+            }
+            for (const auto& loop : graph::detectFeedbackLoops(*_graph)) {
+                if (std::ranges::any_of(loop.edges, [&](const Edge& edge) { return std::ranges::contains(_graph->blocks().subspan(first), edge.destinationBlock()); })) {
+                    throw gr::exception("composition supports feed-forward branches only");
+                }
+            }
+            auto branch = CompositionEditor::makeBranch(_compositionOwner, _graph->blocks().subspan(first));
+            for (const auto& block : _graph->blocks().subspan(first)) {
+                auto unconnected = [](DynamicPort& port) { return port::isStream(port.portMaskInfo()) && !port.isOptional() && !port.isConnected(); };
+                if (anyPort(block->dynamicInputPorts(), unconnected) || anyPort(block->dynamicOutputPorts(), unconnected)) {
+                    throw gr::exception("composition branch has an unconnected mandatory stream port");
+                }
+            }
+            for (const auto& block : _graph->blocks().subspan(first)) {
+                auto adopted = adoptBlock(block);
+                if (!adopted || !adopted->has_value()) {
+                    throw gr::exception(adopted ? std::string("run ended during composition") : adopted.error().message);
+                }
+            }
+            if (this->state() != lifecycle::State::RUNNING || runGeneration() != generation) {
+                throw gr::exception("scheduler stopped during composition");
+            }
+            return CompositionResult{std::move(branch), editor.takePositions()};
+        } catch (...) {
+            const auto failure = std::current_exception();
+            try {
+                while (_graph->blocks().size() > first) {
+                    retireCompositionBlock(_graph->blocks().back());
+                }
+            } catch (...) {
+                // No successful result is published. Mark ERROR after releasing the sweep lock; the
+                // public caller must stop/reset the failed execution before using it again.
+                _compositionInconsistent = true;
+                return std::unexpected(Error("composition rollback failed; execution is inconsistent and must be stopped"));
+            }
+            try {
+                std::rethrow_exception(failure);
+            } catch (const std::exception& e) {
+                return std::unexpected(Error(e));
+            } catch (...) {
+                return std::unexpected(Error("unknown composition failure"));
+            }
+        }
+    }
+
+public:
+    [[nodiscard]] std::expected<void, Error> removeBranch(const CompositionBranch& branch) {
+        auto result = removeBranchGuarded(branch);
+        if (_compositionInconsistent.load() && this->state() != lifecycle::State::ERROR) {
+            failStartAndReport(Error("branch retirement failed; execution quarantined"));
+        }
+        return result;
+    }
+
+private:
+    [[nodiscard]] std::expected<void, Error> removeBranchGuarded(const CompositionBranch& branch) {
+        if (workingScheduler() == static_cast<const void*>(this) || holdsMessagePass()) {
+            return std::unexpected(Error("branch removal cannot re-enter scheduler work or message dispatch"));
+        }
+        const bool    held = awaitMessagePass();
+        on_scope_exit pass = [this, held] {
+            if (held) {
+                releaseMessagePass();
+            }
+        };
+        WorkQuiescenceGuard quiescence(this);
+        std::lock_guard     childLock(_childLifecycleMutex);
+        if (_compositionInconsistent.load()) {
+            return std::unexpected(Error("execution quarantined after failed composition rollback"));
+        }
+        const auto state = CompositionEditor::branchState(branch, _compositionOwner);
+        if (!state || state->removed) {
+            return std::unexpected(Error("branch handle is foreign or already removed"));
+        }
+        std::vector<std::shared_ptr<BlockModel>> blocks;
+        for (const auto& weak : state->blocks) {
+            auto block = weak.lock();
+            if (!block || !std::ranges::contains(_graph->blocks(), block)) {
+                return std::unexpected(Error("native edit invalidated branch ownership"));
+            }
+            blocks.push_back(std::move(block));
+        }
+        for (const auto& edge : _graph->edges()) {
+            if (std::ranges::contains(blocks, edge.sourceBlock()) && !std::ranges::contains(blocks, edge.destinationBlock())) {
+                return std::unexpected(Error("branch has an outgoing edge to an unowned block"));
+            }
+        }
+        try {
+            for (const auto& block : blocks | std::views::reverse) {
+                retireCompositionBlock(block);
+            }
+            state->removed = true;
+            return {};
+        } catch (...) {
+            _compositionInconsistent = true;
+            return std::unexpected(Error("branch retirement failed; execution is inconsistent and must be stopped"));
+        }
+    }
+
+public:
+    [[nodiscard]] bool compositionInconsistent() const { return _compositionInconsistent; }
 
     SchedulerBase() : base_t(gr::property_map()) { registerPropertyCallbacks(); }
 
@@ -1477,13 +1712,13 @@ protected:
     // quiescence is in force, the helper makes no call and returns no result.
     template<std::invocable TCall>
     std::optional<work::Result> callAsWork(TCall&& call) {
-        if (gr::atomic_ref(_nWorkQuiescenceRequests).load_acquire() > 0UZ) {
+        if (_compositionInconsistent.load() || gr::atomic_ref(_nWorkQuiescenceRequests).load_acquire() > 0UZ) {
             std::this_thread::yield();
             return std::nullopt;
         }
         std::ignore             = gr::atomic_ref(_nWorkersInWork).fetch_add_seq_cst(1UZ);
         on_scope_exit leaveWork = [this] { gr::atomic_ref(_nWorkersInWork).fetch_sub(1UZ); };
-        if (gr::atomic_ref(_nWorkQuiescenceRequests).load_acquire() > 0UZ) {
+        if (_compositionInconsistent.load() || gr::atomic_ref(_nWorkQuiescenceRequests).load_acquire() > 0UZ) {
             return std::nullopt;
         }
         const void*&  threadWorkingScheduler = workingScheduler();
@@ -1576,6 +1811,10 @@ protected:
     }
 
     void startImpl() {
+        if (_compositionInconsistent.load()) {
+            this->emitErrorMessageIfAny("composition quarantine", this->changeStateTo(lifecycle::State::ERROR));
+            return;
+        }
         using enum gr::lifecycle::State;
         if (isOnOwnWorkerThread()) {
             deferStart();
@@ -1880,10 +2119,31 @@ protected:
             ++_nWorkersInLoop;
         }
         on_scope_exit leaveLoop = [this] {
-            std::lock_guard workersLock(_workersInLoopMutex);
-            if (--_nWorkersInLoop == 0UZ) {
-                removeWake();
-                settleStoppedBlockingBlocks();
+            bool lastWorker = false;
+            {
+                std::lock_guard workersLock(_workersInLoopMutex);
+                if (--_nWorkersInLoop == 0UZ) {
+                    removeWake();
+                    settleStoppedBlockingBlocks();
+                    lastWorker = true;
+                }
+            }
+            if (lastWorker) {
+                // Local lists are already destroyed. A stop may have prevented every maintenance
+                // pass after retirement. Reclaim those zombies before releasing this worker's count,
+                // so waitDone()/execution teardown do not retain removed branches. No stop hook is
+                // called under the workers lock, and a new run waits for this count before starting.
+                {
+                    std::lock_guard guard(_zombieBlocksMutex);
+                    for (const auto& block : _zombieBlocks) {
+                        if (block->state() == REQUESTED_STOP) {
+                            this->emitErrorMessageIfAny("retired block at end of run", block->changeStateTo(STOPPED));
+                        }
+                    }
+                }
+                for (auto& list : *_executionOrder) {
+                    cleanupZombieBlocks(list);
+                }
             }
         };
         on_scope_exit closeAdoption = [this, runnerID] { closeAdoptionList(runnerID); };
@@ -1957,15 +2217,16 @@ protected:
 
                 // Zombies are cleaned per-thread, as we remove from the localBlockList as well.
                 // Cleaning zombies has low priority, so uses process_stream_to_message_ratio (a different ratio could be introduced)
-                cleanupZombieBlocks(localBlockList);
-
-                adoptBlocks(runnerID, localBlockList);
-
-                const std::size_t nHandledBefore = gr::detail::handledMessageSpans();
-                std::ranges::for_each(localBlockList, &BlockModel::processScheduledMessages);
-                if (gr::detail::handledMessageSpans() != nHandledBefore) {
-                    wakeWorkers(); // a reply a block wrote on this thread waits in the children's ring for the next pass
-                }
+                std::ignore              = callAsWork([&] {
+                    cleanupZombieBlocks(localBlockList);
+                    adoptBlocks(runnerID, localBlockList);
+                    const std::size_t nHandledBefore = gr::detail::handledMessageSpans();
+                    std::ranges::for_each(localBlockList, &BlockModel::processScheduledMessages);
+                    if (gr::detail::handledMessageSpans() != nHandledBefore) {
+                        wakeWorkers();
+                    }
+                    return work::Result{0UZ, 0UZ, work::Status::OK};
+                });
                 const auto previousState = activeState;
                 activeState              = this->state();
                 if (gr::atomic_ref(_run.generation).load_acquire() != generation) {
@@ -1990,8 +2251,12 @@ protected:
                     if (result->status == work::Status::DONE) {
                         // a block queued for this job list, such as the replacement of the block that ended last,
                         // keeps the worker in its loop
-                        cleanupZombieBlocks(localBlockList);
-                        if (adoptBlocks(runnerID, localBlockList) == 0UZ && closeAdoptionListIfEmpty(runnerID)) {
+                        const auto closed = callAsWork([&] {
+                            cleanupZombieBlocks(localBlockList);
+                            const bool done = adoptBlocks(runnerID, localBlockList) == 0UZ && closeAdoptionListIfEmpty(runnerID);
+                            return work::Result{0UZ, 0UZ, done ? work::Status::DONE : work::Status::OK};
+                        });
+                        if (closed && closed->status == work::Status::DONE) {
                             break; // nothing happened -> shutdown this worker
                         }
                     } else if (result->status == work::Status::ERROR) {
@@ -2240,11 +2505,26 @@ protected:
     // block the sweep reached before. Both read _nWorkersInLoop under _workersInLoopMutex. Called by the last worker
     // under that mutex
     void settleStoppedBlockingBlocks() {
-        graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) {
+        auto settle = [this](const auto& block) {
             if (block->blockCategory() != ScheduledBlockGroup && block->isBlocking() && block->state() == lifecycle::State::REQUESTED_STOP) {
                 this->emitErrorMessageIfAny("settleStoppedBlockingBlocks() -> LifecycleState", block->changeStateTo(lifecycle::State::STOPPED));
             }
-        });
+        };
+        // A stop advances the generation before its lifecycle sweep takes the child lock. The
+        // last worker can therefore leave while a composition still owns that lock and mutates
+        // the graph. Read the protected execution/adoption lists instead of the graph's vector.
+        {
+            std::lock_guard lock(_executionOrderMutex);
+            for (const auto& list : *_executionOrder) {
+                std::ranges::for_each(list, settle);
+            }
+        }
+        {
+            std::lock_guard lock(_adoptionBlocksMutex);
+            for (const auto& list : _adoptionBlocks) {
+                std::ranges::for_each(list, settle);
+            }
+        }
     }
 
     // adds a request for work quiescence and waits until no worker is inside work(). A request made from inside a work()
@@ -2572,6 +2852,31 @@ protected:
         return jobList;
     }
 
+    // Reuse ordinary retirement; releasing readers first makes removal/rollback immediately
+    // stop imposing backpressure, even when a worker still holds a retired block in its local list.
+    void retireCompositionBlock(std::shared_ptr<BlockModel> block) {
+        releaseStreamInputs(*block);
+        if (block->msgIn->isConnected()) {
+            if (auto disconnected = block->msgIn->disconnect(); !disconnected) {
+                throw gr::exception(disconnected.error().message);
+            }
+        }
+        const std::string name(block->uniqueName());
+        const auto        previousState = block->state();
+        makeZombie(block);
+        if (previousState != lifecycle::State::ERROR && block->state() == lifecycle::State::ERROR) {
+            throw gr::exception("branch stop hook failed during retirement");
+        }
+        if (block->state() == lifecycle::State::REQUESTED_STOP) {
+            if (auto stopped = block->changeStateTo(lifecycle::State::STOPPED); !stopped) {
+                throw gr::exception(stopped.error().message);
+            }
+        }
+        if (auto removed = _graph->removeBlockByName(name); !removed) {
+            throw gr::exception(removed.error().message);
+        }
+    }
+
     // calls the predicate on each port of the collection and returns true at the first port it accepts
     template<typename TPredicate>
     [[nodiscard]] static bool anyPort(BlockModel::DynamicPorts& ports, TPredicate predicate) {
@@ -2814,6 +3119,9 @@ protected:
     Message replyAfter(Message request, std::string_view replyEndpoint, GraphEdit edit) {
         std::expected<property_map, Error> result;
         try {
+            if (_compositionInconsistent.load()) {
+                throw gr::exception("execution quarantined after failed composition rollback");
+            }
             result = (this->*edit)(request);
         } catch (const gr::exception& e) {
             result = std::unexpected(Error(e));
@@ -3119,10 +3427,6 @@ protected:
     */
     void cleanupZombieBlocks(std::vector<std::shared_ptr<BlockModel>>& localBlockList) {
         using enum lifecycle::State;
-        if (localBlockList.empty()) {
-            return;
-        }
-
         std::lock_guard guard(_zombieBlocksMutex);
 
         auto it = _zombieBlocks.begin();
@@ -3130,8 +3434,14 @@ protected:
         while (it != _zombieBlocks.end()) {
             const auto localBlockIt = std::ranges::find(localBlockList, *it);
             if (localBlockIt == localBlockList.end()) {
-                // we only care about the blocks local to our thread.
-                ++it;
+                // A transaction can retire a queued addition before any worker adopts it. Such a
+                // zombie has no local-list owner to clean it. The shared lists cover every adopted
+                // block; makeZombie() already removed its pending adoption.
+                if (!lifecycle::isActive((*it)->state()) && !jobListHolds(*it)) {
+                    it = _zombieBlocks.erase(it);
+                } else {
+                    ++it;
+                }
                 continue;
             }
 
