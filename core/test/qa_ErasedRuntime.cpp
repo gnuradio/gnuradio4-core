@@ -1450,4 +1450,29 @@ const boost::ut::suite<"refusals return"> refusalTests = [] {
     };
 };
 
+const boost::ut::suite<"native graph adoption"> nativeAdoptionTests = [] {
+    using namespace boost::ut;
+    using namespace gr;
+    "adopt preserves typed blocks and runs through Runtime"_test = [] {
+        auto  graph  = std::make_unique<Graph>();
+        auto& source = graph->emplaceBlock<qa_runtime::RampSource>({{"n_samples", gr::Size_t{64}}});
+        auto& sink   = graph->emplaceBlock<qa_runtime::RecordingSink>({{"name", "adopted_sink"}});
+        expect(graph->connect<"out", "in">(source, sink).has_value());
+        auto adopted = RuntimeGraph::adopt(std::move(graph), {});
+        expect(eq(adopted.blocks().size(), std::size_t{2}));
+        auto runtime = Runtime::create(std::move(adopted));
+        expect(runtime.has_value()) << fatal;
+        bool called = false;
+        runtime->withScheduler([&](SchedulerModel& scheduler) {
+            called = true;
+            expect(scheduler.asBlockModel() != nullptr);
+        });
+        expect(called);
+        expect(eq(runtime->blocks().size(), std::size_t{2}));
+        expect(runtime->runAndWait().has_value());
+        expect(eq(qa_runtime::takeCollected("adopted_sink").samples.size(), std::size_t{64}));
+    };
+    "null native graph is refused"_test = [] { expect(throws<std::invalid_argument>([] { std::ignore = RuntimeGraph::adopt({}, {}); })); };
+};
+
 int main() { /* tests are statically registered */ }

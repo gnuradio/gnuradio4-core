@@ -136,6 +136,16 @@ struct RuntimeGraph::Impl {
     std::map<std::string, std::weak_ptr<BlockModel>, std::less<>> documentUniqueNames; // the `unique_name` of each top-level block fromYaml() read
 };
 
+RuntimeGraph RuntimeGraph::adopt(std::unique_ptr<Graph> graph, std::shared_ptr<PluginLoader> loader) {
+    if (!graph) {
+        throw std::invalid_argument("cannot adopt an empty native graph");
+    }
+    auto impl    = std::make_unique<Impl>();
+    impl->loader = loaderOrGlobal(std::move(loader));
+    impl->graph  = std::move(graph);
+    return RuntimeGraph(std::move(impl));
+}
+
 struct Runtime::Impl {
     std::shared_ptr<PluginLoader>   loader;      // the graph's share, declared first to outlive the scheduler and the blocks
     MsgPortIn                       events;      // declared before the scheduler to outlive the scheduler writing to it
@@ -701,6 +711,23 @@ std::expected<void, RuntimeError> Runtime::send(RuntimeCommand command, std::str
         return std::unexpected(localError(std::format("the scheduler's message input is full -- the message to '{}' endpoint '{}' is dropped", serviceName, endpoint), where));
     }
     return {};
+}
+
+std::vector<BlockHandle> Runtime::blocks() const {
+    std::vector<BlockHandle> handles;
+    if (_impl) {
+        if (auto* graph = _impl->schedulerBlock->graph()) {
+            gr::graph::forEachBlock<block::Category::All>(*graph, [this, &handles](const std::shared_ptr<BlockModel>& block) { handles.push_back(BlockHandle(std::shared_ptr<void>(block), _impl->loader)); });
+        }
+    }
+    return handles;
+}
+
+void Runtime::withScheduler(const std::function<void(SchedulerModel&)>& operation) {
+    if (!_impl) {
+        throw std::logic_error("runtime has been moved from");
+    }
+    operation(*_impl->scheduler);
 }
 
 BlockHandle Runtime::scheduler() const { return _impl ? BlockHandle(std::shared_ptr<void>(_impl->schedulerBlock), _impl->loader, true) : BlockHandle{}; }

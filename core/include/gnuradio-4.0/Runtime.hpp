@@ -36,6 +36,8 @@ class BlockModel;
 
 /// Declared and not defined here. A program that builds its own loader includes `PluginLoader.hpp`.
 class PluginLoader;
+struct Graph;
+class SchedulerModel;
 
 struct GNURADIO_EXPORT RuntimeError {
     std::string   message;
@@ -123,6 +125,9 @@ public:
 
     /// An empty graph over the process's plugin loader.
     RuntimeGraph();
+
+    /// Adopt a caller-built native graph; the runtime retains its plugin loader.
+    [[nodiscard]] static RuntimeGraph adopt(std::unique_ptr<Graph> graph, std::shared_ptr<PluginLoader> loader);
 
     ~RuntimeGraph();
     RuntimeGraph(RuntimeGraph&&) noexcept;
@@ -243,6 +248,14 @@ public:
     /// the scheduler and the graph's plugin loader alive after the Runtime is destroyed, and it is invalid on a
     /// moved-from Runtime.
     [[nodiscard]] BlockHandle scheduler() const;
+
+    /// Native integration callback. The reference must not escape. The caller serializes
+    /// lifecycle and graph edits; this does not create or run a second scheduler.
+    void withScheduler(const std::function<void(SchedulerModel&)>& operation);
+
+    /// Snapshot the current native graph's blocks, including composed branches.
+    /// The caller serializes this with graph edits. Handles retain the returned blocks.
+    [[nodiscard]] std::vector<BlockHandle> blocks() const;
 
     /// The reports the graph made since the last call, oldest first, at most `maxEvents` of them. Between calls the
     /// scheduler's message output holds as many reports as its buffer has slots. A notification that finds no free slot
