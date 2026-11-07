@@ -355,3 +355,7 @@ if(MSVC)
 endif()
 add_ut_test(qa_FiniteSchedulerCompletion)
 set_tests_properties(qa_FiniteSchedulerCompletion PROPERTIES TIMEOUT 60)
+
+add_ut_test(qa_SchedulerComposition)
+target_compile_options(qa_SchedulerComposition PRIVATE -UNDEBUG)
+set_tests_properties(qa_SchedulerComposition PROPERTIES TIMEOUT 90)
