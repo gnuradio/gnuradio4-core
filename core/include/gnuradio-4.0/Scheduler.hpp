@@ -1045,34 +1045,26 @@ public:
 
     std::expected<void, Error> runAndWait() { return runAndWaitImpl(true); }
 
-    // External controllers cancel sources, then wait for the actual run, whether
-    // it was driven directly by runAndWait() or by SchedulerWrapper::start().
-    // Work quiescence and downstream draining share a deadline; lifecycle hooks must cooperate.
+    // Request each source's own DONE finalization. Neither lifecycle changes nor
+    // port writes occur on this thread before the ordinary Stop fallback below.
+    // The flag costs one relaxed load per ordinary Block::work() call. Blocks or
+    // schedulers with custom work() must forward it; silent blocking sources may
+    // not see it until the deadline, when their normal Stop hook releases work.
     bool stopAfterDrain(std::chrono::milliseconds timeout) {
         using enum lifecycle::State;
-        const auto deadline         = std::chrono::steady_clock::now() + timeout;
-        bool       drained          = false;
-        bool       sourcesCancelled = false;
-        while (true) {
-            if (!runInProgress()) {
-                drained = this->state() != ERROR && !runEndingBlock().has_value();
-                break;
-            }
-            // RUNNING is published before start() starts the children. Retry
-            // after short waits until the worker dispatch makes them ready.
-            if (!sourcesCancelled && workerStarted()) {
-                sourcesCancelled = cancelDrainSources(deadline);
-            }
-            if (!runInProgress()) {
-                drained = this->state() != ERROR && !runEndingBlock().has_value();
-                break;
-            }
-            const auto now = std::chrono::steady_clock::now();
-            if (now >= deadline) {
-                break;
-            }
-            std::this_thread::sleep_until(std::min(deadline, now + std::chrono::milliseconds(1)));
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        // RUNNING is visible before child start hooks finish. Do not let those
+        // hooks clear a request made before the run's workers were dispatched.
+        while (runInProgress() && !workerStarted() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
+        if (runInProgress() && std::chrono::steady_clock::now() < deadline) {
+            requestFinish();
+        }
+        while (runInProgress() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        const bool drained = !runInProgress() && std::chrono::steady_clock::now() <= deadline && this->state() != ERROR && !runEndingBlock().has_value();
         if (this->changeStateTo(REQUESTED_STOP)) {
             std::ignore = this->changeStateTo(STOPPED);
         } else {
@@ -1080,6 +1072,33 @@ public:
         }
         waitForRunAndClaims();
         return drained;
+    }
+
+    // Scheduler work bypasses Block::workInternal(), so explicitly forward the
+    // request into this scheduler's graph. Each nested scheduler takes its own
+    // graph-edit/lifecycle guards. No work quiescence is needed for atomic stores.
+    void requestFinish() {
+        const bool    held        = awaitMessagePass();
+        on_scope_exit releasePass = [this, held] {
+            if (held) {
+                releaseMessagePass();
+            }
+        };
+        std::lock_guard childLock(_childLifecycleMutex);
+        auto            connectedStream = [](DynamicPort& port) { return port.isConnected() && port::decodePortType(port.portMaskInfo()) == PortType::STREAM; };
+        auto            walk            = [&](auto&& self, auto& group) -> void {
+            for (auto& block : group.blocks()) {
+                if (block->blockCategory() == ScheduledBlockGroup) {
+                    block->requestFinish();
+                } else if (!block->blocks().empty()) {
+                    self(self, *block);
+                } else if (anyPort(block->dynamicOutputPorts(), connectedStream) && !anyPort(block->dynamicInputPorts(), connectedStream)) {
+                    block->requestFinish();
+                }
+            }
+        };
+        walk(walk, *_graph);
+        wakeWorkers();
     }
 
 private:
@@ -1201,104 +1220,6 @@ protected:
             std::this_thread::yield();
         }
         return true;
-    }
-
-    bool cancelDrainSources(std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) {
-        // Work quiescence does not exclude message-driven graph edits. Try the
-        // message pass first, as graph edits do, and retry a busy pass on the next
-        // drain iteration. Never wait on a child's pass while holding its parent's.
-        if (!tryHoldMessagePass()) {
-            return false;
-        }
-        on_scope_exit releasePass = [this] { releaseMessagePass(); };
-        if (!lifecycle::isActive(this->state())) {
-            return true;
-        }
-        if (!workerStarted()) {
-            return false;
-        }
-        bool       cancelled          = true;
-        const auto connectedStream    = [](const DynamicPort& port) { return port.isConnected() && port::decodePortType(port.portMaskInfo()) == PortType::STREAM; };
-        const auto hasConnectedStream = [&connectedStream](auto& ports) {
-            return std::ranges::any_of(ports, [&connectedStream](auto& entry) {
-                return std::visit(
-                    [&connectedStream](auto& value) {
-                        if constexpr (requires { value.ports; }) {
-                            return std::ranges::any_of(value.ports, connectedStream);
-                        } else {
-                            return connectedStream(value);
-                        }
-                    },
-                    entry);
-            });
-        };
-        const auto isSource = [&hasConnectedStream](auto& block) { return !hasConnectedStream(block.dynamicInputPorts()) && hasConnectedStream(block.dynamicOutputPorts()); };
-        // Blocking sources need their stop hook to release work(). Their own
-        // work call publishes EOS after it returns, including its last samples.
-        {
-            std::unique_lock childLock(_childLifecycleMutex, std::try_to_lock);
-            if (!childLock.owns_lock()) {
-                return false;
-            }
-            graph::forEachBlock<TransparentBlockGroup>(*_graph, [&](auto& block) {
-                if (block->blockCategory() != ScheduledBlockGroup && block->isBlocking() && isSource(*block) && lifecycle::isActive(block->state())) {
-                    std::ignore = block->changeStateTo(lifecycle::State::REQUESTED_STOP);
-                }
-            });
-        }
-        std::ignore           = gr::atomic_ref(_nWorkQuiescenceRequests).fetch_add_seq_cst(1UZ);
-        on_scope_exit release = [this] { releaseWorkQuiescence(); };
-        while (gr::atomic_ref(_nWorkersInWork).load_acquire() != 0UZ) {
-            if (std::chrono::steady_clock::now() >= deadline) {
-                return false;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-        // A work call may request Stop, so take this lock only after quiescence.
-        std::unique_lock childLock(_childLifecycleMutex, std::try_to_lock);
-        if (!childLock.owns_lock()) {
-            return false;
-        }
-        auto cancel = [&](auto&& self, auto& group) -> void {
-            for (auto& block : group.blocks()) {
-                if (auto* scheduler = dynamic_cast<SchedulerModel*>(block.get())) {
-                    // Its worker also dispatches edits independently of ours.
-                    // Let it guard both its graph and any deeper schedulers.
-                    cancelled = scheduler->cancelDrainSources(deadline) && cancelled;
-                    continue;
-                }
-                if (!block->blocks().empty()) {
-                    self(self, *block);
-                    continue;
-                }
-                // Optional unconnected clock/message inputs do not make a
-                // stream source a consumer. Keep every source output at EOS.
-                if (isSource(*block) && lifecycle::isActive(block->state())) {
-                    if (block->changeStateTo(lifecycle::State::REQUESTED_STOP)) {
-                        for (auto& entry : block->dynamicOutputPorts()) {
-                            std::visit(
-                                [&connectedStream](auto& value) {
-                                    const auto publish = [&connectedStream](auto& port) {
-                                        if (connectedStream(port)) {
-                                            std::ignore = port.publishEoS();
-                                        }
-                                    };
-                                    if constexpr (requires { value.ports; }) {
-                                        std::ranges::for_each(value.ports, publish);
-                                    } else {
-                                        publish(value);
-                                    }
-                                },
-                                entry);
-                        }
-                    } else {
-                        cancelled = false;
-                    }
-                }
-            }
-        };
-        cancel(cancel, *_graph);
-        return cancelled;
     }
 
     // the first block whose work() returned ERROR, or whose error a worker drained with no msgOut reader, since the

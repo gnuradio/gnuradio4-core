@@ -906,12 +906,13 @@ public:
 
     static constexpr std::size_t kStallLimit = 1024UZ; // calls in a row with nothing moved that end a wait
 
-    DrainWatermark _drainMark{};
-    std::size_t    _nDrainStalls   = 0UZ;
-    bool           _drainStallHeld = false; // a drain stall whose epilogue waits for room in the outputs
-    DrainWatermark _epilogueWaitMark{};
-    std::size_t    _nEpilogueWaits = 0UZ;   // epilogue calls in a row that waited for room with nothing moved
-    bool           _waitedOnOutput = false; // the last call returned INSUFFICIENT_OUTPUT_ITEMS
+    DrainWatermark    _drainMark{};
+    std::size_t       _nDrainStalls   = 0UZ;
+    bool              _drainStallHeld = false; // a drain stall whose epilogue waits for room in the outputs
+    DrainWatermark    _epilogueWaitMark{};
+    std::size_t       _nEpilogueWaits = 0UZ;   // epilogue calls in a row that waited for room with nothing moved
+    std::atomic<bool> _finishRequested{false}; // one relaxed load per ordinary work() call
+    bool              _waitedOnOutput = false; // the last call returned INSUFFICIENT_OUTPUT_ITEMS
 
     std::vector<std::size_t> _nHandedPastRead; // per connected input, in port order: samples past the read position that processBulk() calls were handed and nothing has consumed or skipped since
 
@@ -1840,6 +1841,7 @@ public:
     // run, and a block that resumes keeps its counts
     [[nodiscard]] std::expected<void, Error> changeStateTo(lifecycle::State newState, const std::source_location location = std::source_location::current()) {
         if (newState == lifecycle::State::RUNNING && this->state() == lifecycle::State::INITIALISED) {
+            _finishRequested.store(false, std::memory_order_relaxed);
             _nDrainStalls     = 0UZ;
             _drainMark        = DrainWatermark{};
             _drainStallHeld   = false;
@@ -1849,6 +1851,12 @@ public:
         }
         return lifecycle::StateMachine<Derived>::changeStateTo(newState, location);
     }
+
+    // Cooperative stream completion: the next ordinary work() call takes its DONE
+    // finalization on its own thread. Custom work() implementations that bypass
+    // workInternal() must forward this request or implement equivalent completion.
+    void               requestFinish() noexcept { _finishRequested.store(true, std::memory_order_relaxed); }
+    [[nodiscard]] bool finishRequested() const noexcept { return _finishRequested.load(std::memory_order_relaxed); }
 
     constexpr void requestStop() noexcept { emitErrorMessageIfAny("requestStop()", this->changeStateTo(lifecycle::State::REQUESTED_STOP)); }
 
@@ -2833,6 +2841,20 @@ public:
 
         if (std::optional<work::Result> earlyOut = checkLifecycle(requestedWork)) {
             return *earlyOut;
+        }
+
+        // Do not call user processing after a finish request. Use precisely the
+        // same DONE finalization as a natural end, including the block's stop hook
+        // and EOS on its own output spans at the current write position. No output
+        // sample capacity is needed to publish this end marker.
+        if (finishRequested()) {
+            applyChangedSettings(true, &_pendingForwardParams);
+            auto         inputSpans  = prepareStreams(inputPorts<PortType::STREAM>(&self()), 0UZ);
+            auto         outputSpans = prepareStreams(outputPorts<PortType::STREAM>(&self()), 0UZ);
+            work::Status status      = DONE;
+            std::size_t  consumed    = 0UZ;
+            finaliseIO(inputSpans, outputSpans, status, consumed, 0UZ, 0UZ);
+            return {requestedWork, 0UZ, status};
         }
 
         on_scope_exit _cacheGuard = [&] {

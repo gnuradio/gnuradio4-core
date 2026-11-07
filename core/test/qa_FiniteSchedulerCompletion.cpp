@@ -22,8 +22,15 @@ struct Source : gr::Block<Source> {
     std::atomic<bool>        stopped     = false;
     [[nodiscard]] bool       isBlocking() const noexcept { return waitForStop; }
     std::function<void()>    onStop;
-    void                     stop() {
-        stopped = true;
+    std::thread::id          workThread, stopThread;
+    std::atomic<std::size_t> finishRequests{0};
+    void                     requestFinish() {
+        ++finishRequests;
+        gr::Block<Source>::requestFinish();
+    }
+    void stop() {
+        stopThread = std::this_thread::get_id();
+        stopped    = true;
         if (onStop) {
             onStop();
         }
@@ -36,7 +43,8 @@ struct Source : gr::Block<Source> {
         produced = 0;
     }
     gr::work::Status processBulk(gr::InputSpanLike auto&, gr::OutputSpanLike auto& a, gr::OutputSpanLike auto& b) {
-        entered = true;
+        workThread = std::this_thread::get_id();
+        entered    = true;
         while (waitForStop && !stopped.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
@@ -85,6 +93,39 @@ struct Sink : gr::Block<Sink> {
         return gr::work::Status::OK;
     }
 };
+struct CustomWorkSource : gr::Block<CustomWorkSource> {
+    gr::PortOut<int> out;
+    GR_MAKE_REFLECTABLE(CustomWorkSource, out);
+    bool              forwardFinish = false;
+    std::atomic<bool> entered{false};
+    gr::work::Status  processBulk(gr::OutputSpanLike auto& output) {
+        output.publish(0);
+        return gr::work::Status::OK;
+    }
+    gr::work::Result work(std::size_t requestedWork) {
+        entered = true;
+        if (forwardFinish && finishRequested()) {
+            return gr::Block<CustomWorkSource>::work(requestedWork);
+        }
+        return {requestedWork, 0UZ, gr::work::Status::OK};
+    }
+};
+
+struct OneSource : gr::Block<OneSource> {
+    gr::PortOut<int> out;
+    GR_MAKE_REFLECTABLE(OneSource, out);
+    std::size_t       produced = 0;
+    std::atomic<bool> entered{false};
+    void              start() {
+        produced = 0;
+        entered  = false;
+    }
+    int processOne() {
+        entered = true;
+        return static_cast<int>(produced++);
+    }
+};
+
 template<gr::scheduler::ExecutionPolicy Policy>
 struct ThrowingInitScheduler : gr::scheduler::SchedulerBase<ThrowingInitScheduler<Policy>, Policy> {
     using gr::scheduler::SchedulerBase<ThrowingInitScheduler<Policy>, Policy>::SchedulerBase;
@@ -106,18 +147,16 @@ struct ThrowingInitScheduler : gr::scheduler::SchedulerBase<ThrowingInitSchedule
 };
 
 template<gr::scheduler::ExecutionPolicy Policy>
-struct CountingDrainScheduler : gr::scheduler::Simple<Policy> {
-    using gr::scheduler::Simple<Policy>::Simple;
-    std::atomic<std::size_t> passes = 0;
-    bool                     cancelDrainSources(std::chrono::steady_clock::time_point deadline) {
-        ++passes;
-        return gr::scheduler::Simple<Policy>::cancelDrainSources(deadline);
-    }
-};
-
-template<gr::scheduler::ExecutionPolicy Policy>
 struct DrainEditScheduler : gr::scheduler::Simple<Policy> {
     using gr::scheduler::Simple<Policy>::Simple;
+
+    bool canClaimMessagePass() {
+        if (!this->tryHoldMessagePass()) {
+            return false;
+        }
+        this->releaseMessagePass();
+        return true;
+    }
 
     // Expose a graph-edit attempt at a controlled thread boundary. A busy
     // dispatcher leaves the request pending, as processScheduledMessages() does.
@@ -187,7 +226,7 @@ void qualify() {
         names.push_back(std::format("{} / {}", name, gr::meta::enumName(Policy).value_or("unknown")));
         return boost::ut::test(std::string_view{names.back()});
     };
-    policyTest("drain releases blocking sources and times out blocking consumers, including nested graphs") = [] {
+    policyTest("silent blocking sources and consumers reach the drain deadline, including nested graphs") = [] {
         for (bool nested : {false, true}) {
             for (bool blockingSource : {false, true}) {
                 gr::Graph flow;
@@ -209,21 +248,20 @@ void qualify() {
                 }
                 expect(scheduler.start().has_value());
                 expect(wait([&] { return blockingSource ? source.entered.load() : sink.entered.load(); }));
-                auto       drain     = std::async(std::launch::async, [&] { return scheduler.stopAfterDrain(blockingSource ? std::chrono::milliseconds(2000) : std::chrono::milliseconds(50)); });
+                auto       drain     = std::async(std::launch::async, [&] { return scheduler.stopAfterDrain(std::chrono::milliseconds(50)); });
                 const bool completed = drain.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
                 expect(completed);
                 if (!completed) {
                     source.stopped = true;
                     sink.stopped   = true;
                 }
-                expect(eq(drain.get(), blockingSource));
-                if (blockingSource) {
-                    expect(eq(source.produced, sink.consumed));
-                }
+                expect(!drain.get());
+                expect(source.stopped.load());
+                expect(sink.stopped.load());
             }
         }
     };
-    policyTest("draining consumers does not repeat source cancellation") = [] {
+    policyTest("draining consumers does not repeat source finish requests") = [] {
         std::atomic<bool> cancelled = false;
         gr::Graph         graph;
         auto&             source = graph.emplaceBlock<Source>();
@@ -237,7 +275,7 @@ void qualify() {
             cancelled        = true;
         };
         expect(graph.connect<"out", "in">(source, sink).has_value());
-        auto inner = std::make_shared<gr::SchedulerWrapper<CountingDrainScheduler<Policy>>>();
+        auto inner = std::make_shared<gr::SchedulerWrapper<gr::scheduler::Simple<Policy>>>();
         inner->setGraph(std::move(graph));
         gr::Graph outer;
         outer.addBlock(gr::SchedulerModel::asBlockModelPtr(inner));
@@ -247,11 +285,44 @@ void qualify() {
         expect(wait([&] { return sink.entered.load(); }));
         auto drain = std::async(std::launch::async, [&] { return scheduler.stopAfterDrain(std::chrono::seconds(5)); });
         expect(wait([&] { return cancelled.load() && sink.entered.load(); }));
-        const auto passes = inner->blockRef().passes.load();
+        const auto passes = source.finishRequests.load();
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        expect(eq(inner->blockRef().passes.load(), passes));
+        expect(eq(source.finishRequests.load(), passes));
+        expect(eq(passes, std::size_t{1}));
         sink.stopped = true;
         expect(drain.get());
+    };
+    policyTest("custom work must forward finish requests") = [] {
+        for (const bool forward : {false, true}) {
+            gr::Graph graph;
+            auto&     source     = graph.emplaceBlock<CustomWorkSource>();
+            source.forwardFinish = forward;
+            auto& sink           = graph.emplaceBlock<Sink>();
+            expect(graph.connect<"out", "in">(source, sink).has_value());
+            gr::SchedulerWrapper<gr::scheduler::Simple<Policy>> scheduler;
+            scheduler.setGraph(std::move(graph));
+            expect(scheduler.start().has_value());
+            expect(wait([&] { return source.entered.load(); }));
+            expect(eq(scheduler.stopAfterDrain(std::chrono::milliseconds(50)), forward));
+        }
+    };
+    policyTest("finish skips processOne and is cleared for the next run") = [] {
+        gr::Graph graph;
+        auto&     source = graph.emplaceBlock<OneSource>();
+        auto&     sink   = graph.emplaceBlock<Sink>();
+        expect(graph.connect<"out", "in">(source, sink).has_value());
+        gr::SchedulerWrapper<gr::scheduler::Simple<Policy>> scheduler;
+        scheduler.setGraph(std::move(graph));
+        std::size_t previous = 0;
+        for (int run = 0; run < 2; ++run) {
+            source.entered = false; // fence this run, not the prior run's completed call
+            expect(scheduler.start().has_value());
+            expect(wait([&] { return source.entered.load(); }));
+            expect(scheduler.stopAfterDrain(std::chrono::seconds(2)));
+            expect(source.produced > 0UZ);
+            expect(eq(sink.consumed - previous, source.produced)) << "run=" << run << " writer=" << source.out.streamWriter().position() << " reader=" << sink.in.streamReader().position();
+            previous = sink.consumed;
+        }
     };
     policyTest("an error during drain is not successful completion") = [] {
         gr::Graph graph;
@@ -320,7 +391,7 @@ void qualify() {
             expect(eq(b.consumed, 2UZ * count));
         }
     };
-    policyTest("drain stop cancels sources and consumes accepted data; stalled drain times out") = [] {
+    policyTest("drain requests source-owned completion and consumes accepted data; stalled drain times out") = [] {
         for (const bool stall : {false, true}) {
             gr::Graph graph;
             auto&     src = graph.emplaceBlock<Source>();
@@ -344,7 +415,7 @@ void qualify() {
             expect(scheduler.state() == gr::lifecycle::State::STOPPED);
         }
     };
-    policyTest("drain stop quiesces a nested scheduler before cancelling its source") = [] {
+    policyTest("drain forwards finish requests to nested source workers") = [] {
         gr::Graph innerGraph;
         auto&     source = innerGraph.emplaceBlock<Source>();
         source.limit     = std::size_t(-1);
@@ -365,7 +436,7 @@ void qualify() {
         expect(eq(source.produced, second.consumed));
         expect(scheduler.state() == gr::lifecycle::State::STOPPED);
     };
-    policyTest("drain excludes graph edits until source cancellation has finished") = [] {
+    policyTest("drain releases its graph guard before the source worker stop hook") = [] {
         for (const bool nested : {false, true}) {
             std::atomic<bool> sourceStopping = false;
             std::atomic<bool> releaseStop    = false;
@@ -401,13 +472,15 @@ void qualify() {
             expect(wait([&] { return sourceStopping.load(); }));
             using namespace gr::serialization_fields;
             const gr::property_map edge{{std::pmr::string(EDGE_SOURCE_BLOCK), std::string(source.unique_name)}, {std::pmr::string(EDGE_SOURCE_PORT), std::string("out")}, {std::pmr::string(EDGE_DESTINATION_BLOCK), std::string(removed.unique_name)}, {std::pmr::string(EDGE_DESTINATION_PORT), std::string("in")}};
-            // Enter the real edge-edit handler from another controller, using
-            // the same message-pass claim as processScheduledMessages().
-            auto edit = std::async(std::launch::async, [&] { return edited->tryRemoveEdge(edge); });
-            expect(!edit.get().has_value()) << "the graph edit ran inside the held cancellation pass";
+            // The worker owns DONE finalization. Its held hook must not retain
+            // the draining controller's graph-edit claim.
+            auto edit = std::async(std::launch::async, [&] { return wait([&] { return edited->canClaimMessagePass(); }); });
+            expect(edit.get()) << "drain held the graph-edit claim during worker finalization";
             releaseStop = true;
             releaseStop.notify_all();
             expect(drain.get());
+            expect(source.stopThread == source.workThread);
+            expect(source.stopThread != std::this_thread::get_id());
             expect(eq(source.produced, first.consumed));
             expect(eq(source.produced, second.consumed));
             const auto response = edited->tryRemoveEdge(edge);

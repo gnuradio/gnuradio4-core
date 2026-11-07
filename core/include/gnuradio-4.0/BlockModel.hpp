@@ -501,6 +501,10 @@ public:
 
     [[nodiscard]] virtual work::Result work(std::size_t requested_work) = 0;
 
+    // Requests worker-owned DONE finalization without changing lifecycle state.
+    // A custom work() override must honor or forward the underlying finish flag.
+    virtual void requestFinish() = 0;
+
     [[nodiscard]] virtual work::Status draw(const property_map& config = {}) = 0;
 
     [[nodiscard]] virtual block::Category blockCategory() const { return block::Category::NormalBlock; }
@@ -811,6 +815,8 @@ public:
     }
 
     [[nodiscard]] constexpr work::Result work(std::size_t requested_work = undefined_size) override { return blockRef().work(requested_work); }
+
+    void requestFinish() override { blockRef().requestFinish(); }
 
     constexpr work::Status draw(const property_map& config = {}) override {
         if constexpr (requires { blockRef().draw(config); }) {
