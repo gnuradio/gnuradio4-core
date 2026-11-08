@@ -332,6 +332,20 @@ if(MSVC)
     gnuradio-options INTERFACE _CRT_SECURE_NO_WARNINGS _SILENCE_CXX20_OLD_SHARED_PTR_ATOMIC_SUPPORT_DEPRECATION_WARNING)
 endif()
 
+# Complex products and quotients use the plain formulas. Under GCC and Clang, std::complex multiplication follows C's
+# Annex G: every product is checked for NaN and calls __mulsc3 to recover infinities, which stops the loop vectorizing,
+# and every quotient calls __divsc3. -fcx-limited-range drops the check and divides without scaling. The flag gives up
+# the recovery of an infinity or NaN result and the scaling of a quotient. Quotients are exact to float rounding for
+# magnitudes below about 2^60, and float samples from a converter stay far inside that range: c*c + d*d leaves the float
+# range near 2^64, so data scaled beyond that loses the scaled division. MSVC's standard library multiplies without the
+# recovery already, and clang-cl's MSVC front end does not take the flag.
+if(NOT MSVC)
+  target_compile_options(
+    gnuradio-options
+    INTERFACE "$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:GNU,Clang,AppleClang>>:-fcx-limited-range>"
+              "$<$<AND:$<COMPILE_LANGUAGE:C>,$<C_COMPILER_ID:GNU,Clang,AppleClang>>:-fcx-limited-range>")
+endif()
+
 message(
   STATUS
     "Is block registry enabled? (faster compile-times and when runtime or Python wrapping APIs are not required) ${GR_ENABLE_BLOCK_REGISTRY}"
