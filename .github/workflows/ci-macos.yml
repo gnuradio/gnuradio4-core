@@ -77,7 +77,8 @@ jobs:
             -DGR_USE_FETCHCONTENT_DEPS=ON \
             -DCMAKE_OSX_SYSROOT="$SDKROOT" \
             -DCMAKE_EXE_LINKER_FLAGS="-L${{ matrix.compiler.prefix }}/lib/c++ -Wl,-rpath,${{ matrix.compiler.prefix }}/lib/c++" \
-            -DCMAKE_SHARED_LINKER_FLAGS="-L${{ matrix.compiler.prefix }}/lib/c++ -Wl,-rpath,${{ matrix.compiler.prefix }}/lib/c++"
+            -DCMAKE_SHARED_LINKER_FLAGS="-L${{ matrix.compiler.prefix }}/lib/c++ -Wl,-rpath,${{ matrix.compiler.prefix }}/lib/c++" \
+            -DCMAKE_MODULE_LINKER_FLAGS="-L${{ matrix.compiler.prefix }}/lib/c++ -Wl,-rpath,${{ matrix.compiler.prefix }}/lib/c++"
 
       - name: Build
         run: cmake --build build
