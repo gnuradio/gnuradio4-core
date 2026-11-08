@@ -36,8 +36,13 @@ bool insertBlockFactory(BlockRegistry& registry, const BlockRegistration& regist
 
 } // namespace gr
 
-/// Defined by GR_PLUGIN: the plugin's own block registry, reachable without the plugin's type.
-GNURADIO_EXPORT
+/// Defined by GR_PLUGIN in each plugin: that plugin's own block registry, reachable without the plugin's type.
+/// Hidden so that each plugin calls its own definition: under `-flat_namespace` an exported symbol binds to the
+/// first loaded plugin's definition, and a plugin built with default visibility would export it.
+#if defined(__GNUC__) && !defined(_WIN32) && !defined(__CYGWIN__)
+__attribute__((visibility("hidden"))) gr::BlockRegistry& grPluginBlockRegistry();
+#else
 gr::BlockRegistry& grPluginBlockRegistry();
+#endif
 
 #endif // GNURADIO_BLOCK_REGISTRATION_HPP
