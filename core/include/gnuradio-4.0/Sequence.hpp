@@ -45,6 +45,7 @@ struct SequenceWaitSlot {
 class alignas(kCacheLine) Sequence {
     mutable std::size_t               _fieldsValue{kInitialCursorValue};
     mutable std::uint32_t             _nTimedWaiters{0U};
+    mutable std::uint32_t             _nPlainWaiters{0U};
     mutable detail::SequenceWaitSlot* _waitSlot{nullptr}; // created by the first waitUntil(), owned by this sequence
 
 public:
@@ -67,7 +68,20 @@ public:
     [[maybe_unused]] forceinline std::size_t incrementAndGet() noexcept { return gr::atomic_ref(_fieldsValue).fetch_add(1UZ) + 1UZ; }
     [[nodiscard]] forceinline std::size_t addAndGet(std::size_t increment) noexcept { return gr::atomic_ref(_fieldsValue).fetch_add(increment) + increment; }
     [[nodiscard]] forceinline std::size_t subAndGet(std::size_t decrement) noexcept { return gr::atomic_ref(_fieldsValue).fetch_sub(decrement) - decrement; }
-    void                                  wait(std::size_t oldValue) const noexcept { gr::atomic_ref(_fieldsValue).wait(oldValue); }
+
+    // Blocks until the value leaves oldValue. The thread is counted in _nPlainWaiters from before its test of the value
+    // until it returns, so notifyCountedWaiters() reaches it. The test is hasLeft(): if the notifier's read-modify-write
+    // of the value comes first in the value's modification order, this call sees the new value and does not block. If
+    // this call's test comes first, the notifier's read-modify-write reads from the test's write, the count increment is
+    // ordered before the notifier's load of the count, and the notifier sees this waiter. The atomic wait then
+    // settles the race between its own value test and the notify.
+    void wait(std::size_t oldValue) const noexcept {
+        gr::atomic_ref(_nPlainWaiters).fetch_add(1U);
+        if (!hasLeft(oldValue)) {
+            gr::atomic_ref(_fieldsValue).wait(oldValue);
+        }
+        gr::atomic_ref(_nPlainWaiters).fetch_sub(1U);
+    }
 
     // Blocks until the value leaves oldValue or the deadline passes, and returns whether it left. After a
     // read-modify-write of the value, notify_all() ends the wait at once. The read-modify-writes are incrementAndGet(),
@@ -89,11 +103,29 @@ public:
         return waitForChange(deadline, [this, oldValue, &other, otherOldValue] { return hasLeft(oldValue) || other.hasLeft(otherOldValue); });
     }
 
+    // the threads blocked in wait()
+    [[nodiscard]] std::uint32_t nPlainWaiters() const noexcept { return gr::atomic_ref(_nPlainWaiters).load_acquire(); }
+
     // the threads waiting in waitUntil()
     [[nodiscard]] std::uint32_t nTimedWaiters() const noexcept { return gr::atomic_ref(_nTimedWaiters).load_acquire(); }
 
+    // Wakes every thread in wait() and waitUntil(), whether or not the caller advanced the value by a read-modify-write.
     void notify_all() noexcept {
         gr::atomic_ref(_fieldsValue).notify_all();
+        if (gr::atomic_ref(_nTimedWaiters).load_acquire() != 0U) [[unlikely]] {
+            notifyTimedWaiters();
+        }
+    }
+
+    // Wakes the threads that wait() and waitUntil() count, and costs two loads while no thread waits. The caller has
+    // advanced the value by a read-modify-write (incrementAndGet(), addAndGet(), subAndGet() or compareAndSet()) just
+    // before: the waiters' counts and tests are ordered against that read-modify-write (see wait() and hasLeft()). A
+    // waiter of the two-sequence waitUntil() relies on the same order for the read-modify-write of its `other`
+    // sequence, followed by this call on the sequence it waits on. After setValue(), use notify_all().
+    void notifyCountedWaiters() noexcept {
+        if (gr::atomic_ref(_nPlainWaiters).load_acquire() != 0U) [[unlikely]] {
+            gr::atomic_ref(_fieldsValue).notify_all();
+        }
         if (gr::atomic_ref(_nTimedWaiters).load_acquire() != 0U) [[unlikely]] {
             notifyTimedWaiters();
         }
@@ -118,7 +150,9 @@ private:
 
     // Tests the value with a compare-and-set of oldValue onto itself. The compare-and-set is ordered against the
     // notifier's read-modify-write of the value. If the notifier's comes first, this call sees the new value. If this
-    // call comes first, the notifier sees this waiter in _nTimedWaiters.
+    // call comes first, the notifier sees this waiter in the waiter counts (_nTimedWaiters or _nPlainWaiters). The test is
+    // a compare-and-set, a write of the same value: a plain load would not order the count against the notifier's load
+    // of it.
     [[nodiscard]] bool hasLeft(std::size_t oldValue) const noexcept {
         std::size_t expected = oldValue;
         return !gr::atomic_ref(_fieldsValue).compare_exchange(expected, oldValue);

@@ -3089,10 +3089,11 @@ public:
             // upstream readers above. The progress sequence advances after both, and a thread woken by the notify
             // finds the samples in the buffers and the readers released. The call that stops the block reports no
             // work but can publish the last samples and the end-of-stream tag, and it advances the sequence too. A
-            // stopped block returns DONE on every later call and moves nothing.
+            // stopped block returns DONE on every later call and moves nothing. The notify costs two loads while
+            // no thread waits on the sequence.
             if (result.performed_work > 0UZ || (result.status == gr::work::Status::DONE && !wasStopped)) {
                 progress->incrementAndGet();
-                progress->notify_all();
+                progress->notifyCountedWaiters();
             }
             return result;
         }
