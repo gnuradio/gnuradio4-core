@@ -1853,9 +1853,19 @@ public:
     }
 
     // Cooperative stream completion: the next ordinary work() call takes its DONE
-    // finalization on its own thread. Custom work() implementations that bypass
-    // workInternal() must forward this request or implement equivalent completion.
-    void               requestFinish() noexcept { _finishRequested.store(true, std::memory_order_relaxed); }
+    // finalization on its own thread. A non-template custom work() falls back to
+    // REQUESTED_STOP so its stop hook can join its producer and end with EOS.
+    // Custom sources can override requestFinish() for cooperative completion;
+    // templated work() overrides must provide such a hook explicitly.
+    void requestFinish() noexcept {
+        _finishRequested.store(true, std::memory_order_relaxed);
+        // Ordinary work() is a function template. A non-template work override
+        // bypasses workInternal(); let its stop hook join the I/O producer and
+        // publish EOS, as for an ordinary stop request.
+        if constexpr (requires { &Derived::work; }) {
+            requestStop();
+        }
+    }
     [[nodiscard]] bool finishRequested() const noexcept { return _finishRequested.load(std::memory_order_relaxed); }
 
     constexpr void requestStop() noexcept { emitErrorMessageIfAny("requestStop()", this->changeStateTo(lifecycle::State::REQUESTED_STOP)); }

@@ -139,19 +139,20 @@ private:
 protected:
     using ProfileHandle = decltype(std::declval<TProfiler&>().forThisThread());
 
-    std::size_t                   _nWatchdogsRunning{0};
-    gr::Sequence                  _watchdogGeneration{}; // a watchdog runs only while it matches this. An advance wakes it.
-    meta::indirect<gr::Graph>     _graph{};
-    TProfiler                     _profiler{};
-    ProfileHandle                 _profilerHandler{_profiler.forThisThread()};
-    std::shared_ptr<TaskExecutor> _pool{gr::thread_pool::Manager::instance().defaultCpuPool()};
-    const TaskExecutor*           _jobListsPool = nullptr; // the pool the job lists were last sized on
-    std::shared_ptr<gr::Sequence> _nRunningJobs = std::make_shared<gr::Sequence>();
-    std::recursive_mutex          _executionOrderMutex; // only used when modifying and copying the graph->local job list
-    std::shared_ptr<JobLists>     _executionOrder = std::make_shared<JobLists>();
-    std::mutex                    _childLifecycleMutex; // serializes the sweeps of start() and stop() and the ReplaceBlock and EmplaceEdge edits; a worker never takes it to count itself
-    std::mutex                    _workersInLoopMutex;  // guards _nWorkersInLoop; no block's stop() hook runs under it
-    std::size_t                   _nWorkersInLoop{0UZ}; // workers inside poolWorker(); only these workers call a block's work()
+    std::size_t                            _nWatchdogsRunning{0};
+    gr::Sequence                           _watchdogGeneration{}; // a watchdog runs only while it matches this. An advance wakes it.
+    meta::indirect<gr::Graph>              _graph{};
+    TProfiler                              _profiler{};
+    ProfileHandle                          _profilerHandler{_profiler.forThisThread()};
+    std::shared_ptr<TaskExecutor>          _pool{gr::thread_pool::Manager::instance().defaultCpuPool()};
+    const TaskExecutor*                    _jobListsPool = nullptr; // the pool the job lists were last sized on
+    std::shared_ptr<gr::Sequence>          _nRunningJobs = std::make_shared<gr::Sequence>();
+    std::recursive_mutex                   _executionOrderMutex; // only used when modifying and copying the graph->local job list
+    std::shared_ptr<JobLists>              _executionOrder     = std::make_shared<JobLists>();
+    inline static thread_local const void* _lifecycleScheduler = nullptr;
+    std::mutex                             _childLifecycleMutex; // serializes the sweeps of start() and stop() and the ReplaceBlock and EmplaceEdge edits; a worker never takes it to count itself
+    std::mutex                             _workersInLoopMutex;  // guards _nWorkersInLoop; no block's stop() hook runs under it
+    std::size_t                            _nWorkersInLoop{0UZ}; // workers inside poolWorker(); only these workers call a block's work()
     // advanced by everything that ends a park and is not work (see wakeWorkers() and registerWake()). The rings in
     // _wakeRings are changed under _workersInLoopMutex
     std::shared_ptr<gr::Sequence>      _wake = std::make_shared<gr::Sequence>();
@@ -1045,21 +1046,29 @@ public:
 
     std::expected<void, Error> runAndWait() { return runAndWaitImpl(true); }
 
-    // Request each source's own DONE finalization. Neither lifecycle changes nor
-    // port writes occur on this thread before the ordinary Stop fallback below.
-    // The flag costs one relaxed load per ordinary Block::work() call. Blocks or
-    // schedulers with custom work() must forward it; silent blocking sources may
-    // not see it until the deadline, when their normal Stop hook releases work.
+    // Request source completion, drain accepted input, then join. Ordinary blocks
+    // finalize DONE on their workers; custom work() sources use their finish hook
+    // or REQUESTED_STOP. The deadline bounds guard acquisition, including nested
+    // startup. The Stop fallback releases silent blocking sources.
+    // Call only from a controller thread, outside scheduler lifecycle hooks.
     bool stopAfterDrain(std::chrono::milliseconds timeout) {
         using enum lifecycle::State;
-        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        if (isOnOwnWorkerThread() || _lifecycleScheduler != nullptr) {
+            throw gr::exception("stopAfterDrain() requires a controller thread outside lifecycle hooks");
+        }
+        const auto now       = std::chrono::steady_clock::now();
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::time_point::max() - now);
+        const auto deadline  = timeout >= remaining ? std::chrono::steady_clock::time_point::max() : now + std::max(timeout, std::chrono::milliseconds::zero());
+        if (this->state() == PAUSED || this->state() == REQUESTED_PAUSE) {
+            std::ignore = this->changeStateTo(RUNNING);
+        }
         // RUNNING is visible before child start hooks finish. Do not let those
         // hooks clear a request made before the run's workers were dispatched.
         while (runInProgress() && !workerStarted() && std::chrono::steady_clock::now() < deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         if (runInProgress() && std::chrono::steady_clock::now() < deadline) {
-            requestFinish();
+            requestFinish(deadline);
         }
         while (runInProgress() && std::chrono::steady_clock::now() < deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -1077,23 +1086,44 @@ public:
     // Scheduler work bypasses Block::workInternal(), so explicitly forward the
     // request into this scheduler's graph. Each nested scheduler takes its own
     // graph-edit/lifecycle guards. No work quiescence is needed for atomic stores.
-    void requestFinish() {
-        const bool    held        = awaitMessagePass();
+    void requestFinish(std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) {
+        const void*   previousLifecycle = std::exchange(_lifecycleScheduler, this);
+        on_scope_exit restoreLifecycle  = [previousLifecycle] { _lifecycleScheduler = previousLifecycle; };
+        // Each scheduler must finish its own start before touching its children.
+        while ((this->state() == lifecycle::State::INITIALISED || runInProgress()) && !workerStarted()) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return;
+            }
+            std::this_thread::yield();
+        }
+        bool held = false;
+        while (!(held = tryHoldMessagePass())) {
+            if (holdsMessagePass() || std::chrono::steady_clock::now() >= deadline) {
+                return;
+            }
+            std::this_thread::yield();
+        }
         on_scope_exit releasePass = [this, held] {
             if (held) {
                 releaseMessagePass();
             }
         };
-        std::lock_guard childLock(_childLifecycleMutex);
-        auto            connectedStream = [](DynamicPort& port) { return port.isConnected() && port::decodePortType(port.portMaskInfo()) == PortType::STREAM; };
-        auto            walk            = [&](auto&& self, auto& group) -> void {
+        std::unique_lock childLock(_childLifecycleMutex, std::defer_lock);
+        while (!childLock.try_lock()) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return;
+            }
+            std::this_thread::yield();
+        }
+        auto connectedStream = [](DynamicPort& port) { return port.isConnected() && port::decodePortType(port.portMaskInfo()) == PortType::STREAM; };
+        auto walk            = [&](auto&& self, auto& group) -> void {
             for (auto& block : group.blocks()) {
                 if (block->blockCategory() == ScheduledBlockGroup) {
-                    block->requestFinish();
+                    block->requestFinish(deadline);
                 } else if (!block->blocks().empty()) {
                     self(self, *block);
                 } else if (anyPort(block->dynamicOutputPorts(), connectedStream) && !anyPort(block->dynamicInputPorts(), connectedStream)) {
-                    block->requestFinish();
+                    block->requestFinish(deadline);
                 }
             }
         };
@@ -1461,6 +1491,8 @@ protected:
     }
 
     void init() {
+        const void*   previousLifecycle = std::exchange(_lifecycleScheduler, this);
+        on_scope_exit restoreLifecycle  = [previousLifecycle] { _lifecycleScheduler = previousLifecycle; };
         awaitExchange();
         [[maybe_unused]] const auto pe = _profilerHandler->startCompleteEvent("scheduler_base.init");
         {
@@ -1483,6 +1515,8 @@ protected:
     // re-entering INITIALISED must rebuild the same execution state that init() builds, because the graph
     // may have been exchanged or edited since: a stale _executionOrder runs the previous graph's blocks
     void reset() {
+        const void*   previousLifecycle = std::exchange(_lifecycleScheduler, this);
+        on_scope_exit restoreLifecycle  = [previousLifecycle] { _lifecycleScheduler = previousLifecycle; };
         awaitExchange();
         // waits for the previous run's workers before reinitializing the blocks. A worker still traversing would call
         // work() on a block whose edges reset() disconnects. stop() retired the workers, so the wait lasts at most one
@@ -1515,7 +1549,17 @@ protected:
         this->emitErrorMessageIfAny("failStart() -> LifecycleState -> ERROR", this->changeStateTo(lifecycle::State::ERROR));
     }
 
+    void reportExecutionException(Error reason) {
+        if (workerStarted()) {
+            failRun("", runGeneration(), reason.message);
+        } else {
+            failStartAndReport(std::move(reason));
+        }
+    }
+
     void start() {
+        const void*   previousLifecycle = std::exchange(_lifecycleScheduler, this);
+        on_scope_exit restoreLifecycle  = [previousLifecycle] { _lifecycleScheduler = previousLifecycle; };
         // Catch before Lifecycle publishes ERROR so parents see the reason and
         // the normal stop sweep also retires partially dispatched workers.
         try {
@@ -1711,7 +1755,18 @@ protected:
 
         if constexpr (singleThreaded) {
             gr::atomic_ref(_nWorkersStarted).fetch_add(1UZ);
-            dispatchWorker(0UZ, std::move(jobListsCopy), *workerGeneration);
+            try {
+                dispatchWorker(0UZ, std::move(jobListsCopy), *workerGeneration);
+            } catch (const gr::exception& error) {
+                reportExecutionException(Error{error.what(), error.sourceLocation, error.errorTime});
+                return;
+            } catch (const std::exception& error) {
+                reportExecutionException(Error{error.what()});
+                return;
+            } catch (...) {
+                reportExecutionException(Error{"unknown scheduler execution exception"});
+                return;
+            }
         } else { // run on processing thread pool
             [[maybe_unused]] const auto pe = _profilerHandler->startCompleteEvent("scheduler_base.runOnPool");
             for (std::size_t runnerID = 0UZ; runnerID < nWorkers; runnerID++) {
@@ -2223,6 +2278,8 @@ protected:
     }
 
     void stop() {
+        const void*   previousLifecycle = std::exchange(_lifecycleScheduler, this);
+        on_scope_exit restoreLifecycle  = [previousLifecycle] { _lifecycleScheduler = previousLifecycle; };
         using enum lifecycle::State;
         // retires the run's workers. A queued worker releases its count without running. A worker in its loop leaves
         // at its next check, even one that misses the stop because the next start() has already set RUNNING.
@@ -2270,6 +2327,8 @@ protected:
     // each move only while the scheduler still reads REQUESTED_PAUSE. A refused move is reported only when the
     // scheduler reads REQUESTED_PAUSE after the refusal.
     void pause() {
+        const void*   previousLifecycle = std::exchange(_lifecycleScheduler, this);
+        on_scope_exit restoreLifecycle  = [previousLifecycle] { _lifecycleScheduler = previousLifecycle; };
         using enum lifecycle::State;
         const auto moveWhilePausing = [this](auto& target, lifecycle::State next) {
             if (this->state() != REQUESTED_PAUSE) {
@@ -2302,6 +2361,8 @@ protected:
     }
 
     void resume() {
+        const void*   previousLifecycle = std::exchange(_lifecycleScheduler, this);
+        on_scope_exit restoreLifecycle  = [previousLifecycle] { _lifecycleScheduler = previousLifecycle; };
         using enum lifecycle::State;
         wakeWorkers();
         {
