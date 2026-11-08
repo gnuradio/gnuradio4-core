@@ -71,10 +71,12 @@ public:
     virtual void requestQuiescenceOfOtherWork() = 0;
     virtual void releaseWorkQuiescence()        = 0;
 
-    // Cancel stream sources, let accepted downstream input reach EOS, then join.
-    // false means the run failed or exceeded the deadline. Sources finish on their
-    // own workers. A silent blocking source cannot observe the flag until its work
-    // returns, so it reaches the deadline and then uses the ordinary Stop hooks.
+    // Finish stream sources, let accepted downstream input reach EOS, then join.
+    // false means the run failed or exceeded the deadline. Ordinary sources finish
+    // on their workers; custom work() sources use their finish or stop hooks.
+    // Silent blocking work is released by the ordinary Stop fallback at the deadline.
+    // A paused graph resumes to drain. Calls from this scheduler's workers or
+    // lifecycle hooks throw; joining requires an external controller thread.
     virtual bool stopAfterDrain(std::chrono::milliseconds timeout) = 0;
 };
 
@@ -235,12 +237,9 @@ private:
             try {
                 std::ignore = sched.runAndWaitImpl(false);
             } catch (const std::exception& error) {
-                if (!sched.workerStarted()) {
-                    sched.failStartAndReport(Error{error.what()});
-                } else if (sched.state() != ERROR) {
-                    sched.emitErrorMessage("runAndWait()", Error{error.what()});
-                    std::ignore = sched.changeStateTo(ERROR);
-                }
+                sched.reportExecutionException(Error{error.what()});
+            } catch (...) {
+                sched.reportExecutionException(Error{"unknown scheduler execution exception"});
             }
         });
         return {};

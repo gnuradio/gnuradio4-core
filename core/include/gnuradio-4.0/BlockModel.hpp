@@ -9,6 +9,7 @@
 #include <gnuradio-4.0/thread/thread_pool.hpp>
 
 #include <charconv>
+#include <chrono>
 #include <concepts>
 #include <memory_resource>
 #include <mutex>
@@ -502,8 +503,11 @@ public:
     [[nodiscard]] virtual work::Result work(std::size_t requested_work) = 0;
 
     // Requests worker-owned DONE finalization without changing lifecycle state.
-    // A custom work() override must honor or forward the underlying finish flag.
-    virtual void requestFinish() = 0;
+    // A custom source may define requestFinish() to stop its I/O producer and
+    // publish EOS after the last queued sample. Otherwise Block::requestFinish()
+    // falls back to REQUESTED_STOP for custom work(), invoking its stop hook.
+    // Scheduler forwarding must honor the shared deadline when taking guards.
+    virtual void requestFinish(std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) = 0;
 
     [[nodiscard]] virtual work::Status draw(const property_map& config = {}) = 0;
 
@@ -816,7 +820,13 @@ public:
 
     [[nodiscard]] constexpr work::Result work(std::size_t requested_work = undefined_size) override { return blockRef().work(requested_work); }
 
-    void requestFinish() override { blockRef().requestFinish(); }
+    void requestFinish(std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) override {
+        if constexpr (requires { blockRef().requestFinish(deadline); }) {
+            blockRef().requestFinish(deadline);
+        } else {
+            blockRef().requestFinish();
+        }
+    }
 
     constexpr work::Status draw(const property_map& config = {}) override {
         if constexpr (requires { blockRef().draw(config); }) {
