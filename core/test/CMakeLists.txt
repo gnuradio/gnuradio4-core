@@ -204,6 +204,10 @@ set_tests_properties(qa_thread_pool_limit PROPERTIES TIMEOUT 60)
 add_ut_test(qa_SchedulerNestedProgress)
 set_tests_properties(qa_SchedulerNestedProgress PROPERTIES TIMEOUT 60)
 
+# waiters of the graph's progress sequence, woken by the blocks' work calls
+add_ut_test(qa_ProgressWake)
+set_tests_properties(qa_ProgressWake PROPERTIES TIMEOUT 60)
+
 add_ut_test(qa_SubGraphAssets)
 # only the case that instantiates an asset needs the registry; the rest run without one
 if(NOT GR_ENABLE_BLOCK_REGISTRY)
