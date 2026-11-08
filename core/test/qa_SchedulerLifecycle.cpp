@@ -4812,9 +4812,9 @@ const boost::ut::suite<"workers that park"> parkingWorkerTests = [] {
     "a block that a leaving worker hands to a parked worker's job list runs within a tenth of the park"_test = [&] { handedBlockRuns(true); };
 
     // A parent's edit holds the work quiescence of each scheduler in its graph. The test's thread holds it here. A block
-    // adopted meanwhile wakes the parked workers. The worker that owns the block takes it into its job list, calls no
-    // work() while the quiescence holds, and parks again. The end of the quiescence is then the only wake that can lead
-    // to the block's first call before the park times out.
+    // adopted meanwhile wakes the parked workers, but adoption into a worker's job list is deferred along with work()
+    // while the quiescence holds. The workers park again with the block still queued. The end of the quiescence must
+    // wake them to adopt and call the block before the park times out.
     auto adoptedUnderQuiescenceRuns = [&]<typename TProbe>(std::string_view policyName, const gr::property_map& settings, std::size_t nWorkers) {
         std::atomic<std::size_t> nReleased{0UZ};
 
@@ -4831,6 +4831,7 @@ const boost::ut::suite<"workers that park"> parkingWorkerTests = [] {
         expect(scheduler.exchange(std::move(flow)).has_value());
 
         bool                  allParked       = false;
+        bool                  queuedWhileHeld = false;
         bool                  taken           = false;
         bool                  parkedAgain     = false;
         bool                  calledWhileHeld = false;
@@ -4839,14 +4840,15 @@ const boost::ut::suite<"workers that park"> parkingWorkerTests = [] {
             allParked = qa_sched::awaitParkedWorkers(scheduler, nWorkers);
             scheduler.requestWorkQuiescence();
             scheduler.adopt(handedModel);
-            taken                 = qa_sched::awaitCondition([&scheduler] { return scheduler.adoptionQueuesEmpty(); });
             parkedAgain           = qa_sched::awaitParkedWorkers(scheduler, nWorkers);
+            queuedWhileHeld       = !scheduler.adoptionQueuesEmpty();
             calledWhileHeld       = handed._called.load(std::memory_order_acquire);
             const auto releasedAt = std::chrono::steady_clock::now();
             scheduler.releaseWorkQuiescence();
             if (qa_sched::awaitCondition([&handed] { return handed._called.load(std::memory_order_acquire); })) {
                 delayMs = qa_sched::Millis(handed._firstCallAt - releasedAt).count();
             }
+            taken = scheduler.adoptionQueuesEmpty();
             scheduler.requestStop();
         });
         expect(handedModel->changeStateTo(REQUESTED_STOP).has_value());
@@ -4855,6 +4857,7 @@ const boost::ut::suite<"workers that park"> parkingWorkerTests = [] {
         std::println("block adopted under a held work quiescence, {} (timeout_ms {}): {}", policyName, kParkTimeout.count(), delayMs.has_value() ? std::format("first call {:.2f} ms after the release", *delayMs) : std::string("never called"));
         expect(completed) << policyName;
         expect(allParked) << policyName << "the workers did not all park";
+        expect(queuedWhileHeld) << policyName << "the worker took the adopted block while the quiescence held";
         expect(taken) << policyName << "no worker took the adopted block";
         expect(parkedAgain) << policyName << "the woken worker did not park again";
         expect(!calledWhileHeld) << policyName << "the adopted block ran while the quiescence held";
