@@ -238,6 +238,13 @@ void checkAll() {
     check("atan2 near |y| = |x|", measure2<V>(nearY, nearX, [](V y, V x) { return gr::meta::atan2<L>(y, x); }, [](T y, T x) { return referenceOf<T>(::atan2l, ::atan2, y, x); }), f ? fb : 2);
 }
 
+// With a fused multiply-add in the target, float lanes take the fused kernels and double lanes do not.
+// Without one the branch is not compiled, as in a build that sets no -march.
+#if defined(__FMA__) || defined(__FP_FAST_FMAF)
+static_assert(gr::meta::detail::elementary_impl::SimdOps<stdx::native_simd<float>>::fused, "float lanes are fused where the target has FMA");
+static_assert(!gr::meta::detail::elementary_impl::SimdOps<stdx::native_simd<double>>::fused, "double lanes stay unfused");
+#endif
+
 } // namespace qa_simd_math
 
 const boost::ut::suite<"simd elementary functions"> simdMathTests = [] {
