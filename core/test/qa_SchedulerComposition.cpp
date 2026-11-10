@@ -8,7 +8,7 @@
 #error composition qualification requires assertions
 #endif
 
-namespace {
+namespace qa_composition {
 struct Stats {
     std::atomic<std::size_t> samples{0}, errors{0};
     std::size_t              next = 0;
@@ -356,8 +356,9 @@ void destruction() {
     require(editing.get());
     deleting.get();
 }
-} // namespace
+} // namespace qa_composition
 int main() {
+    using namespace qa_composition;
     try {
         qualify<gr::scheduler::ExecutionPolicy::singleThreaded>();
         qualify<gr::scheduler::ExecutionPolicy::multiThreaded>();
