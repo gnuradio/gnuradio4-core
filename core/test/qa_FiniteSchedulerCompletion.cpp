@@ -509,10 +509,8 @@ void qualify() {
             src.limit     = count;
             auto& a       = graph.emplaceBlock<Sink>();
             auto& b       = graph.emplaceBlock<Sink>();
-            expect(src.out.resizeBuffer(4).has_value());
-            expect(src.second.resizeBuffer(4).has_value());
-            expect(graph.connect<"out", "in">(src, a).has_value());
-            expect(graph.connect<"second", "in">(src, b).has_value());
+            expect(graph.connect<"out", "in">(src, a, gr::EdgeParameters{.minBufferSize = 4UZ}).has_value());
+            expect(graph.connect<"second", "in">(src, b, gr::EdgeParameters{.minBufferSize = 4UZ}).has_value());
             gr::SchedulerWrapper<gr::scheduler::Simple<Policy>> scheduler;
             scheduler.setGraph(std::move(graph));
             expect(scheduler.start().has_value());
@@ -535,10 +533,8 @@ void qualify() {
             auto& a       = graph.emplaceBlock<Sink>();
             auto& b       = graph.emplaceBlock<Sink>();
             a.stall       = stall;
-            expect(src.out.resizeBuffer(4).has_value());
-            expect(src.second.resizeBuffer(4).has_value());
-            expect(graph.connect<"out", "in">(src, a).has_value());
-            expect(graph.connect<"second", "in">(src, b).has_value());
+            expect(graph.connect<"out", "in">(src, a, gr::EdgeParameters{.minBufferSize = 4UZ}).has_value());
+            expect(graph.connect<"second", "in">(src, b, gr::EdgeParameters{.minBufferSize = 4UZ}).has_value());
             gr::SchedulerWrapper<gr::scheduler::Simple<Policy>> scheduler;
             scheduler.setGraph(std::move(graph));
             expect(scheduler.start().has_value());
@@ -671,10 +667,8 @@ void qualify() {
             first.maxConsume  = 1;
             auto& second      = graph.emplaceBlock<Sink>();
             second.maxConsume = 1;
-            expect(source.out.resizeBuffer(64).has_value());
-            expect(source.second.resizeBuffer(64).has_value());
-            expect(graph.connect<"out", "in">(source, first).has_value());
-            expect(graph.connect<"second", "in">(source, second).has_value());
+            expect(graph.connect<"out", "in">(source, first, gr::EdgeParameters{.minBufferSize = 64UZ}).has_value());
+            expect(graph.connect<"second", "in">(source, second, gr::EdgeParameters{.minBufferSize = 64UZ}).has_value());
             if constexpr (requires { scheduler.setGraph(std::move(graph)); }) {
                 scheduler.setGraph(std::move(graph));
             } else {
