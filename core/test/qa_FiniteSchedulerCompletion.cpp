@@ -303,7 +303,12 @@ void qualify() {
         std::atomic<bool> held = false;
         std::thread       editor([&] { scheduler.blockRef().holdPassUntilWorkEnds(held); });
         expect(wait([&] { return held.load(); }));
-        auto drain = std::async(std::launch::async, [&] { return scheduler.stopAfterDrain(std::chrono::milliseconds(50)); });
+        std::atomic<bool> draining = false;
+        auto              drain    = std::async(std::launch::async, [&] {
+            draining = true;
+            return scheduler.stopAfterDrain(std::chrono::milliseconds(50));
+        });
+        expect(wait([&] { return draining.load(); })); // the thread start stays outside the 2 s the case tests
         expect(drain.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
         source.stopped = true; // releases a broken implementation so the test can report
         expect(!drain.get());
@@ -503,7 +508,8 @@ void qualify() {
         }
     };
     policyTest("async finite completion settles state and drains both output ports") = [] {
-        for (const std::size_t count : {1UZ, 20UZ, 10000UZ}) {
+        // returns the size of the output ports' rings; the allocator may round the 4 samples asked for up to a page
+        const auto finishTwice = [](std::size_t count) {
             gr::Graph graph;
             auto&     src = graph.emplaceBlock<Source>();
             src.limit     = count;
@@ -515,6 +521,7 @@ void qualify() {
             scheduler.setGraph(std::move(graph));
             expect(scheduler.start().has_value());
             expect(wait([&] { return scheduler.state() == gr::lifecycle::State::STOPPED; }));
+            const std::size_t ringSize = std::max(src.out.bufferSize(), src.second.bufferSize());
             scheduler.stop();
             expect(eq(a.consumed, std::size_t(count)));
             expect(eq(b.consumed, std::size_t(count)));
@@ -523,7 +530,12 @@ void qualify() {
             scheduler.stop();
             expect(eq(a.consumed, 2UZ * count));
             expect(eq(b.consumed, 2UZ * count));
-        }
+            return ringSize;
+        };
+        const std::size_t ringSize = finishTwice(1UZ);
+        std::ignore                = finishTwice(20UZ);
+        // three rings and one sample: every ring wraps, and each run fills the rings a few times whatever size they got
+        std::ignore = finishTwice(3UZ * ringSize + 1UZ);
     };
     policyTest("drain requests source-owned completion and consumes accepted data; stalled drain times out") = [] {
         for (const bool stall : {false, true}) {
@@ -600,7 +612,7 @@ void qualify() {
             }
             expect(scheduler.start().has_value());
             expect(wait([&] { return first.entered.load(); }));
-            auto drain = std::async(std::launch::async, [&] { return scheduler.stopAfterDrain(std::chrono::seconds(2)); });
+            auto drain = std::async(std::launch::async, [&] { return scheduler.stopAfterDrain(std::chrono::milliseconds::max()); });
             expect(wait([&] { return sourceStopping.load(); }));
             using namespace gr::serialization_fields;
             const gr::property_map edge{{std::pmr::string(EDGE_SOURCE_BLOCK), std::string(source.unique_name)}, {std::pmr::string(EDGE_SOURCE_PORT), std::string("out")}, {std::pmr::string(EDGE_DESTINATION_BLOCK), std::string(removed.unique_name)}, {std::pmr::string(EDGE_DESTINATION_PORT), std::string("in")}};
