@@ -2862,11 +2862,9 @@ protected:
             }
         }
         const std::string name(block->uniqueName());
-        const auto        previousState = block->state();
+        // makeZombie() reports stop hook errors. An ERROR zombie is still fully retired and
+        // can leave the graph without quarantining the execution, as with RemoveBlock.
         makeZombie(block);
-        if (previousState != lifecycle::State::ERROR && block->state() == lifecycle::State::ERROR) {
-            throw gr::exception("branch stop hook failed during retirement");
-        }
         if (block->state() == lifecycle::State::REQUESTED_STOP) {
             if (auto stopped = block->changeStateTo(lifecycle::State::STOPPED); !stopped) {
                 throw gr::exception(stopped.error().message);
