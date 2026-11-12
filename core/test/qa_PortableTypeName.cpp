@@ -62,6 +62,8 @@ const boost::ut::suite<"Portable Type names"> typeNameTests = [] {
         expect(eq(gr::meta::type_name<NoBlock<Tensor<double>>>(), "gr::testing::NoBlock<gr::Tensor<float64>>"sv));
         expect(eq(gr::meta::type_name<NoBlock<DataSet<float>>>(), "gr::testing::NoBlock<gr::DataSet<float32>>"sv));
         expect(eq(gr::meta::type_name<NoBlock<DataSet<double>>>(), "gr::testing::NoBlock<gr::DataSet<float64>>"sv));
+        expect(eq(gr::meta::type_name<NoBlock<DataSet<float, float>>>(), "gr::testing::NoBlock<gr::DataSet<float32>>"sv));
+        expect(eq(gr::meta::type_name<NoBlock<DataSet<int32_t, double>>>(), "gr::testing::NoBlock<gr::DataSet<int32, float64>>"sv));
         expect(eq(gr::meta::type_name<Something<uint8_t>>(), "gr::testing::Something<uint8, 0, true, (gr::testing::Color)0>"sv));
         expect(eq(gr::meta::type_name<Something<uint8_t, 42>>(), "gr::testing::Something<uint8, 42, true, (gr::testing::Color)0>"sv));
         expect(eq(gr::meta::type_name<Something<uint8_t, 42, false>>(), "gr::testing::Something<uint8, 42, false, (gr::testing::Color)0>"sv));

@@ -632,6 +632,10 @@ inline std::string makePortableTypeName(std::string_view name) {
         cursor++;
     }
     params.push_back(makePortableTypeName(trimmed(view)));
+    // DataSet<T> is DataSet<T, T>: the defaulted axis type must not alter the canonical name
+    if (base == "gr::DataSet" and params.size() == 2UZ and params[0] == params[1]) {
+        params.pop_back();
+    }
     auto join = [](const auto& range, std::string_view sep = ", ") -> std::string {
         std::string out;
         auto        it2  = std::ranges::begin(range);
