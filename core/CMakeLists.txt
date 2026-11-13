@@ -35,8 +35,8 @@ target_link_libraries(
   PUBLIC gnuradio-options
          gnuradio-meta
          gnuradio-shared-state
-         magic_enum
-         vir)
+         magic_enum::magic_enum
+         vir-simd::vir-simd)
 
 # two libraries hold what a program and every shared object it loads must share one copy of. Each compiles the core
 # headers it needs and links no compiled core library. gnuradio-core links both PUBLIC: the link goes from the core
@@ -56,7 +56,7 @@ else()
 endif()
 add_library(gnuradio4::gnuradio-shared-state ALIAS gnuradio-shared-state)
 target_include_directories(gnuradio-shared-state PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include/)
-target_link_libraries(gnuradio-shared-state PRIVATE gnuradio-options gnuradio-meta magic_enum)
+target_link_libraries(gnuradio-shared-state PRIVATE gnuradio-options gnuradio-meta magic_enum::magic_enum)
 if(WIN32)
   target_compile_definitions(gnuradio-shared-state PRIVATE BUILDING_MYPLUGIN)
 endif()
@@ -72,7 +72,7 @@ target_include_directories(gnuradio-blocklib-core PUBLIC $<BUILD_INTERFACE:${CMA
                                                          $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_include_directories(gnuradio-blocklib-core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include/
                                                           ${CMAKE_CURRENT_BINARY_DIR}/include)
-target_link_libraries(gnuradio-blocklib-core PRIVATE gnuradio-options gnuradio-meta magic_enum)
+target_link_libraries(gnuradio-blocklib-core PRIVATE gnuradio-options gnuradio-meta magic_enum::magic_enum)
 if(WIN32)
   target_compile_definitions(gnuradio-blocklib-core PRIVATE BUILDING_MYPLUGIN)
   target_compile_definitions(gnuradio-core PUBLIC BUILDING_MYPLUGIN)
