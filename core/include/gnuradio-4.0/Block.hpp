@@ -1766,6 +1766,11 @@ private:
             inputPorts<PortType::STREAM>(&self()), skipIn);
     }
 
+    // Plain span views of the reservations; indexing a writer span reads its reservation through the writer on every access.
+    static auto plainSpans(auto& spans) {
+        return meta::tuple_transform([]<typename TSpan>(TSpan& span) { return std::span(span.data(), span.size()); }, spans);
+    }
+
 public:
     template<typename TInputSpans, typename TOutputSpans>
     [[nodiscard]] work::Status preparedStreamsStatus(const TInputSpans& inputSpans, const TOutputSpans& outputSpans, std::size_t expectedIn, std::size_t expectedOut) noexcept {
@@ -2218,9 +2223,12 @@ public:
     }
 
     work::Status invokeProcessOnePure(auto& inputSpans, auto& outputSpans, std::size_t nSamplesToProcess) {
+        auto inputPlainSpans  = plainSpans(inputSpans);
+        auto outputPlainSpans = plainSpans(outputSpans);
+
         for (std::size_t i = 0UZ; i < nSamplesToProcess; ++i) {
-            auto results = std::apply([this, i](auto&... inputs) { return this->invoke_processOne(inputs[i]...); }, inputSpans);
-            meta::tuple_for_each([i]<typename R>(auto& output_range, R&& result) { output_range[i] = std::forward<R>(result); }, outputSpans, results);
+            auto results = std::apply([this, i](auto&... inputs) { return this->invoke_processOne(inputs[i]...); }, inputPlainSpans);
+            meta::tuple_for_each([i]<typename R>(auto& output_range, R&& result) { output_range[i] = std::forward<R>(result); }, outputPlainSpans, results);
         }
         return work::Status::OK;
     }
@@ -2234,18 +2242,8 @@ public:
             std::size_t  processedOut;
         };
 
-        // Indexing a writer span re-reads its reservation through the writer on every access.
-        // The reservations stay fixed during the call, and the loop indexes these plain views.
-        const auto toPlainSpans = [](auto& spans) {
-            return meta::tuple_transform(
-                []<typename TSpan>(TSpan& span) {
-                    using TElement = std::remove_reference_t<decltype(*span.data())>;
-                    return std::span<TElement>(span.data(), span.size());
-                },
-                spans);
-        };
-        auto inputPlainSpans  = toPlainSpans(inputSpans);
-        auto outputPlainSpans = toPlainSpans(outputSpans);
+        auto inputPlainSpans  = plainSpans(inputSpans);
+        auto outputPlainSpans = plainSpans(outputSpans);
 
         _inProcessOneDispatch                      = true;
         std::size_t nOutSamplesBeforeRequestedStop = 0UZ;

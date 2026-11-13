@@ -40,6 +40,7 @@ set(_CORE_TESTS
     qa_PluginInstalledDirectory
     qa_PmtCollections
     qa_Port
+    qa_ProcessOnePure
     qa_ProcessOneSimd
     qa_Profiler
     qa_SchedulerDrain
