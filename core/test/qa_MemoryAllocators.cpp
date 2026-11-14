@@ -28,8 +28,14 @@ const boost::ut::suite<"gr::allocator::Aligned"> _aligned = [] {
         static_assert(alignof(int) <= 64UZ);
     };
 
-    "is 64Bytes aligned"_test = [] {
+    "default is cache-line aligned"_test = [] {
         using Vec = std::vector<float, gr::allocator::Aligned<float>>;
+        Vec v(128UZ);
+        expect(is_aligned(v.data(), gr::kCacheLine)) << "vector data must be aligned to gr::kCacheLine";
+    };
+
+    "is 64Bytes aligned"_test = [] {
+        using Vec = std::vector<float, gr::allocator::Aligned<float, 64UZ>>;
         Vec v(128UZ);
         expect(is_aligned(v.data(), 64UZ)) << "vector data must be 64B aligned";
     };
@@ -65,7 +71,7 @@ const boost::ut::suite<"gr::allocator::Aligned"> _aligned = [] {
         expect(eq(v.size(), 1000UZ));
         expect(eq(v.front(), 0_i));
         expect(eq(v.back(), 999_i));
-        expect(is_aligned(v.data(), 64UZ));
+        expect(is_aligned(v.data(), gr::kCacheLine));
     };
 };
 
@@ -106,9 +112,9 @@ const boost::ut::suite<"gr::allocator::Logging"> _logging = [] {
         using Alloc = gr::allocator::Logging<int>;
         std::vector<int, Alloc> v(10UZ);
         v.resize(32UZ);
+        expect(is_aligned(v.data(), gr::kCacheLine));
         v.clear();
         v.shrink_to_fit();
-        expect(is_aligned(v.data(), 64UZ));
     };
 
     "custom CounterLogger"_test = [] {
