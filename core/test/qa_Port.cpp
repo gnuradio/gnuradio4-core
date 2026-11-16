@@ -87,7 +87,7 @@ const boost::ut::suite<"Port"> _portTests = [] { // NOSONAR (N.B. lambda size)
 
     "InputPort"_test = [] { // NOSONAR (N.B. lambda size)
         PortIn<int> in;
-        expect(eq(in.buffer().streamBuffer.size(), 4096UZ));
+        expect(ge(in.buffer().streamBuffer.size(), 4096UZ)); // N.B. GE because the size rounds up to whole pages
 
         auto writer    = in.buffer().streamBuffer.new_writer();
         auto tagWriter = in.buffer().tagBuffer.new_writer();
