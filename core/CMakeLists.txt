@@ -72,7 +72,14 @@ target_include_directories(gnuradio-blocklib-core PUBLIC $<BUILD_INTERFACE:${CMA
                                                          $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_include_directories(gnuradio-blocklib-core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include/
                                                           ${CMAKE_CURRENT_BINARY_DIR}/include)
-target_link_libraries(gnuradio-blocklib-core PRIVATE gnuradio-options gnuradio-meta magic_enum::magic_enum)
+# BlockRegistry.cpp uses gr::exception and DynamicPort, which gnuradio-shared-state defines. An ELF shared library may
+# leave them unresolved for the program to supply; a DLL has to name the library that does.
+target_link_libraries(
+  gnuradio-blocklib-core
+  PRIVATE gnuradio-options
+          gnuradio-meta
+          gnuradio-shared-state
+          magic_enum::magic_enum)
 if(WIN32)
   target_compile_definitions(gnuradio-blocklib-core PRIVATE BUILDING_MYPLUGIN)
   target_compile_definitions(gnuradio-core PUBLIC BUILDING_MYPLUGIN)
