@@ -98,24 +98,8 @@ PluginLoader& globalPluginLoader() {
         auto* envpath = ::getenv("GNURADIO4_PLUGIN_DIRECTORIES");
         if (envpath == nullptr) {
             result.emplace_back(installedPluginDirectory());
-
         } else {
-            std::string_view paths(envpath);
-
-            auto i = paths.cbegin();
-
-            // TODO If we want to support Windows, this should be ; there
-            auto isSeparator = [](char c) { return c == ':'; };
-
-            while (i != paths.cend()) {
-                i      = std::find_if_not(i, paths.cend(), isSeparator);
-                auto j = std::find_if(i, paths.cend(), isSeparator);
-
-                if (i != paths.cend()) {
-                    result.emplace_back(std::string_view(i, j));
-                }
-                i = j;
-            }
+            result = splitPluginDirectories(envpath);
         }
 
         return result;
