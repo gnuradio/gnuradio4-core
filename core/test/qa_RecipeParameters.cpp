@@ -413,6 +413,28 @@ const boost::ut::suite<"RecipeParameters"> recipeParameterTests = [] {
         expect(echoed.error().message.find('\x1b') == std::string::npos) << "control characters never reach an error message";
     };
 
+    "integer add, subtract and multiply refuse exactly the results outside int64"_test = [] {
+        using gr::recipe::detail::checkedArithmetic;
+        using enum gr::recipe::Expression::OpKind;
+        constexpr std::int64_t kMax = std::numeric_limits<std::int64_t>::max();
+        constexpr std::int64_t kMin = std::numeric_limits<std::int64_t>::min();
+        expect(checkedArithmetic(add, kMax - 1, 1) == kMax);
+        expect(!checkedArithmetic(add, kMax, 1).has_value());
+        expect(checkedArithmetic(add, kMin + 1, -1) == kMin);
+        expect(!checkedArithmetic(add, kMin, -1).has_value());
+        expect(checkedArithmetic(subtract, kMin + 1, 1) == kMin);
+        expect(!checkedArithmetic(subtract, kMin, 1).has_value());
+        expect(!checkedArithmetic(subtract, 0, kMin).has_value()) << "-INT64_MIN is not an int64";
+        expect(checkedArithmetic(subtract, -1, kMin) == kMax);
+        expect(checkedArithmetic(multiply, kMin, 1) == kMin);
+        expect(!checkedArithmetic(multiply, kMin, -1).has_value());
+        expect(!checkedArithmetic(multiply, -1, kMin).has_value());
+        expect(checkedArithmetic(multiply, std::int64_t{-4611686018427387904}, 2) == kMin);
+        expect(!checkedArithmetic(multiply, std::int64_t{4611686018427387904}, 2).has_value());
+        expect(!checkedArithmetic(multiply, std::int64_t{-4611686018427387905}, 2).has_value());
+        expect(checkedArithmetic(multiply, 0, kMin) == std::int64_t{0});
+    };
+
     "declaration validation refuses duplicates, reserved names, unknown types and mistyped defaults"_test = [] {
         expect(validateDeclarations(nbfmDeclarations()).has_value());
         const std::vector<ParameterDeclaration> duplicate{{.name = "a", .type = "float32", .defaultValue = std::nullopt, .doc = ""}, {.name = "a", .type = "float32", .defaultValue = std::nullopt, .doc = ""}};

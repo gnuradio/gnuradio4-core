@@ -390,6 +390,35 @@ struct Parser {
     }
 };
 
+/// int64 addition, subtraction or multiplication, or nullopt where the exact result is outside int64
+[[nodiscard]] constexpr std::optional<std::int64_t> checkedArithmetic(Expression::OpKind kind, std::int64_t left, std::int64_t right) noexcept {
+    constexpr std::int64_t kMax = std::numeric_limits<std::int64_t>::max();
+    constexpr std::int64_t kMin = std::numeric_limits<std::int64_t>::min();
+    switch (kind) {
+    case Expression::OpKind::add:
+        if (right > 0 ? left > kMax - right : left < kMin - right) {
+            return std::nullopt;
+        }
+        return left + right;
+    case Expression::OpKind::subtract:
+        if (right < 0 ? left > kMax + right : left < kMin + right) {
+            return std::nullopt;
+        }
+        return left - right;
+    case Expression::OpKind::multiply: {
+        if (left == 0 || right == 0) {
+            return std::int64_t{0};
+        }
+        const bool overflows = left > 0 ? (right > 0 ? left > kMax / right : right < kMin / left) : (right > 0 ? left < kMin / right : right < kMax / left);
+        if (overflows) {
+            return std::nullopt;
+        }
+        return left * right;
+    }
+    default: std::unreachable();
+    }
+}
+
 } // namespace detail
 
 /// Parses the text after the '=' sentinel against the recipe's declarations.
@@ -451,12 +480,11 @@ struct Parser {
                 stack.pop_back();
                 std::int64_t& left = stack.back();
                 // checked arithmetic: an overflowing expression is refused and never wraps
-                std::int64_t result{};
-                const bool   overflowed = op.kind == Expression::OpKind::add ? __builtin_add_overflow(left, right, &result) : op.kind == Expression::OpKind::subtract ? __builtin_sub_overflow(left, right, &result) : __builtin_mul_overflow(left, right, &result);
-                if (overflowed) {
+                const std::optional<std::int64_t> result = detail::checkedArithmetic(op.kind, left, right);
+                if (!result.has_value()) {
                     return std::unexpected(gr::Error(std::format("recipe_expression_conversion: '{}' overflows", detail::printableEcho(expression.source))));
                 }
-                left = result;
+                left = *result;
                 break;
             }
             }
