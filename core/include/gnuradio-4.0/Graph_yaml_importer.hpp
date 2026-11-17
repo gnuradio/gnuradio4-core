@@ -765,8 +765,10 @@ namespace detail {
 /// is also collected as a live binding, addressed by the block-name path from the interior
 /// downward, so a later parameter change can re-evaluate and re-stage it.
 // GCC's -Wnull-dereference reports the inlined std::string copies through push_back here
+#ifdef __GNUC__
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wnull-dereference"
+#endif
 inline std::expected<void, gr::Error> evaluateRecipeExpressions(Tensor<pmt::Value>& blocks, std::span<const recipe::ParameterDeclaration> declarations, std::span<const pmt::Value> values, //
     std::vector<recipe::Binding>& outBindings, std::vector<std::string>& namePath, bool insideComposite) {
     for (std::size_t index = 0; index < blocks.size(); ++index) {
@@ -897,7 +899,9 @@ inline std::expected<void, gr::Error> evaluateRecipeExpressions(Tensor<pmt::Valu
     }
     return {};
 }
+#ifdef __GNUC__
 #pragma GCC diagnostic pop
+#endif
 
 } // namespace detail
 
