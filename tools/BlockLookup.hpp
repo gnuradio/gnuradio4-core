@@ -34,7 +34,7 @@ struct Directory {
  * @brief The directories a tool searches for blocks, in the order it searches them.
  *
  * The command line comes first, then the directories of GNURADIO4_PLUGIN_DIRECTORIES,
- * then `installed`, which is the plugin directory of the installation the caller was built for, and
+ * then `installed`, which is the plugin directory of the installation the caller runs from, and
  * then the shared plugin directories of the GR 4 installers. Both are always searched. A directory
  * named twice is searched once.
  */

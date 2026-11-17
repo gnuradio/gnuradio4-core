@@ -44,6 +44,7 @@
 
 #include "BlockLookup.hpp"
 #include "DocWriter.hpp"
+#include "InstalledLocation.hpp"
 #include "ShippedSchedulers.hpp"
 
 #ifdef INTERNAL_ENABLE_BLOCK_PLUGINS
@@ -1564,8 +1565,8 @@ void reportVersionAsJson(const Context& context) {
 #endif
     json.member("compilerId", CXX_COMPILER_ID);
     json.member("compilerVersion", CXX_COMPILER_VERSION);
-    json.member("installPrefix", GR_TOOLS_INSTALLED_PREFIX);
-    json.member("installedPluginDirectory", GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY);
+    json.member("installPrefix", gr::tools::installedPrefix());
+    json.member("installedPluginDirectory", gr::tools::installedPluginDirectory());
     const gr::DataCacheDirectory dataCache = reportedDataCacheDirectory();
     json.member("dataCacheDirectory", dataCache.path);
     json.member("dataCacheOrigin", nameOf(dataCache.origin));
@@ -1671,8 +1672,9 @@ void reportVersionAsJson(const Context& context) {
     facts.emplace_back("plugin system", "disabled");
 #endif
     facts.emplace_back("compiler", std::format("{} {}", CXX_COMPILER_ID, CXX_COMPILER_VERSION));
-    facts.emplace_back("install prefix", GR_TOOLS_INSTALLED_PREFIX);
-    facts.emplace_back("plugin directory", underPrefix(GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY, GR_TOOLS_INSTALLED_PREFIX));
+    const std::string prefix = gr::tools::installedPrefix();
+    facts.emplace_back("install prefix", prefix);
+    facts.emplace_back("plugin directory", underPrefix(gr::tools::installedPluginDirectory(), prefix));
     facts.emplace_back("data cache", dataCacheFact(reportedDataCacheDirectory()));
     return facts;
 }
@@ -2320,7 +2322,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    std::vector<Directory> directories = searchDirectories(options.pluginDirectories, GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY);
+    std::vector<Directory> directories = searchDirectories(options.pluginDirectories, gr::tools::installedPluginDirectory());
     bool                   searchable  = true;
     for (const Directory& directory : directories) {
         if (directory.origin == "option" && !directory.present) {

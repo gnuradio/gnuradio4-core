@@ -46,6 +46,7 @@
 #include <gnuradio-4.0/config.hpp>
 #include <gnuradio-4.0/formatter/ValueFormatter.hpp>
 
+#include "InstalledLocation.hpp"
 #include "ShippedSchedulers.hpp"
 
 namespace {
@@ -358,7 +359,7 @@ struct Options {
             add(directory);
         }
     }
-    add(GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY);
+    add(gr::tools::installedPluginDirectory());
     for (const std::string& directory : gr::sharedPluginDirectories()) {
         add(directory);
     }

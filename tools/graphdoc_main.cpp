@@ -14,6 +14,7 @@
 
 #ifdef GR_ENABLE_BLOCK_REGISTRY
 #include "BlockLookup.hpp"
+#include "InstalledLocation.hpp"
 #endif
 
 namespace {
@@ -109,7 +110,7 @@ int main(int argc, char** argv) {
     }
 
 #ifdef GR_ENABLE_BLOCK_REGISTRY
-    const std::vector<Directory> directories = searchDirectories(pluginDirectories, GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY);
+    const std::vector<Directory> directories = searchDirectories(pluginDirectories, gr::tools::installedPluginDirectory());
     std::vector<std::string>     paths;
     bool                         searchable = true;
     for (const Directory& directory : directories) {
