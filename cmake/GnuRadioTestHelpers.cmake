@@ -44,9 +44,9 @@ function(gr_qa_pch_anchor RESULT_VAR)
     target_include_directories(${_anchor} PRIVATE ${CMAKE_BINARY_DIR}/include ${CMAKE_CURRENT_FUNCTION_LIST_DIR})
     target_link_libraries(
       ${_anchor}
-      PRIVATE gnuradio-options
-              gnuradio-core
-              gnuradio-blocklib-core
+      PRIVATE gnuradio4::gnuradio-options
+              gnuradio4::gnuradio-core
+              gnuradio4::gnuradio-blocklib-core
               ut
               ${GR_TEST_HELPER_LIBRARIES})
     gnuradio4_precompile_headers(${_anchor})
@@ -82,13 +82,13 @@ function(setup_test_no_asan TEST_NAME)
   target_include_directories(${TEST_NAME} PRIVATE ${CMAKE_BINARY_DIR}/include ${CMAKE_CURRENT_BINARY_DIR})
   target_link_libraries(
     ${TEST_NAME}
-    PRIVATE gnuradio-options
-            gnuradio-core
-            gnuradio-blocklib-core
+    PRIVATE gnuradio4::gnuradio-options
+            gnuradio4::gnuradio-core
+            gnuradio4::gnuradio-blocklib-core
             ut
             ${GR_TEST_HELPER_LIBRARIES})
-  if(TARGET gnuradio-plugin)
-    target_link_libraries(${TEST_NAME} PRIVATE gnuradio-plugin)
+  if(TARGET gnuradio4::gnuradio-plugin)
+    target_link_libraries(${TEST_NAME} PRIVATE gnuradio4::gnuradio-plugin)
   endif()
   if(MSVC)
     # boost.ut nests a lambda per test inside the suite lambda, and /Od gives every local its own slot, so the frames
@@ -119,7 +119,7 @@ function(gr_test_add_dll_directories)
   if(NOT WIN32)
     return()
   endif()
-  set(_gr_test_dll_dirs "PATH=path_list_prepend:$<TARGET_FILE_DIR:gnuradio-blocklib-core>")
+  set(_gr_test_dll_dirs "PATH=path_list_prepend:$<TARGET_FILE_DIR:gnuradio4::gnuradio-blocklib-core>")
   foreach(_gr_test IN LISTS ARGV)
     set_property(
       TEST ${_gr_test}
