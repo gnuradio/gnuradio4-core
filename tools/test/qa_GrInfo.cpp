@@ -104,6 +104,19 @@ enum class Streams { both, standardOutput };
     return result;
 }
 
+// sets `name` to `value`, or removes it when there is none; an empty value removes it on Windows
+inline void setVariable(const std::string& name, const std::optional<std::string>& value) {
+#ifdef _WIN32
+    ::_putenv_s(name.c_str(), value.value_or("").c_str());
+#else
+    if (value.has_value()) {
+        ::setenv(name.c_str(), value->c_str(), 1);
+    } else {
+        ::unsetenv(name.c_str());
+    }
+#endif
+}
+
 // sets or clears one environment variable for the programs a case runs, and puts back the value it found
 class EnvironmentVariable {
     std::string                _name;
@@ -114,19 +127,9 @@ public:
         if (const char* found = std::getenv(_name.c_str()); found != nullptr) {
             _found = found;
         }
-        if (value.has_value()) {
-            ::setenv(_name.c_str(), value->c_str(), 1);
-        } else {
-            ::unsetenv(_name.c_str());
-        }
+        setVariable(_name, value);
     }
-    ~EnvironmentVariable() {
-        if (_found.has_value()) {
-            ::setenv(_name.c_str(), _found->c_str(), 1);
-        } else {
-            ::unsetenv(_name.c_str());
-        }
-    }
+    ~EnvironmentVariable() { setVariable(_name, _found); }
     EnvironmentVariable(const EnvironmentVariable&)            = delete;
     EnvironmentVariable& operator=(const EnvironmentVariable&) = delete;
 };
