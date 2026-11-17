@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <format>
+#include <iterator>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -91,6 +92,28 @@ DataCacheDirectory dataCacheDirectory() {
 
 std::string_view installedPluginDirectory() noexcept { return GR_INSTALLED_PLUGIN_DIRECTORY; }
 
+std::vector<std::string> sharedPluginDirectories() {
+    std::vector<std::filesystem::path> roots;
+#if defined(_WIN32)
+    for (const char* variable : {"LOCALAPPDATA", "PROGRAMDATA"}) {
+        if (const char* root = ::getenv(variable); root != nullptr && *root != '\0') {
+            roots.emplace_back(root);
+        }
+    }
+#elif defined(__APPLE__)
+    roots.emplace_back("/Library/Application Support");
+#endif
+    std::vector<std::string> directories;
+    for (const std::filesystem::path& root : roots) {
+        const std::filesystem::path directory = root / ".gnuradio-4" / "plugins" / std::format("v{}", GR_PLUGIN_CURRENT_ABI_VERSION);
+        std::error_code             ignored;
+        if (std::filesystem::is_directory(directory, ignored)) {
+            directories.push_back(directory.string());
+        }
+    }
+    return directories;
+}
+
 PluginLoader& globalPluginLoader() {
     auto pluginPaths = [] {
         std::vector<std::string> result;
@@ -98,6 +121,7 @@ PluginLoader& globalPluginLoader() {
         auto* envpath = ::getenv("GNURADIO4_PLUGIN_DIRECTORIES");
         if (envpath == nullptr) {
             result.emplace_back(installedPluginDirectory());
+            std::ranges::move(sharedPluginDirectories(), std::back_inserter(result));
         } else {
             result = splitPluginDirectories(envpath);
         }

@@ -880,6 +880,11 @@ public:
 /// prefix given when the build was configured. It stays that path when the installed files are moved.
 [[nodiscard]] std::string_view installedPluginDirectory() noexcept;
 
+/// The plugin directories the GR 4 installers share between packages, keyed on the plugin ABI version, that exist on this
+/// machine: `.gnuradio-4/plugins/v<abi>` under `%LOCALAPPDATA%` and then `%PROGRAMDATA%` on Windows, and under
+/// `/Library/Application Support` on macOS. Elsewhere an installation keeps its plugins in installedPluginDirectory().
+[[nodiscard]] std::vector<std::string> sharedPluginDirectories();
+
 /// The separator between the directories of GNURADIO4_PLUGIN_DIRECTORIES: the platform's own path-list separator, so a
 /// Windows path keeps its drive letter.
 #ifdef _WIN32
@@ -900,8 +905,8 @@ inline constexpr char kPluginDirectorySeparator = ':';
 }
 
 /// The process's loader. The first call builds it, and every gr::Graph constructor makes a call. Building the loader
-/// opens every shared object in the directories of GNURADIO4_PLUGIN_DIRECTORIES, or in installedPluginDirectory() when
-/// the variable is not set. A directory that does not exist is skipped.
+/// opens every shared object in the directories of GNURADIO4_PLUGIN_DIRECTORIES, or in installedPluginDirectory() and
+/// sharedPluginDirectories() when the variable is not set. A directory that does not exist is skipped.
 PluginLoader& globalPluginLoader();
 
 } // namespace gr

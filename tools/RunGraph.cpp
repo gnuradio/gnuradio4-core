@@ -359,6 +359,9 @@ struct Options {
         }
     }
     add(GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY);
+    for (const std::string& directory : gr::sharedPluginDirectories()) {
+        add(directory);
+    }
     return directories;
 }
 
