@@ -14,7 +14,14 @@
 #include <vector>
 
 #include <fcntl.h>
+#ifdef _WIN32
+#include <io.h>
+#include <process.h>
+#include <share.h>
+#include <sys/stat.h>
+#else
 #include <unistd.h>
+#endif
 
 #include <gnuradio-4.0/BlockRegistry.hpp>
 #include <gnuradio-4.0/tools/RunGraph.hpp>
@@ -37,18 +44,39 @@ extern "C" {
 static void onHostSignal(int) {}
 }
 
+constexpr int kStderrFd = 2;
+
+// the descriptor calls StderrCapture makes, under the names each platform gives them
+#ifdef _WIN32
+[[nodiscard]] int processId() { return ::_getpid(); }
+[[nodiscard]] int duplicateDescriptor(int descriptor) { return ::_dup(descriptor); }
+void              redirectDescriptor(int from, int to) { ::_dup2(from, to); }
+void              closeDescriptor(int descriptor) { ::_close(descriptor); }
+[[nodiscard]] int openForWriting(const std::filesystem::path& path) {
+    int descriptor = -1;
+    ::_wsopen_s(&descriptor, path.c_str(), _O_WRONLY | _O_CREAT | _O_TRUNC, _SH_DENYNO, _S_IREAD | _S_IWRITE);
+    return descriptor;
+}
+#else
+[[nodiscard]] int processId() { return ::getpid(); }
+[[nodiscard]] int duplicateDescriptor(int descriptor) { return ::dup(descriptor); }
+void              redirectDescriptor(int from, int to) { ::dup2(from, to); }
+void              closeDescriptor(int descriptor) { ::close(descriptor); }
+[[nodiscard]] int openForWriting(const std::filesystem::path& path) { return ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600); }
+#endif
+
 /// standard error redirected into a file for the duration of one call
 struct StderrCapture {
-    std::filesystem::path path = std::filesystem::temp_directory_path() / std::format("qa_RunGraphLibrary.{}.err", ::getpid());
+    std::filesystem::path path = std::filesystem::temp_directory_path() / std::format("qa_RunGraphLibrary.{}.err", processId());
 
     int _savedFd = -1;
 
     StderrCapture() {
         std::fflush(stderr);
-        _savedFd            = ::dup(STDERR_FILENO);
-        const int captureFd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-        ::dup2(captureFd, STDERR_FILENO);
-        ::close(captureFd);
+        _savedFd            = duplicateDescriptor(kStderrFd);
+        const int captureFd = openForWriting(path);
+        redirectDescriptor(captureFd, kStderrFd);
+        closeDescriptor(captureFd);
     }
 
     StderrCapture(const StderrCapture&)            = delete;
@@ -56,8 +84,8 @@ struct StderrCapture {
 
     ~StderrCapture() {
         std::fflush(stderr);
-        ::dup2(_savedFd, STDERR_FILENO);
-        ::close(_savedFd);
+        redirectDescriptor(_savedFd, kStderrFd);
+        closeDescriptor(_savedFd);
         std::filesystem::remove(path);
     }
 
