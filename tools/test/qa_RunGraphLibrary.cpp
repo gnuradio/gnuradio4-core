@@ -41,7 +41,8 @@ namespace {
 using SignalHandler = decltype(std::signal(SIGINT, SIG_DFL));
 
 extern "C" {
-static void onHostSignal(int) {}
+// sets itself again, because a raised signal resets its handler to the default on Windows
+static void onHostSignal(int signal) { std::signal(signal, onHostSignal); }
 }
 
 constexpr int kStderrFd = 2;
