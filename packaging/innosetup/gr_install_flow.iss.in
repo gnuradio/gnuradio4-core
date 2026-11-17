@@ -540,6 +540,39 @@ begin
   Result := AddBackslash(ExpandConstant('{autodesktop}')) + 'GNU Radio 4 Shell' + GrBundleSuffix('');
 end;
 
+// The bundle also places files no module owns, such as the packages the
+// development files need, and lists them in this file, one path relative to
+// the install root per line. The list is the bundle's, so a payload that grows
+// needs no change here.
+function GrBundleFileList(): String;
+begin
+  Result := AddBackslash(ExpandConstant('{app}')) + 'share\gnuradio4\bundle-files.txt';
+end;
+
+// Only the listed files go. A directory they share with another package, such
+// as include\boost with Boost's own headers, is left to GrRemoveEmptyDirTree,
+// which removes it once nothing is in it. A list or a file that is not there
+// is no fault: the payload is installed only with some development files.
+procedure GrRemoveBundleListedFiles();
+var
+  Lines: TArrayOfString;
+  Index: Integer;
+  Entry: String;
+begin
+  if not LoadStringsFromFile(GrBundleFileList(), Lines) then
+    Exit;
+  for Index := 0 to GetArrayLength(Lines) - 1 do
+  begin
+    Entry := Trim(Lines[Index]);
+    StringChangeEx(Entry, '/', '\', True);
+    { an entry that could name a file outside the install root is not the bundle's to remove }
+    if (Entry = '') or (Pos(':', Entry) > 0) or (Copy(Entry, 1, 1) = '\') or (Pos('..', Entry) > 0) then
+      Continue;
+    DeleteFile(AddBackslash(ExpandConstant('{app}')) + Entry);
+  end;
+  DeleteFile(GrBundleFileList());
+end;
+
 // The unified superbuild installer has no uninstaller of its own: it only
 // drops a launcher and its shortcuts next to the modules, and leaves their
 // removal to whichever module installer is uninstalled last. The file names
@@ -548,6 +581,7 @@ procedure GrRemoveBundleExtras();
 var
   AppDir: String;
 begin
+  GrRemoveBundleListedFiles();
   AppDir := AddBackslash(ExpandConstant('{app}'));
   DeleteFile(AppDir + 'gr4-env.cmd');
   DeleteFile(AppDir + 'gr4-env.ps1');
