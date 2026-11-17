@@ -79,7 +79,7 @@ requires(sizeof(S) <= sizeof(std::intmax_t) && sizeof(T) <= sizeof(std::intmax_t
 // 2^digits, one above the largest value of T: a power of two, exact in every floating-point type
 template<std::integral T, std::floating_point S>
 [[nodiscard]] constexpr S integerUpperLimit() noexcept {
-    return static_cast<S>(std::numeric_limits<T>::max() / 2 + 1) * S{2};
+    return static_cast<S>(static_cast<std::uintmax_t>(std::numeric_limits<T>::max()) / 2U + 1U) * S{2};
 }
 
 constexpr std::string_view trimAndCutComment(std::string_view input) {
