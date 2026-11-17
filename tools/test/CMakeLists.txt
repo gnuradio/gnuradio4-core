@@ -124,7 +124,7 @@ if(TARGET grinfo)
   set_property(
     TEST qa_GrInfo
     APPEND
-    PROPERTY ENVIRONMENT "GR_TOOLS_GRINFO=$<TARGET_FILE:grinfo>")
+    PROPERTY ENVIRONMENT "GR_TOOLS_GRINFO=$<TARGET_FILE:grinfo>" "GR_TOOLS_INSTALL_BINDIR=${CMAKE_INSTALL_BINDIR}")
   add_dependencies(qa_GrInfo grinfo)
   set_tests_properties(qa_GrInfo PROPERTIES TIMEOUT 60)
   if(INTERNAL_ENABLE_BLOCK_PLUGINS)
