@@ -461,7 +461,7 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
     // The text report cuts a long path to its tail and wraps a long value across lines. The text arms join the lines and
     // look for the path's last component; the JSON arms look for the whole path.
     "version reports the data cache directory in use, the one GR_DATA_CACHE_DIR names when it is set"_test = [] {
-        const std::string named        = (std::filesystem::temp_directory_path() / "gr4_qa_grinfo_cache").string();
+        const std::string named        = (std::filesystem::temp_directory_path() / "gr4_qa_grinfo_cache").generic_string();
         const std::string fromVariable = "gr4_qa_grinfo_cache, from GR_DATA_CACHE_DIR";
         {
             const EnvironmentVariable unset("GR_DATA_CACHE_DIR", std::nullopt);
@@ -684,12 +684,12 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
     "a shared object that is neither a plugin nor a block library is reported as an ordinary library and counted"_test = [] {
         const Result text = run({"version", "--plugin-dir", fromEnvironment("GR_TOOLS_TEST_ORDINARY_LIBRARY")}, Streams::standardOutput);
         expect(eq(text.exitCode, 0)) << text.output;
-        expect(withSingleSpaces(text.output).contains("libordinary_library.so ordinary-library 0 0")) << "the file's row names its kind" << text.output;
+        expect(withSingleSpaces(text.output).contains(std::format("{} ordinary-library 0 0", moduleFileName("ordinary_library")))) << "the file's row names its kind" << text.output;
         expect(withSingleSpaces(text.output).contains("ordinary libraries 1 ")) << "the directory holds one such file" << text.output;
 
         const Result json = run({"version", "--json", "--plugin-dir", fromEnvironment("GR_TOOLS_TEST_ORDINARY_LIBRARY")}, Streams::standardOutput);
         expect(eq(json.exitCode, 0)) << json.output;
-        expect(withSingleSpaces(json.output).contains("libordinary_library.so\", \"kind\": \"ordinary-library\"")) << "the file's entry names its kind" << json.output;
+        expect(withSingleSpaces(json.output).contains(std::format("{}\", \"kind\": \"ordinary-library\"", moduleFileName("ordinary_library")))) << "the file's entry names its kind" << json.output;
         const std::size_t rows = occurrences(json.output, "\"kind\": \"ordinary-library\"");
         expect(eq(rows, 1UZ)) << json.output;
         expect(json.output.contains(std::format("\"ordinaryLibraries\": {},", rows))) << "the total counts the entries of that kind" << json.output;
@@ -760,7 +760,10 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         expect(markdown.output.contains("## gr::testing::LibraryDoubler\n")) << "the block named in full" << markdown.output;
         expect(markdown.output.contains("| out | output | float32 |")) << markdown.output;
         expect(markdown.output.contains("| extra_gain | float32 | 1.000000 | dB | yes |")) << markdown.output;
+#ifndef _MSC_VER
+        // the description is the placeholder under MSVC; see "block on a bare name prints its ports and its settings"
         expect(markdown.output.contains("doubles its input")) << "the description the block declares" << markdown.output;
+#endif
 
         const Result html = run(overTestDirectories({"block", "LibraryDoubler", "--html"}), Streams::standardOutput);
         expect(eq(html.exitCode, 0)) << html.output;
