@@ -1536,6 +1536,13 @@ void writeTotals(JsonWriter& json, const Totals& totals) {
     json.endObject();
 }
 
+// the data cache directory in use, written with '/' as the report writes every path whatever the platform
+[[nodiscard]] gr::DataCacheDirectory reportedDataCacheDirectory() {
+    gr::DataCacheDirectory dataCache = gr::dataCacheDirectory();
+    dataCache.path                   = std::filesystem::path(dataCache.path).generic_string();
+    return dataCache;
+}
+
 void reportVersionAsJson(const Context& context) {
     JsonWriter json;
     json.beginObject();
@@ -1559,7 +1566,7 @@ void reportVersionAsJson(const Context& context) {
     json.member("compilerVersion", CXX_COMPILER_VERSION);
     json.member("installPrefix", GR_TOOLS_INSTALLED_PREFIX);
     json.member("installedPluginDirectory", GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY);
-    const gr::DataCacheDirectory dataCache = gr::dataCacheDirectory();
+    const gr::DataCacheDirectory dataCache = reportedDataCacheDirectory();
     json.member("dataCacheDirectory", dataCache.path);
     json.member("dataCacheOrigin", nameOf(dataCache.origin));
     json.member("whyNotUserDataCacheDirectory", dataCache.whyNotUser);
@@ -1666,7 +1673,7 @@ void reportVersionAsJson(const Context& context) {
     facts.emplace_back("compiler", std::format("{} {}", CXX_COMPILER_ID, CXX_COMPILER_VERSION));
     facts.emplace_back("install prefix", GR_TOOLS_INSTALLED_PREFIX);
     facts.emplace_back("plugin directory", underPrefix(GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY, GR_TOOLS_INSTALLED_PREFIX));
-    facts.emplace_back("data cache", dataCacheFact(gr::dataCacheDirectory()));
+    facts.emplace_back("data cache", dataCacheFact(reportedDataCacheDirectory()));
     return facts;
 }
 
