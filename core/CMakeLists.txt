@@ -84,24 +84,28 @@ configure_file("${PROJECT_SOURCE_DIR}/cmake/config.hpp.in"
                "${CMAKE_CURRENT_BINARY_DIR}/include/gnuradio-4.0/config.hpp" @ONLY)
 # TODO: install configure file... but not really meaningful for header only library, since compile flags are defined by
 # the user...
-install(FILES "${CMAKE_CURRENT_BINARY_DIR}/include/gnuradio-4.0/config.hpp"
-        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/gnuradio-4.0")
+gr_install_artifact(
+  FILES "${CMAKE_CURRENT_BINARY_DIR}/include/gnuradio-4.0/config.hpp"
+  DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/gnuradio-4.0"
+  COMPONENT DEVELOP)
 
-install(
+# the shared libraries are the runtime; the core archive and the import libraries are only needed to build against GR
+gr_install_artifact(
   TARGETS gnuradio-core gnuradio-blocklib-core gnuradio-shared-state
   EXPORT gnuradio4Targets
-  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  COMPONENT CORE
+  ARCHIVE_COMPONENT DEVELOP)
 
 # the whole include directory is the public surface, and it is installed as it is laid out: a PUBLIC_HEADER list would
 # flatten the subdirectories into a second copy beside the first
 if(GR_ENABLE_BLOCK_REGISTRY)
-  install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+  gr_install_artifact(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+                      COMPONENT DEVELOP)
 else()
-  install(
+  gr_install_artifact(
     DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    COMPONENT DEVELOP
     PATTERN "Runtime.hpp" EXCLUDE)
 endif()
 

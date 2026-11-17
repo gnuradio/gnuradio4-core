@@ -20,13 +20,13 @@ configure_package_config_file(
   "${CMAKE_CURRENT_BINARY_DIR}/GnuRadioBlockLibConfig.cmake" INSTALL_DESTINATION ${GR_BLOCKLIB_CMAKECONFIG_INSTALL_DIR})
 
 # the generator script is installed beside the macros, which is where they look for it
-install(
+gr_install_artifact(
   FILES "${CMAKE_CURRENT_BINARY_DIR}/GnuRadioBlockLibConfig.cmake"
         "${CMAKE_CURRENT_BINARY_DIR}/GnuRadioBlockLibMacros.cmake"
         "${CMAKE_CURRENT_SOURCE_DIR}/GrParseRegistrations.cmake"
         "${CMAKE_CURRENT_SOURCE_DIR}/parse_registrations.py"
   DESTINATION "${GR_BLOCKLIB_CMAKECONFIG_INSTALL_DIR}"
-  COMPONENT Devel)
+  COMPONENT DEVELOP)
 
 if(ENABLE_TESTING)
   # the generators need no compiler, so their test is a script run against a recorded expectation; the two core plugin

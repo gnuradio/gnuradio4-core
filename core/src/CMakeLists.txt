@@ -9,7 +9,7 @@ if(NOT EMSCRIPTEN)
   add_library(gnuradio4::gnuradio-plugin ALIAS gnuradio-plugin)
   target_link_libraries(gnuradio-plugin INTERFACE gnuradio-core gnuradio-blocklib-core gnuradio-options)
 
-  install(TARGETS gnuradio-plugin EXPORT gnuradio4PluginTargets)
+  gr_install_artifact(TARGETS gnuradio-plugin EXPORT gnuradio4PluginTargets COMPONENT DEVELOP)
 endif()
 
 if(ENABLE_EXAMPLES)

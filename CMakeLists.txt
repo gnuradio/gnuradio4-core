@@ -47,6 +47,18 @@ include(GNUInstallDirs)
 set(GR_INSTALLED_PLUGIN_DIRECTORY "${CMAKE_INSTALL_FULL_LIBDIR}/gnuradio-4/plugins")
 find_package(PkgConfig QUIET)
 
+# The plugin ABI version keys every installed GR 4 layout, so installations built against different ABIs coexist. It is
+# read from the header that defines it, so the two cannot disagree.
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/core/include/gnuradio-4.0/BlockRegistry.hpp" _grPluginAbiDefine
+     REGEX "^#define[ \t]+GR_PLUGIN_CURRENT_ABI_VERSION[ \t]+[0-9]+")
+string(REGEX MATCH "[0-9]+$" GR_PLUGIN_API_VERSION "${_grPluginAbiDefine}")
+if(NOT GR_PLUGIN_API_VERSION)
+  message(FATAL_ERROR "Could not read GR_PLUGIN_CURRENT_ABI_VERSION from core/include/gnuradio-4.0/BlockRegistry.hpp")
+endif()
+
+option(GR_PACKAGING "Bundle the third-party libraries the installed binaries load, for building an installer" OFF)
+include(cmake/GrInstall.cmake)
+
 set(CMAKE_POSITION_INDEPENDENT_CODE TRUE)
 
 # limit parallel compile/link jobs to prevent OOM with template-heavy TUs override with -DGR_BUILD_PARALLEL_LEVEL=<N>
@@ -315,7 +327,7 @@ add_subdirectory(blocklib_generator)
 
 add_library(gnuradio-options INTERFACE)
 add_library(gnuradio4::gnuradio-options ALIAS gnuradio-options)
-install(TARGETS gnuradio-options EXPORT gnuradio4Targets)
+gr_install_artifact(TARGETS gnuradio-options EXPORT gnuradio4Targets COMPONENT DEVELOP)
 
 if(MSVC)
   target_compile_options(
@@ -670,9 +682,10 @@ endif()
 set(GR4_PKGCONFIG_PLUGIN_LIB "")
 configure_file(cmake/gnuradio4.pc.in ${CMAKE_CURRENT_BINARY_DIR}/gnuradio4.pc @ONLY)
 
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/gnuradio4.pc DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig # Standard location
-        # for .pc files
-)
+gr_install_artifact(
+  FILES ${CMAKE_CURRENT_BINARY_DIR}/gnuradio4.pc
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
+  COMPONENT DEVELOP)
 
 set(GR_CMAKECONFIG_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/cmake/gnuradio4")
 
@@ -684,26 +697,43 @@ write_basic_package_version_file(
   VERSION "${GR4_PKG_VERSION}"
   COMPATIBILITY SameMajorVersion)
 
-install(
+gr_install_artifact(
   EXPORT gnuradio4Targets
   FILE gnuradio4Targets.cmake
   NAMESPACE gnuradio4::
-  DESTINATION "${GR_CMAKECONFIG_INSTALL_DIR}")
+  DESTINATION "${GR_CMAKECONFIG_INSTALL_DIR}"
+  COMPONENT DEVELOP)
 
 if(TARGET gnuradio-plugin)
-  install(
+  gr_install_artifact(
     EXPORT gnuradio4PluginTargets
     FILE gnuradio4PluginTargets.cmake
     NAMESPACE gnuradio4::
-    DESTINATION "${GR_CMAKECONFIG_INSTALL_DIR}")
+    DESTINATION "${GR_CMAKECONFIG_INSTALL_DIR}"
+    COMPONENT DEVELOP)
 endif()
 
-install(
+# the modules a downstream GR 4 project builds, tests, installs and packages with; gnuradio4Config.cmake includes them
+gr_install_artifact(
   FILES "${CMAKE_CURRENT_BINARY_DIR}/gnuradio4Config.cmake"
         "${CMAKE_CURRENT_BINARY_DIR}/gnuradio4ConfigVersion.cmake"
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GnuRadio4PrecompileHeaders.cmake"
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/VirSimdVersion.cmake"
-  DESTINATION "${GR_CMAKECONFIG_INSTALL_DIR}")
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GnuRadioTestHelpers.cmake"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GrInstall.cmake"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GrInnoSetup.cmake"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GrProductBuild.cmake"
+  DESTINATION "${GR_CMAKECONFIG_INSTALL_DIR}"
+  COMPONENT DEVELOP)
+
+# installer templates shared by every downstream GR installer. Both trees are installed on every platform: the
+# superbuild reads them back out of the install prefix and decides there which one it needs. USE_SOURCE_PERMISSIONS
+# keeps the shell scripts executable, since pkgbuild refuses a --scripts directory it cannot run.
+gr_install_artifact(
+  DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/packaging/innosetup" "${CMAKE_CURRENT_SOURCE_DIR}/packaging/productbuild"
+  DESTINATION "${GR_CMAKECONFIG_INSTALL_DIR}/packaging"
+  COMPONENT DEVELOP
+  USE_SOURCE_PERMISSIONS)
 
 # print effective options
 message(STATUS "================================================")

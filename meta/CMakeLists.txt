@@ -33,10 +33,11 @@ if(GR_CACHE_LINE_SIZE)
 endif()
 
 set_target_properties(gnuradio-meta PROPERTIES PUBLIC_HEADER "${meta_public_headers}")
-install(
+gr_install_artifact(
   TARGETS gnuradio-meta
   EXPORT gnuradio4Targets
-  PUBLIC_HEADER DESTINATION include/gnuradio-4.0/meta)
+  PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/gnuradio-4.0/meta
+  COMPONENT DEVELOP)
 
 if(ENABLE_TESTING)
   add_subdirectory(test)

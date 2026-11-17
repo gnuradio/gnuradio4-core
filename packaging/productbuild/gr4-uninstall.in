@@ -1,0 +1,232 @@
+#!/bin/sh
+#
+# Removes installed GNU Radio 4 packages and their manifest entries.
+#
+# macOS has no uninstaller, so the manifest's unregister path -- which on
+# Windows runs from GrCurUninstallStepChanged() at usPostUninstall -- has
+# nothing to drive it.  This script is that driver.  Configured by CMake, see
+# cmake/GrProductBuild.cmake; installed to <install-root>/bin/gr4-uninstall by
+# gr-core's required component.
+#
+# Usage:
+#   gr4-uninstall --list                 show what is installed
+#   gr4-uninstall --package gr-blocks   remove one package
+#   gr4-uninstall --all                  remove every GNU Radio 4 package
+#   gr4-uninstall --all --dry-run        show what --all would remove
+#
+# Needs root to remove anything under the install root.
+
+set -u
+
+api_version='@GR_PLUGIN_API_VERSION@'
+install_root='@GR_PRODUCTBUILD_INSTALL_ROOT@'
+shared_root='@GR_PRODUCTBUILD_SHARED_ROOT@'
+plugin_root='@GR_PRODUCTBUILD_PLUGIN_ROOT@'
+identifier_namespace='@GR_PRODUCTBUILD_IDENTIFIER_NAMESPACE@'
+
+manifest_path="${shared_root}/manifest/v${api_version}/manifest.json"
+tools_dir="${shared_root}/tools"
+manifest_tool="${tools_dir}/gr_manifest.sh"
+
+mode=''
+target_package=''
+dry_run='no'
+
+usage() {
+    # the whole leading comment block, so it cannot drift out of date the way a
+    # hard-coded line range does
+    awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --list) mode='list'; shift ;;
+        --all) mode='all'; shift ;;
+        --package)
+            if [ $# -lt 2 ]; then echo "gr4-uninstall: --package requires a name" >&2; exit 2; fi
+            mode='package'; target_package="$2"; shift 2 ;;
+        --dry-run) dry_run='yes'; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "gr4-uninstall: unknown option '$1'" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+if [ -z "${mode}" ]; then
+    usage >&2
+    exit 2
+fi
+
+if [ ! -f "${manifest_path}" ]; then
+    echo "gr4-uninstall: nothing is installed (no manifest at ${manifest_path})"
+    exit 0
+fi
+if [ ! -f "${manifest_tool}" ]; then
+    echo "gr4-uninstall: the manifest tool is missing from ${tools_dir}" >&2
+    echo "gr4-uninstall: reinstall GNU Radio 4, or remove ${shared_root} by hand" >&2
+    exit 1
+fi
+
+query_output=$(mktemp -t gr4_uninstall) || exit 1
+# shellcheck disable=SC2064
+trap "rm -f '${query_output}'" EXIT
+
+query() {
+    sh "${manifest_tool}" --action query --manifest-path "${manifest_path}" \
+        --out-file "${query_output}" --api-version "${api_version}" ||
+        { echo "gr4-uninstall: cannot read ${manifest_path}" >&2; exit 1; }
+}
+
+query
+
+# 'component.gr-core=4.0.0' and 'plugin.foo=1.0' -> 'component gr-core 4.0.0'
+#
+# sed -E, because BSD sed -- which is what macOS ships -- has no \| alternation
+# in a basic regular expression and would quietly match nothing.
+list_entries() {
+    sed -E -n 's/^(component|plugin)\.([^=]*)=(.*)$/\1 \2 \3/p' "${query_output}"
+}
+
+identifier_prefix_of() {
+    prefix=$(sed -n "s/^identifier\.$1=//p" "${query_output}" | head -n 1)
+    if [ -n "${prefix}" ]; then
+        printf '%s' "${prefix}"
+        return
+    fi
+    # Written by an installer that did not record one -- the Windows tool never
+    # does. Fall back to the namespace so --all still finds the receipts.
+    printf '%s' "${identifier_namespace}"
+}
+
+# Every pkgutil receipt whose identifier is the prefix or sits below it.
+receipts_for_prefix() {
+    pkgutil --pkgs 2>/dev/null | while IFS= read -r receipt; do
+        case "${receipt}" in
+            "$1"|"$1".*) printf '%s\n' "${receipt}" ;;
+        esac
+    done
+}
+
+if [ "${mode}" = 'list' ]; then
+    printf 'install root: %s\n' "$(sed -n 's/^install-root=//p' "${query_output}")"
+    printf 'plugin root:  %s\n' "$(sed -n 's/^plugin-root=//p' "${query_output}")"
+    printf 'manifest:     %s\n\n' "${manifest_path}"
+    list_entries | while read -r section name version; do
+        printf '%-10s %-24s %-12s %s\n' "${section}" "${name}" "${version}" "$(identifier_prefix_of "${name}")"
+    done
+    exit 0
+fi
+
+if [ "${mode}" = 'package' ]; then
+    if ! list_entries | awk -v want="${target_package}" '$2 == want { found = 1 } END { exit !found }'; then
+        echo "gr4-uninstall: '${target_package}' is not recorded in ${manifest_path}" >&2
+        echo "gr4-uninstall: run --list to see what is installed" >&2
+        exit 1
+    fi
+    selected=$(list_entries | awk -v want="${target_package}" '$2 == want { print $1, $2 }')
+else
+    selected=$(list_entries | awk '{ print $1, $2 }')
+fi
+
+if [ "${dry_run}" != 'yes' ] && [ "$(id -u)" -ne 0 ]; then
+    echo "gr4-uninstall: must be run as root, try: sudo $0 $*" >&2
+    exit 1
+fi
+
+# Removes one receipt's payload. pkgutil --files prints paths relative to the
+# receipt's own install-location, so both it and the volume have to be read back
+# from --pkg-info to rebuild an absolute path.
+remove_receipt() {
+    receipt="$1"
+    info=$(pkgutil --pkg-info "${receipt}" 2>/dev/null) || return 0
+    volume=$(printf '%s' "${info}" | sed -n 's/^volume: //p' | head -n 1)
+    location=$(printf '%s' "${info}" | sed -n 's/^location: //p' | head -n 1)
+    [ -n "${volume}" ] || volume='/'
+    base="${volume%/}/${location#/}"
+    base="${base%/}"
+
+    # files first, then directories deepest-first: rmdir refuses non-empty
+    # directories, which is what keeps anything the user put there safe. This is
+    # the same guarantee GrRemoveEmptyDirTree() relies on RemoveDir for.
+    pkgutil --files "${receipt}" --only-files 2>/dev/null | while IFS= read -r relative; do
+        [ -n "${relative}" ] || continue
+        path="${base}/${relative}"
+        if [ "${dry_run}" = 'yes' ]; then
+            printf '  would remove %s\n' "${path}"
+        else
+            rm -f "${path}" 2>/dev/null
+        fi
+    done
+
+    pkgutil --files "${receipt}" --only-dirs 2>/dev/null | sort -r | while IFS= read -r relative; do
+        [ -n "${relative}" ] || continue
+        path="${base}/${relative}"
+        if [ "${dry_run}" = 'yes' ]; then
+            printf '  would remove %s if empty\n' "${path}"
+        else
+            rmdir "${path}" 2>/dev/null
+        fi
+    done
+
+    if [ "${dry_run}" = 'yes' ]; then
+        printf '  would forget %s\n' "${receipt}"
+    else
+        pkgutil --forget "${receipt}" >/dev/null 2>&1
+    fi
+}
+
+printf '%s\n' "${selected}" | while read -r section name; do
+    [ -n "${name}" ] || continue
+    printf '%s %s\n' "${section}" "${name}"
+    prefix=$(identifier_prefix_of "${name}")
+    receipts=$(receipts_for_prefix "${prefix}")
+    if [ -z "${receipts}" ]; then
+        printf '  no pkgutil receipts under %s, removing the manifest entry only\n' "${prefix}"
+    fi
+    printf '%s\n' "${receipts}" | while IFS= read -r receipt; do
+        [ -n "${receipt}" ] || continue
+        remove_receipt "${receipt}"
+    done
+done
+
+if [ "${dry_run}" = 'yes' ]; then
+    echo
+    echo "gr4-uninstall: dry run, nothing was removed"
+    exit 0
+fi
+
+# The subshell above cannot export anything, so the unregister lists are rebuilt
+# here from the same selection.
+component_names=$(printf '%s\n' "${selected}" | awk '$1 == "component" { printf "%s|", $2 }')
+plugin_names=$(printf '%s\n' "${selected}" | awk '$1 == "plugin" { printf "%s|", $2 }')
+
+sh "${manifest_tool}" --action unregister --manifest-path "${manifest_path}" \
+    --out-file "${query_output}" --api-version "${api_version}" \
+    --components "${component_names%|}" --plugins "${plugin_names%|}" ||
+    {
+        echo "gr4-uninstall: the files were removed, but ${manifest_path}" >&2
+        echo "gr4-uninstall: still lists them. Remove the entries by hand." >&2
+        exit 1
+    }
+
+if ! grep -q '^manifest-removed=1$' "${query_output}"; then
+    echo "gr4-uninstall: done; other GNU Radio 4 packages are still installed"
+    exit 0
+fi
+
+# Only reached once the manifest is gone, so nothing else claims these paths.
+# Port of GrPruneAppDataTree(): rmdir refuses non-empty directories, so a plugin
+# tree someone is still using survives.
+rm -f "${tools_dir}/gr_manifest.sh"
+rm -f "${manifest_path}.corrupt"
+rmdir "${tools_dir}" 2>/dev/null
+rmdir "${shared_root}/manifest/v${api_version}" 2>/dev/null
+rmdir "${shared_root}/manifest" 2>/dev/null
+rmdir "${plugin_root}" 2>/dev/null
+rmdir "${shared_root}/plugins" 2>/dev/null
+rmdir "${shared_root}" 2>/dev/null
+
+# The shared prefix keeps the directories whichever package installed first
+# created: no receipt claims them, so nothing else removes them.
+find "${install_root}" -depth -type d -exec rmdir {} + 2>/dev/null
+
+echo "gr4-uninstall: done; GNU Radio 4 has been removed"
