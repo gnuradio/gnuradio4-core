@@ -12,6 +12,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -281,7 +282,21 @@ std::expected<std::shared_ptr<gr::BlockModel>, gr::Error> instantiateBlockFromYa
 namespace detail {
 // Minimal shared-library shim, so that PluginHandler itself stays free of platform #ifdefs.
 #ifdef _WIN32
-[[nodiscard]] inline void*       openSharedLibrary(const char* path) noexcept { return ::LoadLibraryA(path); }
+// The libraries a plugin loads are looked for first in its own directory, the running program's directory and
+// System32. An installed plugin's dependencies sit beside it or beside the programs in bin, and PATH need name neither:
+// LOAD_WITH_ALTERED_SEARCH_PATH alone does not search the program's directory. Failing that, the plugin's directory,
+// the system directories and PATH are searched, which a build tree relies on. Both need an absolute path.
+[[nodiscard]] inline void* openSharedLibrary(const char* path) noexcept {
+    std::error_code             error;
+    const std::filesystem::path absolutePath = std::filesystem::absolute(path, error);
+    if (error) {
+        return ::LoadLibraryA(path);
+    }
+    if (HMODULE module = ::LoadLibraryExW(absolutePath.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS); module != nullptr) {
+        return module;
+    }
+    return ::LoadLibraryExW(absolutePath.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+}
 [[nodiscard]] inline void*       findSharedLibrarySymbol(void* handle, const char* name) noexcept { return reinterpret_cast<void*>(::GetProcAddress(static_cast<HMODULE>(handle), name)); }
 inline void                      closeSharedLibrary(void* handle) noexcept { ::FreeLibrary(static_cast<HMODULE>(handle)); }
 [[nodiscard]] inline std::string lastSharedLibraryError() {
