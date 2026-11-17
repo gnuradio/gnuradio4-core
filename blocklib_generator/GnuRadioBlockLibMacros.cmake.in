@@ -526,12 +526,14 @@ function(gr_add_block_library LIB_NAME)
         target_sources(${SHARED_LIB_NAME} PRIVATE $<TARGET_OBJECTS:${OBJECT_LIB_NAME}>)
         target_link_libraries(${SHARED_LIB_NAME} PUBLIC gnuradio4::gnuradio-core gnuradio4::gnuradio-blocklib-core ${CBL_LINK_LIBRARIES})
         gr_detail_install_component_args()
-        # on Windows the DLL is the RUNTIME artifact and the import library the ARCHIVE one
+        # The library goes to the plugin directory, where the plugin loader looks, on every platform. On Windows the
+        # DLL is the RUNTIME artifact, so a program that links it rather than loading it needs that directory on PATH.
+        # The import library, the ARCHIVE artifact, stays in the library directory with the other link inputs.
         install(
             TARGETS ${SHARED_LIB_NAME}
             EXPORT gnuradio4Targets
             LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/gnuradio-4/plugins ${GR_RUNTIME_COMPONENT_ARGS}
-            RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} ${GR_RUNTIME_COMPONENT_ARGS}
+            RUNTIME DESTINATION ${CMAKE_INSTALL_LIBDIR}/gnuradio-4/plugins ${GR_RUNTIME_COMPONENT_ARGS}
             ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} ${GR_DEVELOP_COMPONENT_ARGS})
     endif()
 
@@ -642,10 +644,11 @@ function(gr_add_block_plugin LIB_NAME)
     target_link_libraries(${PLUGIN_LIB_NAME} ${OBJECT_LIB_NAME})
     if(NOT CBL_NO_INSTALL)
         gr_detail_install_component_args()
+        # in the plugin directory, where the plugin loader looks, as a block library's shared library is
         install(
             TARGETS ${PLUGIN_LIB_NAME}
-            LIBRARY DESTINATION lib ${GR_RUNTIME_COMPONENT_ARGS}
-            RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} ${GR_RUNTIME_COMPONENT_ARGS}
+            LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/gnuradio-4/plugins ${GR_RUNTIME_COMPONENT_ARGS}
+            RUNTIME DESTINATION ${CMAKE_INSTALL_LIBDIR}/gnuradio-4/plugins ${GR_RUNTIME_COMPONENT_ARGS}
             ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} ${GR_DEVELOP_COMPONENT_ARGS})
     endif()
 

@@ -102,6 +102,16 @@ function(setup_test_no_asan TEST_NAME)
   endif()
   add_test(NAME ${TEST_NAME} COMMAND ${CMAKE_CROSSCOMPILING_EMULATOR} ${CMAKE_CURRENT_BINARY_DIR}/${TEST_NAME})
   gr_test_add_dll_directories(${TEST_NAME})
+  # Windows finds the DLLs a test links on PATH. An installed block library's DLL is in the plugin directory, which is
+  # neither beside the test nor in bin, so every directory holding one of the test's DLLs goes on PATH.
+  if(WIN32)
+    set(_dll_dirs "$<TARGET_RUNTIME_DLL_DIRS:${TEST_NAME}>")
+    set_property(
+      TEST ${TEST_NAME}
+      APPEND
+      PROPERTY ENVIRONMENT_MODIFICATION
+               "$<$<BOOL:${_dll_dirs}>:PATH=path_list_prepend:$<JOIN:${_dll_dirs},$<SEMICOLON>PATH=path_list_prepend:>>")
+  endif()
 endfunction()
 
 function(setup_test TEST_NAME)
