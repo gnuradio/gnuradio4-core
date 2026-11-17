@@ -406,13 +406,13 @@ struct elementary {
     // takes h no larger than 2^60, which leaves it as it is below |x| = 20 and keeps the discarded
     // lanes' quotient normal without a select, which Clang would move the division past.
     SIMD_ELEMENTARY_INLINE static V sinh_(V x) noexcept {
-        const V a     = O::abs(x);
-        const V small = O::select(O::lt(a, c(0x1p-28)), x, odd_poly(x, exp_arg(a), 1, C::sinh));
-        const M mid   = O::lt(a, c(20));
-        const V h     = exp_clamped(O::min(exp_arg(a), c(S::half_exp_max)), c(-1));
-        const V q     = O::div(c(0.25), O::min(h, c(0x1p60)));
-        const V large = O::copysign(O::select(mid, O::sub(h, q), h), x);
-        const V s     = O::select(O::lt(a, c(1)), small, large);
+        const V a         = O::abs(x);
+        const V small_arg = O::select(O::lt(a, c(0x1p-28)), x, odd_poly(x, exp_arg(a), 1, C::sinh));
+        const M mid       = O::lt(a, c(20));
+        const V h         = exp_clamped(O::min(exp_arg(a), c(S::half_exp_max)), c(-1));
+        const V q         = O::div(c(0.25), O::min(h, c(0x1p60)));
+        const V large     = O::copysign(O::select(mid, O::sub(h, q), h), x);
+        const V s         = O::select(O::lt(a, c(1)), small_arg, large);
         return O::select(is_inf(x), x, s);
     }
 
@@ -428,8 +428,8 @@ struct elementary {
     // tanh: at most 2 ulp. The polynomial up to |x| = 3/4; above it, 1 - 2 / (e^(2|x|) + 1),
     // which rounds to 1 from |x| = 19 on, so |x| is limited to 20.
     SIMD_ELEMENTARY_INLINE static V tanh_(V x) noexcept {
-        const V a     = O::abs(x);
-        const V small = O::select(O::lt(a, c(0x1p-28)), x, odd_poly(x, a, 0.75, C::tanh));
+        const V a         = O::abs(x);
+        const V small_arg = O::select(O::lt(a, c(0x1p-28)), x, odd_poly(x, a, 0.75, C::tanh));
         // below 2^-60 as in exp_arg
         const V m  = O::select(O::lt(a, c(0x1p-60)), O::select(O::eq(a, c(0)), a, c(0x1p-60)), O::min(a, c(20.)));
         const V a2 = O::add(m, m);
@@ -441,7 +441,7 @@ struct elementary {
             }
         }();
         const V large = O::copysign(O::sub(c(1), O::div(c(2), O::add(e2, c(1)))), x);
-        return O::select(O::lt(a, c(0.75)), small, large);
+        return O::select(O::lt(a, c(0.75)), small_arg, large);
     }
 
     // log, log2, log10. x = 2^e m with m in [sqrt(1/2), sqrt 2), f = m - 1 exactly; log(1 + f) =
@@ -665,14 +665,14 @@ struct elementary {
     // taken away as one, whose rounding is below a fifth of r's last bit there. rlo is the
     // rounding of the last difference: |s| exceeds the part taken from it above 2^-10.
     SIMD_ELEMENTARY_INLINE static trig_parts reduce_lean_parts(V x, V k) noexcept {
-        V s          = O::fnmadd(k, c(L::pi[0] / 2), x);
-        s            = O::fnmadd(k, c(L::pi[1] / 2), s);
-        const V r1   = O::fnmadd(k, c(L::pi[2] / 2), s);
-        const V near = O::fnmadd(k, c(L::pi[3] / 2), r1);
-        const V t    = O::fmadd(k, c(L::pi[3] / 2), O::mul(k, c(L::pi[2] / 2)));
-        const V far  = O::sub(s, t);
-        const M m    = O::lt(O::abs(r1), c(0x1p-10));
-        return {k, O::select(m, near, far), O::select(m, O::fnmadd(k, c(L::pi[3] / 2), O::sub(r1, near)), O::sub(O::sub(s, far), t))};
+        V s             = O::fnmadd(k, c(L::pi[0] / 2), x);
+        s               = O::fnmadd(k, c(L::pi[1] / 2), s);
+        const V r1      = O::fnmadd(k, c(L::pi[2] / 2), s);
+        const V r_small = O::fnmadd(k, c(L::pi[3] / 2), r1);
+        const V t       = O::fmadd(k, c(L::pi[3] / 2), O::mul(k, c(L::pi[2] / 2)));
+        const V r_large = O::sub(s, t);
+        const M m       = O::lt(O::abs(r1), c(0x1p-10));
+        return {k, O::select(m, r_small, r_large), O::select(m, O::fnmadd(k, c(L::pi[3] / 2), O::sub(r1, r_small)), O::sub(O::sub(s, r_large), t))};
     }
 
     SIMD_ELEMENTARY_INLINE static V reduce_lean(V x, V k) noexcept { return reduce_lean_parts(x, k).r; }
@@ -859,28 +859,28 @@ struct elementary {
             // 1) / (t + 1)); |u| <= tan(pi/8), within the float table's 7/16. b + u is taken exactly
             // as s + e (|b| > |u|); the numerator and the denominator are both selected, which keeps
             // Clang from moving the division past the select onto -1/0
-            const M far = O::lt(c(2.414213562373095), t);
-            const M mid = O::lt(c(0.41421356237309503), t);
-            const V num = O::select(far, c(-1), O::select(mid, O::sub(t, c(1)), t));
-            const V den = O::select(far, t, O::select(mid, O::add(t, c(1)), c(1)));
-            const V u   = O::div(num, den);
-            const V b   = O::select(far, c(S::pi2_hi), O::select(mid, c(S::pi4_hi), c(0)));
-            const V blo = O::select(far, c(S::pi2_lo), O::select(mid, c(S::pi4_lo), c(0)));
-            const V sum = O::add(b, u);
-            const V e   = O::add(O::sub(b, sum), u);
-            const V z   = O::mul(u, u);
+            const M far_range = O::lt(c(2.414213562373095), t);
+            const M mid       = O::lt(c(0.41421356237309503), t);
+            const V num       = O::select(far_range, c(-1), O::select(mid, O::sub(t, c(1)), t));
+            const V den       = O::select(far_range, t, O::select(mid, O::add(t, c(1)), c(1)));
+            const V u         = O::div(num, den);
+            const V b         = O::select(far_range, c(S::pi2_hi), O::select(mid, c(S::pi4_hi), c(0)));
+            const V blo       = O::select(far_range, c(S::pi2_lo), O::select(mid, c(S::pi4_lo), c(0)));
+            const V sum       = O::add(b, u);
+            const V e         = O::add(O::sub(b, sum), u);
+            const V z         = O::mul(u, u);
             return {sum, O::add(e, O::fmadd(O::mul(u, z), poly(z, C::atan), blo))};
         }
         if constexpr (widened) {
             // float accuracy: above tan(3 pi / 8), pi/2 + atan(-1/t); above tan(pi/8),
             // pi/4 + atan((t - 1) / (t + 1)); the cancellation there costs bits double can spare
-            const M far = O::lt(c(2.414213562373095), t);
-            const M mid = O::lt(c(0.41421356237309503), t);
-            const V num = O::select(far, c(-1), O::select(mid, O::sub(t, c(1)), t));
-            const V den = O::select(far, t, O::select(mid, O::add(t, c(1)), c(1)));
-            const V u   = O::div(num, den);
-            const V z   = O::mul(u, u);
-            return {O::select(far, c(1.5707963267948966), O::select(mid, c(0.7853981633974483), c(0))), O::fmadd(O::mul(u, z), poly(z, C::atan), u)};
+            const M far_range = O::lt(c(2.414213562373095), t);
+            const M mid       = O::lt(c(0.41421356237309503), t);
+            const V num       = O::select(far_range, c(-1), O::select(mid, O::sub(t, c(1)), t));
+            const V den       = O::select(far_range, t, O::select(mid, O::add(t, c(1)), c(1)));
+            const V u         = O::div(num, den);
+            const V z         = O::mul(u, u);
+            return {O::select(far_range, c(1.5707963267948966), O::select(mid, c(0.7853981633974483), c(0))), O::fmadd(O::mul(u, z), poly(z, C::atan), u)};
         }
         const M r1 = O::le(c(0.4375), t);
         const M r2 = O::le(c(0.6875), t);
@@ -911,8 +911,8 @@ struct elementary {
         // the UCRT raises underflow for double atan of |x| up to twice the smallest normal and for
         // float atan not at all; glibc and musl raise it below the smallest normal for both, which
         // float atan leaves out
-        const V small = std::is_same_v<Acc, double> ? tiny_result(x, 2 * min_normal()) : x;
-        return O::select(tiny, small, O::copysign(O::add(p.hi, p.low), x));
+        const V small_arg = std::is_same_v<Acc, double> ? tiny_result(x, 2 * min_normal()) : x;
+        return O::select(tiny, small_arg, O::copysign(O::add(p.hi, p.low), x));
     }
 
     // atan2: at most 2 ulp. t = min(|x|, |y|) / max(|x|, |y|), at most 1, so that the division
@@ -1253,11 +1253,11 @@ struct elementary {
             if (all_within(a, 0x1p-28, 86)) {
                 // the polynomial on |x| itself, as odd_poly's limits change nothing here, and x's
                 // sign once at the end: the polynomial of -|x| is that of |x| negated exactly
-                const V h     = half_exp_normal(a);
-                const V m     = O::min(a, c(1));
-                const V z     = O::mul(m, m);
-                const V small = O::fmadd(O::mul(m, z), poly(z, C::sinh), m);
-                return O::copysign(O::select(O::lt(a, c(1)), small, O::sub(h, O::div(c(0.25), h))), x);
+                const V h         = half_exp_normal(a);
+                const V m         = O::min(a, c(1));
+                const V z         = O::mul(m, m);
+                const V small_arg = O::fmadd(O::mul(m, z), poly(z, C::sinh), m);
+                return O::copysign(O::select(O::lt(a, c(1)), small_arg, O::sub(h, O::div(c(0.25), h))), x);
             }
         } else if constexpr (!widened) {
             // double up to |x| = 708: h = e^|x| / 2 is 2^(m - 1) times exp_table's value, and the
@@ -1265,13 +1265,13 @@ struct elementary {
             const V a = O::abs(x);
             if (all_within(a, 0x1p-28, 708)) {
                 V       m;
-                const V t     = exp_table(a, m);
-                const V h     = O::mul(O::pow2(O::sub(m, c(1))), t);
-                const V s     = O::min(a, c(1));
-                const V z     = O::mul(s, s);
-                const V small = O::fmadd(O::mul(s, z), poly(z, C::sinh), s);
-                const V large = O::sub(h, O::div(c(0.25), O::min(h, c(0x1p60))));
-                return O::copysign(O::select(O::lt(a, c(1)), small, large), x);
+                const V t         = exp_table(a, m);
+                const V h         = O::mul(O::pow2(O::sub(m, c(1))), t);
+                const V s         = O::min(a, c(1));
+                const V z         = O::mul(s, s);
+                const V small_arg = O::fmadd(O::mul(s, z), poly(z, C::sinh), s);
+                const V large     = O::sub(h, O::div(c(0.25), O::min(h, c(0x1p60))));
+                return O::copysign(O::select(O::lt(a, c(1)), small_arg, large), x);
             }
         }
         const M nan = O::isnan(x);
@@ -1306,12 +1306,12 @@ struct elementary {
             const V a = O::abs(x);
             if (all_within(a, 0x1p-28, 43)) {
                 // as in sinh, the polynomial on |x| and the sign at the end
-                const V e2    = exp_normal(O::add(a, a));
-                const V m     = O::min(a, c(0.75));
-                const V z     = O::mul(m, m);
-                const V small = O::fmadd(O::mul(m, z), poly(z, C::tanh), m);
-                const V large = O::sub(c(1), O::div(c(2), O::add(e2, c(1))));
-                return O::copysign(O::select(O::lt(a, c(0.75)), small, large), x);
+                const V e2        = exp_normal(O::add(a, a));
+                const V m         = O::min(a, c(0.75));
+                const V z         = O::mul(m, m);
+                const V small_arg = O::fmadd(O::mul(m, z), poly(z, C::tanh), m);
+                const V large     = O::sub(c(1), O::div(c(2), O::add(e2, c(1))));
+                return O::copysign(O::select(O::lt(a, c(0.75)), small_arg, large), x);
             }
         }
         const M nan = O::isnan(x);

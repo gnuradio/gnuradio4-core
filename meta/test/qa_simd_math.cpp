@@ -1,3 +1,8 @@
+#ifdef _WIN32
+// windows.h defines near and far as empty macros, and the elementary functions have to compile after it
+#include <windows.h>
+#endif
+
 #include <boost/ut.hpp>
 
 #include <algorithm>
