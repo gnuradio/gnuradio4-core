@@ -491,7 +491,11 @@ if(EMSCRIPTEN)
     "SHELL:-s ENVIRONMENT=web,worker,node")
 endif()
 
-find_package(magic_enum 0.9.3 CONFIG REQUIRED)
+find_package(
+  magic_enum
+  0.9.3
+  CONFIG
+  REQUIRED)
 
 find_package(vir-simd CONFIG REQUIRED)
 include(cmake/VirSimdVersion.cmake)
@@ -499,7 +503,11 @@ gr_require_vir_simd_version(0.4.4)
 
 if(ENABLE_TESTING)
   add_compile_definitions(BOOST_UT_DISABLE_MODULE)
-  find_package(ut 2.3.1 CONFIG REQUIRED)
+  find_package(
+    ut
+    2.3.1
+    CONFIG
+    REQUIRED)
   if(TARGET Boost::ut AND NOT TARGET ut)
     add_library(ut ALIAS Boost::ut)
   elseif(TARGET boost::ut AND NOT TARGET ut)
@@ -508,8 +516,8 @@ if(ENABLE_TESTING)
 
   # only the HTTP asset test of a native build serves files; Emscripten builds fetch through the browser
   if(NOT EMSCRIPTEN)
-    # cpp-httplib's version file accepts only its own minor version, so a version passed to find_package would pin 0.18.x
-    # (a package that sets no version is taken as it is)
+    # cpp-httplib's version file accepts only its own minor version, so a version passed to find_package would pin
+    # 0.18.x (a package that sets no version is taken as it is)
     find_package(httplib CONFIG REQUIRED)
     if(httplib_VERSION AND httplib_VERSION VERSION_LESS 0.18.1)
       message(FATAL_ERROR "cpp-httplib ${httplib_VERSION} was found, 0.18.1 or newer is required")
@@ -696,7 +704,8 @@ if(TARGET gnuradio-plugin)
 endif()
 
 install(
-  FILES "${CMAKE_CURRENT_BINARY_DIR}/gnuradio4Config.cmake" "${CMAKE_CURRENT_BINARY_DIR}/gnuradio4ConfigVersion.cmake"
+  FILES "${CMAKE_CURRENT_BINARY_DIR}/gnuradio4Config.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/gnuradio4ConfigVersion.cmake"
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GnuRadio4PrecompileHeaders.cmake"
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/VirSimdVersion.cmake"
   DESTINATION "${GR_CMAKECONFIG_INSTALL_DIR}")

@@ -4,7 +4,13 @@
 # REASON_VARIABLE it sets that variable to the problem, or to an empty string, and returns instead, so that a package
 # config can report not-found rather than abort its consumer's configure.
 function(gr_require_vir_simd_version MINIMUM_VERSION)
-  cmake_parse_arguments(PARSE_ARGV 1 ARG "" "REASON_VARIABLE" "")
+  cmake_parse_arguments(
+    PARSE_ARGV
+    1
+    ARG
+    ""
+    "REASON_VARIABLE"
+    "")
 
   get_target_property(_include_dirs vir-simd::vir-simd INTERFACE_INCLUDE_DIRECTORIES)
   foreach(_dir IN LISTS _include_dirs)
@@ -16,8 +22,15 @@ function(gr_require_vir_simd_version MINIMUM_VERSION)
 
   # the header packs the version as one hexadecimal number, major * 0x10000 + minor * 0x100 + patch, written with digit
   # separators, e.g. 0x0'04'04 for 0.4.4
-  string(REPLACE "'" "" _version_define "${_version_define}")
-  if(NOT _version_define MATCHES "0x([0-9a-fA-F]+)$")
+  string(
+    REPLACE "'"
+            ""
+            _version_define
+            "${_version_define}")
+  if(NOT
+     _version_define
+     MATCHES
+     "0x([0-9a-fA-F]+)$")
     set(_problem "vir-simd was found, but its version could not be read from vir/simd_version.h")
   else()
     math(EXPR _packed "0x${CMAKE_MATCH_1}")

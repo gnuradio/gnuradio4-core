@@ -20,7 +20,11 @@ endif()
 if(ENABLE_TESTING)
   find_dependency(ut 2.3.1 CONFIG)
 else()
-  find_package(ut 2.3.1 CONFIG QUIET)
+  find_package(
+    ut
+    2.3.1
+    CONFIG
+    QUIET)
 endif()
 
 # Optional transitive dependencies of exported targets.
