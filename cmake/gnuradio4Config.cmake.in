@@ -14,9 +14,13 @@ if(_gr_vir_simd_problem)
   return()
 endif()
 
-# the installed UnitTestHelper.hpp and gnuradio4::ut-benchmark include Boost.UT, so a consumer that builds tests needs it
+# The installed UnitTestHelper.hpp and gnuradio4::ut-benchmark include Boost.UT. A consumer that builds tests needs it.
+# Any other consumer takes it when it is there, and one that links gnuradio4::ut-benchmark without it is stopped by the
+# missing Boost::ut target.
 if(ENABLE_TESTING)
   find_dependency(ut 2.3.1 CONFIG)
+else()
+  find_package(ut 2.3.1 CONFIG QUIET)
 endif()
 
 # Optional transitive dependencies of exported targets.

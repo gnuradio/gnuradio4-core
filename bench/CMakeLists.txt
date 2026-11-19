@@ -2,7 +2,9 @@ add_library(ut-benchmark INTERFACE benchmark.hpp)
 add_library(gnuradio4::ut-benchmark ALIAS ut-benchmark)
 target_include_directories(ut-benchmark INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
                                                   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-target_link_libraries(ut-benchmark INTERFACE ut)
+# Installed, it names Boost.UT's own target: the build's 'ut' alias exists only in a build with tests, and a project
+# that builds benchmarks against a core built without them still gets the harness.
+target_link_libraries(ut-benchmark INTERFACE $<BUILD_INTERFACE:ut> $<INSTALL_INTERFACE:Boost::ut>)
 install(TARGETS ut-benchmark EXPORT gnuradio4Targets)
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/benchmark.hpp DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
@@ -32,4 +34,6 @@ function(add_benchmark BM_NAME)
   target_link_libraries(${BM_NAME} PRIVATE gnuradio4::gnuradio-options ut gnuradio4::ut-benchmark)
 endfunction()
 
-add_benchmark(bm_example)
+if(ENABLE_TESTING)
+  add_benchmark(bm_example)
+endif()

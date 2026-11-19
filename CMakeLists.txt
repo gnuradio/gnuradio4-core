@@ -565,9 +565,9 @@ if(Python3_FOUND AND NOT EMSCRIPTEN)
   endif()
 endif()
 
-if(ENABLE_TESTING)
-  add_subdirectory(bench) # custom ut addon for microbenchmarking
-endif()
+# the microbenchmark harness, a Boost.UT add-on, is installed whatever the build runs; core's own benchmarks are built
+# with its tests
+add_subdirectory(bench)
 
 add_subdirectory(core)
 add_subdirectory(meta)
