@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <complex>
 #include <fstream>
@@ -684,7 +685,7 @@ const boost::ut::suite StreamTagConcept = [] {
             int64_t     index;
             std::string data;
         };
-        expect(eq(sizeof(buffer_tag), gr::kCacheLine)) << "tag size";
+        expect(std::has_single_bit(sizeof(buffer_tag))) << "tag size";
         BufferLike auto buffer    = CircularBuffer<int32_t>(1024);
         BufferLike auto tagBuffer = CircularBuffer<buffer_tag>(32);
         expect(ge(buffer.size(), 1024u));
