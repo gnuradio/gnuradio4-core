@@ -1270,14 +1270,15 @@ const boost::ut::suite<"non power of two"> _nonPo2 = [] {
 
         auto buffer = TestBuffer(1024); // Should remain power of 2
 
-        expect(eq(buffer.size(), 1024UZ));
+        // N.B. GE because the size rounds up to whole pages, and a page of 16 kB or more holds more than 1024 int32_t
+        expect(ge(buffer.size(), 1024UZ));
         expect(std::has_single_bit(buffer.size())) << "Power-of-2 sizes should be preserved for performance";
 
         auto writer = buffer.new_writer();
         auto reader = buffer.new_reader();
 
         // quick wraparound test
-        constexpr std::size_t writeReadQuanta = 511UZ;
+        const std::size_t writeReadQuanta = buffer.size() / 2UZ - 1UZ; // three rounds wrap the buffer at every page size
         for (std::size_t round = 0UZ; round < 3UZ; ++round) {
             {
                 auto write_span = writer.tryReserve(writeReadQuanta);
