@@ -63,6 +63,11 @@ function ConvertTo-OrderedDictionary {
         }
         return $converted
     }
+    if ($InputObject -is [System.Array]) {
+        # the leading comma keeps the array whole: a function's output is unrolled, so a one-element list returned bare
+        # would come back as its element, and be written back as a scalar
+        return , @($InputObject | ForEach-Object { ConvertTo-OrderedDictionary $_ })
+    }
     return $InputObject
 }
 
@@ -94,6 +99,15 @@ function Write-Manifest {
     $directory = Split-Path -Parent $ManifestPath
     if (-not (Test-Path -LiteralPath $directory)) {
         New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+    # an earlier version of this script wrote a one-element 'configurations' list as a scalar; it is written as a list
+    foreach ($section in @('components', 'plugins')) {
+        if (-not $Manifest.Contains($section) -or $Manifest[$section] -isnot [System.Collections.IDictionary]) { continue }
+        foreach ($entry in $Manifest[$section].Values) {
+            if ($entry -is [System.Collections.IDictionary] -and $entry.Contains('configurations')) {
+                $entry['configurations'] = @($entry['configurations'])
+            }
+        }
     }
     # write to a sibling temporary file first so a crash cannot truncate the manifest
     $temporary = "$ManifestPath.new"
