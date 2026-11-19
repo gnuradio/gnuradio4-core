@@ -29,8 +29,7 @@ Inside the container:
 
 ```bash
 cmake -S . -B build \
-  -DCMAKE_BUILD_TYPE=Debug \
-  -DGR_USE_FETCHCONTENT_DEPS=ON
+  -DCMAKE_BUILD_TYPE=Debug
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
@@ -41,7 +40,6 @@ tuple, for example:
 ```bash
 CC=clang-20 CXX=clang++-20 cmake -S . -B build-clang \
   -DCMAKE_BUILD_TYPE=Release \
-  -DGR_USE_FETCHCONTENT_DEPS=ON \
   -DADDRESS_SANITIZER=ON
 cmake --build build-clang --parallel
 ctest --test-dir build-clang --output-on-failure
@@ -57,14 +55,28 @@ Required tools:
 - pkg-config
 - Ninja or GNU Make
 
-Native package availability varies by distribution. If Boost.UT, cpp-httplib, or
-vir-simd are not packaged for your system, configure with
-`-DGR_USE_FETCHCONTENT_DEPS=ON`.
+Required libraries, found through their CMake package files:
+
+- magic_enum >= 0.9.3
+- vir-simd >= 0.4.4
+- Boost.UT >= 2.3.1, only when building tests and benchmarks
+- cpp-httplib >= 0.18.1, only when building tests natively
+
+Native package availability varies by distribution. The
+[gr-deps superbuild](https://github.com/johnwparent/gnuradio4-superbuild)
+builds all four into one prefix of your choosing; point CMake at it, or at any
+other install of them, with `CMAKE_PREFIX_PATH`. Cross builds that search a
+sysroot, such as Emscripten's, need the packages inside that sysroot or a root
+added through `CMAKE_FIND_ROOT_PATH`.
+
+```bash
+cmake -S gnuradio4-superbuild -B build-deps -DCMAKE_INSTALL_PREFIX=<deps prefix>
+cmake --build build-deps
+```
 
 ```bash
 cmake -S . -B build \
-  -DCMAKE_BUILD_TYPE=Debug \
-  -DGR_USE_FETCHCONTENT_DEPS=ON
+  -DCMAKE_BUILD_TYPE=Debug
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
@@ -122,8 +134,7 @@ brew install llvm@20 cmake ninja
 CC=/opt/homebrew/opt/llvm@20/bin/clang \
 CXX=/opt/homebrew/opt/llvm@20/bin/clang++ \
 cmake -S . -B build-macos \
-  -DCMAKE_BUILD_TYPE=Debug \
-  -DGR_USE_FETCHCONTENT_DEPS=ON
+  -DCMAKE_BUILD_TYPE=Debug
 cmake --build build-macos --parallel
 ctest --test-dir build-macos --output-on-failure
 ```
@@ -138,13 +149,11 @@ the exact environment you are using. The historical MSYS2/UCRT64 and CLANG64
 setup may still be useful, but it is not the primary validated development path.
 
 For local experiments, install Git, CMake, Ninja, a C++23-capable compiler, and
-the same third-party dependencies listed above, or use FetchContent where
-possible:
+the same third-party dependencies listed above:
 
 ```bash
 cmake -S . -B build ^
   -DCMAKE_BUILD_TYPE=Debug ^
-  -DGR_USE_FETCHCONTENT_DEPS=ON ^
   -DWARNINGS_AS_ERRORS=OFF
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure
@@ -165,7 +174,6 @@ need mechanical cleanup.
 
 ## Useful CMake Options
 
-- `-DGR_USE_FETCHCONTENT_DEPS=ON`: fetch missing third-party dependencies.
 - `-DUSE_CCACHE=OFF`: disable local compiler cache integration.
 - `-DADDRESS_SANITIZER=ON`: enable AddressSanitizer.
 - `-DUB_SANITIZER=ON`: enable UndefinedBehaviorSanitizer.

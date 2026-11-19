@@ -2,11 +2,15 @@ add_library(gnuradio-meta INTERFACE)
 add_library(gnuradio4::gnuradio-meta ALIAS gnuradio-meta)
 target_include_directories(gnuradio-meta INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/>
                                                    $<INSTALL_INTERFACE:include/>)
-target_link_libraries(gnuradio-meta INTERFACE gnuradio4::gnuradio-options gnuradio4::vir)
+target_link_libraries(gnuradio-meta INTERFACE gnuradio4::gnuradio-options magic_enum::magic_enum vir-simd::vir-simd)
+if(MSVC)
+  target_compile_definitions(gnuradio-meta INTERFACE NOMINMAX)
+endif()
 
 set(meta_public_headers
     include/gnuradio-4.0/meta/Attributes.hpp
     include/gnuradio-4.0/meta/CacheLineSize.hpp
+    include/gnuradio-4.0/meta/MagicEnum.hpp
     include/gnuradio-4.0/meta/RangesHelper.hpp
     include/gnuradio-4.0/meta/UnitTestHelper.hpp
     include/gnuradio-4.0/meta/formatter.hpp
