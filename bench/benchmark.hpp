@@ -1033,7 +1033,11 @@ public:
 };
 } // namespace cfg
 
+// Declared inside ut's namespace: MSVC gives a specialization declared by its qualified name at global scope the
+// global namespace's mangling, so the definition it references from inside ut is never emitted (LNK2001).
+namespace boost::inline ext::ut {
 template<>
-inline auto boost::ut::cfg<boost::ut::override> = boost::ut::runner<::cfg::reporter<boost::ut::printer>>{};
+inline auto cfg<override> = runner<::cfg::reporter<printer>>{};
+} // namespace boost::inline ext::ut
 
 #endif // GNURADIO_BENCHMARK_HPP
