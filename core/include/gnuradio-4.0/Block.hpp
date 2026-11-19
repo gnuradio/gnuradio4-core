@@ -1768,7 +1768,7 @@ private:
 
     // Plain span views of the reservations; indexing a writer span reads its reservation through the writer on every access.
     static auto plainSpans(auto& spans) {
-        return meta::tuple_transform([]<typename TSpan>(TSpan& span) { return std::span(span.data(), span.size()); }, spans);
+        return meta::tuple_transform([]<typename TSpan>(TSpan& span) { return std::span(std::ranges::data(span), std::ranges::size(span)); }, spans);
     }
 
 public:

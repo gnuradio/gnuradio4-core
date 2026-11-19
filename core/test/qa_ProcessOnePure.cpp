@@ -3,6 +3,8 @@
 #include <complex>
 #include <cstddef>
 #include <cstdint>
+#include <ranges>
+#include <span>
 #include <tuple>
 #include <vector>
 
@@ -45,6 +47,21 @@ struct SumDiff : gr::Block<SumDiff> {
     GR_MAKE_REFLECTABLE(SumDiff, in0, in1, sum, diff);
 
     [[nodiscard]] std::tuple<std::complex<float>, std::complex<float>> processOne(std::complex<float> a, std::complex<float> b) const noexcept { return {a + b, a - b}; }
+};
+
+// processOne is not const, so work() calls invokeProcessOneNonConst.
+struct RunningSum : gr::Block<RunningSum> {
+    gr::PortIn<std::complex<float>>  in;
+    gr::PortOut<std::complex<float>> out;
+
+    GR_MAKE_REFLECTABLE(RunningSum, in, out);
+
+    std::complex<float> _sum{};
+
+    [[nodiscard]] std::complex<float> processOne(std::complex<float> x) noexcept {
+        _sum += x;
+        return _sum;
+    }
 };
 
 static_assert(!gr::traits::block::can_processOne_simd<ComplexAffine>);
@@ -168,6 +185,38 @@ struct TwoInTwoOut {
     }
 };
 
+// A stream-buffer span that exposes its storage only through its iterators, as the span concepts allow: it has no member data().
+template<typename TElement>
+struct IteratorOnlySpan {
+    using value_type = std::remove_cv_t<TElement>;
+
+    TElement*   first = nullptr;
+    std::size_t count = 0UZ;
+
+    [[nodiscard]] TElement*   begin() const noexcept { return first; }
+    [[nodiscard]] TElement*   end() const noexcept { return first + count; }
+    [[nodiscard]] std::size_t size() const noexcept { return count; }
+
+    bool consume(std::size_t) noexcept { return true; }
+    void publish(std::size_t) noexcept {}
+    void publishTag(const gr::property_map&, std::size_t) noexcept {} // the non-const loop publishes a pending output tag through each writer span
+};
+
+} // namespace gr::qa_processone_pure
+
+// SpanLike converts the span to std::span as an rvalue, which std::span accepts for a borrowed range; the span does not own its storage
+namespace std::ranges {
+template<typename TElement>
+inline constexpr bool enable_borrowed_range<gr::qa_processone_pure::IteratorOnlySpan<TElement>> = true;
+} // namespace std::ranges
+
+namespace gr::qa_processone_pure {
+static_assert(gr::ReaderSpanLike<IteratorOnlySpan<const std::complex<float>>>);
+static_assert(gr::WriterSpanLike<IteratorOnlySpan<std::complex<float>>>);
+template<typename T>
+concept HasMemberData = requires(T& s) { s.data(); };
+static_assert(!HasMemberData<IteratorOnlySpan<const std::complex<float>>>);
+static_assert(!HasMemberData<IteratorOnlySpan<std::complex<float>>>);
 } // namespace gr::qa_processone_pure
 
 const boost::ut::suite<"processOne const loop"> processOnePureTests = [] {
@@ -219,6 +268,42 @@ const boost::ut::suite<"processOne const loop"> processOnePureTests = [] {
             if (n == 1000UZ) {
                 expect(rig.position.wrapped > 0UZ) << "the second chunk of 1000 samples wraps";
             }
+        }
+    };
+
+    "custom span without a member data() over a const processOne"_test = [] {
+        constexpr std::size_t            n = 33UZ;
+        std::vector<std::complex<float>> input(n);
+        std::vector<std::complex<float>> output(n);
+        for (std::size_t i = 0UZ; i < n; ++i) {
+            input[i] = sampleAt<std::complex<float>>(i);
+        }
+        ComplexAffine block;
+        auto          inputSpans  = std::tuple{IteratorOnlySpan<const std::complex<float>>{input.data(), n}};
+        auto          outputSpans = std::tuple{IteratorOnlySpan<std::complex<float>>{output.data(), n}};
+        expect(block.invokeProcessOnePure(inputSpans, outputSpans, n) == gr::work::Status::OK);
+        for (std::size_t i = 0UZ; i < n; ++i) {
+            expect(output[i] == block.processOne(input[i])) << "i =" << i;
+        }
+    };
+
+    "custom span without a member data() over a non-const processOne"_test = [] {
+        constexpr std::size_t            n = 33UZ;
+        std::vector<std::complex<float>> input(n);
+        std::vector<std::complex<float>> output(n);
+        for (std::size_t i = 0UZ; i < n; ++i) {
+            input[i] = sampleAt<std::complex<float>>(i);
+        }
+        RunningSum block;
+        auto       inputSpans  = std::tuple{IteratorOnlySpan<const std::complex<float>>{input.data(), n}};
+        auto       outputSpans = std::tuple{IteratorOnlySpan<std::complex<float>>{output.data(), n}};
+        const auto result      = block.invokeProcessOneNonConst(inputSpans, outputSpans, n);
+        expect(result.status == gr::work::Status::OK);
+        expect(eq(result.processedOut, n));
+        std::complex<float> sum{};
+        for (std::size_t i = 0UZ; i < n; ++i) {
+            sum += input[i];
+            expect(output[i] == sum) << "i =" << i;
         }
     };
 };
