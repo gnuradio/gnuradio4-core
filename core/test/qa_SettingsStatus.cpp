@@ -232,8 +232,8 @@ struct HeldKeySettings : gr::scheduler::SchedulerSettings {
     GR_MAKE_REFLECTABLE(HeldKeySettings, spare);
 };
 
-struct HeldKeyScheduler : gr::scheduler::SchedulerBase<HeldKeyScheduler, gr::scheduler::ExecutionPolicy::singleThreaded, gr::profiling::null::Profiler, HeldKeySettings> {
-    using Base = gr::scheduler::SchedulerBase<HeldKeyScheduler, gr::scheduler::ExecutionPolicy::singleThreaded, gr::profiling::null::Profiler, HeldKeySettings>;
+struct HeldKeyScheduler : gr::scheduler::SchedulerBase<HeldKeyScheduler, gr::scheduler::ExecutionPolicy::single_threaded, gr::profiling::null::Profiler, HeldKeySettings> {
+    using Base = gr::scheduler::SchedulerBase<HeldKeyScheduler, gr::scheduler::ExecutionPolicy::single_threaded, gr::profiling::null::Profiler, HeldKeySettings>;
     using Base::Base;
 
     void customInit() {
@@ -251,7 +251,7 @@ struct HeldKeyScheduler : gr::scheduler::SchedulerBase<HeldKeyScheduler, gr::sch
 
 // a single-threaded scheduler whose start hook counts its starts and stops the run; under this policy the hook runs
 // after the worker has returned
-struct StoppingStartHook : gr::scheduler::SchedulerBase<StoppingStartHook, gr::scheduler::ExecutionPolicy::singleThreaded> {
+struct StoppingStartHook : gr::scheduler::SchedulerBase<StoppingStartHook, gr::scheduler::ExecutionPolicy::single_threaded> {
     using SchedulerBase::SchedulerBase;
 
     std::size_t nStarts       = 0UZ; // read once the run has returned

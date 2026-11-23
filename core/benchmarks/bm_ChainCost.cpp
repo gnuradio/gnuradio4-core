@@ -268,7 +268,7 @@ inline const boost::ut::suite<"chain cost"> _chain_cost = [] {
         std::println("");
         for (const Order order : {Order::forward, Order::reversed}) {
             for (const std::size_t ring : kRingSizes) {
-                const RunStats stats = runChain<GainOne, singleThreaded>(4UZ, ring, order, true, 1'000'000UZ);
+                const RunStats stats = runChain<GainOne, single_threaded>(4UZ, ring, order, true, 1'000'000UZ);
                 expect(eq(stats.nReceived, 1'000'000UZ));
                 std::string blocks;
                 for (const std::string& block : stats.executionOrder) {
@@ -281,7 +281,7 @@ inline const boost::ut::suite<"chain cost"> _chain_cost = [] {
         for (const bool touch : {true, false}) {
             for (const std::size_t nChain : kChainLengths) {
                 const auto     t0    = std::chrono::steady_clock::now();
-                const RunStats stats = runChain<GainOne, singleThreaded>(nChain, kDefaultRing, Order::forward, touch);
+                const RunStats stats = runChain<GainOne, single_threaded>(nChain, kDefaultRing, Order::forward, touch);
                 const auto     ns    = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
                 expect(eq(stats.nReceived, kSamples));
                 std::println("probe N={} ring=64Ki touch={:<5} : {:5.2f} ns/input, {:.0f} samples/source-call, {:.0f} samples/sink-call", //
@@ -294,24 +294,24 @@ inline const boost::ut::suite<"chain cost"> _chain_cost = [] {
 
     for (const std::size_t nChain : kChainLengths) {
         for (const std::size_t ring : kRingSizes) {
-            const std::string name                = std::format("processOne  N={} ring={:>7} fwd  singleThreaded", nChain, sizeLabel(ring));
-            named(name).repeat<kRepeat>(kSamples) = [nChain, ring] { expect(eq(runChain<GainOne, singleThreaded>(nChain, ring).nReceived, kSamples)); };
+            const std::string name                = std::format("processOne  N={} ring={:>7} fwd  single_threaded", nChain, sizeLabel(ring));
+            named(name).repeat<kRepeat>(kSamples) = [nChain, ring] { expect(eq(runChain<GainOne, single_threaded>(nChain, ring).nReceived, kSamples)); };
         }
 
-        const std::string noTouchName                = std::format("processOne  N={} ring={:>7} fwd  singleThreaded, src/snk do not touch data", nChain, sizeLabel(kDefaultRing));
-        named(noTouchName).repeat<kRepeat>(kSamples) = [nChain] { expect(eq(runChain<GainOne, singleThreaded>(nChain, kDefaultRing, Order::forward, false).nReceived, kSamples)); };
+        const std::string noTouchName                = std::format("processOne  N={} ring={:>7} fwd  single_threaded, src/snk do not touch data", nChain, sizeLabel(kDefaultRing));
+        named(noTouchName).repeat<kRepeat>(kSamples) = [nChain] { expect(eq(runChain<GainOne, single_threaded>(nChain, kDefaultRing, Order::forward, false).nReceived, kSamples)); };
 
         if (nChain >= 2UZ) {
             for (const std::size_t ring : {8192UZ, kDefaultRing}) {
-                const std::string blockingName                = std::format("processOne  N={} ring={:>7} fwd  singleThreadedBlocking", nChain, sizeLabel(ring));
-                named(blockingName).repeat<kRepeat>(kSamples) = [nChain, ring] { expect(eq(runChain<GainOne, singleThreadedBlocking>(nChain, ring).nReceived, kSamples)); };
+                const std::string blockingName                = std::format("processOne  N={} ring={:>7} fwd  single_threaded_blocking", nChain, sizeLabel(ring));
+                named(blockingName).repeat<kRepeat>(kSamples) = [nChain, ring] { expect(eq(runChain<GainOne, single_threaded_blocking>(nChain, ring).nReceived, kSamples)); };
 
-                const std::string reversedName                = std::format("processOne  N={} ring={:>7} rev  singleThreaded", nChain, sizeLabel(ring));
-                named(reversedName).repeat<kRepeat>(kSamples) = [nChain, ring] { expect(eq(runChain<GainOne, singleThreaded>(nChain, ring, Order::reversed).nReceived, kSamples)); };
+                const std::string reversedName                = std::format("processOne  N={} ring={:>7} rev  single_threaded", nChain, sizeLabel(ring));
+                named(reversedName).repeat<kRepeat>(kSamples) = [nChain, ring] { expect(eq(runChain<GainOne, single_threaded>(nChain, ring, Order::reversed).nReceived, kSamples)); };
             }
 
-            const std::string bulkName                = std::format("processBulk N={} ring={:>7} fwd  singleThreaded", nChain, sizeLabel(kDefaultRing));
-            named(bulkName).repeat<kRepeat>(kSamples) = [nChain] { expect(eq(runChain<GainBulk, singleThreaded>(nChain, kDefaultRing).nReceived, kSamples)); };
+            const std::string bulkName                = std::format("processBulk N={} ring={:>7} fwd  single_threaded", nChain, sizeLabel(kDefaultRing));
+            named(bulkName).repeat<kRepeat>(kSamples) = [nChain] { expect(eq(runChain<GainBulk, single_threaded>(nChain, kDefaultRing).nReceived, kSamples)); };
         }
 
         for (const std::size_t chunk : kChunkSizes) {
@@ -321,8 +321,8 @@ inline const boost::ut::suite<"chain cost"> _chain_cost = [] {
     }
 
     for (const std::size_t ring : {kDefaultRing, kLargeRing}) {
-        const std::string mixedName                = std::format("mixed       N=4 ring={:>7} fwd  singleThreaded", sizeLabel(ring));
-        named(mixedName).repeat<kRepeat>(kSamples) = [ring] { expect(eq(runMixedChain<singleThreaded>(ring).nReceived, kSamples)); };
+        const std::string mixedName                = std::format("mixed       N=4 ring={:>7} fwd  single_threaded", sizeLabel(ring));
+        named(mixedName).repeat<kRepeat>(kSamples) = [ring] { expect(eq(runMixedChain<single_threaded>(ring).nReceived, kSamples)); };
     }
 };
 

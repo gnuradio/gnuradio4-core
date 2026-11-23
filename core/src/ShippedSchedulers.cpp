@@ -34,10 +34,10 @@ void registerShippedSchedulers() {
         using scheduler::ExecutionPolicy;
         using scheduler::Simple;
         SchedulerRegistry& registry = globalSchedulerRegistry();
-        insertUnlessHeld<Simple<ExecutionPolicy::singleThreaded>>(registry, kDefaultSchedulerKey);
-        insertUnlessHeld<Simple<ExecutionPolicy::multiThreaded>>(registry, "gr::scheduler::Simple<multiThreaded>");
-        insertUnlessHeld<Simple<ExecutionPolicy::singleThreadedBlocking>>(registry, "gr::scheduler::Simple<singleThreadedBlocking>");
-        insertUnlessHeld<Simple<ExecutionPolicy::multiThreadedBlocking>>(registry, "gr::scheduler::Simple<multiThreadedBlocking>");
+        insertUnlessHeld<Simple<ExecutionPolicy::single_threaded>>(registry, kDefaultSchedulerKey);
+        insertUnlessHeld<Simple<ExecutionPolicy::multi_threaded>>(registry, "gr::scheduler::Simple<multi_threaded>");
+        insertUnlessHeld<Simple<ExecutionPolicy::single_threaded_blocking>>(registry, "gr::scheduler::Simple<single_threaded_blocking>");
+        insertUnlessHeld<Simple<ExecutionPolicy::multi_threaded_blocking>>(registry, "gr::scheduler::Simple<multi_threaded_blocking>");
     });
 }
 

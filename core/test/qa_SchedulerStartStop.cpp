@@ -62,7 +62,7 @@ struct CountingSink : gr::Block<CountingSink> {
     void processOne(float) {}
 };
 
-using TestScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>;
+using TestScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multi_threaded>;
 
 // the stop claims the scheduler's transition before its own child sweep runs, so this returns inside
 // the window under test
@@ -277,7 +277,7 @@ struct DoneSource : gr::Block<DoneSource> {
     }
 };
 
-using SerialScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>;
+using SerialScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded>;
 
 // nMessages Set messages on kCountedEndpoint to serviceName. The clientRequestID of each is its index
 inline std::vector<gr::Message> countedMessages(std::string_view serviceName, std::size_t nMessages) {

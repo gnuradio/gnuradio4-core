@@ -202,8 +202,8 @@ struct ChunkSink : gr::Block<ChunkSink> {
 };
 
 /// A scheduler whose constructor refuses to build it, whatever settings it is given.
-struct UnbuildableScheduler : gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> {
-    explicit UnbuildableScheduler(const gr::property_map& = {}) : gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>({}) { throw gr::exception("the fixture scheduler cannot be built"); }
+struct UnbuildableScheduler : gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> {
+    explicit UnbuildableScheduler(const gr::property_map& = {}) : gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded>({}) { throw gr::exception("the fixture scheduler cannot be built"); }
 };
 
 } // namespace fixture

@@ -449,22 +449,22 @@ void destruction() {
 int main() {
     using namespace qa_composition;
     try {
-        qualify<gr::scheduler::ExecutionPolicy::singleThreaded>();
-        qualify<gr::scheduler::ExecutionPolicy::multiThreaded>();
-        retireAtStop<gr::scheduler::ExecutionPolicy::singleThreaded>();
-        retireAtStop<gr::scheduler::ExecutionPolicy::multiThreaded>();
-        destruction<gr::scheduler::ExecutionPolicy::singleThreaded>();
-        destruction<gr::scheduler::ExecutionPolicy::multiThreaded>();
-        drainDuringComposition<gr::scheduler::ExecutionPolicy::singleThreaded>();
-        drainDuringComposition<gr::scheduler::ExecutionPolicy::multiThreaded>();
-        stopHookFailure<gr::scheduler::ExecutionPolicy::singleThreaded>(false);
-        stopHookFailure<gr::scheduler::ExecutionPolicy::multiThreaded>(false);
-        stopHookFailure<gr::scheduler::ExecutionPolicy::singleThreaded>(true);
-        stopHookFailure<gr::scheduler::ExecutionPolicy::multiThreaded>(true);
-        quarantine<gr::scheduler::ExecutionPolicy::singleThreaded>(false);
-        quarantine<gr::scheduler::ExecutionPolicy::multiThreaded>(false);
-        quarantine<gr::scheduler::ExecutionPolicy::singleThreaded>(true);
-        quarantine<gr::scheduler::ExecutionPolicy::multiThreaded>(true);
+        qualify<gr::scheduler::ExecutionPolicy::single_threaded>();
+        qualify<gr::scheduler::ExecutionPolicy::multi_threaded>();
+        retireAtStop<gr::scheduler::ExecutionPolicy::single_threaded>();
+        retireAtStop<gr::scheduler::ExecutionPolicy::multi_threaded>();
+        destruction<gr::scheduler::ExecutionPolicy::single_threaded>();
+        destruction<gr::scheduler::ExecutionPolicy::multi_threaded>();
+        drainDuringComposition<gr::scheduler::ExecutionPolicy::single_threaded>();
+        drainDuringComposition<gr::scheduler::ExecutionPolicy::multi_threaded>();
+        stopHookFailure<gr::scheduler::ExecutionPolicy::single_threaded>(false);
+        stopHookFailure<gr::scheduler::ExecutionPolicy::multi_threaded>(false);
+        stopHookFailure<gr::scheduler::ExecutionPolicy::single_threaded>(true);
+        stopHookFailure<gr::scheduler::ExecutionPolicy::multi_threaded>(true);
+        quarantine<gr::scheduler::ExecutionPolicy::single_threaded>(false);
+        quarantine<gr::scheduler::ExecutionPolicy::multi_threaded>(false);
+        quarantine<gr::scheduler::ExecutionPolicy::single_threaded>(true);
+        quarantine<gr::scheduler::ExecutionPolicy::multi_threaded>(true);
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';
         return 1;

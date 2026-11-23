@@ -378,7 +378,7 @@ void qualify() {
             expect(rejected.load());
         }
     };
-    if constexpr (Policy == gr::scheduler::ExecutionPolicy::singleThreaded || Policy == gr::scheduler::ExecutionPolicy::singleThreadedBlocking) {
+    if constexpr (Policy == gr::scheduler::ExecutionPolicy::single_threaded || Policy == gr::scheduler::ExecutionPolicy::single_threaded_blocking) {
         policyTest("exceptions during synchronous work are run errors") = [] {
             gr::Graph graph;
             auto&     source = graph.emplaceBlock<ThrowingWorkSource>();
@@ -794,6 +794,6 @@ void qualify() {
     };
 }
 int main() {
-    qualify<gr::scheduler::ExecutionPolicy::singleThreaded>();
-    qualify<gr::scheduler::ExecutionPolicy::multiThreaded>();
+    qualify<gr::scheduler::ExecutionPolicy::single_threaded>();
+    qualify<gr::scheduler::ExecutionPolicy::multi_threaded>();
 }

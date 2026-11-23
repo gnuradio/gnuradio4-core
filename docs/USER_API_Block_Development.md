@@ -962,7 +962,7 @@ struct ChunkSettings : gr::scheduler::SchedulerSettings {
     GR_MAKE_REFLECTABLE(ChunkSettings, chunk_size, burst); // its own members only
 };
 
-struct ChunkScheduler : gr::scheduler::SchedulerBase<ChunkScheduler, gr::scheduler::ExecutionPolicy::singleThreaded, gr::profiling::null::Profiler, ChunkSettings> {
+struct ChunkScheduler : gr::scheduler::SchedulerBase<ChunkScheduler, gr::scheduler::ExecutionPolicy::single_threaded, gr::profiling::null::Profiler, ChunkSettings> {
     using SchedulerBase::SchedulerBase;
 
     std::optional<gr::Refused> checkSettings(const Settings& s) const; // optional, sees every key

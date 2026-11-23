@@ -248,7 +248,7 @@ struct Received {
 
 // a scheduler whose idle workers park for up to 30 s, which no wake in these cases waits for, run by runAndWait() on a
 // thread of its own
-template<gr::scheduler::ExecutionPolicy kPolicy = multiThreadedBlocking>
+template<gr::scheduler::ExecutionPolicy kPolicy = multi_threaded_blocking>
 struct ParkedRun {
     gr::scheduler::Simple<kPolicy> scheduler;
     Plane                          plane{scheduler};
@@ -319,8 +319,8 @@ const suite<"the messages between blocks and the runtime's Set"> sendTests = [] 
         sender.target  = std::string(chain.gain.unique_name);
         sender.gains   = {2.f, 3.f};
         sender.refused = {{"no_such_key", 1.f}};
-        ParkedRun<multiThreaded> run(std::move(chain.flow));
-        Received                 received;
+        ParkedRun<multi_threaded> run(std::move(chain.flow));
+        Received                  received;
         run.scheduler.installReader(received.reader());
         expect(fatal(sender.control.connect(run.scheduler.msgIn).has_value())); // the scheduler passes what the sender sends on to its blocks
         run.start();
@@ -495,8 +495,8 @@ const suite<"the delivery toward the event stream and the parent"> deliveryTests
         for (std::size_t i = 0UZ; i < 5UZ; ++i) {
             knobs.push_back(std::addressof(flow.emplaceBlock<Knobs>()));
         }
-        ParkedRun<multiThreaded> run(std::move(flow));
-        Received                 received; // a reader the delivery calls before it writes the event stream
+        ParkedRun<multi_threaded> run(std::move(flow));
+        Received                  received; // a reader the delivery calls before it writes the event stream
         run.scheduler.installReader(received.reader());
         // raised before the run, the 20 reach the first delivery, which leaves at least the last 4 in the event queue
         for (Knobs* block : knobs) {
@@ -531,11 +531,11 @@ const suite<"the delivery toward the event stream and the parent"> deliveryTests
 
     "a nested scheduler stopped while its parent does not run delivers its stop's notification to the parent's reader"_test = [] {
         Chain chain;
-        auto  inner = std::make_shared<gr::SchedulerWrapper<gr::scheduler::Simple<multiThreaded>>>();
+        auto  inner = std::make_shared<gr::SchedulerWrapper<gr::scheduler::Simple<multi_threaded>>>();
         inner->setGraph(std::move(chain.flow));
         gr::Graph outer;
         outer.addBlock(gr::SchedulerModel::asBlockModelPtr(inner));
-        gr::scheduler::Simple<multiThreaded> top; // never started
+        gr::scheduler::Simple<multi_threaded> top; // never started
         expect(fatal(top.exchange(std::move(outer)).has_value()));
         Received received;
         top.installReader(received.reader());
@@ -607,7 +607,7 @@ const suite<"the runtime's runs report their settings"> runTests = [] {
         expect(fatal(source.has_value() && handle.has_value() && sink.has_value()));
         expect(fatal(graph.connect(*source, "out", *handle, "in").has_value()));
         expect(fatal(graph.connect(*handle, "out", *sink, "in").has_value()));
-        std::expected<gr::Runtime, gr::RuntimeError> runtime = gr::Runtime::create(std::move(graph), "gr::scheduler::Simple<multiThreaded>");
+        std::expected<gr::Runtime, gr::RuntimeError> runtime = gr::Runtime::create(std::move(graph), "gr::scheduler::Simple<multi_threaded>");
         expect(fatal(runtime.has_value())) << (runtime ? std::string{} : runtime.error().message);
         expect(fatal(runtime->start().has_value()));
 

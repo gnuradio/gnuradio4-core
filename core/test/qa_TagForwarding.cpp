@@ -580,7 +580,7 @@ void runChain(const std::vector<std::size_t>& tagAt, TInspect&& inspect, auto&& 
     expect(flow.connect<"out", "in">(source, middle).has_value());
     expect(flow.connect<"out", "in">(middle, sink).has_value());
 
-    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler{};
     expect(scheduler.exchange(std::move(flow)).has_value());
     expect(scheduler.runAndWait().has_value());
 
@@ -615,7 +615,7 @@ template<typename... TMiddle>
     auto       chain = std::apply([&](auto&... blocks) { return std::tie(source, blocks..., sink); }, middle);
     [&]<std::size_t... I>(std::index_sequence<I...>) { (link(std::get<I>(chain), std::get<I + 1UZ>(chain)), ...); }(std::make_index_sequence<sizeof...(TMiddle) + 1UZ>{});
 
-    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler{};
     expect(scheduler.exchange(std::move(flow)).has_value());
     expect(scheduler.runAndWait().has_value());
 
@@ -707,7 +707,7 @@ const boost::ut::suite<"tag forwarding"> _tagForwarding = [] {
         expect(flow.connect<"out", "in">(source, middle).has_value());
         expect(flow.connect<"out", "in">(middle, sink).has_value());
 
-        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler{};
         expect(scheduler.exchange(std::move(flow)).has_value());
         expect(scheduler.runAndWait().has_value());
 
@@ -727,7 +727,7 @@ const boost::ut::suite<"tag forwarding"> _tagForwarding = [] {
         expect(flow.connect<"out", "in">(source, middle).has_value());
         expect(flow.connect<"out", "in">(middle, sink).has_value());
 
-        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler{};
         expect(scheduler.exchange(std::move(flow)).has_value());
         expect(scheduler.runAndWait().has_value());
 
@@ -806,7 +806,7 @@ const boost::ut::suite<"tag forwarding"> _tagForwarding = [] {
         expect(flow.connect<"out", "in">(source, middle).has_value());
         expect(flow.connect<"out", "in">(middle, sink).has_value());
 
-        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler{};
         expect(scheduler.exchange(std::move(flow)).has_value());
         expect(scheduler.runAndWait().has_value());
 
@@ -926,7 +926,7 @@ const boost::ut::suite<"tag forwarding"> _tagForwarding = [] {
         expect(flow.connect<"out", "in1">(longSource, add).has_value());
         expect(flow.connect<"out", "in">(add, sink).has_value());
 
-        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler{};
         expect(scheduler.exchange(std::move(flow)).has_value());
         expect(scheduler.runAndWait().has_value());
 

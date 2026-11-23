@@ -223,7 +223,7 @@ template<typename TChainBlock>
         }
     }
 
-    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler(gr::property_map{{"max_work_items", std::uint64_t{kChunk}}}); // std::size_t converts ambiguously to pmt::Value on wasm32
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler(gr::property_map{{"max_work_items", std::uint64_t{kChunk}}}); // std::size_t converts ambiguously to pmt::Value on wasm32
     expect(scheduler.exchange(std::move(flow)).has_value());
     expect(scheduler.runAndWait().has_value());
 

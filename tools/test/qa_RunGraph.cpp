@@ -194,7 +194,7 @@ struct Result {
 #endif
 
 // the schedulers rungraph registers itself, one per execution policy of core's Simple scheduler
-constexpr std::array<std::string_view, 4UZ> kOwnSchedulers{"gr::scheduler::Simple<singleThreaded>", "gr::scheduler::Simple<multiThreaded>", "gr::scheduler::Simple<singleThreadedBlocking>", "gr::scheduler::Simple<multiThreadedBlocking>"};
+constexpr std::array<std::string_view, 4UZ> kOwnSchedulers{"gr::scheduler::Simple<single_threaded>", "gr::scheduler::Simple<multi_threaded>", "gr::scheduler::Simple<single_threaded_blocking>", "gr::scheduler::Simple<multi_threaded_blocking>"};
 
 } // namespace qa_rungraph
 
@@ -491,7 +491,7 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
     "--verbose reports the scheduler before the graph file is read"_test = [] {
         const Result unread = run({"--graph", "unread.yaml", "--plugin-dir", fromEnvironment("GR_TOOLS_CORE_TEST_PLUGINS"), "--verbose", "--set", "timeout_ms=37"});
         expect(eq(unread.exitCode, 1)) << unread.output;
-        expect(unread.output.contains("rungraph: scheduler gr::scheduler::Simple<singleThreaded>\n")) << unread.output;
+        expect(unread.output.contains("rungraph: scheduler gr::scheduler::Simple<single_threaded>\n")) << unread.output;
         expect(unread.output.contains("rungraph: scheduler setting timeout_ms = 37")) << unread.output;
     };
 

@@ -136,7 +136,7 @@ const boost::ut::suite<"the subnormal flush of a scheduler"> schedulerFlushTests
         const bool  callerFlushes = subnormalsFlushed();
         std::string failures;
         for (const bool flush : {true, false}) {
-            const RunResult result = runWithFlush<multiThreaded>(flush);
+            const RunResult result = runWithFlush<multi_threaded>(flush);
             if (result.nReceived != 1UZ || !isExpectedDoubled(result.doubled, flush) || result.threadFlushes != (kCanFlushSubnormals && flush) || result.ranOnCaller) {
                 failures += std::format("[flush_subnormals {}: {}] ", flush, describe(result));
             }
@@ -150,7 +150,7 @@ const boost::ut::suite<"the subnormal flush of a scheduler"> schedulerFlushTests
         for (const bool callerFlush : {false, true}) {
             for (const bool flush : {true, false}) {
                 setSubnormalFlush(callerFlush);
-                const RunResult result       = runWithFlush<singleThreaded>(flush);
+                const RunResult result       = runWithFlush<single_threaded>(flush);
                 const bool      flushesAfter = subnormalsFlushed();
                 const float     doubledAfter = doubledOnThisThread();
                 setSubnormalFlush(false);

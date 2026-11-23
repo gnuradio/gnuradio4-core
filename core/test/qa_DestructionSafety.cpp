@@ -58,7 +58,7 @@ struct TimedSource : gr::Block<TimedSource>, gr::BlockingSync<TimedSource> {
     }
 };
 
-using InnerScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>;
+using InnerScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multi_threaded>;
 
 [[nodiscard]] gr::Graph makeGraph() {
     using namespace boost::ut;

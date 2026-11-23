@@ -780,7 +780,7 @@ template<typename TBuild>
     gr::Graph flow;
     Sink*     sink = build(flow);
 
-    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler;
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler;
     expect(scheduler.exchange(std::move(flow)).has_value());
     expect(scheduler.runAndWait().has_value());
 
@@ -873,7 +873,7 @@ template<typename TMiddle>
     expect(flow.connect<"out", "in">(source, middle).has_value());
     expect(flow.connect<"out", "in">(middle, sink).has_value());
 
-    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler;
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler;
     expect(scheduler.exchange(std::move(flow)).has_value());
     expect(scheduler.runAndWait().has_value());
     return RecordedRun{.nSamples = sink.nSamples, .tags = sink.tags};
@@ -901,7 +901,7 @@ template<typename TMiddle>
     expect(flow.connect<"out", "in">(source, middle).has_value());
     expect(flow.connect<"out", "in">(middle, sink).has_value());
 
-    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler;
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler;
     expect(scheduler.exchange(std::move(flow)).has_value());
     expect(scheduler.runAndWait().has_value());
 
@@ -1315,7 +1315,7 @@ const boost::ut::suite<"uniform tag propagation"> _uniformTagPropagation = [] {
         sink.in.min_samples                 = kInputMinimum;
         sink.in.max_samples                 = 7UZ;
         expect(flow.connect<"out", "in">(source, sink).has_value());
-        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler;
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler;
         expect(scheduler.exchange(std::move(flow)).has_value());
         expect(scheduler.runAndWait().has_value());
         expectTagIndices("two samples consumed per call", sink.tags, tags | std::views::transform(&TagRecord::index) | std::ranges::to<std::vector>());
@@ -1352,7 +1352,7 @@ const boost::ut::suite<"uniform tag propagation"> _uniformTagPropagation = [] {
         auto& sink            = flow.emplaceBlock<RecordingSink>(gr::property_map{{"name", std::string("snk")}});
         expect(flow.connect<"out", "in">(source, middle).has_value());
         expect(flow.connect<"out", "in">(middle, sink).has_value());
-        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler;
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler;
         expect(scheduler.exchange(std::move(flow)).has_value());
         expect(scheduler.runAndWait().has_value());
 

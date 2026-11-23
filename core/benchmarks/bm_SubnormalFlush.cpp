@@ -120,7 +120,7 @@ struct RunResult {
     expect(flow.connect<"out", "in">(source, pole).has_value());
     expect(flow.connect<"out", "in">(pole, sink).has_value());
 
-    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{gr::property_map{{"flush_subnormals", flush}}};
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler{gr::property_map{{"flush_subnormals", flush}}};
     expect(scheduler.exchange(std::move(flow)).has_value());
     expect(scheduler.runAndWait().has_value());
     return {sink._nReceived, sink._last, sink._power};

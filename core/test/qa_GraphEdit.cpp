@@ -263,7 +263,7 @@ struct LoaderCanary : gr::Block<LoaderCanary> {
     [[nodiscard]] constexpr float processOne() const noexcept { return 0.0f; }
 };
 
-using TestScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>;
+using TestScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multi_threaded>;
 
 // ends its stream at its first call
 struct EndingSource : gr::Block<EndingSource> {
@@ -2462,7 +2462,7 @@ const boost::ut::suite<"messages after a job list ends"> laterMessageTests = [] 
     using namespace boost::ut;
     using enum gr::lifecycle::State;
 
-    // under multiThreaded each job list has a worker of its own, and a worker leaves once every block of its job list
+    // under multi_threaded each job list has a worker of its own, and a worker leaves once every block of its job list
     // is done. Here the first job list ends at once and the second runs until the stop.
     "the scheduler replies after its first job list has ended"_test = [] {
         constexpr std::string_view kPoolName = "qa_edit_two_threads";
@@ -2703,17 +2703,17 @@ const boost::ut::suite<"a replacement in a running graph"> runningReplacementTes
     using enum gr::lifecycle::State;
     using namespace gr::scheduler::property;
 
-    "a replacement in a multi-threaded run passes on the samples queued at its ports"_test = [] { qa_edit::expectQueuedSamplesPassReplacement<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>>(); };
+    "a replacement in a multi-threaded run passes on the samples queued at its ports"_test = [] { qa_edit::expectQueuedSamplesPassReplacement<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multi_threaded>>(); };
 
-    "a replacement in a multi-threaded blocking run passes on the samples queued at its ports"_test = [] { qa_edit::expectQueuedSamplesPassReplacement<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreadedBlocking>>(); };
+    "a replacement in a multi-threaded blocking run passes on the samples queued at its ports"_test = [] { qa_edit::expectQueuedSamplesPassReplacement<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multi_threaded_blocking>>(); };
 
-    "a replacement in a single-threaded run passes on the samples queued at its ports"_test = [] { qa_edit::expectQueuedSamplesPassReplacement<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>>(); };
+    "a replacement in a single-threaded run passes on the samples queued at its ports"_test = [] { qa_edit::expectQueuedSamplesPassReplacement<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded>>(); };
 
-    "a replacement in a single-threaded blocking run passes on the samples queued at its ports"_test = [] { qa_edit::expectQueuedSamplesPassReplacement<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking>>(); };
+    "a replacement in a single-threaded blocking run passes on the samples queued at its ports"_test = [] { qa_edit::expectQueuedSamplesPassReplacement<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded_blocking>>(); };
 
-    "a replacement in a multi-threaded run joins the job list of the block it replaces, and the reply names that job list"_test = [] { qa_edit::expectReplacementJoinsJobList<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>>(); };
+    "a replacement in a multi-threaded run joins the job list of the block it replaces, and the reply names that job list"_test = [] { qa_edit::expectReplacementJoinsJobList<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multi_threaded>>(); };
 
-    "a replacement in a multi-threaded blocking run joins the job list of the block it replaces, and the reply names that job list"_test = [] { qa_edit::expectReplacementJoinsJobList<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreadedBlocking>>(); };
+    "a replacement in a multi-threaded blocking run joins the job list of the block it replaces, and the reply names that job list"_test = [] { qa_edit::expectReplacementJoinsJobList<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multi_threaded_blocking>>(); };
 
     "a replacement inside a subgraph of a running graph runs"_test = [] {
         qa_edit::registerTestBlocks();
@@ -3006,9 +3006,9 @@ const boost::ut::suite<"edits that give a block a reader or take its last one"> 
         expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
     };
 
-    "an edge emplaced in a multi-threaded run restarts its stopped source, and the reply names it"_test = [] { qa_edit::expectEmplacedEdgeRestartsStoppedSource<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>>(); };
+    "an edge emplaced in a multi-threaded run restarts its stopped source, and the reply names it"_test = [] { qa_edit::expectEmplacedEdgeRestartsStoppedSource<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multi_threaded>>(); };
 
-    "an edge emplaced in a single-threaded run restarts its stopped source, and the reply names it"_test = [] { qa_edit::expectEmplacedEdgeRestartsStoppedSource<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>>(); };
+    "an edge emplaced in a single-threaded run restarts its stopped source, and the reply names it"_test = [] { qa_edit::expectEmplacedEdgeRestartsStoppedSource<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded>>(); };
 
 #ifndef GR_TEST_WITHOUT_BLOCK_REGISTRY // replacement by name resolves the type through the registry
     // the source stops without an end-of-stream tag, and the stage keeps waiting on its input

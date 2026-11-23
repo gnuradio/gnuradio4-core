@@ -653,7 +653,7 @@ const suite<"the start and the stop of a block's settings"> startTests = [] {
         gr::Graph flow;
         auto&     block = flow.emplaceBlock<Applier>();
         block.readsGain = true;
-        gr::SchedulerWrapper<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>> scheduler;
+        gr::SchedulerWrapper<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multi_threaded>> scheduler;
         scheduler.setGraph(std::move(flow));
         expect(fatal(scheduler.start().has_value()));
         expect(fatal(waitUntil([&] { return FrameworkAccess::isRunning(gr::settings::detail::settingsOf(block)) && block.nWorkCalls.load() > 0UZ; })));
@@ -725,15 +725,15 @@ void waitingSetReturnsAfterTheWake(bool nested) {
 const suite<"the scheduler wakes for a block's settings"> wakeTests = [] {
     using enum gr::scheduler::ExecutionPolicy;
     "a waiting set on a running block returns applied after the wake, on each scheduler kind"_test = [] {
-        waitingSetReturnsAfterTheWake<gr::scheduler::Simple<singleThreadedBlocking>>(false);
-        waitingSetReturnsAfterTheWake<gr::scheduler::Simple<multiThreadedBlocking>>(false);
-        waitingSetReturnsAfterTheWake<gr::scheduler::BreadthFirst<multiThreadedBlocking>>(false);
-        waitingSetReturnsAfterTheWake<gr::scheduler::DepthFirst<multiThreadedBlocking>>(false);
+        waitingSetReturnsAfterTheWake<gr::scheduler::Simple<single_threaded_blocking>>(false);
+        waitingSetReturnsAfterTheWake<gr::scheduler::Simple<multi_threaded_blocking>>(false);
+        waitingSetReturnsAfterTheWake<gr::scheduler::BreadthFirst<multi_threaded_blocking>>(false);
+        waitingSetReturnsAfterTheWake<gr::scheduler::DepthFirst<multi_threaded_blocking>>(false);
     };
 
     "a waiting set on a block of a nested scheduler returns applied after the wake"_test = [] {
-        waitingSetReturnsAfterTheWake<gr::scheduler::Simple<singleThreadedBlocking>>(true);
-        waitingSetReturnsAfterTheWake<gr::scheduler::Simple<multiThreadedBlocking>>(true);
+        waitingSetReturnsAfterTheWake<gr::scheduler::Simple<single_threaded_blocking>>(true);
+        waitingSetReturnsAfterTheWake<gr::scheduler::Simple<multi_threaded_blocking>>(true);
     };
 
     "a set from a worker of any scheduler does not wait"_test = [] {
@@ -754,12 +754,12 @@ const suite<"the scheduler wakes for a block's settings"> wakeTests = [] {
         expect(fatal(otherFlow.connect<"out", "in">(otherGain, otherSink).has_value()));
         caller.target = std::addressof(gr::settings::detail::settingsOf(otherGain));
 
-        gr::SchedulerWrapper<gr::scheduler::Simple<multiThreaded>> other;
+        gr::SchedulerWrapper<gr::scheduler::Simple<multi_threaded>> other;
         other.setGraph(std::move(otherFlow));
         expect(fatal(other.start().has_value()));
         expect(fatal(waitUntil([&] { return FrameworkAccess::isRunning(gr::settings::detail::settingsOf(otherGain)); })));
 
-        gr::SchedulerWrapper<gr::scheduler::Simple<multiThreaded>> scheduler;
+        gr::SchedulerWrapper<gr::scheduler::Simple<multi_threaded>> scheduler;
         scheduler.setGraph(std::move(flow));
         expect(fatal(scheduler.start().has_value()));
         expect(fatal(waitUntil([&] { return caller.called.load(std::memory_order_acquire); })));
@@ -782,7 +782,7 @@ const suite<"notifications reach a reader"> notificationTests = [] {
         expect(fatal(flow.connect<"out", "in">(gain, sink).has_value()));
         gain.failAbove = 10.f;
 
-        gr::SchedulerWrapper<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking>> scheduler;
+        gr::SchedulerWrapper<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded_blocking>> scheduler;
         scheduler.setGraph(std::move(flow));
         std::mutex                              lock;
         std::vector<gr::settings::Notification> received;
@@ -1007,7 +1007,7 @@ const suite<"the scheduler's own settings"> schedulerSettingsTests = [] {
         auto&     source = flow.emplaceBlock<Ones>({{"n_samples", 0U}});
         auto&     sink   = flow.emplaceBlock<Record>();
         expect(fatal(flow.connect<"out", "in">(source, sink).has_value()));
-        gr::SchedulerWrapper<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>> scheduler;
+        gr::SchedulerWrapper<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multi_threaded>> scheduler;
         scheduler.setGraph(std::move(flow));
         expect(fatal(scheduler.start().has_value()));
         expect(fatal(waitUntil([&] { return FrameworkAccess::isRunning(gr::settings::detail::settingsOf(scheduler)); })));
@@ -1100,7 +1100,7 @@ const suite<"the scheduler's own settings"> schedulerSettingsTests = [] {
     };
 
     "a scheduler's pool name is empty by default, and a name no pool has is reported and reads back empty"_test = [] {
-        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded> scheduler;
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multi_threaded> scheduler;
         expect(eq(scheduler.get<std::string>("poolName").value_or("?"), std::string()));
         gr::MsgPortIn messages;
         expect(fatal(scheduler.msgOut.connect(messages).has_value()));
@@ -1122,7 +1122,7 @@ const suite<"the cases of a run's outcome, its delivery and its pool"> outcomeTe
     "a key the start hook fails is a failed value, and a read lists it no more"_test = [] {
         Chain chain({{"code", std::string("A1")}});
         chain.gain.failCodeWithoutValue = true;
-        gr::SchedulerWrapper<gr::scheduler::Simple<multiThreaded>> scheduler;
+        gr::SchedulerWrapper<gr::scheduler::Simple<multi_threaded>> scheduler;
         scheduler.setGraph(std::move(chain.flow));
         expect(fatal(scheduler.start().has_value()));
         expect(fatal(waitUntil([&] { return FrameworkAccess::isRunning(gr::settings::detail::settingsOf(chain.gain)); })));
@@ -1140,13 +1140,13 @@ const suite<"the cases of a run's outcome, its delivery and its pool"> outcomeTe
     "an inherited off marks a nested block's notification quiet, which a host's reader still receives"_test = [] {
         Chain chain;
         chain.gain.failAbove = 10.f;
-        auto inner           = std::make_shared<gr::SchedulerWrapper<gr::scheduler::Simple<multiThreaded>>>();
+        auto inner           = std::make_shared<gr::SchedulerWrapper<gr::scheduler::Simple<multi_threaded>>>();
         inner->setGraph(std::move(chain.flow));
         expect(fatal(inner->set("notification_level", std::string("off")).has_value()));
         gr::Graph outer;
         outer.addBlock(gr::SchedulerModel::asBlockModelPtr(inner));
-        CerrCapture                                                captured; // swapped in before the workers start
-        gr::SchedulerWrapper<gr::scheduler::Simple<multiThreaded>> scheduler;
+        CerrCapture                                                 captured; // swapped in before the workers start
+        gr::SchedulerWrapper<gr::scheduler::Simple<multi_threaded>> scheduler;
         scheduler.setGraph(std::move(outer));
         expect(fatal(scheduler.start().has_value()));
         expect(fatal(waitUntil([&] { return FrameworkAccess::isRunning(gr::settings::detail::settingsOf(chain.gain)); })));
@@ -1182,7 +1182,7 @@ const suite<"the cases of a run's outcome, its delivery and its pool"> outcomeTe
         auto&     rightSink   = both.emplaceBlock<Record>();
         expect(fatal(both.connect<"out", "in">(leftSource, leftGain).has_value() && both.connect<"out", "in">(leftGain, leftSink).has_value()));
         expect(fatal(both.connect<"out", "in">(rightSource, rightGain).has_value() && both.connect<"out", "in">(rightGain, rightSink).has_value()));
-        gr::SchedulerWrapper<gr::scheduler::Simple<multiThreaded>> scheduler;
+        gr::SchedulerWrapper<gr::scheduler::Simple<multi_threaded>> scheduler;
         scheduler.setGraph(std::move(both));
         std::atomic<int>         inReader{0};
         std::atomic<bool>        overlapped{false};
@@ -1214,7 +1214,7 @@ const suite<"the cases of a run's outcome, its delivery and its pool"> outcomeTe
         auto&     sink    = flow.emplaceBlock<Drop>();
         expect(fatal(flow.connect<"out", "in">(source, counter).has_value()));
         expect(fatal(flow.connect<"out", "in">(counter, sink).has_value()));
-        gr::SchedulerWrapper<Probe<gr::scheduler::Simple<multiThreadedBlocking>>> scheduler;
+        gr::SchedulerWrapper<Probe<gr::scheduler::Simple<multi_threaded_blocking>>> scheduler;
         scheduler.setGraph(std::move(flow));
         expect(fatal(scheduler.start().has_value()));
         expect(fatal(waitUntil([&] { return counter.nWorkCalls.load() > 0UZ; })));
@@ -1235,7 +1235,7 @@ const suite<"the cases of a run's outcome, its delivery and its pool"> outcomeTe
             expect(fatal(flow.connect<"out", "in">(source, sink).has_value()));
             return flow;
         };
-        Probe<gr::scheduler::Simple<multiThreaded>> top;
+        Probe<gr::scheduler::Simple<multi_threaded>> top;
         expect(fatal(top.exchange(finiteChain()).has_value()));
         expect(fatal(top.runAndWait().has_value()));
         expect(eq(top.poolInUse(), std::string(gr::thread_pool::kDefaultCpuPoolId)));

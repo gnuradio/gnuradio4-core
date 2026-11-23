@@ -86,9 +86,9 @@ auto registerDivide = gr::registerBlock<good::divide, float, double>(static_cast
 
 namespace good {
 
-class GoodMathScheduler : public gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded> {
+class GoodMathScheduler : public gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multi_threaded> {
 public:
-    explicit GoodMathScheduler(const gr::property_map& = {}) : gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>({}) {}
+    explicit GoodMathScheduler(const gr::property_map& = {}) : gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multi_threaded>({}) {}
 };
 
 } // namespace good

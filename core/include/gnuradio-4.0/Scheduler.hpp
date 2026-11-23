@@ -179,14 +179,14 @@ inline static const char* const kInputWithoutEdge = "InputWithoutEdge"; // names
 } // namespace property
 
 enum class ExecutionPolicy {
-    singleThreaded,         ///
-    multiThreaded,          ///
-    singleThreadedBlocking, /// blocks with a time-out if none of the blocks in the graph made progress (N.B. a CPU/battery power-saving measures)
-    multiThreadedBlocking   /// multiThreaded, and each worker blocks with a time-out while the blocks of its own job list make no progress
+    single_threaded,          ///
+    multi_threaded,           ///
+    single_threaded_blocking, /// blocks with a time-out if none of the blocks in the graph made progress (N.B. a CPU/battery power-saving measures)
+    multi_threaded_blocking   /// multi_threaded, and each worker blocks with a time-out while the blocks of its own job list make no progress
 };
 
 // the policies that run one worker per job list on the thread pool
-[[nodiscard]] constexpr bool isMultiThreaded(ExecutionPolicy policy) noexcept { return policy == ExecutionPolicy::multiThreaded || policy == ExecutionPolicy::multiThreadedBlocking; }
+[[nodiscard]] constexpr bool isMultiThreaded(ExecutionPolicy policy) noexcept { return policy == ExecutionPolicy::multi_threaded || policy == ExecutionPolicy::multi_threaded_blocking; }
 
 using JobLists = std::vector<std::vector<std::shared_ptr<BlockModel>>>;
 
@@ -217,7 +217,7 @@ struct SchedulerSettings {
     GR_MAKE_REFLECTABLE(SchedulerSettings, timeout_ms, watchdog_timeout, timeout_inactivity_count, process_stream_to_message_ratio, pool_park_count, max_work_items, poolName, sched_settings, flush_subnormals, settings_timeout_ms);
 };
 
-template<typename Derived, ExecutionPolicy execution = ExecutionPolicy::singleThreaded, profiling::ProfilerLike TProfiler = profiling::null::Profiler, typename TSettings = SchedulerSettings>
+template<typename Derived, ExecutionPolicy execution = ExecutionPolicy::single_threaded, profiling::ProfilerLike TProfiler = profiling::null::Profiler, typename TSettings = SchedulerSettings>
 struct SchedulerBase : Block<Derived> {
     static_assert(std::derived_from<TSettings, SchedulerSettings>, "a scheduler's Settings derive from gr::scheduler::SchedulerSettings");
 
@@ -473,7 +473,7 @@ protected:
     // start() has returned, the swap proceeds. The thread that applies a swap requested on the scheduler's worker
     // swaps as the worker would: a start in the same message batch has published RUNNING without running a worker.
     [[nodiscard]] std::expected<void, Error> swapAllowedFromThisThread() {
-        if constexpr (executionPolicy() == ExecutionPolicy::singleThreaded || executionPolicy() == ExecutionPolicy::singleThreadedBlocking) {
+        if constexpr (executionPolicy() == ExecutionPolicy::single_threaded || executionPolicy() == ExecutionPolicy::single_threaded_blocking) {
             const auto state = this->state();
             if (!isOnOwnWorkerThread() && applyingScheduler() != static_cast<const void*>(this) && lifecycle::isActive(state)) {
                 std::lock_guard guard(_runMutex);
@@ -657,7 +657,7 @@ public:
     [[nodiscard]] static constexpr auto executionPolicy() { return execution; }
 
     // whether an idle worker parks on the graph's progress sequence until work or a wake ends the park
-    [[nodiscard]] static constexpr bool parksIdleWorkers() { return executionPolicy() == ExecutionPolicy::singleThreadedBlocking || executionPolicy() == ExecutionPolicy::multiThreadedBlocking; }
+    [[nodiscard]] static constexpr bool parksIdleWorkers() { return executionPolicy() == ExecutionPolicy::single_threaded_blocking || executionPolicy() == ExecutionPolicy::multi_threaded_blocking; }
 
     // waits until no worker is inside work(), and keeps every worker out of work() until releaseWorkQuiescence(). The
     // requests of several callers add up, and each caller releases its own. A request made inside a work() call of this
@@ -1545,8 +1545,8 @@ private:
         }
 
         // N.B. the transition to lifecycle::State::RUNNING will for the ExecutionPolicy:
-        // * singleThreaded[Blocking] naturally block in the calling thread
-        // * multiThreaded[Blocking] spawn two worker and block on 'waitDone()'
+        // * single_threaded[Blocking] naturally block in the calling thread
+        // * multi_threaded[Blocking] spawn two worker and block on 'waitDone()'
         // A swap or a restart that a worker requested runs the next run of this call.
         waitForRunAndClaims();
 
@@ -2134,7 +2134,7 @@ protected:
         }
 
         assert(_executionOrder != nullptr && !_executionOrder->empty());
-        constexpr bool    singleThreaded = executionPolicy() == ExecutionPolicy::singleThreaded || executionPolicy() == ExecutionPolicy::singleThreadedBlocking;
+        constexpr bool    singleThreaded = executionPolicy() == ExecutionPolicy::single_threaded || executionPolicy() == ExecutionPolicy::single_threaded_blocking;
         auto              jobListsCopy   = _executionOrder;
         const std::size_t nWorkers       = singleThreaded ? 1UZ : jobListsCopy->size();
         auto              ioThreadPool   = gr::thread_pool::Manager::defaultIoPool();
@@ -2362,11 +2362,11 @@ protected:
                 currentDraining = gr::detail::drainingCalls();
             }
 
-            // A message waiting at msgIn or from the run's blocks restarts the idle back-off. A multiThreadedBlocking
+            // A message waiting at msgIn or from the run's blocks restarts the idle back-off. A multi_threaded_blocking
             // worker restarts it only for a message at msgIn.
             const bool msgInPending    = this->msgIn.available() > 0UZ;
             const bool childPending    = _fromChildMessagePort.available() > 0UZ;
-            const bool restartsBackoff = msgInPending || (executionPolicy() != ExecutionPolicy::multiThreadedBlocking && childPending);
+            const bool restartsBackoff = msgInPending || (executionPolicy() != ExecutionPolicy::multi_threaded_blocking && childPending);
 
             // Process messages either when the ratio gate opens, or immediately when any entry-point port has
             // pending traffic. This keeps the ratio's amortisation of empty-queue checks while giving arriving
@@ -4300,7 +4300,7 @@ inline void printExecutionOrder(const std::vector<std::vector<std::shared_ptr<Bl
 
 } // namespace detail
 
-template<ExecutionPolicy execution = ExecutionPolicy::singleThreaded, profiling::ProfilerLike TProfiler = profiling::null::Profiler>
+template<ExecutionPolicy execution = ExecutionPolicy::single_threaded, profiling::ProfilerLike TProfiler = profiling::null::Profiler>
 struct Simple : SchedulerBase<Simple<execution, TProfiler>, execution, TProfiler> {
     using Description = Doc<R""(Simple loop based Scheduler, which iterates over all blocks in the order they have beein defined and emplaced definition in the graph.)"">;
 
@@ -4315,10 +4315,10 @@ struct Simple : SchedulerBase<Simple<execution, TProfiler>, execution, TProfiler
 
         std::size_t n_batches = 1UZ;
         switch (this->executionPolicy()) {
-        case ExecutionPolicy::singleThreaded:
-        case ExecutionPolicy::singleThreadedBlocking: break;
-        case ExecutionPolicy::multiThreaded:
-        case ExecutionPolicy::multiThreadedBlocking: n_batches = this->nJobLists(nBlocks); break;
+        case ExecutionPolicy::single_threaded:
+        case ExecutionPolicy::single_threaded_blocking: break;
+        case ExecutionPolicy::multi_threaded:
+        case ExecutionPolicy::multi_threaded_blocking: n_batches = this->nJobLists(nBlocks); break;
         default:;
         }
 
@@ -4330,14 +4330,14 @@ struct Simple : SchedulerBase<Simple<execution, TProfiler>, execution, TProfiler
     }
 };
 
-template<ExecutionPolicy execution = ExecutionPolicy::singleThreaded, profiling::ProfilerLike TProfiler = profiling::null::Profiler>
+template<ExecutionPolicy execution = ExecutionPolicy::single_threaded, profiling::ProfilerLike TProfiler = profiling::null::Profiler>
 struct BreadthFirst : SchedulerBase<BreadthFirst<execution, TProfiler>, execution, TProfiler> {
     using Description = Doc<R""(Breadth First Scheduler which traverses the graph starting from the source blocks in a breath first fashion
 detecting cycles and blocks which can be reached from several source blocks.)"">;
 
     using SchedulerBase<BreadthFirst<execution, TProfiler>, execution, TProfiler>::SchedulerBase;
 
-    static_assert(execution != ExecutionPolicy::singleThreadedBlocking, "Unsupported execution policy");
+    static_assert(execution != ExecutionPolicy::single_threaded_blocking, "Unsupported execution policy");
 
     void customInit() {
         /* implements Breadth-first search scheduling algorithm (https://en.wikipedia.org/wiki/Breadth-first_search)
@@ -4412,13 +4412,13 @@ detecting cycles and blocks which can be reached from several source blocks.)"">
     }
 };
 
-template<ExecutionPolicy execution = ExecutionPolicy::singleThreaded, profiling::ProfilerLike TProfiler = profiling::null::Profiler>
+template<ExecutionPolicy execution = ExecutionPolicy::single_threaded, profiling::ProfilerLike TProfiler = profiling::null::Profiler>
 struct DepthFirst : SchedulerBase<DepthFirst<execution, TProfiler>, execution, TProfiler> {
     using Description = Doc<R""(Depth First Scheduler which traverses the graph starting from the source blocks in a depth-first manner.)"">;
 
     using SchedulerBase<DepthFirst<execution, TProfiler>, execution, TProfiler>::SchedulerBase;
 
-    static_assert(execution != ExecutionPolicy::singleThreadedBlocking, "Unsupported execution policy");
+    static_assert(execution != ExecutionPolicy::single_threaded_blocking, "Unsupported execution policy");
 
     void customInit() {
         /**

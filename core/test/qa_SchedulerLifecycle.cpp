@@ -531,9 +531,9 @@ struct PoolOccupier {
     PoolOccupier& operator=(const PoolOccupier&) = delete;
 };
 
-using TestScheduler     = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>;
-using SerialScheduler   = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>;
-using BlockingScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking>;
+using TestScheduler     = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multi_threaded>;
+using SerialScheduler   = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded>;
+using BlockingScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded_blocking>;
 
 // a sub-scheduler that counts the work() calls of the scheduler that runs it once each call has returned
 template<typename TScheduler>
@@ -624,8 +624,8 @@ struct AdoptingScheduler : TestScheduler {
 
 // a scheduler that supplies its own worker instead of the one the base provides: the smallest loop that runs a job
 // list, so that what it exercises is the dispatch every scheduler shares and not the base worker's body
-struct OwnWorkerScheduler : gr::scheduler::SchedulerBase<OwnWorkerScheduler, gr::scheduler::ExecutionPolicy::multiThreaded> {
-    using Base = gr::scheduler::SchedulerBase<OwnWorkerScheduler, gr::scheduler::ExecutionPolicy::multiThreaded>;
+struct OwnWorkerScheduler : gr::scheduler::SchedulerBase<OwnWorkerScheduler, gr::scheduler::ExecutionPolicy::multi_threaded> {
+    using Base = gr::scheduler::SchedulerBase<OwnWorkerScheduler, gr::scheduler::ExecutionPolicy::multi_threaded>;
     using Base::SchedulerBase;
 
     void customInit() {
@@ -663,8 +663,8 @@ inline std::atomic<std::size_t> gTwoArgumentWorkers{0UZ};
 
 // a scheduler whose own worker takes the job list alone, without the run's generation. The worker runs until the
 // scheduler leaves an active state.
-struct TwoArgumentWorkerScheduler : gr::scheduler::SchedulerBase<TwoArgumentWorkerScheduler, gr::scheduler::ExecutionPolicy::multiThreaded> {
-    using Base = gr::scheduler::SchedulerBase<TwoArgumentWorkerScheduler, gr::scheduler::ExecutionPolicy::multiThreaded>;
+struct TwoArgumentWorkerScheduler : gr::scheduler::SchedulerBase<TwoArgumentWorkerScheduler, gr::scheduler::ExecutionPolicy::multi_threaded> {
+    using Base = gr::scheduler::SchedulerBase<TwoArgumentWorkerScheduler, gr::scheduler::ExecutionPolicy::multi_threaded>;
     using Base::SchedulerBase;
 
     void customInit() {
@@ -952,9 +952,9 @@ struct NamedPool {
 
 [[nodiscard]] NamedPool<gr::thread_pool::TaskExecutor> twoThreadPool() { return fixedPool(kOccupiedPoolName, 2U); }
 
-using PoolParkingScheduler    = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreadedBlocking>;
-using PoolParkingBreadthFirst = gr::scheduler::BreadthFirst<gr::scheduler::ExecutionPolicy::multiThreadedBlocking>;
-using PoolParkingDepthFirst   = gr::scheduler::DepthFirst<gr::scheduler::ExecutionPolicy::multiThreadedBlocking>;
+using PoolParkingScheduler    = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multi_threaded_blocking>;
+using PoolParkingBreadthFirst = gr::scheduler::BreadthFirst<gr::scheduler::ExecutionPolicy::multi_threaded_blocking>;
+using PoolParkingDepthFirst   = gr::scheduler::DepthFirst<gr::scheduler::ExecutionPolicy::multi_threaded_blocking>;
 
 constexpr std::string_view kParkingPoolName = "qa_parking_cpu";
 constexpr std::size_t      kFiniteSamples   = 1UZ << 16;
@@ -1142,8 +1142,8 @@ struct MessageStampSink : gr::Block<MessageStampSink> {
 };
 
 // records when a parent's worker first calls its work(). Its own workers call its blocks and never call it
-struct CalledSubScheduler : gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> {
-    using Base = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>;
+struct CalledSubScheduler : gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> {
+    using Base = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded>;
     using Base::Base;
 
     std::atomic<bool>                     _called{false};
@@ -1902,13 +1902,13 @@ struct HookOrderSink : gr::Block<HookOrderSink> {
 };
 
 // runs the chain source, two stages, the blocking stage, three stages and the sink under TScheduler, and sends
-// `request` while the blocking stage waits. Under multiThreaded every block has a worker of its own, and the source is
+// `request` while the blocking stage waits. Under multi_threaded every block has a worker of its own, and the source is
 // inside a held work() call when the request arrives. A pause is followed by a stop that ends the run.
 template<typename TScheduler>
 void expectBlockingHooksFirst(gr::lifecycle::State request) {
     using namespace boost::ut;
     using enum gr::lifecycle::State;
-    static constexpr bool kWorkerPerBlock = TScheduler::executionPolicy() == gr::scheduler::ExecutionPolicy::multiThreaded;
+    static constexpr bool kWorkerPerBlock = TScheduler::executionPolicy() == gr::scheduler::ExecutionPolicy::multi_threaded;
 
     auto           pool = fixedPool(kHookOrderPoolName, 8U);
     HookOrderProbe probe;
@@ -2261,7 +2261,7 @@ const boost::ut::suite<"a scheduler started on its own thread"> ownThreadStartTe
         source._pluggedIn = true;
         expect(wrapper.start().has_value()) << "a scheduler in ERROR must accept a start";
         if (wrapper._schedulerThread.joinable()) {
-            wrapper._schedulerThread.join(); // under multiThreaded the start returns once the workers are counted
+            wrapper._schedulerThread.join(); // under multi_threaded the start returns once the workers are counted
         }
         wrapper.blockRef().waitDone(); // the workers end once the bounded stream has passed
         expect(ge(sink._nReceived, qa_sched::kSamplesBeforeTerminal)) << "the stream must pass once the source can start";
@@ -2544,7 +2544,7 @@ const boost::ut::suite<"the pool of a scheduler started on its own thread"> ownT
 const boost::ut::suite<"settings staged on a scheduler"> stagedSchedulerSettingsTests = [] {
     using namespace boost::ut;
 
-    // under singleThreadedBlocking the worker parks after every pass without progress. The timeout_ms given to the
+    // under single_threaded_blocking the worker parks after every pass without progress. The timeout_ms given to the
     // constructor outlasts the run bound, and the timeout_ms staged after the construction does not. Opening the gate
     // moves no sequence. The run ends in time only if its parks last the staged timeout_ms.
     "a timeout_ms staged after the construction rules the next run"_test = [] {
@@ -3871,10 +3871,10 @@ const boost::ut::suite<"a subgraph's progress sequence"> subgraphProgressTests =
     using namespace boost::ut;
 
     // A subgraph's blocks were initialized with the subgraph's own progress sequence while the scheduler
-    // waits on the top-level one. Under singleThreadedBlocking the worker then parks on a sequence the work
+    // waits on the top-level one. Under single_threaded_blocking the worker then parks on a sequence the work
     // inside the subgraph cannot move, and the stop that follows never releases it. Neither half triggers
-    // it alone: the same graph stops in a millisecond under singleThreaded, and so does a flat chain under
-    // singleThreadedBlocking.
+    // it alone: the same graph stops in a millisecond under single_threaded, and so does a flat chain under
+    // single_threaded_blocking.
     "a subgraph's blocks publish progress where the scheduler waits"_test = [] {
         gr::Graph flow;
         std::ignore = flow.emplaceBlock<qa_sched::BlockingSource>();
@@ -3920,7 +3920,7 @@ const boost::ut::suite<"a subgraph's progress sequence"> subgraphProgressTests =
 const boost::ut::suite<"the zero-progress park"> zeroProgressParkTests = [] {
     using namespace boost::ut;
 
-    // under singleThreadedBlocking the worker parks on the progress sequence once it has seen more than
+    // under single_threaded_blocking the worker parks on the progress sequence once it has seen more than
     // timeout_inactivity_count zero-progress traversals. Opening the gate moves no sequence, and the
     // watchdog's first tick sits beyond the run bound, so the run completes only if the park releases
     // on its own timeout. With timeout_inactivity_count 0 a park necessarily separates the source's
@@ -4066,7 +4066,7 @@ const boost::ut::suite<"the zero-progress park"> zeroProgressParkTests = [] {
 const boost::ut::suite<"a job list that finishes before the others"> upstreamReleaseTests = [] {
     using namespace boost::ut;
 
-    // A worker leaves as soon as every block of its job list reports DONE, and under multiThreaded a job
+    // A worker leaves as soon as every block of its job list reports DONE, and under multi_threaded a job
     // list may hold a single block, so the block that ends the stream gets no further work() call. An
     // upstream source learns that its last consumer is gone only from the reader counts of its output
     // ports, which the finished block lowers by releasing its input.
@@ -4194,7 +4194,7 @@ template<typename TScheduler, typename TSend>
     return times;
 }
 
-// runs a graph that never moves under singleThreadedBlocking with a 10 ms watchdog. A client sends an echo request
+// runs a graph that never moves under single_threaded_blocking with a 10 ms watchdog. A client sends an echo request
 // to the scheduler, or to the sink with pollBlock, about once a millisecond, well inside the watchdog period. Each
 // request ends the worker's park. It returns whether the watchdog reported the stall, and the requests sent
 [[nodiscard]] inline std::pair<bool, std::size_t> stallReportedWhilePolling(bool pollBlock) {
@@ -4476,9 +4476,9 @@ const boost::ut::suite<"workers that park"> parkingWorkerTests = [] {
         expect(eq(sink._nInOrder, qa_sched::kFiniteSamples)) << schedulerName << "samples delivered in order";
     };
 
-    "a chain of parked workers delivers every sample under multiThreadedBlocking on Simple"_test       = [&] { deliversEverySample.operator()<qa_sched::PoolParkingScheduler>("Simple"); };
-    "a chain of parked workers delivers every sample under multiThreadedBlocking on BreadthFirst"_test = [&] { deliversEverySample.operator()<qa_sched::PoolParkingBreadthFirst>("BreadthFirst"); };
-    "a chain of parked workers delivers every sample under multiThreadedBlocking on DepthFirst"_test   = [&] { deliversEverySample.operator()<qa_sched::PoolParkingDepthFirst>("DepthFirst"); };
+    "a chain of parked workers delivers every sample under multi_threaded_blocking on Simple"_test       = [&] { deliversEverySample.operator()<qa_sched::PoolParkingScheduler>("Simple"); };
+    "a chain of parked workers delivers every sample under multi_threaded_blocking on BreadthFirst"_test = [&] { deliversEverySample.operator()<qa_sched::PoolParkingBreadthFirst>("BreadthFirst"); };
+    "a chain of parked workers delivers every sample under multi_threaded_blocking on DepthFirst"_test   = [&] { deliversEverySample.operator()<qa_sched::PoolParkingDepthFirst>("DepthFirst"); };
 
     // A pool worker at the idle back-off's longest sleep calls its blocks every few hundred microseconds. A parked
     // one calls them only when the progress sequence moves, a wake arrives or the park times out, and none of these
@@ -4737,10 +4737,10 @@ const boost::ut::suite<"workers that park"> parkingWorkerTests = [] {
         expect(lt(delayMs.value_or(static_cast<double>(kParkTimeout.count())), static_cast<double>(kPromptBound.count()))) << policyName << "the end of the quiescence left the worker parked";
     };
 
-    "a block adopted during a held work quiescence runs within a tenth of the park after the quiescence ends under singleThreadedBlocking"_test = [&] { adoptedUnderQuiescenceRuns.operator()<qa_sched::BlockingProbe>("singleThreadedBlocking", parkingSettings, 1UZ); };
-    "a block adopted during a held work quiescence runs within a tenth of the park after the quiescence ends under multiThreadedBlocking"_test  = [&] {
+    "a block adopted during a held work quiescence runs within a tenth of the park after the quiescence ends under single_threaded_blocking"_test = [&] { adoptedUnderQuiescenceRuns.operator()<qa_sched::BlockingProbe>("single_threaded_blocking", parkingSettings, 1UZ); };
+    "a block adopted during a held work quiescence runs within a tenth of the park after the quiescence ends under multi_threaded_blocking"_test  = [&] {
         auto pool = qa_sched::fixedPool(qa_sched::kParkingPoolName, kParkingThreads);
-        adoptedUnderQuiescenceRuns.operator()<qa_sched::PoolParkingProbe>("multiThreadedBlocking", poolParkingSettings, 2UZ);
+        adoptedUnderQuiescenceRuns.operator()<qa_sched::PoolParkingProbe>("multi_threaded_blocking", poolParkingSettings, 2UZ);
     };
 
     // The test's thread runs the scheduler's message service, and the message reaches msgIn without a wake (see
@@ -4847,7 +4847,7 @@ const boost::ut::suite<"workers that park"> parkingWorkerTests = [] {
         auto pool = qa_sched::fixedPool(qa_sched::kParkingPoolName, kParkingThreads);
         removedBlockStops.operator()<qa_sched::PoolParkingProbe>("removed block", poolParkingSettings, 2UZ);
     };
-    "a block that a message served on another thread removes from a parked singleThreadedBlocking run stops within a tenth of the park"_test = [&] { removedBlockStops.operator()<qa_sched::BlockingProbe>("removed block, singleThreadedBlocking", parkingSettings, 1UZ); };
+    "a block that a message served on another thread removes from a parked single_threaded_blocking run stops within a tenth of the park"_test = [&] { removedBlockStops.operator()<qa_sched::BlockingProbe>("removed block, single_threaded_blocking", parkingSettings, 1UZ); };
 
     // the scheduler starts the added scheduler on a pool of its own and queues it for a job list. The added
     // scheduler's graph moves nothing. The queueing is then the only wake
@@ -4926,21 +4926,21 @@ const boost::ut::suite<"workers that park"> parkingWorkerTests = [] {
         expect(!parkedAfterPause) << caseName << "a worker parked after the scheduler read PAUSED";
     };
 
-    "a singleThreadedBlocking worker does not park while a pause sweeps the blocks"_test                              = [&] { pauseParksNoWorker.operator()<qa_sched::BlockingProbe>("singleThreadedBlocking, released in the sweep", false, parkingSettings); };
-    "a singleThreadedBlocking worker whose work() call spans the start of a pause does not park after the pause"_test = [&] { pauseParksNoWorker.operator()<qa_sched::BlockingProbe>("singleThreadedBlocking, work() spanning the start of the pause", true, parkingSettings); };
+    "a single_threaded_blocking worker does not park while a pause sweeps the blocks"_test                              = [&] { pauseParksNoWorker.operator()<qa_sched::BlockingProbe>("single_threaded_blocking, released in the sweep", false, parkingSettings); };
+    "a single_threaded_blocking worker whose work() call spans the start of a pause does not park after the pause"_test = [&] { pauseParksNoWorker.operator()<qa_sched::BlockingProbe>("single_threaded_blocking, work() spanning the start of the pause", true, parkingSettings); };
     // no pool worker parks in the sweep or within a tenth of the park after PAUSED
-    "no pool worker parks while a pause sweeps the blocks under multiThreadedBlocking"_test = [&] {
+    "no pool worker parks while a pause sweeps the blocks under multi_threaded_blocking"_test = [&] {
         auto pool = qa_sched::fixedPool(qa_sched::kParkingPoolName, 1U);
-        pauseParksNoWorker.operator()<qa_sched::PoolParkingProbe>("multiThreadedBlocking, released in the sweep", false, poolParkingSettings);
+        pauseParksNoWorker.operator()<qa_sched::PoolParkingProbe>("multi_threaded_blocking, released in the sweep", false, poolParkingSettings);
     };
-    "a pool worker whose work() call spans the start of a pause does not park after the pause under multiThreadedBlocking"_test = [&] {
+    "a pool worker whose work() call spans the start of a pause does not park after the pause under multi_threaded_blocking"_test = [&] {
         auto pool = qa_sched::fixedPool(qa_sched::kParkingPoolName, 1U);
-        pauseParksNoWorker.operator()<qa_sched::PoolParkingProbe>("multiThreadedBlocking, work() spanning the start of the pause", true, poolParkingSettings);
+        pauseParksNoWorker.operator()<qa_sched::PoolParkingProbe>("multi_threaded_blocking, work() spanning the start of the pause", true, poolParkingSettings);
     };
 
     // The source ends its stream behind items that the relay never takes. The relay then drains, and it ends after a
     // bound of calls in which nothing it waits on moved. Nothing else moves. A worker parked between those calls would
-    // therefore call the relay once per park. Under multiThreaded the bound passes at the idle back-off's pace.
+    // therefore call the relay once per park. Under multi_threaded the bound passes at the idle back-off's pace.
     auto untakenRemainderEnds = [&]<typename TScheduler>(std::string_view policyName) {
         static constexpr std::string_view kDrainPoolName = "qa_drain_cpu";
         auto                              pool           = qa_sched::fixedPool(kDrainPoolName, 3U);
@@ -4965,9 +4965,9 @@ const boost::ut::suite<"workers that park"> parkingWorkerTests = [] {
         expect(eq(sink._nReceived, 0UZ)) << policyName;
     };
 
-    "a block that never takes its remainder ends the graph under multiThreaded"_test                         = [&] { untakenRemainderEnds.operator()<qa_sched::TestScheduler>("multiThreaded"); };
-    "a block that never takes its remainder keeps its worker from parking under singleThreadedBlocking"_test = [&] { untakenRemainderEnds.operator()<qa_sched::BlockingScheduler>("singleThreadedBlocking"); };
-    "a block that never takes its remainder keeps its worker from parking under multiThreadedBlocking"_test  = [&] { untakenRemainderEnds.operator()<qa_sched::PoolParkingScheduler>("multiThreadedBlocking"); };
+    "a block that never takes its remainder ends the graph under multi_threaded"_test                          = [&] { untakenRemainderEnds.operator()<qa_sched::TestScheduler>("multi_threaded"); };
+    "a block that never takes its remainder keeps its worker from parking under single_threaded_blocking"_test = [&] { untakenRemainderEnds.operator()<qa_sched::BlockingScheduler>("single_threaded_blocking"); };
+    "a block that never takes its remainder keeps its worker from parking under multi_threaded_blocking"_test  = [&] { untakenRemainderEnds.operator()<qa_sched::PoolParkingScheduler>("multi_threaded_blocking"); };
 };
 
 namespace qa_sched {
@@ -4988,7 +4988,7 @@ struct SlowIdleSource : gr::Block<SlowIdleSource> {
 
 using BlockingWakeProbe = WakeProbe<BlockingScheduler>;
 
-// runs an idle graph under singleThreadedBlocking with a park that outlasts the case. With kWakes set, it waits until
+// runs an idle graph under single_threaded_blocking with a park that outlasts the case. With kWakes set, it waits until
 // the watchdog has woken the worker that many times. Without, it waits until the worker has parked and `window` has
 // passed. It returns the source's work() calls, the wakes, and the time it waited
 struct IdleRun {
@@ -5040,7 +5040,7 @@ const boost::ut::suite<"a watchdog wake"> watchdogWakeTests = [] {
         const qa_sched::IdleRun woken   = qa_sched::runIdle(gr::Size_t(10), kWakes, {});
         const qa_sched::IdleRun control = qa_sched::runIdle(gr::Size_t(60'000), 0UZ, woken.elapsed);
 
-        std::println("idle singleThreadedBlocking run: {} work() calls and {} wakes with a 10 ms watchdog, {} calls and {} wakes without one", woken.nCalls, woken.nWakes, control.nCalls, control.nWakes);
+        std::println("idle single_threaded_blocking run: {} work() calls and {} wakes with a 10 ms watchdog, {} calls and {} wakes without one", woken.nCalls, woken.nWakes, control.nCalls, control.nWakes);
         expect(eq(control.nWakes, 0UZ)) << "the control's watchdog woke its worker";
         expect(le(control.nCalls, std::size_t(qa_sched::kIdleInactivityCount) + 2UZ)) << "the control's worker did not park after the inactivity count";
         // a wake that lands during a pass ends the next park at once, so each wake adds at most two passes
@@ -5195,8 +5195,8 @@ const boost::ut::suite<"a sub-scheduler's exported stream ports"> exportedPortTe
 
 namespace qa_sched {
 
-using BreadthFirstScheduler = gr::scheduler::BreadthFirst<gr::scheduler::ExecutionPolicy::multiThreaded>;
-using DepthFirstScheduler   = gr::scheduler::DepthFirst<gr::scheduler::ExecutionPolicy::multiThreaded>;
+using BreadthFirstScheduler = gr::scheduler::BreadthFirst<gr::scheduler::ExecutionPolicy::multi_threaded>;
+using DepthFirstScheduler   = gr::scheduler::DepthFirst<gr::scheduler::ExecutionPolicy::multi_threaded>;
 
 // the threads that ran each block's processOne(), keyed by the block
 inline std::mutex                                       gProcessingThreadsMutex;
@@ -5655,7 +5655,7 @@ const boost::ut::suite<"a stop or a destruction during a deferred graph swap"> d
         // old graph's reset() hook holds the swap after its check of the destruction flag until the destruction has set
         // the flag and has read the state. The restart then reads the flag as set and does not run. Under a single-threaded
         // policy the swap runs inside the runner's call, and a destruction during that call is outside the scheduler's
-        // contract. The case therefore runs under multiThreaded alone, where the runner's call has returned before the
+        // contract. The case therefore runs under multi_threaded alone, where the runner's call has returned before the
         // swap.
         static constexpr auto kBound = std::chrono::milliseconds(1000);
 
@@ -5704,7 +5704,7 @@ const boost::ut::suite<"a stop or a destruction during a deferred graph swap"> d
 
         // timed on the wall clock. A worker requests a swap to a graph whose source runs until the test ends it. The
         // swap restarts the scheduler before the destruction begins, so the restart reads the destruction flag as unset.
-        // Under multiThreaded the new source holds its first work() call until the destruction has set the flag. The
+        // Under multi_threaded the new source holds its first work() call until the destruction has set the flag. The
         // destruction then stops the restarted run and waits for its workers. A single-threaded scheduler runs the
         // restarted run inside the runner's call, and a destruction during that call is outside the scheduler's
         // contract. Under those policies the test stops the run, and the destruction begins after the runner's call
@@ -5794,7 +5794,7 @@ const boost::ut::suite<"a stop requested while exchange() stops a running graph"
     // exchange() from a thread outside the scheduler stops the running graph and then restores RUNNING with the new
     // graph. The old graph's stop() hook holds that stop while the scheduler reads REQUESTED_STOP. A stop requested
     // then changes no state. The exchange must still install the new graph and leave the scheduler STOPPED.
-    "a stop requested while exchange() stops a running multiThreaded graph is kept"_test = [] {
+    "a stop requested while exchange() stops a running multi_threaded graph is kept"_test = [] {
         std::atomic<bool> stopEntered{false};
         std::atomic<bool> stopReleased{false};
 
@@ -6303,14 +6303,14 @@ struct OwnRequestSink : gr::Block<OwnRequestSink> {
 };
 
 // runs source, stage and sink under TScheduler, and the stage sends `request` to the scheduler from inside its own
-// processOne() call. Under multiThreaded the source holds a work() call of its own worker when the request arrives. A
+// processOne() call. Under multi_threaded the source holds a work() call of its own worker when the request arrives. A
 // pause is followed by a stop from the test's thread. A scheduler whose request or run does not return is leaked with
 // its probe. The case then fails instead of hanging.
 template<typename TScheduler>
 void expectRequestFromOwnWorkReturns(gr::lifecycle::State request) {
     using namespace boost::ut;
     using enum gr::lifecycle::State;
-    static constexpr bool kWorkerPerBlock = TScheduler::executionPolicy() == gr::scheduler::ExecutionPolicy::multiThreaded;
+    static constexpr bool kWorkerPerBlock = TScheduler::executionPolicy() == gr::scheduler::ExecutionPolicy::multi_threaded;
 
     auto pool         = fixedPool(kOwnRequestPoolName, 4U);
     auto probe        = std::make_unique<OwnRequestProbe>();
@@ -6404,7 +6404,7 @@ struct PairRequestSource : gr::Block<PairRequestSource> {
     }
 };
 
-// runs two PairRequestSources, each feeding a CountingSink, under multiThreaded with a pool thread for each block. The
+// runs two PairRequestSources, each feeding a CountingSink, under multi_threaded with a pool thread for each block. The
 // first request comes from the first source's work() call, or with firstFromTestThread from a thread of the test once
 // the second source is inside its call. The test's thread stops a run that the requests left active. A scheduler or a
 // thread whose request or run does not return is leaked with the probe. The case then fails instead of hanging. A

@@ -46,7 +46,7 @@ int main() {
         return 3;
     }
 
-    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler;
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler;
     if (!scheduler.exchange(std::move(graph)).has_value()) {
         std::println(stderr, "the scheduler did not take the graph");
         return 4;

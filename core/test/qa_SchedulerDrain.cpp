@@ -925,7 +925,7 @@ constexpr std::string_view kDroppedTailEndpoint = "dropped tail";
     return entry == report.data->end() ? std::string() : entry->second.value_or(std::string());
 }
 
-using SerialScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>;
+using SerialScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded>;
 
 constexpr auto kRunBound = std::chrono::seconds(5);
 
@@ -1436,9 +1436,9 @@ const boost::ut::suite<"end-of-stream drain"> drainTests = [] {
         expect(decimator.state() == STOPPED) << "the end of the stream did not reach the downstream block";
     };
 
-    "a block whose epilogue waits for room ends its stream within the bound under singleThreadedBlocking"_test = [] { qa_drain::expectEpilogueWaitEndsUnderScheduler<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking>>(); };
+    "a block whose epilogue waits for room ends its stream within the bound under single_threaded_blocking"_test = [] { qa_drain::expectEpilogueWaitEndsUnderScheduler<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded_blocking>>(); };
 
-    "a block whose epilogue waits for room ends its stream within the bound under multiThreadedBlocking"_test = [] { qa_drain::expectEpilogueWaitEndsUnderScheduler<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreadedBlocking>>(); };
+    "a block whose epilogue waits for room ends its stream within the bound under multi_threaded_blocking"_test = [] { qa_drain::expectEpilogueWaitEndsUnderScheduler<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multi_threaded_blocking>>(); };
 
     "a drain stall held while the epilogue waits for room is reported once, and the epilogue runs once room appears"_test = [] {
         gr::PortOut<int>                upstream;

@@ -11,7 +11,7 @@
 namespace qa_progress_wake {
 
 using Clock = std::chrono::steady_clock;
-using Run   = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>;
+using Run   = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded>;
 
 // A wake that a waiter misses shows as a wait of its whole deadline, so the timed waiter's deadline and the
 // watchdog's period lie beyond the bound on a wake, which a loaded runner still meets.

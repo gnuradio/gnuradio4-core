@@ -66,7 +66,7 @@ Usage: rungraph --graph <file> [options]
 )"
 #endif
                                     R"(  --scheduler <key>  the registry key of the scheduler that runs the graph;
-                     gr::scheduler::Simple<singleThreaded> without it
+                     gr::scheduler::Simple<single_threaded> without it
   --seconds <s>      stop the graph after <s> seconds; without it the run ends when the graph does
   --show <name>      print the settings of the block named <name> when the run ends; repeatable
   --set, -s <key>=<value>
@@ -101,10 +101,10 @@ lists.)"
                                     R"( A directory named twice is searched once.
 
 rungraph registers core's Simple scheduler under one key per execution policy:
-gr::scheduler::Simple<singleThreaded> runs every block on one thread,
-gr::scheduler::Simple<multiThreaded> spreads the blocks over the threads of the processing pool,
-gr::scheduler::Simple<singleThreadedBlocking> runs on one thread and sleeps while no block
-makes progress, and gr::scheduler::Simple<multiThreadedBlocking> spreads the blocks over the
+gr::scheduler::Simple<single_threaded> runs every block on one thread,
+gr::scheduler::Simple<multi_threaded> spreads the blocks over the threads of the processing pool,
+gr::scheduler::Simple<single_threaded_blocking> runs on one thread and sleeps while no block
+makes progress, and gr::scheduler::Simple<multi_threaded_blocking> spreads the blocks over the
 pool's threads, each of which sleeps while its own blocks make no progress.)"
 #ifdef INTERNAL_ENABLE_BLOCK_PLUGINS
                                     R"( A plugin or a block

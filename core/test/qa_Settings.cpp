@@ -615,7 +615,7 @@ struct RatioStream {
         return {};
     }
 
-    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler{};
     if (!scheduler.exchange(std::move(flow)).has_value()) {
         return {};
     }
@@ -650,7 +650,7 @@ struct RateStreamResult {
     expect(flow.connect<"out", "in">(source, middle).has_value());
     expect(flow.connect<"out", "in">(middle, sink).has_value());
 
-    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler{};
     expect(scheduler.exchange(std::move(flow)).has_value());
     expect(scheduler.runAndWait().has_value());
 
@@ -903,8 +903,8 @@ struct ChunkSchedulerSettings : gr::scheduler::SchedulerSettings {
 
 // a scheduler with a setting of its own: the check refuses a chunk of 3, and the apply hook counts its calls and keeps
 // the chunk in force
-struct ChunkScheduler : gr::scheduler::SchedulerBase<ChunkScheduler, gr::scheduler::ExecutionPolicy::singleThreaded, gr::profiling::null::Profiler, ChunkSchedulerSettings> {
-    using Base = gr::scheduler::SchedulerBase<ChunkScheduler, gr::scheduler::ExecutionPolicy::singleThreaded, gr::profiling::null::Profiler, ChunkSchedulerSettings>;
+struct ChunkScheduler : gr::scheduler::SchedulerBase<ChunkScheduler, gr::scheduler::ExecutionPolicy::single_threaded, gr::profiling::null::Profiler, ChunkSchedulerSettings> {
+    using Base = gr::scheduler::SchedulerBase<ChunkScheduler, gr::scheduler::ExecutionPolicy::single_threaded, gr::profiling::null::Profiler, ChunkSchedulerSettings>;
     using Base::_pool;
     using Base::Base;
 
@@ -990,7 +990,7 @@ const boost::ut::suite<"settings"> _settings = [] {
         expect(flow.connect<"out", "in">(source, middle).has_value());
         expect(flow.connect<"out", "in">(middle, sink).has_value());
 
-        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler{};
         expect(scheduler.exchange(std::move(flow)).has_value());
         expect(scheduler.runAndWait().has_value());
 
@@ -1037,7 +1037,7 @@ const boost::ut::suite<"settings"> _settings = [] {
         expect(fatal(flow.connect<"out", "in">(source, copier).has_value()));
         expect(fatal(flow.connect<"out", "in">(copier, sink).has_value()));
 
-        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler{};
         expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
         expect(scheduler.runAndWait().has_value()) << "the run ends without an error";
         expect(eq(copier.settings.level.value, kEndLevel)) << "the tag past the trailing samples sets the level";
@@ -1515,9 +1515,9 @@ template<typename TSink>
     expect(flow.connect<"out", "in">(source, pass).has_value());
     expect(flow.connect<"out", "in">(pass, sink).has_value());
 
-    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler;
-    gr::MsgPortOut                                                        toScheduler;
-    gr::MsgPortIn                                                         fromScheduler;
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler;
+    gr::MsgPortOut                                                         toScheduler;
+    gr::MsgPortIn                                                          fromScheduler;
     expect(toScheduler.connect(scheduler.msgIn).has_value());
     if (readMessages) {
         expect(scheduler.msgOut.connect(fromScheduler).has_value());
@@ -1562,8 +1562,8 @@ struct ForwarderRun {
     expect(flow.connect<"out", "in">(source, forwarder).has_value());
     expect(flow.connect<"out", "in">(forwarder, sink).has_value());
 
-    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler;
-    gr::MsgPortIn                                                         fromScheduler;
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler;
+    gr::MsgPortIn                                                          fromScheduler;
     expect(scheduler.msgOut.connect(fromScheduler).has_value());
     expect(scheduler.exchange(std::move(flow)).has_value());
 
@@ -2034,7 +2034,7 @@ struct NamesRecordingSink : Block<NamesRecordingSink> {
     source.nSamples = nSamples;
     std::ignore     = sink.setTagCouplings(property_map{{"names", std::string(key)}});
     expect(fatal(flow.connect<"out", "in">(source, sink).has_value()));
-    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler{};
     expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
     expect(fatal(scheduler.runAndWait().has_value()));
     return sink.namesAtSample;

@@ -629,7 +629,7 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         expect(eq(schedulers.exitCode, 0)) << schedulers.output;
         expect(schedulers.output.contains("gr::scheduler")) << "the family of core's schedulers" << schedulers.output;
         expect(schedulers.output.contains("this-program")) << "the keys the program registers itself" << schedulers.output;
-        for (const std::string_view policy : {"<singleThreaded>", "<multiThreaded>", "<singleThreadedBlocking>", "<multiThreadedBlocking>"}) {
+        for (const std::string_view policy : {"<single_threaded>", "<multi_threaded>", "<single_threaded_blocking>", "<multi_threaded_blocking>"}) {
             expect(schedulers.output.contains(policy)) << "one key per execution policy" << policy << schedulers.output;
         }
         expect(schedulers.output.contains("GoodMathScheduler")) << "the scheduler a plugin registers" << schedulers.output;
@@ -650,8 +650,8 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         for (const std::string_view key : {"\"libraries\"", "\"schedulerKeys\"", "\"families\"", "\"schedulers\"", "\"instantiations\"", "\"totals\""}) {
             expect(schedulers.output.contains(key)) << key << schedulers.output;
         }
-        expect(schedulers.output.contains("\"key\": \"gr::scheduler::Simple<singleThreaded>\"")) << schedulers.output;
-        expect(schedulers.output.contains("\"key\": \"gr::scheduler::Simple<multiThreaded>\"")) << schedulers.output;
+        expect(schedulers.output.contains("\"key\": \"gr::scheduler::Simple<single_threaded>\"")) << schedulers.output;
+        expect(schedulers.output.contains("\"key\": \"gr::scheduler::Simple<multi_threaded>\"")) << schedulers.output;
         expect(schedulers.output.contains("\"key\": \"good::GoodMathScheduler\"")) << schedulers.output;
         expect(schedulers.output.contains("\"name\": \"timeout_ms\"")) << schedulers.output;
         expect(schedulers.output.contains("\"unit\": \"ms\"")) << "the unit the annotation carries" << schedulers.output;
@@ -665,7 +665,7 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
     "version names the registered schedulers and counts them"_test = [] {
         const Result version = run(overTestDirectories({"version"}));
         expect(eq(version.exitCode, 0)) << version.output;
-        expect(version.output.contains("gr::scheduler::Simple<singleThreaded>")) << version.output;
+        expect(version.output.contains("gr::scheduler::Simple<single_threaded>")) << version.output;
         expect(version.output.contains("good::GoodMathScheduler")) << version.output;
         expect(version.output.contains("scheduler keys")) << version.output;
     };
@@ -720,7 +720,7 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         expect(markdown.output.starts_with("# grinfo version\n")) << "the command is the title" << markdown.output;
         expect(hasRenderedRow(markdown.output, {fromEnvironment("GR_TOOLS_CORE_TEST_PLUGINS"), "option", "searched"})) << "a directory row, its path whole" << markdown.output;
         expect(markdown.output.contains("| Good Math Plugin | v1 | MIT | 4 | 1 |")) << "a plugin row" << markdown.output;
-        expect(markdown.output.contains("- gr::scheduler::Simple\\<singleThreaded\\>\n")) << "a scheduler key, its brackets escaped" << markdown.output;
+        expect(markdown.output.contains("- gr::scheduler::Simple\\<single_threaded\\>\n")) << "a scheduler key, its brackets escaped" << markdown.output;
 
         const Result html = run(overTestDirectories({"version", "--html"}), Streams::standardOutput);
         expect(eq(html.exitCode, 0)) << html.output;

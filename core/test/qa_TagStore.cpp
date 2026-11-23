@@ -399,7 +399,7 @@ const boost::ut::suite<"segmented tag store"> _tagStoreTests = [] {
         expect(flow.connect<"out", "in">(source, lead).has_value());
         expect(flow.connect<"out", "in">(source, lag).has_value());
 
-        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded> scheduler{};
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multi_threaded> scheduler{};
         expect(scheduler.exchange(std::move(flow)).has_value());
         expect(scheduler.runAndWait().has_value());
 

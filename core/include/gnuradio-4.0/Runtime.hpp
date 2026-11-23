@@ -209,7 +209,7 @@ class GNURADIO_EXPORT Runtime {
 public:
     enum class State : std::uint8_t { Idle, Initialized, Running, RequestedPause, Paused, RequestedStop, Stopped, Error };
 
-    static constexpr std::string_view kDefaultScheduler = "gr::scheduler::Simple<singleThreaded>";
+    static constexpr std::string_view kDefaultScheduler = "gr::scheduler::Simple<single_threaded>";
 
     /// A block's settings endpoint. It takes a `Set` alone, which gets no reply, with a request id or without; a key it
     /// refuses arrives on `kSettingsNotificationEndpoint`. `BlockHandle::get()` reads the settings, and
