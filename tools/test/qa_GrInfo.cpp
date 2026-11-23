@@ -543,8 +543,9 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         expect(pluginDirectory.starts_with(prefix + "/")) << "the plugin directory lies in the tree the tool runs from" << empty.output;
 
         fs::create_directories(pluginDirectory);
-        const std::string plugin = moduleFileName("GoodBasePlugin");
-        fs::copy_file(fs::path(fromEnvironment("GR_TOOLS_CORE_TEST_PLUGINS")) / plugin, fs::path(pluginDirectory) / plugin);
+        // a block plugin is a shared library, not a MODULE, so its suffix differs from moduleFileName()'s on macOS
+        const fs::path plugin = fromEnvironment("GR_TOOLS_GOOD_BASE_PLUGIN");
+        fs::copy_file(plugin, fs::path(pluginDirectory) / plugin.filename());
         const Result installed = versionOf(firstRoot);
         expect(eq(installed.exitCode, 0)) << installed.output;
         expect(installed.output.contains("\"name\": \"Good Base Plugin\"")) << "the plugin of the tree is loaded" << installed.output;

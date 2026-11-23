@@ -134,6 +134,7 @@ if(TARGET grinfo)
       APPEND
       PROPERTY ENVIRONMENT
                "GR_TOOLS_CORE_TEST_PLUGINS=${CMAKE_BINARY_DIR}/core/test/plugins"
+               "GR_TOOLS_GOOD_BASE_PLUGIN=$<TARGET_FILE:GoodBasePlugin>"
                "GR_TOOLS_TEST_BLOCK_LIBRARY=${CMAKE_BINARY_DIR}/core/test/block_library"
                "GR_TOOLS_TEST_SCHEDULER_LIBRARY=${CMAKE_BINARY_DIR}/core/test/scheduler_library"
                "GR_TOOLS_TEST_PLUGIN_ABI=${CMAKE_BINARY_DIR}/core/test/plugin_abi"
