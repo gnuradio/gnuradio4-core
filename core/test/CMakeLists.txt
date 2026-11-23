@@ -160,6 +160,7 @@ set_tests_properties(
 # argument meets the language's own refusal, a value where a type goes, worded by each compiler
 set(_COMPILE_FAIL_SETTINGS_TESTS
     "cf_Settings_base_name_const|a block's member takes the name of a setting of its base block, which is reserved"
+    "cf_Settings_direct_setting|a block declares each setting of its own in its struct Settings"
     "cf_Settings_struct_check_without_member|a check that takes `const Settings& s` needs the block to reflect a member of type `Settings`"
     "cf_Settings_hook_without_settings|the settings hook takes the block's settings"
     "cf_Settings_call_name_member|a block's member takes the name of one of the block's settings calls, which are reserved"
@@ -168,6 +169,8 @@ set(_COMPILE_FAIL_SETTINGS_TESTS
     "cf_PortCountFor_float|PortCountFor annotates an integer setting"
     "cf_PortCountFor_no_collection|PortCountFor names a dynamic port collection of the block"
     "cf_PortCountFor_twice|two settings size one port collection"
+    "cf_Settings_older_hook|a member named settingsChanged is no hook"
+    "cf_Settings_older_hook_overloads|a member named settingsChanged is no hook"
     "cf_Settings_mutable_check|the check hook is `std::optional<gr::Refused> checkSettings.const Settings& s. const`"
     "cf_Limits_type_cannot_hold|a predicate of Limits names a value the setting's type cannot hold"
     "cf_Limits_short_form|Limits takes predicates alone: Min, Max, Over, Under and OneOf"

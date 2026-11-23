@@ -371,10 +371,11 @@ struct FinalOldHook final {
     void settingsChanged(const property_map&, const property_map&) {}
 };
 
-static_assert(gr::settings::HasSettingsApply<OldHook> && gr::settings::HasSettingsApply<TemplatedOldHook>, "the older hook is a settings hook");
+static_assert(gr::settings::detail::NamesSettingsChanged<OldHook>);
+static_assert(gr::settings::detail::NamesSettingsChanged<TemplatedOldHook>);
 static_assert(gr::settings::detail::NamesCheckSettings<MutableCheck> && !gr::settings::HasSettingsCheck<MutableCheck>);
-static_assert(gr::settings::HasSettingsApply<Plain> && gr::settings::HasSettingsCheck<Plain>);
-static_assert(gr::settings::HasSettingsApply<FinalOldHook>, "a final block type takes the older hook");
+static_assert(!gr::settings::detail::NamesSettingsChanged<Plain> && gr::settings::HasSettingsApply<Plain> && gr::settings::HasSettingsCheck<Plain>);
+static_assert(gr::settings::detail::NamesSettingsChanged<FinalOldHook>, "a final block type with the older hook is refused");
 
 template<typename TBlock>
 struct Fixture {

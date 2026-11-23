@@ -1225,25 +1225,6 @@ struct PredicateForms : Block<PredicateForms> {
     [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
 };
 
-/// a gain held as a direct member, with the older settings hook
-struct OlderForms : Block<OlderForms> {
-    PortIn<float>  in{};
-    PortOut<float> out{};
-    float          gain = 1.f;
-
-    GR_MAKE_REFLECTABLE(OlderForms, in, out, gain);
-
-    property_map lastOld{};
-    property_map lastNew{};
-
-    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
-
-    void settingsChanged(const property_map& oldSettings, const property_map& newSettings) {
-        lastOld = oldSettings;
-        lastNew = newSettings;
-    }
-};
-
 /// a count a caller must give, since its default lies outside its limits
 struct RequiredCount : Block<RequiredCount> {
     PortIn<float>  in{};
@@ -1621,14 +1602,6 @@ constexpr bool percentTakesCharacterByValue() {
 const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
     using namespace boost::ut;
     using namespace qa_refusals;
-
-    "a direct member is a setting, and settingsChanged() gets its values before and after a change"_test = [] {
-        OlderForms block{property_map{{"name", std::string("older_forms")}}};
-        expect(fatal(block.set({{"gain", 2.f}}).has_value()));
-        expect(eq(block.gain, 2.f)) << "the direct member keeps its value";
-        expect(block.lastNew.contains("gain") && block.lastNew.at("gain") == pmt::Value(2.f)) << "the hook is not given the new value";
-        expect(block.lastOld.contains("gain") && block.lastOld.at("gain") == pmt::Value(1.f)) << "the hook is not given the value before";
-    };
 
     "a holder of the block's base reaches its settings object through settings()"_test = [] {
         LimitedGain               block{property_map{{"name", std::string("base_holder")}}};

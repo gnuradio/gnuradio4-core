@@ -439,8 +439,6 @@ public:
     [[nodiscard]] std::optional<property_map> getStored(std::span<const std::string> keys = {}) const;
     [[nodiscard]] std::optional<pmt::Value>   getStored(const std::string& key) const;
     void                                      storeDefaults() { storeInForceAsDefaults(); }
-    // a member the settings hook assigns is read when the hook returns, so nothing is left to copy
-    void updateActiveParameters() noexcept {}
 
 protected:
     // the block author's calls, which `gr::Block` offers its block
@@ -765,6 +763,7 @@ namespace detail {
 
 // a type that names a member, whatever its signature, makes `&Probe<T>::name` ambiguous
 struct HookNames {
+    int settingsChanged;
     int applySettings;
     int checkSettings;
 };
@@ -773,18 +772,14 @@ struct HookNameProbe : T, HookNames {};
 
 // a final type takes no probe, so it is tested by the member's address, which misses an overloaded or templated member
 template<typename T>
+concept NamesSettingsChanged = std::is_class_v<T> && ((std::is_final_v<T> && requires { &T::settingsChanged; }) || (!std::is_final_v<T> && !requires { &HookNameProbe<T>::settingsChanged; }));
+template<typename T>
 concept NamesApplySettings = std::is_class_v<T> && ((std::is_final_v<T> && requires { &T::applySettings; }) || (!std::is_final_v<T> && !requires { &HookNameProbe<T>::applySettings; }));
 template<typename T>
 concept NamesCheckSettings = std::is_class_v<T> && ((std::is_final_v<T> && requires { &T::checkSettings; }) || (!std::is_final_v<T> && !requires { &HookNameProbe<T>::checkSettings; }));
 
 template<typename TBlock>
 concept CheckTakesSettingsStruct = requires { static_cast<std::optional<Refused> (TBlock::*)(const typename TBlock::Settings&) const>(&TBlock::checkSettings); };
-
-// the older settings hook: the values before and after the change, and the tags the hook forwards
-template<typename TBlock>
-concept SettingsChangedTakesMaps = requires(TBlock& block, const property_map& oldSettings, const property_map& newSettings) { block.settingsChanged(oldSettings, newSettings); };
-template<typename TBlock>
-concept SettingsChangedForwards = requires(TBlock& block, const property_map& oldSettings, const property_map& newSettings, property_map& forwardSettings) { block.settingsChanged(oldSettings, newSettings, forwardSettings); };
 
 template<typename TBlock>
 concept ApplyTakesNothing = requires { static_cast<void (TBlock::*)()>(&TBlock::applySettings); };
@@ -809,7 +804,7 @@ template<typename TBlock>
 concept HasSettingsCheck = detail::CheckTakesSettingsStruct<TBlock>;
 
 template<typename TBlock>
-concept HasSettingsApply = detail::ApplyTakesSettings<TBlock> || detail::ApplyTakesSettingsAndOld<TBlock> || detail::SettingsChangedTakesMaps<TBlock> || detail::SettingsChangedForwards<TBlock>;
+concept HasSettingsApply = detail::ApplyTakesSettings<TBlock> || detail::ApplyTakesSettingsAndOld<TBlock>;
 
 template<typename TBlock>
 concept HasSettingsReset = requires(TBlock& block) { block.reset(); };
@@ -827,11 +822,8 @@ concept HasSettingsReset = requires(TBlock& block) { block.reset(); };
  * changed the `Annotated` setting `x`; at the setup every setting is changed. Each hook is optional, and `reset()` runs
  * after a reset's defaults apply. A rule about values lives in the check hook, which refuses the whole call before a
  * write; the apply hook fails a key, by `fail` or a throw, only where doing the thing fails. A throw from the check is
- * its refusal naming no setting, with the thrown message; one from the apply fails each key the call changed. A block
- * may define the older hook in place of the apply hook: `void settingsChanged(const property_map& old, const
- * property_map& new)`, with the changed settings' values before and after, or with a third `property_map&` whose
- * entries it forwards as a tag. On a scheduler the core's `applySchedulerSettings()` applies the keys of
- * `SchedulerSettings` before the scheduler's hook.
+ * its refusal naming no setting, with the thrown message; one from the apply fails each key the call changed. On a
+ * scheduler the core's `applySchedulerSettings()` applies the keys of `SchedulerSettings` before the scheduler's hook.
  */
 template<typename TBlock>
 struct BlockSettingsOf : SettingsBase {
@@ -841,9 +833,10 @@ private:
 
 public:
     explicit BlockSettingsOf(TBlock& block, property_map constructedWith = {}) : SettingsBase(detail::declarationTable<TBlock>(), std::addressof(block), describedMapOf(block), std::move(constructedWith)), _block(block) {
+        static_assert(!detail::NamesSettingsChanged<TBlock>, "the settings hook is `applySettings`, and a member named settingsChanged is no hook");
         static_assert(!detail::ApplyTakesNothing<TBlock>, "the settings hook takes the block's settings, as `void applySettings(Settings& s)` or `void applySettings(Settings& s, const Settings& old)`");
         static_assert(!detail::NamesApplySettings<TBlock> || HasSettingsApply<TBlock> || detail::ApplyTakesNothing<TBlock>, "the settings hook is `void applySettings(Settings& s)` or `void applySettings(Settings& s, const Settings& old)`, with `s` const where it assigns nothing");
-        static_assert(!(detail::ApplyTakesSettings<TBlock> || detail::ApplyTakesSettingsAndOld<TBlock>) || detail::holdsSettingsStruct<TBlock>(), "an apply hook that takes `Settings& s` needs the block to reflect a member of type `Settings`");
+        static_assert(!HasSettingsApply<TBlock> || detail::holdsSettingsStruct<TBlock>(), "an apply hook that takes `Settings& s` needs the block to reflect a member of type `Settings`");
         static_assert(!detail::NamesCheckSettings<TBlock> || HasSettingsCheck<TBlock>, "the check hook is `std::optional<gr::Refused> checkSettings(const Settings& s) const`");
         static_assert(!detail::CheckTakesSettingsStruct<TBlock> || detail::holdsSettingsStruct<TBlock>(), "a check that takes `const Settings& s` needs the block to reflect a member of type `Settings`");
     }
@@ -923,7 +916,7 @@ private:
     [[nodiscard]] bool applyTakesSettings() const noexcept override { return HasSettingsApply<TBlock> || detail::AppliesSchedulerSettings<TBlock>; }
 
     void runSettingsApplyHook([[maybe_unused]] const property_map& changed, [[maybe_unused]] const settings::ValueMap& previousValues, [[maybe_unused]] const settings::ValueMap* fieldsBefore) override {
-        if constexpr ((detail::ApplyTakesSettings<TBlock> || detail::ApplyTakesSettingsAndOld<TBlock> || detail::AppliesSchedulerSettings<TBlock>) && detail::holdsSettingsStruct<TBlock>()) {
+        if constexpr ((HasSettingsApply<TBlock> || detail::AppliesSchedulerSettings<TBlock>) && detail::holdsSettingsStruct<TBlock>()) {
             typename TBlock::Settings& own = detail::settingsStructOf(_block);
             const ChangedForHook       marks(own, fieldsBefore == nullptr ? nullptr : &changed);
             if constexpr (detail::ApplyTakesSettingsAndOld<TBlock> || detail::AppliesSchedulerSettings<TBlock>) {
@@ -933,25 +926,11 @@ private:
                 }
                 if constexpr (detail::ApplyTakesSettingsAndOld<TBlock>) {
                     _block.applySettings(own, old);
-                } else if constexpr (detail::ApplyTakesSettings<TBlock>) {
+                } else if constexpr (HasSettingsApply<TBlock>) {
                     _block.applySettings(own);
                 }
             } else {
                 _block.applySettings(own);
-            }
-        } else if constexpr (detail::SettingsChangedTakesMaps<TBlock> || detail::SettingsChangedForwards<TBlock>) {
-            property_map oldSettings;
-            for (const auto& [key, value] : previousValues) {
-                oldSettings.insert_or_assign(std::pmr::string(key), value);
-            }
-            if constexpr (detail::SettingsChangedForwards<TBlock>) {
-                property_map forwardSettings;
-                _block.settingsChanged(oldSettings, changed, forwardSettings);
-                for (auto& [key, value] : forwardSettings) {
-                    forwardTag(key, std::move(value));
-                }
-            } else {
-                _block.settingsChanged(oldSettings, changed);
             }
         }
     }

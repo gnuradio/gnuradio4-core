@@ -937,6 +937,12 @@ template<typename TBlock>
     return kDirectMember;
 }
 
+// a setting the block declares as a member of its own outside its struct Settings; a base block's settings are its own
+// direct members
+[[nodiscard]] consteval bool holdsOwnDirectSetting(std::span<const ReflectedMember> members) {
+    return std::ranges::any_of(members, [](const ReflectedMember& member) { return member.role == ReflectedMember::Role::setting && !member.inStruct && !member.fromBaseType && !member.repeatedBase; });
+}
+
 // a scheduler's block category
 template<typename TBlock>
 consteval bool isScheduledBlockGroup() {
@@ -985,6 +991,7 @@ template<typename TBlock>
     static_assert(kPortFault != PortCountForFault::notInteger, "PortCountFor annotates an integer setting");
     static_assert(kPortFault != PortCountForFault::noDynamicCollection, "PortCountFor names a dynamic port collection of the block");
     static_assert(kPortFault != PortCountForFault::sizedTwice, "PortCountFor: two settings size one port collection");
+    static_assert(!holdsOwnDirectSetting(kMembers), "a block declares each setting of its own in its struct Settings");
     if constexpr (constexpr std::size_t kTaken = firstBaseNameTaken(kMembers, kOuterNames<TBlock>, baseMemberCountOf<TBlock>()); kTaken != kDirectMember) {
         refuseBaseMemberName<FlatMemberAt<TBlock, kTaken>::kName>();
     }
