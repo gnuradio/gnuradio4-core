@@ -136,7 +136,13 @@ json_escape() {
 }
 
 manifest_is_readable() {
-    plutil -lint "$1" >/dev/null 2>&1
+    # NOT plutil -lint: it only validates property lists and rejects JSON outright
+    # (even '{"a":1}'), so it reported every well-formed manifest as unreadable --
+    # which made 'register' move the manifest aside as corrupt and start a fresh one,
+    # silently dropping every component registered by an earlier package, and made
+    # 'query' always answer manifest-present=0. A conversion to a discarded output
+    # parses the file without writing to it.
+    plutil -convert json -o /dev/null "$1" >/dev/null 2>&1
 }
 
 # Prints one scalar, empty when the key is absent.
