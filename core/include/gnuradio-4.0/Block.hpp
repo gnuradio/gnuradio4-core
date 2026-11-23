@@ -519,7 +519,7 @@ struct isBlockDependent {
 
 namespace block::property {
 // [[maybe_unused]]: names referenced only from Block.cpp (initStandardPropertyCallbacks) and user code — silences -Werror=unused-variable on TUs that include only the header.
-[[maybe_unused]] inline const char* const        kHeartbeat      = "Heartbeat";      ///< heartbeat property - the canary in the coal mine (supports block-specific subscribe/unsubscribe)
+[[maybe_unused]] inline const char* const        kHeartbeat      = "Heartbeat";      ///< a Get or a Set is answered with the time of the reply
 [[maybe_unused]] inline static const char* const kEcho           = "Echo";           ///< basic property that receives any matching message and sends a mirror with it's serviceName/unique_name
 [[maybe_unused]] inline static const char* const kLifeCycleState = "LifecycleState"; ///< basic property that sets the block's @see lifecycle::StateMachine
 [[maybe_unused]] inline const char* const        kSetting        = "Settings";       ///< asynchronous message-based setting handling,
@@ -570,8 +570,7 @@ struct BlockBase {
     SubgraphExportHandler _subgraphExportHandler = nullptr;
     void*                 _subgraphExportContext = nullptr;
 
-    std::map<std::string, PropertyCallback>                   propertyCallbacks;
-    std::map<std::string, std::set<std::string>, std::less<>> propertySubscriptions; // the clients each endpoint of this block notifies
+    std::map<std::string, PropertyCallback> propertyCallbacks;
 
     // replies that found msgOut full, oldest first. They are sent before any newer reply. They are at most as many as
     // msgOut holds.
@@ -599,7 +598,6 @@ struct BlockBase {
      * and a block supplying its own processMessages() still hides this one.
      */
     void emitMessage(std::string_view endpoint, property_map message, std::string_view clientRequestID = "") noexcept;
-    void notifyListeners(std::string_view endpoint, property_map message) noexcept;
     void emitErrorMessage(std::string_view endpoint, std::string_view errorMsg, std::string_view clientRequestID = "", std::source_location location = std::source_location::current()) noexcept;
     void emitErrorMessage(std::string_view endpoint, Error e, std::string_view clientRequestID = "") noexcept;
     void emitErrorMessageIfAny(std::string_view endpoint, std::expected<void, Error> e, std::string_view clientRequestID = "") noexcept;
@@ -703,13 +701,12 @@ enum class Category {
  * these properties leverage the Majordomo Protocol (MDP) pattern for structured and efficient communication.
  *
  * Predefined properties include:
- * - `kHeartbeat`: Monitors and reports the block's operational state.
+ * - `kHeartbeat`: answers a Get or a Set with the time of the reply.
  * - `kEcho`: Responds to messages by echoing them back, aiding in communication testing.
  * - `kLifeCycleState`: Manages and reports the block's lifecycle state.
- * - `kSetting`: a `Set` stages the settings it carries and gets no reply; a refused key goes out as a notification. A
- *   subscriber is sent the block's settings after each work call that applied a change.
+ * - `kSetting`: a `Set` stages the settings it carries and gets no reply; a refused key goes out as a notification.
  *
- * These properties can be interacted with through messages, supporting operations like setting values, querying states, and subscribing to updates.
+ * These properties answer `SET` and `GET` messages. A host follows settings on the scheduler's `SettingsNotification` endpoint.
  * This model provides a flexible interface for blocks to adapt their processing based on runtime conditions and external inputs.
  *
  * Implementing a Property:
@@ -1750,9 +1747,6 @@ public:
             return;
         }
         std::ignore = settings::detail::FrameworkAccess::applyStagedParameters(_settings); // the settings notify each failed key; a failed apply never ends the run
-        if (propertySubscriptions.contains(block::property::kSetting)) {                   // the settings are read only for a subscriber
-            notifyListeners(block::property::kSetting, settings::heldValues(_settings.get()));
-        }
         if constexpr (gr::meta::kDebugBuild) {
             checkBlockParameterConsistency();
         }
@@ -2003,10 +1997,6 @@ public:
     constexpr void processScheduledMessages() {
         if (!_unsentReplies.empty()) {
             sendUnsentReplies();
-        }
-        if (propertySubscriptions.contains(block::property::kHeartbeat)) { // the time is read only for a subscriber
-            const auto nanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
-            notifyListeners(block::property::kHeartbeat, pmt::Value::Map{{"heartbeat", nanoseconds}});
         }
 
         bool handlerRan  = false;

@@ -2,21 +2,6 @@
 
 namespace gr {
 
-namespace {
-// a Subscribe adds the client to the endpoint's subscribers and an Unsubscribe removes it; a new client past
-// kMaxSubscribersPerProperty is refused
-void subscribe(std::map<std::string, std::set<std::string>, std::less<>>& subscriptions, std::string_view endpoint, const Message& message) {
-    std::set<std::string>& subscribers = subscriptions[std::string(endpoint)];
-    if (message.cmd == message::Command::Unsubscribe) {
-        subscribers.erase(message.clientRequestID);
-    } else if (!subscribers.contains(message.clientRequestID) && subscribers.size() >= message::kMaxSubscribersPerProperty) {
-        throw gr::exception(std::format("refused client {}: property {} already notifies {} clients, the cap kMaxSubscribersPerProperty", message.clientRequestID, endpoint, message::kMaxSubscribersPerProperty));
-    } else {
-        subscribers.insert(message.clientRequestID);
-    }
-}
-} // namespace
-
 void BlockBase::initStandardPropertyCallbacks() noexcept {
     propertyCallbacks = {
         {block::property::kHeartbeat, &BlockBase::propertyCallbackHeartbeat},
@@ -28,14 +13,6 @@ void BlockBase::initStandardPropertyCallbacks() noexcept {
 
 void BlockBase::emitMessage(std::string_view endpoint, property_map message, std::string_view clientRequestID) noexcept { //
     sendMessage<message::Command::Notify>(cbMsgOut(), cbUniqueName() /* serviceName */, endpoint, std::move(message), clientRequestID);
-}
-
-void BlockBase::notifyListeners(std::string_view endpoint, property_map message) noexcept {
-    if (const auto it = propertySubscriptions.find(endpoint); it != propertySubscriptions.end()) {
-        for (const std::string& clientID : it->second) {
-            emitMessage(endpoint, message, clientID);
-        }
-    }
 }
 
 void BlockBase::emitErrorMessage(std::string_view endpoint, std::string_view errorMsg, std::string_view clientRequestID, std::source_location location) noexcept { //
@@ -133,10 +110,6 @@ std::optional<Message> BlockBase::propertyCallbackHeartbeat(std::string_view pro
         message.data           = pmt::Value::Map{{"heartbeat", nanoseconds}};
         return message;
     }
-    if (message.cmd == Subscribe || message.cmd == Unsubscribe) {
-        subscribe(propertySubscriptions, propertyName, message);
-        return std::nullopt;
-    }
 
     throw gr::exception(std::format("block {} property {} does not implement command {}, msg: {}", cbUniqueName(), propertyName, message.cmd, message));
 }
@@ -205,10 +178,6 @@ std::optional<Message> BlockBase::propertyCallbackSettings(std::string_view prop
         if (const std::expected<settings::Values, settings::Rejected> staged = cbSettings().set(*message.data, settings::noWait); !staged) {
             FrameworkAccess::notifyRefused(cbSettings(), staged.error());
         }
-        return std::nullopt;
-    }
-    if (message.cmd == Subscribe || message.cmd == Unsubscribe) {
-        subscribe(propertySubscriptions, propertyName, message);
         return std::nullopt;
     }
 

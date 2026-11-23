@@ -101,30 +101,6 @@ const boost::ut::suite<"block message plumbing"> blockMessageTests = [] {
         expect(replies[0].data->contains("heartbeat")) << "the reply carries no time";
     };
 
-    "a Heartbeat subscriber is told the time at each message pass until it unsubscribes"_test = [] {
-        qa_block_messages::InheritedHandler block;
-        MsgPortOut                          toBlock;
-        MsgPortIn                           fromBlock;
-        qa_block_messages::connect(block, toBlock, fromBlock);
-
-        block.processScheduledMessages();
-        expect(qa_block_messages::takeMessages(fromBlock).empty()) << "a block with no subscriber sends a heartbeat";
-
-        sendMessage<message::Command::Subscribe>(toBlock, "", block::property::kHeartbeat, property_map{}, "client");
-        block.processScheduledMessages(); // the Subscribe is taken after this pass's heartbeat
-        expect(qa_block_messages::takeMessages(fromBlock).empty()) << "the Subscribe got a reply";
-        block.processScheduledMessages();
-        const std::vector<Message> beats = qa_block_messages::takeMessages(fromBlock);
-        expect(fatal(eq(beats.size(), 1UZ))) << "one heartbeat per message pass";
-        expect(beats[0].clientRequestID == "client" && beats[0].data.has_value() && beats[0].data->contains("heartbeat"));
-
-        sendMessage<message::Command::Unsubscribe>(toBlock, "", block::property::kHeartbeat, property_map{}, "client");
-        block.processScheduledMessages();
-        std::ignore = qa_block_messages::takeMessages(fromBlock); // the heartbeat sent ahead of the Unsubscribe
-        block.processScheduledMessages();
-        expect(qa_block_messages::takeMessages(fromBlock).empty()) << "an unsubscribed client is told the time";
-    };
-
     "a block that defines its own processMessages() hides the inherited one"_test = [] {
         qa_block_messages::OwnHandler block;
         MsgPortOut                    toBlock;
