@@ -1300,7 +1300,7 @@ private:
     // finds the two unequal. The mangled name identifies a type across objects only when the type has external
     // linkage. Two objects can give one mangled name to two distinct types in anonymous namespaces, to two local
     // classes of functions with internal linkage, and to two unnamed classes or closures. Two handler pairs are of one
-    // type when they share one type_info, or when their mangled name carries none of these forms and their sizes and
+    // type when they share one type_info, or when their type name carries none of these forms and their sizes and
     // alignments agree.
     [[nodiscard]] static bool sameHandlerType(const Handlers& first, const Handlers& second) noexcept {
         if (first.type == nullptr || second.type == nullptr) {
@@ -1313,13 +1313,15 @@ private:
         return !namesTypeWithoutExternalLinkage(name) && name == std::string_view(second.type->name()) && first.size == second.size && first.alignment == second.alignment;
     }
 
-    // true when a mangled name contains a form that gcc or clang gives to a type without external linkage: an anonymous
-    // namespace (_GLOBAL__N), an entity local to a function with internal linkage (ZL), an unnamed class or closure
-    // (clang's $_, gcc's ._anon_) or a closure or unnamed type in a mangled scope (Ul, Ut). A name that contains one of
-    // these strings by chance is refused too.
-    [[nodiscard]] static bool namesTypeWithoutExternalLinkage(std::string_view mangledName) noexcept {
-        constexpr std::array<std::string_view, 6UZ> kMarkers{"_GLOBAL__N", "ZL", "$_", "._anon_", "Ul", "Ut"};
-        return std::ranges::any_of(kMarkers, [mangledName](std::string_view marker) { return mangledName.contains(marker); });
+    // true when a type name contains a form given to a type without external linkage. gcc and clang name the type
+    // mangled: an anonymous namespace (_GLOBAL__N), an entity local to a function with internal linkage (ZL), an unnamed
+    // class or closure (clang's $_, gcc's ._anon_) or a closure or unnamed type in a mangled scope (Ul, Ut). MSVC names
+    // it undecorated: an anonymous namespace (`anonymous namespace'), a function's scope ('::`), a closure (<lambda_) or
+    // an unnamed class (<unnamed-). MSVC spells a local class of an inline function as it does one of a static function,
+    // so both are refused. A name that contains one of these strings by chance is refused too.
+    [[nodiscard]] static bool namesTypeWithoutExternalLinkage(std::string_view typeName) noexcept {
+        constexpr std::array<std::string_view, 10UZ> kMarkers{"_GLOBAL__N", "ZL", "$_", "._anon_", "Ul", "Ut", "`anonymous namespace'", "'::`", "<lambda_", "<unnamed-"};
+        return std::ranges::any_of(kMarkers, [typeName](std::string_view marker) { return typeName.contains(marker); });
     }
 
     // A wrapper offers its handlers through this interface and not through model. The layout of model stays as it is.
