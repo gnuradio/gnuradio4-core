@@ -6,6 +6,8 @@ add_library(
   src/BlockModel.cpp
   src/Port.cpp
   src/Settings.cpp
+  src/SettingNotification.cpp
+  src/SettingValue.cpp
   src/Graph.cpp
   src/PluginLoader.cpp
   src/PmtTypeHelpers.cpp)

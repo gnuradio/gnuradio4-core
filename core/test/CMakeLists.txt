@@ -50,6 +50,7 @@ set(_CORE_TESTS
     qa_SettingsBase
     qa_SettingsConcurrency
     qa_SettingsTable
+    qa_SettingValue
     qa_SubnormalFlush
     qa_RecipeParameters
     qa_TagForwarding
