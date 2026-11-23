@@ -282,7 +282,7 @@ inline void loadEntrySettings(BlockModel& block, const property_map& grcBlock, c
         if (couplings == nullptr) {
             throw gr::exception(std::format("Unable to create block '{}' of type '{}': tag_couplings is not a map", identity.name, identity.type));
         }
-        if (const std::expected<void, settings::Rejected> coupled = block.settings().setTagCouplings(*couplings); !coupled) {
+        if (const std::expected<void, settings::Rejected> coupled = block.setTagCouplings(*couplings); !coupled) {
             throw settings::RefusedSettings(std::format("Unable to create block '{}' of type '{}': {}", identity.name, identity.type, settings::describeRejected(coupled.error())), coupled.error(), identity.name);
         }
     }
@@ -445,15 +445,15 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
             currentBlock = std::make_shared<GraphWrapper<gr::Graph>>(gr::Graph(loader, parameters));
         }
 
-        checkDeclared(currentBlock->settings().writableMembers(), blockName, currentBlock->typeName(), parameters);
+        checkDeclared(currentBlock->writableMembers(), blockName, currentBlock->typeName(), parameters);
 
-        currentBlock->setName(blockName);
+        std::ignore = currentBlock->setName(blockName);
         // a definition is constructed with its exported parameters alone, so its other keys load as settings
         loadEntrySettings(*currentBlock, grcBlock, split.fromDefinition ? &parameters : nullptr, identity);
         if (schedulerId.has_value()) {
             // A scheduler's init() hides the block init() that addBlock() calls. The loader initializes the scheduler's
             // settings here.
-            if (const std::expected<void, settings::Rejected> initialized = settings::detail::FrameworkAccess::init(currentBlock->settings()); !initialized) {
+            if (const std::expected<void, settings::Rejected> initialized = settings::detail::FrameworkAccess::init(settings::detail::settingsOf(*currentBlock)); !initialized) {
                 throw settings::RefusedSettings(std::format("Unable to create block '{}' of type '{}': {}", blockName, *schedulerId, settings::describeRejected(initialized.error())), initialized.error(), blockName);
             }
         }

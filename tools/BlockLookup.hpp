@@ -119,9 +119,9 @@ private:
         std::vector<OutputPort> ports;
         if (instance != nullptr) {
             try {
-                gr::settings::detail::FrameworkAccess::describe(instance->settings());
+                gr::settings::detail::FrameworkAccess::describe(gr::settings::detail::settingsOf(*instance));
             } catch (...) {
-                // a block that refuses its own defaults still declares its ports
+                // a block whose description throws still declares its ports
             }
             // a collection's members all carry the type of the collection, so it enters as one entry
             for (auto& entry : instance->dynamicOutputPorts()) {

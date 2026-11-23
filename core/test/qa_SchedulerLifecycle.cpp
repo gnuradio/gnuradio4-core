@@ -3843,7 +3843,7 @@ const boost::ut::suite<"a transparent subgraph in the execution order"> subgraph
         auto& sink    = wrapper->graph()->emplaceBlock<qa_sched::CountingSink>();
 
         const std::shared_ptr<gr::BlockModel>& subgraph = flow.addBlock(wrapper);
-        subgraph->setName("inner");
+        expect(fatal(subgraph->setName("inner").has_value()));
         expect(wrapper->exportPort(true, std::string(sink.unique_name), gr::PortDirection::INPUT, "in", "in").has_value());
         expect(flow.connect(flow.blocks()[0], gr::PortDefinition{"out"}, subgraph, gr::PortDefinition{"in"}).has_value());
 
@@ -3884,7 +3884,7 @@ const boost::ut::suite<"a subgraph's progress sequence"> subgraphProgressTests =
         auto& sink     = interior.emplaceBlock<qa_sched::CountingSink>();
 
         const std::shared_ptr<gr::BlockModel>& subgraph = flow.addBlock(wrapper);
-        subgraph->setName("inner");
+        expect(fatal(subgraph->setName("inner").has_value()));
         expect(wrapper->exportPort(true, std::string(sink.unique_name), gr::PortDirection::INPUT, "in", "in").has_value());
         expect(flow.connect(flow.blocks()[0], gr::PortDefinition{"out"}, subgraph, gr::PortDefinition{"in"}).has_value());
 

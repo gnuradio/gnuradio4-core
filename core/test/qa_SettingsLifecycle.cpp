@@ -89,6 +89,7 @@ struct Gain : gr::Block<Gain> {
     std::atomic<int> nStops{0};
     std::string      startThrow{};
     bool             failCodeWithoutValue = false;
+    bool             refuseNames          = false;
     float            failAbove            = 1e9f;
 
     void start() {
@@ -102,6 +103,13 @@ struct Gain : gr::Block<Gain> {
     }
 
     void stop() { ++nStops; }
+
+    std::optional<gr::Refused> checkSettings(const Settings&) const {
+        if (refuseNames) {
+            return gr::Refused("name", "the device keeps its name");
+        }
+        return {};
+    }
 
     // a gain the device refuses takes back its batch
     void applySettings(const Settings& s, const Settings& old) {
@@ -529,9 +537,9 @@ const suite<"settings of a graph's block"> graphLinkTests = [] {
             const auto removed = scheduler.graph().removeBlockByName(lone.unique_name);
             expect(fatal(removed.has_value()));
             kept = *removed;
-            expect(FrameworkAccess::schedulerLink(kept->settings()) == nullptr) << "a removed block kept the scheduler's link";
+            expect(FrameworkAccess::schedulerLink(gr::settings::detail::settingsOf(*kept)) == nullptr) << "a removed block kept the scheduler's link";
         }
-        const std::expected<gr::settings::Values, Rejected> set = kept->settings().set("gain", 2.f);
+        const std::expected<gr::settings::Values, Rejected> set = kept->set("gain", 2.f);
         expect(set.has_value()) << textOf(set);
     };
 
@@ -545,6 +553,77 @@ const suite<"settings of a graph's block"> graphLinkTests = [] {
         expect(ran.error().message.contains(added->uniqueName())) << ran.error().message;
         expect(ran.error().message.contains("without init()")) << ran.error().message;
         expect(eq(static_cast<Applier*>(added->raw())->nWorkCalls.load(), 0UZ));
+    };
+
+    "a block renamed and placed through its model after it joined a graph keeps both through a run, reads and saves them"_test = [] {
+        gr::Graph flow;
+        std::ignore = flow.emplaceBlock<Ones>();
+        std::ignore = flow.emplaceBlock<Gain>();
+        std::ignore = flow.emplaceBlock<Record>();
+        expect(fatal(flow.connect(flow.blocks()[0], gr::PortDefinition{"out"}, flow.blocks()[1], gr::PortDefinition{"in"}).has_value()));
+        expect(fatal(flow.connect(flow.blocks()[1], gr::PortDefinition{"out"}, flow.blocks()[2], gr::PortDefinition{"in"}).has_value()));
+        const std::shared_ptr<gr::BlockModel> gain = flow.blocks()[1];
+
+        CerrCapture captured;
+        expect(fatal(gain->setName("renamed").has_value()));
+        expect(fatal(gain->set("ui_constraints", property_map{{"x", std::string("left")}}).has_value()));
+        expect(fatal(gain->set("gain", 2.f).has_value()));
+        expect(eq(gain->get<std::string>("name").value_or(""), std::string("renamed"))) << "a read misses the name that waits for the start";
+        const property_map  savedBlock = gr::serializeBlock(gr::globalPluginLoader(), gain, gr::BlockSerializationFlags::Settings);
+        const property_map* parameters = savedBlock.at(std::pmr::string(gr::serialization_fields::BLOCK_PARAMETERS)).get_if<property_map>();
+        expect(fatal(parameters != nullptr));
+        expect(parameters->at(std::pmr::string("name")) == gr::pmt::Value(std::string("renamed"))) << "a save misses the name that waits for the start";
+        gr::scheduler::Simple<> scheduler;
+        expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+        expect(fatal(scheduler.runAndWait().has_value()));
+
+        expect(eq(gain->name(), std::string_view("renamed"))) << "the run took back the name";
+        expect(eq(gain->get<std::string>("name").value_or(""), std::string("renamed")));
+        const std::expected<gr::settings::Value, Rejected> placed = gain->get("ui_constraints");
+        expect(fatal(placed.has_value()));
+        const property_map* placedMap = placed->value.get_if<property_map>();
+        expect(placedMap != nullptr && placedMap->contains("x")) << "the run took back the UI map";
+        const property_map saved = FrameworkAccess::savedValues(gr::settings::detail::settingsOf(*gain));
+        expect(saved.contains("name") && saved.at("name") == gr::pmt::Value(std::string("renamed"))) << "the saved settings lack the name";
+        const auto savedPlace = saved.find("ui_constraints");
+        expect(savedPlace != saved.end() && savedPlace->second.get_if<property_map>() != nullptr && savedPlace->second.get_if<property_map>()->contains("x")) << "the saved settings lack the UI map";
+        expect(eq(captured.lines("outside applySettings()"), 0UZ)) << captured.str();
+    };
+
+    "a subgraph renamed through its model after it joined a stopped graph saves the new name"_test = [] {
+        gr::Graph flow;
+        auto      wrapper                              = std::make_shared<gr::GraphWrapper<gr::Graph>>();
+        std::ignore                                    = wrapper->graph()->emplaceBlock<Gain>();
+        const std::shared_ptr<gr::BlockModel> subgraph = flow.addBlock(wrapper);
+        expect(fatal(FrameworkAccess::isSetUp(gr::settings::detail::settingsOf(*subgraph)))) << "the rename would not go through the subgraph's settings";
+
+        expect(fatal(subgraph->setName("inner").has_value()));
+        expect(eq(subgraph->get<std::string>("name").value_or(""), std::string("inner"))) << "a read misses the new name";
+        expect(eq(subgraph->name(), std::string_view("inner"))) << "no work call reaches a subgraph, so its new name applies at the call";
+        const property_map  savedBlock = gr::serializeBlock(gr::globalPluginLoader(), subgraph, gr::BlockSerializationFlags::Settings);
+        const property_map* parameters = savedBlock.at(std::pmr::string(gr::serialization_fields::BLOCK_PARAMETERS)).get_if<property_map>();
+        expect(fatal(parameters != nullptr));
+        expect(parameters->at(std::pmr::string("name")) == gr::pmt::Value(std::string("inner"))) << "a save writes the subgraph's old name";
+    };
+
+    "a rename through the model that the block's check refuses returns the refusal and keeps the old name"_test = [] {
+        gr::Graph                             flow;
+        auto&                                 gain  = flow.emplaceBlock<Gain>({{"name", std::string("kept")}});
+        const std::shared_ptr<gr::BlockModel> model = flow.blocks()[0];
+        gain.refuseNames                            = true;
+
+        const std::expected<gr::settings::Values, Rejected> refused = model->setName("renamed");
+        expect(fatal(!refused.has_value())) << "a refused rename reported success";
+        expect(eq(refused.error().size(), 1UZ));
+        expect(eq(refused.error().front().key, std::string("name")));
+        expect(eq(refused.error().front().reason, std::string("the device keeps its name")));
+        expect(eq(model->get<std::string>("name").value_or(""), std::string("kept"))) << "a read returns the refused name";
+        expect(eq(model->name(), std::string_view("kept")));
+
+        gain.refuseNames                                            = false;
+        const std::expected<gr::settings::Values, Rejected> renamed = model->setName("renamed");
+        expect(renamed.has_value()) << textOf(renamed);
+        expect(eq(model->get<std::string>("name").value_or(""), std::string("renamed")));
     };
 };
 
@@ -931,14 +1010,14 @@ const suite<"the scheduler's own settings"> schedulerSettingsTests = [] {
         gr::SchedulerWrapper<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>> scheduler;
         scheduler.setGraph(std::move(flow));
         expect(fatal(scheduler.start().has_value()));
-        expect(fatal(waitUntil([&] { return FrameworkAccess::isRunning(scheduler.settings()); })));
+        expect(fatal(waitUntil([&] { return FrameworkAccess::isRunning(gr::settings::detail::settingsOf(scheduler)); })));
 
-        const std::expected<gr::settings::Values, Rejected> timeout = scheduler.settings().set("settings_timeout_ms", 250U);
+        const std::expected<gr::settings::Values, Rejected> timeout = scheduler.set("settings_timeout_ms", 250U);
         expect(timeout == gr::settings::Values{{"settings_timeout_ms", Entry{.state = Entry::State::pending, .value = {}, .reason = std::string(gr::settings::kPendingNextStart)}}}) << textOf(timeout);
         expect(eq(FrameworkAccess::schedulerLink(gr::settings::detail::settingsOf(source))->defaultTimeout(), 1000ms)) << "the timeout applied while the scheduler runs";
         std::ignore = scheduler.set("notification_level", std::string("error"));
 
-        const std::expected<gr::settings::Values, Rejected> atStart = scheduler.settings().set("timeout_ms", 50U);
+        const std::expected<gr::settings::Values, Rejected> atStart = scheduler.set("timeout_ms", 50U);
         expect(fatal(!atStart.has_value())) << "a running scheduler took a key that waits for a stop";
         expect(fatal(!atStart.error().empty()));
         expect(eq(atStart.error().front().reason, std::string("not allowed while running")));
@@ -947,7 +1026,7 @@ const suite<"the scheduler's own settings"> schedulerSettingsTests = [] {
 
         source.finish = false;
         expect(fatal(scheduler.start().has_value()));
-        expect(fatal(waitUntil([&] { return FrameworkAccess::isRunning(scheduler.settings()); })));
+        expect(fatal(waitUntil([&] { return FrameworkAccess::isRunning(gr::settings::detail::settingsOf(scheduler)); })));
         expect(eq(FrameworkAccess::schedulerLink(gr::settings::detail::settingsOf(source))->defaultTimeout(), 250ms)) << "the next start dropped the held timeout";
         expect(FrameworkAccess::schedulerLink(gr::settings::detail::settingsOf(source))->level() == gr::settings::NotificationLevel::error) << "the next start dropped the held level";
         source.finish = true;
@@ -1012,10 +1091,10 @@ const suite<"the scheduler's own settings"> schedulerSettingsTests = [] {
         expect(scheduler.set({{"settings_timeout_ms", 50U}, {"notification_level", std::string("info")}}).has_value());
         expect(eq(link->defaultTimeout(), 50ms));
         expect(link->level() == gr::settings::NotificationLevel::info);
-        expect(inner->settings().set({{"settings_timeout_ms", 70U}, {"notification_level", std::string("error")}}).has_value());
+        expect(inner->set({{"settings_timeout_ms", 70U}, {"notification_level", std::string("error")}}).has_value());
         expect(eq(link->defaultTimeout(), 70ms));
         expect(link->level() == gr::settings::NotificationLevel::error);
-        expect(inner->settings().set({{"settings_timeout_ms", 0U}, {"notification_level", std::string()}}).has_value());
+        expect(inner->set({{"settings_timeout_ms", 0U}, {"notification_level", std::string()}}).has_value());
         expect(eq(link->defaultTimeout(), 50ms)) << "a nested timeout set back to 0 inherits again";
         expect(link->level() == gr::settings::NotificationLevel::info);
     };
@@ -1063,7 +1142,7 @@ const suite<"the cases of a run's outcome, its delivery and its pool"> outcomeTe
         chain.gain.failAbove = 10.f;
         auto inner           = std::make_shared<gr::SchedulerWrapper<gr::scheduler::Simple<multiThreaded>>>();
         inner->setGraph(std::move(chain.flow));
-        expect(fatal(inner->settings().set("notification_level", std::string("off")).has_value()));
+        expect(fatal(inner->set("notification_level", std::string("off")).has_value()));
         gr::Graph outer;
         outer.addBlock(gr::SchedulerModel::asBlockModelPtr(inner));
         CerrCapture                                                captured; // swapped in before the workers start
@@ -1165,7 +1244,7 @@ const suite<"the cases of a run's outcome, its delivery and its pool"> outcomeTe
             auto inner = std::make_shared<gr::SchedulerWrapper<Probe<gr::scheduler::Simple<>>>>();
             inner->setGraph(finiteChain());
             if (named) {
-                expect(fatal(inner->settings().set("poolName", std::string(gr::thread_pool::kDefaultCpuPoolId)).has_value()));
+                expect(fatal(inner->set("poolName", std::string(gr::thread_pool::kDefaultCpuPoolId)).has_value()));
             }
             gr::Graph outer;
             outer.addBlock(gr::SchedulerModel::asBlockModelPtr(inner));

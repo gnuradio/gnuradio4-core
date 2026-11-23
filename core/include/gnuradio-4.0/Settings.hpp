@@ -608,6 +608,7 @@ private:
     [[nodiscard]] bool                                                  passes(settings::NotificationLevel level) const;
     [[nodiscard]] bool                                                  onOwnThread() const noexcept;
     [[nodiscard]] bool                                                  holdsLock() const noexcept;
+    [[nodiscard]] bool                                                  isSetUp() const;
     [[nodiscard]] std::vector<std::pair<std::string_view, std::size_t>> unsizedCollectionSizes() const;                   // each reflected port collection no port key sizes, with its size
     void                                                                restoreUnpublishedFields(const ValueMap& fields); // reports each reflected field in `fields` that differs from its value in force, and writes that value back
     void                                                                failLater(std::string_view tagKey, std::string_view reason);
@@ -622,6 +623,7 @@ struct FrameworkAccess {
     static Rejected                      applyStagedParameters(SettingsBase& settings) { return settings.applyStagedParameters(); }
     static void                          describe(SettingsBase& settings) { settings.describe(); }
     static void                          moveState(SettingsBase& settings, BlockState state) { settings.moveState(state); }
+    static bool                          isSetUp(const SettingsBase& settings) { return settings.isSetUp(); }
     static void                          endFields(SettingsBase& settings) { settings.endFields(); }
     static Rejected                      beginRun(SettingsBase& settings, bool isStart) { return settings.beginRun(isStart); }
     static Rejected                      checkStart(SettingsBase& settings) { return settings.checkStart(); }

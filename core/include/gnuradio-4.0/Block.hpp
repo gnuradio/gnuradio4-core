@@ -1199,11 +1199,6 @@ private:
 public:
     // tag access (#625): processBulk blocks use inSpan.tags() directly; processOne blocks use inputTagsPresent() + mergedInputTag()
 
-    // the block's settings object; a block's own member `settings` hides it, and a holder of `Block<Derived>&` still
-    // reaches it
-    [[nodiscard]] constexpr const SettingsBase& settings() const noexcept { return _settings; }
-    [[nodiscard]] constexpr SettingsBase&       settings() noexcept { return _settings; }
-
     // a holder's settings calls: `set`, `get` and the others of `SettingsBase`, with their signatures there
     [[nodiscard]] std::expected<settings::Values, settings::Rejected> set(const property_map& changes, settings::Timeout timeout = std::nullopt) { return _settings.set(changes, timeout); }
     [[nodiscard]] std::expected<settings::Values, settings::Rejected> set(std::string_view key, pmt::Value value, settings::Timeout timeout = std::nullopt) { return _settings.set(key, std::move(value), timeout); }

@@ -1060,10 +1060,49 @@ const suite<"SettingsCheck: a check that throws"> throwingCheckTests = [] {
     };
 };
 
+// a block that offers its settings object to every holder under the name `settings`
+template<typename TBlock>
+concept OffersSettingsAccessor = requires(TBlock& block) { block.settings(); };
+
 const suite<"SettingsCheck: a block's settings in its struct"> structTests = [] {
     "a second call is judged over a first that is accepted and not yet applied"_test = [] {
         const StageSeen seen = stageAfterPendingChange();
         expect(seen.accepted && eq(seen.gain, 30.f) && seen.mode == "clip") << seen.reasons;
+    };
+
+    "a type-erased block makes the same settings calls as a typed one, with the same results"_test = [] {
+        static_assert(!OffersSettingsAccessor<Stage> && !OffersSettingsAccessor<const Stage>);
+        static_assert(!OffersSettingsAccessor<gr::BlockModel> && !OffersSettingsAccessor<const gr::BlockModel>);
+        using Model = gr::BlockModel;
+        static_assert(std::same_as<decltype(std::declval<Model&>().set(property_map{})), decltype(std::declval<Stage&>().set(property_map{}))>);
+        static_assert(std::same_as<decltype(std::declval<Model&>().set("gain", gr::pmt::Value(1.f))), decltype(std::declval<Stage&>().set("gain", gr::pmt::Value(1.f)))>);
+        static_assert(std::same_as<decltype(std::declval<Model&>().check(property_map{})), decltype(std::declval<Stage&>().check(property_map{}))>);
+        static_assert(std::same_as<decltype(std::declval<Model&>().ready()), decltype(std::declval<Stage&>().ready())>);
+        static_assert(std::same_as<decltype(std::declval<const Model&>().get("gain")), decltype(std::declval<const Stage&>().get("gain"))>);
+        static_assert(std::same_as<decltype(std::declval<const Model&>().get()), decltype(std::declval<const Stage&>().get())>);
+        static_assert(std::same_as<decltype(std::declval<const Model&>().get<float>("gain")), decltype(std::declval<const Stage&>().get<float>("gain"))>);
+        static_assert(std::same_as<decltype(std::declval<const Model&>().writableMembers()), decltype(std::declval<const Stage&>().writableMembers())>);
+        static_assert(std::same_as<decltype(std::declval<Model&>().resetDefaults()), decltype(std::declval<Stage&>().resetDefaults())>);
+        static_assert(std::same_as<decltype(std::declval<Model&>().setTagCouplings(property_map{})), decltype(std::declval<Stage&>().setTagCouplings(property_map{}))>);
+        static_assert(std::same_as<decltype(std::declval<const Model&>().tagCouplings()), decltype(std::declval<const Stage&>().tagCouplings())>);
+
+        Stage                   typed;
+        gr::BlockWrapper<Stage> wrapped;
+        Model&                  erased = wrapped;
+        for (const auto& changes : {property_map{{"gain", 6.f}}, property_map{{"gain", 30.f}}, property_map{{"mode", std::string("clip")}}}) {
+            const auto byType  = typed.set(changes);
+            const auto byModel = erased.set(changes);
+            expect(eq(byType.has_value(), byModel.has_value()));
+            if (!byType.has_value() && !byModel.has_value()) {
+                expect(eq(gr::settings::describeRejected(byType.error()), gr::settings::describeRejected(byModel.error())));
+            }
+        }
+        expect(typed.get<float>("gain") == erased.get<float>("gain") && erased.get<float>("gain") == std::expected<float, Rejected>(6.f));
+        expect(eq(typed.check({{"gain", 30.f}}).has_value(), erased.check({{"gain", 30.f}}).has_value()));
+        expect(typed.ready().has_value() && erased.ready().has_value());
+        expect(typed.writableMembers() == erased.writableMembers());
+        expect(erased.setTagCouplings(property_map{{"gain", std::string("qa:gain")}}).has_value() && erased.tagCouplings().contains("gain"));
+        expect(erased.resetDefaults().has_value() && erased.get<float>("gain") == std::expected<float, Rejected>(0.f));
     };
 
 #ifdef GR_ENABLE_BLOCK_REGISTRY

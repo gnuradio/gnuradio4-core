@@ -119,7 +119,7 @@ inline RecipeParameterSplit splitRecipeParameters(PluginLoader& loader, std::str
 /// loads a split's `remaining` keys into `block`'s settings, and each key the block declares no setting of into its
 /// `meta_information`. Throws `settings::RefusedSettings` for a refused key, naming the block and its type
 inline void loadRemainingSettings(BlockModel& block, std::string_view blockName, std::string_view blockType, const property_map& remaining) {
-    const std::set<std::string> writable = block.settings().writableMembers();
+    const std::set<std::string> writable = block.writableMembers();
     property_map                changes;
     for (const auto& [key, value] : remaining) {
         if (writable.contains(std::string(key))) {
@@ -128,7 +128,7 @@ inline void loadRemainingSettings(BlockModel& block, std::string_view blockName,
             block.metaInformation().insert_or_assign(key, value);
         }
     }
-    const std::expected<settings::Values, settings::Rejected> loaded = block.settings().set(changes);
+    const std::expected<settings::Values, settings::Rejected> loaded = block.set(changes);
     if (const settings::Rejected refused = loaded ? settings::detail::failedKeys(*loaded) : loaded.error(); !refused.empty()) {
         throw settings::RefusedSettings(std::format("Unable to create block '{}' of type '{}': {}", blockName, blockType, settings::describeRejected(refused)), refused, blockName);
     }
@@ -163,7 +163,7 @@ inline std::expected<std::shared_ptr<BlockModel>, gr::Error> instantiateRecipe(P
         return instantiated;
     }
     if (!blockName.empty()) {
-        (*instantiated)->setName(std::string(blockName));
+        std::ignore = (*instantiated)->setName(std::string(blockName));
     }
     loadRemainingSettings(**instantiated, blockName, blockType, split.remaining);
     return instantiated;

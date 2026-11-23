@@ -27,6 +27,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <tuple>
 #include <type_traits>
@@ -413,6 +414,33 @@ struct GainCappedAtStart : Block<GainCappedAtStart> {
     }
 
     [[nodiscard]] work::Status processBulk() { return work::Status::OK; }
+};
+
+/// a block whose device keeps its name: while `keepsName` holds, its check refuses every call
+struct NameKeeper : Block<NameKeeper> {
+    PortIn<float>  in;
+    PortOut<float> out;
+
+    struct Settings {
+        float gain = 1.f;
+
+        GR_MAKE_REFLECTABLE(Settings, gain);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(NameKeeper, in, out, settings);
+
+    bool keepsName = false;
+
+    explicit NameKeeper(property_map init = {}) : Block<NameKeeper>(std::move(init)) {}
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * settings.gain; }
+
+    std::optional<gr::Refused> checkSettings(const Settings&) const {
+        if (keepsName) {
+            return gr::Refused("name", "the device keeps its name");
+        }
+        return {};
+    }
 };
 
 inline void registerTestBlocks() {
@@ -1777,10 +1805,10 @@ const boost::ut::suite<"refusals return"> refusalTests = [] {
         const std::expected<settings::Values, settings::Rejected> refused = scale->set({{"gain", 5.0f}, {"qa_undeclared", 1.0f}});
         expect(fatal(!refused.has_value())) << "a key the block does not declare was taken";
         expect(std::ranges::any_of(refused.error(), [](const settings::Rejection& entry) { return entry.key == "qa_undeclared"; })) << messageOf(refused);
-        expect(scaleBlock->settings().get<float>("gain") != 5.0f) << "a refused call staged the declared key beside the undeclared one";
+        expect(scaleBlock->get<float>("gain") != 5.0f) << "a refused call staged the declared key beside the undeclared one";
 
         expect(scale->set({{"gain", 5.0f}}).has_value()) << "a declared key alone is refused";
-        expect(scaleBlock->settings().get<float>("gain") == 5.0f) << "a declared key was not staged";
+        expect(scaleBlock->get<float>("gain") == 5.0f) << "a declared key was not staged";
     };
 
     "a staged value the block cannot convert stages none of the keys beside it"_test = [] {
@@ -1821,6 +1849,21 @@ const boost::ut::suite<"refusals return"> refusalTests = [] {
         expect(nothrow([&] { refused.emplace(graph.add(std::make_shared<BlockWrapper<Scale>>(property_map{{"gain", std::string("loud")}}), "refused")); }));
         expect(fatal(refused.has_value() && !refused->has_value())) << "a block that refused its parameters was added";
         expect(graph.blocks().empty()) << "a refused block stayed in the graph";
+    };
+
+    "a rename a configured block refuses is add()'s error, and the block stays out of the graph"_test = [] {
+        auto block = std::make_shared<BlockWrapper<NameKeeper>>(property_map{{"name", std::string("kept")}});
+        expect(fatal(block->set("gain", 2.f).has_value())) << "a set() sets the block up, so add() renames it by a set() too";
+        static_cast<NameKeeper*>(block->raw())->keepsName = true;
+
+        RuntimeGraph                                            graph;
+        std::optional<std::expected<BlockHandle, RuntimeError>> added;
+        expect(nothrow([&] { added.emplace(graph.add(block, "renamed")); }));
+        expect(fatal(added.has_value() && !added->has_value())) << "add() dropped a rename the block refuses";
+        expect(added->error().message.contains("the device keeps its name")) << added->error().message;
+        expect(eq(added->error().where, std::string("RuntimeGraph::add")));
+        expect(graph.blocks().empty()) << "a block that refused its name was added";
+        expect(eq(block->name(), std::string_view("kept")));
     };
 
     "a scheduler setting that is misspelled or refused is refused by create()"_test = [] {

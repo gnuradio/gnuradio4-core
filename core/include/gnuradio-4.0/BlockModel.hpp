@@ -200,6 +200,10 @@ struct hash<gr::Edge> {
 
 namespace gr {
 
+namespace settings::detail {
+struct ModelAccess;
+}
+
 class BlockModel {
 public:
     struct NamedPortCollection {
@@ -471,7 +475,7 @@ public:
      * @brief user-defined name
      * N.B. may not be unique -> ::uniqueName
      */
-    virtual void setName(std::string name) noexcept = 0;
+    virtual std::expected<settings::Values, settings::Rejected> setName(std::string name) noexcept = 0;
 
     /**
      * @brief used to store static non-graph-processing information like Annotated<> info etc.
@@ -482,9 +486,8 @@ public:
 
     /**
      * @brief used to store non-graph-processing information like UI block position etc.
+     * N.B. a host writes it with set("ui_constraints", ...), which keeps it in force and saves it
      */
-    [[nodiscard]] virtual property_map& uiConstraints() noexcept = 0;
-
     [[nodiscard]] virtual const property_map& uiConstraints() const = 0;
 
     /**
@@ -493,9 +496,21 @@ public:
      */
     [[nodiscard]] virtual std::string_view uniqueName() const = 0;
 
-    [[nodiscard]] virtual SettingsBase& settings() = 0;
-
-    [[nodiscard]] virtual const SettingsBase& settings() const = 0;
+    // the block's settings calls, with the signatures and results of a typed block's
+    [[nodiscard]] std::expected<settings::Values, settings::Rejected> set(const property_map& changes, settings::Timeout timeout = std::nullopt) { return settingsObject().set(changes, timeout); }
+    [[nodiscard]] std::expected<settings::Values, settings::Rejected> set(std::string_view key, pmt::Value value, settings::Timeout timeout = std::nullopt) { return settingsObject().set(key, std::move(value), timeout); }
+    [[nodiscard]] std::expected<void, settings::Rejected>             check(const property_map& changes) { return settingsObject().check(changes); }
+    [[nodiscard]] std::expected<void, settings::Rejected>             ready() { return settingsObject().ready(); }
+    [[nodiscard]] std::expected<settings::Value, settings::Rejected>  get(std::string_view key) const { return settingsObject().get(key); }
+    [[nodiscard]] std::expected<settings::Values, settings::Rejected> get(std::span<const std::string> keys = {}) const { return settingsObject().get(keys); }
+    template<typename T>
+    [[nodiscard]] std::expected<T, settings::Rejected> get(std::string_view key) const {
+        return settingsObject().template get<T>(key);
+    }
+    [[nodiscard]] std::set<std::string>                   writableMembers() const { return settingsObject().writableMembers(); }
+    std::expected<settings::Values, settings::Rejected>   resetDefaults(settings::Timeout timeout = std::nullopt) { return settingsObject().resetDefaults(timeout); }
+    [[nodiscard]] std::expected<void, settings::Rejected> setTagCouplings(const property_map& couplings) { return settingsObject().setTagCouplings(couplings); }
+    [[nodiscard]] property_map                            tagCouplings() const { return settingsObject().tagCouplings(); }
 
     [[nodiscard]] virtual work::Result work(std::size_t requested_work) = 0;
 
@@ -518,6 +533,10 @@ private:
     friend class GraphWrapper;
     template<BlockLike T, typename Ownership>
     friend class BlockWrapper;
+    friend struct settings::detail::ModelAccess;
+
+    [[nodiscard]] virtual SettingsBase&       settingsObject()       = 0;
+    [[nodiscard]] virtual const SettingsBase& settingsObject() const = 0;
 
     // lists the block's ports again after a setting resized a port collection; a model with no port loader keeps its list
     void reloadDynamicPorts() {
@@ -638,6 +657,20 @@ inline bool Edge::hasSameInput(const Edge& other, PortType type) const {
     }
     return type == PortType::ANY || port::decodePortType(input.value()->portMaskInfo()) == type;
 }
+
+namespace settings::detail {
+
+struct ModelAccess {
+    [[nodiscard]] static SettingsBase&       of(BlockModel& model) noexcept { return model.settingsObject(); }
+    [[nodiscard]] static const SettingsBase& of(const BlockModel& model) noexcept { return model.settingsObject(); }
+};
+
+// the settings object of a type-erased block, for core's own use; a holder of the block calls `set`, `get` and the
+// others on the block
+[[nodiscard]] inline SettingsBase&       settingsOf(BlockModel& model) noexcept { return ModelAccess::of(model); }
+[[nodiscard]] inline const SettingsBase& settingsOf(const BlockModel& model) noexcept { return ModelAccess::of(model); }
+
+} // namespace settings::detail
 
 namespace serialization_fields {
 using namespace std::string_view_literals;
@@ -961,15 +994,26 @@ public:
     [[nodiscard]] std::expected<void, Error> changeStateTo(lifecycle::State newState) noexcept override { return blockRef().changeStateTo(newState); }
     [[nodiscard]] lifecycle::State           state() const noexcept override { return blockRef().state(); }
     [[nodiscard]] std::string_view           name() const override { return blockRef().name; }
-    void                                     setName(std::string name) noexcept override { blockRef().name = std::move(name); }
     [[nodiscard]] property_map&              metaInformation() noexcept override { return blockRef().meta_information; } // TODO: to be removed (read-only)
     [[nodiscard]] const property_map&        metaInformation() const override { return blockRef().meta_information; }
-    [[nodiscard]] property_map&              uiConstraints() noexcept override { return blockRef().ui_constraints; }
     [[nodiscard]] const property_map&        uiConstraints() const override { return blockRef().ui_constraints; }
     [[nodiscard]] std::string_view           uniqueName() const override { return blockRef().unique_name; }
-    [[nodiscard]] SettingsBase&              settings() override { return settings::detail::settingsOf(blockRef()); }
-    [[nodiscard]] const SettingsBase&        settings() const override { return settings::detail::settingsOf(blockRef()); }
     [[nodiscard]] void*                      raw() override { return std::addressof(blockRef()); }
+
+    // once the block is set up, a new name is a set() of `name` with noWait: a save returns it at once, a read too unless
+    // the block runs, and name() returns it once the block applies it, which a scheduler-managed subgraph that runs does
+    // at its scheduler's next start; a refusal of the set() is the result
+    std::expected<settings::Values, settings::Rejected> setName(std::string name) noexcept override {
+        if (!settings::detail::FrameworkAccess::isSetUp(settingsObject())) {
+            blockRef().name = std::move(name);
+            return settings::Values{};
+        }
+        return settingsObject().set("name", pmt::Value(std::move(name)), settings::noWait);
+    }
+
+private:
+    [[nodiscard]] SettingsBase&       settingsObject() override { return settings::detail::settingsOf(blockRef()); }
+    [[nodiscard]] const SettingsBase& settingsObject() const override { return settings::detail::settingsOf(blockRef()); }
 };
 
 namespace detail {

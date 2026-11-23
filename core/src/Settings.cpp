@@ -352,6 +352,11 @@ void SettingsBase::BlockLock::unlock() {
     _owns = false;
 }
 
+bool SettingsBase::isSetUp() const {
+    const BlockLock lock(*this);
+    return _setUp;
+}
+
 std::vector<std::pair<std::string_view, std::size_t>> SettingsBase::unsizedCollectionSizes() const {
     std::vector<std::pair<std::string_view, std::size_t>> sizes;
     for (const auto& [collection, sizeOf] : _table.collectionSizes) {

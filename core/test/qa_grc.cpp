@@ -419,7 +419,7 @@ inline std::string blockNames(const gr::Graph& graph) {
 }
 
 /// `disconnect_on_done` as the block's settings read it, true when it is missing
-inline bool disconnectsOnDone(const BlockModel& block) { return block.settings().get<bool>("disconnect_on_done").value_or(true); }
+inline bool disconnectsOnDone(const BlockModel& block) { return block.get<bool>("disconnect_on_done").value_or(true); }
 
 /// the message of the gr::exception `call` throws, empty when it throws none
 inline std::string refusalOf(const std::function<void()>& call) {
@@ -469,7 +469,7 @@ const boost::ut::suite<"GRC round trip"> grcTests = [] {
         auto loaded = gr::loadGrc(loader, gr::saveGrc(loader, flow));
         expect(eq(loaded->blocks().size(), 1UZ));
 
-        const property_map parameters = gr::settings::heldValues(loaded->blocks().front()->settings().get());
+        const property_map parameters = gr::settings::heldValues(loaded->blocks().front()->get());
         expect(parameters.at("gain") == pmt::Value(2.5f)) << "a float setting did not survive";
         expect(parameters.at("label") == pmt::Value(std::string("carried"))) << "a string setting did not survive";
         expect(parameters.at("enabled") == pmt::Value(false)) << "a bool setting did not survive";
@@ -488,7 +488,7 @@ const boost::ut::suite<"GRC round trip"> grcTests = [] {
         expect(dump.contains("tag_couplings")) << "the saved graph holds no tag_couplings: " << dump;
         auto loaded = gr::loadGrc(loader, dump);
         expect(fatal(eq(loaded->blocks().size(), 1UZ)));
-        gr::SettingsBase& settings = loaded->blocks().front()->settings();
+        gr::SettingsBase& settings = gr::settings::detail::settingsOf(*loaded->blocks().front());
         expect(settings.tagCouplings() == couplings) << "the table does not survive the round trip";
 
         const float taggedGain = 4.0f;
@@ -656,7 +656,7 @@ const boost::ut::suite<"GRC round trip"> grcTests = [] {
         auto& scale    = interior.emplaceBlock<Scale>({{"name", std::string("inner-scale")}, {"gain", 4.0f}});
 
         const std::shared_ptr<BlockModel>& subgraph = flow.addBlock(wrapper);
-        subgraph->setName("inner");
+        expect(fatal(subgraph->setName("inner").has_value()));
         subgraph->metaInformation()["application:role"] = std::string("demodulator");
         scale.meta_information["application:disabled"]  = false;
         expect(wrapper->exportPort(true, std::string(scale.unique_name), PortDirection::INPUT, "in", "in").has_value());
@@ -740,7 +740,7 @@ const boost::ut::suite<"GRC round trip"> grcTests = [] {
 
         auto loaded = gr::loadGrc(loader, dump);
         expect(eq(loaded->blocks().size(), 1UZ));
-        expect(gr::settings::heldValues(loaded->blocks().front()->settings().get()).at("gain") == pmt::Value(9.0f)) << "the dump must carry what the block would use";
+        expect(gr::settings::heldValues(loaded->blocks().front()->get()).at("gain") == pmt::Value(9.0f)) << "the dump must carry what the block would use";
     };
 
     // the end-to-end statement: the graph that came back through the YAML runs, and delivers what the
@@ -771,7 +771,7 @@ const boost::ut::suite<"GRC round trip"> grcTests = [] {
         auto& scale    = interior.emplaceBlock<Scale>({{"name", std::string("scale")}, {"gain", 2.0f}});
 
         const std::shared_ptr<BlockModel>& subgraph = nested.addBlock(wrapper);
-        subgraph->setName("inner");
+        expect(fatal(subgraph->setName("inner").has_value()));
         expect(wrapper->exportPort(true, std::string(scale.unique_name), PortDirection::INPUT, "in", "in").has_value());
         expect(wrapper->exportPort(true, std::string(scale.unique_name), PortDirection::OUTPUT, "out", "out").has_value());
         expect(nested.connect(nested.blocks()[0], PortDefinition{"out"}, subgraph, PortDefinition{"in"}).has_value());
@@ -802,7 +802,7 @@ const boost::ut::suite<"GRC round trip"> grcTests = [] {
         std::ignore  = nested.emplaceBlock<RampSource>({{"name", std::string("source")}, {"n_samples", 16U}});
         auto wrapper = std::make_shared<GraphWrapper<gr::Graph>>();
         std::ignore  = wrapper->graph()->emplaceBlock<Scale>({{"name", std::string("scale")}});
-        nested.addBlock(wrapper)->setName("inner");
+        expect(fatal(nested.addBlock(wrapper)->setName("inner").has_value()));
 
         auto loaded = gr::loadGrc(localLoader, gr::saveGrc(localLoader, nested));
         expect(loaded->_pluginLoader == &localLoader) << "the root graph bound a loader other than the one that loaded it";
@@ -948,7 +948,7 @@ connections:
         expect(eq(std::string(composite->name()), std::string("demod"))) << "the file's own name did not reach the block";
         expect(!composite->metaInformation().contains("gain_factor")) << "a recipe parameter must not be left behind as meta_information";
 
-        const auto gain = composite->graph()->blocks().front()->settings().get<float>("gain");
+        const auto gain = composite->graph()->blocks().front()->get<float>("gain");
         expect(gain.has_value());
         expect(eq(gain.value_or(float{}), 3.5f)) << "the supplied parameter did not reach the interior setting";
     };
@@ -959,23 +959,23 @@ connections:
 
         gr::Graph                          graph(loader);
         const std::shared_ptr<BlockModel>& composite = graph.emplaceBlock("qa::GainRecipe", {{"name", std::string("demod")}, {"gain_factor", 3.5f}});
-        expect(gr::settings::detail::FrameworkAccess::isGiven(composite->settings(), "gain_factor")) << "the parameter the recipe is built with is given";
+        expect(gr::settings::detail::FrameworkAccess::isGiven(gr::settings::detail::settingsOf(*composite), "gain_factor")) << "the parameter the recipe is built with is given";
         expect(eq(composite->typeName(), std::string_view("gr::Graph"))) << "a message to its graph finds a graph";
         expect(eq(composite->recipeType(), std::string_view("qa::GainRecipe")));
-        expect(fatal(composite->settings().set(gr::property_map{{"gain_factor", 4.5f}}, gr::settings::noWait).has_value()));
-        expect(fatal(composite->settings().setTagCouplings(gr::property_map{{"gain_factor", std::string("qa:gain")}}).has_value()));
+        expect(fatal(composite->set(gr::property_map{{"gain_factor", 4.5f}}, gr::settings::noWait).has_value()));
+        expect(fatal(composite->setTagCouplings(gr::property_map{{"gain_factor", std::string("qa:gain")}}).has_value()));
 
         const std::string saved = gr::saveGrc(loader, graph);
         expect(saved.contains("gain_factor") && saved.contains("qa:gain")) << saved;
         auto loaded = gr::loadGrc(loader, saved);
         expect(fatal(eq(loaded->blocks().size(), 1UZ)));
         const std::shared_ptr<BlockModel>& reloaded = loaded->blocks().front();
-        expect(gr::settings::detail::FrameworkAccess::isGiven(reloaded->settings(), "gain_factor")) << "the loaded composite's record holds the parameter";
-        expect(eq(reloaded->settings().get<float>("gain_factor").value_or(0.f), 4.5f));
-        const gr::property_map couplings = reloaded->settings().tagCouplings();
+        expect(gr::settings::detail::FrameworkAccess::isGiven(gr::settings::detail::settingsOf(*reloaded), "gain_factor")) << "the loaded composite's record holds the parameter";
+        expect(eq(reloaded->get<float>("gain_factor").value_or(0.f), 4.5f));
+        const gr::property_map couplings = reloaded->tagCouplings();
         expect(couplings.contains("gain_factor") && couplings.at("gain_factor") == pmt::Value(std::string("qa:gain"))) << "the parameter's coupling came back";
         expect(fatal(reloaded->graph() != nullptr && !reloaded->graph()->blocks().empty()));
-        expect(eq(reloaded->graph()->blocks().front()->settings().get<float>("gain").value_or(0.f), 4.5f)) << "the load derives the inner gain from the saved parameter";
+        expect(eq(reloaded->graph()->blocks().front()->get<float>("gain").value_or(0.f), 4.5f)) << "the load derives the inner gain from the saved parameter";
     };
 
     "a recipe composite attached without a recipe type saves as a subgraph and loads with its inner graph"_test = [] {
@@ -989,8 +989,8 @@ connections:
         std::vector<gr::recipe::ParameterDeclaration> declarations{{.name = "boost", .type = "float32", .defaultValue = pmt::Value(1.0f), .doc = ""}};
         std::vector<gr::recipe::Binding>              bindings{{.namePath = {"inner-scale"}, .settingKey = "gain", .expression = {}, .substituted = 0UZ, .sequence = {}}};
         expect(fatal(wrapper->attachRecipeBindings({.declarations = std::move(declarations), .bindings = std::move(bindings), .values = {pmt::Value(1.0f)}}, gr::property_map{{"boost", 1.0f}}).has_value()));
-        expect(fatal(wrapper->settings().set(gr::property_map{{"boost", 3.0f}}, gr::settings::noWait).has_value()));
-        expect(fatal(wrapper->settings().setTagCouplings(gr::property_map{{"boost", std::string("qa:boost")}}).has_value()));
+        expect(fatal(wrapper->set(gr::property_map{{"boost", 3.0f}}, gr::settings::noWait).has_value()));
+        expect(fatal(wrapper->setTagCouplings(gr::property_map{{"boost", std::string("qa:boost")}}).has_value()));
         std::ignore = flow.addBlock(wrapper);
 
         const std::string saved = gr::saveGrc(loader, flow);
@@ -999,7 +999,7 @@ connections:
         expect(fatal(eq(loaded->blocks().size(), 1UZ)));
         const std::shared_ptr<BlockModel>& reloaded = loaded->blocks().front();
         expect(fatal(reloaded->graph() != nullptr && eq(reloaded->graph()->blocks().size(), 1UZ))) << "the inner graph came back";
-        expect(eq(reloaded->graph()->blocks().front()->settings().get<float>("gain").value_or(0.f), 3.0f)) << "the inner block keeps the value the parameter derived";
+        expect(eq(reloaded->graph()->blocks().front()->get<float>("gain").value_or(0.f), 3.0f)) << "the inner block keeps the value the parameter derived";
     };
 
     "a graph file that omits a recipe's required parameter names the block and the parameter"_test = [] {
@@ -1041,7 +1041,7 @@ connections:
         expect(eq(std::string(composite->name()), std::string("demod"))) << "the caller's name did not reach the block";
         expect(!composite->metaInformation().contains("gain_factor")) << "a recipe parameter must not be left behind as meta_information";
 
-        const auto gain = composite->graph()->blocks().front()->settings().get<float>("gain");
+        const auto gain = composite->graph()->blocks().front()->get<float>("gain");
         expect(gain.has_value());
         expect(eq(gain.value_or(float{}), 3.5f)) << "the supplied parameter did not reach the interior setting";
     };
@@ -1082,7 +1082,7 @@ connections:
         expect(eq(std::string(composite->name()), std::string("demod"))) << "the caller's name did not reach the block";
         expect(!composite->metaInformation().contains("gain_factor")) << "a recipe parameter must not be left behind as meta_information";
 
-        const auto gain = composite->graph()->blocks().front()->settings().get<float>("gain");
+        const auto gain = composite->graph()->blocks().front()->get<float>("gain");
         expect(gain.has_value());
         expect(eq(gain.value_or(float{}), 3.5f)) << "the supplied parameter did not reach the interior setting";
     };
@@ -1306,7 +1306,7 @@ connections:
       label: from-the-file
 )yaml",
                           gr::BlockSettings{{"scale", {{"gain", 5.0f}}}});
-        const gr::property_map settings = gr::settings::heldValues(loaded->blocks().front()->settings().get());
+        const gr::property_map settings = gr::settings::heldValues(loaded->blocks().front()->get());
         expect(settings.at("gain") == pmt::Value(5.0f));
         expect(settings.at("label") == pmt::Value(std::string("from-the-file")));
     };
@@ -1519,8 +1519,8 @@ connections:
             }
             return record.has_value() ? entries : std::string("refused");
         };
-        expect(eq(recordText(again->settings()), recordText(gr::settings::detail::settingsOf(radio)))) << "the loaded record differs from the saved one";
-        expect(gr::settings::detail::FrameworkAccess::savedValues(again->settings()) == gr::settings::detail::FrameworkAccess::savedValues(gr::settings::detail::settingsOf(radio))) << "the loaded block's given keys differ from the saved block's";
+        expect(eq(recordText(gr::settings::detail::settingsOf(*again)), recordText(gr::settings::detail::settingsOf(radio)))) << "the loaded record differs from the saved one";
+        expect(gr::settings::detail::FrameworkAccess::savedValues(gr::settings::detail::settingsOf(*again)) == gr::settings::detail::FrameworkAccess::savedValues(gr::settings::detail::settingsOf(radio))) << "the loaded block's given keys differ from the saved block's";
     };
 };
 
@@ -1573,7 +1573,7 @@ const boost::ut::suite<"GRC subgraph settings"> grcSubgraphSettingsTests = [] {
         BlockModel& group  = onlyBlock(*loaded);
 
         expect(eq(std::string(group.name()), std::string("group")));
-        expect(gr::settings::heldValues(group.settings().get()).at("disconnect_on_done") == pmt::Value(false)) << "the file's value must replace the default";
+        expect(gr::settings::heldValues(group.get()).at("disconnect_on_done") == pmt::Value(false)) << "the file's value must replace the default";
         expect(group.metaInformation().contains("unread")) << "the entry's meta_information reaches the subgraph";
         expect(fatal(group.graph() != nullptr));
         expect(eq(group.graph()->blocks().size(), 1UZ)) << "the interior loads beside the settings";
@@ -1584,7 +1584,7 @@ const boost::ut::suite<"GRC subgraph settings"> grcSubgraphSettingsTests = [] {
         registerTestScheduler();
         const auto         loaded     = gr::loadGrc(gr::globalPluginLoader(), kManaged);
         BlockModel&        managed    = onlyBlock(*loaded);
-        const property_map parameters = gr::settings::heldValues(managed.settings().get());
+        const property_map parameters = gr::settings::heldValues(managed.get());
 
         expect(eq(std::string(managed.name()), std::string("managed")));
         expect(parameters.at("timeout_ms") == pmt::Value(gr::Size_t{7U})) << "the scheduler's value wins";
@@ -1610,12 +1610,12 @@ const boost::ut::suite<"GRC subgraph settings"> grcSubgraphSettingsTests = [] {
 
         const auto  group = gr::loadGrc(loader, gr::saveGrc(loader, *gr::loadGrc(loader, kGroup)));
         BlockModel& saved = onlyBlock(*group);
-        expect(gr::settings::heldValues(saved.settings().get()).at("disconnect_on_done") == pmt::Value(false)) << "the writer must save the subgraph's settings";
+        expect(gr::settings::heldValues(saved.get()).at("disconnect_on_done") == pmt::Value(false)) << "the writer must save the subgraph's settings";
 
         const auto  managed      = gr::loadGrc(loader, gr::saveGrc(loader, *gr::loadGrc(loader, kManaged)));
         BlockModel& savedManaged = onlyBlock(*managed);
         expect(eq(std::string(savedManaged.name()), std::string("managed")));
-        expect(gr::settings::heldValues(savedManaged.settings().get()).at("timeout_ms") == pmt::Value(gr::Size_t{7U})) << "the writer must save the scheduler's settings";
+        expect(gr::settings::heldValues(savedManaged.get()).at("timeout_ms") == pmt::Value(gr::Size_t{7U})) << "the writer must save the scheduler's settings";
     };
 
     "a caller's settings reach a subgraph by its unique_name or its name"_test = [] {
@@ -1626,14 +1626,14 @@ const boost::ut::suite<"GRC subgraph settings"> grcSubgraphSettingsTests = [] {
         for (const std::string_view key : {"the-group", "group"}) {
             const auto  loaded = gr::loadGrc(loader, kGroup, gr::BlockSettings{{std::string(key), {{"disconnect_on_done", true}}}});
             BlockModel& group  = onlyBlock(*loaded);
-            expect(gr::settings::heldValues(group.settings().get()).at("disconnect_on_done") == pmt::Value(true)) << key;
+            expect(gr::settings::heldValues(group.get()).at("disconnect_on_done") == pmt::Value(true)) << key;
             expect(eq(std::string(group.name()), std::string("group"))) << key;
         }
 
         const auto  loaded  = gr::loadGrc(loader, kManaged, gr::BlockSettings{{"managed", {{"timeout_ms", gr::Size_t{9U}}}}});
         BlockModel& managed = onlyBlock(*loaded);
-        expect(gr::settings::heldValues(managed.settings().get()).at("timeout_ms") == pmt::Value(gr::Size_t{9U})) << "the caller's value wins over the scheduler's";
-        expect(gr::settings::heldValues(managed.settings().get()).at("watchdog_timeout") == pmt::Value(gr::Size_t{300U}));
+        expect(gr::settings::heldValues(managed.get()).at("timeout_ms") == pmt::Value(gr::Size_t{9U})) << "the caller's value wins over the scheduler's";
+        expect(gr::settings::heldValues(managed.get()).at("watchdog_timeout") == pmt::Value(gr::Size_t{300U}));
     };
 
     "a key the subgraph does not declare is refused with the nearest names"_test = [] {
@@ -1805,6 +1805,6 @@ connections:
         for (const std::string_view key : {"layout_hint", "application_note", "paramaters"}) {
             expect(scale.metaInformation().contains(std::string(key))) << std::format("meta_information lost '{}'", key);
         }
-        expect(!gr::settings::heldValues(scale.settings().get()).contains("layout_hint")) << "a key under meta_information is no setting";
+        expect(!gr::settings::heldValues(scale.get()).contains("layout_hint")) << "a key under meta_information is no setting";
     };
 };

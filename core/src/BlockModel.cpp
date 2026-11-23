@@ -23,12 +23,15 @@ namespace {
 /// derived, a tag set or a device reported stays out, since a load would make it given.
 void serializeSettings(const std::shared_ptr<BlockModel>& block, property_map& result) {
     pmt::Value::Map parameters;
-    for (const auto& [key, value] : settings::detail::FrameworkAccess::savedValues(block->settings())) {
+    for (const auto& [key, value] : settings::detail::FrameworkAccess::savedValues(settings::detail::settingsOf(*block))) {
         parameters[key] = value;
     }
-    parameters[convert_string_domain(serialization_fields::BLOCK_NAME)] = std::string(block->name()); // a graph file names every block, given or not
+    // a graph file names every block, given or not; a name the settings hold is saved, also one waiting for the start
+    if (const auto nameKey = convert_string_domain(serialization_fields::BLOCK_NAME); !parameters.contains(nameKey)) {
+        parameters[nameKey] = std::string(block->name());
+    }
     result.emplace(serialization_fields::BLOCK_PARAMETERS, std::move(parameters));
-    if (property_map couplings = block->settings().tagCouplings(); !couplings.empty()) {
+    if (property_map couplings = block->tagCouplings(); !couplings.empty()) {
         result.emplace(serialization_fields::BLOCK_TAG_COUPLINGS, std::move(couplings));
     }
 }
@@ -96,8 +99,7 @@ property_map serializeBlock(PluginLoader& pluginLoader, const std::shared_ptr<Bl
         map.emplace(serialization_fields::BLOCK_ID, "SUBGRAPH"s);
         map[convert_string_domain(serialization_fields::BLOCK_UNIQUE_NAME)] = std::string(block->uniqueName());
 
-        // A subgraph writes its settings as a block does. The name comes from the block, since setName() leaves the
-        // settings unchanged.
+        // A subgraph writes its settings and its name as a block does.
         if (flags & BlockSerializationFlags::Settings) {
             serializeSettings(block, map);
         }
@@ -106,7 +108,7 @@ property_map serializeBlock(PluginLoader& pluginLoader, const std::shared_ptr<Bl
             parameters = property_map{};
         }
         // a subgraph that loads again holds the inner graph as saved, and no recipe parameter
-        for (const std::string& parameter : settings::detail::FrameworkAccess::parameterNames(block->settings())) {
+        for (const std::string& parameter : settings::detail::FrameworkAccess::parameterNames(settings::detail::settingsOf(*block))) {
             parameters.get_if<property_map>()->erase(convert_string_domain(parameter));
             if (const auto couplings = map.find(convert_string_domain(serialization_fields::BLOCK_TAG_COUPLINGS)); couplings != map.end()) {
                 if (property_map* coupled = couplings->second.get_if<property_map>(); coupled != nullptr) {
@@ -114,7 +116,10 @@ property_map serializeBlock(PluginLoader& pluginLoader, const std::shared_ptr<Bl
                 }
             }
         }
-        (*parameters.get_if<property_map>())[convert_string_domain(serialization_fields::BLOCK_NAME)] = std::string(block->name());
+        // a name the settings hold may wait for a nested scheduler's next start, and name() returns the old one until then
+        if (const auto nameKey = convert_string_domain(serialization_fields::BLOCK_NAME); !parameters.get_if<property_map>()->contains(nameKey)) {
+            (*parameters.get_if<property_map>())[nameKey] = std::string(block->name());
+        }
 
         // and it carries meta_information the way every other block does
         if (!block->metaInformation().empty()) {

@@ -61,15 +61,15 @@ BlockModel* modelOf(const std::shared_ptr<void>& handle) noexcept { return stati
 // a refusal that names no key: by a handle itself, or of a run
 [[nodiscard]] settings::Rejected refusal(std::string reason) { return settings::Rejected{settings::Rejection{.key = {}, .reason = std::move(reason)}}; }
 
-// the settings a handle's `set` and `check` reach; the scheduler's are given to `Runtime::create()` alone
-[[nodiscard]] std::expected<SettingsBase*, settings::Rejected> settingsToWrite(const std::shared_ptr<void>& model, bool isScheduler) {
+// the block a handle's `set` and `check` reach; the scheduler's settings are given to `Runtime::create()` alone
+[[nodiscard]] std::expected<BlockModel*, settings::Rejected> blockToWrite(const std::shared_ptr<void>& model, bool isScheduler) {
     if (!model) {
         return std::unexpected(refusal("empty block handle"));
     }
     if (isScheduler) {
         return std::unexpected(refusal("scheduler settings only through Runtime::create()"));
     }
-    return &modelOf(model)->settings();
+    return modelOf(model);
 }
 
 std::shared_ptr<BlockModel> modelPtrOf(const std::shared_ptr<void>& handle) noexcept { return std::static_pointer_cast<BlockModel>(handle); }
@@ -366,7 +366,7 @@ struct Runtime::Impl {
         graph::forEachBlock<block::Category::All>(*schedulerBlock, [&values, &names](const std::shared_ptr<BlockModel>& block) {
             const auto        named = names.find(block.get());
             const std::string name  = named != names.end() ? named->second : std::string(block->uniqueName());
-            for (auto& [key, entry] : settings::detail::FrameworkAccess::runOutcome(block->settings())) {
+            for (auto& [key, entry] : settings::detail::FrameworkAccess::runOutcome(settings::detail::settingsOf(*block))) {
                 values.insert_or_assign(std::format("{}.{}", name, key), std::move(entry));
             }
         });
@@ -383,7 +383,7 @@ std::string BlockHandle::name() const {
     if (!_model) {
         return {};
     }
-    if (const std::expected<std::string, settings::Rejected> named = modelOf(_model)->settings().get<std::string>("name"); named.has_value()) {
+    if (const std::expected<std::string, settings::Rejected> named = modelOf(_model)->get<std::string>("name"); named.has_value()) {
         return *named;
     }
     return std::string(modelOf(_model)->name());
@@ -394,32 +394,32 @@ std::string BlockHandle::uniqueName() const { return _model ? std::string(modelO
 std::string BlockHandle::typeName() const { return _model ? std::string(modelOf(_model)->typeName()) : std::string{}; }
 
 std::expected<settings::Values, settings::Rejected> BlockHandle::set(const property_map& changes, settings::Timeout timeout) {
-    return settingsToWrite(_model, _isScheduler).and_then([&](SettingsBase* settings) { return settings->set(changes, timeout); });
+    return blockToWrite(_model, _isScheduler).and_then([&](BlockModel* block) { return block->set(changes, timeout); });
 }
 
 std::expected<settings::Values, settings::Rejected> BlockHandle::set(std::string_view key, pmt::Value value, settings::Timeout timeout) {
-    return settingsToWrite(_model, _isScheduler).and_then([&](SettingsBase* settings) { return settings->set(key, std::move(value), timeout); });
+    return blockToWrite(_model, _isScheduler).and_then([&](BlockModel* block) { return block->set(key, std::move(value), timeout); });
 }
 
 std::expected<void, settings::Rejected> BlockHandle::check(const property_map& changes) {
-    return settingsToWrite(_model, _isScheduler).and_then([&](SettingsBase* settings) { return settings->check(changes); });
+    return blockToWrite(_model, _isScheduler).and_then([&](BlockModel* block) { return block->check(changes); });
 }
 
 std::expected<settings::Value, settings::Rejected> BlockHandle::get(std::string_view key) const {
     if (!_model) {
         return std::unexpected(refusal("empty block handle"));
     }
-    return modelOf(_model)->settings().get(key);
+    return modelOf(_model)->get(key);
 }
 
 std::expected<settings::Values, settings::Rejected> BlockHandle::get(std::span<const std::string> keys) const {
     if (!_model) {
         return std::unexpected(refusal("empty block handle"));
     }
-    return modelOf(_model)->settings().get(keys);
+    return modelOf(_model)->get(keys);
 }
 
-std::set<std::string> BlockHandle::writableMembers() const { return _model ? modelOf(_model)->settings().writableMembers() : std::set<std::string>{}; }
+std::set<std::string> BlockHandle::writableMembers() const { return _model ? modelOf(_model)->writableMembers() : std::set<std::string>{}; }
 
 property_map BlockHandle::metaInformation() const { return _model ? modelOf(_model)->metaInformation() : property_map{}; }
 
@@ -463,7 +463,7 @@ std::expected<BlockHandle, RuntimeError> RuntimeGraph::emplace(std::string_view 
             }
             return std::unexpected(localError(std::format("unknown block type '{}' -- the loader holds {} block types", type, loader.availableBlocks().size()), where));
         }
-        model->setName(std::string(name)); // before addBlock, for init() to see the final name
+        std::ignore = model->setName(std::string(name)); // before addBlock, for init() to see the final name
         _impl->graph->addBlock(model);
     } catch (const settings::RefusedSettings& refused) { // a constructor or init() refuses a parameter
         return std::unexpected(refusedError(refused.message, refused.rejected, refused.block, where));
@@ -483,8 +483,11 @@ std::expected<BlockHandle, RuntimeError> RuntimeGraph::add(std::shared_ptr<Block
     if (!block) {
         return std::unexpected(localError("block is null", where));
     }
-    if (!name.empty()) {
-        block->setName(std::string(name)); // before addBlock, for init() to see the final name
+    if (!name.empty()) { // before addBlock, for init() to see the final name
+        const std::expected<settings::Values, settings::Rejected> renamed = block->setName(std::string(name));
+        if (const settings::Rejected refused = renamed ? settings::detail::failedKeys(*renamed) : renamed.error(); !refused.empty()) {
+            return std::unexpected(refusedError(std::format("block '{}': name '{}': {}", block->uniqueName(), name, refused.front().reason), refused, block->name(), where));
+        }
     }
     try {
         _impl->graph->addBlock(block);
@@ -633,7 +636,7 @@ std::expected<Runtime, RuntimeError> Runtime::create(RuntimeGraph&& graph, std::
     });
 
     // the scheduler's constructor files a key it does not declare as meta-information and keeps the default
-    const std::set<std::string>& declared = impl->schedulerBlock->settings().writableMembers();
+    const std::set<std::string>& declared = impl->schedulerBlock->writableMembers();
     for (const auto& [key, value] : schedulerParameters) {
         if (const std::string keyName{std::string_view(key)}; !declared.contains(keyName)) {
             return std::unexpected(refusedError(std::format("scheduler type '{}' declares no setting '{}'", type, keyName), settings::Rejected{settings::Rejection{.key = keyName, .reason = "unknown setting"}}, impl->schedulerBlock->name(), where));
@@ -653,7 +656,7 @@ std::expected<Runtime, RuntimeError> Runtime::create(RuntimeGraph&& graph, std::
     // settings change.
     if (!schedulerParameters.empty()) {
         // a stopped scheduler applies its settings at the call
-        const std::expected<settings::Values, settings::Rejected> applied = impl->schedulerBlock->settings().set(schedulerParameters);
+        const std::expected<settings::Values, settings::Rejected> applied = impl->schedulerBlock->set(schedulerParameters);
         if (const settings::Rejected refused = applied ? settings::detail::failedKeys(*applied) : applied.error(); !refused.empty()) {
             return std::unexpected(refusedError(std::format("scheduler type '{}': {}", type, settings::describeRejected(refused)), refused, impl->schedulerBlock->name(), where));
         }
@@ -720,7 +723,7 @@ std::expected<settings::Values, settings::Rejected> Runtime::start() {
         graph::forEachBlock<block::Category::All>(*impl.schedulerBlock, [&refused, &names](const std::shared_ptr<BlockModel>& block) {
             const auto        named = names.find(block.get());
             const std::string name  = named != names.end() ? named->second : std::string(block->uniqueName());
-            for (settings::Rejection entry : FrameworkAccess::runRefusals(block->settings())) {
+            for (settings::Rejection entry : FrameworkAccess::runRefusals(settings::detail::settingsOf(*block))) {
                 entry.key = entry.key.empty() ? name : std::format("{}.{}", name, entry.key);
                 refused.push_back(std::move(entry));
             }

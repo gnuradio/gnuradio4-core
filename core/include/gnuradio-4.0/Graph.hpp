@@ -366,11 +366,11 @@ public:
             if (!target.has_value()) {
                 return std::unexpected(target.error().message);
             }
-            return settings::detail::InnerTarget{.settings = &(*target)->settings(), .blockName = std::string((*target)->name())};
+            return settings::detail::InnerTarget{.settings = &settings::detail::settingsOf(**target), .blockName = std::string((*target)->name())};
         };
         _composite = std::make_unique<settings::detail::CompositeSettings>(std::move(bindings.declarations), std::move(bindings.bindings), std::move(bindings.values), given, std::move(resolve));
-        settings::detail::FrameworkAccess::attachComposite(this->settings(), _composite.get());
-        _composite->attachOwner(this->settings());
+        settings::detail::FrameworkAccess::attachComposite(settings::detail::settingsOf(*this), _composite.get());
+        _composite->attachOwner(settings::detail::settingsOf(*this));
         attachStreamPaths();
         _recipeType = std::string(recipeType);
         return {};
@@ -428,7 +428,7 @@ private:
         std::vector<settings::detail::StreamEntry> entries;
         for (const auto& [uniqueName, _] : _exportedInputPortsForBlock) {
             BlockModel* entry = blockOf(uniqueName);
-            if (entry == nullptr || std::ranges::any_of(entries, [entry](const settings::detail::StreamEntry& known) { return known.entry == &entry->settings(); })) {
+            if (entry == nullptr || std::ranges::any_of(entries, [entry](const settings::detail::StreamEntry& known) { return known.entry == &settings::detail::settingsOf(*entry); })) {
                 continue;
             }
             std::vector<BlockModel*> reached{entry};
@@ -440,15 +440,15 @@ private:
                     }
                 }
             }
-            settings::detail::StreamEntry path{.entry = &entry->settings(), .reached = {}};
+            settings::detail::StreamEntry path{.entry = &settings::detail::settingsOf(*entry), .reached = {}};
             for (BlockModel* block : reached) {
-                path.reached.push_back(&block->settings());
+                path.reached.push_back(&settings::detail::settingsOf(*block));
             }
             entries.push_back(std::move(path));
         }
         std::vector<SettingsBase*> innerBlocks;
         for (const std::shared_ptr<BlockModel>& block : inner->blocks()) {
-            innerBlocks.push_back(&block->settings());
+            innerBlocks.push_back(&settings::detail::settingsOf(*block));
         }
         _composite->setStreamPaths(this->uniqueName(), std::move(entries), innerBlocks);
     }
@@ -999,7 +999,7 @@ public:
         if (edge._domain.kind == "host" && (edge._dataResource == nullptr || edge._tagResource == nullptr)) {
             auto tryResolveFromBlock = [&edge](const BlockModel& block) -> bool {
                 // a stopped block reads the value waiting to apply
-                std::string domainStr = block.settings().get<std::string>("compute_domain").value_or(std::string{});
+                std::string domainStr = block.get<std::string>("compute_domain").value_or(std::string{});
                 if (!domainStr.empty() && domainStr != gr::thread_pool::kDefaultIoPoolId && domainStr != gr::thread_pool::kDefaultCpuPoolId && domainStr != "host") {
                     edge._domainStr = std::move(domainStr);
                     edge._domain    = ComputeDomain::parse(edge._domainStr);

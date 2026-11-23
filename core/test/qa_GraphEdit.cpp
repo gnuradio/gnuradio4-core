@@ -1296,7 +1296,7 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         }();
         expect(fatal(emplaced != nullptr)) << "the emplaced block is not in the graph";
 
-        const std::expected<float, gr::settings::Rejected> gain = emplaced->settings().get<float>("gain");
+        const std::expected<float, gr::settings::Rejected> gain = emplaced->get<float>("gain");
         expect(fatal(gain.has_value())) << "the emplaced block reports no gain setting";
         expect(eq(gain.value_or(0.0f), 4.5f)) << "the emplaced block kept its constructor default instead of the serialized value";
 
@@ -1411,7 +1411,7 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
 
         const std::shared_ptr<gr::BlockModel>& accepted = flow.emplaceBlock(tunableType, {{"gain", 2.0f}});
         expect(eq(flow.blocks().size(), nBlocksBefore + 1UZ)) << "a block with settings it declares must join the graph";
-        const std::expected<float, gr::settings::Rejected> gain = accepted->settings().get<float>("gain");
+        const std::expected<float, gr::settings::Rejected> gain = accepted->get<float>("gain");
         expect(fatal(gain.has_value())) << "the accepted block reports no gain setting";
         expect(eq(gain.value_or(0.0f), 2.0f)) << "the accepted block must apply its settings";
     };

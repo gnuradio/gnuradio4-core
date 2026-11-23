@@ -719,11 +719,10 @@ void collectPorts(gr::BlockModel::DynamicPorts& ports, std::string_view directio
 }
 
 void collectSettings(const gr::BlockModel& block, std::vector<Setting>& into) {
-    const gr::SettingsBase&     settings  = block.settings();
     const gr::property_map&     meta      = block.metaInformation();
-    const gr::property_map      defaults  = gr::settings::heldValues(settings.get()); // before `init()`, each key at its default
-    const std::set<std::string> writable  = settings.writableMembers();
-    const gr::property_map      couplings = settings.tagCouplings();
+    const gr::property_map      defaults  = gr::settings::heldValues(block.get()); // before `init()`, each key at its default
+    const std::set<std::string> writable  = block.writableMembers();
+    const gr::property_map      couplings = block.tagCouplings();
 
     std::set<std::string> names(writable.begin(), writable.end());
     for (const auto& [name, _] : defaults) {
@@ -830,7 +829,7 @@ void collectSettings(const gr::BlockModel& block, std::vector<Setting>& into) {
 
     fact.detailed = true;
     try {
-        gr::settings::detail::FrameworkAccess::describe(instance->settings());
+        gr::settings::detail::FrameworkAccess::describe(gr::settings::detail::settingsOf(*instance));
     } catch (const gr::exception& error) {
         fact.settingsError = error.message;
     } catch (const std::exception& error) {

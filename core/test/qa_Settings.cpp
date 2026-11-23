@@ -1603,12 +1603,6 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
     using namespace boost::ut;
     using namespace qa_refusals;
 
-    "a holder of the block's base reaches its settings object through settings()"_test = [] {
-        LimitedGain               block{property_map{{"name", std::string("base_holder")}}};
-        const Block<LimitedGain>& base = block;
-        expect(std::addressof(base.settings()) == std::addressof(gr::settings::detail::settingsOf(block)));
-    };
-
     "integral limits compare a float before converting it"_test = [] {
         constexpr float lower = 0.f; // the ends of IntegralLimitedRate's rate
         constexpr float upper = 100.f;

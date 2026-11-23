@@ -202,12 +202,12 @@ void Graph::linkSettings(BlockModel& block) {
         return;
     }
     const std::unique_ptr<SettingsLink>& link = _settingsLinks.emplace_back(std::make_unique<SettingsLink>(*this, block));
-    settings::detail::FrameworkAccess::attachGraph(block.settings(), link.get());
+    settings::detail::FrameworkAccess::attachGraph(settings::detail::settingsOf(block), link.get());
 }
 
 void Graph::leaveScheduler(BlockModel& block) {
-    if (settings::detail::SchedulerLink* link = settings::detail::FrameworkAccess::schedulerLink(block.settings()); link != nullptr) {
-        settings::detail::FrameworkAccess::detachScheduler(block.settings(), link);
+    if (settings::detail::SchedulerLink* link = settings::detail::FrameworkAccess::schedulerLink(settings::detail::settingsOf(block)); link != nullptr) {
+        settings::detail::FrameworkAccess::detachScheduler(settings::detail::settingsOf(block), link);
     }
     if (block.blockCategory() == block::Category::TransparentBlockGroup) {
         std::ranges::for_each(block.blocks(), [](const std::shared_ptr<BlockModel>& inner) { leaveScheduler(*inner); });
@@ -224,14 +224,14 @@ void Graph::unlinkSettings(BlockModel& block) {
         if (link->block != &block) {
             return false;
         }
-        settings::detail::FrameworkAccess::detachGraph(link->block->settings(), link.get());
+        settings::detail::FrameworkAccess::detachGraph(settings::detail::settingsOf(*link->block), link.get());
         return true;
     });
 }
 
 void Graph::unlinkAllSettings() {
     for (const std::unique_ptr<SettingsLink>& link : _settingsLinks) {
-        settings::detail::FrameworkAccess::detachGraph(link->block->settings(), link.get());
+        settings::detail::FrameworkAccess::detachGraph(settings::detail::settingsOf(*link->block), link.get());
         leaveScheduler(*link->block);
     }
     _settingsLinks.clear();
