@@ -49,6 +49,16 @@ namespace {
                 add(*element.expression);
             }
         }
+    } else if (!binding.mapEntries.empty()) {
+        for (const recipe::MapEntry& entry : binding.mapEntries) {
+            if (entry.substituted) {
+                if (std::ranges::find(read, *entry.substituted) == read.end()) {
+                    read.push_back(*entry.substituted);
+                }
+            } else if (entry.expression) {
+                add(*entry.expression);
+            }
+        }
     } else {
         add(binding.expression);
     }

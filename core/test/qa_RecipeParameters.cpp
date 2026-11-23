@@ -223,7 +223,7 @@ const boost::ut::suite<"RecipeParameters"> recipeParameterTests = [] {
 
         const std::vector<gr::pmt::Value> values{gr::pmt::Value(std::pmr::string("gardner")), gr::pmt::Value(std::vector<std::int32_t>{-2, 0, 3}), gr::pmt::Value(48000.0)};
 
-        const gr::recipe::Binding substituted{.namePath = {"inner"}, .settingKey = "detector", .expression = {}, .substituted = 0UZ, .sequence = {}};
+        const gr::recipe::Binding substituted{.namePath = {"inner"}, .settingKey = "detector", .expression = {}, .substituted = 0UZ, .sequence = {}, .map = {}, .mapEntries = {}};
         const auto                bound = gr::recipe::bindingValue(substituted, std::span<const gr::pmt::Value>(values));
         expect(bound.has_value());
         const auto* text = bound->get_if<std::pmr::string>();
@@ -232,13 +232,13 @@ const boost::ut::suite<"RecipeParameters"> recipeParameterTests = [] {
             expect(eq(std::string_view(*text), std::string_view("gardner")));
         }
 
-        const gr::recipe::Binding vectorBound{.namePath = {"inner"}, .settingKey = "carriers", .expression = {}, .substituted = 1UZ, .sequence = {}};
+        const gr::recipe::Binding vectorBound{.namePath = {"inner"}, .settingKey = "carriers", .expression = {}, .substituted = 1UZ, .sequence = {}, .map = {}, .mapEntries = {}};
         const auto                carriers = gr::recipe::bindingValue(vectorBound, std::span<const gr::pmt::Value>(values));
         expect(carriers.has_value());
         expect(carriers->get_if<gr::Tensor<std::int32_t>>() != nullptr) << "the sequence arrives whole";
 
         // an index past the values is a refusal rather than a read off the end
-        const gr::recipe::Binding outOfRange{.namePath = {"inner"}, .settingKey = "x", .expression = {}, .substituted = 9UZ, .sequence = {}};
+        const gr::recipe::Binding outOfRange{.namePath = {"inner"}, .settingKey = "x", .expression = {}, .substituted = 9UZ, .sequence = {}, .map = {}, .mapEntries = {}};
         expect(!gr::recipe::bindingValue(outOfRange, std::span<const gr::pmt::Value>(values)).has_value());
     };
 
@@ -275,7 +275,7 @@ const boost::ut::suite<"RecipeParameters"> recipeParameterTests = [] {
         }
 
         const std::vector<gr::pmt::Value> values{gr::pmt::Value(false), gr::pmt::Value(48000.0)};
-        const gr::recipe::Binding         toggle{.namePath = {"inner"}, .settingKey = "enabled", .expression = {}, .substituted = 0UZ, .sequence = {}};
+        const gr::recipe::Binding         toggle{.namePath = {"inner"}, .settingKey = "enabled", .expression = {}, .substituted = 0UZ, .sequence = {}, .map = {}, .mapEntries = {}};
         const auto                        bound = gr::recipe::bindingValue(toggle, std::span<const gr::pmt::Value>(values));
         expect(bound.has_value());
         const auto* flag = bound->get_if<bool>();
@@ -483,8 +483,9 @@ struct RecipeScale : gr::Block<RecipeScale> {
         gr::Annotated<float>              rate  = 0.0f;
         gr::Annotated<std::string>        label = "";
         gr::Annotated<std::vector<float>> taps{};
+        gr::Annotated<gr::property_map>   options{};
 
-        GR_MAKE_REFLECTABLE(Settings, gain, rate, label, taps);
+        GR_MAKE_REFLECTABLE(Settings, gain, rate, label, taps, options);
     } settings;
 
     GR_MAKE_REFLECTABLE(RecipeScale, in, out, settings);
@@ -717,6 +718,34 @@ blocks:
               - "=peak"
               - "=peak / 2"
               - !!float32 0.25
+      exported_ports:
+        - [inner, INPUT, in, in]
+        - [inner, OUTPUT, out, out]
+)yaml";
+
+constexpr std::string_view kDerivedOptionsRecipe = R"yaml(
+blocks:
+  - id: SUBGRAPH
+    parameters:
+      name: optioned
+    exported_parameters:
+      - name: peak
+        type: float32
+      - name: detector
+        type: string
+        default: gardner
+    graph:
+      blocks:
+        - id: "qa::RecipeScale"
+          parameters:
+            name: inner
+            options:
+              level: "=peak * 2"
+              fixed: !!int32 3
+              nested:
+                detector: "=detector"
+                half: "=peak / 2"
+                note: "\\=verbatim"
       exported_ports:
         - [inner, INPUT, in, in]
         - [inner, OUTPUT, out, out]
@@ -1129,6 +1158,76 @@ blocks:
                 expect(eq((*stagedTaps)[2], 0.25f));
             }
         }
+    };
+
+    "a map setting's entries derive from expressions at every depth and re-derive live"_test = [] {
+        const auto number = [](const gr::property_map& map, std::string_view key) {
+            const auto it = map.find(std::pmr::string(key));
+            if (it == map.end()) {
+                return -1.0;
+            }
+            if (const auto* single = it->second.get_if<float>(); single != nullptr) {
+                return static_cast<double>(*single);
+            }
+            return it->second.value_or(-1.0);
+        };
+        const auto nestedOf = [](const gr::property_map& map) {
+            const auto  it     = map.find(std::pmr::string("nested"));
+            const auto* nested = it == map.end() ? nullptr : it->second.get_if<gr::property_map>();
+            return nested == nullptr ? gr::property_map{} : *nested;
+        };
+        const auto textAt = [](const gr::property_map& map, std::string_view key) {
+            const auto it = map.find(std::pmr::string(key));
+            return it == map.end() ? std::string{} : std::string(it->second.value_or(std::string_view{}));
+        };
+        const auto fixedOf = [](const gr::property_map& map) {
+            const auto it = map.find(std::pmr::string("fixed"));
+            return it == map.end() ? std::int32_t{0} : it->second.value_or(std::int32_t{0});
+        };
+        registerRecipeTestBlock();
+        auto             loader = recipeTestLoader();
+        gr::property_map parameters;
+        parameters["peak"]   = 0.5f;
+        const auto composite = gr::detail::instantiateBlockFromYamlDefinition(loader, definitionFrom(kDerivedOptionsRecipe), parameters);
+        expect(fatal(composite.has_value())) << (composite.has_value() ? "" : composite.error().message);
+        const auto inner = interiorBlock(*composite);
+        expect(fatal(inner != nullptr));
+
+        const gr::property_map options = inner->get<gr::property_map>("options").value_or(gr::property_map{});
+        expect(eq(number(options, "level"), 1.0)) << "an entry of the map derives";
+        expect(eq(fixedOf(options), 3)) << "a literal entry is carried unchanged";
+        const gr::property_map nested = nestedOf(options);
+        expect(eq(number(nested, "half"), 0.25)) << "an entry of a map inside the map derives";
+        expect(eq(textAt(nested, "detector"), std::string("gardner"))) << "a string parameter is substituted inside the map";
+        expect(eq(textAt(nested, "note"), std::string("=verbatim"))) << "the escape yields a literal '=' inside the map";
+
+        gr::property_map change;
+        change["peak"]     = 0.8f;
+        const auto applied = setParameters(*composite, change);
+        expect(fatal(applied.has_value())) << (applied.has_value() ? "" : applied.error());
+        const auto staged    = gr::settings::heldValues(inner->get());
+        const auto optionsIt = staged.find("options");
+        expect(fatal(optionsIt != staged.end())) << "the whole map is staged, because a setting is staged whole";
+        const auto* stagedOptions = optionsIt->second.get_if<gr::property_map>();
+        expect(fatal(stagedOptions != nullptr));
+        expect(approx(number(*stagedOptions, "level"), 1.6, 1e-6)) << "the entry re-derives against the changed parameter";
+        expect(approx(number(nestedOf(*stagedOptions), "half"), 0.4, 1e-6)) << "the inner entry re-derives against the changed parameter";
+        expect(eq(textAt(nestedOf(*stagedOptions), "detector"), std::string("gardner")));
+        expect(eq(fixedOf(*stagedOptions), 3));
+    };
+
+    "an expression in a sequence inside a map setting is refused by name"_test = [] {
+        registerRecipeTestBlock();
+        auto        loader = recipeTestLoader();
+        std::string text(kDerivedOptionsRecipe);
+        const auto  at = text.find("fixed: !!int32 3");
+        expect(fatal(at != std::string::npos));
+        text.replace(at, std::string_view("fixed: !!int32 3").size(), "fixed: [\"=peak\"]");
+        gr::property_map parameters;
+        parameters["peak"] = 0.5f;
+        const auto refused = gr::detail::instantiateBlockFromYamlDefinition(loader, definitionFrom(text), parameters);
+        expect(fatal(!refused.has_value())) << "an expression in a sequence inside a map was taken";
+        expect(refused.error().message.contains("=peak") && refused.error().message.contains("fixed")) << refused.error().message;
     };
 
     "a clamped edge holds its bounds at every rate, and the derived setting re-evaluates live"_test = [] {
@@ -1603,7 +1702,7 @@ const boost::ut::suite<"a call on a recipe composite"> compositeCallTests = [] {
         expect(fatal(outer->exportPort(true, head.unique_name, gr::PortDirection::INPUT, "in", "in").has_value()));
         expect(fatal(outer->exportPort(true, tail.unique_name, gr::PortDirection::OUTPUT, "out", "out").has_value()));
         std::vector<ParameterDeclaration> declarations{{.name = "boost", .type = "float32", .defaultValue = gr::pmt::Value(1.0f), .doc = ""}};
-        std::vector<gr::recipe::Binding>  bindings{{.namePath = {"tail"}, .settingKey = "gain", .expression = {}, .substituted = 0UZ, .sequence = {}}};
+        std::vector<gr::recipe::Binding>  bindings{{.namePath = {"tail"}, .settingKey = "gain", .expression = {}, .substituted = 0UZ, .sequence = {}, .map = {}, .mapEntries = {}}};
         expect(fatal(outer->attachRecipeBindings({.declarations = std::move(declarations), .bindings = std::move(bindings), .values = {gr::pmt::Value(1.0f)}}).has_value()));
         expect(fatal(outer->setTagCouplings(property_map{{"boost", std::string("qa:boost")}}).has_value()));
 

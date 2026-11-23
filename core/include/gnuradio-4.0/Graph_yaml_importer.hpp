@@ -711,6 +711,32 @@ namespace detail {
     return {};
 }
 
+/// How one "=reference" derives: `=name` naming a string, boolean or vector parameter hands that value through
+/// unchanged, since those types carry no arithmetic and have no grammar over them. Every other reference is an
+/// expression on the numeric path.
+struct DerivedText {
+    pmt::Value                        value;
+    std::optional<recipe::Expression> expression;
+    std::optional<std::size_t>        substituted;
+};
+
+[[nodiscard]] inline std::expected<DerivedText, gr::Error> deriveText(std::string_view reference, std::span<const recipe::ParameterDeclaration> declarations, std::span<const pmt::Value> values) {
+    for (std::size_t declared = 0UZ; declared < declarations.size(); ++declared) {
+        if (std::string_view(declarations[declared].name) == reference && recipe::detail::substitutedTypeWord(declarations[declared].type)) {
+            return DerivedText{.value = values[declared], .expression = std::nullopt, .substituted = declared};
+        }
+    }
+    auto expression = recipe::parseExpression(reference, declarations);
+    if (!expression.has_value()) {
+        return std::unexpected(expression.error());
+    }
+    auto result = recipe::evaluate(*expression, values);
+    if (!result.has_value()) {
+        return std::unexpected(result.error());
+    }
+    return DerivedText{.value = std::move(*result), .expression = std::move(*expression), .substituted = std::nullopt};
+}
+
 /// the first string spelled "=expr" anywhere in `value`, a map or list walked whole
 [[nodiscard]] inline std::optional<std::string> firstRecipeExpressionIn(const pmt::Value& value) {
     if (const auto* text = value.get_if<std::pmr::string>(); text != nullptr) {
@@ -733,10 +759,41 @@ namespace detail {
     return std::nullopt;
 }
 
+/// derives each "=reference" text of a map-valued parameter and of the maps it holds, at any depth, and unescapes each
+/// "\=text". Each derived entry is recorded in `derived` by its keys below `path`. A sequence inside the map is read as
+/// written, so an expression in one is refused.
+[[nodiscard]] inline std::expected<void, gr::Error> evaluateMapEntries(property_map& map, std::vector<std::string>& path, std::span<const recipe::ParameterDeclaration> declarations, std::span<const pmt::Value> values, std::vector<recipe::MapEntry>& derived) {
+    for (auto& [key, item] : map) {
+        path.emplace_back(key);
+        if (auto* inner = item.get_if<property_map>(); inner != nullptr) {
+            if (auto walked = evaluateMapEntries(*inner, path, declarations, values, derived); !walked.has_value()) {
+                return walked;
+            }
+        } else if (const auto* text = item.get_if<std::pmr::string>(); text != nullptr) {
+            const std::string_view textView(*text);
+            const auto             sentinel = recipe::detail::sentinelOf(textView);
+            if (sentinel == recipe::detail::SentinelKind::escapedLiteral) {
+                item = std::pmr::string(textView.substr(1));
+            } else if (sentinel == recipe::detail::SentinelKind::expression) {
+                auto entry = deriveText(textView.substr(1), declarations, values);
+                if (!entry.has_value()) {
+                    return std::unexpected(entry.error());
+                }
+                derived.push_back({.path = path, .expression = entry->expression, .substituted = entry->substituted});
+                item = std::move(entry->value);
+            }
+        } else if (auto found = firstRecipeExpressionIn(item); found.has_value()) {
+            return std::unexpected(gr::Error(std::format("recipe_expression_parse: '{}' in a sequence of map entry '{}': not evaluated", recipe::detail::printableEcho(*found), recipe::detail::printableEcho(key))));
+        }
+        path.pop_back();
+    }
+    return {};
+}
+
 /// walks block entries at any nesting depth: a parameters value spelled "=expr" is evaluated
 /// against the recipe's declarations and replaced with the result; "\=text" unescapes to the
-/// literal "=text". A sequence-valued parameter derives element by element and a connection's
-/// buffer size derives the same way. Below the composite's own level each evaluated expression
+/// literal "=text". A sequence-valued parameter derives element by element, a map-valued one entry
+/// by entry at any depth, and a connection's buffer size derives the same way. Below the composite's own level each evaluated expression
 /// is also collected as a live binding, addressed by the block-name path from the interior
 /// downward, so a later parameter change can re-evaluate and re-stage it.
 // GCC's -Wnull-dereference reports the inlined std::string copies through push_back here
@@ -779,7 +836,23 @@ inline std::expected<void, gr::Error> evaluateRecipeExpressions(Tensor<pmt::Valu
                             }
                             std::vector<std::string> path = namePath;
                             path.push_back(blockName);
-                            outBindings.push_back({.namePath = std::move(path), .settingKey = std::string(key), .expression = {}, .substituted = std::nullopt, .sequence = std::move(*program)});
+                            outBindings.push_back({.namePath = std::move(path), .settingKey = std::string(key), .expression = {}, .substituted = std::nullopt, .sequence = std::move(*program), .map = {}, .mapEntries = {}});
+                        }
+                        continue;
+                    }
+                    if (auto* map = value.get_if<property_map>(); map != nullptr) {
+                        std::vector<std::string>      entryPath;
+                        std::vector<recipe::MapEntry> entries;
+                        if (auto walked = evaluateMapEntries(*map, entryPath, declarations, values, entries); !walked.has_value()) {
+                            return walked;
+                        }
+                        if (!entries.empty() && insideComposite) {
+                            if (blockName.empty()) {
+                                return std::unexpected(gr::Error(std::format("recipe_expression_parse: the block holding a derived '{}' map needs a name so the entries can re-evaluate live", recipe::detail::printableEcho(key))));
+                            }
+                            std::vector<std::string> path = namePath;
+                            path.push_back(blockName);
+                            outBindings.push_back({.namePath = std::move(path), .settingKey = std::string(key), .expression = {}, .substituted = std::nullopt, .sequence = {}, .map = *map, .mapEntries = std::move(entries)});
                         }
                         continue;
                     }
@@ -796,47 +869,20 @@ inline std::expected<void, gr::Error> evaluateRecipeExpressions(Tensor<pmt::Valu
                     if (sentinel != recipe::detail::SentinelKind::expression) {
                         continue;
                     }
-                    // `=name` naming a string, boolean or vector parameter hands that value through unchanged. Those
-                    // types carry no arithmetic and have no grammar over them: a recipe substitutes such a value
-                    // and does nothing else with it. Every other expression takes the numeric path.
-                    const std::string_view     reference = textView.substr(1);
-                    std::optional<std::size_t> substituted;
-                    for (std::size_t declared = 0UZ; declared < declarations.size(); ++declared) {
-                        if (std::string_view(declarations[declared].name) == reference && recipe::detail::substitutedTypeWord(declarations[declared].type)) {
-                            substituted = declared;
-                            break;
-                        }
-                    }
-                    if (substituted.has_value()) {
-                        if (insideComposite) {
-                            if (blockName.empty()) {
-                                return std::unexpected(gr::Error(std::format("recipe_expression_parse: the block holding '={}' needs a name so the parameter can re-substitute live", recipe::detail::printableEcho(reference))));
-                            }
-                            std::vector<std::string> path = namePath;
-                            path.push_back(blockName);
-                            outBindings.push_back({.namePath = std::move(path), .settingKey = std::string(key), .expression = {}, .substituted = substituted, .sequence = {}});
-                        }
-                        value = values[*substituted];
-                        continue;
-                    }
-
-                    auto expression = recipe::parseExpression(reference, declarations);
-                    if (!expression.has_value()) {
-                        return std::unexpected(expression.error());
-                    }
-                    auto result = recipe::evaluate(*expression, values);
-                    if (!result.has_value()) {
-                        return std::unexpected(result.error());
+                    auto derived = deriveText(textView.substr(1), declarations, values);
+                    if (!derived.has_value()) {
+                        return std::unexpected(derived.error());
                     }
                     if (insideComposite) {
                         if (blockName.empty()) {
-                            return std::unexpected(gr::Error(std::format("recipe_expression_parse: the block holding '={}' needs a name so the expression can re-evaluate live", recipe::detail::printableEcho(expression->source))));
+                            const bool substituted = derived->substituted.has_value();
+                            return std::unexpected(gr::Error(std::format("recipe_expression_parse: the block holding '={}' needs a name so the {} can re-{} live", recipe::detail::printableEcho(substituted ? textView.substr(1) : std::string_view(derived->expression->source)), substituted ? "parameter" : "expression", substituted ? "substitute" : "evaluate")));
                         }
                         std::vector<std::string> path = namePath;
                         path.push_back(blockName);
-                        outBindings.push_back({.namePath = std::move(path), .settingKey = std::string(key), .expression = *expression, .substituted = std::nullopt, .sequence = {}});
+                        outBindings.push_back({.namePath = std::move(path), .settingKey = std::string(key), .expression = derived->expression.value_or(recipe::Expression{}), .substituted = derived->substituted, .sequence = {}, .map = {}, .mapEntries = {}});
                     }
-                    value = std::move(*result);
+                    value = std::move(derived->value);
                 }
             }
         }

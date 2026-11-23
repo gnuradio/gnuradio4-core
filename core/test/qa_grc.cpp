@@ -987,7 +987,7 @@ connections:
         auto&     interior = *wrapper->graph();
         std::ignore        = interior.emplaceBlock<Scale>({{"name", std::string("inner-scale")}, {"gain", 1.0f}});
         std::vector<gr::recipe::ParameterDeclaration> declarations{{.name = "boost", .type = "float32", .defaultValue = pmt::Value(1.0f), .doc = ""}};
-        std::vector<gr::recipe::Binding>              bindings{{.namePath = {"inner-scale"}, .settingKey = "gain", .expression = {}, .substituted = 0UZ, .sequence = {}}};
+        std::vector<gr::recipe::Binding>              bindings{{.namePath = {"inner-scale"}, .settingKey = "gain", .expression = {}, .substituted = 0UZ, .sequence = {}, .map = {}, .mapEntries = {}}};
         expect(fatal(wrapper->attachRecipeBindings({.declarations = std::move(declarations), .bindings = std::move(bindings), .values = {pmt::Value(1.0f)}}, gr::property_map{{"boost", 1.0f}}).has_value()));
         expect(fatal(wrapper->set(gr::property_map{{"boost", 3.0f}}, gr::settings::noWait).has_value()));
         expect(fatal(wrapper->setTagCouplings(gr::property_map{{"boost", std::string("qa:boost")}}).has_value()));
