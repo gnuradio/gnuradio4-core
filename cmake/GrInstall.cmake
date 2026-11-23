@@ -9,7 +9,8 @@
 # * Homebrew, where a macOS build gets its LLVM runtime. Copying those dylibs would not rewrite any install name, so the
 #   binaries would still load the originals. A macOS package currently expects Homebrew LLVM.
 # * GR 4's own libraries. Every GR 4 package installs into one shared root, so a downstream package that bundled
-#   gnuradio-*.dll or a block library would claim files another installer owns.
+#   gnuradio-*.dll or a block library would claim files another installer owns. On macOS they are named through
+#   @rpath/, which the patterns allow for: unexcluded, such a name either fails to resolve or copies GR 4 a second time.
 function(_gr_runtime_dependency_excludes OUT_VAR)
   set(${OUT_VAR}
       PRE_EXCLUDE_REGEXES
@@ -26,8 +27,8 @@ function(_gr_runtime_dependency_excludes OUT_VAR)
       "[Uu][Cc][Rr][Tt][Bb][Aa][Ss][Ee][Dd]\\.[Dd][Ll][Ll]"
       "[Vv][Cc][Rr][Uu][Nn][Tt][Ii][Mm][Ee].*[Dd]\\.[Dd][Ll][Ll]"
       "[Mm][Ss][Vv][Cc][Pp][0-9]+[Dd](_[A-Za-z0-9_]+)?\\.[Dd][Ll][Ll]"
-      "^(lib)?gnuradio-"
-      "^(lib)?Gr[A-Za-z0-9]*Blocks"
+      "^(@rpath/)?(lib)?gnuradio-"
+      "^(@rpath/)?(lib)?Gr[A-Za-z0-9]*Blocks"
       POST_EXCLUDE_REGEXES
       ".*[Ss][Yy][Ss][Tt][Ee][Mm]32.*"
       ".*[Ww][Ii][Nn][Ss][Xx][Ss].*"
