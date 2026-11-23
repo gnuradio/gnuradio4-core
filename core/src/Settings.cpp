@@ -645,35 +645,6 @@ void SettingsBase::storeInForceAsDefaults() {
     storeDefaultsFrom(_inForce);
 }
 
-property_map SettingsBase::setStaged(const property_map& changes) {
-    if (set(changes, settings::noWait)) {
-        return {};
-    }
-    return changes;
-}
-
-std::optional<property_map> SettingsBase::getStored(std::span<const std::string> keys) const {
-    const BlockLock lock(*this);
-    property_map    stored;
-    for (const auto& [key, value] : _storedDefaults) {
-        if (keys.empty() || std::ranges::find(keys, key) != keys.end()) {
-            stored.insert_or_assign(std::pmr::string(key), value);
-        }
-    }
-    if (!keys.empty() && stored.size() != keys.size()) {
-        return std::nullopt;
-    }
-    return stored;
-}
-
-std::optional<pmt::Value> SettingsBase::getStored(const std::string& key) const {
-    const BlockLock lock(*this);
-    if (const auto it = _storedDefaults.find(key); it != _storedDefaults.end()) {
-        return it->second;
-    }
-    return std::nullopt;
-}
-
 property_map SettingsBase::pendingValues() const {
     const BlockLock lock(*this);
     property_map    pending;

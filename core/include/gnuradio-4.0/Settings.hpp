@@ -431,15 +431,6 @@ public:
     [[nodiscard]] std::expected<void, Rejected> setTagCouplings(const property_map& couplings);
     [[nodiscard]] property_map                  tagCouplings() const;
 
-    // stages `changes` as a `set` that does not wait; a refusal refuses every key, and the keys refused are returned
-    [[nodiscard]] property_map setStaged(const property_map& changes);
-    [[nodiscard]] property_map stagedParameters() const { return pendingValues(); } // each change waiting to apply
-    [[nodiscard]] property_map activeParameters() const { return settings::heldValues(get()); }
-    // the values a reset returns to, of `keys` or of every key; none for a key that has none
-    [[nodiscard]] std::optional<property_map> getStored(std::span<const std::string> keys = {}) const;
-    [[nodiscard]] std::optional<pmt::Value>   getStored(const std::string& key) const;
-    void                                      storeDefaults() { storeInForceAsDefaults(); }
-
 protected:
     // the block author's calls, which `gr::Block` offers its block
     // the value the block now holds for `key`, from any of its threads: the key keeps it beside the value last set, with
