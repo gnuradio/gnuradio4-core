@@ -254,5 +254,8 @@ function(gr_install_artifact)
             ${FORWARDED_ARGS}
     RUNTIME DESTINATION ${BIN_DEST} COMPONENT ${GR_INSTALL_COMPONENT}
     LIBRARY DESTINATION ${LIB_DEST} COMPONENT ${GR_INSTALL_COMPONENT}
+    # Apple requires a FRAMEWORK destination whenever RUNTIME_DEPENDENCIES is given, because a resolved dependency may
+    # itself be a framework. No GR target is a framework, so this never creates an install rule of its own.
+    FRAMEWORK DESTINATION ${LIB_DEST} COMPONENT ${GR_INSTALL_COMPONENT}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT ${GR_INSTALL_ARCHIVE_COMPONENT})
 endfunction()
