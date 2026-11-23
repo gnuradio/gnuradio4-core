@@ -125,26 +125,6 @@ const boost::ut::suite<"block message plumbing"> blockMessageTests = [] {
         expect(qa_block_messages::takeMessages(fromBlock).empty()) << "an unsubscribed client is told the time";
     };
 
-    "the Settings, StagedSettings, TagCouplings, MetaInformation and UiConstraints endpoints answer a Get"_test = [] {
-        qa_block_messages::InheritedHandler block;
-        MsgPortOut                          toBlock;
-        MsgPortIn                           fromBlock;
-        qa_block_messages::connect(block, toBlock, fromBlock);
-        sendMessage<message::Command::Set>(toBlock, "", block::property::kUiConstraints, property_map{{"x", 1.0f}});
-        block.processScheduledMessages();
-        expect(qa_block_messages::takeMessages(fromBlock).empty()) << "the UiConstraints Set got a reply";
-
-        for (const char* endpoint : {block::property::kSetting, block::property::kStagedSetting, block::property::kTagCouplings, block::property::kMetaInformation, block::property::kUiConstraints}) {
-            sendMessage<message::Command::Get>(toBlock, "", endpoint, property_map{});
-        }
-        block.processScheduledMessages();
-        const std::vector<Message> replies = qa_block_messages::takeMessages(fromBlock);
-        expect(fatal(eq(replies.size(), 5UZ))) << "each Get is answered once";
-        expect(std::ranges::all_of(replies, [](const Message& reply) { return reply.data.has_value(); })) << "a Get is answered with an error";
-        expect(replies[0].data->contains("ui_constraints")) << "the settings leave out ui_constraints";
-        expect(replies[4].data->contains("x")) << "the UiConstraints Get does not return the value set";
-    };
-
     "a block that defines its own processMessages() hides the inherited one"_test = [] {
         qa_block_messages::OwnHandler block;
         MsgPortOut                    toBlock;

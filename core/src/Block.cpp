@@ -23,12 +23,6 @@ void BlockBase::initStandardPropertyCallbacks() noexcept {
         {block::property::kEcho, &BlockBase::propertyCallbackEcho},
         {block::property::kLifeCycleState, &BlockBase::propertyCallbackLifecycleState},
         {block::property::kSetting, &BlockBase::propertyCallbackSettings},
-        {block::property::kStagedSetting, &BlockBase::propertyCallbackStagedSettings},
-        {block::property::kStoreDefaults, &BlockBase::propertyCallbackStoreDefaults},
-        {block::property::kResetDefaults, &BlockBase::propertyCallbackResetDefaults},
-        {block::property::kTagCouplings, &BlockBase::propertyCallbackTagCouplings},
-        {block::property::kMetaInformation, &BlockBase::propertyCallbackMetaInformation},
-        {block::property::kUiConstraints, &BlockBase::propertyCallbackUiConstraints},
     };
 }
 
@@ -213,127 +207,9 @@ std::optional<Message> BlockBase::propertyCallbackSettings(std::string_view prop
         }
         return std::nullopt;
     }
-    if (message.cmd == Get) {
-        message.data = settings::heldValues(cbSettings().get());
-        return message;
-    }
     if (message.cmd == Subscribe || message.cmd == Unsubscribe) {
         subscribe(propertySubscriptions, propertyName, message);
         return std::nullopt;
-    }
-
-    throw gr::exception(std::format("block {} property {} does not implement command {}, msg: {}", cbUniqueName(), propertyName, message.cmd, message));
-}
-
-std::optional<Message> BlockBase::propertyCallbackStagedSettings(std::string_view propertyName, Message message) {
-    using enum gr::message::Command;
-    using settings::detail::FrameworkAccess;
-    assert(propertyName == block::property::kStagedSetting);
-
-    if (message.cmd == Set) {
-        if (!message.data.has_value()) {
-            throw gr::exception(std::format("block {} (aka. {}) cannot set {} w/o data msg: {}", cbUniqueName(), cbName(), propertyName, message));
-        }
-        if (const std::expected<settings::Values, settings::Rejected> staged = cbSettings().set(*message.data, settings::noWait); !staged) {
-            throw gr::exception(std::format("block {} refused {}: {}", cbUniqueName(), propertyName, settings::describeRejected(staged.error())));
-        }
-        if (message.clientRequestID.empty()) {
-            return std::nullopt;
-        }
-        message.data = FrameworkAccess::pendingValues(cbSettings());
-        return message;
-    }
-    if (message.cmd == Get) {
-        message.data = FrameworkAccess::pendingValues(cbSettings());
-        return message;
-    }
-
-    throw gr::exception(std::format("block {} property {} does not implement command {}, msg: {}", cbUniqueName(), propertyName, message.cmd, message));
-}
-
-std::optional<Message> BlockBase::propertyCallbackStoreDefaults(std::string_view propertyName, Message message) {
-    using enum gr::message::Command;
-    assert(propertyName == block::property::kStoreDefaults);
-
-    if (message.cmd == Set) {
-        settings::detail::FrameworkAccess::storeDefaults(cbSettings());
-        return std::nullopt;
-    }
-
-    throw gr::exception(std::format("block {} property {} does not implement command {}, msg: {}", cbUniqueName(), propertyName, message.cmd, message));
-}
-
-std::optional<Message> BlockBase::propertyCallbackResetDefaults(std::string_view propertyName, Message message) {
-    using enum gr::message::Command;
-    assert(propertyName == block::property::kResetDefaults);
-
-    if (message.cmd == Set) {
-        if (const std::expected<settings::Values, settings::Rejected> reset = cbSettings().resetDefaults(settings::noWait); !reset) {
-            settings::detail::FrameworkAccess::notifyRefused(cbSettings(), reset.error());
-        }
-        return std::nullopt;
-    }
-
-    throw gr::exception(std::format("block {} property {} does not implement command {}, msg: {}", cbUniqueName(), propertyName, message.cmd, message));
-}
-
-std::optional<Message> BlockBase::propertyCallbackTagCouplings(std::string_view propertyName, Message message) {
-    using enum gr::message::Command;
-    assert(propertyName == block::property::kTagCouplings);
-
-    if (message.cmd == Set) {
-        if (!message.data.has_value()) {
-            throw gr::exception(std::format("block {} (aka. {}) cannot set {} w/o data msg: {}", cbUniqueName(), cbName(), propertyName, message));
-        }
-        if (const std::expected<void, settings::Rejected> coupled = cbSettings().setTagCouplings(*message.data); !coupled) {
-            throw gr::exception(std::format("block {} refused {}: {}", cbUniqueName(), propertyName, settings::describeRejected(coupled.error())));
-        }
-        if (message.clientRequestID.empty()) {
-            return std::nullopt;
-        }
-        message.data = cbSettings().tagCouplings();
-        return message;
-    }
-    if (message.cmd == Get) {
-        message.data = cbSettings().tagCouplings();
-        return message;
-    }
-
-    throw gr::exception(std::format("block {} property {} does not implement command {}, msg: {}", cbUniqueName(), propertyName, message.cmd, message));
-}
-
-std::optional<Message> BlockBase::propertyCallbackMetaInformation(std::string_view propertyName, Message message) {
-    using enum gr::message::Command;
-    assert(propertyName == block::property::kMetaInformation);
-
-    if (message.cmd == Get) {
-        message.data = cbMetaInformation();
-        return message;
-    }
-
-    throw gr::exception(std::format("block {} property {} does not implement command {}, msg: {}", cbUniqueName(), propertyName, message.cmd, message));
-}
-
-std::optional<Message> BlockBase::propertyCallbackUiConstraints(std::string_view propertyName, Message message) {
-    using enum gr::message::Command;
-    assert(propertyName == block::property::kUiConstraints);
-
-    if (message.cmd == Set) {
-        if (!message.data.has_value()) {
-            throw gr::exception(std::format("block {} (aka. {}) cannot set {} w/o data msg: {}", cbUniqueName(), cbName(), propertyName, message));
-        }
-        if (const std::expected<settings::Values, settings::Rejected> staged = cbSettings().set(property_map{{"ui_constraints", *message.data}}, settings::noWait); !staged) {
-            settings::detail::FrameworkAccess::notifyRefused(cbSettings(), staged.error());
-        }
-        return std::nullopt;
-    }
-    if (message.cmd == Get) {
-        const std::expected<settings::Value, settings::Rejected> read = cbSettings().get("ui_constraints");
-        if (!read) {
-            throw gr::exception(std::format("block {} refused {}: {}", cbUniqueName(), propertyName, settings::describeRejected(read.error())));
-        }
-        message.data = read->as<property_map>().value_or(property_map{});
-        return message;
     }
 
     throw gr::exception(std::format("block {} property {} does not implement command {}, msg: {}", cbUniqueName(), propertyName, message.cmd, message));

@@ -562,8 +562,6 @@ private:
     [[nodiscard]] std::optional<pmt::Value> heldValue(std::string_view key) const; // the value a read of the key returns
     [[nodiscard]] bool                      holdsInForce(std::string_view tagKey, const pmt::Value& value) const;
     void                                    storeDefaultsFrom(const ValueMap& values);
-    void                                    storeInForceAsDefaults();
-    [[nodiscard]] property_map              pendingValues() const;
     [[nodiscard]] std::string               tagKeyOrSent(std::string_view key) const;
 
     [[nodiscard]] std::expected<void, Rejected> firstUse();
@@ -653,11 +651,7 @@ struct FrameworkAccess {
     static std::vector<std::string> parameterNames(const SettingsBase& settings); // a recipe composite's parameters, else none
 
     static void notifyRefused(const SettingsBase& settings, const Rejected& refused) { settings.notifyRefused(refused); }
-    // the values in force become the ones a reset returns to
-    static void storeDefaults(SettingsBase& settings) { settings.storeInForceAsDefaults(); }
-    // each change waiting to apply, with its value
-    [[nodiscard]] static property_map pendingValues(const SettingsBase& settings) { return settings.pendingValues(); }
-    static void                       notify(const SettingsBase& settings, NotificationLevel level, NotificationKind what, std::string_view key, std::string_view reason) { settings.notify(level, what, key, reason); }
+    static void notify(const SettingsBase& settings, NotificationLevel level, NotificationKind what, std::string_view key, std::string_view reason) { settings.notify(level, what, key, reason); }
 
     // the block author's calls
     static void publish(SettingsBase& settings, std::string_view key, pmt::Value value, std::string_view reason = {}) { settings.publish(key, std::move(value), reason); }

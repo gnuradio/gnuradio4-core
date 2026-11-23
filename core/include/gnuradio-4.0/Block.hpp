@@ -519,17 +519,11 @@ struct isBlockDependent {
 
 namespace block::property {
 // [[maybe_unused]]: names referenced only from Block.cpp (initStandardPropertyCallbacks) and user code — silences -Werror=unused-variable on TUs that include only the header.
-[[maybe_unused]] inline const char* const        kHeartbeat      = "Heartbeat";        ///< heartbeat property - the canary in the coal mine (supports block-specific subscribe/unsubscribe)
-[[maybe_unused]] inline static const char* const kEcho           = "Echo";             ///< basic property that receives any matching message and sends a mirror with it's serviceName/unique_name
-[[maybe_unused]] inline static const char* const kLifeCycleState = "LifecycleState";   ///< basic property that sets the block's @see lifecycle::StateMachine
-[[maybe_unused]] inline const char* const        kSetting        = "Settings";         ///< asynchronous message-based setting handling,
-                                                                                       // N.B. 'Set' Settings are first staged before being applied within the work(...) function (real-time/non-real-time decoupling)
-[[maybe_unused]] inline const char* const        kStagedSetting   = "StagedSettings";  ///< a Set stages its settings as on kSetting, a Get returns the changes waiting to apply
-[[maybe_unused]] inline static const char* const kMetaInformation = "MetaInformation"; ///< asynchronous message-based retrieval of the static meta-information (i.e. Annotated<> interfaces, constraints, etc...)
-[[maybe_unused]] inline static const char* const kUiConstraints   = "UiConstraints";   ///< asynchronous message-based retrieval of user-defined UI constraints
-[[maybe_unused]] inline static const char* const kStoreDefaults   = "StoreDefaults";   ///< a Set makes the values in force the ones a reset returns to
-[[maybe_unused]] inline static const char* const kResetDefaults   = "ResetDefaults";   ///< a Set stages a reset to the defaults
-[[maybe_unused]] inline const char* const        kTagCouplings    = "TagCouplings";    ///< read or change the settings coupled to tag keys, @see SettingsBase::setTagCouplings
+[[maybe_unused]] inline const char* const        kHeartbeat      = "Heartbeat";      ///< heartbeat property - the canary in the coal mine (supports block-specific subscribe/unsubscribe)
+[[maybe_unused]] inline static const char* const kEcho           = "Echo";           ///< basic property that receives any matching message and sends a mirror with it's serviceName/unique_name
+[[maybe_unused]] inline static const char* const kLifeCycleState = "LifecycleState"; ///< basic property that sets the block's @see lifecycle::StateMachine
+[[maybe_unused]] inline const char* const        kSetting        = "Settings";       ///< asynchronous message-based setting handling,
+                                                                                     // N.B. 'Set' Settings are first staged before being applied within the work(...) function (real-time/non-real-time decoupling)
 
 [[maybe_unused]] inline const char* const kSettingsNotification = "SettingsNotification"; ///< the top scheduler's notifications of its blocks' settings, one per message
 
@@ -570,7 +564,6 @@ struct BlockBase {
     std::string_view (*_cbName)(const void*)                                = nullptr;
     const MsgPortInBuiltin& (*_cbMsgIn)(const void*)                        = nullptr;
     MsgPortOutBuiltin& (*_cbMsgOut)(void*)                                  = nullptr;
-    const property_map& (*_cbMetaInformation)(const void*)                  = nullptr;
 
     // Hook for GraphWrapper to handle subgraph export port messages on any block type
     using SubgraphExportHandler                  = std::optional<Message> (*)(void* context, Message);
@@ -595,7 +588,6 @@ struct BlockBase {
     std::string_view           cbName() const { return _cbName(_blockSelf); }
     const MsgPortInBuiltin&    cbMsgIn() const { return _cbMsgIn(_blockSelf); }
     MsgPortOutBuiltin&         cbMsgOut() { return _cbMsgOut(_blockSelf); }
-    const property_map&        cbMetaInformation() const { return _cbMetaInformation(_blockSelf); }
 
     /**
      * Message plumbing, compiled once rather than stamped per block type.
@@ -623,12 +615,6 @@ struct BlockBase {
     std::optional<Message> propertyCallbackEcho(std::string_view propertyName, Message message);
     std::optional<Message> propertyCallbackLifecycleState(std::string_view propertyName, Message message);
     std::optional<Message> propertyCallbackSettings(std::string_view propertyName, Message message);
-    std::optional<Message> propertyCallbackStagedSettings(std::string_view propertyName, Message message);
-    std::optional<Message> propertyCallbackStoreDefaults(std::string_view propertyName, Message message);
-    std::optional<Message> propertyCallbackResetDefaults(std::string_view propertyName, Message message);
-    std::optional<Message> propertyCallbackTagCouplings(std::string_view propertyName, Message message);
-    std::optional<Message> propertyCallbackMetaInformation(std::string_view propertyName, Message message);
-    std::optional<Message> propertyCallbackUiConstraints(std::string_view propertyName, Message message);
     std::optional<Message> propertyCallbackSubgraphExport(std::string_view propertyName, Message message);
 };
 
@@ -721,12 +707,7 @@ enum class Category {
  * - `kEcho`: Responds to messages by echoing them back, aiding in communication testing.
  * - `kLifeCycleState`: Manages and reports the block's lifecycle state.
  * - `kSetting`: a `Set` stages the settings it carries and gets no reply; a refused key goes out as a notification. A
- *   subscriber is sent the block's settings after each work call that applied a change. A `Get` returns them.
- * - `kStagedSetting`: a `Set` stages as on `kSetting`, a refusal being its error reply; a `Get` returns the changes waiting.
- * - `kStoreDefaults` & `kResetDefaults`: a `Set` makes the values in force the defaults, or stages a reset to them.
- * - `kTagCouplings`: a `Get` returns the settings coupled to tag keys; a `Set` changes them, an empty key removing one.
- * - `kMetaInformation`: returns static meta-information (i.e. Annotated<> interfaces, constraints, etc...) (N.B. does not affect Block operation)
- * - `kUiConstraints`: returns user-defined UI constraints (N.B. does not affect Block operation)
+ *   subscriber is sent the block's settings after each work call that applied a change.
  *
  * These properties can be interacted with through messages, supporting operations like setting values, querying states, and subscribing to updates.
  * This model provides a flexible interface for blocks to adapt their processing based on runtime conditions and external inputs.
@@ -932,7 +913,6 @@ protected: // BlockBase function-pointer plumbing — not part of the user API
     static std::string_view           cbNameImpl(const void* self) { return static_cast<const Block*>(self)->name; }
     static const MsgPortInBuiltin&    cbMsgInImpl(const void* self) { return static_cast<const Block*>(self)->msgIn; }
     static MsgPortOutBuiltin&         cbMsgOutImpl(void* self) { return static_cast<Block*>(self)->msgOut; }
-    static const property_map&        cbMetaInformationImpl(const void* self) { return static_cast<const Block*>(self)->meta_information.value; }
 
 public:
     template<typename TFunction, typename... Args>
@@ -964,14 +944,13 @@ public:
         _blockSelf = static_cast<void*>(this);
 
         // initialize inherited BlockBase accessor function pointers
-        _cbSettings        = &Block::cbSettingsImpl;
-        _cbState           = &Block::cbStateImpl;
-        _cbChangeStateTo   = &Block::cbChangeStateToImpl;
-        _cbUniqueName      = &Block::cbUniqueNameImpl;
-        _cbName            = &Block::cbNameImpl;
-        _cbMsgIn           = &Block::cbMsgInImpl;
-        _cbMsgOut          = &Block::cbMsgOutImpl;
-        _cbMetaInformation = &Block::cbMetaInformationImpl;
+        _cbSettings      = &Block::cbSettingsImpl;
+        _cbState         = &Block::cbStateImpl;
+        _cbChangeStateTo = &Block::cbChangeStateToImpl;
+        _cbUniqueName    = &Block::cbUniqueNameImpl;
+        _cbName          = &Block::cbNameImpl;
+        _cbMsgIn         = &Block::cbMsgInImpl;
+        _cbMsgOut        = &Block::cbMsgOutImpl;
 
         initStandardPropertyCallbacks();
 

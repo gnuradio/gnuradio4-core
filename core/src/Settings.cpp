@@ -642,23 +642,6 @@ void SettingsBase::storeDefaultsFrom(const ValueMap& values) {
     }
 }
 
-void SettingsBase::storeInForceAsDefaults() {
-    if (!firstUse()) { // a block that is not ready holds no values to keep
-        return;
-    }
-    const BlockLock lock(*this);
-    storeDefaultsFrom(_inForce);
-}
-
-property_map SettingsBase::pendingValues() const {
-    const BlockLock lock(*this);
-    property_map    pending;
-    for (const auto& [key, change] : _pending.keys) {
-        pending.insert_or_assign(std::pmr::string(key), change.value);
-    }
-    return pending;
-}
-
 std::string SettingsBase::tagKeyOrSent(std::string_view key) const { return canonicalKey(_table, key).value_or(std::string(key)); }
 
 std::optional<SettingsBase::Threshold> SettingsBase::threshold() const {
