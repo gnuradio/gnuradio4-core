@@ -227,6 +227,18 @@ rmdir "${shared_root}" 2>/dev/null
 
 # The shared prefix keeps the directories whichever package installed first
 # created: no receipt claims them, so nothing else removes them.
-find "${install_root}" -depth -type d -exec rmdir {} + 2>/dev/null
+#
+# Only for a prefix GR owns outright. rmdir refuses non-empty directories, but
+# under a prefix shared with other software an empty directory is not
+# necessarily ours -- walking /usr/local would quietly remove empty directories
+# belonging to everything else installed there. The receipt-driven rmdir above
+# has already taken away the directories GR actually created.
+case "${install_root}" in
+    '' | / | /usr | /usr/bin | /usr/lib | /usr/local | /usr/share | /opt | /opt/homebrew | /Library | /System | /Applications)
+        ;;
+    *)
+        find "${install_root}" -depth -type d -exec rmdir {} + 2>/dev/null
+        ;;
+esac
 
 echo "gr4-uninstall: done; GNU Radio 4 has been removed"
