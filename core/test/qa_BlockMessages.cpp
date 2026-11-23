@@ -85,22 +85,6 @@ const boost::ut::suite<"block message plumbing"> blockMessageTests = [] {
         expect(eq(fromBlock.streamReader().available(), 1UZ)) << "the inherited handler must answer the echo request";
     };
 
-    "a Heartbeat Get is answered with the time of the reply"_test = [] {
-        qa_block_messages::InheritedHandler block;
-        MsgPortOut                          toBlock;
-        MsgPortIn                           fromBlock;
-        expect(block.msgOut.connect(fromBlock).has_value());
-        expect(toBlock.connect(block.msgIn).has_value());
-        sendMessage<message::Command::Get>(toBlock, "", block::property::kHeartbeat, property_map{});
-
-        block.processScheduledMessages();
-
-        const std::vector<Message> replies = qa_block_messages::takeMessages(fromBlock);
-        expect(fatal(eq(replies.size(), 1UZ))) << "the Heartbeat Get is answered once";
-        expect(fatal(replies[0].data.has_value()));
-        expect(replies[0].data->contains("heartbeat")) << "the reply carries no time";
-    };
-
     "a block that defines its own processMessages() hides the inherited one"_test = [] {
         qa_block_messages::OwnHandler block;
         MsgPortOut                    toBlock;

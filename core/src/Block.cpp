@@ -4,7 +4,6 @@ namespace gr {
 
 void BlockBase::initStandardPropertyCallbacks() noexcept {
     propertyCallbacks = {
-        {block::property::kHeartbeat, &BlockBase::propertyCallbackHeartbeat},
         {block::property::kEcho, &BlockBase::propertyCallbackEcho},
         {block::property::kLifeCycleState, &BlockBase::propertyCallbackLifecycleState},
         {block::property::kSetting, &BlockBase::propertyCallbackSettings},
@@ -99,19 +98,6 @@ void BlockBase::sendUnsentReplies() {
     std::ranges::move(_unsentReplies.begin(), _unsentReplies.begin() + nSent, msgSpan.begin());
     msgSpan.publish(msgSpan.size());
     _unsentReplies.erase(_unsentReplies.begin(), _unsentReplies.begin() + nSent);
-}
-
-std::optional<Message> BlockBase::propertyCallbackHeartbeat(std::string_view propertyName, Message message) {
-    using enum gr::message::Command;
-    assert(propertyName == block::property::kHeartbeat);
-
-    if (message.cmd == Set || message.cmd == Get) {
-        const auto nanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
-        message.data           = pmt::Value::Map{{"heartbeat", nanoseconds}};
-        return message;
-    }
-
-    throw gr::exception(std::format("block {} property {} does not implement command {}, msg: {}", cbUniqueName(), propertyName, message.cmd, message));
 }
 
 std::optional<Message> BlockBase::propertyCallbackEcho(std::string_view propertyName, Message message) {

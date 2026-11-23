@@ -519,7 +519,6 @@ struct isBlockDependent {
 
 namespace block::property {
 // [[maybe_unused]]: names referenced only from Block.cpp (initStandardPropertyCallbacks) and user code — silences -Werror=unused-variable on TUs that include only the header.
-[[maybe_unused]] inline const char* const        kHeartbeat      = "Heartbeat";      ///< a Get or a Set is answered with the time of the reply
 [[maybe_unused]] inline static const char* const kEcho           = "Echo";           ///< basic property that receives any matching message and sends a mirror with it's serviceName/unique_name
 [[maybe_unused]] inline static const char* const kLifeCycleState = "LifecycleState"; ///< basic property that sets the block's @see lifecycle::StateMachine
 [[maybe_unused]] inline const char* const        kSetting        = "Settings";       ///< asynchronous message-based setting handling,
@@ -609,7 +608,6 @@ struct BlockBase {
     void sendUnsentReplies();
 
     // the property callbacks, compiled once, not per block type
-    std::optional<Message> propertyCallbackHeartbeat(std::string_view propertyName, Message message);
     std::optional<Message> propertyCallbackEcho(std::string_view propertyName, Message message);
     std::optional<Message> propertyCallbackLifecycleState(std::string_view propertyName, Message message);
     std::optional<Message> propertyCallbackSettings(std::string_view propertyName, Message message);
@@ -701,7 +699,6 @@ enum class Category {
  * these properties leverage the Majordomo Protocol (MDP) pattern for structured and efficient communication.
  *
  * Predefined properties include:
- * - `kHeartbeat`: answers a Get or a Set with the time of the reply.
  * - `kEcho`: Responds to messages by echoing them back, aiding in communication testing.
  * - `kLifeCycleState`: Manages and reports the block's lifecycle state.
  * - `kSetting`: a `Set` stages the settings it carries and gets no reply; a refused key goes out as a notification.
