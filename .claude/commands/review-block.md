@@ -35,7 +35,7 @@ git diff --name-only <range> -- '*.hpp' '*.cpp'
   6. constructor
   7. lifecycle (`start`, `stop`, `reset`)
   8. processing (`processOne` / `processBulk`)
-  9. `settingsChanged`
+  9. `applySettings`
   10. helper methods
 - `processOne` xor `processBulk` — exactly one, not both, not neither
 
@@ -63,7 +63,7 @@ git diff --name-only <range> -- '*.hpp' '*.cpp'
 **Reflectable completeness**
 
 - `GR_MAKE_REFLECTABLE` lists the type, then all ports and settings — nothing missing, nothing extra
-- All settings that appear in `settingsChanged` are reflected
+- All settings that appear in `applySettings` are reflected
 - `GR_REGISTER_BLOCK` (if present) lists all intended type instantiations
 
 **Error handling (§5, §6)**
@@ -80,7 +80,7 @@ git diff --name-only <range> -- '*.hpp' '*.cpp'
 
 **Settings**
 
-- If the block has mutable settings: `settingsChanged()` handles all of them
+- If the block has mutable settings: `applySettings()` handles all of them
 - Settings revert logic: unchanged settings are restored when a trigger does not match (if applicable)
 
 Do NOT comment on formatting — it is handled by clang-format.

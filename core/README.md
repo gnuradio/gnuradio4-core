@@ -437,7 +437,7 @@ with properties:
 
 ```cpp
 // to send a message
-sendMessage<Set>(toBlock /* MsgOut port */, "" /* serviceName */, block::property::kStagedSetting /* endpoint */, { { "factor", 42 } } /* data  */);
+sendMessage<Set>(toBlock /* MsgOut port */, "" /* serviceName */, block::property::kSetting /* endpoint */, { { "factor", 42 } } /* data  */);
 // and to read one message:
 auto returnReplyMsg = [](gr::MsgPortIn &fromBlock) {
     ReaderSpanLike auto span = fromBlock.streamReader().get<SpanReleasePolicy::ProcessAll>(1UZ);

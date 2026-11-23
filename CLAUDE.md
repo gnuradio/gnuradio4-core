@@ -115,10 +115,14 @@ struct MyBlock : gr::Block<MyBlock> {
     gr::PortIn<float>  in;
     gr::PortOut<float> out;
 
-    Annotated<float, "gain"> gain = 1.0f;
-    float sample_rate = 1.0f;
+    struct Settings {
+        Annotated<float> gain = 1.0f;
+        float sample_rate = 1.0f;
 
-    GR_MAKE_REFLECTABLE(MyBlock, in, out, gain, sample_rate);
+        GR_MAKE_REFLECTABLE(Settings, gain, sample_rate);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(MyBlock, in, out, settings);
 
     float _cachedValue = 0.0f;
 
@@ -130,7 +134,7 @@ struct MyBlock : gr::Block<MyBlock> {
 
     [[nodiscard]] constexpr auto processOne(float x) const noexcept { ... }
 
-    void settingsChanged(const gr::property_map&, const gr::property_map&) { ... }
+    void applySettings(const Settings& s) { ... }
 };
 ```
 
@@ -292,7 +296,7 @@ should strive for the same.
 ### Blocks
 
 - Inherit via CRTP: `struct Foo : gr::Block<Foo> { ... }`.
-- Settings are `Annotated<T, "name", ...>` fields.
+- Settings are `Annotated<T, ...>` fields.
   Reflected fields MUST use `snake_case` for SigMF compatibility.
 - `GR_MAKE_REFLECTABLE(...)` lists the type, then all reflected members (ports + settings).
 - Tags: in `processOne`, use `this->mergedInputTag()` / `this->publishTag(...)`;
@@ -302,7 +306,7 @@ should strive for the same.
 
 - `gr::PortIn<T>`, `gr::PortOut<T>` for static ports.
 - `std::vector<gr::PortIn<T>>` / `std::vector<gr::PortOut<T>>` for dynamic ports —
-  resize in `settingsChanged`.
+  resize in `applySettings`.
 - Port names must be short, descriptive nouns: `in`, `out`, `reference`, `error_signal`.
 
 ### Graphs & Scheduling
@@ -349,7 +353,7 @@ should strive for the same.
   - Every `processOne` / `processBulk` path MUST be tested.
   - Edge cases: empty input, single sample, maximum buffer, type boundaries.
   - Tag propagation MUST be tested when the block reads or writes tags.
-  - Settings changes MUST be tested via `settingsChanged` if the block implements it.
+  - Settings changes MUST be tested via `set(...)` if the block implements `applySettings`.
 - **Test names** are sentences describing the scenario, not function names.
 - **No `sleep` / timing-based tests** — use deterministic scheduling or event signalling.
 

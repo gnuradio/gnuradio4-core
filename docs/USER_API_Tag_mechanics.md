@@ -1,7 +1,7 @@
 # Tag mechanics — User-API Reference
 
 Tags are key-value metadata attached to specific sample positions in a data stream. They carry
-signal descriptions (`gr:sample_rate`, `gr:signal_name`, ...), trigger events, context switches, and
+signal descriptions (`gr:sample_rate`, `gr:signal_name`, ...), trigger events and
 user-defined metadata. Tags propagate through the graph alongside samples — the framework handles
 forwarding, settings synchronisation, and position tracking automatically unless the block opts out.
 
@@ -24,11 +24,9 @@ of annotated signal data.
   `BackwardTagPropagation` puts every tag of a chunk on the chunk's first output sample. Override
   `forwardTags()` for full custom control.
 - **Settings**: a tag sets a setting only where the application or the graph couples the setting to
-  the tag's key: `settings().setTagCouplings()`, a graph file's `tag_couplings` or a `TagCouplings`
-  message. The framework writes no tag for a setting.
+  the tag's key: `block.setTagCouplings()` or a graph file's `tag_couplings`. The framework
+  writes no tag for a setting.
 - Tags are **never merged** across different positions or sources. No implicit data loss.
-- **Contexts** (`gr:context` and `gr:ctx_time` keys) switch entire settings presets per sample — a
-  pipeline can coherently shift between different operating modes.
 
 ---
 
@@ -165,10 +163,8 @@ the attempt is refused, reported on `stderr` and the tag dropped, rather than re
 reservation and handing the downstream block ring slots nobody wrote. Publish through the span —
 `outSpan.publishTag(map, offset)` in `processBulk` — not through the port, and not via
 `this->publishTag(map)`, which goes to the ports directly outside processOne dispatch. The framework
-follows the same rule for the forward map a block's `settingsChanged()` fills, including for a setting
-a block stages from inside its own `processBulk` before calling `requestStop()`: the setting is
-applied and the forward map published on that same work call, through the span it is already
-holding, just before the end-of-stream tag.
+follows the same rule for the settings `applySettings()` forwards on the work call that ends the
+stream: they leave on that call, through the span it holds, before the end-of-stream tag.
 
 ---
 
@@ -465,12 +461,15 @@ the application or the graph sets it per block instance:
 
 ```cpp
 auto& gain = graph.emplaceBlock<Gain>();
-gain.settings().setTagCouplings({{"sample_rate", std::string("gr:sample_rate")}});
+if (auto coupled = gain.setTagCouplings({{"sample_rate", std::string("gr:sample_rate")}}); !coupled) {
+    // each entry of coupled.error() names a refused setting and the reason
+}
 ```
 
-When a tag carrying `gr:sample_rate` arrives, the framework calls `settings().autoUpdate(tag)`, which
-stages the value for `sample_rate`. The block's `settingsChanged(old, new)` callback fires before the
-next processing call. With no coupling, no setting takes any tag, whatever its name. The key may be in
+When a tag carrying `gr:sample_rate` arrives at the first sample of a work call, the framework checks
+its value as a call's and stages it for `sample_rate`. The block's `applySettings()` runs before the
+next processing call. A tag at the value `get()` returns stages nothing. A value the check refuses goes out
+as an error notification, and the tag goes on downstream. With no coupling, no setting takes any tag, whatever its name. The key may be in
 any domain: a block's setting may follow `foo:level` that an out-of-tree block writes.
 
 ```
@@ -485,18 +484,15 @@ any domain: a block's setting may follow `foo:level` that an out-of-tree block w
 
 The coupling table maps a setting's name to a key. A setting follows at most one key, and one key
 may set several settings of a block. An entry with an empty key removes a coupling, and
-`settings().tagCouplings()` reads the table. The table belongs to the block: it holds in every
-context, and a reset leaves it as it is. The call refuses a name that is not a writable setting, a
-key that is not a string or not `domain:name`, and the five keys the framework acts on itself:
-`gr:end_of_stream`, `gr:reset_default`, `gr:store_default`, `gr:context` and `gr:ctx_time`. The
-exception names the block, the setting and the key, and the table stays as it was.
+`block.tagCouplings()` reads the table. The table belongs to the block, and a reset leaves it as
+it is. A name of the bare group's settings couples member 0's key. The call returns a refusal for a
+name that is not a writable setting, a key that is not a string or not `domain:name`, and the two
+keys the framework acts on itself: `gr:end_of_stream` and `gr:reset_default`. Each entry
+names the setting and the key, and the table stays as it was.
 
-A coupled setting
-
-- follows its key from the call that couples it, whatever set it before. The values the block's
-  `init()` applies from its constructor's map leave it following.
-- takes the key's value until a caller sets it with `set()`. A reset makes it follow its key again,
-  in every context. A reset that `settingsChanged()` refuses leaves it as it was.
+A coupled setting follows its key from the call that couples it. A caller's `set()` holds until the
+next tag that carries the key, and a value a tag sets is no value a caller gave: a save does not
+write it.
 
 A graph file holds the table in a block's `tag_couplings` map, and the loader applies it after the
 block's `parameters`:
@@ -511,29 +507,34 @@ blocks:
       sample_rate: "gr:sample_rate"
 ```
 
-A `Set` to the block's `TagCouplings` property changes the table at run time, and a `Get` reads it.
+`block.setTagCouplings()` changes the table at run time, and `block.tagCouplings()` reads it.
 `grinfo` reports each setting's coupled key, read from the instance it inspects, as `tagKey`.
 
 The framework writes no tag for a setting, whether a caller or a tag set it. A block that hands a
-value downstream writes it into the forward map its `settingsChanged(old, new, forward)` receives,
-and the framework publishes that map on the block's outputs:
+value downstream names it with `this->forwardTag()`, and the framework publishes it at the first
+sample of the block's next output:
 
 ```cpp
-void settingsChanged(const property_map&, const property_map& newSettings, property_map& forward) {
-    if (newSettings.contains("sample_rate")) {
-        forward.insert_or_assign(std::pmr::string(gr::tag::SAMPLE_RATE.key()), sample_rate);
+struct Settings {
+    gr::Annotated<float, gr::Unit<"Hz">> sample_rate = 1.f;
+
+    GR_MAKE_REFLECTABLE(Settings, sample_rate);
+} settings;
+
+void applySettings(const Settings& s, const Settings& old) {
+    if (s.sample_rate != old.sample_rate) {
+        this->forwardTag(gr::tag::SAMPLE_RATE.key(), s.sample_rate.value);
     }
 }
 ```
 
-When `settingsChanged()` throws on a batch whose values coupled tags alone carried, each setting
-takes back its earlier value and the block reports the refusal in a plain message. A batch that
-also holds a value from `set()`, a context or a reset is reported as an error. The block publishes
-none of the forward map the refusing call filled. The tag leaves with the value it arrived with.
-When the batch holds a reset, each coupled setting follows its key only when it did before the reset,
-even after a `setTagCouplings()` that the callback itself made before it threw. A coupling table the
-callback wrote with `setTagCouplings()` stays. A set the callback stored with `set()` stays, and its
-keys decide which settings follow.
+The hook also runs when the graph takes the block, with the declared defaults in `old`; the framework drops
+what it forwards then, so the block above publishes one tag per later change of its rate and none
+at the start. A block whose first sample must carry its rate publishes that tag in its work function.
+
+When `applySettings()` throws or fails a key, every key of that apply takes back its earlier value, an
+error notification names each, and the block publishes none of the settings the failing call forwarded.
+The tag leaves with the value it arrived with.
 
 A block that republishes _every_ input tag itself, whatever its keys, declares `NoTagPropagation`.
 The framework then forwards no tag on its own:
@@ -589,68 +590,14 @@ Example — a 10× decimator:
 
 The ratio is applied to the `gr:sample_rate` a forwarded tag carries, so the block's own stored
 `sample_rate` stays at the rate it is fed. A block with no `sample_rate` setting also publishes the
-scaled value. A block's own forward map leaves as the block wrote it. The decimation block only needs
-to set `input_chunk_size` in `settingsChanged`:
+scaled value. A block's own forwarded settings leave as the block named them. The decimation block only needs
+to set `input_chunk_size` in `applySettings`:
 
 ```cpp
-void settingsChanged(const property_map&, const property_map&) {
-    this->input_chunk_size = decim;
+void applySettings(const Settings& s) {
+    this->input_chunk_size = s.decim;
 }
 ```
-
----
-
-## Contexts — modal settings switching
-
-The `gr:context` and `gr:ctx_time` tag keys enable coherent pipeline-wide settings switching. A
-context is a named operating mode (e.g., `"calibration"`, `"measurement"`, `"beam_A"`) with an
-associated UTC timestamp.
-
-### How contexts work
-
-1. **Store settings for a context**: call `settings().set(params, ctx)` with a
-   `SettingsCtx{.time = ..., .context = "measurement"}`. The settings are stored (not yet applied)
-   and associated with that context.
-
-2. **Activate via tag**: when a tag with a `gr:context` key arrives at a block, `autoUpdate` calls
-   `activateContext(ctx)`. This looks up the best-matching stored settings for that context and
-   stages them.
-
-3. **Pipeline coherence**: the same context tag propagates through the graph. Each block activates
-   its own stored settings for that context — the entire pipeline switches coherently at the tagged
-   sample position.
-
-```
-  timing source                     block A                block B
-  ┌───────────┐                 ┌────────────┐         ┌────────────┐
-  │           │──▽──────────────│ ctx="cal"  │──▽──────│ ctx="cal"  │
-  │  tag:     │   propagates    │ gain=0.5   │         │ filter=LP  │
-  │  {gr:     │   through       │ (stored    │         │ (stored    │
-  │  context: │   graph         │  for "cal")│         │  for "cal")│
-  │   "cal"}  │                 │            │         │            │
-  └───────────┘                 └────────────┘         └────────────┘
-
-  Before tag:  gain=1.0, filter=BP      ← "default" context active
-  After tag:   gain=0.5, filter=LP      ← "cal" context activated simultaneously
-```
-
-This mechanism is very powerful for:
-
-- **Beam switching** in accelerator control (different optics settings per beam)
-- **Calibration sequences** (switch to calibration mode, then back)
-- **Multi-mission instruments** (telescope switching between targets)
-
-The context string is arbitrary — the user defines the operating modes. Settings for each context
-are stored independently and activated on demand.
-
-### `gr:context` vs `gr:ctx_time`
-
-- `gr:context` (string): the mode name — selects WHICH settings to apply
-- `gr:ctx_time` (uint64, ns UTC): selects the context's settings set in effect at that time
-
-A tag with only `gr:context` selects the set in effect now. A tag with both selects the set in
-effect at `gr:ctx_time`. The switch reads no other key: a trigger tag's `gr:trigger_time` beside
-`gr:context` does not move it. A block that stores no settings for the context ignores the tag.
 
 ---
 
@@ -728,37 +675,24 @@ A rate change does not rescale `gr:n_dropped_samples`. Its readers count the tag
 | `gr:trigger_offset`    | `float`        | s    | sub-sample time correction |
 | `gr:trigger_meta_info` | `property_map` |      | additional event metadata  |
 
-### Context switching
-
-| Key           | Type            | Purpose                                                      |
-| ------------- | --------------- | ------------------------------------------------------------ |
-| `gr:context`  | `std::string`   | multiplexing key — selects which stored settings to activate |
-| `gr:ctx_time` | `uint64_t` (ns) | UTC time at which the tag's context takes effect             |
-
 ### Lifecycle
 
 | Key                | Type   | Purpose                                                      |
 | ------------------ | ------ | ------------------------------------------------------------ |
 | `gr:reset_default` | `bool` | reset block settings to stored defaults                      |
-| `gr:store_default` | `bool` | store current settings as new defaults                       |
 | `gr:end_of_stream` | `bool` | signals end of data — downstream blocks transition to `DONE` |
 
-A block acts on a `gr:reset_default` or `gr:store_default` tag as it acts on a `Set` to its
-`ResetDefaults` or `StoreDefaults` property. The value is not read. A bare `reset_default` or
-`store_default` key acts on nothing.
+A block acts on a `gr:reset_default` tag as it acts on a call to `block.resetDefaults()`. The
+value is not read. A bare `reset_default` key acts on nothing. The stored defaults are the values in
+force when the block's initialization ended.
 
-While the default context is active, a reset, by tag or by message, restores the default of each
-setting that `set()` changed in that context, a value from the constructor's map included. A reset
-leaves a setting that a settings message changed, or that no call has set, at its present value.
-After a reset, every coupled setting follows its key again in every context, and the coupling table
-stays as it was. With a named context active, a reset returns the block to the default context and
-restores every default.
+A reset, by tag or by call, sets every stored default, as one call that gives each key, and then
+runs the block's `reset()`. The coupling table stays as it was.
 
 A reset and the other keys of its tag apply as one change: the restored defaults, with the tag's own values over them.
-`settingsChanged()` hears of that change once. A `Set` to `ResetDefaults` that arrives while a reset tag waits to apply
-serves both, and the block's `reset()` runs once. A store runs after the other keys of its tag apply. The stored
-defaults then include the values the tag carries. The tag forwards downstream, and each block it reaches acts on it.
-A graph builder who wants one block to act sends it a message, not a tag.
+`applySettings()` hears of that change once. A `resetDefaults()` call made while a reset tag waits to apply serves both,
+and the block's `reset()` runs once. The tag forwards downstream, and each block it reaches acts on it. A host that
+wants one block to reset calls that block's `resetDefaults()`, not a tag.
 
 ### Transmit bursts
 
