@@ -18,7 +18,6 @@
 #include <utility>
 #include <vector>
 
-#include <gnuradio-4.0/SettingsCtx.hpp>
 #include <gnuradio-4.0/Tag.hpp>
 #include <gnuradio-4.0/Value.hpp>
 #include <gnuradio-4.0/YamlPmt.hpp>
@@ -159,7 +158,6 @@ struct Block {
     std::string            schedulerId; ///< empty unless the subgraph is scheduler-managed
     std::string            parameters;  ///< sorted `key: value` lines
     std::string            metaInformation;
-    std::vector<NamedText> contexts;            ///< one entry per `ctx_parameters` context
     std::vector<NamedText> schedulerParameters; ///< the parameters of the scheduler managing a subgraph
     std::vector<NamedText> uninterpretedKeys;   ///< what the entry carries and the tables above do not render
 
@@ -292,9 +290,9 @@ enum class LevelKind { Root, Subgraph };
  * @brief One block entry, read by the rules the importer applies to it.
  *
  * The entry's `id` decides which of its fields are read, as it does in the importer: a SUBGRAPH
- * carries a graph and may name a scheduler; every other entry carries its name in its parameters
- * and may carry contexts. A field the importer refuses is refused here as well. A field it passes
- * over is listed in the document rather than read.
+ * carries a graph and may name a scheduler; every other entry carries its name in its parameters.
+ * A field of the wrong shape is refused here as the importer refuses it. A field no table renders,
+ * whether or not the format has it, is listed in the document rather than read.
  */
 [[nodiscard]] inline std::expected<Block, std::string> readBlock(const property_map& entry) {
     Block                  block;
@@ -361,38 +359,6 @@ enum class LevelKind { Root, Subgraph };
             block.metaInformation = mapLines(*map);
             read.add("meta_information");
         }
-    }
-
-    if (const pmt::Value* contexts = entryOf(entry, "ctx_parameters"); contexts != nullptr && !subgraph) {
-        const Tensor<pmt::Value>* list = listOf(*contexts);
-        if (list == nullptr) {
-            return std::unexpected(std::format("Unable to create block '{}' of type '{}': ctx_parameters is not a list", block.name, block.type));
-        }
-        for (std::size_t at = 0UZ; at < list->size(); ++at) {
-            const property_map* context = mapOf((*list)[at]);
-            if (context == nullptr) {
-                return std::unexpected(std::format("Unable to create block '{}' of type '{}': a ctx_parameters entry is not a map", block.name, block.type));
-            }
-            const pmt::Value*                name              = entryOf(*context, gr::settings::kContextField);
-            const pmt::Value*                time              = entryOf(*context, gr::settings::kContextTimeField);
-            const pmt::Value*                values            = entryOf(*context, "parameters");
-            const std::optional<std::string> label             = name == nullptr ? std::nullopt : stringOf(*name);
-            const std::uint64_t*             contextTime       = time == nullptr ? nullptr : time->get_if<std::uint64_t>();
-            const property_map*              contextParameters = values == nullptr ? nullptr : mapOf(*values);
-            if (!label.has_value() || contextTime == nullptr || contextParameters == nullptr) {
-                return std::unexpected(std::format("Unable to create block '{}' of type '{}': a ctx_parameters entry needs a context, a context_time and a parameters map", block.name, block.type));
-            }
-            block.contexts.emplace_back(std::format("{} @ {}", *label, *contextTime), mapLines(*contextParameters));
-
-            KeysRead contextRead;
-            contextRead.add(gr::settings::kContextField);
-            contextRead.add(gr::settings::kContextTimeField);
-            contextRead.add("parameters");
-            for (NamedText& left : unreadKeysOf(*context, contextRead)) {
-                unread.emplace_back(std::format("ctx_parameters[{}].{}", at, left.name), std::move(left.value));
-            }
-        }
-        read.add("ctx_parameters");
     }
 
     if (const pmt::Value* scheduler = entryOf(entry, "scheduler"); scheduler != nullptr && subgraph) {
@@ -995,14 +961,7 @@ inline void writeLevelBody(DocWriter& writer, const Level& level, std::size_t de
         std::vector<std::vector<std::string>> rows;
         rows.reserve(level.blocks.size());
         for (const Block& block : level.blocks) {
-            std::string parameters = block.parameters;
-            for (const NamedText& context : block.contexts) {
-                if (!parameters.empty()) {
-                    parameters += "\n";
-                }
-                parameters += std::format("[context {}] {}", context.name, context.value);
-            }
-            rows.push_back({nameCell(block), typeCell(block), parameters, block.metaInformation});
+            rows.push_back({nameCell(block), typeCell(block), block.parameters, block.metaInformation});
         }
         // the block table is the one that grows without bound, so it is the one held in a box
         const std::array<std::string_view, 4> headers{"Name", "Type", "Parameters", "Meta information"};

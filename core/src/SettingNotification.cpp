@@ -1,4 +1,5 @@
 #include <gnuradio-4.0/SettingNotification.hpp>
+#include <gnuradio-4.0/SharedState.hpp>
 
 #include <algorithm>
 #include <array>
@@ -36,9 +37,8 @@ std::string notificationLine(const Notification& notification) {
 namespace detail {
 
 void printNotification(const Notification& notification) {
-    static std::mutex printLock;
     const std::string line = notificationLine(notification);
-    std::lock_guard   lock(printLock);
+    std::lock_guard   lock(notificationPrintLock());
     std::cerr << line << '\n';
 }
 

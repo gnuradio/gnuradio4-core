@@ -18,79 +18,16 @@ std::expected<void, Error> BlockModel::exportPort(bool, std::string_view, PortDi
 
 namespace {
 
-/// Writes the block's `parameters`, its `ctx_parameters` when it stores any outside the default context, and its
-/// `tag_couplings` when it couples any setting to a tag key.
+/// Writes the block's `parameters`, its name and the keys a caller gave it, and its `tag_couplings` when it couples any setting to
+/// a tag key. A key waiting to apply goes in at its waiting value, so the save commits nothing; a value the block
+/// derived, a tag set or a device reported stays out, since a load would make it given.
 void serializeSettings(const std::shared_ptr<BlockModel>& block, property_map& result) {
-    // Helper function to write parameters
-    auto writeParameters = [&](const property_map& settingsMap) {
-        pmt::Value::Map parameters;
-        auto            writeMap = [&](const auto& localMap) {
-            for (const auto& [settingsKey, settingsValue] : localMap) {
-                parameters[settingsKey] = settingsValue;
-            }
-        };
-        writeMap(settingsMap);
-        return parameters;
-    };
-
-    // Serialization must not change the graph it serializes, so the staged parameters are read rather
-    // than committed: the dump carries what the block would use, and the block keeps them staged.
-    //
-    // Only writable members go in. A block's readable members are a superset, and a reader refuses a
-    // key it cannot set: unique_name is the identity of the block the dump was written from, and
-    // input_chunk_size, output_chunk_size and stride are constants of a block that is not declared
-    // Resampling<>/Stride<>.
-    const std::set<std::string>& writable = block->settings().writableMembers();
-    property_map                 activeParameters;
-    auto                         insertWritable = [&writable, &activeParameters](const property_map& source) {
-        for (const auto& [key, value] : source) {
-            if (writable.contains(std::string(key))) {
-                activeParameters.insert_or_assign(key, value);
-            }
-        }
-    };
-    insertWritable(block->settings().get());
-    insertWritable(block->settings().stagedParameters());
-    const auto& stored = block->settings().getStoredAll();
-
-    result.emplace(serialization_fields::BLOCK_PARAMETERS, writeParameters(activeParameters));
-
-    using namespace std::string_literals;
-    Tensor<pmt::Value> ctxParamsSeq;
-    ctxParamsSeq.reserve(stored.size());
-    for (const auto& [ctx, ctxParameters] : stored) {
-        if (ctx.holds<std::string>()) {
-            if (auto str = ctx.value_or(std::string_view{}); str.empty()) {
-                continue;
-            }
-        }
-
-        for (const auto& [ctxTime, settingsMap] : ctxParameters) {
-            pmt::Value::Map ctxParam;
-
-            // Convert ctxTime.context to a string, regardless of its actual type
-            std::string contextStr;
-            pmt::ValueVisitor([&contextStr]<typename T>(const T& arg) {
-                if constexpr (std::is_same_v<T, std::string>) {
-                    contextStr = arg;
-                } else if constexpr (std::is_same_v<std::string_view, T> || std::is_same_v<std::pmr::string, T>) {
-                    contextStr = std::string(arg);
-                } else if constexpr (std::is_arithmetic_v<T>) {
-                    contextStr = std::to_string(arg);
-                } else {
-                    contextStr.clear();
-                }
-            }).visit(ctxTime.context);
-
-            ctxParam.emplace(gr::settings::kContextField, contextStr);
-            ctxParam.emplace(gr::settings::kContextTimeField, ctxTime.time);
-            ctxParam.emplace(serialization_fields::BLOCK_PARAMETERS, writeParameters(settingsMap));
-            ctxParamsSeq.emplace_back(std::move(ctxParam));
-        }
+    pmt::Value::Map parameters;
+    for (const auto& [key, value] : settings::detail::FrameworkAccess::savedValues(block->settings())) {
+        parameters[key] = value;
     }
-    if (!ctxParamsSeq.empty()) { // absent and empty mean the same thing to a reader, as for meta_information
-        result.emplace(serialization_fields::BLOCK_CTX_PARAMETERS, std::move(ctxParamsSeq));
-    }
+    parameters[convert_string_domain(serialization_fields::BLOCK_NAME)] = std::string(block->name()); // a graph file names every block, given or not
+    result.emplace(serialization_fields::BLOCK_PARAMETERS, std::move(parameters));
     if (property_map couplings = block->settings().tagCouplings(); !couplings.empty()) {
         result.emplace(serialization_fields::BLOCK_TAG_COUPLINGS, std::move(couplings));
     }
@@ -151,7 +88,11 @@ property_map serializeBlockImpl(gr::PluginLoader& pluginLoader, const std::share
 property_map serializeBlock(PluginLoader& pluginLoader, const std::shared_ptr<BlockModel>& block, int flags) {
     property_map map;
 
-    if (const gr::Graph* subgraph = block->graph()) {
+    // a recipe composite saves as its recipe's type with its parameters, and a load builds its inner graph again
+    if (const std::string_view recipeType = block->recipeType(); !recipeType.empty()) {
+        map                                                        = serializeBlockImpl(pluginLoader, block, flags);
+        map[convert_string_domain(serialization_fields::BLOCK_ID)] = std::string(recipeType);
+    } else if (const gr::Graph* subgraph = block->graph(); subgraph != nullptr) {
         map.emplace(serialization_fields::BLOCK_ID, "SUBGRAPH"s);
         map[convert_string_domain(serialization_fields::BLOCK_UNIQUE_NAME)] = std::string(block->uniqueName());
 
@@ -163,6 +104,15 @@ property_map serializeBlock(PluginLoader& pluginLoader, const std::shared_ptr<Bl
         pmt::Value& parameters = map[convert_string_domain(serialization_fields::BLOCK_PARAMETERS)];
         if (parameters.get_if<property_map>() == nullptr) {
             parameters = property_map{};
+        }
+        // a subgraph that loads again holds the inner graph as saved, and no recipe parameter
+        for (const std::string& parameter : settings::detail::FrameworkAccess::parameterNames(block->settings())) {
+            parameters.get_if<property_map>()->erase(convert_string_domain(parameter));
+            if (const auto couplings = map.find(convert_string_domain(serialization_fields::BLOCK_TAG_COUPLINGS)); couplings != map.end()) {
+                if (property_map* coupled = couplings->second.get_if<property_map>(); coupled != nullptr) {
+                    coupled->erase(convert_string_domain(parameter));
+                }
+            }
         }
         (*parameters.get_if<property_map>())[convert_string_domain(serialization_fields::BLOCK_NAME)] = std::string(block->name());
 

@@ -19,20 +19,24 @@ namespace qa_msg {
 struct MessageFlooder : gr::Block<MessageFlooder> {
     gr::PortOut<float> out;
 
-    gr::Annotated<gr::Size_t, "notifications to emit before requesting stop"> n_messages = 1U;
+    struct Settings {
+        gr::Annotated<gr::Size_t, gr::Doc<"notifications to emit before requesting stop">> n_messages = 1U;
 
-    GR_MAKE_REFLECTABLE(MessageFlooder, out, n_messages);
+        GR_MAKE_REFLECTABLE(Settings, n_messages);
+    } settings;
 
-    gr::Size_t _nEmitted = 0U;
+    GR_MAKE_REFLECTABLE(MessageFlooder, out, settings);
+
+    gr::Size_t nEmitted = 0U;
 
     gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
-        if (_nEmitted >= n_messages) {
+        if (nEmitted >= settings.n_messages) {
             outSpan.publish(0UZ);
             this->requestStop();
             return gr::work::Status::DONE;
         }
-        this->emitMessage("qa_MessagePlane::flood", {{"seq", _nEmitted}});
-        _nEmitted++;
+        this->emitMessage("qa_MessagePlane::flood", {{"seq", nEmitted}});
+        nEmitted++;
         outSpan.publish(std::min(outSpan.size(), 1UZ));
         return gr::work::Status::OK;
     }
@@ -54,21 +58,25 @@ constexpr std::string_view kDeviceLost = "the device disappeared";
 struct DeviceLossSource : gr::Block<DeviceLossSource> {
     gr::PortOut<float> out;
 
-    gr::Annotated<bool, "return ERROR after the report"> fail_after_report = true;
+    struct Settings {
+        gr::Annotated<bool, gr::Doc<"return ERROR after the report">> fail_after_report = true;
 
-    GR_MAKE_REFLECTABLE(DeviceLossSource, out, fail_after_report);
+        GR_MAKE_REFLECTABLE(Settings, fail_after_report);
+    } settings;
 
-    bool _reported = false;
+    GR_MAKE_REFLECTABLE(DeviceLossSource, out, settings);
+
+    bool reported = false;
 
     gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
-        if (!_reported) {
+        if (!reported) {
             this->emitErrorMessage("processBulk", kDeviceLost);
-            _reported = true;
+            reported = true;
             outSpan.publish(std::min(outSpan.size(), 1UZ));
             return gr::work::Status::OK;
         }
         outSpan.publish(0UZ);
-        return fail_after_report ? gr::work::Status::ERROR : gr::work::Status::DONE;
+        return settings.fail_after_report ? gr::work::Status::ERROR : gr::work::Status::DONE;
     }
 };
 
@@ -78,18 +86,22 @@ constexpr std::string_view kSensorFault = "the sensor stopped answering";
 struct ErrorAfterReportSource : gr::Block<ErrorAfterReportSource> {
     gr::PortOut<float> out;
 
-    gr::Annotated<bool, "report a fault before the ERROR"> report_first = false;
+    struct Settings {
+        gr::Annotated<bool, gr::Doc<"report a fault before the ERROR">> report_first = false;
 
-    GR_MAKE_REFLECTABLE(ErrorAfterReportSource, out, report_first);
+        GR_MAKE_REFLECTABLE(Settings, report_first);
+    } settings;
 
-    const bool* _awaitedReport = nullptr;
+    GR_MAKE_REFLECTABLE(ErrorAfterReportSource, out, settings);
+
+    const bool* awaitedReport = nullptr;
 
     gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
         outSpan.publish(0UZ);
-        if (_awaitedReport == nullptr || !*_awaitedReport) {
+        if (awaitedReport == nullptr || !*awaitedReport) {
             return gr::work::Status::OK;
         }
-        if (report_first) {
+        if (settings.report_first) {
             this->emitErrorMessage("processBulk", kSensorFault);
         }
         return gr::work::Status::ERROR;
@@ -106,13 +118,13 @@ struct ReplyKeepingScheduler : gr::scheduler::Simple<> {
     using gr::scheduler::Simple<>::_unforwardedReplies;
 };
 
-// messages to the kSetting property with the given command, each carrying its index as the client request ID
+// messages to the kEcho property with the given command, each carrying its index as the client request ID
 [[nodiscard]] std::vector<gr::Message> makeNumberedMessages(std::size_t count, gr::message::Command cmd, std::string_view serviceName) {
     std::vector<gr::Message> messages(count);
     for (std::size_t i = 0UZ; i < count; ++i) {
         messages[i].cmd             = cmd;
         messages[i].serviceName     = serviceName;
-        messages[i].endpoint        = gr::block::property::kSetting;
+        messages[i].endpoint        = gr::block::property::kEcho;
         messages[i].clientRequestID = std::to_string(i);
     }
     return messages;
@@ -176,19 +188,6 @@ const boost::ut::suite<"message plane back-pressure"> messagePlaneTests = [] {
         expect(gt(stalledSubscriber.streamReader().available(), 0UZ)) << "the subscriber should have received what fitted";
         expect(gt(message::droppedMessageCount().load(std::memory_order_relaxed) - nBefore, 0UZ)) << "messages that did not fit must be counted as drops";
     };
-
-    "processScheduledMessages() sends a kHeartbeat notify only where a subscriber is registered"_test = [] {
-        qa_msg::SilentBlock block;
-        MsgPortIn           reader;
-        expect(block.msgOut.connect(reader).has_value());
-
-        block.processScheduledMessages();
-        expect(eq(reader.streamReader().available(), 0UZ)) << "no subscriber is registered yet, so nothing should have been sent";
-
-        block.propertySubscriptions[std::string(block::property::kHeartbeat)].insert("test-client");
-        block.processScheduledMessages();
-        expect(eq(reader.streamReader().available(), 1UZ)) << "a registered subscriber must still receive exactly one heartbeat per poll";
-    };
 };
 
 const boost::ut::suite<"a block error that ends the run"> blockErrorRunTests = [] {
@@ -246,7 +245,7 @@ const boost::ut::suite<"a block error that ends the run"> blockErrorRunTests = [
         expect(sched.exchange(std::move(flow)).has_value());
 
         expect(sched.runAndWait().has_value()) << "a run that ends with DONE succeeds whatever its blocks reported";
-        expect(source._reported) << "the block must have sent its report";
+        expect(source.reported) << "the block must have sent its report";
     };
 
     // one scheduler thread traverses the blocks in turn, and the failing source waits for the other block's report, so
@@ -260,7 +259,7 @@ const boost::ut::suite<"a block error that ends the run"> blockErrorRunTests = [
             auto&     failingSink  = flow.emplaceBlock<qa_msg::NullSink>();
             expect(flow.connect<"out", "in">(reporter, reporterSink).has_value());
             expect(flow.connect<"out", "in">(failing, failingSink).has_value());
-            failing._awaitedReport = &reporter._reported;
+            failing.awaitedReport = &reporter.reported;
             const std::string reporterName(reporter.unique_name);
             const std::string failingName(failing.unique_name);
 
@@ -270,7 +269,7 @@ const boost::ut::suite<"a block error that ends the run"> blockErrorRunTests = [
             expect(sched.exchange(std::move(flow)).has_value());
 
             const std::expected<void, Error> result = sched.runAndWait();
-            expect(reporter._reported) << "the surviving block must have sent its report";
+            expect(reporter.reported) << "the surviving block must have sent its report";
             expect(!result.has_value()) << "a block that ends its run with ERROR must fail the run";
             if (!result.has_value()) {
                 const std::string& message = result.error().message;
@@ -300,7 +299,7 @@ const boost::ut::suite<"replies kept for a full message output"> keptReplyTests 
         expect(eq(reader.streamReader().available(), capacity)) << "the notifications should fill msgOut";
 
         constexpr std::size_t nOverflow = 3UZ;
-        const auto            requests  = qa_msg::makeNumberedMessages(capacity + nOverflow, message::Command::Get, block.unique_name);
+        const auto            requests  = qa_msg::makeNumberedMessages(capacity + nOverflow, message::Command::Set, block.unique_name);
         const std::size_t     nBefore   = message::droppedMessageCount().load(std::memory_order_relaxed);
         block.processMessages(block.msgIn, requests);
         expect(eq(block._unsentReplies.size(), capacity)) << "the kept replies should stop at the size of msgOut";

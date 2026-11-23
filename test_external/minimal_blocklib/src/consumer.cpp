@@ -18,8 +18,7 @@
 // also keeps a static library's objects from being discarded.
 int main() {
     gr::minimal_blocklib::Gain<float> direct;
-    direct.gain = 2.0F;
-    if (direct.processOne(3.0F) != 6.0F) {
+    if (!direct.set("gain", 2.0F) || direct.processOne(3.0F) != 6.0F) {
         std::println(stderr, "the directly instantiated block did not compute");
         return 1;
     }

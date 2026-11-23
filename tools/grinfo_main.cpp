@@ -73,7 +73,7 @@ constexpr std::size_t kWidth = 80UZ;
 
 // The settings gr::Block declares on behalf of every block. They carry the same name, type and default everywhere,
 // so the report leaves them out of a block's own table unless they are asked for.
-constexpr std::array<std::string_view, 8> kFrameworkSettings{"compute_domain", "disconnect_on_done", "input_chunk_size", "name", "output_chunk_size", "stride", "ui_constraints", "unique_name"};
+constexpr std::array<std::string_view, 9> kFrameworkSettings{"compute_domain", "disconnect_on_done", "input_chunk_size", "name", "notification_level", "output_chunk_size", "stride", "ui_constraints", "unique_name"};
 
 constexpr std::string_view kUsage = R"(grinfo - report the GNU Radio 4 framework, its plugins, blocks and schedulers
 
@@ -320,10 +320,13 @@ struct Column {
     // whether a column that reads the same on every row is worth taking out of the table: the column a row is
     // looked up by never is, however often it repeats
     bool collapsible = false;
+    // whether the column gives way first, down to its header, when a line would run over: a column a reader can do
+    // without at a glance, so that the columns a row is read by keep their width
+    bool yieldsFirst = false;
 };
 
 // Rows printed as columns two spaces apart within the report's width: a column no wider than its widest cell until
-// the line would run over, and then the widest column gives way and its cells are cut. A row whose last cells are
+// the line would run over, and then a column that yields first gives way, then the widest, and their cells are cut. A row whose last cells are
 // empty ends where its last filled cell does. A set of headers that are all empty prints no header line, which is
 // what a listing that names its columns in the line above it needs.
 void printTable(std::string_view indent, std::span<const Column> columns, std::span<const std::vector<std::string>> rows) {
@@ -346,6 +349,11 @@ void printTable(std::string_view indent, std::span<const Column> columns, std::s
         }
         return width;
     };
+    for (std::size_t i = 0UZ; i < columns.size(); ++i) {
+        if (columns[i].yieldsFirst && total() > kWidth) {
+            widths[i] = std::max(columns[i].header.size(), widths[i] - std::min(widths[i], total() - kWidth));
+        }
+    }
     while (total() > kWidth) {
         const auto widest = std::ranges::max_element(widths);
         if (*widest <= 4UZ) {
@@ -562,9 +570,11 @@ struct Setting {
     std::string                   description;
     std::string                   documentation;
     std::string                   enumValues;
-    std::string                   tagKey; // the tag key the instance couples the setting to, empty for none
-    bool                          writable = false;
-    bool                          visible  = true;
+    std::string                   limits;       // the values the setting takes, as the metadata states them: "> 0 and < 0.5"
+    std::string                   kind;         // `setting`, or `status` for a value the block reports and no caller sets
+    std::string                   updatePolicy; // `stopped`, or `topology` for a port key; empty where the block declares none
+    std::string                   tagKey;       // the tag key the instance couples the setting to, empty for none
+    bool                          visible = true;
 };
 
 enum class KeyOrigin : std::uint8_t { ThisProgram, BlockLibrary, Plugin, LinkedLibrary, NotAttributed };
@@ -709,15 +719,23 @@ void collectPorts(gr::BlockModel::DynamicPorts& ports, std::string_view directio
 }
 
 void collectSettings(const gr::BlockModel& block, std::vector<Setting>& into) {
-    const gr::SettingsBase&      settings  = block.settings();
-    const gr::property_map&      meta      = block.metaInformation();
-    const gr::property_map       defaults  = settings.defaultParameters();
-    const std::set<std::string>& writable  = settings.writableMembers();
-    const gr::property_map       couplings = settings.tagCouplings();
+    const gr::SettingsBase&     settings  = block.settings();
+    const gr::property_map&     meta      = block.metaInformation();
+    const gr::property_map      defaults  = gr::settings::heldValues(settings.get()); // before `init()`, each key at its default
+    const std::set<std::string> writable  = settings.writableMembers();
+    const gr::property_map      couplings = settings.tagCouplings();
 
     std::set<std::string> names(writable.begin(), writable.end());
     for (const auto& [name, _] : defaults) {
         names.emplace(std::string_view(name));
+    }
+    // a status value holds no value before `init()`; its declaration's metadata names it. A member group's entry names
+    // a pattern, whose members the defaults hold
+    constexpr std::string_view kTypeSuffix = "::type";
+    for (const auto& [key, _] : meta) {
+        if (const std::string_view metaKey(key); metaKey.ends_with(kTypeSuffix) && !metaKey.contains('*')) {
+            names.emplace(metaKey.substr(0UZ, metaKey.size() - kTypeSuffix.size()));
+        }
     }
     for (const std::string& name : names) {
         Setting setting;
@@ -726,12 +744,16 @@ void collectSettings(const gr::BlockModel& block, std::vector<Setting>& into) {
         if (stored != defaults.cend()) {
             setting.defaultValue = stored->second;
             setting.type         = gr::pmt::detail::type_name(stored->second);
+        } else {
+            setting.type = metaString(meta, name + "::type"); // a key that holds no value, as a status value before `init()`
         }
         setting.unit          = metaString(meta, name + "::unit");
         setting.description   = metaString(meta, name + "::description");
         setting.documentation = metaString(meta, name + "::documentation");
         setting.enumValues    = metaString(meta, name + "::enum_values");
-        setting.writable      = writable.contains(name);
+        setting.limits        = metaString(meta, name + "::limits");
+        setting.kind          = writable.contains(name) ? "setting" : "status";
+        setting.updatePolicy  = metaString(meta, name + "::update_policy");
         setting.tagKey        = metaString(couplings, name);
         if (const auto visible = meta.find(name + "::visible"); visible != meta.cend()) {
             setting.visible = visible->second.value_or(true);
@@ -761,9 +783,9 @@ void collectSettings(const gr::BlockModel& block, std::vector<Setting>& into) {
 /**
  * @brief Reads one registered key from a default-constructed instance of it.
  *
- * `settings().init()` is the call that copies a block's annotations into its meta information and stores its
- * defaults, and it needs neither a progress counter nor a thread pool, so the block is never started. Anything the
- * instance throws on the way is kept as that key's error and every other key is read as before.
+ * The settings' `describe()` copies a block's annotations into its meta information and its described defaults into
+ * their fields, and calls no block hook and checks nothing, so the block is never initialized or started. Anything
+ * the instance throws on the way is kept as that key's error and every other key is read as before.
  */
 [[nodiscard]] Instantiation readKey(Context& context, const std::string& key, Registry registry, bool detailed) {
     const KeyParts parts = partsOf(key);
@@ -808,7 +830,7 @@ void collectSettings(const gr::BlockModel& block, std::vector<Setting>& into) {
 
     fact.detailed = true;
     try {
-        instance->settings().init();
+        gr::settings::detail::FrameworkAccess::describe(instance->settings());
     } catch (const gr::exception& error) {
         fact.settingsError = error.message;
     } catch (const std::exception& error) {
@@ -1106,7 +1128,7 @@ void printSection(std::string_view indent, std::string_view name, std::string_vi
 
 constexpr std::array<Column, 9> kPortColumns{Column{.header = "port"}, Column{.header = "direction"}, Column{.header = "type"}, Column{.header = "port type", .collapsible = true}, Column{.header = "domain", .collapsible = true}, Column{.header = "sync", .collapsible = true}, Column{.header = "optional", .collapsible = true}, Column{.header = "collection", .collapsible = true}, Column{.header = "samples", .collapsible = true}};
 
-constexpr std::array<Column, 5> kSettingColumns{Column{.header = "setting"}, Column{.header = "type"}, Column{.header = "default"}, Column{.header = "unit", .collapsible = true}, Column{.header = "writable", .collapsible = true}};
+constexpr std::array<Column, 7> kSettingColumns{Column{.header = "setting"}, Column{.header = "type"}, Column{.header = "default"}, Column{.header = "unit", .collapsible = true}, Column{.header = "limits", .collapsible = true, .yieldsFirst = true}, Column{.header = "kind", .collapsible = true}, Column{.header = "update policy", .collapsible = true}};
 
 constexpr std::array<Column, 3> kDifferenceColumns{Column{.header = "item"}, Column{.header = "name"}, Column{.header = "types"}};
 
@@ -1156,7 +1178,7 @@ struct BlockTables {
             if (!setting.enumValues.empty()) {
                 type += std::format(" (enum: {})", setting.enumValues);
             }
-            place(settings, settingCells, setting.name, i, fact.parameters).push_back({std::move(type), defaultText(setting), setting.unit, yesNo(setting.writable)});
+            place(settings, settingCells, setting.name, i, fact.parameters).push_back({std::move(type), defaultText(setting), setting.unit, setting.limits, setting.kind, setting.updatePolicy});
         }
     }
 
@@ -1460,7 +1482,9 @@ void writeSetting(JsonWriter& json, const Setting& setting) {
     json.member("description", setting.description);
     json.member("documentation", setting.documentation);
     json.member("enumValues", setting.enumValues);
-    json.flag("writable", setting.writable);
+    json.member("limits", setting.limits);
+    json.member("kind", setting.kind);
+    json.member("updatePolicy", setting.updatePolicy);
     json.member("tagKey", setting.tagKey);
     json.flag("visible", setting.visible);
     json.flag("framework", std::ranges::contains(kFrameworkSettings, std::string_view(setting.name)));

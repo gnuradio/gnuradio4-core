@@ -273,7 +273,9 @@ struct YamlDefinitionsLoader {
     }
 };
 
-std::expected<std::shared_ptr<gr::BlockModel>, gr::Error> instantiateBlockFromYamlDefinition(gr::PluginLoader& loader, const YamlDefinitionsLoader::Definition& def, const property_map& parameters = {}) noexcept;
+/// builds the block a YAML definition describes; an error carries the definition's refusal, and a setting refused inside
+/// the definition throws `settings::RefusedSettings`
+std::expected<std::shared_ptr<gr::BlockModel>, gr::Error> instantiateBlockFromYamlDefinition(gr::PluginLoader& loader, const YamlDefinitionsLoader::Definition& def, const property_map& parameters = {});
 
 } // namespace detail
 
@@ -733,7 +735,8 @@ public:
 
     /// Instantiates `name` and keeps the reason a YAML definition refuses. The block is null when no
     /// block, plugin or definition is registered under `name`. An error carries the reason the
-    /// definition gave. A block constructor that throws propagates its exception.
+    /// definition gave. A block constructor's exception propagates, and a setting refused inside a definition throws
+    /// `settings::RefusedSettings`.
     std::expected<std::shared_ptr<gr::BlockModel>, gr::Error> instantiateOrError(std::string_view name, const property_map& params = property_map{}) {
         // Try to create a node from the global registry
         if (auto result = _registry->create(name, params)) {
@@ -754,7 +757,8 @@ public:
         return std::shared_ptr<gr::BlockModel>{};
     }
 
-    /// Calls instantiateOrError(), prints a definition's refusal and returns null for it.
+    /// Calls instantiateOrError(), prints a definition's refusal and returns null for it. A setting refused inside a
+    /// definition throws `settings::RefusedSettings`.
     std::shared_ptr<gr::BlockModel> instantiate(std::string_view name, const property_map& params = property_map{}) {
         auto result = instantiateOrError(name, params);
         if (!result) {

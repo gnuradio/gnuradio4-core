@@ -56,7 +56,7 @@
 // entry and Block stores its cooperative finish flag. The scheduler drain virtual
 // interface requires matching plugins to be rebuilt.
 // Composition appends two scheduler virtual entries beyond cooperative finish.
-#define GR_PLUGIN_CURRENT_ABI_VERSION 14
+#define GR_PLUGIN_CURRENT_ABI_VERSION 15
 
 namespace gr {
 
@@ -166,7 +166,6 @@ public:
     }
 
     template<BlockLike TBlock>
-    requires std::is_constructible_v<TBlock, property_map>
     bool insert(std::string_view alias = "", std::string_view aliasParameters = "", std::uint8_t abiVersion = GR_PLUGIN_CURRENT_ABI_VERSION) {
         return insert(gr::meta::type_name<TBlock>(), makeRegistryAlias(alias, aliasParameters), defaultFactory<TBlock>, abiVersion);
     }

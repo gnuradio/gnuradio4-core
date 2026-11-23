@@ -245,17 +245,15 @@ inline EM_CONSTEXPR_STATIC DefaultTag<"trigger_time", uint64_t, "ns", "UTC-based
 inline EM_CONSTEXPR_STATIC DefaultTag<"trigger_offset", float, "s", "sample delay w.r.t. the trigger (e.g.compensating analog group delays)"> TRIGGER_OFFSET;
 inline EM_CONSTEXPR_STATIC DefaultTag<"trigger_meta_info", property_map, "", "maps containing additional trigger information"> TRIGGER_META_INFO;
 inline EM_CONSTEXPR_STATIC DefaultTag<"local_time", uint64_t, "ns", "UTC-based time-stamp (host)"> LOCAL_TIME; // should be only in 'TRIGGER_META_INFO', used for metering sample vs. time propagation delays
-inline EM_CONSTEXPR_STATIC DefaultTag<"context", std::string, "", "multiplexing key to orchestrate node settings/behavioural changes"> CONTEXT;
-inline EM_CONSTEXPR_STATIC DefaultTag<"ctx_time", std::uint64_t, "ns", "UTC time at which the tag's context takes effect"> CONTEXT_TIME;
+inline EM_CONSTEXPR_STATIC DefaultTag<"context", std::string, "", "multiplexing key, matched by trigger names"> CONTEXT;
 inline EM_CONSTEXPR_STATIC DefaultTag<"reset_default", bool, "", "reset block state to stored default"> RESET_DEFAULTS;
-inline EM_CONSTEXPR_STATIC DefaultTag<"store_default", bool, "", "store block settings as default"> STORE_DEFAULTS;
 inline EM_CONSTEXPR_STATIC DefaultTag<"end_of_stream", bool, "", "end of stream, receiver should change to DONE state"> END_OF_STREAM;
 inline EM_CONSTEXPR_STATIC DefaultTag<"tx_sob", bool, "", "start of a transmit burst, on the burst's first sample"> TX_SOB;
 inline EM_CONSTEXPR_STATIC DefaultTag<"tx_eob", bool, "", "end of a transmit burst, on the burst's last sample"> TX_EOB;
 inline EM_CONSTEXPR_STATIC DefaultTag<"tx_time", std::uint64_t, "ns", "UTC time at which the tagged sample, a burst's first, leaves the antenna"> TX_TIME;
 
 /// the gr: keys the framework itself acts on in every block a tag reaches; no setting may be coupled to one
-inline constexpr std::array<std::string_view, 5> kControlKeys = {END_OF_STREAM.key(), RESET_DEFAULTS.key(), STORE_DEFAULTS.key(), CONTEXT.key(), CONTEXT_TIME.key()};
+inline constexpr std::array<std::string_view, 2> kControlKeys = {END_OF_STREAM.key(), RESET_DEFAULTS.key()};
 
 template<typename T>
 inline void put(property_map& map, std::string_view key, T&& value) {

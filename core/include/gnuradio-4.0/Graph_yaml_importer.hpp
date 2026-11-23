@@ -9,6 +9,7 @@
 #include <optional>
 #include <ranges>
 #include <set>
+#include <span>
 #include <vector>
 
 #include <gnuradio-4.0/meta/indirect.hpp>
@@ -29,11 +30,10 @@ namespace gr {
  * A key names the one block or subgraph that carries it as its `unique_name` or its `name`. A key no block carries, a
  * key two blocks carry and two keys for one block are refused before any block is made. A key the block does not
  * declare, given or in the file's `parameters`, is refused after the block is constructed and before it joins the graph.
- * A key of a `ctx_parameters` entry that names none of the block's readable members is refused the same way. A key the
- * block does not declare belongs under the entry's `meta_information`. The entry's map replaces those keys of the
- * block's `parameters`. Every block is constructed with the merged parameters, and its settings load the same map. Its
- * constructor, `settingsChanged()` and `start()` see the given values. A port count such as `n_inputs` sizes the ports
- * before the connections are made.
+ * A key the block does not declare belongs under the entry's `meta_information`. The entry's map replaces those keys of
+ * the block's `parameters`. Every block is constructed with the merged parameters, which its settings check and apply
+ * when the graph takes the block. Its constructor, `applySettings()` and `start()` see the given values. A port count
+ * such as `n_inputs` sizes the ports before the connections are made.
  */
 using BlockSettings = std::map<std::string, property_map, std::less<>>;
 
@@ -235,12 +235,13 @@ inline std::vector<const property_map*> resolveBlockSettings(const Tensor<pmt::V
     return settingsByPosition;
 }
 
-/// Throws for a key of `parameters` that `declared` does not hold, naming the nearest declared keys.
+/// Throws `settings::RefusedSettings` for a key of `parameters` that `declared` does not hold, naming the nearest declared
+/// keys; its entry is the key, "unknown setting".
 inline void checkDeclared(const std::set<std::string>& declared, std::string_view blockName, std::string_view typeName, const property_map& parameters) {
     for (const auto& [key, value] : parameters) {
         const std::string_view name(key.data(), key.size());
         if (!declared.contains(std::string(name))) {
-            throw gr::exception(std::format("block '{}' of type '{}' declares no setting named '{}'; the nearest are {}", blockName, typeName, name, closestNames(name, declared)));
+            throw settings::RefusedSettings(std::format("block '{}' of type '{}' declares no setting named '{}'; the nearest are {}", blockName, typeName, name, closestNames(name, declared)), settings::Rejected{settings::Rejection{.key = std::string(name), .reason = "unknown setting"}}, blockName);
         }
     }
 }
@@ -269,37 +270,11 @@ inline property_map readEntryParameters(const property_map& grcBlock, const Bloc
     return *parameters;
 }
 
-/// Loads `parameters`, the entry's `ctx_parameters` and its `tag_couplings` into the block's settings and activates the
-/// default context. `tag_couplings` maps a setting's name to the tag key that sets it.
-inline void loadEntrySettings(BlockModel& block, const property_map& grcBlock, const property_map& parameters, const BlockIdentity& identity) {
-    if (auto loaded = loadRemainingSettings(block, identity.name, identity.type, parameters); !loaded.has_value()) {
-        throw gr::exception(loaded.error().message, loaded.error().sourceLocation);
-    }
-
-    if (auto it = grcBlock.find("ctx_parameters"); it != grcBlock.end()) {
-        const auto parametersCtx = checked_access_ptr<const Tensor<pmt::Value>, false>{it->second.get_if<Tensor<pmt::Value>>()};
-        if (parametersCtx == nullptr) {
-            throw gr::exception(std::format("Unable to create block '{}' of type '{}': ctx_parameters is not a list", identity.name, identity.type));
-        }
-
-        // a context's keys are checked against the readable members. The writer stores every readable member there.
-        const std::set<std::string> readable = block.settings().readableMembers();
-        for (const auto& ctxPmt : *parametersCtx) {
-            const auto ctxPar = checked_access_ptr<const property_map, false>{ctxPmt.get_if<property_map>()};
-            if (ctxPar == nullptr) {
-                throw gr::exception(std::format("Unable to create block '{}' of type '{}': a ctx_parameters entry is not a map", identity.name, identity.type));
-            }
-
-            const auto ctxName       = ctxPar->at(std::pmr::string(gr::settings::kContextField)).value_or(std::string_view{});
-            const auto ctxTime       = checked_access_ptr<const std::uint64_t, false>{ctxPar->at(std::pmr::string(gr::settings::kContextTimeField)).get_if<std::uint64_t>()};
-            const auto ctxParameters = checked_access_ptr<const property_map, false>{ctxPar->at("parameters").get_if<property_map>()};
-            if (ctxName.data() == nullptr || ctxTime == nullptr || ctxParameters == nullptr) {
-                throw gr::exception(std::format("Unable to create block '{}' of type '{}': a ctx_parameters entry needs a context, a context_time and a parameters map", identity.name, identity.type));
-            }
-
-            checkDeclared(readable, identity.name, block.typeName(), *ctxParameters);
-            block.settings().loadParametersFromPropertyMap(*ctxParameters, SettingsCtx{*ctxTime, ctxName});
-        }
+/// Loads the entry's `tag_couplings`, a setting's name to the tag key that sets it, and, for a block not constructed with
+/// them, its `parameters`.
+inline void loadEntrySettings(BlockModel& block, const property_map& grcBlock, const property_map* parametersToLoad, const BlockIdentity& identity) {
+    if (parametersToLoad != nullptr) {
+        loadRemainingSettings(block, identity.name, identity.type, *parametersToLoad);
     }
 
     if (auto it = grcBlock.find(serialization_fields::BLOCK_TAG_COUPLINGS); it != grcBlock.end()) {
@@ -307,15 +282,9 @@ inline void loadEntrySettings(BlockModel& block, const property_map& grcBlock, c
         if (couplings == nullptr) {
             throw gr::exception(std::format("Unable to create block '{}' of type '{}': tag_couplings is not a map", identity.name, identity.type));
         }
-        try {
-            block.settings().setTagCouplings(*couplings);
-        } catch (const gr::exception& refused) {
-            throw gr::exception(std::format("Unable to create block '{}' of type '{}': {}", identity.name, identity.type, refused.message));
+        if (const std::expected<void, settings::Rejected> coupled = block.settings().setTagCouplings(*couplings); !coupled) {
+            throw settings::RefusedSettings(std::format("Unable to create block '{}' of type '{}': {}", identity.name, identity.type, settings::describeRejected(coupled.error())), coupled.error(), identity.name);
         }
-    }
-
-    if (const auto failed = block.settings().activateContext(); failed == std::nullopt) {
-        throw gr::exception("Settings for context could not be activated");
     }
 }
 
@@ -338,12 +307,13 @@ inline void loadEntrySettings(BlockModel& block, const property_map& grcBlock, c
     return minBufferSize;
 }
 
-inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGraph, gr::property_map yaml, const BlockSettings& overrides = {}, std::source_location location = std::source_location::current()) {
+/// Loads a graph file's map into `resultGraph`, or the `graph` of one of its `SUBGRAPH` entries.
+inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGraph, const gr::property_map& yaml, const BlockSettings& overrides = {}, std::source_location location = std::source_location::current()) {
     LoadedBlocks createdBlocks;
 
     Tensor<pmt::Value> blks;
     if (auto it = yaml.find("blocks"); it != yaml.end()) {
-        if (const auto blkRef = checked_access_ptr<Tensor<pmt::Value>, false>{it->second.get_if<Tensor<pmt::Value>>()}; blkRef != nullptr) {
+        if (const auto blkRef = checked_access_ptr<const Tensor<pmt::Value>, false>{it->second.get_if<Tensor<pmt::Value>>()}; blkRef != nullptr) {
             blks = *blkRef;
         }
     }
@@ -388,7 +358,7 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
             }
             const auto&        graphData    = *_graphData;
             gr::Graph&         graph        = *graphWrapper->graph();
-            const LoadedBlocks innerBlocks  = loadGraphFromMap(loader, graph, graphData);
+            const LoadedBlocks innerBlocks  = loadGraphFromMap(loader, graph, graphData, {}, location);
             const auto         exportedIt   = graphData.find("exported_ports");
             const auto         exportedList = exportedIt == graphData.cend() ? Tensor<pmt::Value>() : exportedIt->second.value_or(Tensor<pmt::Value>());
             for (const auto& exportedPort_ : exportedList) {
@@ -458,7 +428,7 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
             // A registered block is constructed with its whole map, so that its constructor sees the values it runs
             // with. A definition takes only its exported parameters.
             const property_map& constructedWith = split.fromDefinition ? split.exported : parameters;
-            const auto          instantiated    = loader.instantiateOrError(blockType, constructedWith);
+            const auto          instantiated    = split.fromDefinition ? instantiateDefinition(loader, blockType, blockName, constructedWith) : loader.instantiateOrError(blockType, constructedWith);
             if (!instantiated.has_value()) {
                 throw gr::exception(std::format("Unable to create block '{}' of type '{}': {}", blockName, blockType, instantiated.error().message));
             }
@@ -475,26 +445,32 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
             currentBlock = std::make_shared<GraphWrapper<gr::Graph>>(gr::Graph(loader, parameters));
         }
 
-        if (!split.fromDefinition) {
-            // the settings take the map once, below, and Settings::init() does not apply the constructor's copy again
-            currentBlock->settings().setInitBlockParameters({});
-        }
         checkDeclared(currentBlock->settings().writableMembers(), blockName, currentBlock->typeName(), parameters);
 
         currentBlock->setName(blockName);
-        loadEntrySettings(*currentBlock, grcBlock, parameters, identity);
+        // a definition is constructed with its exported parameters alone, so its other keys load as settings
+        loadEntrySettings(*currentBlock, grcBlock, split.fromDefinition ? &parameters : nullptr, identity);
         if (schedulerId.has_value()) {
-            // A scheduler's init() hides the block init() that addBlock() calls. The loader applies the scheduler's
+            // A scheduler's init() hides the block init() that addBlock() calls. The loader initializes the scheduler's
             // settings here.
-            const ApplyStagedParametersResult applied = currentBlock->settings().applyStagedParameters();
-            if (!applied.failedParameters.empty()) {
-                throw gr::exception(std::format("Unable to create block '{}' of type '{}': {}", blockName, *schedulerId, applied.refusal));
+            if (const std::expected<void, settings::Rejected> initialized = settings::detail::FrameworkAccess::init(currentBlock->settings()); !initialized) {
+                throw settings::RefusedSettings(std::format("Unable to create block '{}' of type '{}': {}", blockName, *schedulerId, settings::describeRejected(initialized.error())), initialized.error(), blockName);
             }
         }
         restoreMetaInformation(*currentBlock);
-        // a subgraph loads its blocks before it joins the graph. A refused inner block leaves the graph as it was.
+        // a subgraph loads its blocks before it joins the graph. A refused inner block leaves the graph as it was, and
+        // reads `<subgraph>.<block>` as its entries at a start do. A block under a nested scheduler reads its path from
+        // that scheduler at every outer level, as at a start, and the message names each subgraph the refusal passed
         if (isSubgraph) {
-            loadGraph(currentBlock);
+            try {
+                loadGraph(currentBlock);
+            } catch (const settings::RefusedSettings& refused) {
+                const bool                underNestedScheduler = schedulerId.has_value() || refused.underNestedScheduler;
+                const bool                keepsName            = blockName.empty() || underNestedScheduler || refused.block.empty();
+                settings::RefusedSettings named(blockName.empty() ? refused.message : std::format("subgraph '{}': {}", blockName, refused.message), refused.rejected, keepsName ? refused.block : std::format("{}.{}", blockName, refused.block), refused.sourceLocation);
+                named.underNestedScheduler = underNestedScheduler;
+                throw named;
+            }
         }
 
         const std::shared_ptr<BlockModel>& added = resultGraph.addBlock(std::move(currentBlock));
@@ -503,7 +479,7 @@ inline LoadedBlocks loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGrap
 
     Tensor<pmt::Value> connections;
     if (auto it = yaml.find("connections"); it != yaml.end()) {
-        if (const auto connRef = checked_access_ptr<Tensor<pmt::Value>, false>{it->second.get_if<Tensor<pmt::Value>>()}; connRef != nullptr) {
+        if (const auto connRef = checked_access_ptr<const Tensor<pmt::Value>, false>{it->second.get_if<Tensor<pmt::Value>>()}; connRef != nullptr) {
             connections = *connRef;
         }
     }
@@ -641,8 +617,7 @@ inline gr::property_map saveGraphToMap(PluginLoader& loader, const gr::Graph& ro
 } // namespace detail
 
 /// Reads a graph from a GRC document, with `overrides` merged over the parameters of the top-level blocks its keys name
-/// (see `BlockSettings`). A key no block carries, a key two blocks carry and a key a block does not declare are
-/// refused.
+/// (see `BlockSettings`). A key no block carries, a key two blocks carry and a key a block does not declare are refused.
 inline gr::meta::indirect<gr::Graph> loadGrc(PluginLoader& loader, std::string_view yamlSrc, const BlockSettings& overrides = {}, std::source_location location = std::source_location::current()) {
     gr::meta::indirect<gr::Graph> resultGraph{loader};
     const auto                    yaml = pmt::yaml::deserialize(yamlSrc);
@@ -658,7 +633,7 @@ inline gr::meta::indirect<gr::Graph> loadGrc(PluginLoader& loader, std::string_v
 /// skimming a block sees what it is before how it is configured. Every map in the document is
 /// emitted with these keys first and the remainder lexicographically, which also makes the
 /// output deterministic (the underlying map's own iteration order is a hash artifact).
-inline constexpr std::array<std::string_view, 13> grcYamlKeyOrder{"id", "name", "unique_name", "block_category", "meta_information", "parameters", "ctx_parameters", "tag_couplings", "scheduler", "exported_ports", "blocks", "connections", "graph"};
+inline constexpr std::array<std::string_view, 12> grcYamlKeyOrder{"id", "name", "unique_name", "block_category", "meta_information", "parameters", "tag_couplings", "scheduler", "exported_ports", "blocks", "connections", "graph"};
 
 inline std::string saveGrc(PluginLoader& loader, const gr::Graph& rootGraph) { return pmt::yaml::serialize(detail::saveGraphToMap(loader, rootGraph), grcYamlKeyOrder); }
 
@@ -776,8 +751,8 @@ inline std::expected<void, gr::Error> evaluateRecipeExpressions(Tensor<pmt::Valu
         if (blockEntry == nullptr) {
             continue;
         }
-        // only `parameters` takes expressions; a context's parameters and the tag couplings are read as written
-        for (const std::string_view literalKey : {std::string_view("ctx_parameters"), std::string_view("tag_couplings")}) {
+        // only `parameters` takes expressions; the tag couplings are read as written
+        for (const std::string_view literalKey : {std::string_view("tag_couplings")}) {
             if (const auto literalIt = blockEntry->find(std::pmr::string(literalKey)); literalIt != blockEntry->end()) {
                 if (auto found = firstRecipeExpressionIn(literalIt->second); found.has_value()) {
                     return std::unexpected(gr::Error(std::format("recipe_expression_parse: '{}' in {} is not evaluated; an expression belongs in parameters", recipe::detail::printableEcho(*found), literalKey)));
@@ -905,7 +880,7 @@ inline std::expected<void, gr::Error> evaluateRecipeExpressions(Tensor<pmt::Valu
 
 } // namespace detail
 
-inline std::expected<std::shared_ptr<gr::BlockModel>, gr::Error> detail::instantiateBlockFromYamlDefinition(PluginLoader& loader, const detail::YamlDefinitionsLoader::Definition& def, const property_map& parameters) noexcept {
+inline std::expected<std::shared_ptr<gr::BlockModel>, gr::Error> detail::instantiateBlockFromYamlDefinition(PluginLoader& loader, const detail::YamlDefinitionsLoader::Definition& def, const property_map& parameters) {
     try {
         // the expressions of a copy of the definition are evaluated against the declarations overlaid with the caller's
         // parameters before the graph loader runs, so the loader reads literal values alone
@@ -936,23 +911,41 @@ inline std::expected<std::shared_ptr<gr::BlockModel>, gr::Error> detail::instant
             }
         }
 
+        // the definition's outer subgraph is the block the caller names, so a refusal inside it names the inner block alone
+        std::string outerPrefix;
+        if (blocksList != nullptr && !blocksList->empty()) {
+            if (const auto* outer = (*blocksList)[0].get_if<property_map>(); outer != nullptr) {
+                if (const std::string outerName = readBlockIdentity(*outer).name; !outerName.empty()) {
+                    outerPrefix = std::format("{}.", outerName);
+                }
+            }
+        }
         gr::Graph tempGraph;
-        detail::loadGraphFromMap(loader, tempGraph, definition);
+        try {
+            detail::loadGraphFromMap(loader, tempGraph, definition);
+        } catch (const settings::RefusedSettings& refused) {
+            if (outerPrefix.empty() || refused.underNestedScheduler || !refused.block.starts_with(outerPrefix)) {
+                throw;
+            }
+            throw settings::RefusedSettings(refused.message, refused.rejected, refused.block.substr(outerPrefix.size()), refused.sourceLocation);
+        }
         auto blocks = tempGraph.blocks();
         if (blocks.empty()) {
             return std::unexpected(gr::Error{"YAML definition produced no blocks"});
         }
         if (!declarations.empty()) {
-            // a parameter change on the composite re-evaluates the expressions and stages the results. A
+            // a call that names a parameter on the composite re-evaluates the expressions and sets the results. A
             // scheduler-managed composite has no GraphWrapper to carry the bindings, so its parameters apply at
             // instantiation only.
             if (auto* wrapper = dynamic_cast<GraphWrapper<gr::Graph>*>(blocks.front().get()); wrapper != nullptr) {
-                if (auto attached = wrapper->attachRecipeBindings({.declarations = std::move(declarations), .bindings = std::move(bindings), .values = std::move(*values), .lastStaged = {}}); !attached.has_value()) {
+                if (auto attached = wrapper->attachRecipeBindings({.declarations = std::move(declarations), .bindings = std::move(bindings), .values = std::move(*values)}, parameters, def.metadata.block_type); !attached.has_value()) {
                     return std::unexpected(attached.error());
                 }
             }
         }
         return blocks.front();
+    } catch (const settings::RefusedSettings&) { // the caller receives the refused entries
+        throw;
     } catch (const gr::exception& e) {
         return std::unexpected(gr::Error{e});
     } catch (const std::exception& e) {

@@ -5,13 +5,14 @@
  * @brief Build and run a GNU Radio 4 flow graph without naming a framework template.
  *
  * Blocks and schedulers are selected by a string. Parameters and ports are selected by name. This header therefore
- * instantiates no `Block<T>`, `CtxSettings<T>`, `Port<T, ...>` or `SchedulerBase<...>`. Everything it declares is
+ * instantiates no `Block<T>`, `settings::BlockSettingsOf<T>`, `Port<T, ...>` or `SchedulerBase<...>`. Everything it declares is
  * compiled once into `gnuradio-core`. The typed API remains the choice where compile-time port checking matters.
  *
  * A consumer is built with the same compiler family as the installed `gnuradio-core`.
  */
 
 #include <gnuradio-4.0/Export.hpp>
+#include <gnuradio-4.0/SettingValue.hpp>
 #include <gnuradio-4.0/Tag.hpp>
 #include <gnuradio-4.0/Value.hpp>
 
@@ -40,9 +41,10 @@ struct Graph;
 class SchedulerModel;
 
 struct GNURADIO_EXPORT RuntimeError {
-    std::string   message;
-    std::string   where;    // the rendered source location of a framework error, or the method that refused
-    std::uint64_t time = 0; // ns since epoch when the framework reported it, 0 otherwise
+    std::string        message;
+    std::string        where;      // the rendered source location of a framework error, or the method that refused
+    std::uint64_t      time = 0;   // ns since epoch when the framework reported it, 0 otherwise
+    settings::Rejected rejected{}; // the refused settings, each key as `<block name>.<key>`, for an error that settings refused; empty otherwise
 };
 
 struct GNURADIO_EXPORT EdgeSpec {
@@ -80,17 +82,26 @@ public:
     [[nodiscard]] std::string uniqueName() const;
     [[nodiscard]] std::string typeName() const;
 
-    /// Stages parameters for the block to apply. A running block applies them at its next work call, and a block that
-    /// is not running applies them when its run starts. A key the block does not declare is an error naming the key.
-    /// A value that does not convert to its setting's type is an error carrying the block's reason. Either error stages
-    /// none of the parameters. A value outside the setting's limits is staged, and the block drops it without a report
-    /// when it applies it. The scheduler's handle refuses every call: a scheduler takes its settings in
-    /// `Runtime::create()`.
-    [[nodiscard]] std::expected<void, RuntimeError> setStaged(const property_map& parameters);
+    /// The block's settings calls, with the arguments and results of `SettingsBase`'s: `set` waits as `timeout` says,
+    /// `settings::noWait` for no wait, and `get` reads each key as a marked value. An empty handle refuses every call,
+    /// and the scheduler's handle refuses `set` and `check`, each with one entry that names no key: a scheduler takes
+    /// its settings in `Runtime::create()`.
+    [[nodiscard]] std::expected<settings::Values, settings::Rejected> set(const property_map& changes, settings::Timeout timeout = std::nullopt);
+    [[nodiscard]] std::expected<settings::Values, settings::Rejected> set(std::string_view key, pmt::Value value, settings::Timeout timeout = std::nullopt);
+    [[nodiscard]] std::expected<void, settings::Rejected>             check(const property_map& changes);
 
-    /// The block's settings as of its last settings change, or of the end of its last run.
-    [[nodiscard]] property_map              get(std::span<const std::string> keys = {}) const;
-    [[nodiscard]] std::optional<pmt::Value> get(const std::string& key) const;
+    [[nodiscard]] std::expected<settings::Value, settings::Rejected>  get(std::string_view key) const;
+    [[nodiscard]] std::expected<settings::Values, settings::Rejected> get(std::span<const std::string> keys = {}) const;
+
+    template<typename T>
+    [[nodiscard]] std::expected<T, settings::Rejected> get(std::string_view key) const {
+        return get(key).and_then([](const settings::Value& entry) { return entry.as<T>(); }).transform_error([key](settings::Rejected rejected) {
+            for (settings::Rejection& entry : rejected) {
+                entry.key = std::string(key);
+            }
+            return rejected;
+        });
+    }
 
     /// The keys the block declares as settable. The scheduler's handle lists its own keys, which only `Runtime::create()`
     /// takes.
@@ -137,14 +148,14 @@ public:
 
     /// Builds a block of `type` through the graph's loader, names it and adds it. A type the loader does not know is an
     /// error naming the type. A known type that cannot be built is an error with the loader's reason. A parameter the
-    /// block does not declare or refuses is an error carrying the block's refusal. A recipe takes the parameters its
+    /// block does not declare or refuses is an error whose `rejected` holds the block's refusal. A recipe takes the parameters its
     /// definition exports when it is built and the other keys as settings. A scheduler type is an error: a nested
     /// scheduler comes from a graph document through `fromYaml()`.
     [[nodiscard]] std::expected<BlockHandle, RuntimeError> emplace(std::string_view type, std::string_view name, property_map parameters = {});
 
     /// Adds a block the caller built, which can keep its own typed pointer. `name` renames the block when it is not
-    /// empty. A block whose settings refuse a key or a value when the graph initializes it is an error carrying the
-    /// reason.
+    /// empty. A block whose settings refuse the name, a key or a value when the graph initializes it is an error whose
+    /// `rejected` holds the refusal.
     [[nodiscard]] std::expected<BlockHandle, RuntimeError> add(std::shared_ptr<BlockModel> block, std::string_view name = {});
 
     /// The blocks of the graph and of its nested graphs, or with `Recursive::No` those of the graph alone.
@@ -164,7 +175,8 @@ public:
     ///
     /// The graph and a Runtime created from it share ownership of the loader. A document the reader refuses is an error
     /// carrying the reader's message, headed by the line and column for a document that does not parse. A block type
-    /// the loader does not know is an error naming the type.
+    /// the loader does not know is an error naming the type. A block or a scheduler whose settings refuse a value of the
+    /// document is an error whose `rejected` holds the refusal.
     ///
     /// `overrides` puts the caller's settings in place of the document's. Each key names a block at the document's top
     /// level by its `unique_name` or name. Its values replace those of the block's parameters before the block reads
@@ -187,10 +199,11 @@ private:
  * `BlockHandle::get()` then reads what the run left. The Runtime keeps the last run's result. The destructor stops the
  * run in progress and waits for it to end.
  *
- * The member functions other than the destructor and the move assignment may be called from several threads at once.
- * A thread of the run, such as a block's or a callback's, requests the stop with
- * `stopFor(std::chrono::nanoseconds::zero())`, which does not wait. On such a thread `stop()`, `waitFor()` and the
- * destructor wait for a run that cannot end, and `stopFor()` with a timeout returns false at that timeout.
+ * The Runtime adds no threading rule of its own: its calls follow the rules of the scheduler and block calls they make.
+ * `stop()`, `stopFor()`, `waitFor()` and `result()` may be called from any thread outside the run. A thread of the run,
+ * such as a block's or a callback's, requests the stop with `stopFor(std::chrono::nanoseconds::zero())`, which does not
+ * wait. On such a thread `stop()`, `waitFor()` and the destructor wait for a run that cannot end, and `stopFor()` with
+ * a timeout returns false at that timeout.
  */
 class GNURADIO_EXPORT Runtime {
 public:
@@ -198,17 +211,20 @@ public:
 
     static constexpr std::string_view kDefaultScheduler = "gr::scheduler::Simple<singleThreaded>";
 
-    /// A block's endpoint that answers a `Get` with its settings, stages the settings of a `Set`, and takes a `Subscribe`
-    /// to their changes.
+    /// A block's settings endpoint. It takes a `Set` alone, which gets no reply, with a request id or without; a key it
+    /// refuses arrives on `kSettingsNotificationEndpoint`. `BlockHandle::get()` reads the settings, and
+    /// `BlockHandle::set()` returns a call's result.
     static constexpr std::string_view kSettingsEndpoint = "Settings";
-    /// A block's endpoint that answers a `Get` with its staged settings and stages the settings of a `Set`.
-    static constexpr std::string_view kStagedSettingsEndpoint = "StagedSettings";
+    /// The endpoint the scheduler's notifications of its blocks' settings arrive on, one per event: the event's data
+    /// holds `level`, `what`, `block`, `key`, `reason` and `replaced`. At most 16 wait unread; a host that reads late
+    /// reads the latest of each block, key and level.
+    static constexpr std::string_view kSettingsNotificationEndpoint = "SettingsNotification";
     /// The scheduler's endpoint that answers a `Get` with the running graph as a graph document under `value`.
     static constexpr std::string_view kGraphGRCEndpoint = "GraphGRC";
 
     /// Builds the scheduler `type` through the graph's loader with `schedulerParameters` and hands it the graph. A
     /// parameter the scheduler does not declare is an error. So is a value it refuses, in its constructor or when
-    /// `create()` applies the parameters to it. `graph` is consumed when a Runtime is returned and left as it was on an
+    /// `create()` applies the parameters to it. The error's `rejected` holds the refused keys. `graph` is consumed when a Runtime is returned and left as it was on an
     /// error. The shipped `Simple` schedulers are registered in `gr::globalSchedulerRegistry()` alone, and a loader over
     /// another scheduler registry does not find them.
     [[nodiscard]] static std::expected<Runtime, RuntimeError> create(RuntimeGraph&& graph, std::string_view type = kDefaultScheduler, property_map schedulerParameters = {});
@@ -219,12 +235,29 @@ public:
     Runtime(const Runtime&)            = delete;
     Runtime& operator=(const Runtime&) = delete;
 
-    /// Runs to completion on the calling thread and returns the run's result. Refused while a run is in progress.
+    /// Runs to completion on the calling thread and returns the run's result. Refused while a run is in progress. A stop
+    /// asked while the start is under way ends the run, and the result is success.
     [[nodiscard]] std::expected<void, RuntimeError> runAndWait();
 
     /// Runs the graph as `runAndWait()` does, on a thread the Runtime owns. Returns once the scheduler is running or the
-    /// run has ended. Refused while a run is in progress. `result()` reports how the run ended.
-    [[nodiscard]] std::expected<void, RuntimeError> start();
+    /// run has ended. `result()` reports how the run ended. The values name each key a caller gave as `block.key`, with
+    /// the block named as an entry of the refusal names it, by the name the caller gave or a shared name's unique name: a key
+    /// that failed at the start, one whose value in force differs from the value given and one still pending after the
+    /// scheduler's settings timeout; a key in force as given has no entry. The
+    /// refusal holds one entry for a call made while a run is in progress, one entry naming the scheduler with "a stop
+    /// was asked during the start" when a stop ended the run before the graph ran, and otherwise each block's refusal
+    /// and one entry naming the scheduler with the error of a start that left the graph not running.
+    [[nodiscard]] std::expected<settings::Values, settings::Rejected> start();
+
+    /// Pauses the run in progress and returns once it is paused. A change set while paused waits for `resume()`. The
+    /// error says why a graph that is not running does not pause.
+    [[nodiscard]] std::expected<void, RuntimeError> pause();
+
+    /// Resumes a paused run and returns once the graph runs again and each change held while paused has applied, or
+    /// the scheduler's settings timeout has passed. The values name each key the resume applied as `block.key`, as
+    /// `start()` names them: a key whose apply failed is a failed value and the graph runs on. The refusal holds one
+    /// entry naming the scheduler, for a graph that is not paused or that the resume leaves not running.
+    [[nodiscard]] std::expected<settings::Values, settings::Rejected> resume();
 
     /// Requests the stop of the run in progress, by `start()` or by `runAndWait()` on another thread, and returns once
     /// the run has ended. Without a run in progress it does nothing.
@@ -271,8 +304,10 @@ public:
     /// `serviceName` reaches every block and the scheduler. A reply or a notification arrives through `pollEvents()`
     /// with `clientRequestID`. A message no block answers gets no reply.
     ///
-    /// `send()` is the path for requests and subscriptions. `BlockHandle::setStaged()` is the path for changing a
-    /// setting: it checks the keys and the conversion of the values and answers at once.
+    /// `send()` is the path for requests and subscriptions. `BlockHandle::set()` is the path for changing a
+    /// setting: it returns the call's result, as the block's settings object does.
+    ///
+    /// A message to a graph that does not run waits in the input and reaches its block once the graph starts.
     ///
     /// The call never waits for the run. When the input is full, the call drops the message and returns an error, and
     /// `gr::message::droppedMessageCount()` counts the drop.

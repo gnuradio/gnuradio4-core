@@ -30,9 +30,9 @@ GR_REGISTER_BLOCK(MyClockSource)
 struct MyClockSource : gr::Block<MyClockSource>, gr::BlockingSync<MyClockSource> {
     gr::PortOut<std::uint8_t> clk;
 
-    gr::Annotated<float, "sample_rate">        sample_rate         = 1000.f; // mandatory field
-    gr::Annotated<gr::Size_t, "chunk_size">    chunk_size          = 100;    // optional
-    gr::Annotated<bool, "use_internal_thread"> use_internal_thread = true;   // optional
+    gr::Annotated<float>        sample_rate         = 1000.f; // mandatory field
+    gr::Annotated<gr::Size_t>    chunk_size          = 100;    // optional
+    gr::Annotated<bool> use_internal_thread = true;   // optional
 
     GR_MAKE_REFLECTABLE(MyClockSource, clk, sample_rate, chunk_size, use_internal_thread);
 
@@ -65,8 +65,8 @@ struct MyGenerator : gr::Block<MyGenerator<T>>, gr::BlockingSync<MyGenerator<T>>
     gr::PortIn<std::uint8_t, gr::Optional> clk_in;
     gr::PortOut<T>                         out;
 
-    gr::Annotated<float, "sample_rate">     sample_rate = 1000.f;
-    gr::Annotated<gr::Size_t, "chunk_size"> chunk_size  = 100;
+    gr::Annotated<float>     sample_rate = 1000.f;
+    gr::Annotated<gr::Size_t> chunk_size  = 100;
 
     GR_MAKE_REFLECTABLE(MyGenerator, clk_in, out, sample_rate, chunk_size);
 
@@ -171,14 +171,14 @@ const auto nSamples = this->syncSamples(output);
 ```cpp
 // Default: internal timer thread (consistent wall-clock timing)
 struct MySource : Block<MySource>, BlockingSync<MySource> {
-    Annotated<float, "sample_rate"> sample_rate = 1000.f;
+    Annotated<float> sample_rate = 1000.f;
     // use_internal_thread defaults to true
 };
 
 // Disable internal thread (on-demand or HW-driven)
 struct MyHWSource : Block<MyHWSource>, BlockingSync<MyHWSource> {
-    Annotated<float, "sample_rate">        sample_rate         = 1000.f;
-    Annotated<bool, "use_internal_thread"> use_internal_thread = false;
+    Annotated<float>        sample_rate         = 1000.f;
+    Annotated<bool> use_internal_thread = false;
 };
 ```
 
@@ -207,8 +207,8 @@ const auto nSamples = this->syncSamples(output, true);  // dropIfBehind = true
 
 ```cpp
 struct MySDRSource : Block<MySDRSource>, BlockingSync<MySDRSource> {
-    Annotated<float, "sample_rate">        sample_rate         = 1e6f;
-    Annotated<bool, "use_internal_thread"> use_internal_thread = false;  // HW has own thread
+    Annotated<float>        sample_rate         = 1e6f;
+    Annotated<bool> use_internal_thread = false;  // HW has own thread
 
     std::atomic<bool> dataReady{false};
     RingBuffer<T>     hwBuffer;

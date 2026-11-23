@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <complex>
@@ -28,8 +29,11 @@
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/PmtTypeHelpers.hpp>
 #include <gnuradio-4.0/Scheduler.hpp>
+#include <gnuradio-4.0/SchedulerModel.hpp>
 #include <gnuradio-4.0/Sequence.hpp>
 #include <gnuradio-4.0/Settings.hpp>
+
+#include "settings_utils.hpp"
 
 /**
  * @brief Where a resampling block's sample_rate lives.
@@ -43,10 +47,13 @@
 
 namespace qa_coupling {
 /// couples `setting` to the tag key `key` through the settings API
-inline void couple(gr::SettingsBase& settings, std::string_view setting, std::string_view key) { settings.setTagCouplings(gr::property_map{{std::pmr::string(setting), std::string(key)}}); }
+inline void couple(gr::SettingsBase& settings, std::string_view setting, std::string_view key) { std::ignore = settings.setTagCouplings(gr::property_map{{std::pmr::string(setting), std::string(key)}}); }
 } // namespace qa_coupling
 
 namespace qa_settings {
+
+// a tag that reaches the block's input, as the work call hands it to the settings
+inline void enterTag(gr::SettingsBase& settings, const gr::Tag& tag) { std::ignore = gr::settings::detail::FrameworkAccess::tagEnters(settings, tag.map); }
 
 using namespace gr;
 
@@ -59,25 +66,13 @@ struct Decimator : Block<Decimator, Resampling<>> {
     PortIn<float>  in;
     PortOut<float> out;
 
-    Annotated<float, "sample rate"> sample_rate = kInputRate;
+    struct Settings {
+        Annotated<float> sample_rate = kInputRate;
 
-    GR_MAKE_REFLECTABLE(Decimator, in, out, sample_rate);
+        GR_MAKE_REFLECTABLE(Settings, sample_rate);
+    } settings;
 
-    work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
-        const std::size_t ratio = static_cast<std::size_t>(input_chunk_size.value);
-        for (std::size_t i = 0UZ; i < outSpan.size(); ++i) {
-            outSpan[i] = inSpan[i * ratio];
-        }
-        return work::Status::OK;
-    }
-};
-
-/// the same decimator without a rate of its own: the chunk ratio is all it knows about the rate it publishes at
-struct RatelessDecimator : Block<RatelessDecimator, Resampling<>> {
-    PortIn<float>  in;
-    PortOut<float> out;
-
-    GR_MAKE_REFLECTABLE(RatelessDecimator, in, out);
+    GR_MAKE_REFLECTABLE(Decimator, in, out, settings);
 
     work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
         const std::size_t ratio = static_cast<std::size_t>(input_chunk_size.value);
@@ -96,71 +91,6 @@ struct RateTagSource : Block<RateTagSource> {
     std::size_t _emitted = 0UZ;
 
     work::Status processBulk(OutputSpanLike auto& outSpan) {
-        if (_emitted >= kSamples) {
-            outSpan.publish(0UZ);
-            return work::Status::DONE;
-        }
-        const std::size_t n = std::min(outSpan.size(), kSamples - _emitted);
-        if (n == 0UZ) {
-            outSpan.publish(0UZ);
-            return work::Status::INSUFFICIENT_OUTPUT_ITEMS;
-        }
-        std::ranges::fill(outSpan | std::views::take(n), 1.0f);
-        if (_emitted == 0UZ) {
-            outSpan.publishTag(property_map{{gr::tag::SAMPLE_RATE.key(), kInputRate}}, 0UZ);
-        }
-        _emitted += n;
-        outSpan.publish(n);
-        return work::Status::OK;
-    }
-};
-
-inline constexpr std::size_t kStarvedCalls = 100UZ;
-
-/// a decimator recording every rate applied to it; its default differs from the rate it is
-/// constructed with, so the first application is a genuine change
-struct WatchingDecimator : Block<WatchingDecimator, Resampling<>> {
-    PortIn<float>  in;
-    PortOut<float> out;
-
-    Annotated<float, "sample rate"> sample_rate = 1.0f;
-
-    GR_MAKE_REFLECTABLE(WatchingDecimator, in, out, sample_rate);
-
-    std::vector<float> appliedRates;
-
-    work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
-        const std::size_t ratio = static_cast<std::size_t>(input_chunk_size.value);
-        for (std::size_t i = 0UZ; i < outSpan.size(); ++i) {
-            outSpan[i] = inSpan[i * ratio];
-        }
-        return work::Status::OK;
-    }
-
-    void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings) {
-        if (newSettings.contains(gr::tag::SAMPLE_RATE.name())) {
-            appliedRates.push_back(sample_rate.value);
-        }
-    }
-};
-
-/// a source publishing nothing for its first kStarvedCalls calls, driving the chain behind it with
-/// calls that can move no sample
-struct LateSource : Block<LateSource> {
-    PortOut<float> out;
-
-    GR_MAKE_REFLECTABLE(LateSource, out);
-
-    std::size_t idleCalls = 0UZ;
-
-    std::size_t _emitted = 0UZ;
-
-    work::Status processBulk(OutputSpanLike auto& outSpan) {
-        if (idleCalls < kStarvedCalls) {
-            ++idleCalls;
-            outSpan.publish(0UZ);
-            return work::Status::INSUFFICIENT_INPUT_ITEMS;
-        }
         if (_emitted >= kSamples) {
             outSpan.publish(0UZ);
             return work::Status::DONE;
@@ -209,14 +139,6 @@ struct RateTagSink : Block<RateTagSink> {
     }
 };
 
-[[nodiscard]] float rateOf(const property_map& map) { return RateTagSink::rateOf(map).value_or(0.0f); }
-
-[[nodiscard]] float storedRateOf(const property_map& settingsMap) {
-    const auto   it    = settingsMap.find(gr::tag::SAMPLE_RATE.name());
-    const float* value = it != settingsMap.end() ? it->second.get_if<float>() : nullptr;
-    return value != nullptr ? *value : 0.0f;
-}
-
 inline constexpr std::size_t kTagStride   = 16UZ;
 inline constexpr std::size_t kShortStream = 512UZ;
 inline constexpr std::size_t kLongStream  = 2UZ * kShortStream;
@@ -260,64 +182,104 @@ struct RateCountingBlock : Block<RateCountingBlock> {
     PortIn<float>  in;
     PortOut<float> out;
 
-    Annotated<float, "sample rate"> sample_rate = 1.0f;
+    struct Settings {
+        Annotated<float> sample_rate = 1.0f;
 
-    GR_MAKE_REFLECTABLE(RateCountingBlock, in, out, sample_rate);
+        GR_MAKE_REFLECTABLE(Settings, sample_rate);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(RateCountingBlock, in, out, settings);
 
     std::size_t nSettingsChanged = 0UZ;
+    bool        setUp            = false;
 
     [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
 
-    void settingsChanged(const property_map& /*oldSettings*/, const property_map& /*newSettings*/) { nSettingsChanged++; }
+    void applySettings(const Settings& s, const Settings& old) {
+        if (setUp && s.sample_rate != old.sample_rate) { // the initialization is not counted
+            nSettingsChanged++;
+        }
+        setUp = true;
+    }
 };
 
 /// keeps both maps of every settings change, so what the callback was told can be read off the block. Every member
 /// carries an initializer of its own: the block is an aggregate constructed from its base alone, and a member with
+/// one setting of each kind a conversion case sends to: integers of both signs, floating point, a vector, an array
+/// and a native size
+struct ConversionBlock : Block<ConversionBlock> {
+    PortIn<float>  in{};
+    PortOut<float> out{};
+
+    struct Settings {
+        std::int64_t            signed_count   = 0;
+        std::uint64_t           unsigned_count = 0U;
+        float                   sample_rate    = 1.0f;
+        double                  frequency      = 1.0;
+        std::vector<float>      taps{};
+        std::array<double, 2UZ> weights{};
+        std::size_t             num_filters = 1UZ;
+
+        GR_MAKE_REFLECTABLE(Settings, signed_count, unsigned_count, sample_rate, frequency, taps, weights, num_filters);
+    } settings{};
+
+    GR_MAKE_REFLECTABLE(ConversionBlock, in, out, settings);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
+};
+
+/// the reasons set() refuses the parameters with, empty when it accepts them all
+template<typename TBlock>
+[[nodiscard]] std::string refusalOf(TBlock& block, const property_map& parameters) {
+    const auto result = block.set(parameters);
+    return result.has_value() ? std::string{} : gr::settings::describeRejected(result.error());
+}
+
 /// no initializer is one clang reports as a missing field initializer at each such construction.
 struct ChangeRecordingBlock : Block<ChangeRecordingBlock> {
     PortIn<float>  in{};
     PortOut<float> out{};
 
-    Annotated<float, "sample rate">         sample_rate = 1.0f;
-    Annotated<gr::Size_t, "FFT size">       fft_size    = 1024U;
-    Annotated<gr::Size_t, "averages">       n_averages  = 1U;
-    Annotated<gr::Size_t, "worker threads"> n_workers   = 1U;
+    struct Settings {
+        Annotated<float>                             sample_rate = 1.0f;
+        Annotated<gr::Size_t>                        fft_size    = 1024U;
+        Annotated<gr::Size_t>                        n_averages  = 1U;
+        Annotated<gr::Size_t, Doc<"worker threads">> n_workers   = 1U;
 
-    GR_MAKE_REFLECTABLE(ChangeRecordingBlock, in, out, sample_rate, fft_size, n_averages, n_workers);
+        GR_MAKE_REFLECTABLE(Settings, sample_rate, fft_size, n_averages, n_workers);
+    } settings{};
+
+    GR_MAKE_REFLECTABLE(ChangeRecordingBlock, in, out, settings);
 
     std::vector<property_map> oldSeen{};
     std::vector<property_map> newSeen{};
 
     [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
 
-    void settingsChanged(const property_map& oldSettings, const property_map& newSettings) {
-        oldSeen.push_back(oldSettings);
-        newSeen.push_back(newSettings);
+    void applySettings(const Settings& s, const Settings& old) {
+        property_map before;
+        property_map after;
+        const auto   record = [&before, &after](std::string_view key, const auto& now, const auto& was) {
+            if (now.value != was.value) {
+                before.insert_or_assign(std::pmr::string(key), was.value);
+                after.insert_or_assign(std::pmr::string(key), now.value);
+            }
+        };
+        record("sample_rate", s.sample_rate, old.sample_rate);
+        record("fft_size", s.fft_size, old.fft_size);
+        record("n_averages", s.n_averages, old.n_averages);
+        record("n_workers", s.n_workers, old.n_workers);
+        if (!after.empty()) {
+            oldSeen.push_back(std::move(before));
+            newSeen.push_back(std::move(after));
+        }
     }
 };
 
 void applySettings(ChangeRecordingBlock& block, const property_map& parameters) {
-    std::ignore = block.settings().set(parameters);
-    std::ignore = block.settings().activateContext();
-    std::ignore = block.settings().applyStagedParameters();
+    std::ignore = block.set(parameters);
+    std::ignore = gr::testing::applyStagedForTest(gr::settings::detail::settingsOf(block));
 }
-
-/// a block whose one setting is vector-valued: the settings map holds it as a tensor, so whether a repeat of it is a
-/// change is decided by tensor comparison. Every member carries an initializer of its own, as above.
-struct TapsRecordingBlock : Block<TapsRecordingBlock> {
-    PortIn<float>  in{};
-    PortOut<float> out{};
-
-    Annotated<std::vector<float>, "filter taps"> taps = std::vector<float>{1.0f};
-
-    GR_MAKE_REFLECTABLE(TapsRecordingBlock, in, out, taps);
-
-    std::size_t nSettingsChanged = 0UZ;
-
-    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
-
-    void settingsChanged(const property_map& /*oldSettings*/, const property_map& /*newSettings*/) { nSettingsChanged++; }
-};
 
 [[nodiscard]] std::optional<gr::Size_t> sizeOf(const property_map& map, std::string_view key) {
     const auto it = map.find(key);
@@ -326,15 +288,6 @@ struct TapsRecordingBlock : Block<TapsRecordingBlock> {
     }
     const gr::Size_t* value = it->second.get_if<gr::Size_t>();
     return value != nullptr ? std::optional<gr::Size_t>(*value) : std::nullopt;
-}
-
-[[nodiscard]] std::string contextOf(const property_map& map) {
-    const auto it = map.find(gr::settings::kContextField);
-    if (it == map.end()) {
-        return {};
-    }
-    const auto text = it->second.value_or(std::string_view{});
-    return text.data() != nullptr ? std::string(text) : std::string{};
 }
 
 template<typename T>
@@ -363,25 +316,28 @@ struct DiscardSink : Block<DiscardSink> {
     void processOne(float) noexcept {}
 };
 
-/// passes its input on scaled. The work function counts the samples in n_seen and copies that member into its settings
-/// after each call. Nothing in the block writes or copies n_foreign. Every member carries an initializer of its own, as
+/// passes its input on scaled. The work function counts the samples in n_seen and publishes the count after each
+/// call. Nothing in the block writes or copies n_foreign. Every member carries an initializer of its own, as
 /// above.
 struct CopyingCounter : Block<CopyingCounter> {
     PortIn<float>  in{};
     PortOut<float> out{};
 
-    Annotated<float, "output scale">        scale     = 1.0f;
-    Annotated<gr::Size_t, "samples passed"> n_seen    = 0U;
-    Annotated<gr::Size_t, "external count"> n_foreign = 0U;
+    struct Settings {
+        Annotated<float, Doc<"output scale">>        scale     = 1.0f;
+        Annotated<gr::Size_t, Doc<"samples passed">> n_seen    = 0U;
+        Annotated<gr::Size_t, Doc<"external count">> n_foreign = 0U;
 
-    GR_MAKE_REFLECTABLE(CopyingCounter, in, out, scale, n_seen, n_foreign);
+        GR_MAKE_REFLECTABLE(Settings, scale, n_seen, n_foreign);
+    } settings{};
+
+    GR_MAKE_REFLECTABLE(CopyingCounter, in, out, settings);
 
     std::atomic<std::size_t>* nCopies = nullptr;
 
     work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
-        std::ranges::transform(inSpan, outSpan.begin(), [this](float value) { return value * scale.value; });
-        n_seen.value += static_cast<gr::Size_t>(inSpan.size());
-        this->updateActiveParameters({"n_seen"});
+        std::ranges::transform(inSpan, outSpan.begin(), [this](float value) { return value * settings.scale.value; });
+        this->publish("n_seen", static_cast<gr::Size_t>(settings.n_seen.value + inSpan.size()));
         if (nCopies != nullptr && !inSpan.empty()) {
             nCopies->fetch_add(1UZ, std::memory_order_release);
         }
@@ -389,16 +345,11 @@ struct CopyingCounter : Block<CopyingCounter> {
     }
 };
 
-/// runs a CopyingCounter between a source and a sink on a scheduler in a thread of its own, and keeps every message
-/// the scheduler sends out
+/// runs a CopyingCounter between a source and a sink on a scheduler in a thread of its own
 struct RunningCounter {
     std::atomic<std::size_t> nCopies{0UZ};
     gr::scheduler::Simple<>  scheduler{};
-    gr::MsgPortOut           toScheduler{};
-    gr::MsgPortIn            fromScheduler{};
-    std::vector<gr::Message> received{};
     CopyingCounter*          counter = nullptr;
-    std::string              counterName{};
     std::thread              runner{};
 
     RunningCounter() {
@@ -409,11 +360,8 @@ struct RunningCounter {
         auto&     sink   = flow.emplaceBlock<DiscardSink>();
         block.nCopies    = &nCopies;
         counter          = &block;
-        counterName      = std::string(block.unique_name);
         expect(flow.connect<"out", "in">(source, block).has_value());
         expect(flow.connect<"out", "in">(block, sink).has_value());
-        expect(toScheduler.connect(scheduler.msgIn).has_value());
-        expect(scheduler.msgOut.connect(fromScheduler).has_value());
         expect(scheduler.exchange(std::move(flow)).has_value());
         runner = std::thread([this] { std::ignore = scheduler.runAndWait(); });
     }
@@ -443,26 +391,8 @@ struct RunningCounter {
         return awaitTrue([this, target] { return nCopies.load(std::memory_order_acquire) >= target; });
     }
 
-    /// the first message received so far or later that carries the client request id and data
-    [[nodiscard]] std::optional<property_map> awaitData(std::string_view clientRequestID) {
-        std::optional<property_map> data;
-        std::ignore = awaitTrue([this, clientRequestID, &data] {
-            ReaderSpanLike auto messages = fromScheduler.streamReader().get<SpanReleasePolicy::ProcessAll>();
-            received.insert(received.end(), messages.begin(), messages.end());
-            std::ignore   = messages.consume(messages.size());
-            const auto it = std::ranges::find_if(received, [clientRequestID](const gr::Message& message) { return message.clientRequestID == clientRequestID && message.data.has_value(); });
-            if (it != received.end()) {
-                data = *it->data;
-            }
-            return data.has_value();
-        });
-        return data;
-    }
-
-    [[nodiscard]] std::optional<property_map> readSettings() {
-        gr::sendMessage<gr::message::Command::Get>(toScheduler, counterName, gr::block::property::kSetting, property_map{}, "read");
-        return awaitData("read");
-    }
+    /// the values a read of the running counter's settings gives, on the test's thread
+    [[nodiscard]] property_map readSettings() const { return gr::settings::heldValues(counter->get()); }
 };
 
 inline constexpr std::string_view kDecimationKey    = "test:decimation";
@@ -475,10 +405,14 @@ struct RatioFollower : Block<RatioFollower, Resampling<>, Stride<>> {
     PortIn<float>  in;
     PortOut<float> out;
 
-    Annotated<gr::Size_t, "decimation", Limits<1U, 64U>>    decimation    = 1U;
-    Annotated<gr::Size_t, "interpolation", Limits<1U, 64U>> interpolation = 1U;
+    struct Settings {
+        Annotated<gr::Size_t, Limits<Min<1U>, Max<64U>>> decimation    = 1U;
+        Annotated<gr::Size_t, Limits<Min<1U>, Max<64U>>> interpolation = 1U;
 
-    GR_MAKE_REFLECTABLE(RatioFollower, in, out, decimation, interpolation);
+        GR_MAKE_REFLECTABLE(Settings, decimation, interpolation);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(RatioFollower, in, out, settings);
 
     std::size_t nMisSizedCalls = 0UZ;
     std::size_t nResets        = 0UZ;
@@ -486,8 +420,8 @@ struct RatioFollower : Block<RatioFollower, Resampling<>, Stride<>> {
     void reset() { ++nResets; }
 
     work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
-        const std::size_t nDecimation    = decimation.value;
-        const std::size_t nInterpolation = interpolation.value;
+        const std::size_t nDecimation    = settings.decimation.value;
+        const std::size_t nInterpolation = settings.interpolation.value;
         const std::size_t nChunks        = inSpan.size() / nDecimation;
         if (inSpan.size() != nChunks * nDecimation || outSpan.size() != nChunks * nInterpolation) {
             ++nMisSizedCalls;
@@ -500,9 +434,9 @@ struct RatioFollower : Block<RatioFollower, Resampling<>, Stride<>> {
         return work::Status::OK;
     }
 
-    void settingsChanged(const property_map& /*oldSettings*/, const property_map& /*newSettings*/) {
-        input_chunk_size  = decimation.value;
-        output_chunk_size = interpolation.value;
+    void applySettings(const Settings& s) {
+        input_chunk_size  = s.decimation.value;
+        output_chunk_size = s.interpolation.value;
     }
 };
 
@@ -515,9 +449,13 @@ struct EpilogueLevelCopy : Block<EpilogueLevelCopy, Resampling<kEpilogueChunk, k
     PortIn<float>  in;
     PortOut<float> out;
 
-    Annotated<float, "level"> level = 0.f;
+    struct Settings {
+        Annotated<float> level = 0.f;
 
-    GR_MAKE_REFLECTABLE(EpilogueLevelCopy, in, out, level);
+        GR_MAKE_REFLECTABLE(Settings, level);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(EpilogueLevelCopy, in, out, settings);
 
     work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
         std::ranges::copy(inSpan, outSpan.begin());
@@ -671,8 +609,8 @@ struct RatioStream {
     source.pauseAt     = stream.pauseAt;
     source.nPauseCalls = stream.nPauseCalls;
     auto& follower     = flow.emplaceBlock<RatioFollower>(property_map{{"name", std::string("ratio")}, {"stride", stream.stride}});
-    follower.settings().setTagCouplings(property_map{{"decimation", std::string(kDecimationKey)}, {"interpolation", std::string(kInterpolationKey)}});
-    auto& sink = flow.emplaceBlock<SampleSink>(property_map{{"name", std::string("snk")}});
+    std::ignore        = follower.setTagCouplings(property_map{{"decimation", std::string(kDecimationKey)}, {"interpolation", std::string(kInterpolationKey)}});
+    auto& sink         = flow.emplaceBlock<SampleSink>(property_map{{"name", std::string("snk")}});
     if (!flow.connect<"out", "in">(source, follower).has_value() || !flow.connect<"out", "in">(follower, sink).has_value()) {
         return {};
     }
@@ -707,7 +645,7 @@ struct RateStreamResult {
     source.nSamples  = nSamples;
     source.finalRate = finalRate;
     auto& middle     = flow.emplaceBlock<RateCountingBlock>();
-    qa_coupling::couple(middle.settings(), "sample_rate", gr::tag::SAMPLE_RATE.key());
+    qa_coupling::couple(gr::settings::detail::settingsOf(middle), "sample_rate", gr::tag::SAMPLE_RATE.key());
     auto& sink = flow.emplaceBlock<RateTagSink>();
     expect(flow.connect<"out", "in">(source, middle).has_value());
     expect(flow.connect<"out", "in">(middle, sink).has_value());
@@ -716,10 +654,8 @@ struct RateStreamResult {
     expect(scheduler.exchange(std::move(flow)).has_value());
     expect(scheduler.runAndWait().has_value());
 
-    return {middle.nSettingsChanged, middle.sample_rate.value};
+    return {middle.nSettingsChanged, middle.settings.sample_rate.value};
 }
-
-[[nodiscard]] Decimator makeDecimator();
 
 const boost::ut::suite<"integer into floating-point settings"> exactIntegerTests = [] {
     using namespace boost::ut;
@@ -757,10 +693,9 @@ const boost::ut::suite<"integer into floating-point settings"> exactIntegerTests
     "a float setting takes an integer it holds exactly"_test = [] {
         qa_settings::RateCountingBlock block;
         block.init(std::make_shared<gr::Sequence>());
-        expect(nothrow([&] { std::ignore = block.settings().set({{"sample_rate", std::int64_t{20'000'000}}}); }));
-        std::ignore = block.settings().activateContext();
-        std::ignore = block.settings().applyStagedParameters();
-        expect(eq(block.sample_rate.value, 20'000'000.0f));
+        expect(nothrow([&] { std::ignore = block.set({{"sample_rate", std::int64_t{20'000'000}}}); }));
+        std::ignore = gr::testing::applyStagedForTest(gr::settings::detail::settingsOf(block));
+        expect(eq(block.settings.sample_rate.value, 20'000'000.0f));
     };
 };
 
@@ -837,65 +772,49 @@ const boost::ut::suite<"out-of-range numbers into integer settings"> integerRang
     };
 
     "an integer setting refuses a value outside its type's range"_test = [] {
-        const auto fromUnsigned = gr::settings::convertParameter<std::int64_t>("count", pmt::Value(std::numeric_limits<std::uint64_t>::max()));
-        expect(!fromUnsigned.has_value() && fromUnsigned.error().contains("count")) << fromUnsigned.error_or("a value");
+        ConversionBlock block;
+        block.init(std::make_shared<gr::Sequence>());
 
-        const auto fromDouble = gr::settings::convertParameter<std::uint64_t>("count", pmt::Value(0x1p64));
-        expect(!fromDouble.has_value() && fromDouble.error().contains("count")) << fromDouble.error_or("a value");
+        const std::string fromUnsigned = refusalOf(block, {{"signed_count", std::numeric_limits<std::uint64_t>::max()}});
+        expect(fromUnsigned.contains("signed_count")) << fromUnsigned;
+        const std::string fromDouble = refusalOf(block, {{"unsigned_count", 0x1p64}});
+        expect(fromDouble.contains("unsigned_count")) << fromDouble;
+        const std::string fraction = refusalOf(block, {{"unsigned_count", 2.5}});
+        expect(fraction.contains("not a whole number")) << fraction;
+        expect(eq(block.settings.signed_count, std::int64_t{0}) && eq(block.settings.unsigned_count, std::uint64_t{0})) << "a refused value reaches the member";
     };
 };
 
-const boost::ut::suite<"staged type refusals"> stagedRefusalTests = [] {
+const boost::ut::suite<"sequence and size settings"> sequenceTests = [] {
     using namespace boost::ut;
-
-    // setStaged, set and the tag auto-update leaves each type-check before staging, so a
-    // wrong-typed value reaches the apply path only through the unchecked entrances (raw
-    // context activation of deserialized state). The extraction itself must therefore
-    // report the mismatch rather than terminate the process.
-    "a wrong-typed staged value yields an error, not termination"_test = [] {
-        const pmt::Value wrong{std::string("not a number")};
-        expect(!gr::settings::extractStagedValue<gr::Size_t>(wrong, "input_chunk_size").has_value()) << "scalar mismatch reports";
-        expect(!gr::settings::extractStagedValue<std::vector<float>>(wrong, "taps").has_value()) << "tensor mismatch reports";
-    };
 
     // an untagged YAML list parses to a tensor of type-erased values, whatever its elements hold
     "a type-erased value sequence converts element by element"_test = [] {
-        const auto toSequence = [](const std::vector<pmt::Value>& elements) { return pmt::Value(gr::Tensor<pmt::Value>(elements.begin(), elements.end())); };
+        const auto      toSequence = [](const std::vector<pmt::Value>& elements) { return pmt::Value(gr::Tensor<pmt::Value>(elements.begin(), elements.end())); };
+        ConversionBlock block;
+        block.init(std::make_shared<gr::Sequence>());
 
-        const auto taps = gr::settings::convertParameter<std::vector<float>>("taps", toSequence({pmt::Value(0.5), pmt::Value(std::int64_t{2}), pmt::Value(0.25f)}));
-        expect(taps.has_value()) << (taps.has_value() ? std::string{} : taps.error());
-        if (taps.has_value()) {
-            expect(eq(taps->size(), 3UZ));
-            expect(eq((*taps)[0], 0.5f));
-            expect(eq((*taps)[1], 2.0f));
-            expect(eq((*taps)[2], 0.25f));
-        }
+        const std::string accepted = refusalOf(block, {{"taps", toSequence({pmt::Value(0.5), pmt::Value(std::int64_t{2}), pmt::Value(0.25f)})}, {"weights", toSequence({pmt::Value(std::int64_t{3}), pmt::Value(0.5f)})}});
+        expect(accepted.empty()) << accepted;
+        expect(block.settings.taps == std::vector<float>{0.5f, 2.0f, 0.25f}) << "the taps take the converted elements";
+        expect(block.settings.weights == std::array<double, 2UZ>{3.0, 0.5}) << "the weights take the converted elements";
 
-        const auto weights = gr::settings::convertParameter<std::array<double, 2UZ>>("weights", toSequence({pmt::Value(std::int64_t{3}), pmt::Value(0.5f)}));
-        expect(weights.has_value()) << (weights.has_value() ? std::string{} : weights.error());
-        if (weights.has_value()) {
-            expect(eq((*weights)[0], 3.0));
-            expect(eq((*weights)[1], 0.5));
-        }
-        expect(!gr::settings::convertParameter<std::array<double, 3UZ>>("weights", toSequence({pmt::Value(3.0), pmt::Value(0.5)})).has_value()) << "a sequence whose length differs from the array's refuses";
+        expect(!refusalOf(block, {{"weights", toSequence({pmt::Value(3.0), pmt::Value(0.5), pmt::Value(1.0)})}}).empty()) << "a sequence whose length differs from the array's refuses";
 
-        const auto refused = gr::settings::convertParameter<std::vector<float>>("taps", toSequence({pmt::Value(0.5), pmt::Value(std::pmr::string("two"))}));
-        expect(!refused.has_value()) << "an element the scalar rule would refuse refuses the sequence";
-        if (!refused.has_value()) {
-            expect(refused.error().contains("taps")) << refused.error();
-            expect(refused.error().contains("two")) << refused.error();
-        }
+        const std::string refused = refusalOf(block, {{"taps", toSequence({pmt::Value(0.5), pmt::Value(std::pmr::string("two"))})}});
+        expect(refused.contains("taps")) << "an element the scalar rule would refuse refuses the sequence: " << refused;
+        expect(block.settings.taps == std::vector<float>{0.5f, 2.0f, 0.25f}) << "a refused sequence reaches the member";
     };
 
-    "a native size_t survives the staging representation on every platform"_test = [] {
+    "a native size_t setting takes a value given as gr::Size_t on every platform"_test = [] {
         constexpr std::size_t expected = 37UZ;
-        const pmt::Value      staged{gr::detail::castToGrSizeIfNeeded(expected)};
-        const auto            extracted = gr::settings::extractStagedValue<std::size_t>(staged, "num_filters");
+        ConversionBlock       block;
+        block.init(std::make_shared<gr::Sequence>());
 
-        expect(extracted.has_value()) << "the staging representation converts back to native size_t";
-        if (extracted.has_value()) {
-            expect(eq(*extracted, expected));
-        }
+        const std::string refusal = refusalOf(block, {{"num_filters", static_cast<gr::Size_t>(expected)}}); // a pmt::Value holds no native size_t on every platform
+        expect(refusal.empty()) << refusal;
+        expect(eq(block.settings.num_filters, expected));
+        expect(block.get<std::size_t>("num_filters") == expected) << "the value in force reads back as a native size_t";
     };
 };
 
@@ -912,16 +831,6 @@ void expectConvertsAsString(std::string_view text) {
     const std::expected<T, std::string> fromValue  = fromText<T>(text);
     const std::expected<T, std::string> fromString = pmt::convert_safely<T>(std::string(text));
     expect(fromValue == fromString) << std::format("'{}' to {}: '{}' from the Value, '{}' from the std::string", text, meta::type_name<T>(), fromValue.error_or("a value"), fromString.error_or("a value"));
-}
-
-/// the error set() raises for the parameters, empty when it accepts them all
-[[nodiscard]] std::string refusalOf(ChangeRecordingBlock& block, const property_map& parameters) {
-    try {
-        std::ignore = block.settings().set(parameters);
-    } catch (const gr::exception& e) {
-        return e.message;
-    }
-    return {};
 }
 
 const boost::ut::suite<"text held in a Value"> textValueTests = [] {
@@ -971,33 +880,6 @@ const boost::ut::suite<"text held in a Value"> textValueTests = [] {
         }
     };
 
-    "a float or double setting refuses text that holds no number"_test = [] {
-        constexpr std::array blankTexts{"", " ", "\t", " \t\n\r\v\f ", "  # comment"};
-        constexpr std::array trailingLetterTexts{"1.5abc", "48000Hz", "0 x"};
-        for (std::string_view text : blankTexts) {
-            const auto asFloat  = gr::settings::convertParameter<float>("sample_rate", pmt::Value{text});
-            const auto asDouble = gr::settings::convertParameter<double>("frequency", pmt::Value{text});
-            expect(!asFloat.has_value() && asFloat.error().contains("sample_rate")) << std::format("'{}' as a float setting", text);
-            expect(!asDouble.has_value() && asDouble.error().contains("frequency")) << std::format("'{}' as a double setting", text);
-
-            const auto floatReason  = fromText<float>(text);
-            const auto doubleReason = fromText<double>(text);
-            expect(!floatReason.has_value() && floatReason.error().contains("empty")) << floatReason.error_or("a value");
-            expect(!doubleReason.has_value() && doubleReason.error().contains("empty")) << doubleReason.error_or("a value");
-        }
-        for (std::string_view text : trailingLetterTexts) {
-            expect(!gr::settings::convertParameter<float>("sample_rate", pmt::Value{text}).has_value()) << std::format("'{}' as a float setting", text);
-            expect(!gr::settings::convertParameter<double>("frequency", pmt::Value{text}).has_value()) << std::format("'{}' as a double setting", text);
-        }
-
-        for (std::string_view text : {std::string_view("0"), std::string_view(" 0 ")}) {
-            const auto asFloat  = gr::settings::convertParameter<float>("sample_rate", pmt::Value{text});
-            const auto asDouble = gr::settings::convertParameter<double>("frequency", pmt::Value{text});
-            expect(asFloat == 0.0f) << asFloat.error_or("a different value");
-            expect(asDouble == 0.0) << asDouble.error_or("a different value");
-        }
-    };
-
     "a std::string_view is parsed within its bounds"_test = [] {
         const std::string_view                  prefix = std::string_view("1.25").substr(0UZ, 3UZ);
         const std::expected<float, std::string> parsed = pmt::convert_safely<float>(prefix);
@@ -1012,58 +894,99 @@ const boost::ut::suite<"text held in a Value"> textValueTests = [] {
     };
 };
 
-[[nodiscard]] Decimator makeDecimator() {
-    Decimator block;
-    block.init(std::make_shared<gr::Sequence>());
-    std::ignore = block.settings().set({{"input_chunk_size", kDecimation}, {"output_chunk_size", gr::Size_t(1)}});
-    std::ignore = block.settings().activateContext();
-    std::ignore = block.settings().applyStagedParameters();
-    return block;
-}
+// the core's settings of a scheduler and one of ChunkScheduler's own
+struct ChunkSchedulerSettings : gr::scheduler::SchedulerSettings {
+    Annotated<gr::Size_t, Doc<"samples a worker takes per pass">, Limits<Min<1U>, Max<64U>>, StoppedOnly> chunk_size = 4U;
+
+    GR_MAKE_REFLECTABLE(ChunkSchedulerSettings, chunk_size);
+};
+
+// a scheduler with a setting of its own: the check refuses a chunk of 3, and the apply hook counts its calls and keeps
+// the chunk in force
+struct ChunkScheduler : gr::scheduler::SchedulerBase<ChunkScheduler, gr::scheduler::ExecutionPolicy::singleThreaded, gr::profiling::null::Profiler, ChunkSchedulerSettings> {
+    using Base = gr::scheduler::SchedulerBase<ChunkScheduler, gr::scheduler::ExecutionPolicy::singleThreaded, gr::profiling::null::Profiler, ChunkSchedulerSettings>;
+    using Base::_pool;
+    using Base::Base;
+
+    std::size_t nApplyCalls  = 0UZ; // an apply before this member's construction is lost when it is constructed
+    gr::Size_t  appliedChunk = 0U;
+
+    std::optional<gr::Refused> checkSettings(const Settings& s) const {
+        if (s.chunk_size == 3U) {
+            return gr::Refused(s.chunk_size, "a chunk of 3 samples splits no frame");
+        }
+        return std::nullopt;
+    }
+
+    void applySettings(const Settings& s) {
+        ++nApplyCalls;
+        appliedChunk = s.chunk_size;
+    }
+};
 
 } // namespace qa_settings
+
+const boost::ut::suite<"settings of a derived scheduler"> derivedSchedulerTests = [] {
+    using namespace boost::ut;
+    using namespace qa_settings;
+
+    "a derived scheduler's own setting joins the core's keys with its limits, documentation and update policy"_test = [] {
+        ChunkScheduler scheduler;
+        expect(fatal(scheduler.check({}).has_value()));
+        expect(eq(scheduler.get<gr::Size_t>("chunk_size").value_or(0U), 4U));
+        expect(eq(scheduler.get<gr::Size_t>("timeout_ms").value_or(0U), 100U)) << "a key of the core";
+        const property_map& metadata = gr::settings::detail::declarationTable<ChunkScheduler>().keyMetadata;
+        expect(metadata.contains("chunk_size::maximum") && metadata.contains("chunk_size::documentation") && metadata.contains("chunk_size::update_policy"));
+        expect(metadata.contains("poolName::update_policy")) << "the core's keys keep their declarations";
+
+        expect(!scheduler.set("chunk_size", gr::Size_t{65U}).has_value()) << "a value above the limit was taken";
+        expect(!scheduler.set("chunk_size", gr::Size_t{3U}).has_value()) << "a value the check refuses was taken";
+        expect(fatal(scheduler.set({{"chunk_size", gr::Size_t{8U}}, {"poolName", std::string(gr::thread_pool::kDefaultIoPoolId)}}).has_value()));
+        expect(eq(scheduler.settings.chunk_size.value, 8U));
+        expect(eq(scheduler.appliedChunk, 8U)) << "the scheduler's apply hook ran";
+        expect(scheduler._pool.get() == gr::thread_pool::Manager::defaultIoPool().get()) << "the core's apply of poolName ran beside the scheduler's hook";
+    };
+
+    "a derived scheduler's settings are set up after its members are constructed"_test = [] {
+        gr::SchedulerWrapper<ChunkScheduler> wrapped(property_map{{"chunk_size", gr::Size_t{8U}}});
+        ChunkScheduler&                      scheduler = *static_cast<ChunkScheduler*>(wrapped.raw());
+        expect(eq(scheduler.nApplyCalls, 1UZ)) << "the setup's apply ran before the member was constructed";
+        expect(eq(scheduler.appliedChunk, 8U));
+    };
+
+    "a value a derived scheduler refuses at construction reaches a wrapper's caller and a scheduler's first use"_test = [] {
+        gr::settings::Rejected thrown;
+        try {
+            gr::SchedulerWrapper<ChunkScheduler> wrapped(property_map{{"chunk_size", gr::Size_t{3U}}});
+        } catch (const gr::settings::RefusedSettings& refused) {
+            thrown = refused.rejected;
+        }
+        expect(fatal(eq(thrown.size(), 1UZ))) << "the wrapper's constructor took the value";
+        expect(eq(thrown.front().key, std::string("chunk_size")));
+
+        ChunkScheduler                                    byHand({{"chunk_size", gr::Size_t{3U}}});
+        const std::expected<void, gr::settings::Rejected> checked = byHand.check({});
+        expect(fatal(!checked.has_value())) << "the first use took the value";
+        expect(eq(checked.error().front().key, std::string("chunk_size")));
+
+        ChunkScheduler                       started({{"chunk_size", gr::Size_t{3U}}});
+        const std::expected<void, gr::Error> run = started.runAndWait();
+        expect(fatal(!run.has_value())) << "the start took the value";
+        expect(run.error().message.contains("scheduler '") && run.error().message.contains("chunk_size")) << run.error().message;
+        expect(!run.error().message.contains("not allowed while running")) << "a scheduler that never ran was told to stop: " << run.error().message;
+    };
+};
 
 const boost::ut::suite<"settings"> _settings = [] {
     using namespace boost::ut;
     using namespace qa_settings;
-
-    "a decimator keeps its input rate and forwards no tag for it on every application"_test = [] {
-        Decimator block = makeDecimator();
-
-        const property_map rateUpdate{{"sample_rate", kInputRate}};
-        for (std::size_t nApplication = 1UZ; nApplication <= 3UZ; ++nApplication) {
-            std::ignore       = block.settings().setStaged(rateUpdate);
-            const auto result = block.settings().applyStagedParameters();
-
-            expect(result.forwardParameters.empty()) << std::format("application {} forwards the applied rate as a tag", nApplication);
-            expect(eq(storedRateOf(block.settings().get()), kInputRate)) << std::format("application {} leaves the stored rate at the input rate", nApplication);
-            expect(eq(block.sample_rate.value, kInputRate)) << std::format("application {} leaves the member at the input rate", nApplication);
-        }
-    };
-
-    "a decimator's rate survives repeated save and load cycles"_test = [] {
-        Decimator block = makeDecimator();
-
-        std::ignore = block.settings().setStaged({{"sample_rate", kInputRate}});
-        std::ignore = block.settings().applyStagedParameters();
-
-        for (std::size_t nCycle = 1UZ; nCycle <= 3UZ; ++nCycle) {
-            const property_map saved = block.settings().get();
-            std::ignore              = block.settings().setStaged(saved);
-            const auto result        = block.settings().applyStagedParameters();
-
-            expect(eq(storedRateOf(saved), kInputRate)) << std::format("cycle {} saves the input rate", nCycle);
-            expect(eq(block.sample_rate.value, kInputRate)) << std::format("cycle {} leaves the member at the input rate", nCycle);
-            expect(result.forwardParameters.empty()) << std::format("cycle {} forwards the applied rate as a tag", nCycle);
-        }
-    };
 
     "a rate tag through a decimator arrives scaled"_test = [] {
         gr::Graph flow;
         auto&     source = flow.emplaceBlock<RateTagSource>(property_map{{"name", std::string("src")}});
         auto&     middle = flow.emplaceBlock<Decimator>(property_map{{"name", std::string("mid")}, {"input_chunk_size", kDecimation}, {"output_chunk_size", gr::Size_t(1)}});
         auto&     sink   = flow.emplaceBlock<RateTagSink>(property_map{{"name", std::string("snk")}});
-        qa_coupling::couple(middle.settings(), "sample_rate", gr::tag::SAMPLE_RATE.key());
+        qa_coupling::couple(gr::settings::detail::settingsOf(middle), "sample_rate", gr::tag::SAMPLE_RATE.key());
         expect(flow.connect<"out", "in">(source, middle).has_value());
         expect(flow.connect<"out", "in">(middle, sink).has_value());
 
@@ -1073,44 +996,7 @@ const boost::ut::suite<"settings"> _settings = [] {
 
         expect(ge(sink.rates.size(), 1UZ)) << "the sink must see the rate the decimator publishes at";
         expect(std::ranges::all_of(sink.rates, [](float rate) { return rate == kOutputRate; })) << "every forwarded rate must be the output rate";
-        expect(eq(middle.sample_rate.value, kInputRate)) << "the tag leaves the block's own setting at the input rate";
-    };
-
-    "a rate tag through a decimator that declares no sample_rate arrives scaled"_test = [] {
-        gr::Graph flow;
-        auto&     source = flow.emplaceBlock<RateTagSource>(property_map{{"name", std::string("src")}});
-        auto&     middle = flow.emplaceBlock<RatelessDecimator>(property_map{{"name", std::string("mid")}, {"input_chunk_size", kDecimation}, {"output_chunk_size", gr::Size_t(1)}});
-        auto&     sink   = flow.emplaceBlock<RateTagSink>(property_map{{"name", std::string("snk")}});
-        expect(flow.connect<"out", "in">(source, middle).has_value());
-        expect(flow.connect<"out", "in">(middle, sink).has_value());
-
-        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
-        expect(scheduler.exchange(std::move(flow)).has_value());
-        expect(scheduler.runAndWait().has_value());
-
-        expect(ge(sink.rates.size(), 1UZ)) << "the sink must see the rate the decimator publishes at";
-        expect(std::ranges::all_of(sink.rates, [](float rate) { return rate == kOutputRate; })) << "the chunk ratio must scale the forwarded rate whether or not the block owns one";
-    };
-
-    "a decimator starved by its source keeps the rate it is fed at"_test = [] {
-        gr::Graph flow;
-        auto&     source = flow.emplaceBlock<LateSource>(property_map{{"name", std::string("src")}});
-        auto&     middle = flow.emplaceBlock<WatchingDecimator>(property_map{{"name", std::string("mid")}, {"sample_rate", kInputRate}, {"input_chunk_size", kDecimation}, {"output_chunk_size", gr::Size_t(1)}});
-        auto&     sink   = flow.emplaceBlock<RateTagSink>(property_map{{"name", std::string("snk")}});
-        expect(flow.connect<"out", "in">(source, middle).has_value());
-        expect(flow.connect<"out", "in">(middle, sink).has_value());
-
-        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
-        expect(scheduler.exchange(std::move(flow)).has_value());
-        expect(scheduler.runAndWait().has_value());
-
-        expect(eq(source.idleCalls, kStarvedCalls)) << "the source must have driven the chain while it could publish nothing";
-        expect(eq(middle.sample_rate.value, kInputRate)) << "a call that moves nothing must leave the block's own rate alone";
-        expect(eq(storedRateOf(middle.settings().get()), kInputRate)) << "and must leave the stored rate alone with it";
-        expect(eq(middle.appliedRates.size(), 1UZ)) << "the rate it is built at applies once, not once per call that moved nothing";
-        expect(std::ranges::all_of(middle.appliedRates, [](float rate) { return rate == kInputRate; })) << "the block must never be run at the rate it publishes at";
-        expect(ge(sink.rates.size(), 1UZ)) << "the forwarded rate must still reach the sink once there is a span to publish into";
-        expect(std::ranges::all_of(sink.rates, [](float rate) { return rate == kOutputRate; })) << "and that tag carries the output rate";
+        expect(eq(middle.settings.sample_rate.value, kInputRate)) << "the tag leaves the block's own setting at the input rate";
     };
 
     "a tag that sets a block's chunk ratio sizes the call that starts at its sample"_test = [] {
@@ -1146,27 +1032,16 @@ const boost::ut::suite<"settings"> _settings = [] {
         source.nSamples   = nSamples;
         source.tagsToEmit = {{.index = nSamples, .map = levelTag, .pastLastSample = true}};
         auto& copier      = flow.emplaceBlock<EpilogueLevelCopy>(property_map{{"name", std::string("copy")}});
-        copier.settings().setTagCouplings(property_map{{"level", std::string(kLevelKey)}});
-        auto& sink = flow.emplaceBlock<SampleSink>(property_map{{"name", std::string("snk")}});
+        std::ignore       = copier.setTagCouplings(property_map{{"level", std::string(kLevelKey)}});
+        auto& sink        = flow.emplaceBlock<SampleSink>(property_map{{"name", std::string("snk")}});
         expect(fatal(flow.connect<"out", "in">(source, copier).has_value()));
         expect(fatal(flow.connect<"out", "in">(copier, sink).has_value()));
 
         gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
         expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
         expect(scheduler.runAndWait().has_value()) << "the run ends without an error";
-        expect(eq(copier.level.value, kEndLevel)) << "the tag past the trailing samples sets the level";
+        expect(eq(copier.settings.level.value, kEndLevel)) << "the tag past the trailing samples sets the level";
         expect(eq(sink.samples.size(), nSamples)) << "the epilogue passes the trailing samples on";
-    };
-
-    "a rate tag's map staged into a decimator sets nothing"_test = [] {
-        Decimator block = makeDecimator();
-        std::ignore     = block.settings().setStaged({{"sample_rate", kInputRate}});
-        std::ignore     = block.settings().applyStagedParameters();
-
-        const property_map refused = block.settings().setStaged(property_map{{std::pmr::string(gr::tag::SAMPLE_RATE.key()), kOutputRate}});
-        expect(refused.contains(gr::tag::SAMPLE_RATE.key())) << "the tag key is admitted as a setting";
-        std::ignore = block.settings().applyStagedParameters();
-        expect(eq(block.sample_rate.value, kInputRate)) << "the tag's rate reaches the block's own rate";
     };
 
     "an unchanged setting tag costs one apply however often it repeats"_test = [] {
@@ -1177,22 +1052,15 @@ const boost::ut::suite<"settings"> _settings = [] {
         expect(eq(shortRun.nSettingsChanged, longRun.nSettingsChanged)) << "the apply count must not scale with the number of identical tags";
         expect(eq(shortRun.finalRate, kInputRate));
         expect(eq(longRun.finalRate, kInputRate));
-    };
-
-    "a new value in the same stream still applies"_test = [] {
-        const RateStreamResult unchanged = runRateStream(kLongStream, kInputRate);
-        const RateStreamResult retuned   = runRateStream(kLongStream, kRetunedRate);
-
-        expect(eq(retuned.nSettingsChanged, unchanged.nSettingsChanged + 1UZ)) << "the differing tag must cost exactly one further apply";
-        expect(eq(retuned.finalRate, kRetunedRate)) << "the differing tag must reach the block's setting";
+        expect(eq(runRateStream(kLongStream, kRetunedRate).finalRate, kRetunedRate)) << "a new value in the same stream must reach the block's setting";
     };
 
     "a change names the key that moved and no key that was merely set before"_test = [] {
         ChangeRecordingBlock block{property_map{{"fft_size", gr::Size_t(2048)}, {"n_averages", gr::Size_t(8)}, {"sample_rate", 48000.0f}}};
         block.init(std::make_shared<gr::Sequence>());
 
-        expect(fatal(eq(block.newSeen.size(), 1UZ))) << "the three construction values are one change";
-        expect(eq(block.newSeen.front().size(), 3UZ)) << "each construction value moves its own key and no other";
+        expect(fatal(eq(block.newSeen.size(), 1UZ))) << "the initialization is one change";
+        expect(block.newSeen.front().contains("fft_size") && !block.newSeen.front().contains("n_workers")) << "the initialization changes the constructed settings from their defaults alone";
         block.oldSeen.clear();
         block.newSeen.clear();
 
@@ -1205,42 +1073,7 @@ const boost::ut::suite<"settings"> _settings = [] {
 
         const property_map& oldSettings = block.oldSeen.front();
         expect(eq(sizeOf(oldSettings, "n_workers").value_or(0U), gr::Size_t(1))) << "the previous value of the moved key stays readable";
-        expect(eq(sizeOf(oldSettings, "fft_size").value_or(0U), gr::Size_t(2048))) << "the settings before the change stay complete";
-        expect(eq(block.fft_size.value, gr::Size_t(2048))) << "a key that is not named keeps its value";
-    };
-
-    "a setting re-applied at the value the block holds is no change"_test = [] {
-        ChangeRecordingBlock block{property_map{{"fft_size", gr::Size_t(2048)}}};
-        block.init(std::make_shared<gr::Sequence>());
-        block.oldSeen.clear();
-        block.newSeen.clear();
-
-        applySettings(block, {{"fft_size", gr::Size_t(2048)}});
-
-        expect(eq(block.newSeen.size(), 0UZ)) << "no value moved, so there is no change to report";
-        expect(eq(block.fft_size.value, gr::Size_t(2048))) << "the value stays applied";
-        expect(eq(sizeOf(block.settings().get(), "fft_size").value_or(0U), gr::Size_t(2048))) << "the settings still report the value";
-    };
-
-    "a vector setting re-applied at the value the block holds is no change"_test = [] {
-        TapsRecordingBlock block;
-        block.init(std::make_shared<gr::Sequence>());
-        const std::size_t        nChangesAtStart = block.nSettingsChanged;
-        const std::vector<float> taps{0.25f, 0.5f, 0.25f};
-
-        std::ignore = block.settings().set({{"taps", taps}});
-        std::ignore = block.settings().activateContext();
-        std::ignore = block.settings().applyStagedParameters();
-
-        expect(eq(block.nSettingsChanged, nChangesAtStart + 1UZ)) << "the new vector is one change";
-        expect(block.taps.value == taps) << "and it reaches the member";
-
-        std::ignore = block.settings().set({{"taps", taps}});
-        std::ignore = block.settings().activateContext();
-        std::ignore = block.settings().applyStagedParameters();
-
-        expect(eq(block.nSettingsChanged, nChangesAtStart + 1UZ)) << "the same vector costs no further change";
-        expect(block.taps.value == taps) << "and leaves the value applied";
+        expect(eq(block.settings.fft_size.value, gr::Size_t(2048))) << "a key that is not named keeps its value";
     };
 
     "tags carrying equal vectors compare equal"_test = [] {
@@ -1254,85 +1087,18 @@ const boost::ut::suite<"settings"> _settings = [] {
         expect(first != third) << "differing payloads make different tags";
     };
 
-    "a change names only the moved key of a pair set together"_test = [] {
-        ChangeRecordingBlock block{property_map{{"fft_size", gr::Size_t(2048)}}};
-        block.init(std::make_shared<gr::Sequence>());
-        block.oldSeen.clear();
-        block.newSeen.clear();
-
-        applySettings(block, {{"fft_size", gr::Size_t(2048)}, {"n_averages", gr::Size_t(16)}});
-
-        expect(fatal(eq(block.newSeen.size(), 1UZ))) << "the moved key is one change";
-        const property_map& newSettings = block.newSeen.front();
-        expect(eq(newSettings.size(), 1UZ)) << "the key set at its current value is not named";
-        expect(eq(sizeOf(newSettings, "n_averages").value_or(0U), gr::Size_t(16))) << "the moved key is named";
-    };
-
-    "activating another context is reported even when no value moves"_test = [] {
-        ChangeRecordingBlock block;
-        block.init(std::make_shared<gr::Sequence>());
-
-        // both contexts hold the same definition, so after the first activation neither can move a value
-        const auto         now = gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now());
-        const property_map definition{{"fft_size", gr::Size_t(4096)}, {"n_averages", gr::Size_t(8)}};
-        expect(block.settings().set(definition, gr::SettingsCtx{now, "A"}).empty());
-        expect(block.settings().set(definition, gr::SettingsCtx{now, "B"}).empty());
-        expect(block.settings().activateContext(gr::SettingsCtx{now, "A"}).has_value());
-        std::ignore = block.settings().applyStagedParameters();
-        block.oldSeen.clear();
-        block.newSeen.clear();
-
-        expect(block.settings().activateContext(gr::SettingsCtx{now, "B"}).has_value());
-        std::ignore = block.settings().applyStagedParameters();
-        expect(fatal(eq(block.newSeen.size(), 1UZ))) << "activating B is a change of its own";
-        expect(eq(block.newSeen.back().size(), 1UZ)) << "B carries the values the block holds, so no value key is named";
-        expect(eq(contextOf(block.newSeen.back()), std::string("B"))) << "the newly active context is named";
-
-        expect(block.settings().activateContext(gr::SettingsCtx{now, "A"}).has_value());
-        std::ignore = block.settings().applyStagedParameters();
-        expect(fatal(eq(block.newSeen.size(), 2UZ))) << "activating A again is a further change";
-        expect(eq(block.newSeen.back().size(), 1UZ)) << "returning to A moves no value either";
-        expect(eq(contextOf(block.newSeen.back()), std::string("A"))) << "the context that became active is named";
-        expect(eq(block.fft_size.value, gr::Size_t(4096))) << "the activated definition stays applied";
-    };
-
-    "re-staging an identical definition with no context reports nothing"_test = [] {
-        ChangeRecordingBlock block{property_map{{"fft_size", gr::Size_t(2048)}, {"n_averages", gr::Size_t(8)}}};
-        block.init(std::make_shared<gr::Sequence>());
-        block.oldSeen.clear();
-        block.newSeen.clear();
-
-        const property_map definition{{"fft_size", gr::Size_t(2048)}, {"n_averages", gr::Size_t(8)}};
-        applySettings(block, definition);
-        applySettings(block, definition);
-
-        expect(eq(block.newSeen.size(), 0UZ)) << "the active context does not move, so there is no event and no value to report";
-        expect(eq(block.fft_size.value, gr::Size_t(2048))) << "the definition stays applied";
-    };
-
     "numeric settings given as text are parsed and applied"_test = [] {
         ChangeRecordingBlock block;
         block.init(std::make_shared<gr::Sequence>());
 
         const std::string refusal = refusalOf(block, {{"sample_rate", std::string("48000.5")}, {"fft_size", std::string("4096")}});
         expect(refusal.empty()) << refusal;
-        std::ignore = block.settings().activateContext();
-        std::ignore = block.settings().applyStagedParameters();
+        std::ignore = gr::testing::applyStagedForTest(gr::settings::detail::settingsOf(block));
 
-        expect(eq(block.sample_rate.value, 48000.5f)) << "the float setting takes the parsed value";
-        expect(eq(block.fft_size.value, gr::Size_t(4096))) << "the unsigned setting takes the parsed value";
-    };
-
-    "a numeric setting given text that does not parse is refused by its key"_test = [] {
-        ChangeRecordingBlock block{property_map{{"fft_size", gr::Size_t(2048)}}};
-        block.init(std::make_shared<gr::Sequence>());
-
-        const std::string refusal = refusalOf(block, {{"fft_size", std::string("4096.5")}});
-        expect(refusal.contains("fft_size")) << refusal;
-        std::ignore = block.settings().activateContext();
-        std::ignore = block.settings().applyStagedParameters();
-
-        expect(eq(block.fft_size.value, gr::Size_t(2048))) << "the refused text does not reach the member";
+        expect(eq(block.settings.sample_rate.value, 48000.5f)) << "the float setting takes the parsed value";
+        expect(eq(block.settings.fft_size.value, gr::Size_t(4096))) << "the unsigned setting takes the parsed value";
+        const std::string blank = refusalOf(block, {{"sample_rate", std::string(" \t")}});
+        expect(blank.contains("sample_rate")) << "text that holds no number: " << blank;
     };
 };
 
@@ -1340,66 +1106,13 @@ const boost::ut::suite<"a block copies its own members into its settings"> copyT
     using namespace boost::ut;
     using namespace qa_settings;
 
-    "the call copies the named members and returns their number"_test = [] {
-        CopyingCounter block;
-        block.init(std::make_shared<gr::Sequence>());
-        block.n_seen.value    = 5U;
-        block.n_foreign.value = 7U;
-
-        expect(eq(block.updateActiveParameters({"n_seen", "scale"}), 2UZ)) << "each named member counts once";
-
-        const property_map copied = block.settings().get();
-        expect(eq(valueAt<gr::Size_t>(copied, "n_seen").value_or(0U), gr::Size_t(5))) << "the named member reaches the map";
-        expect(eq(valueAt<gr::Size_t>(copied, "n_foreign").value_or(1U), gr::Size_t(0))) << "a member not named keeps the applied value";
-    };
-
-    "a misspelled key copies nothing and the call returns 0"_test = [] {
-        CopyingCounter block;
-        block.init(std::make_shared<gr::Sequence>());
-        block.n_seen.value = 5U;
-
-        expect(eq(block.updateActiveParameters({"n_sen"}), 0UZ)) << "the count includes a key no member carries";
-
-        const property_map copied = block.settings().get();
-        expect(eq(valueAt<gr::Size_t>(copied, "n_seen").value_or(1U), gr::Size_t(0))) << "the member the key misses keeps the applied value";
-        expect(copied.find(std::string_view("n_sen")) == copied.end()) << "a key no member carries adds nothing";
-    };
-
-    "a Get reads the value the block copied from its work function"_test = [] {
+    "a read on another thread gives the value the block copied from its work function"_test = [] {
         RunningCounter run;
         expect(fatal(run.awaitCopies(1UZ))) << "the counter never passed a sample";
 
-        const std::optional<property_map> settings = run.readSettings();
+        const property_map settings = run.readSettings();
 
-        expect(fatal(settings.has_value())) << "the Get got no reply";
-        expect(gt(valueAt<gr::Size_t>(*settings, "n_seen").value_or(0U), gr::Size_t(0))) << "the Get reads the declared default, not the copied member";
-    };
-
-    "a member written on another thread and never copied reads the last applied value"_test = [] {
-        RunningCounter run;
-        expect(fatal(run.awaitCopies(1UZ))) << "the counter never passed a sample";
-        run.counter->n_foreign.value = 7U;
-
-        const std::optional<property_map> settings = run.readSettings();
-
-        expect(fatal(settings.has_value())) << "the Get got no reply";
-        expect(eq(valueAt<gr::Size_t>(*settings, "n_foreign").value_or(1U), gr::Size_t(0))) << "a Get copied a member the block did not name";
-        expect(gt(valueAt<gr::Size_t>(*settings, "n_seen").value_or(0U), gr::Size_t(0))) << "the same reply carries the copied member";
-    };
-
-    "a subscriber hears of the next applied change and of no copy before it"_test = [] {
-        RunningCounter run;
-        gr::sendMessage<gr::message::Command::Subscribe>(run.toScheduler, run.counterName, gr::block::property::kSetting, property_map{}, "watch");
-        // the block handles its messages in order, so the reply to this Get comes after the subscription stands
-        expect(fatal(run.readSettings().has_value())) << "the Get got no reply";
-        expect(fatal(run.awaitCopies(1UZ))) << "the counter copied nothing after the subscription";
-
-        gr::sendMessage<gr::message::Command::Set>(run.toScheduler, run.counterName, gr::block::property::kSetting, property_map{{"scale", 2.0f}}, "set");
-        const std::optional<property_map> notice = run.awaitData("watch");
-
-        expect(fatal(notice.has_value())) << "the subscriber heard nothing of the applied change";
-        expect(eq(valueAt<float>(*notice, "scale").value_or(1.0f), 2.0f)) << "the first notice does not carry the applied scale";
-        expect(gt(valueAt<gr::Size_t>(*notice, "n_seen").value_or(0U), gr::Size_t(0))) << "the notice carries the member's value";
+        expect(gt(valueAt<gr::Size_t>(settings, "n_seen").value_or(0U), gr::Size_t(0))) << "the read gives the declared default, not the copied member";
     };
 };
 
@@ -1412,11 +1125,15 @@ struct LimitedGain : Block<LimitedGain> {
     PortIn<float>  in{};
     PortOut<float> out{};
 
-    Annotated<float, "gain", Limits<0.f, 1.f>> gain = 0.5f;
+    struct Settings {
+        Annotated<float, Limits<Min<0.f>, Max<1.f>>> gain = 0.5f;
 
-    GR_MAKE_REFLECTABLE(LimitedGain, in, out, gain);
+        GR_MAKE_REFLECTABLE(Settings, gain);
+    } settings{};
 
-    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
+    GR_MAKE_REFLECTABLE(LimitedGain, in, out, settings);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * settings.gain; }
 };
 
 /// a gain the block takes between -1 and 1
@@ -1424,11 +1141,15 @@ struct SignedGain : Block<SignedGain> {
     PortIn<float>  in{};
     PortOut<float> out{};
 
-    Annotated<float, "gain", Limits<-1.f, 1.f>> gain = 0.5f;
+    struct Settings {
+        Annotated<float, Limits<Min<-1.f>, Max<1.f>>> gain = 0.5f;
 
-    GR_MAKE_REFLECTABLE(SignedGain, in, out, gain);
+        GR_MAKE_REFLECTABLE(Settings, gain);
+    } settings{};
 
-    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
+    GR_MAKE_REFLECTABLE(SignedGain, in, out, settings);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * settings.gain; }
 };
 
 /// a float rate the block takes between 0 and 100, with integral limits
@@ -1436,11 +1157,107 @@ struct IntegralLimitedRate : Block<IntegralLimitedRate> {
     PortIn<float>  in{};
     PortOut<float> out{};
 
-    Annotated<float, "rate", Limits<0, 100>> rate = 50.f;
+    struct Settings {
+        Annotated<float, Limits<Min<0>, Max<100>>> rate = 50.f;
 
-    GR_MAKE_REFLECTABLE(IntegralLimitedRate, in, out, rate);
+        GR_MAKE_REFLECTABLE(Settings, rate);
+    } settings{};
 
-    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * rate; }
+    GR_MAKE_REFLECTABLE(IntegralLimitedRate, in, out, settings);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * settings.rate; }
+};
+
+/// one setting per form of a declared range, and two rules no predicate states, which the block's check holds
+struct LimitForms : Block<LimitForms> {
+    PortIn<float>  in{};
+    PortOut<float> out{};
+
+    struct Settings {
+        Annotated<gr::Size_t, Limits<Min<gr::Size_t{2}>, Max<std::numeric_limits<gr::Size_t>::max()>>>           count      = 2U;
+        Annotated<gr::Size_t, Limits<Min<gr::Size_t{0}>, Max<gr::Size_t{64}>>>                                   taps       = 16U;
+        Annotated<std::int32_t, Limits<Min<std::numeric_limits<std::int32_t>::lowest()>, Max<std::int32_t{10}>>> offset     = 0;
+        Annotated<double, Limits<Min<-1.5>, Max<std::numeric_limits<double>::max()>>>                            level      = 0.0;
+        Annotated<float, Limits<Min<0.1f>, Max<0.45f>>>                                                          fraction   = 0.25f;
+        Annotated<gr::Size_t, Limits<Min<gr::Size_t{8}>, Max<gr::Size_t{4096}>>>                                 fft_length = 64U;
+        Annotated<gr::Size_t, Limits<Min<gr::Size_t{0}>, Max<gr::Size_t{100}>>>                                  pairs      = 4U;
+
+        GR_MAKE_REFLECTABLE(Settings, count, taps, offset, level, fraction, fft_length, pairs);
+    } settings{};
+
+    GR_MAKE_REFLECTABLE(LimitForms, in, out, settings);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
+
+    std::optional<gr::Refused> checkSettings(const Settings& s) const {
+        if (!std::has_single_bit(s.fft_length.value)) {
+            return gr::Refused(s.fft_length, "not a power of 2");
+        }
+        if (s.pairs % 2U != 0U) {
+            return gr::Refused(s.pairs, "not even");
+        }
+        return std::nullopt;
+    }
+};
+
+enum class Taper { rectangular, hann, hamming };
+
+/// one setting per form of the predicates in Limits
+struct PredicateForms : Block<PredicateForms> {
+    PortIn<float>  in{};
+    PortOut<float> out{};
+
+    struct Settings {
+        Annotated<gr::Size_t, Limits<Min<1U>, Max<64U>>>             taps          = 16U;
+        Annotated<float, Limits<Over<0.f>, Under<0.5f>>>             cutoff        = 0.25f;
+        Annotated<float, Limits<Over<0.f>, Max<1.f>>>                weight        = 1.f;
+        Annotated<gr::Size_t, Limits<Min<1U>>>                       length        = 8U;
+        Annotated<gr::Size_t, Limits<OneOf<1U, 2U, 4U>>>             decimation    = 2U;
+        Annotated<std::int32_t, Limits<Over<0>, OneOf<2, 4, 8>>>     order         = 4;
+        Annotated<double, Limits<Over<-3>, Under<std::int64_t{3}>>>  integer_level = 0.0;
+        Annotated<Taper, Limits<OneOf<Taper::hann, Taper::hamming>>> taper         = Taper::hann;
+
+        GR_MAKE_REFLECTABLE(Settings, taps, cutoff, weight, length, decimation, order, integer_level, taper);
+    } settings{};
+
+    GR_MAKE_REFLECTABLE(PredicateForms, in, out, settings);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
+};
+
+/// a gain held as a direct member, with the older settings hook
+struct OlderForms : Block<OlderForms> {
+    PortIn<float>  in{};
+    PortOut<float> out{};
+    float          gain = 1.f;
+
+    GR_MAKE_REFLECTABLE(OlderForms, in, out, gain);
+
+    property_map lastOld{};
+    property_map lastNew{};
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
+
+    void settingsChanged(const property_map& oldSettings, const property_map& newSettings) {
+        lastOld = oldSettings;
+        lastNew = newSettings;
+    }
+};
+
+/// a count a caller must give, since its default lies outside its limits
+struct RequiredCount : Block<RequiredCount> {
+    PortIn<float>  in{};
+    PortOut<float> out{};
+
+    struct Settings {
+        Annotated<gr::Size_t, Limits<Min<1U>>> count = 0U;
+
+        GR_MAKE_REFLECTABLE(Settings, count);
+    } settings{};
+
+    GR_MAKE_REFLECTABLE(RequiredCount, in, out, settings);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
 };
 
 /// a gain whose default lies outside its limits, beside an offset without limits
@@ -1448,93 +1265,72 @@ struct OutOfLimitsDefault : Block<OutOfLimitsDefault> {
     PortIn<float>  in{};
     PortOut<float> out{};
 
-    Annotated<float, "gain", Limits<0.f, 1.f>> gain   = 2.f;
-    float                                      offset = 0.f;
+    struct Settings {
+        Annotated<float, Limits<Min<0.f>, Max<1.f>>> gain   = 2.f;
+        float                                        offset = 0.f;
 
-    GR_MAKE_REFLECTABLE(OutOfLimitsDefault, in, out, gain, offset);
+        GR_MAKE_REFLECTABLE(Settings, gain, offset);
+    } settings{};
 
-    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain + offset; }
+    GR_MAKE_REFLECTABLE(OutOfLimitsDefault, in, out, settings);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * settings.gain + settings.offset; }
 };
 
-/// a gain whose default lies outside its limits, with a reset() that counts its calls
-struct CountingReset : Block<CountingReset> {
-    PortIn<float>  in{};
-    PortOut<float> out{};
-
-    Annotated<float, "gain", Limits<0.f, 1.f>> gain = 2.f;
-
-    GR_MAKE_REFLECTABLE(CountingReset, in, out, gain);
-
-    std::size_t resets = 0;
-
-    void reset() { ++resets; }
-
-    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
-};
-
-/// a gain whose default lies inside its limits, with a reset() and a settingsChanged() that count their calls
+/// a gain whose default lies inside its limits, with a reset() and a applySettings() that count their calls
 struct CountingResetWithinLimits : Block<CountingResetWithinLimits> {
     PortIn<float>  in{};
     PortOut<float> out{};
 
-    Annotated<float, "gain", Limits<0.f, 1.f>> gain = 0.5f;
+    struct Settings {
+        Annotated<float, Limits<Min<0.f>, Max<1.f>>> gain = 0.5f;
 
-    GR_MAKE_REFLECTABLE(CountingResetWithinLimits, in, out, gain);
+        GR_MAKE_REFLECTABLE(Settings, gain);
+    } settings{};
+
+    GR_MAKE_REFLECTABLE(CountingResetWithinLimits, in, out, settings);
 
     std::size_t resets  = 0;
     std::size_t changes = 0;
 
     void reset() { ++resets; }
 
-    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * settings.gain; }
 
-    void settingsChanged(const property_map& /*oldSettings*/, const property_map& /*newSettings*/) { ++changes; }
+    void applySettings([[maybe_unused]] const Settings& s) { ++changes; }
 };
 
-/// a gain beside a setting named like the reset key, with a reset() and a settingsChanged() that count their calls
+/// a gain beside a setting named like the reset key, with a reset() and a applySettings() that count their calls
 struct ResetNamedSetting : Block<ResetNamedSetting> {
     PortIn<float>  in{};
     PortOut<float> out{};
 
-    Annotated<float, "gain">                              gain          = 1.f;
-    Annotated<bool, "a setting named like the reset key"> reset_default = false;
+    struct Settings {
+        Annotated<float>                                           gain          = 1.f;
+        Annotated<bool, Doc<"a setting named like the reset key">> reset_default = false;
 
-    GR_MAKE_REFLECTABLE(ResetNamedSetting, in, out, gain, reset_default);
+        GR_MAKE_REFLECTABLE(Settings, gain, reset_default);
+    } settings{};
+
+    GR_MAKE_REFLECTABLE(ResetNamedSetting, in, out, settings);
 
     std::size_t resets  = 0;
     std::size_t changes = 0;
 
     void reset() { ++resets; }
 
-    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * settings.gain; }
 
-    void settingsChanged(const property_map& /*oldSettings*/, const property_map& /*newSettings*/) { ++changes; }
+    void applySettings([[maybe_unused]] const Settings& s) { ++changes; }
 };
 
 /// a tag that carries only `key`, set to true
 [[nodiscard]] Tag flagTag(std::string_view key) { return Tag{0UZ, property_map{{std::pmr::string(key), true}}}; }
 
-[[nodiscard]] std::string setRefusal(SettingsBase& settings, const property_map& parameters, SettingsCtx ctx = {}) {
-    try {
-        std::ignore = settings.set(parameters, ctx);
-    } catch (const gr::exception& e) {
-        return e.message;
-    }
-    return {};
+[[nodiscard]] std::string setRefusal(SettingsBase& settings, const property_map& parameters) {
+    const auto result = settings.set(parameters);
+    return result.has_value() ? std::string{} : gr::settings::describeRejected(result.error());
 }
-
-/// a gain between 0 and 1 beside an offset between -1 and 1
-struct LimitedGainAndOffset : Block<LimitedGainAndOffset> {
-    PortIn<float>  in{};
-    PortOut<float> out{};
-
-    Annotated<float, "gain", Limits<0.f, 1.f>>    gain   = 0.5f;
-    Annotated<float, "offset", Limits<-1.f, 1.f>> offset = 0.f;
-
-    GR_MAKE_REFLECTABLE(LimitedGainAndOffset, in, out, gain, offset);
-
-    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain + offset; }
-};
 
 /// publishes a fixed number of samples and puts `tag`, when it is not empty, on the first
 struct FiniteTagSource : Block<FiniteTagSource> {
@@ -1572,13 +1368,17 @@ struct UndeclaredPass : Block<UndeclaredPass> {
 struct LimitedSink : Block<LimitedSink> {
     PortIn<float> in{};
 
-    Annotated<float, "gain", Limits<0.f, 1.f>> gain = 0.5f;
+    struct Settings {
+        Annotated<float, Limits<Min<0.f>, Max<1.f>>> gain = 0.5f;
 
-    GR_MAKE_REFLECTABLE(LimitedSink, in, gain);
+        GR_MAKE_REFLECTABLE(Settings, gain);
+    } settings{};
+
+    GR_MAKE_REFLECTABLE(LimitedSink, in, settings);
 
     std::size_t nReceived = 0UZ;
 
-    [[nodiscard]] float held() const noexcept { return gain.value; }
+    [[nodiscard]] float held() const noexcept { return settings.gain.value; }
 
     work::Status processBulk(std::span<const float> input) {
         nReceived += input.size();
@@ -1586,22 +1386,50 @@ struct LimitedSink : Block<LimitedSink> {
     }
 };
 
-/// a sink that counts its samples, with a count its settingsChanged() refuses at 0 and a level it takes at any value
+enum class SinkMode { fast, slow };
+
+/// a sink that counts its samples, with a mode a host names
+struct ModeSink : Block<ModeSink> {
+    PortIn<float> in{};
+
+    struct Settings {
+        SinkMode mode = SinkMode::fast;
+
+        GR_MAKE_REFLECTABLE(Settings, mode);
+    } settings{};
+
+    GR_MAKE_REFLECTABLE(ModeSink, in, settings);
+
+    std::size_t nReceived = 0UZ;
+
+    [[nodiscard]] SinkMode held() const noexcept { return settings.mode; }
+
+    work::Status processBulk(std::span<const float> input) {
+        nReceived += input.size();
+        return work::Status::OK;
+    }
+};
+
+/// a sink that counts its samples, with a count its applySettings() refuses at 0 and a level it takes at any value
 struct RefusingSink : Block<RefusingSink> {
     PortIn<float> in{};
 
-    gr::Size_t count = 4U;
-    float      level = 1.f;
+    struct Settings {
+        gr::Size_t count = 4U;
+        float      level = 1.f;
 
-    GR_MAKE_REFLECTABLE(RefusingSink, in, count, level);
+        GR_MAKE_REFLECTABLE(Settings, count, level);
+    } settings{};
+
+    GR_MAKE_REFLECTABLE(RefusingSink, in, settings);
 
     std::size_t nReceived = 0UZ;
 
-    [[nodiscard]] gr::Size_t held() const noexcept { return count; }
+    [[nodiscard]] gr::Size_t held() const noexcept { return settings.count; }
 
-    void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings) {
-        if (newSettings.contains("count") && count == 0U) {
-            throw gr::exception("count must be at least 1");
+    void applySettings(const Settings& s, const Settings& old) {
+        if (s.count != old.count && s.count == 0U) {
+            throw gr::exception("count below 1");
         }
     }
 
@@ -1609,95 +1437,32 @@ struct RefusingSink : Block<RefusingSink> {
         nReceived += input.size();
         return work::Status::OK;
     }
-};
-
-/// a count whose default lies outside its limits, which settingsChanged() refuses above kMostTaken
-struct LimitedRefusingBlock : Block<LimitedRefusingBlock> {
-    static constexpr gr::Size_t kMostTaken = 4U;
-
-    PortIn<float>  in{};
-    PortOut<float> out{};
-
-    Annotated<gr::Size_t, "count", Limits<1U, 10U>> count = 0U;
-
-    GR_MAKE_REFLECTABLE(LimitedRefusingBlock, in, out, count);
-
-    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
-
-    void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings) {
-        if (newSettings.contains("count") && count.value > kMostTaken) {
-            throw gr::exception(std::format("count must be at most {}", kMostTaken));
-        }
-    }
-};
-
-/// a count its settingsChanged() refuses at 0, after it empties `newSettings`
-struct ClearingRefusingBlock : Block<ClearingRefusingBlock> {
-    PortIn<float>  in{};
-    PortOut<float> out{};
-
-    gr::Size_t count = 4U;
-
-    GR_MAKE_REFLECTABLE(ClearingRefusingBlock, in, out, count);
-
-    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
-
-    void settingsChanged(const property_map& /*oldSettings*/, property_map& newSettings) {
-        if (count == 0U) {
-            newSettings.clear();
-            throw gr::exception("count must be at least 1");
-        }
-    }
-};
-
-/// a count its settingsChanged() refuses at 0, after it removes or activates the context a test names, once each
-struct ContextChangingSink : Block<ContextChangingSink> {
-    PortIn<float> in{};
-
-    gr::Size_t count = 4U;
-
-    GR_MAKE_REFLECTABLE(ContextChangingSink, in, count);
-
-    std::optional<SettingsCtx> removeOnRefusal{};
-    std::optional<SettingsCtx> activateOnRefusal{};
-    bool                       removed = false;
-
-    void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings) {
-        if (!newSettings.contains("count") || count != 0U) {
-            return;
-        }
-        if (removeOnRefusal.has_value()) {
-            removed = this->settings().removeContext(*std::exchange(removeOnRefusal, std::nullopt));
-        }
-        if (activateOnRefusal.has_value()) {
-            std::ignore = this->settings().activateContext(*std::exchange(activateOnRefusal, std::nullopt));
-        }
-        throw gr::exception("count must be at least 1");
-    }
-
-    work::Status processBulk(std::span<const float> /*input*/) { return work::Status::OK; }
 };
 
 inline constexpr std::string_view kCountKey      = "qa:count";
 inline constexpr std::string_view kTakenCountKey = "qa:count_taken";
 
-/// passes its input on and hands on each count it is given under kTakenCountKey; its settingsChanged() refuses a count
+/// passes its input on and hands on each count it is given under kTakenCountKey; its applySettings() refuses a count
 /// of 0 after it filled the forward map
 struct RefusingForwarder : Block<RefusingForwarder> {
     PortIn<float>  in{};
     PortOut<float> out{};
 
-    gr::Size_t count = 4U;
+    struct Settings {
+        gr::Size_t count = 4U;
 
-    GR_MAKE_REFLECTABLE(RefusingForwarder, in, out, count);
+        GR_MAKE_REFLECTABLE(Settings, count);
+    } settings{};
 
-    void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings, property_map& forwardSettings) {
-        if (!newSettings.contains("count")) {
+    GR_MAKE_REFLECTABLE(RefusingForwarder, in, out, settings);
+
+    void applySettings(const Settings& s, const Settings& old) {
+        if (s.count == old.count) {
             return;
         }
-        forwardSettings.insert_or_assign(std::pmr::string(kTakenCountKey), count);
-        if (count == 0U) {
-            throw gr::exception("count must be at least 1");
+        this->forwardTag(kTakenCountKey, s.count);
+        if (s.count == 0U) {
+            throw gr::exception("count below 1");
         }
     }
 
@@ -1723,11 +1488,8 @@ struct TagRecordingSink : Block<TagRecordingSink> {
     }
 };
 
-constexpr std::string_view kRejectedSettings = "applyChangedSettings() - rejected settings";
-
-/// the refusals a port received, the plain messages apart from the errors
+/// the error messages a port received
 struct ReportedRefusals {
-    std::string plain;
     std::string errors;
 };
 
@@ -1737,9 +1499,6 @@ struct ReportedRefusals {
     for (const gr::Message& message : messages) {
         if (!message.data.has_value()) {
             reported.errors += message.data.error().message;
-        } else if (message.endpoint == kRejectedSettings) {
-            const auto error = message.data->find("error");
-            reported.plain += error == message.data->end() ? std::string() : error->second.value_or(std::string());
         }
     }
     std::ignore = messages.consume(messages.size());
@@ -1753,14 +1512,16 @@ struct SinkRun {
     std::size_t                                   nReceived = 0UZ;
     std::size_t                                   nSent     = 0UZ;
     ReportedRefusals                              reported{};
+    std::vector<gr::settings::Notification>       notified{};
 };
 
 /// runs a source that tags its first sample with `tag` through a block that declares no tag policy into a sink named
 /// `sinkName`. The sink couples each key of `tag` to its setting of the same name. A Set message carries `set` to the
 /// sink when it is not empty. A reader takes the scheduler's messages when `readMessages` is true. With no reader a
-/// block's error ends the run.
+/// block's error ends the run. A notification reader at the scheduler keeps every notification when
+/// `readsNotifications` is true.
 template<typename TSink>
-[[nodiscard]] SinkRun<TSink> runIntoSink(const std::string& sinkName, const property_map& tag, const property_map& set, bool readMessages) {
+[[nodiscard]] SinkRun<TSink> runIntoSink(const std::string& sinkName, const property_map& tag, const property_map& set, bool readMessages, bool readsNotifications = false) {
     using namespace boost::ut;
     gr::Graph flow;
     auto&     source = flow.emplaceBlock<FiniteTagSource>();
@@ -1768,7 +1529,7 @@ template<typename TSink>
     auto&     sink   = flow.emplaceBlock<TSink>({{"name", sinkName}});
     source.tag       = tag;
     for (const auto& [key, value] : tag) {
-        qa_coupling::couple(sink.settings(), key, key);
+        qa_coupling::couple(gr::settings::detail::settingsOf(sink), key, key);
     }
     expect(flow.connect<"out", "in">(source, pass).has_value());
     expect(flow.connect<"out", "in">(pass, sink).has_value());
@@ -1784,8 +1545,13 @@ template<typename TSink>
         gr::sendMessage<gr::message::Command::Set>(toScheduler, sink.unique_name, gr::block::property::kSetting, set);
     }
     expect(scheduler.exchange(std::move(flow)).has_value());
+    auto notified = std::make_shared<std::vector<gr::settings::Notification>>(); // the run's thread delivers, and the run ends before the read
+    if (readsNotifications) {
+        scheduler.installReader([notified](const gr::settings::Notification& notification) { notified->push_back(notification); });
+    }
 
     SinkRun<TSink> run{.result = scheduler.runAndWait()};
+    run.notified  = *notified;
     run.held      = sink.held();
     run.nReceived = sink.nReceived;
     run.nSent     = source.nSamples;
@@ -1811,7 +1577,7 @@ struct ForwarderRun {
     auto&     forwarder = flow.emplaceBlock<RefusingForwarder>({{"name", std::string("refusing_forwarder")}});
     auto&     sink      = flow.emplaceBlock<TagRecordingSink>();
     source.tag          = property_map{{std::pmr::string(kCountKey), count}};
-    qa_coupling::couple(forwarder.settings(), "count", kCountKey);
+    qa_coupling::couple(gr::settings::detail::settingsOf(forwarder), "count", kCountKey);
     expect(flow.connect<"out", "in">(source, forwarder).has_value());
     expect(flow.connect<"out", "in">(forwarder, sink).has_value());
 
@@ -1821,40 +1587,9 @@ struct ForwarderRun {
     expect(scheduler.exchange(std::move(flow)).has_value());
 
     ForwarderRun run{.result = scheduler.runAndWait()};
-    run.held     = forwarder.count;
+    run.held     = forwarder.settings.count;
     run.tags     = sink.tags;
     run.reported = readRefusals(fromScheduler);
-    return run;
-}
-
-constexpr std::string_view kRefusedContext = "refused";
-
-/// runs a source that tags its first sample with gr:context = kRefusedContext into a RefusingSink whose set for that
-/// context holds a count of 0. A reader takes the scheduler's messages when `readMessages` is true.
-[[nodiscard]] SinkRun<RefusingSink> runContextTagIntoRefusingSink(bool readMessages) {
-    using namespace boost::ut;
-    gr::Graph flow;
-    auto&     source = flow.emplaceBlock<FiniteTagSource>();
-    auto&     sink   = flow.emplaceBlock<RefusingSink>({{"name", std::string("refusing_sink")}});
-    source.tag       = property_map{{gr::tag::CONTEXT.key(), std::string(kRefusedContext)}};
-    const SettingsCtx refusedCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), std::string(kRefusedContext)};
-    expect(sink.settings().set({{"count", gr::Size_t{0U}}}, refusedCtx).empty());
-    expect(flow.connect<"out", "in">(source, sink).has_value());
-
-    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler;
-    gr::MsgPortIn                                                         fromScheduler;
-    if (readMessages) {
-        expect(scheduler.msgOut.connect(fromScheduler).has_value());
-    }
-    expect(scheduler.exchange(std::move(flow)).has_value());
-
-    SinkRun<RefusingSink> run{.result = scheduler.runAndWait()};
-    run.held      = sink.held();
-    run.nReceived = sink.nReceived;
-    run.nSent     = source.nSamples;
-    if (readMessages) {
-        run.reported = readRefusals(fromScheduler);
-    }
     return run;
 }
 
@@ -1865,16 +1600,17 @@ constexpr std::string_view kRefusedContext = "refused";
     return found;
 }
 
-inline constexpr auto isEven       = [](const int& value) { return value % 2 == 0; };
-inline constexpr auto anyCharacter = [](const char&) { return true; };
+inline constexpr int kPercentLower = 0;
+inline constexpr int kPercentUpper = 100;
+using Percent                      = Limits<Min<kPercentLower>, Max<kPercentUpper>>;
 
-// true when Limit takes Character values at its limits and refuses values just outside them
-template<typename Limit, typename Character>
-constexpr bool limitsTakeCharacterByValue() {
-    const bool edgesTaken   = Limit::validate(static_cast<Character>(Limit::MinRange)) && Limit::validate(static_cast<Character>(Limit::MaxRange));
-    const bool aboveRefused = !Limit::validate(static_cast<Character>(Limit::MaxRange + 1));
+// true when Percent takes Character values at its ends and refuses values just outside them
+template<typename Character>
+constexpr bool percentTakesCharacterByValue() {
+    const bool edgesTaken   = Percent::validate(static_cast<Character>(kPercentLower)) && Percent::validate(static_cast<Character>(kPercentUpper));
+    const bool aboveRefused = !Percent::validate(static_cast<Character>(kPercentUpper + 1));
     if constexpr (std::is_signed_v<Character>) {
-        return edgesTaken && aboveRefused && !Limit::validate(static_cast<Character>(Limit::MinRange - 1));
+        return edgesTaken && aboveRefused && !Percent::validate(static_cast<Character>(kPercentLower - 1));
     } else {
         return edgesTaken && aboveRefused;
     }
@@ -1886,134 +1622,162 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
     using namespace boost::ut;
     using namespace qa_refusals;
 
-    "a value outside the limits is refused by set(), naming the block, the key, the value and the limit"_test = [] {
-        LimitedGain block{property_map{{"name", std::string("gain_stage")}}};
-        block.init(std::make_shared<gr::Sequence>());
+    "a direct member is a setting, and settingsChanged() gets its values before and after a change"_test = [] {
+        OlderForms block{property_map{{"name", std::string("older_forms")}}};
+        expect(fatal(block.set({{"gain", 2.f}}).has_value()));
+        expect(eq(block.gain, 2.f)) << "the direct member keeps its value";
+        expect(block.lastNew.contains("gain") && block.lastNew.at("gain") == pmt::Value(2.f)) << "the hook is not given the new value";
+        expect(block.lastOld.contains("gain") && block.lastOld.at("gain") == pmt::Value(1.f)) << "the hook is not given the value before";
+    };
 
-        const std::string refusal = setRefusal(block.settings(), {{"gain", 2.0f}});
-        expect(refusal.contains("block 'gain_stage'")) << refusal;
-        expect(refusal.contains("gain = 2")) << refusal;
-        expect(refusal.contains("[0, 1]")) << refusal;
+    "a holder of the block's base reaches its settings object through settings()"_test = [] {
+        LimitedGain               block{property_map{{"name", std::string("base_holder")}}};
+        const Block<LimitedGain>& base = block;
+        expect(std::addressof(base.settings()) == std::addressof(gr::settings::detail::settingsOf(block)));
+    };
 
-        std::ignore = block.settings().activateContext();
-        std::ignore = block.settings().applyStagedParameters();
-        expect(eq(block.gain.value, 0.5f)) << "the refused value does not reach the member";
+    "setStaged() returns the keys it refused, and storeDefaults() makes the values in force the stored ones"_test = [] {
+        LimitedGain   block{property_map{{"name", std::string("staged_stage")}}};
+        SettingsBase& settings = gr::settings::detail::settingsOf(block);
+        expect(settings.setStaged({{"gain", 2.0f}}).contains("gain")) << "a refused key is not returned";
+        expect(settings.set({{"gain", 0.25f}}).has_value());
+        settings.storeDefaults();
+        expect(settings.getStored("gain") == std::optional<pmt::Value>(0.25f)) << "the stored value is not the one in force";
+        expect(settings.activeParameters().contains("gain"));
     };
 
     "integral limits compare a float before converting it"_test = [] {
-        using RateLimits  = decltype(IntegralLimitedRate::rate)::LimitType;
-        const float lower = static_cast<float>(RateLimits::MinRange);
-        const float upper = static_cast<float>(RateLimits::MaxRange);
-        for (const float rate : {lower - 0.5f, upper + 0.5f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity()}) {
+        constexpr float lower = 0.f; // the ends of IntegralLimitedRate's rate
+        constexpr float upper = 100.f;
+        for (const float rate : {lower - 0.5f, upper + 0.5f, std::numeric_limits<float>::infinity()}) {
             IntegralLimitedRate block{property_map{{"name", std::string("rate_stage")}}};
             block.init(std::make_shared<gr::Sequence>());
-            expect(!setRefusal(block.settings(), {{"rate", rate}}).empty()) << std::format("set() takes rate = {}", rate);
+            expect(!setRefusal(gr::settings::detail::settingsOf(block), {{"rate", rate}}).empty()) << std::format("set() takes rate = {}", rate);
         }
 
         IntegralLimitedRate block{property_map{{"name", std::string("rate_stage")}}};
         block.init(std::make_shared<gr::Sequence>());
-        const std::string refusal = setRefusal(block.settings(), {{"rate", upper - 0.5f}});
+        const std::string refusal = setRefusal(gr::settings::detail::settingsOf(block), {{"rate", upper - 0.5f}});
         expect(refusal.empty()) << refusal;
-        std::ignore = block.settings().activateContext();
-        std::ignore = block.settings().applyStagedParameters();
-        expect(eq(block.rate.value, upper - 0.5f)) << "an accepted value keeps its fraction";
-
-        Annotated<float, "wide", Limits<std::int64_t{0}, std::numeric_limits<std::int64_t>::max()>> wide = 1.f;
-        expect(!wide.validate_and_set(-0.5f)) << "below a lower limit of 0";
-        expect(!wide.validate_and_set(0x1p64f)) << "beyond the int64_t range";
-        expect(wide.validate_and_set(0.5f));
-        expect(eq(wide.value, 0.5f)) << "an accepted value keeps its fraction";
-    };
-
-    "a floating value compares exactly with an integral limit the floating type rounds"_test = [] {
-        constexpr std::int64_t                                         signedUpper = std::numeric_limits<std::int64_t>::max();
-        const float                                                    floatUpper  = static_cast<float>(signedUpper);
-        Annotated<float, "wide", Limits<std::int64_t{0}, signedUpper>> wide        = 1.f;
-        expect(!wide.validate_and_set(floatUpper)) << "the rounded limit lies above the limit";
-        expect(wide.validate_and_set(std::nextafter(floatUpper, 0.f))) << "the float below it lies inside";
-
-        constexpr std::uint64_t                                                    unsignedUpper = std::numeric_limits<std::uint64_t>::max();
-        const double                                                               doubleUpper   = static_cast<double>(unsignedUpper);
-        Annotated<double, "unsignedWide", Limits<std::uint64_t{0}, unsignedUpper>> unsignedWide  = 1.0;
-        expect(!unsignedWide.validate_and_set(doubleUpper)) << "the rounded limit lies above the limit";
-        expect(unsignedWide.validate_and_set(std::nextafter(doubleUpper, 0.0))) << "the double below it lies inside";
+        std::ignore = gr::testing::applyStagedForTest(gr::settings::detail::settingsOf(block));
+        expect(eq(block.settings.rate.value, upper - 0.5f)) << "an accepted value keeps its fraction";
 
         constexpr std::int32_t                                            narrowUpper = std::numeric_limits<std::int32_t>::max();
-        Annotated<double, "narrow", Limits<std::int32_t{0}, narrowUpper>> narrow      = 1.0;
-        expect(narrow.validate_and_set(static_cast<double>(narrowUpper))) << "a limit the double holds exactly is inside";
-        expect(!narrow.validate_and_set(static_cast<double>(narrowUpper) + 0.5)) << "and a fraction above it is outside";
+        Annotated<double, Limits<Min<std::int32_t{0}>, Max<narrowUpper>>> narrow      = 1.0;
+        expect(!narrow.validate_and_set(static_cast<double>(narrowUpper) + 0.5)) << "a fraction above an integral limit the double holds exactly is outside";
+    };
 
-        constexpr std::int32_t twoToFloatDigits = std::int32_t{1} << std::numeric_limits<float>::digits;
+    "a declared range is refused naming only the bounds a value of the setting's type can break"_test = [] {
+        LimitForms block{property_map{{"name", std::string("forms")}}};
+        block.init(std::make_shared<gr::Sequence>());
+        SettingsBase& settings = gr::settings::detail::settingsOf(block);
 
-        constexpr std::int32_t                                          oddUpper     = twoToFloatDigits + 3;
-        const float                                                     roundedUpper = static_cast<float>(oddUpper);
-        Annotated<float, "belowOdd", Limits<std::int32_t{0}, oddUpper>> belowOdd     = 1.f;
-        expect(static_cast<double>(roundedUpper) > static_cast<double>(oddUpper)) << "float rounds the upper limit up";
-        expect(!belowOdd.validate_and_set(roundedUpper)) << "the rounded upper limit lies above the limit";
-        expect(belowOdd.validate_and_set(std::nextafter(roundedUpper, 0.f))) << "the float below it lies inside";
+        expect(eq(setRefusal(settings, {{"count", gr::Size_t{1}}}), std::string("count: out of range [2, inf): 1"))) << "an upper bound at the type's largest value";
+        expect(eq(setRefusal(settings, {{"taps", gr::Size_t{65}}}), std::string("taps: out of range (-inf, 64]: 65"))) << "a lower bound at the type's smallest value";
+        expect(eq(setRefusal(settings, {{"offset", std::int32_t{11}}}), std::string("offset: out of range (-inf, 10]: 11")));
+        expect(eq(setRefusal(settings, {{"level", -2.0}}), std::string("level: out of range [-1.5, inf): -2")));
+        expect(eq(setRefusal(settings, {{"fraction", 0.5f}}), std::string("fraction: out of range [0.1, 0.45]: 0.5"))) << "a float bound in its shortest text";
+        expect(eq(setRefusal(settings, {{"fraction", 0.05}}), std::string("fraction: out of range [0.1, 0.45]: 0.05")));
+        expect(eq(setRefusal(settings, {{"fft_length", gr::Size_t{4}}}), std::string("fft_length: out of range [8, 4096]: 4"))) << "a range beside a rule of the block's check";
+    };
 
-        constexpr std::int32_t                                                                   oddLower     = twoToFloatDigits + 1;
-        const float                                                                              roundedLower = static_cast<float>(oddLower);
-        Annotated<float, "aboveOdd", Limits<oddLower, std::numeric_limits<std::int32_t>::max()>> aboveOdd     = static_cast<float>(twoToFloatDigits) * 2.f;
-        expect(static_cast<double>(roundedLower) < static_cast<double>(oddLower)) << "float rounds the lower limit down";
-        expect(!aboveOdd.validate_and_set(roundedLower)) << "the rounded lower limit lies below the limit";
-        expect(aboveOdd.validate_and_set(std::nextafter(roundedLower, std::numeric_limits<float>::max()))) << "the float above it lies inside";
+    "predicates in Limits refuse a value with one text naming each of them"_test = [] {
+        PredicateForms block{property_map{{"name", std::string("predicates")}}};
+        block.init(std::make_shared<gr::Sequence>());
+        SettingsBase& settings = gr::settings::detail::settingsOf(block);
+
+        expect(eq(setRefusal(settings, {{"taps", gr::Size_t{0}}}), std::string("taps: out of range [1, 64]: 0")));
+        expect(eq(setRefusal(settings, {{"taps", gr::Size_t{65}}}), std::string("taps: out of range [1, 64]: 65")));
+        expect(setRefusal(settings, {{"taps", gr::Size_t{1}}}).empty() && setRefusal(settings, {{"taps", gr::Size_t{64}}}).empty()) << "Min and Max include their value";
+        expect(eq(setRefusal(settings, {{"cutoff", 0.f}}), std::string("cutoff: out of range (0, 0.5): 0"))) << "Over excludes its value";
+        expect(eq(setRefusal(settings, {{"cutoff", 0.5f}}), std::string("cutoff: out of range (0, 0.5): 0.5"))) << "Under excludes its value";
+        expect(setRefusal(settings, {{"cutoff", std::nextafter(0.5f, 0.f)}}).empty());
+        expect(eq(setRefusal(settings, {{"weight", 0.f}}), std::string("weight: out of range (0, 1]: 0")));
+        expect(setRefusal(settings, {{"weight", 1.f}}).empty());
+        expect(eq(setRefusal(settings, {{"length", gr::Size_t{0}}}), std::string("length: out of range [1, inf): 0")));
+        expect(eq(setRefusal(settings, {{"decimation", gr::Size_t{3}}}), std::string("decimation: not one of: 1, 2, 4: 3")));
+        expect(setRefusal(settings, {{"decimation", gr::Size_t{4}}}).empty());
+        expect(eq(setRefusal(settings, {{"order", 3}}), std::string("order: not one of: 2, 4, 8: 3")));
+    };
+
+    "OneOf on an enumeration takes the enumerators it lists and refuses the others by name"_test = [] {
+        PredicateForms block{property_map{{"name", std::string("taper")}}};
+        block.init(std::make_shared<gr::Sequence>());
+        SettingsBase& settings = gr::settings::detail::settingsOf(block);
+
+        expect(eq(setRefusal(settings, {{"taper", std::string("rectangular")}}), std::string("taper: not one of: hann, hamming: rectangular")));
+        expect(setRefusal(settings, {{"taper", std::string("hamming")}}).empty());
+        expect(block.get<std::string>("taper") == std::string("hamming"));
+        expect(!setRefusal(settings, {{"taper", std::string("kaiser")}}).empty()) << "a name the enumeration lacks";
+        using TaperLimits = decltype(PredicateForms::Settings::taper)::LimitType;
+        static_assert(TaperLimits::validate(Taper::hann) && TaperLimits::validate(Taper::hamming) && !TaperLimits::validate(Taper::rectangular));
+        static_assert(!Limits<OneOf<1, 2>>::validate(Taper::hann), "a number never equals an enumerator");
+    };
+
+    "a NaN fails every predicate, and a number of another type is compared exactly"_test = [] {
+        PredicateForms block{property_map{{"name", std::string("predicates")}}};
+        block.init(std::make_shared<gr::Sequence>());
+        SettingsBase& settings = gr::settings::detail::settingsOf(block);
+
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        expect(eq(setRefusal(settings, {{"cutoff", nan}}), std::string("cutoff: not a number")));
+        expect(eq(setRefusal(settings, {{"weight", nan}}), std::string("weight: not a number")));
+        static_assert(!decltype(PredicateForms::Settings::cutoff)::LimitType::validate(std::numeric_limits<double>::quiet_NaN()));
+        expect(!Limits<Max<1.f>>::validate(nan) && !Limits<OneOf<1.f>>::validate(nan)); // at run time: MSVC 19.51 folds `NaN <= 1.f` to true in a constant expression
+
+        using IntegerEnds = decltype(PredicateForms::Settings::integer_level)::LimitType;
+        static_assert(IntegerEnds::validate(-2.5) && IntegerEnds::validate(2.5));
+        static_assert(!IntegerEnds::validate(-3.0) && !IntegerEnds::validate(3.0), "an excluded integer end refuses the float equal to it");
+        expect(IntegerEnds::validate(std::nextafter(-3.0, 0.0)) && IntegerEnds::validate(std::nextafter(3.0, 0.0)));
+        static_assert(!Limits<Over<std::uint32_t{0}>>::validate(-0.5) && Limits<Over<std::uint32_t{0}>>::validate(0.5));
+        static_assert(!Limits<Under<std::int64_t{1} << 62>>::validate(0x1p62) && Limits<Under<std::int64_t{1} << 62>>::validate(0x1p61));
+    };
+
+    "a count set to its default outside the limits is refused before and after a valid value"_test = [] {
+        RequiredCount block{property_map{{"name", std::string("set_zero")}}};
+        SettingsBase& settings = gr::settings::detail::settingsOf(block);
+        expect(eq(setRefusal(settings, {{"count", gr::Size_t{0U}}}), std::string("count: out of range [1, inf): 0"))) << "set() accepts the default outside the limits";
+        expect(!block.ready().has_value()) << "a refused set() makes the block ready";
+        expect(setRefusal(settings, {{"count", gr::Size_t{2U}}}).empty());
+        expect(block.ready().has_value());
+        expect(eq(setRefusal(settings, {{"count", gr::Size_t{0U}}}), std::string("count: out of range [1, inf): 0")));
+        expect(block.get<gr::Size_t>("count") == gr::Size_t{2U}) << "the refused value is in force";
+        expect(!block.check({{"count", gr::Size_t{0U}}}).has_value()) << "check() accepts the default outside the limits";
+
+        RequiredCount given{property_map{{"name", std::string("given_zero")}, {"count", gr::Size_t{0U}}}};
+        expect(!given.ready().has_value()) << "a count given at construction equal to its default outside the limits is not judged as the default";
     };
 
     "a character or bool value compares with integral limits by its integer value"_test = [] {
-        using Percent = Limits<0, 100>;
         static_assert(Percent::validate(char{5}));
-        static_assert(limitsTakeCharacterByValue<Percent, char>());
-        static_assert(limitsTakeCharacterByValue<Percent, signed char>());
-        static_assert(limitsTakeCharacterByValue<Percent, unsigned char>());
-        static_assert(limitsTakeCharacterByValue<Percent, wchar_t>());
-        static_assert(limitsTakeCharacterByValue<Percent, char8_t>());
-        static_assert(limitsTakeCharacterByValue<Percent, char16_t>());
-        static_assert(limitsTakeCharacterByValue<Percent, char32_t>());
+        static_assert(percentTakesCharacterByValue<char>());
+        static_assert(percentTakesCharacterByValue<signed char>());
+        static_assert(percentTakesCharacterByValue<unsigned char>());
+        static_assert(percentTakesCharacterByValue<wchar_t>());
+        static_assert(percentTakesCharacterByValue<char8_t>());
+        static_assert(percentTakesCharacterByValue<char16_t>());
+        static_assert(percentTakesCharacterByValue<char32_t>());
         static_assert(Percent::validate(false) && Percent::validate(true));
-        static_assert(!Limits<2, 100>::validate(true));
+        static_assert(!Limits<Min<2>, Max<100>>::validate(true));
 
-        using Digit = Limits<'0', '9'>;
+        using Digit = Limits<Min<'0'>, Max<'9'>>;
         static_assert(Digit::validate(int{'5'}));
         static_assert(!Digit::validate(int{'0'} - 1) && !Digit::validate(int{'9'} + 1));
 
-        using EvenPercent = Limits<0, 100, isEven>;
-        static_assert(EvenPercent::validate(char{4}) && !EvenPercent::validate(char{5}));
-
-        using AnyCharacter = Limits<char{0}, char{0}, anyCharacter>;
-        static_assert(AnyCharacter::validate(int{'a'}));
-        static_assert(!AnyCharacter::validate(int{std::numeric_limits<char>::max()} + 1));
-
-        Annotated<char, "letter", Percent> letter = char{5};
-        expect(letter.validate_and_set(static_cast<char>(Percent::MaxRange)));
-        expect(!letter.validate_and_set(static_cast<char>(Percent::MaxRange + 1)));
-        expect(eq(letter.value, static_cast<char>(Percent::MaxRange))) << "the refused value does not reach the member";
+        Annotated<char, Percent> letter = char{5};
+        expect(letter.validate_and_set(static_cast<char>(kPercentUpper)));
+        expect(!letter.validate_and_set(static_cast<char>(kPercentUpper + 1)));
+        expect(eq(letter.value, static_cast<char>(kPercentUpper))) << "the refused value does not reach the member";
     };
 
-    "a refused set() leaves the keys that follow tags as they were"_test = [] {
-        LimitedGain block{property_map{{"name", std::string("gain_stage")}}};
-        block.init(std::make_shared<gr::Sequence>());
-        const auto        now = gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now());
-        const SettingsCtx night{now, "night"};
-        expect(setRefusal(block.settings(), {{"gain", 0.25f}}, night).empty());
-        const std::set<std::string> following = block.settings().autoUpdateParameters(night);
-        const gr::Size_t            nSets     = block.settings().getNAutoUpdateParameters();
-        expect(fatal(following.contains("disconnect_on_done") && following.contains("compute_domain") && following.contains("name")));
-
-        const property_map refused{{"disconnect_on_done", false}, {"compute_domain", std::string("default_cpu")}, {"name", std::string("renamed")}, {"gain", 2.0f}};
-        expect(setRefusal(block.settings(), refused, night).contains("[0, 1]"));
-        expect(setRefusal(block.settings(), refused, SettingsCtx{now + 1U, "dawn"}).contains("[0, 1]"));
-        expect(block.settings().autoUpdateParameters(night) == following) << "a refused map changes which keys follow tags";
-        expect(eq(block.settings().getNAutoUpdateParameters(), nSets)) << "a refused map leaves a set for a context it never stored";
-    };
-
-    "a refused set() that renames the block names it by the name it keeps"_test = [] {
+    "a refused set() that renames the block leaves it the name it has"_test = [] {
         LimitedGain block{property_map{{"name", std::string("gain_stage")}}};
         block.init(std::make_shared<gr::Sequence>());
 
-        const std::string refusal = setRefusal(block.settings(), {{"name", std::string("renamed")}, {"gain", 2.0f}});
-        expect(refusal.contains("block 'gain_stage'")) << refusal;
-        expect(!refusal.contains("renamed")) << "the refusal names the block by a name it never takes" << refusal;
+        const std::string refusal = setRefusal(gr::settings::detail::settingsOf(block), {{"name", std::string("renamed")}, {"gain", 2.0f}});
+        expect(refusal.contains("out of range [0, 1]: ")) << refusal;
+        expect(eq(std::string(block.name), std::string("gain_stage"))) << "a refused call renames the block";
+        expect(block.get<std::string>("name") == std::string("gain_stage")) << "a refused call renames the block in its settings";
     };
 
     "a block constructed with a value outside the limits does not join the graph"_test = [] {
@@ -2025,45 +1789,11 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
             refusal = e.message;
         }
         expect(refusal.contains("block 'stage'")) << "the refusal names the block by the name the map gives" << refusal;
-        expect(refusal.contains("[0, 1]")) << refusal;
+        expect(refusal.contains("out of range [0, 1]: ")) << refusal;
         expect(flow.blocks().empty()) << "the refused block is in the graph";
     };
 
-    "a block whose staged initial value is refused fails its init with the refusal"_test = [] {
-        LimitedGain block{property_map{{"name", std::string("gain_stage")}}};
-        std::ignore = block.settings().setStaged({{"gain", 2.0f}});
-        block.init(std::make_shared<gr::Sequence>());
-
-        expect(block.state() == lifecycle::State::ERROR) << "the block reads initialized";
-        expect(fatal(block._initError.has_value())) << "the block keeps no init error";
-        expect(block._initError->message.contains("block 'gain_stage'")) << block._initError->message;
-        expect(block._initError->message.contains("[0, 1]")) << block._initError->message;
-    };
-
-    "a staged value refused at the apply reaches the message output with the refusal"_test = [] {
-        LimitedGain   block{property_map{{"name", std::string("gain_stage")}}};
-        gr::MsgPortIn fromBlock;
-        expect(block.msgOut.connect(fromBlock).has_value());
-        block.init(std::make_shared<gr::Sequence>());
-
-        std::ignore = block.settings().setStaged({{"gain", 2.0f}});
-        block.applyChangedSettings();
-
-        std::string         reported;
-        ReaderSpanLike auto messages = fromBlock.streamReader().get<SpanReleasePolicy::ProcessAll>();
-        for (const gr::Message& message : messages) {
-            if (!message.data.has_value()) {
-                reported += message.data.error().message;
-            }
-        }
-        std::ignore = messages.consume(messages.size());
-        expect(reported.contains("block 'gain_stage'")) << reported;
-        expect(reported.contains("gain = 2")) << reported;
-        expect(reported.contains("[0, 1]")) << reported;
-        expect(eq(block.gain.value, 0.5f)) << "the refused value does not reach the member";
-    };
-
-    "a tag value the limits refuse is reported in a plain message, and the run completes"_test = [] {
+    "a tag value the limits refuse leaves the member, and the run completes"_test = [] {
         const property_map tag{{"gain", 2.0f}};
 
         const SinkRun<LimitedSink> unread = runIntoSink<LimitedSink>("limited_sink", tag, {}, false);
@@ -2073,88 +1803,29 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
 
         const SinkRun<LimitedSink> read = runIntoSink<LimitedSink>("limited_sink", tag, {}, true);
         expect(read.result.has_value());
-        expect(read.reported.plain.contains("block 'limited_sink' refuses gain = 2")) << "no plain message names the refusal, got: " << read.reported.plain;
-        expect(read.reported.plain.contains("[0, 1]")) << read.reported.plain;
         expect(read.reported.errors.empty()) << "the refused tag value is reported as an error: " << read.reported.errors;
     };
 
-    "a value a Set message stages and the limits refuse ends the run in the error"_test = [] {
-        const SinkRun<LimitedSink> run = runIntoSink<LimitedSink>("limited_sink", {}, {{"gain", 2.0f}}, false);
-        expect(fatal(!run.result.has_value())) << "the run completes past the refused value";
-        expect(run.result.error().message.contains(kRejectedSettings)) << run.result.error().message;
-        expect(run.result.error().message.contains("block 'limited_sink' refuses gain = 2")) << run.result.error().message;
+    "a Set message whose value the limits refuse leaves the member, and the run completes"_test = [] {
+        // a Set without a request id gets no reply: its refusal goes out as a notification, which ends no run
+        const SinkRun<LimitedSink> run = runIntoSink<LimitedSink>("limited_sink", {}, {{"gain", 2.0f}}, false, true);
+        expect(run.result.has_value()) << "a refused Set message ended the run: " << (run.result.has_value() ? std::string() : run.result.error().message);
         expect(eq(run.held, 0.5f)) << "the refused value reaches the member";
+        expect(eq(run.nReceived, run.nSent)) << "the sink misses samples";
+        const auto refusal = [](const gr::settings::Notification& notification) { return notification.level == gr::settings::NotificationLevel::error && notification.what == gr::settings::NotificationKind::failed && notification.key == "gain" && notification.reason == "out of range [0, 1]: 2"; };
+        expect(eq(static_cast<std::size_t>(std::ranges::count_if(run.notified, refusal)), 1UZ)) << "the refusal did not reach the reader once";
     };
 
-    "a value settingsChanged() refuses leaves the member and settings().get() at the value last taken"_test = [] {
-        RefusingSink  block{property_map{{"name", std::string("refusing_stage")}}};
-        gr::MsgPortIn fromBlock;
-        expect(block.msgOut.connect(fromBlock).has_value());
-        block.init(std::make_shared<gr::Sequence>());
-
-        const gr::Size_t taken = block.count + 2U;
-        std::ignore            = block.settings().setStaged({{"count", taken}});
-        block.applyChangedSettings();
-        expect(fatal(eq(block.count, taken))) << "the block does not take a count it accepts";
-
-        std::ignore = block.settings().setStaged({{"count", gr::Size_t{0U}}});
-        block.applyChangedSettings();
-        const ReportedRefusals reported = readRefusals(fromBlock);
-        expect(reported.errors.contains("count must be at least 1")) << "the refusal does not reach the message output, got: " << reported.errors;
-        expect(eq(block.count, taken)) << "the refused value stays in the member";
-        const std::optional<pmt::Value> got = block.settings().get("count");
-        expect(fatal(got.has_value()));
-        expect(eq(got->value_or(gr::Size_t{0U}), taken)) << "settings().get() returns the refused value";
+    "a Set message that names no enumerator is refused with the text set() gives"_test = [] {
+        const SinkRun<ModeSink> run = runIntoSink<ModeSink>("mode_sink", {}, {{"mode", std::string("sideways")}}, false, true);
+        expect(run.result.has_value()) << "a refused Set message ended the run: " << (run.result.has_value() ? std::string() : run.result.error().message);
+        expect(run.held == SinkMode::fast) << "the refused name reaches the member";
+        const auto refusal = [](const gr::settings::Notification& notification) { return notification.level == gr::settings::NotificationLevel::error && notification.what == gr::settings::NotificationKind::failed && notification.key == "mode" && notification.reason == "not one of: fast, slow: sideways"; };
+        expect(eq(static_cast<std::size_t>(std::ranges::count_if(run.notified, refusal)), 1UZ)) << "the refusal did not reach the reader once";
     };
 
-    "a value set() stores and settingsChanged() refuses is not applied again by a later activation"_test = [] {
-        RefusingSink  block{property_map{{"name", std::string("refusing_stage")}}};
-        gr::MsgPortIn fromBlock;
-        expect(block.msgOut.connect(fromBlock).has_value());
-        block.init(std::make_shared<gr::Sequence>());
-
-        const gr::Size_t taken = block.count + 2U;
-        std::ignore            = block.settings().set({{"count", taken}});
-        std::ignore            = block.settings().activateContext();
-        block.applyChangedSettings();
-        expect(fatal(eq(block.count, taken))) << "the block does not take a count it accepts";
-
-        std::ignore = block.settings().set({{"count", gr::Size_t{0U}}});
-        std::ignore = block.settings().activateContext();
-        block.applyChangedSettings();
-        expect(readRefusals(fromBlock).errors.contains("count must be at least 1")) << "the refusal does not reach the message output";
-        expect(eq(block.count, taken)) << "the refused value stays in the member";
-        const std::optional<pmt::Value> stored = block.settings().getStored("count");
-        expect(fatal(stored.has_value()));
-        expect(eq(stored->value_or(gr::Size_t{0U}), taken)) << "the refused value stays stored";
-
-        const float level = block.level * 2.f;
-        std::ignore       = block.settings().set({{"level", level}});
-        std::ignore       = block.settings().activateContext();
-        block.applyChangedSettings();
-        const ReportedRefusals later = readRefusals(fromBlock);
-        expect(later.errors.empty()) << "the activation of another key applies the refused value again: " << later.errors;
-        expect(eq(block.level, level)) << "the block does not take the other key";
-        expect(eq(block.count, taken));
-    };
-
-    "a tag value settingsChanged() refuses is reported in a plain message, and the run completes"_test = [] {
-        const gr::Size_t   initial = RefusingSink{}.count;
-        const property_map tag{{"count", gr::Size_t{0U}}};
-
-        const SinkRun<RefusingSink> unread = runIntoSink<RefusingSink>("refusing_sink", tag, {}, false);
-        expect(unread.result.has_value()) << "the refused tag value ends the run: " << (unread.result.has_value() ? std::string() : unread.result.error().message);
-        expect(eq(unread.held, initial)) << "the refused value stays in the member";
-        expect(eq(unread.nReceived, unread.nSent)) << "the sink misses samples";
-
-        const SinkRun<RefusingSink> read = runIntoSink<RefusingSink>("refusing_sink", tag, {}, true);
-        expect(read.result.has_value());
-        expect(read.reported.plain.contains("block 'refusing_sink' refuses count = 0: count must be at least 1")) << "no plain message names the refusal, got: " << read.reported.plain;
-        expect(read.reported.errors.empty()) << "the refused tag value is reported as an error: " << read.reported.errors;
-    };
-
-    "a coupled tag value settingsChanged() refuses leaves on the tag as it arrived, and the forward map stays behind"_test = [] {
-        const gr::Size_t initial = RefusingForwarder{}.count;
+    "a coupled tag value applySettings() refuses leaves on the tag as it arrived, and the forward map stays behind"_test = [] {
+        const gr::Size_t initial = RefusingForwarder{}.settings.count;
         const gr::Size_t taken   = initial + 2U;
 
         const ForwarderRun accepted = runThroughRefusingForwarder(taken);
@@ -2172,430 +1843,18 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
         const ForwarderRun run     = runThroughRefusingForwarder(refused);
         expect(fatal(run.result.has_value())) << "the refused tag value ends the run";
         expect(eq(run.held, initial)) << "the refused value stays in the member";
-        expect(run.reported.plain.contains("block 'refusing_forwarder' refuses count = 0: count must be at least 1")) << "no plain message names the refused setting, got: " << run.reported.plain;
         expect(run.reported.errors.empty()) << "the refused tag value is reported as an error: " << run.reported.errors;
         const std::vector<Tag> counts = tagsWithKey(run.tags, kCountKey);
         expect(fatal(eq(counts.size(), 1UZ)));
         expect(eq(counts[0].map.at(std::pmr::string(kCountKey)).value_or(initial), refused)) << "the tag does not leave with the value it arrived with";
-        expect(tagsWithKey(run.tags, kTakenCountKey).empty()) << "the forward map of the refused change leaves";
+        expect(std::ranges::none_of(tagsWithKey(run.tags, kTakenCountKey), [](const Tag& tag) { return tag.map.at(std::pmr::string(kTakenCountKey)).value_or(gr::Size_t{1U}) == refused; })) << "the forward map of the refused change leaves";
     };
 
-    "a value a Set message stages and settingsChanged() refuses ends the run in the error"_test = [] {
-        const gr::Size_t            initial = RefusingSink{}.count;
+    "a value a Set message stages and applySettings() refuses leaves the member, and the run completes"_test = [] {
+        const gr::Size_t            initial = RefusingSink{}.settings.count;
         const SinkRun<RefusingSink> run     = runIntoSink<RefusingSink>("refusing_sink", {}, {{"count", gr::Size_t{0U}}}, false);
-        expect(fatal(!run.result.has_value())) << "the run completes past the refused value";
-        expect(run.result.error().message.contains("count must be at least 1")) << run.result.error().message;
+        expect(run.result.has_value()) << "a failed apply ends the run: " << (run.result.has_value() ? std::string() : run.result.error().message);
         expect(eq(run.held, initial)) << "the refused value stays in the member";
-    };
-
-    "a refused activation of another context returns to the earlier context and leaves the refused one's stored set as set() stored it"_test = [] {
-        RefusingSink  block{property_map{{"name", std::string("refusing_stage")}}};
-        gr::MsgPortIn fromBlock;
-        expect(block.msgOut.connect(fromBlock).has_value());
-        block.init(std::make_shared<gr::Sequence>());
-
-        const gr::Size_t   held       = block.count;
-        const SettingsCtx  earlierCtx = block.settings().activeContext();
-        const SettingsCtx  refusedCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), "refused"};
-        const property_map refusedSet{{"count", gr::Size_t{0U}}, {"level", block.level * 2.f}};
-        expect(block.settings().set(refusedSet, refusedCtx).empty());
-        expect(block.settings().activateContext(refusedCtx).has_value());
-        block.applyChangedSettings();
-        expect(readRefusals(fromBlock).errors.contains("count must be at least 1")) << "the activation is not refused";
-        expect(eq(block.count, held)) << "the refused value stays in the member";
-        expect(block.settings().activeContext() == earlierCtx) << "the refused context stays active";
-        for (const auto& [key, value] : refusedSet) {
-            const std::optional<pmt::Value> stored = block.settings().getStored(std::string(std::string_view(key)), refusedCtx);
-            expect(stored.has_value() && *stored == value) << "the refused context's stored set changes at " << key;
-        }
-
-        expect(block.settings().activateContext(refusedCtx).has_value());
-        block.applyChangedSettings();
-        expect(readRefusals(fromBlock).errors.contains("count must be at least 1")) << "activating the refused context again does not reach the callback";
-        expect(eq(block.count, held));
-        expect(block.settings().activeContext() == earlierCtx) << "the refused context stays active after a second refusal";
-    };
-
-    "a gr:context tag whose activation settingsChanged() refuses is reported in a plain message, and the earlier context stays active"_test = [] {
-        RefusingSink  block{property_map{{"name", std::string("refusing_stage")}}};
-        gr::MsgPortIn fromBlock;
-        expect(block.msgOut.connect(fromBlock).has_value());
-        block.init(std::make_shared<gr::Sequence>());
-
-        const gr::Size_t  held       = block.count;
-        const SettingsCtx earlierCtx = block.settings().activeContext();
-        const SettingsCtx refusedCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), std::string(kRefusedContext)};
-        expect(block.settings().set({{"count", gr::Size_t{0U}}}, refusedCtx).empty());
-        block.settings().autoUpdate(Tag{0UZ, property_map{{gr::tag::CONTEXT.key(), std::string(kRefusedContext)}}});
-        block.applyChangedSettings();
-
-        const ReportedRefusals reported = readRefusals(fromBlock);
-        expect(reported.plain.contains("count must be at least 1")) << "no plain message names the refusal, got: " << reported.plain;
-        expect(reported.errors.empty()) << "the refused activation is reported as an error: " << reported.errors;
-        expect(eq(block.count, held)) << "the refused value stays in the member";
-        expect(block.settings().activeContext() == earlierCtx) << "the refused context stays active";
-    };
-
-    "a number outside an integer setting's range never enters a context's set, and the gr:context tag that activates the set reports nothing"_test = [] {
-        RefusingSink  block{property_map{{"name", std::string("refusing_stage")}}};
-        gr::MsgPortIn fromBlock;
-        expect(block.msgOut.connect(fromBlock).has_value());
-        block.init(std::make_shared<gr::Sequence>());
-
-        const gr::Size_t    held       = block.count;
-        const float         level      = 2.f * block.level;
-        const std::uint64_t outOfRange = std::numeric_limits<std::uint64_t>::max();
-        const SettingsCtx   rangedCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), std::string("ranged")};
-        expect(setRefusal(block.settings(), {{"count", outOfRange}}, rangedCtx).contains("count")) << "set() stores a count outside its range";
-        expect(block.settings().set({{"level", level}}, rangedCtx).empty());
-        const std::optional<pmt::Value> stored = block.settings().getStored("count", rangedCtx);
-        expect(!stored.has_value() || stored->value_or(gr::Size_t{0U}) == held) << "the context's set holds the refused count";
-
-        block.settings().autoUpdate(Tag{0UZ, property_map{{gr::tag::CONTEXT.key(), std::string("ranged")}}});
-        block.applyChangedSettings();
-
-        const ReportedRefusals reported = readRefusals(fromBlock);
-        expect(reported.plain.empty()) << "the activation reports a refusal: " << reported.plain;
-        expect(reported.errors.empty()) << "the activation reports an error: " << reported.errors;
-        expect(eq(block.count, held)) << "the refused count reaches the member";
-        expect(eq(block.level, level)) << "the context's level is not applied";
-        expect(block.settings().activeContext() == rangedCtx) << "the tag's context is not active";
-    };
-
-    "a batch holding a gr:context tag's activation and a setStaged() value ends in the error when refused"_test = [] {
-        RefusingSink  block{property_map{{"name", std::string("refusing_stage")}}};
-        gr::MsgPortIn fromBlock;
-        expect(block.msgOut.connect(fromBlock).has_value());
-        block.init(std::make_shared<gr::Sequence>());
-
-        const gr::Size_t  heldCount = block.count;
-        const float       heldLevel = block.level;
-        const SettingsCtx refusedCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), std::string(kRefusedContext)};
-        expect(block.settings().set({{"count", gr::Size_t{0U}}}, refusedCtx).empty());
-        std::ignore = block.settings().setStaged({{"level", 2.f * heldLevel}});
-        block.settings().autoUpdate(Tag{0UZ, property_map{{gr::tag::CONTEXT.key(), std::string(kRefusedContext)}}});
-        block.applyChangedSettings();
-
-        const ReportedRefusals reported = readRefusals(fromBlock);
-        expect(reported.errors.contains("count must be at least 1")) << "the refusal does not reach the error output, got: " << reported.errors;
-        expect(reported.plain.empty()) << "the refusal of a mixed batch is reported in a plain message: " << reported.plain;
-        expect(eq(block.count, heldCount)) << "the refused count reaches the member";
-        expect(eq(block.level, heldLevel)) << "the refused level reaches the member";
-    };
-
-    "a gr:context tag whose activation settingsChanged() refuses leaves the run going"_test = [] {
-        const gr::Size_t initial = RefusingSink{}.count;
-
-        const SinkRun<RefusingSink> unread = runContextTagIntoRefusingSink(false);
-        expect(unread.result.has_value()) << "the refused activation ends the run: " << (unread.result.has_value() ? std::string() : unread.result.error().message);
-        expect(eq(unread.held, initial)) << "the refused value stays in the member";
-        expect(eq(unread.nReceived, unread.nSent)) << "the sink misses samples";
-
-        const SinkRun<RefusingSink> read = runContextTagIntoRefusingSink(true);
-        expect(read.result.has_value());
-        expect(read.reported.plain.contains("block 'refusing_sink' refuses")) << "no plain message names the refusal, got: " << read.reported.plain;
-        expect(read.reported.errors.empty()) << "the refused activation is reported as an error: " << read.reported.errors;
-    };
-
-    "a refused batch that removeContext() staged keeps the context it falls back to"_test = [] {
-        RefusingSink  block{property_map{{"name", std::string("refusing_stage")}}};
-        gr::MsgPortIn fromBlock;
-        expect(block.msgOut.connect(fromBlock).has_value());
-        block.init(std::make_shared<gr::Sequence>());
-
-        const SettingsCtx removedCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), "removed"};
-        expect(block.settings().set({{"count", gr::Size_t{block.count + 1U}}}, removedCtx).empty());
-        expect(block.settings().activateContext(removedCtx).has_value());
-        block.applyChangedSettings();
-        expect(readRefusals(fromBlock).errors.empty()) << "the activation is refused";
-        const gr::Size_t held = block.count;
-
-        // the default context's newest stored set holds a count the callback refuses
-        expect(block.settings().set({{"count", gr::Size_t{0U}}}, SettingsCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), ""}).empty());
-        expect(block.settings().removeContext(removedCtx));
-        block.applyChangedSettings();
-        expect(readRefusals(fromBlock).errors.contains("count must be at least 1")) << "the fallback to the default context is not refused";
-        expect(eq(block.count, held)) << "the refused value stays in the member";
-        expect(block.settings().activeContext().context.value_or(std::string_view{}).empty()) << "the removed context is active again";
-    };
-
-    "a refused activation whose earlier context removeContext() removed before the apply returns to the default context"_test = [] {
-        RefusingSink  block{property_map{{"name", std::string("refusing_stage")}}};
-        gr::MsgPortIn fromBlock;
-        expect(block.msgOut.connect(fromBlock).has_value());
-        block.init(std::make_shared<gr::Sequence>());
-
-        const SettingsCtx earlierCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), "earlier"};
-        expect(block.settings().set({{"count", gr::Size_t{block.count + 1U}}}, earlierCtx).empty());
-        expect(block.settings().activateContext(earlierCtx).has_value());
-        block.applyChangedSettings();
-        expect(readRefusals(fromBlock).errors.empty()) << "the earlier context is refused";
-        const gr::Size_t held = block.count;
-
-        const SettingsCtx refusedCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), "refused"};
-        expect(block.settings().set({{"count", gr::Size_t{0U}}}, refusedCtx).empty());
-        expect(block.settings().activateContext(refusedCtx).has_value());
-        expect(block.settings().removeContext(earlierCtx));
-        block.applyChangedSettings();
-        expect(readRefusals(fromBlock).errors.contains("count must be at least 1")) << "the activation is not refused";
-        expect(eq(block.count, held)) << "the refused value stays in the member";
-        expect(block.settings().activeContext().context.value_or(std::string_view{}).empty()) << "the default context is not active";
-
-        expect(block.settings().activateContext(refusedCtx).has_value());
-        block.applyChangedSettings();
-        expect(readRefusals(fromBlock).errors.contains("count must be at least 1")) << "activating the refused context again does not reach the callback";
-    };
-
-    "a refused activation returns to the earlier context when set() stored a newer set of it before the apply"_test = [] {
-        RefusingSink  block{property_map{{"name", std::string("refusing_stage")}}};
-        gr::MsgPortIn fromBlock;
-        expect(block.msgOut.connect(fromBlock).has_value());
-        block.init(std::make_shared<gr::Sequence>());
-
-        const SettingsCtx earlierCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), "earlier"};
-        expect(block.settings().set({{"count", gr::Size_t{block.count + 1U}}}, earlierCtx).empty());
-        expect(block.settings().activateContext(earlierCtx).has_value());
-        block.applyChangedSettings();
-        expect(readRefusals(fromBlock).errors.empty()) << "the earlier context is refused";
-        const gr::Size_t held  = block.count;
-        const gr::Size_t newer = held + 1U;
-
-        const SettingsCtx refusedCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), "refused"};
-        expect(block.settings().set({{"count", gr::Size_t{0U}}}, refusedCtx).empty());
-        expect(block.settings().activateContext(refusedCtx).has_value());
-        // a newer set of the earlier context prunes the set the activation recorded
-        expect(block.settings().set({{"count", newer}}, SettingsCtx{0U, "earlier"}).empty());
-        block.applyChangedSettings();
-        expect(readRefusals(fromBlock).errors.contains("count must be at least 1")) << "the activation is not refused";
-        expect(eq(block.count, held)) << "the refused value stays in the member";
-        expect(block.settings().activeContext().context == earlierCtx.context) << "the earlier context is not active";
-
-        expect(block.settings().activateContext(SettingsCtx{0U, "earlier"}).has_value());
-        block.applyChangedSettings();
-        expect(readRefusals(fromBlock).errors.empty()) << "the earlier context's newer set is refused";
-        expect(eq(block.count, newer)) << "activating the earlier context again does not stage its newer set";
-    };
-
-    "a refused activation whose earlier context settingsChanged() removes returns to the default context"_test = [] {
-        ContextChangingSink block{property_map{{"name", std::string("removing_stage")}}};
-        gr::MsgPortIn       fromBlock;
-        expect(block.msgOut.connect(fromBlock).has_value());
-        block.init(std::make_shared<gr::Sequence>());
-
-        const SettingsCtx earlierCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), "earlier"};
-        expect(block.settings().set({{"count", gr::Size_t{block.count + 1U}}}, earlierCtx).empty());
-        expect(block.settings().activateContext(earlierCtx).has_value());
-        block.applyChangedSettings();
-        expect(readRefusals(fromBlock).errors.empty()) << "the earlier context is refused";
-        const gr::Size_t held = block.count;
-
-        const SettingsCtx refusedCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), "refused"};
-        expect(block.settings().set({{"count", gr::Size_t{0U}}}, refusedCtx).empty());
-        block.removeOnRefusal = earlierCtx;
-        expect(block.settings().activateContext(refusedCtx).has_value());
-        block.applyChangedSettings();
-        expect(readRefusals(fromBlock).errors.contains("count must be at least 1")) << "the activation is not refused";
-        expect(block.removed) << "the callback does not remove the earlier context";
-        expect(eq(block.count, held)) << "the refused value stays in the member";
-        expect(block.settings().activeContext().context.value_or(std::string_view{}).empty()) << "the default context is not active";
-    };
-
-    "a context settingsChanged() activates before it refuses does not return to the refused context when it is refused too"_test = [] {
-        ContextChangingSink block{property_map{{"name", std::string("activating_stage")}}};
-        gr::MsgPortIn       fromBlock;
-        expect(block.msgOut.connect(fromBlock).has_value());
-        block.init(std::make_shared<gr::Sequence>());
-
-        const gr::Size_t  held       = block.count;
-        const SettingsCtx earlierCtx = block.settings().activeContext();
-        const SettingsCtx refusedCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), "refused"};
-        const SettingsCtx laterCtx{refusedCtx.time + 1U, "later"};
-        expect(block.settings().set({{"count", gr::Size_t{0U}}}, refusedCtx).empty());
-        expect(block.settings().set({{"count", gr::Size_t{0U}}}, laterCtx).empty());
-        block.activateOnRefusal = laterCtx;
-        expect(block.settings().activateContext(refusedCtx).has_value());
-        block.applyChangedSettings();
-        expect(readRefusals(fromBlock).errors.contains("count must be at least 1")) << "the activation is not refused";
-        expect(block.settings().activeContext() == laterCtx) << "the context the callback activates is not active";
-
-        block.applyChangedSettings();
-        expect(readRefusals(fromBlock).errors.contains("count must be at least 1")) << "the context the callback activates is not refused";
-        expect(eq(block.count, held)) << "the refused value stays in the member";
-        expect(block.settings().activeContext() == earlierCtx) << "a refused context is active";
-    };
-
-    "a value settingsChanged() refuses leaves the stored set of a context the callback activates as that context stored it"_test = [] {
-        const gr::Size_t refused = 0U;
-        for (const gr::Size_t storedInNext : {refused, gr::Size_t{refused + 5U}}) {
-            ContextChangingSink block{property_map{{"name", std::string("activating_stage")}}};
-            gr::MsgPortIn       fromBlock;
-            expect(block.msgOut.connect(fromBlock).has_value());
-            block.init(std::make_shared<gr::Sequence>());
-
-            const gr::Size_t  held = block.count;
-            const SettingsCtx nextCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), "next"};
-            expect(block.settings().set({{"count", storedInNext}}, nextCtx).empty());
-            block.activateOnRefusal = nextCtx;
-            std::ignore             = block.settings().setStaged({{"count", refused}});
-            block.applyChangedSettings();
-            expect(readRefusals(fromBlock).errors.contains("count must be at least 1")) << "the staged count is not refused";
-            expect(eq(block.count, held)) << "the refused value stays in the member";
-            expect(block.settings().activeContext() == nextCtx) << "the context the callback activates is not active";
-            const std::optional<pmt::Value> stored = block.settings().getStored("count", nextCtx);
-            expect(fatal(stored.has_value()));
-            expect(eq(stored->value_or(gr::Size_t{held}), storedInNext)) << "the rollback rewrites the stored set of the context the callback activates";
-        }
-    };
-
-    "a refused reset_default tag returns the block to the named context it was in"_test = [] {
-        RefusingSink  block{property_map{{"name", std::string("refusing_stage")}}};
-        gr::MsgPortIn fromBlock;
-        expect(block.msgOut.connect(fromBlock).has_value());
-        block.init(std::make_shared<gr::Sequence>());
-
-        const SettingsCtx namedCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), "named"};
-        const float       namedLevel = 2.f * block.level;
-        expect(block.settings().set({{"level", namedLevel}}, namedCtx).empty());
-        expect(block.settings().activateContext(namedCtx).has_value());
-        block.applyChangedSettings();
-        expect(fatal(eq(block.level, namedLevel))) << "the block does not take the named context's level";
-
-        qa_coupling::couple(block.settings(), "count", "count");
-        block.settings().autoUpdate(Tag{0UZ, property_map{{std::pmr::string(gr::tag::RESET_DEFAULTS.key()), true}, {"count", gr::Size_t{0U}}}});
-        block.applyChangedSettings();
-        const ReportedRefusals reported = readRefusals(fromBlock);
-        expect((reported.errors + reported.plain).contains("count must be at least 1")) << "the reset with a count of 0 is not refused";
-        expect(eq(block.level, namedLevel)) << "the refused reset restores the level";
-        expect(block.settings().activeContext() == namedCtx) << "the refused reset leaves the default context active";
-    };
-
-    "a value settingsChanged() refuses after a reset_default tag left a named context keeps the default context"_test = [] {
-        RefusingSink  block{property_map{{"name", std::string("refusing_stage")}}};
-        gr::MsgPortIn fromBlock;
-        expect(block.msgOut.connect(fromBlock).has_value());
-        block.init(std::make_shared<gr::Sequence>());
-
-        const float       defaultLevel = block.level;
-        const SettingsCtx namedCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now()), "named"};
-        expect(block.settings().set({{"level", 2.f * defaultLevel}}, namedCtx).empty());
-        expect(block.settings().activateContext(namedCtx).has_value());
-        block.applyChangedSettings();
-
-        block.settings().autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.key()));
-        block.applyChangedSettings();
-        const SettingsCtx resetCtx = block.settings().activeContext();
-        expect(fatal(eq(block.level, defaultLevel))) << "the reset does not restore the level";
-        expect(fatal(resetCtx.context.value_or(std::string_view{}).empty())) << "the reset does not return to the default context";
-
-        std::ignore = block.settings().setStaged({{"count", gr::Size_t{0U}}});
-        block.applyChangedSettings();
-        expect(readRefusals(fromBlock).errors.contains("count must be at least 1")) << "the count of 0 is not refused";
-        expect(block.settings().activeContext() == resetCtx) << "the refused value returns the block to the named context the reset left";
-    };
-
-    "a member whose limits refuse its previous value keeps the refused value, and its stored set agrees"_test = [] {
-        LimitedRefusingBlock block{property_map{{"name", std::string("limited_refusing_stage")}}};
-        gr::MsgPortIn        fromBlock;
-        expect(block.msgOut.connect(fromBlock).has_value());
-        block.init(std::make_shared<gr::Sequence>());
-
-        const gr::Size_t refused = LimitedRefusingBlock::kMostTaken + 1U;
-        expect(block.settings().set({{"count", refused}}).empty());
-        std::ignore = block.settings().activateContext();
-        block.applyChangedSettings();
-        expect(readRefusals(fromBlock).errors.contains("count must be at most")) << "the refusal does not reach the message output";
-        expect(eq(block.count.value, refused)) << "the member takes back a previous value outside its limits";
-        const std::optional<pmt::Value> stored = block.settings().getStored("count");
-        expect(fatal(stored.has_value()));
-        expect(eq(stored->value_or(gr::Size_t{0U}), block.count.value)) << "the stored set and the member disagree";
-    };
-
-    "a refused value is written back when settingsChanged() empties newSettings before it throws"_test = [] {
-        ClearingRefusingBlock block{property_map{{"name", std::string("clearing_stage")}}};
-        gr::MsgPortIn         fromBlock;
-        expect(block.msgOut.connect(fromBlock).has_value());
-        block.init(std::make_shared<gr::Sequence>());
-
-        const gr::Size_t held = block.count;
-        std::ignore           = block.settings().setStaged({{"count", gr::Size_t{0U}}});
-        block.applyChangedSettings();
-        const ReportedRefusals reported = readRefusals(fromBlock);
-        expect(reported.errors.contains("count must be at least 1")) << "the refusal is not an error, got: " << reported.errors;
-        expect(reported.plain.empty()) << "the refusal of a staged value is a plain message: " << reported.plain;
-        expect(eq(block.count, held)) << "the refused value stays in the member";
-    };
-
-    "a batch with a tag value and a staged value the limits refuse reports each refusal by where it came from"_test = [] {
-        LimitedGainAndOffset block{property_map{{"name", std::string("pair_stage")}}};
-        gr::MsgPortIn        fromBlock;
-        expect(block.msgOut.connect(fromBlock).has_value());
-        block.init(std::make_shared<gr::Sequence>());
-        qa_coupling::couple(block.settings(), "gain", "gain");
-
-        block.settings().autoUpdate(Tag{0UZ, property_map{{"gain", 2.0f}}});
-        std::ignore = block.settings().setStaged({{"offset", 5.0f}});
-        block.applyChangedSettings();
-
-        const ReportedRefusals reported = readRefusals(fromBlock);
-        expect(reported.errors.contains("block 'pair_stage' refuses offset = 5")) << "the error does not name the staged value, got: " << reported.errors;
-        expect(!reported.errors.contains("gain =")) << "the error names the tag value: " << reported.errors;
-        expect(reported.plain.contains("block 'pair_stage' refuses gain = 2")) << "the plain message does not name the tag value, got: " << reported.plain;
-        expect(!reported.plain.contains("offset =")) << "the plain message names the staged value: " << reported.plain;
-        expect(eq(block.gain.value, 0.5f) && eq(block.offset.value, 0.f)) << "a refused value reaches its member";
-    };
-
-    "a typed setStaged() with a value that does not convert throws and stages none of the keys"_test = [] {
-        LimitedGainAndOffset block{property_map{{"name", std::string("atomic_stage")}}};
-        block.init(std::make_shared<gr::Sequence>());
-        std::ignore               = block.settings().setStaged({{"gain", 0.25f}, {"offset", 0.125f}});
-        const property_map before = block.settings().stagedParameters();
-        expect(eq(before.size(), 2UZ));
-
-        // The map's key order is not fixed, so each key is the refused one in turn.
-        const property_map accepted{{"gain", 0.75f}, {"offset", -0.5f}};
-        for (const std::string refusedKey : {"gain", "offset"}) {
-            property_map parameters = accepted;
-            parameters.insert_or_assign(std::pmr::string(refusedKey), std::string("loud"));
-            bool refused = false;
-            try {
-                std::ignore = block.settings().setStaged(parameters);
-            } catch (const gr::exception&) {
-                refused = true;
-            }
-            expect(refused) << refusedKey << ": a value that does not convert was taken";
-
-            const property_map after = block.settings().stagedParameters();
-            expect(eq(after.size(), before.size())) << refusedKey << ": a refused call changed the staged keys";
-            for (const auto& [key, value] : before) {
-                const auto staged = after.find(key);
-                expect(staged != after.end() && staged->second == value) << refusedKey << ": a refused call replaced the staged value of " << std::string_view(key);
-            }
-        }
-
-        block.applyChangedSettings();
-        expect(eq(block.gain.value, 0.25f) && eq(block.offset.value, 0.125f)) << "the apply took a value of a refused call";
-    };
-
-    "a key a tag and setStaged() both stage is reported by the later of the two"_test = [] {
-        LimitedGain   block{property_map{{"name", std::string("gain_stage")}}};
-        gr::MsgPortIn fromBlock;
-        expect(block.msgOut.connect(fromBlock).has_value());
-        block.init(std::make_shared<gr::Sequence>());
-        qa_coupling::couple(block.settings(), "gain", "gain");
-
-        block.settings().autoUpdate(Tag{0UZ, property_map{{"gain", 2.0f}}});
-        std::ignore = block.settings().setStaged({{"gain", 3.0f}});
-        block.applyChangedSettings();
-        const ReportedRefusals stagedLast = readRefusals(fromBlock);
-        expect(stagedLast.errors.contains("refuses gain = 3")) << stagedLast.errors;
-        expect(stagedLast.plain.empty()) << "a value setStaged() replaced is reported as a tag value: " << stagedLast.plain;
-
-        std::ignore = block.settings().setStaged({{"gain", 3.0f}});
-        block.settings().autoUpdate(Tag{0UZ, property_map{{"gain", 2.0f}}});
-        block.applyChangedSettings();
-        const ReportedRefusals taggedLast = readRefusals(fromBlock);
-        expect(taggedLast.plain.contains("refuses gain = 2")) << taggedLast.plain;
-        expect(taggedLast.errors.empty()) << "a value a tag replaced is reported as an error: " << taggedLast.errors;
     };
 
     "a scheduler constructed with an undeclared key is refused naming the nearest key"_test = [] {
@@ -2616,206 +1875,49 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
         } catch (const gr::exception& e) {
             refusal = e.message;
         }
-        expect(refusal.contains("[0, 1]")) << "the first block's refusal is missing: " << refusal;
-        expect(refusal.contains("[-1, 1]")) << "the second block's refusal is missing: " << refusal;
-    };
-
-    "a merged block given a value its blocks cannot convert names every block that refuses it"_test = [] {
-        std::string refusal;
-        try {
-            gr::Merge<LimitedGain, "out", SignedGain, "in"> merged{property_map{{"gain", std::string("x")}}};
-        } catch (const gr::exception& e) {
-            refusal = e.message;
-        }
-        expect(refusal.contains("LimitedGain' refuses gain = ")) << "the first block's refusal is missing: " << refusal;
-        expect(refusal.contains("SignedGain' refuses gain = ")) << "the second block's refusal is missing: " << refusal;
-        expect(refusal.contains("the value does not convert to the setting's type")) << "the refusal gives another reason: " << refusal;
-    };
-
-    "a merged block given a name tells its blocks apart in a limits refusal"_test = [] {
-        std::string refusal;
-        try {
-            gr::Merge<LimitedGain, "out", SignedGain, "in"> merged{property_map{{"name", std::string("m")}, {"gain", 2.0f}}};
-        } catch (const gr::exception& e) {
-            refusal = e.message;
-        }
-        expect(refusal.contains("LimitedGain: block 'm' refuses gain = 2")) << "the first block's refusal is missing: " << refusal;
-        expect(refusal.contains("SignedGain: block 'm' refuses gain = 2")) << "the second block's refusal is missing: " << refusal;
-    };
-
-    "a merged block given a name tells its blocks apart in a conversion refusal"_test = [] {
-        std::string refusal;
-        try {
-            gr::Merge<LimitedGain, "out", SignedGain, "in"> merged{property_map{{"name", std::string("m")}, {"gain", std::string("x")}}};
-        } catch (const gr::exception& e) {
-            refusal = e.message;
-        }
-        expect(refusal.contains("LimitedGain: block 'm' refuses gain = ")) << "the first block's refusal is missing: " << refusal;
-        expect(refusal.contains("SignedGain: block 'm' refuses gain = ")) << "the second block's refusal is missing: " << refusal;
+        expect(refusal.contains("out of range [0, 1]: ")) << "the first block's refusal is missing: " << refusal;
+        expect(refusal.contains("out of range [-1, 1]: ")) << "the second block's refusal is missing: " << refusal;
     };
 
     "a reset_default tag in either spelling of its key restores the default and calls the block's reset() once"_test = [] {
         for (const std::string_view key : {std::string(gr::tag::RESET_DEFAULTS.key()), std::format(":{}", gr::tag::RESET_DEFAULTS.key())}) {
-            CountingResetWithinLimits              block{property_map{{"name", std::string("gain_stage")}}};
-            CtxSettings<CountingResetWithinLimits> settings{block};
-            settings.init();
-            const float defaultGain = block.gain.value;
-            std::ignore             = settings.set({{"gain", defaultGain / 2.f}});
-            expect(settings.activateContext().has_value());
-            std::ignore = settings.applyStagedParameters();
-            expect(eq(block.gain.value, defaultGain / 2.f)) << "the value to reset does not reach the member";
+            CountingResetWithinLimits block{property_map{{"name", std::string("gain_stage")}}};
+            gr::SettingsBase&         settings = gr::settings::detail::settingsOf(block);
+            std::ignore                        = settings.check({});
+            const float defaultGain            = block.settings.gain.value;
+            std::ignore                        = settings.set({{"gain", defaultGain / 2.f}});
+            std::ignore                        = gr::testing::applyStagedForTest(settings);
+            expect(eq(block.settings.gain.value, defaultGain / 2.f)) << "the value to reset does not reach the member";
 
             const std::size_t resetsBefore = block.resets;
-            settings.autoUpdate(flagTag(key));
-            expect(settings.changed()) << key << " leaves the settings unchanged";
-            const ApplyStagedParametersResult result = settings.applyStagedParameters();
-            expect(result.refusal.empty()) << result.refusal;
-            expect(eq(block.gain.value, defaultGain)) << key << " leaves the member off its default";
+            qa_settings::enterTag(settings, flagTag(key));
+            expect(gr::settings::detail::FrameworkAccess::hasWork(settings)) << key << " leaves the settings unchanged";
+            const gr::settings::Rejected result = gr::testing::applyStagedForTest(settings);
+            expect(result.empty()) << gr::settings::describeRejected(result);
+            expect(eq(block.settings.gain.value, defaultGain)) << key << " leaves the member off its default";
             expect(eq(block.resets, resetsBefore + 1UZ)) << key << " calls reset() a number of times other than once";
 
-            settings.resetDefaults();
+            std::ignore = settings.resetDefaults();
             expect(eq(block.resets, resetsBefore + 2UZ)) << "resetDefaults() calls reset() a number of times other than once";
         }
     };
 
-    "a reset_default tag still staged when resetDefaults() runs is served by that reset"_test = [] {
-        CountingResetWithinLimits              block{property_map{{"name", std::string("gain_stage")}}};
-        CtxSettings<CountingResetWithinLimits> settings{block};
-        settings.init();
-        const float defaultGain = block.gain.value;
-        std::ignore             = settings.set({{"gain", defaultGain / 2.f}});
-        expect(settings.activateContext().has_value());
-        std::ignore = settings.applyStagedParameters();
-        expect(eq(block.gain.value, defaultGain / 2.f)) << "the value to reset does not reach the member";
-
-        const std::size_t resetsBefore  = block.resets;
-        const std::size_t changesBefore = block.changes;
-        settings.autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.key()));
-        settings.resetDefaults();
-        expect(eq(block.gain.value, defaultGain)) << "the reset leaves the member off its default";
-        expect(eq(block.resets, resetsBefore + 1UZ)) << "the staged reset and the call run reset() a number of times other than once";
-        expect(eq(block.changes, changesBefore + 1UZ)) << "the staged reset and the call are reported as a number of changes other than one";
-
-        std::ignore = settings.applyStagedParameters();
-        expect(eq(block.resets, resetsBefore + 1UZ)) << "the staged reset runs again at the next apply";
-    };
-
-    "a reset_default tag the limits refuse leaves the block's reset() uncalled"_test = [] {
-        CountingReset              block{property_map{{"name", std::string("gain_stage")}}};
-        CtxSettings<CountingReset> settings{block};
-        settings.init();
-        std::ignore = settings.set({{"gain", 0.5f}});
-        expect(settings.activateContext().has_value());
-        std::ignore = settings.applyStagedParameters();
-        expect(eq(block.gain.value, 0.5f)) << "the value to reset does not reach the member";
-
-        const std::size_t resetsBefore = block.resets;
-        settings.autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.key()));
-        const ApplyStagedParametersResult result = settings.applyStagedParameters();
-        expect(result.refusal.contains("refuses gain = 2")) << result.refusal;
-        expect(eq(block.resets, resetsBefore)) << "the refused reset calls reset()";
-        expect(eq(block.gain.value, 0.5f)) << "the refused default reaches the member";
-    };
-
-    "a store_default tag in either spelling of its key makes the current values the ones a reset restores"_test = [] {
-        for (const std::string_view key : {std::string(gr::tag::STORE_DEFAULTS.key()), std::format(":{}", gr::tag::STORE_DEFAULTS.key())}) {
-            CountingResetWithinLimits              block{property_map{{"name", std::string("gain_stage")}}};
-            CtxSettings<CountingResetWithinLimits> settings{block};
-            settings.init();
-            const float storedGain = block.gain.value / 2.f;
-            std::ignore            = settings.set({{"gain", storedGain}});
-            expect(settings.activateContext().has_value());
-            std::ignore = settings.applyStagedParameters();
-
-            settings.autoUpdate(flagTag(key));
-            expect(settings.changed()) << key << " leaves the settings unchanged";
-            std::ignore = settings.applyStagedParameters();
-
-            std::ignore = settings.set({{"gain", storedGain / 2.f}});
-            expect(settings.activateContext().has_value());
-            std::ignore = settings.applyStagedParameters();
-            expect(eq(block.gain.value, storedGain / 2.f)) << "the value set after the store does not reach the member";
-
-            settings.autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.key()));
-            std::ignore = settings.applyStagedParameters();
-            expect(eq(block.gain.value, storedGain)) << "a reset after " << key << " restores a value other than the stored one";
-        }
-    };
-
-    "a reset_default or store_default tag under the bare name acts on nothing"_test = [] {
-        CountingResetWithinLimits              block{property_map{{"name", std::string("gain_stage")}}};
-        CtxSettings<CountingResetWithinLimits> settings{block};
-        settings.init();
-        const float setGain = block.gain.value / 2.f;
-        std::ignore         = settings.set({{"gain", setGain}});
-        expect(settings.activateContext().has_value());
-        std::ignore = settings.applyStagedParameters();
-
-        const std::size_t resetsBefore = block.resets;
-        settings.autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.name()));
-        std::ignore = settings.applyStagedParameters();
-        expect(eq(block.gain.value, setGain)) << "a bare reset_default key restores the default";
-        expect(eq(block.resets, resetsBefore)) << "a bare reset_default key calls reset()";
-
-        settings.autoUpdate(flagTag(gr::tag::STORE_DEFAULTS.name()));
-        std::ignore = settings.applyStagedParameters();
-        settings.autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.key()));
-        std::ignore = settings.applyStagedParameters();
-        expect(neq(block.gain.value, setGain)) << "a bare store_default key stores the current values";
-    };
-
-    "a store_default tag stores the values the same tag carries"_test = [] {
-        CountingResetWithinLimits              block{property_map{{"name", std::string("gain_stage")}}};
-        CtxSettings<CountingResetWithinLimits> settings{block};
-        settings.init();
-        qa_coupling::couple(settings, "gain", "gain");
-        const float taggedGain = block.gain.value / 2.f;
-        settings.autoUpdate(Tag{0UZ, property_map{{"gain", taggedGain}, {std::pmr::string(gr::tag::STORE_DEFAULTS.key()), true}}});
-        std::ignore = settings.applyStagedParameters();
-        expect(eq(block.gain.value, taggedGain)) << "the tagged value does not reach the member";
-
-        std::ignore = settings.set({{"gain", taggedGain / 2.f}});
-        expect(settings.activateContext().has_value());
-        std::ignore = settings.applyStagedParameters();
-
-        settings.autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.key()));
-        std::ignore = settings.applyStagedParameters();
-        expect(eq(block.gain.value, taggedGain)) << "the store does not hold the value its own tag carries";
-    };
-
-    "a value staged with a reset_default tag at the value it held before is reported as no change"_test = [] {
+    "a batch with a reset_default tag and a value staged after it is reported as one change"_test = [] {
         qa_settings::ChangeRecordingBlock block;
         block.init(std::make_shared<gr::Sequence>());
-        const gr::Size_t setSize = 2U * block.fft_size.value;
-        qa_settings::applySettings(block, {{"fft_size", setSize}});
-        expect(eq(block.fft_size.value, setSize)) << "the value to reset does not reach the member";
-        block.oldSeen.clear();
-        block.newSeen.clear();
-
-        std::ignore = block.settings().setStaged({{"fft_size", setSize}});
-        block.settings().autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.key()));
-        std::ignore = block.settings().applyStagedParameters();
-        expect(eq(block.fft_size.value, setSize)) << "the value staged with the reset does not reach the member";
-        for (const property_map& reported : block.newSeen) {
-            expect(!qa_settings::sizeOf(reported, "fft_size").has_value()) << "a change names fft_size, which ends at the value it began with";
-        }
-    };
-
-    "a batch with a reset_default tag and a value of its own is reported as one change"_test = [] {
-        qa_settings::ChangeRecordingBlock block;
-        block.init(std::make_shared<gr::Sequence>());
-        const gr::Size_t defaultSize     = block.fft_size.value;
-        const gr::Size_t defaultAverages = block.n_averages.value;
+        const gr::Size_t defaultSize     = block.settings.fft_size.value;
+        const gr::Size_t defaultAverages = block.settings.n_averages.value;
         qa_settings::applySettings(block, {{"fft_size", 2U * defaultSize}, {"n_averages", 2U * defaultAverages}});
-        expect(eq(block.fft_size.value, 2U * defaultSize) && eq(block.n_averages.value, 2U * defaultAverages)) << "the values to reset do not reach the members";
+        expect(eq(block.settings.fft_size.value, 2U * defaultSize) && eq(block.settings.n_averages.value, 2U * defaultAverages)) << "the values to reset do not reach the members";
         block.oldSeen.clear();
         block.newSeen.clear();
+        std::ignore = block.changeStateTo(gr::lifecycle::State::RUNNING); // the staged value waits for the reset tag
 
-        std::ignore = block.settings().setStaged({{"n_averages", 4U * defaultAverages}});
-        block.settings().autoUpdate(flagTag(gr::tag::RESET_DEFAULTS.key()));
-        std::ignore = block.settings().applyStagedParameters();
-        expect(eq(block.fft_size.value, defaultSize)) << "the reset leaves fft_size off its default";
-        expect(eq(block.n_averages.value, 4U * defaultAverages)) << "the value staged with the reset does not reach the member";
+        qa_settings::enterTag(gr::settings::detail::settingsOf(block), flagTag(gr::tag::RESET_DEFAULTS.key()));
+        std::ignore = block.set({{"n_averages", 4U * defaultAverages}}, gr::settings::noWait); // the later of the two holds the key
+        std::ignore = gr::testing::applyStagedForTest(gr::settings::detail::settingsOf(block));
+        expect(eq(block.settings.fft_size.value, defaultSize)) << "the reset leaves fft_size off its default";
+        expect(eq(block.settings.n_averages.value, 4U * defaultAverages)) << "the value staged with the reset does not reach the member";
         expect(fatal(eq(block.newSeen.size(), 1UZ))) << "the batch is reported as a number of changes other than one";
         expect(eq(qa_settings::sizeOf(block.newSeen.front(), "fft_size").value_or(0U), defaultSize)) << "the change names a restored value other than the default";
         expect(eq(qa_settings::sizeOf(block.newSeen.front(), "n_averages").value_or(0U), 4U * defaultAverages)) << "the change names a value other than the staged one";
@@ -2828,36 +1930,33 @@ const boost::ut::suite<"settings refusals"> settingsRefusalTests = [] {
         block.init(std::make_shared<gr::Sequence>());
         const std::size_t changesBefore = block.changes;
         const std::size_t resetsBefore  = block.resets;
-        const bool        setValue      = !block.reset_default.value;
+        const bool        setValue      = !block.settings.reset_default.value;
 
-        expect(block.settings().setStaged({{gr::tag::RESET_DEFAULTS.name(), setValue}}).empty()) << "the setting is not admitted";
-        std::ignore = block.settings().applyStagedParameters();
-        expect(eq(block.reset_default.value, setValue)) << "the value does not reach the member";
-        expect(eq(block.changes, changesBefore + 1UZ)) << "settingsChanged() runs a number of times other than once";
+        expect(block.set({{gr::tag::RESET_DEFAULTS.name(), setValue}}, gr::settings::noWait).has_value()) << "the setting is not admitted";
+        std::ignore = gr::testing::applyStagedForTest(gr::settings::detail::settingsOf(block));
+        expect(eq(block.settings.reset_default.value, setValue)) << "the value does not reach the member";
+        expect(eq(block.changes, changesBefore + 1UZ)) << "applySettings() runs a number of times other than once";
         expect(eq(block.resets, resetsBefore)) << "the setting resets the block";
+        qa_settings::enterTag(gr::settings::detail::settingsOf(block), flagTag(gr::tag::RESET_DEFAULTS.name()));
+        std::ignore = gr::testing::applyStagedForTest(gr::settings::detail::settingsOf(block));
+        expect(eq(block.resets, resetsBefore)) << "a tag under the bare name resets the block";
 
-        const property_map notSet = block.settings().setStaged({{gr::tag::RESET_DEFAULTS.key(), true}});
-        expect(notSet.contains(gr::tag::RESET_DEFAULTS.key())) << "setStaged() admits the gr: form of the reset key";
+        const auto notSet = block.set({{gr::tag::RESET_DEFAULTS.key(), true}}, gr::settings::noWait);
+        expect(!notSet.has_value() && gr::settings::describeRejected(notSet.error()).contains(gr::tag::RESET_DEFAULTS.key())) << "set() admits the gr: form of the reset key";
     };
 
-    "a reset to a default the limits refuse throws and leaves every setting as it was"_test = [] {
+    "a reset to a default the limits refuse is refused and leaves every setting as it was"_test = [] {
         OutOfLimitsDefault block{property_map{{"name", std::string("gain_stage")}}};
         block.init(std::make_shared<gr::Sequence>());
-        std::ignore = block.settings().set({{"gain", 0.5f}, {"offset", 3.0f}});
-        expect(block.settings().activateContext().has_value());
-        std::ignore = block.settings().applyStagedParameters();
-        expect(eq(block.gain.value, 0.5f) && eq(block.offset, 3.0f)) << "the values to reset do not reach the members";
+        std::ignore = block.set({{"gain", 0.5f}, {"offset", 3.0f}});
+        std::ignore = gr::testing::applyStagedForTest(gr::settings::detail::settingsOf(block));
+        expect(eq(block.settings.gain.value, 0.5f) && eq(block.settings.offset, 3.0f)) << "the values to reset do not reach the members";
 
-        std::string refusal;
-        try {
-            block.settings().resetDefaults();
-        } catch (const gr::exception& e) {
-            refusal = e.message;
-        }
-        expect(refusal.contains("block 'gain_stage' refuses gain = 2")) << refusal;
-        expect(refusal.contains("[0, 1]")) << refusal;
-        expect(eq(block.gain.value, 0.5f)) << "the refused default reaches the member";
-        expect(eq(block.offset, 3.0f)) << "the reset applies the other defaults";
+        const auto        reset   = block.resetDefaults();
+        const std::string refusal = reset.has_value() ? std::string{} : gr::settings::describeRejected(reset.error());
+        expect(eq(refusal, std::string("gain: out of range [0, 1]: 2")));
+        expect(eq(block.settings.gain.value, 0.5f)) << "the refused default reaches the member";
+        expect(eq(block.settings.offset, 3.0f)) << "the reset applies the other defaults";
     };
 };
 
@@ -2871,39 +1970,36 @@ struct FollowingBlock : Block<FollowingBlock> {
     PortIn<float>  in{};
     PortOut<float> out{};
 
-    Annotated<float, "sample rate"> sample_rate = 1.f;
-    Annotated<float, "level">       level       = 0.f;
-    Annotated<float, "gain">        gain        = 1.f;
+    struct Settings {
+        Annotated<float> sample_rate = 1.f;
+        Annotated<float> level       = 0.f;
+        Annotated<float> gain        = 1.f;
 
-    GR_MAKE_REFLECTABLE(FollowingBlock, in, out, sample_rate, level, gain);
+        GR_MAKE_REFLECTABLE(Settings, sample_rate, level, gain);
+    } settings{};
 
-    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
-};
-
-/// a gain, with a settingsChanged() that refuses every change while `refusing` is set
-struct RefusingFollowingBlock : Block<RefusingFollowingBlock> {
-    PortIn<float>  in{};
-    PortOut<float> out{};
-
-    Annotated<float, "gain"> gain = 1.f;
-
-    GR_MAKE_REFLECTABLE(RefusingFollowingBlock, in, out, gain);
-
-    bool refusing = false;
-
-    void settingsChanged(const property_map& /*oldSettings*/, const property_map& /*newSettings*/) {
-        if (refusing) {
-            throw gr::exception("the block refuses every change");
-        }
-    }
+    GR_MAKE_REFLECTABLE(FollowingBlock, in, out, settings);
 
     [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
 };
 
 [[nodiscard]] Tag tagOf(std::string_view key, float value) { return Tag{0UZ, property_map{{std::pmr::string(key), value}}}; }
 
+/// a scheduler as a block's settings see it, holding every notification at info and above; the test thread alone
+/// drives the block
+struct NotificationRecorder : gr::settings::detail::SchedulerLink {
+    std::vector<gr::settings::Notification> held{};
+    int                                     wakes = 0;
+
+    void                                           wake() override { ++wakes; }
+    void                                           push(gr::settings::Notification notification) override { held.push_back(std::move(notification)); }
+    bool                                           isWorkerThread() const override { return false; }
+    std::optional<gr::settings::NotificationLevel> level() const override { return gr::settings::NotificationLevel::info; }
+    std::chrono::milliseconds                      defaultTimeout() const override { return gr::settings::kDefaultTimeout; }
+};
+
 /// couples sample_rate to gr:sample_rate and level to foo:level
-void coupleRateAndLevel(SettingsBase& settings) { settings.setTagCouplings({{"sample_rate", std::string(gr::tag::SAMPLE_RATE.key())}, {"level", std::string(kLevelKey)}}); }
+void coupleRateAndLevel(SettingsBase& settings) { std::ignore = settings.setTagCouplings({{"sample_rate", std::string(gr::tag::SAMPLE_RATE.key())}, {"level", std::string(kLevelKey)}}); }
 
 /// the key a setting is coupled to, empty for none
 [[nodiscard]] std::string keyOf(const SettingsBase& settings, std::string_view setting) {
@@ -2912,14 +2008,10 @@ void coupleRateAndLevel(SettingsBase& settings) { settings.setTagCouplings({{"sa
     return it != table.end() ? it->second.value_or(std::string()) : std::string();
 }
 
-/// the message setTagCouplings() throws for `couplings`, empty when it throws none
+/// the reasons setTagCouplings() refuses `couplings` with, empty when it takes them
 [[nodiscard]] std::string couplingRefusal(SettingsBase& settings, const property_map& couplings) {
-    try {
-        settings.setTagCouplings(couplings);
-    } catch (const gr::exception& refused) {
-        return refused.message;
-    }
-    return {};
+    const std::expected<void, gr::settings::Rejected> result = settings.setTagCouplings(couplings);
+    return result.has_value() ? std::string{} : gr::settings::describeRejected(result.error());
 }
 
 /// publishes `nSamples` samples and puts `tag` on the sample at `tagIndex`
@@ -2949,14 +2041,18 @@ struct IndexedTagSource : Block<IndexedTagSource> {
 struct NamesRecordingSink : Block<NamesRecordingSink> {
     PortIn<float> in{};
 
-    std::vector<std::string> names = {"untagged"};
+    struct Settings {
+        std::vector<std::string> names = {"untagged"};
 
-    GR_MAKE_REFLECTABLE(NamesRecordingSink, in, names);
+        GR_MAKE_REFLECTABLE(Settings, names);
+    } settings{};
+
+    GR_MAKE_REFLECTABLE(NamesRecordingSink, in, settings);
 
     std::vector<std::vector<std::string>> namesAtSample{};
 
     work::Status processBulk(std::span<const float> input) {
-        namesAtSample.insert(namesAtSample.end(), input.size(), names);
+        namesAtSample.insert(namesAtSample.end(), input.size(), settings.names);
         return work::Status::OK;
     }
 };
@@ -2979,7 +2075,7 @@ struct NamesRecordingSink : Block<NamesRecordingSink> {
     source.tag      = tag;
     source.tagIndex = tagIndex;
     source.nSamples = nSamples;
-    sink.settings().setTagCouplings(property_map{{"names", std::string(key)}});
+    std::ignore     = sink.setTagCouplings(property_map{{"names", std::string(key)}});
     expect(fatal(flow.connect<"out", "in">(source, sink).has_value()));
     gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
     expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
@@ -2992,361 +2088,135 @@ const boost::ut::suite<"keys that follow tags"> autoUpdateKeyTests = [] {
     using namespace boost::ut;
     using namespace qa_refusals;
 
-    "a tag on an active set that a newer set of its context pruned leaves a key the context set explicitly"_test = [] {
-        LimitedGainAndOffset              block{property_map{{"name", std::string("gain_stage")}}};
-        CtxSettings<LimitedGainAndOffset> settings{block};
-        settings.init();
-        settings.setTagCouplings({{"gain", std::string("gain")}, {"offset", std::string("offset")}});
-        const float       setGain = block.gain.value / 2.f;
-        const SettingsCtx activeCtx{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now() - std::chrono::milliseconds(1)), "x"};
-        expect(settings.set({{"gain", setGain}}, activeCtx).empty());
-        expect(settings.activateContext(activeCtx).has_value());
-        std::ignore = settings.applyStagedParameters();
-        expect(eq(block.gain.value, setGain)) << "the explicit value does not reach the member";
-
-        expect(settings.set({}, SettingsCtx{0U, "x"}).empty());
-        const auto stored  = settings.getStoredAll();
-        const auto setsOfX = stored.find(pmt::Value(std::string("x")));
-        expect(fatal(setsOfX != stored.end()));
-        expect(eq(setsOfX->second.size(), 1UZ)) << "the set for now leaves more than one set of the context";
-        expect(setsOfX->second.front().context != activeCtx) << "the set for now leaves the active set stored";
-
-        const float taggedOffset = block.offset.value + 0.5f;
-        settings.autoUpdate(Tag{0UZ, property_map{{"gain", setGain / 2.f}, {"offset", taggedOffset}}});
-        std::ignore = settings.applyStagedParameters();
-        expect(eq(block.gain.value, setGain)) << "the tag overrides the key the context set explicitly";
-        expect(eq(block.offset.value, taggedOffset)) << "the tag leaves a key that follows tags";
-    };
-
     "a tag sets a setting only through the key the setting is coupled to"_test = [] {
         using namespace qa_follows_tag;
-        FollowingBlock              coupled;
-        CtxSettings<FollowingBlock> coupledSettings{coupled};
-        FollowingBlock              uncoupled;
-        CtxSettings<FollowingBlock> uncoupledSettings{uncoupled};
-        coupledSettings.init();
-        uncoupledSettings.init();
+        FollowingBlock    coupled;
+        gr::SettingsBase& coupledSettings = gr::settings::detail::settingsOf(coupled);
+        FollowingBlock    uncoupled;
+        gr::SettingsBase& uncoupledSettings = gr::settings::detail::settingsOf(uncoupled);
+        std::ignore                         = coupledSettings.check({});
+        std::ignore                         = uncoupledSettings.check({});
         coupleRateAndLevel(coupledSettings);
 
-        const float taggedRate = 2.f * coupled.sample_rate.value;
-        coupledSettings.autoUpdate(tagOf(gr::tag::SAMPLE_RATE.key(), taggedRate));
-        uncoupledSettings.autoUpdate(tagOf(gr::tag::SAMPLE_RATE.key(), taggedRate));
-        std::ignore = coupledSettings.applyStagedParameters();
-        std::ignore = uncoupledSettings.applyStagedParameters();
-        expect(eq(coupled.sample_rate.value, taggedRate)) << "the coupled setting does not take its key";
-        expect(neq(uncoupled.sample_rate.value, taggedRate)) << "a setting named sample_rate on a block with no coupling takes the gr: key";
+        const float taggedRate = 2.f * coupled.settings.sample_rate.value;
+        qa_settings::enterTag(coupledSettings, tagOf(gr::tag::SAMPLE_RATE.key(), taggedRate));
+        qa_settings::enterTag(uncoupledSettings, tagOf(gr::tag::SAMPLE_RATE.key(), taggedRate));
+        std::ignore = gr::testing::applyStagedForTest(coupledSettings);
+        std::ignore = gr::testing::applyStagedForTest(uncoupledSettings);
+        expect(eq(coupled.settings.sample_rate.value, taggedRate)) << "the coupled setting does not take its key";
+        expect(neq(uncoupled.settings.sample_rate.value, taggedRate)) << "a setting named sample_rate on a block with no coupling takes the gr: key";
 
         const float bareValue = 2.f * taggedRate;
         for (const std::string_view bareKey : {std::string_view(gr::tag::SAMPLE_RATE.name()), gr::tag::nameOf(kLevelKey), std::string_view("gain")}) {
-            coupledSettings.autoUpdate(tagOf(bareKey, bareValue));
+            qa_settings::enterTag(coupledSettings, tagOf(bareKey, bareValue));
         }
-        std::ignore = coupledSettings.applyStagedParameters();
-        expect(eq(coupled.sample_rate.value, taggedRate)) << "a bare sample_rate key sets the setting coupled to gr:sample_rate";
-        expect(neq(coupled.level.value, bareValue)) << "a bare level key sets the setting coupled to foo:level";
-        expect(neq(coupled.gain.value, bareValue)) << "a key equal to an uncoupled setting's name sets it";
+        std::ignore = gr::testing::applyStagedForTest(coupledSettings);
+        expect(eq(coupled.settings.sample_rate.value, taggedRate)) << "a bare sample_rate key sets the setting coupled to gr:sample_rate";
+        expect(neq(coupled.settings.level.value, bareValue)) << "a bare level key sets the setting coupled to foo:level";
+        expect(neq(coupled.settings.gain.value, bareValue)) << "a key equal to an uncoupled setting's name sets it";
 
-        const float foreignLevel = coupled.level.value + 1.f;
-        coupledSettings.autoUpdate(tagOf(kLevelKey, foreignLevel));
-        std::ignore = coupledSettings.applyStagedParameters();
-        expect(eq(coupled.level.value, foreignLevel)) << "a setting is not coupled to a key in another domain";
+        const float foreignLevel = coupled.settings.level.value + 1.f;
+        qa_settings::enterTag(coupledSettings, tagOf(kLevelKey, foreignLevel));
+        std::ignore = gr::testing::applyStagedForTest(coupledSettings);
+        expect(eq(coupled.settings.level.value, foreignLevel)) << "a setting is not coupled to a key in another domain";
     };
 
     "one key sets every setting coupled to it, and a setting follows one key"_test = [] {
         using namespace qa_follows_tag;
-        FollowingBlock              block;
-        CtxSettings<FollowingBlock> settings{block};
-        settings.init();
-        settings.setTagCouplings({{"level", std::string(kLevelKey)}, {"gain", std::string(kLevelKey)}});
+        FollowingBlock    block;
+        gr::SettingsBase& settings = gr::settings::detail::settingsOf(block);
+        std::ignore                = settings.check({});
+        std::ignore                = settings.setTagCouplings({{"level", std::string(kLevelKey)}, {"gain", std::string(kLevelKey)}});
         expect(eq(settings.tagCouplings().size(), 2UZ));
 
-        const float shared = block.gain.value + block.level.value + 1.f;
-        settings.autoUpdate(tagOf(kLevelKey, shared));
-        std::ignore = settings.applyStagedParameters();
-        expect(eq(block.level.value, shared) && eq(block.gain.value, shared)) << "the key does not set both settings coupled to it";
+        const float shared = block.settings.gain.value + block.settings.level.value + 1.f;
+        qa_settings::enterTag(settings, tagOf(kLevelKey, shared));
+        std::ignore = gr::testing::applyStagedForTest(settings);
+        expect(eq(block.settings.level.value, shared) && eq(block.settings.gain.value, shared)) << "the key does not set both settings coupled to it";
 
         constexpr std::string_view kGainKey = "foo:gain";
-        settings.setTagCouplings({{"gain", std::string(kGainKey)}});
+        std::ignore                         = settings.setTagCouplings({{"gain", std::string(kGainKey)}});
         expect(eq(keyOf(settings, "gain"), std::string(kGainKey))) << "a second coupling does not replace the first";
         const float levelOnly = shared + 1.f;
         const float gainOnly  = shared + 2.f;
-        settings.autoUpdate(tagOf(kLevelKey, levelOnly));
-        settings.autoUpdate(tagOf(kGainKey, gainOnly));
-        std::ignore = settings.applyStagedParameters();
-        expect(eq(block.level.value, levelOnly)) << "the setting left on the key stops following it";
-        expect(eq(block.gain.value, gainOnly)) << "the setting moved to another key follows the key it left";
+        qa_settings::enterTag(settings, tagOf(kLevelKey, levelOnly));
+        qa_settings::enterTag(settings, tagOf(kGainKey, gainOnly));
+        std::ignore = gr::testing::applyStagedForTest(settings);
+        expect(eq(block.settings.level.value, levelOnly)) << "the setting left on the key stops following it";
+        expect(eq(block.settings.gain.value, gainOnly)) << "the setting moved to another key follows the key it left";
 
-        settings.setTagCouplings({{"gain", std::string()}, {"level", std::string(":") + std::string(gr::tag::nameOf(kLevelKey))}});
+        std::ignore = settings.setTagCouplings({{"gain", std::string()}, {"level", std::string(":") + std::string(gr::tag::nameOf(kLevelKey))}});
         expect(eq(keyOf(settings, "gain"), std::string())) << "an empty key leaves the coupling in place";
         expect(eq(keyOf(settings, "level"), std::string(gr::tag::nameOf(kLevelKey)))) << "a key with a leading colon is held in another spelling than the bare name";
-        settings.autoUpdate(tagOf(kGainKey, gainOnly + 1.f));
-        std::ignore = settings.applyStagedParameters();
-        expect(eq(block.gain.value, gainOnly)) << "a setting whose coupling is removed follows its old key";
+        qa_settings::enterTag(settings, tagOf(kGainKey, gainOnly + 1.f));
+        std::ignore = gr::testing::applyStagedForTest(settings);
+        expect(eq(block.settings.gain.value, gainOnly)) << "a setting whose coupling is removed follows its old key";
     };
 
     "a coupling to a key the framework acts on, to a non-writable setting or to a malformed key is refused"_test = [] {
         using namespace qa_follows_tag;
-        FollowingBlock              block;
-        CtxSettings<FollowingBlock> settings{block};
-        settings.init();
+        FollowingBlock    block;
+        gr::SettingsBase& settings = gr::settings::detail::settingsOf(block);
+        std::ignore                = settings.check({});
         coupleRateAndLevel(settings);
         const property_map before = settings.tagCouplings();
 
         for (const std::string_view controlKey : gr::tag::kControlKeys) {
             const std::string refusal = couplingRefusal(settings, {{"gain", std::string(controlKey)}});
-            expect(refusal.contains("gain") && refusal.contains(controlKey) && refusal.contains("acts on this key")) << "a coupling to " << controlKey << " is not refused by name: " << refusal;
+            expect(refusal.contains("gain") && refusal.contains(controlKey) && refusal.contains("reserved by the framework")) << "a coupling to " << controlKey << " is not refused by name: " << refusal;
         }
         for (const std::string_view setting : {std::string_view("unique_name"), std::string_view("no_such_setting")}) {
             const std::string refusal = couplingRefusal(settings, {{std::pmr::string(setting), std::string("foo:x")}});
-            expect(refusal.contains(setting) && refusal.contains("no writable setting")) << "a coupling of " << setting << " is not refused by name: " << refusal;
+            expect(refusal.contains(setting) && refusal.contains("not writable")) << "a coupling of " << setting << " is not refused by name: " << refusal;
         }
         for (const std::string_view malformed : {std::string_view(":"), std::string_view("gr:"), std::string_view("::x"), std::string_view("foo:a b"), std::string_view("foo:\tx")}) {
             const std::string refusal = couplingRefusal(settings, {{"gain", std::string(malformed)}});
             expect(refusal.contains("gain") && refusal.contains("not domain:name")) << "the malformed key '" << malformed << "' is not refused: " << refusal;
         }
         const std::string notText = couplingRefusal(settings, {{"gain", 42}});
-        expect(notText.contains("gain") && notText.contains("not a string")) << "a key that is not a string is not refused: " << notText;
+        expect(notText.contains("gain") && notText.contains("tag key not a text")) << "a key that is not a string is not refused: " << notText;
 
-        const std::string mixed = couplingRefusal(settings, {{"gain", std::string("foo:gain")}, {"level", std::string(gr::tag::CONTEXT.key())}});
+        const std::string mixed = couplingRefusal(settings, {{"gain", std::string("foo:gain")}, {"level", std::string(gr::tag::kControlKeys.front())}});
         expect(!mixed.empty()) << "a batch with one refused entry is taken";
         expect(settings.tagCouplings() == before) << "a refused call changes the table";
     };
 
-    "a caller's set() stops a coupled setting following until a reset, and a reset keeps the table"_test = [] {
-        using namespace qa_follows_tag;
-        FollowingBlock              block;
-        CtxSettings<FollowingBlock> settings{block};
-        const float                 constructedLevel = block.level.value + 1.f;
-        settings.setInitBlockParameters({{"level", constructedLevel}});
-        settings.init();
-        coupleRateAndLevel(settings);
-        const property_map table       = settings.tagCouplings();
-        const float        defaultRate = block.sample_rate.value;
-        const float        setRate     = 2.f * defaultRate;
-        std::ignore                    = settings.set({{"sample_rate", setRate}});
-        expect(settings.activateContext().has_value());
-        std::ignore = settings.applyStagedParameters();
-
-        const float taggedLevel = constructedLevel + 1.f;
-        settings.autoUpdate(tagOf(gr::tag::SAMPLE_RATE.key(), 3.f * defaultRate));
-        settings.autoUpdate(tagOf(kLevelKey, taggedLevel));
-        std::ignore = settings.applyStagedParameters();
-        expect(eq(block.sample_rate.value, setRate)) << "the tag overrides the value the caller set after the coupling";
-        expect(eq(block.level.value, taggedLevel)) << "a setting the constructor's map set before the coupling does not follow its key";
-
-        settings.resetDefaults();
-        expect(eq(block.sample_rate.value, defaultRate)) << "the reset does not restore the default";
-        expect(settings.tagCouplings() == table) << "the reset changes the table";
-        const float taggedRate = 4.f * defaultRate;
-        settings.autoUpdate(tagOf(gr::tag::SAMPLE_RATE.key(), taggedRate));
-        std::ignore = settings.applyStagedParameters();
-        expect(eq(block.sample_rate.value, taggedRate)) << "a setting the caller set before the reset does not follow its key";
-    };
-
-    "a reset makes a coupled setting the caller set follow its key again"_test = [] {
-        using namespace qa_follows_tag;
-        FollowingBlock              block;
-        CtxSettings<FollowingBlock> settings{block};
-        settings.init();
-        coupleRateAndLevel(settings);
-        const float defaultRate = block.sample_rate.value;
-        const float setRate     = 2.f * defaultRate;
-        expect(settings.set({{"sample_rate", setRate}}).empty());
-        expect(settings.activateContext().has_value());
-        std::ignore = settings.applyStagedParameters();
-        expect(eq(block.sample_rate.value, setRate)) << "the caller's value does not reach the member";
-        expect(!settings.autoUpdateParameters().contains("sample_rate")) << "the caller's set() leaves the setting following";
-
-        settings.resetDefaults();
-        expect(settings.autoUpdateParameters().contains("sample_rate")) << "the reset leaves the setting out of the following set";
-        const float taggedRate = 3.f * defaultRate;
-        settings.autoUpdate(tagOf(gr::tag::SAMPLE_RATE.key(), taggedRate));
-        std::ignore = settings.applyStagedParameters();
-        expect(eq(block.sample_rate.value, taggedRate)) << "the tag after the reset does not set the setting the caller set";
-    };
-
-    "a reset makes a coupled setting the caller set in another context follow its key there again"_test = [] {
-        using namespace qa_follows_tag;
-        FollowingBlock              block;
-        CtxSettings<FollowingBlock> settings{block};
-        settings.init();
-        coupleRateAndLevel(settings);
-        const float       defaultRate = block.sample_rate.value;
-        const SettingsCtx other{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now() - std::chrono::milliseconds(1)), "x"};
-        expect(settings.set({{"sample_rate", 2.f * defaultRate}}, other).empty());
-        expect(!settings.autoUpdateParameters(other).contains("sample_rate")) << "the caller's set() in the other context leaves the setting following there";
-
-        settings.resetDefaults();
-        expect(settings.autoUpdateParameters(other).contains("sample_rate")) << "the reset leaves the setting out of the other context's following set";
-        expect(settings.activateContext(other).has_value());
-        std::ignore            = settings.applyStagedParameters();
-        const float taggedRate = 3.f * defaultRate;
-        settings.autoUpdate(tagOf(gr::tag::SAMPLE_RATE.key(), taggedRate));
-        std::ignore = settings.applyStagedParameters();
-        expect(eq(block.sample_rate.value, taggedRate)) << "in the other context the tag after the reset does not set the setting";
-    };
-
-    "a reset that settingsChanged() refuses leaves a coupled setting the caller set out of the following set"_test = [] {
-        using namespace qa_follows_tag;
-        constexpr std::string_view kGainKey = "foo:gain";
-        for (const bool byTag : {true, false}) {
-            const std::string_view              path = byTag ? "a reset_default tag" : "resetDefaults()";
-            RefusingFollowingBlock              block;
-            CtxSettings<RefusingFollowingBlock> settings{block};
-            settings.init();
-            settings.setTagCouplings({{"gain", std::string(kGainKey)}});
-            const float setGain = 2.f * block.gain.value;
-            expect(settings.set({{"gain", setGain}}).empty());
-            expect(settings.activateContext().has_value());
-            std::ignore = settings.applyStagedParameters();
-            expect(fatal(eq(block.gain.value, setGain))) << "the caller's value does not reach the member";
-
-            block.refusing = true;
-            std::string refusal;
-            try {
-                if (byTag) {
-                    settings.autoUpdate(Tag{0UZ, property_map{{std::pmr::string(gr::tag::RESET_DEFAULTS.key()), true}}});
-                    std::ignore = settings.applyStagedParameters();
-                } else {
-                    settings.resetDefaults();
-                }
-            } catch (const gr::exception& e) {
-                refusal = e.message;
-            }
-            block.refusing = false;
-            expect(fatal(refusal.contains("the block refuses every change"))) << path << "is not refused";
-            expect(eq(block.gain.value, setGain)) << "the refused reset changes the gain";
-            expect(!settings.autoUpdateParameters().contains("gain")) << "a refusal of" << path << "leaves the gain following its key";
-
-            settings.autoUpdate(tagOf(kGainKey, 3.f * setGain));
-            std::ignore = settings.applyStagedParameters();
-            expect(eq(block.gain.value, setGain)) << "after a refusal of" << path << "a tag changes the gain the caller set";
-        }
-    };
-
     "a setting coupled before init() follows its key, whatever value the constructor's map gives it"_test = [] {
         using namespace qa_follows_tag;
-        FollowingBlock              block;
-        CtxSettings<FollowingBlock> settings{block};
-        const float                 constructedRate = 2.f * block.sample_rate.value;
-        settings.setInitBlockParameters({{"sample_rate", constructedRate}});
+        const float       constructedRate = 2.f * FollowingBlock{}.settings.sample_rate.value;
+        FollowingBlock    block{property_map{{"sample_rate", constructedRate}}};
+        gr::SettingsBase& settings = gr::settings::detail::settingsOf(block);
         coupleRateAndLevel(settings);
-        settings.init();
-        std::ignore = settings.applyStagedParameters();
-        expect(eq(block.sample_rate.value, constructedRate)) << "the constructor's value does not reach the member";
-        expect(settings.autoUpdateParameters().contains("sample_rate")) << "the constructor's value stops the coupled setting following";
+        std::ignore = settings.check({});
+        expect(eq(block.settings.sample_rate.value, constructedRate)) << "the constructor's value does not reach the member";
 
         const float taggedRate = 2.f * constructedRate;
-        settings.autoUpdate(tagOf(gr::tag::SAMPLE_RATE.key(), taggedRate));
-        std::ignore = settings.applyStagedParameters();
-        expect(eq(block.sample_rate.value, taggedRate)) << "the tag does not set a setting coupled before init()";
-    };
-
-    "init() leaves out of the following set a coupled setting the caller set in another context"_test = [] {
-        using namespace qa_follows_tag;
-        FollowingBlock              block;
-        CtxSettings<FollowingBlock> settings{block};
-        const float                 constructedRate = 2.f * block.sample_rate.value;
-        settings.setInitBlockParameters({{"sample_rate", constructedRate}});
-        coupleRateAndLevel(settings);
-        const SettingsCtx other{gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now() - std::chrono::milliseconds(1)), "x"};
-        expect(settings.set({{"sample_rate", 3.f * constructedRate}}, other).empty());
-        settings.init();
-        expect(settings.autoUpdateParameters().contains("sample_rate")) << "the constructor's value stops the coupled setting following";
-        expect(!settings.autoUpdateParameters(other).contains("sample_rate")) << "init() makes the setting the caller set in the other context follow its key there";
-    };
-
-    "a context tag's gr:ctx_time selects the set of the context in effect at that time"_test = [] {
-        using namespace qa_follows_tag;
-        FollowingBlock              block;
-        CtxSettings<FollowingBlock> settings{block};
-        settings.init();
-        const auto          now       = std::chrono::system_clock::now();
-        const float         nowGain   = 2.f * block.gain.value;
-        const float         laterGain = 3.f * block.gain.value;
-        const std::uint64_t laterTime = gr::settings::convertTimePointToUint64Ns(now + std::chrono::hours(1));
-        expect(settings.set({{"gain", nowGain}}, SettingsCtx{gr::settings::convertTimePointToUint64Ns(now - std::chrono::milliseconds(1)), "x"}).empty());
-        expect(settings.set({{"gain", laterGain}}, SettingsCtx{laterTime, "x"}).empty());
-
-        settings.autoUpdate(Tag{0UZ, property_map{{gr::tag::CONTEXT.key(), std::string("x")}, {gr::tag::CONTEXT_TIME.key(), laterTime + 1U}}});
-        std::ignore = settings.applyStagedParameters();
-        expect(eq(block.gain.value, laterGain)) << "the tag does not select the set in effect at its gr:ctx_time";
-    };
-
-    "a context tag carrying only gr:trigger_time selects the context's set for now"_test = [] {
-        using namespace qa_follows_tag;
-        FollowingBlock              block;
-        CtxSettings<FollowingBlock> settings{block};
-        settings.init();
-        const auto          now       = std::chrono::system_clock::now();
-        const float         nowGain   = 2.f * block.gain.value;
-        const float         laterGain = 3.f * block.gain.value;
-        const std::uint64_t laterTime = gr::settings::convertTimePointToUint64Ns(now + std::chrono::hours(1));
-        expect(settings.set({{"gain", nowGain}}, SettingsCtx{gr::settings::convertTimePointToUint64Ns(now - std::chrono::milliseconds(1)), "x"}).empty());
-        expect(settings.set({{"gain", laterGain}}, SettingsCtx{laterTime, "x"}).empty());
-
-        settings.autoUpdate(Tag{0UZ, property_map{{gr::tag::CONTEXT.key(), std::string("x")}, {gr::tag::TRIGGER_TIME.key(), laterTime + 1U}}});
-        std::ignore = settings.applyStagedParameters();
-        expect(eq(block.gain.value, nowGain)) << "gr:trigger_time moves the context's activation";
+        qa_settings::enterTag(settings, tagOf(gr::tag::SAMPLE_RATE.key(), taggedRate));
+        std::ignore = gr::testing::applyStagedForTest(settings);
+        expect(eq(block.settings.sample_rate.value, taggedRate)) << "the tag does not set a setting coupled before init()";
     };
 
     "the framework writes no tag for an applied setting"_test = [] {
         using namespace qa_follows_tag;
-        FollowingBlock              block;
-        CtxSettings<FollowingBlock> settings{block};
-        settings.init();
+        FollowingBlock    block;
+        gr::SettingsBase& settings = gr::settings::detail::settingsOf(block);
+        std::ignore                = settings.check({});
         coupleRateAndLevel(settings);
-        const float setRate = 2.f * block.sample_rate.value;
-        std::ignore         = settings.set({{"sample_rate", setRate}, {"level", block.level.value + 1.f}, {"gain", 2.f * block.gain.value}});
-        expect(settings.activateContext().has_value());
-        const ApplyStagedParametersResult setResult = settings.applyStagedParameters();
-        expect(eq(block.sample_rate.value, setRate)) << "the caller's value is not applied";
-        expect(setResult.forwardParameters.empty()) << "a value a caller sets leaves as a tag";
+        const float setRate = 2.f * block.settings.sample_rate.value;
+        std::ignore         = settings.set({{"sample_rate", setRate}, {"level", block.settings.level.value + 1.f}, {"gain", 2.f * block.settings.gain.value}});
+        std::ignore         = gr::testing::applyStagedForTest(settings);
+        expect(eq(block.settings.sample_rate.value, setRate)) << "the caller's value is not applied";
+        expect(gr::settings::detail::FrameworkAccess::takeForwarded(settings).empty()) << "a value a caller sets leaves as a tag";
 
-        FollowingBlock              tagged;
-        CtxSettings<FollowingBlock> taggedSettings{tagged};
-        taggedSettings.init();
+        FollowingBlock    tagged;
+        gr::SettingsBase& taggedSettings = gr::settings::detail::settingsOf(tagged);
+        std::ignore                      = taggedSettings.check({});
         coupleRateAndLevel(taggedSettings);
-        const float taggedRate = 3.f * tagged.sample_rate.value;
-        taggedSettings.autoUpdate(tagOf(gr::tag::SAMPLE_RATE.key(), taggedRate));
-        const ApplyStagedParametersResult tagResult = taggedSettings.applyStagedParameters();
-        expect(eq(tagged.sample_rate.value, taggedRate));
-        expect(tagResult.forwardParameters.empty()) << "a tag's value leaves as a second tag";
-    };
-
-    "a TagCouplings message sets and reads the table, and a refused coupling reaches the message output"_test = [] {
-        using namespace qa_follows_tag;
-        FollowingBlock block{property_map{{"name", std::string("follower")}}};
-        gr::MsgPortOut toBlock;
-        gr::MsgPortIn  fromBlock;
-        expect(fatal(toBlock.connect(block.msgIn).has_value()));
-        expect(fatal(block.msgOut.connect(fromBlock).has_value()));
-        block.init(std::make_shared<gr::Sequence>());
-
-        const property_map couplings{{"sample_rate", std::string(gr::tag::SAMPLE_RATE.key())}, {"level", std::string(kLevelKey)}};
-        gr::sendMessage<gr::message::Command::Set>(toBlock, "", gr::block::property::kTagCouplings, couplings);
-        gr::sendMessage<gr::message::Command::Get>(toBlock, "", gr::block::property::kTagCouplings, property_map{}, "read");
-        gr::sendMessage<gr::message::Command::Set>(toBlock, "", gr::block::property::kTagCouplings, property_map{{"gain", std::string(gr::tag::RESET_DEFAULTS.key())}});
-        block.processScheduledMessages();
-        expect(block.settings().tagCouplings() == couplings) << "the Set message does not reach the table";
-
-        std::optional<property_map> read;
-        std::string                 errors;
-        ReaderSpanLike auto         messages = fromBlock.streamReader().get<SpanReleasePolicy::ProcessAll>();
-        for (const gr::Message& message : messages) {
-            if (!message.data.has_value()) {
-                errors += message.data.error().message;
-            } else if (message.clientRequestID == "read") {
-                read = *message.data;
-            }
-        }
-        std::ignore = messages.consume(messages.size());
-        expect(read == std::optional<property_map>(couplings)) << "the Get message does not return the table";
-        expect(errors.contains("gain") && errors.contains(gr::tag::RESET_DEFAULTS.key())) << "the refused coupling does not reach the message output: " << errors;
-
-        const float taggedRate = 2.f * block.sample_rate.value;
-        block.settings().autoUpdate(tagOf(gr::tag::SAMPLE_RATE.key(), taggedRate));
-        std::ignore = block.settings().applyStagedParameters();
-        expect(eq(block.sample_rate.value, taggedRate)) << "the setting the message coupled does not follow its key";
+        const float taggedRate = 3.f * tagged.settings.sample_rate.value;
+        qa_settings::enterTag(taggedSettings, tagOf(gr::tag::SAMPLE_RATE.key(), taggedRate));
+        std::ignore = gr::testing::applyStagedForTest(taggedSettings);
+        expect(eq(tagged.settings.sample_rate.value, taggedRate));
+        expect(gr::settings::detail::FrameworkAccess::takeForwarded(taggedSettings).empty()) << "a tag's value leaves as a second tag";
     };
 
     "a list of strings coupled to a tag key takes the tag's list at the tag's sample"_test = [] {
@@ -3360,7 +2230,7 @@ const boost::ut::suite<"keys that follow tags"> autoUpdateKeyTests = [] {
 
         const std::vector<std::pair<std::string_view, pmt::Value>> carriers{{"Tensor<pmt::Value>", pmt::Value(tagged)}, {"Tensor<std::pmr::string>", pmt::Value(textTensor)}};
 
-        const std::vector<std::string> untagged = NamesRecordingSink{}.names;
+        const std::vector<std::string> untagged = NamesRecordingSink{}.settings.names;
         for (const auto& [carrier, list] : carriers) {
             const auto namesAtSample = namesFollowingTag(kNamesKey, property_map{{std::pmr::string(kNamesKey), list}}, kTagIndex, kSamples);
             expect(fatal(eq(namesAtSample.size(), kSamples))) << carrier;
@@ -3368,38 +2238,31 @@ const boost::ut::suite<"keys that follow tags"> autoUpdateKeyTests = [] {
                 expect(namesAtSample[i] == (i < kTagIndex ? untagged : tagged)) << std::format("the list a {} carries: '{}' at sample {}, the tag at sample {}", carrier, joined(namesAtSample[i]), i, kTagIndex);
             }
         }
-    };
 
-    "a list of strings coupled to a tag key keeps its list when the tag's list holds an element that is no string"_test = [] {
-        using namespace qa_follows_tag;
-        constexpr std::string_view    kNamesKey = "foo:names";
-        constexpr std::size_t         kTagIndex = 5UZ;
-        constexpr std::size_t         kSamples  = 2UZ * kTagIndex;
         const std::vector<pmt::Value> mixed{pmt::Value(std::string("first")), pmt::Value(1.f)};
-
-        const std::vector<std::string> untagged      = NamesRecordingSink{}.names;
-        const auto                     namesAtSample = namesFollowingTag(kNamesKey, property_map{{std::pmr::string(kNamesKey), pmt::Value(Tensor<pmt::Value>(mixed.begin(), mixed.end()))}}, kTagIndex, kSamples);
-        expect(fatal(eq(namesAtSample.size(), kSamples)));
-        for (std::size_t i = 0UZ; i < kSamples; ++i) {
-            expect(namesAtSample[i] == untagged) << std::format("a list with an element that is no string sets '{}' at sample {}, the tag at sample {}", joined(namesAtSample[i]), i, kTagIndex);
-        }
+        const auto                    namesOfMixed = namesFollowingTag(kNamesKey, property_map{{std::pmr::string(kNamesKey), pmt::Value(Tensor<pmt::Value>(mixed.begin(), mixed.end()))}}, kTagIndex, kSamples);
+        expect(std::ranges::all_of(namesOfMixed, [&untagged](const std::vector<std::string>& names) { return names == untagged; })) << "a list with an element that is no string sets the setting";
     };
 };
 
 namespace qa_reset_callbacks {
 using namespace gr;
 
-/// a gain whose settingsChanged() and reset() read the block's own settings
+/// a gain whose applySettings() and reset() read the block's own settings
 struct SettingsReadingReset : Block<SettingsReadingReset> {
     PortIn<float>  in{};
     PortOut<float> out{};
 
-    Annotated<float, "gain"> gain = 1.f;
+    struct Settings {
+        Annotated<float> gain = 1.f;
 
-    GR_MAKE_REFLECTABLE(SettingsReadingReset, in, out, gain);
+        GR_MAKE_REFLECTABLE(Settings, gain);
+    } settings{};
 
-    std::optional<float> gainReadByLastChange; // the gain that settings() held in the last settingsChanged()
-    std::optional<float> gainReadByLastReset;  // the gain that settings() held in the last reset()
+    GR_MAKE_REFLECTABLE(SettingsReadingReset, in, out, settings);
+
+    std::optional<float> gainReadByLastChange; // the gain that get() returned in the last applySettings()
+    std::optional<float> gainReadByLastReset;  // the gain that get() returned in the last reset()
     std::size_t          resets = 0;
 
     void reset() {
@@ -3407,14 +2270,13 @@ struct SettingsReadingReset : Block<SettingsReadingReset> {
         gainReadByLastReset = readGain();
     }
 
-    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * settings.gain; }
 
-    void settingsChanged(const property_map& /*oldSettings*/, const property_map& /*newSettings*/) { gainReadByLastChange = readGain(); }
+    void applySettings([[maybe_unused]] const Settings& s) { gainReadByLastChange = readGain(); }
 
     [[nodiscard]] std::optional<float> readGain() {
-        const std::optional<pmt::Value> value     = this->settings().get(std::string("gain"));
-        const float*                    gainValue = value.has_value() ? value->get_if<float>() : nullptr;
-        return gainValue != nullptr ? std::optional<float>(*gainValue) : std::nullopt;
+        const std::expected<float, gr::settings::Rejected> value = this->get<float>("gain");
+        return value.has_value() ? std::optional<float>(*value) : std::nullopt;
     }
 };
 
@@ -3443,39 +2305,33 @@ const boost::ut::suite<"a reset whose callbacks read the settings"> resetCallbac
     using namespace boost::ut;
     using namespace qa_reset_callbacks;
 
-    "a reset by tag or by message returns when settingsChanged() and reset() read the settings"_test = [] {
+    "a reset by tag or by call returns when applySettings() and reset() read the settings"_test = [] {
         for (const bool byTag : {true, false}) {
-            const std::string_view path  = byTag ? "a reset_default tag" : "a ResetDefaults message";
+            const std::string_view path  = byTag ? "a reset_default tag" : "a resetDefaults() call";
             auto                   block = std::make_unique<SettingsReadingReset>();
             block->init(std::make_shared<gr::Sequence>());
-            const float defaultGain = block->gain.value;
-            std::ignore             = block->settings().set({{"gain", defaultGain / 2.f}});
-            expect(block->settings().activateContext().has_value());
-            std::ignore = block->settings().applyStagedParameters();
-            expect(eq(block->gain.value, defaultGain / 2.f)) << "the value to reset does not reach the member";
+            const float defaultGain = block->settings.gain.value;
+            std::ignore             = block->set({{"gain", defaultGain / 2.f}});
+            std::ignore             = gr::testing::applyStagedForTest(gr::settings::detail::settingsOf(*block));
+            expect(eq(block->settings.gain.value, defaultGain / 2.f)) << "the value to reset does not reach the member";
             block->gainReadByLastChange.reset();
             const std::size_t resetsBefore = block->resets;
 
-            gr::MsgPortOut toBlock;
-            if (!byTag) {
-                expect(fatal(toBlock.connect(block->msgIn).has_value()));
-                gr::sendMessage<gr::message::Command::Set>(toBlock, "", gr::block::property::kResetDefaults, gr::property_map{});
-            }
             const bool returned = resetReturns(block, [byTag](SettingsReadingReset& target) {
                 if (byTag) {
-                    target.settings().autoUpdate(qa_refusals::flagTag(gr::tag::RESET_DEFAULTS.key()));
-                    std::ignore = target.settings().applyStagedParameters();
+                    qa_settings::enterTag(gr::settings::detail::settingsOf(target), qa_refusals::flagTag(gr::tag::RESET_DEFAULTS.key()));
+                    std::ignore = gr::testing::applyStagedForTest(gr::settings::detail::settingsOf(target));
                 } else {
-                    target.processScheduledMessages();
+                    std::ignore = target.resetDefaults();
                 }
             });
             expect(returned) << path << " does not return within " << kResetBound.count() << " s";
             if (!returned) {
                 continue;
             }
-            expect(eq(block->gain.value, defaultGain)) << path << " leaves the member off its default";
+            expect(eq(block->settings.gain.value, defaultGain)) << path << " leaves the member off its default";
             expect(eq(block->resets, resetsBefore + 1UZ)) << path << " calls reset() a number of times other than once";
-            expect(block->gainReadByLastChange == std::optional<float>(defaultGain)) << "settingsChanged() reads a gain other than the default after " << path;
+            expect(block->gainReadByLastChange == std::optional<float>(defaultGain)) << "applySettings() reads a gain other than the default after " << path;
             expect(block->gainReadByLastReset == std::optional<float>(defaultGain)) << "reset() reads a gain other than the default after " << path;
         }
     };
@@ -3484,59 +2340,62 @@ const boost::ut::suite<"a reset whose callbacks read the settings"> resetCallbac
 namespace qa_callback_staging {
 using namespace gr;
 
-/// a gain and offset stage whose reset() or settingsChanged() stages an offset once, when armed
+/// a gain and offset stage whose reset() or applySettings() sets an offset on its own settings once, when armed
 struct StagingCallbacks : Block<StagingCallbacks> {
     PortIn<float>  in{};
     PortOut<float> out{};
 
-    Annotated<float, "gain">   gain   = 1.f;
-    Annotated<float, "offset"> offset = 0.f;
+    struct Settings {
+        Annotated<float> gain   = 1.f;
+        Annotated<float> offset = 0.f;
 
-    GR_MAKE_REFLECTABLE(StagingCallbacks, in, out, gain, offset);
+        GR_MAKE_REFLECTABLE(Settings, gain, offset);
+    } settings{};
 
-    std::optional<float> offsetFromReset;  // the offset the next reset() stages
-    std::optional<float> offsetFromChange; // the offset the next settingsChanged() stages
+    GR_MAKE_REFLECTABLE(StagingCallbacks, in, out, settings);
+
+    std::optional<float>                                                       offsetFromReset;  // the offset the next reset() sets
+    std::optional<float>                                                       offsetFromChange; // the offset the next applySettings() sets
+    std::optional<std::expected<gr::settings::Values, gr::settings::Rejected>> ownCall{};
 
     void reset() { stageOffsetOnce(offsetFromReset); }
 
-    void settingsChanged(const property_map& /*oldSettings*/, const property_map& /*newSettings*/) { stageOffsetOnce(offsetFromChange); }
+    void applySettings([[maybe_unused]] const Settings& s) { stageOffsetOnce(offsetFromChange); }
 
-    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain.value + offset.value; }
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * settings.gain.value + settings.offset.value; }
 
     void stageOffsetOnce(std::optional<float>& armed) {
         if (const std::optional<float> value = std::exchange(armed, std::nullopt); value.has_value()) {
-            std::ignore = this->settings().setStaged({{"offset", *value}});
+            ownCall = this->set({{"offset", *value}}, gr::settings::noWait);
         }
     }
 };
 
-enum class StagingPath { resetTag, storeTag, contextActivation, resetCall };
+enum class StagingPath { resetTag, changeTag, resetCall };
 
 [[nodiscard]] constexpr std::string_view describe(StagingPath path) noexcept {
     switch (path) {
-    case StagingPath::resetTag: return "a reset_default tag whose reset() stages";
-    case StagingPath::storeTag: return "a store_default tag whose settingsChanged() stages";
-    case StagingPath::contextActivation: return "a context activation whose settingsChanged() stages";
-    case StagingPath::resetCall: return "a resetDefaults() call whose reset() stages";
+    case StagingPath::resetTag: return "a reset_default tag whose reset() sets";
+    case StagingPath::changeTag: return "a coupled tag whose applySettings() sets";
+    case StagingPath::resetCall: return "a resetDefaults() call whose reset() sets";
     }
     return "";
 }
 
 } // namespace qa_callback_staging
 
-const boost::ut::suite<"a value a callback stages during an apply"> callbackStagingTests = [] {
+const boost::ut::suite<"a callback sets its own block during an apply"> callbackStagingTests = [] {
     using namespace boost::ut;
     using namespace qa_callback_staging;
 
-    "a value a callback stages during applyChangedSettings() is applied by the next one"_test = [] {
-        for (const StagingPath path : {StagingPath::resetTag, StagingPath::storeTag, StagingPath::contextActivation, StagingPath::resetCall}) {
+    "a callback's set on its own block during an apply is refused, and nothing waits for the next apply"_test = [] {
+        for (const StagingPath path : {StagingPath::resetTag, StagingPath::changeTag, StagingPath::resetCall}) {
             StagingCallbacks block;
             block.init(std::make_shared<gr::Sequence>());
-            qa_coupling::couple(block.settings(), "gain", "gain");
-            const float defaultGain  = block.gain.value;
-            const float stagedOffset = block.offset.value + 2.f;
-            const float offsetBefore = block.offset.value;
-            const auto  now          = gr::settings::convertTimePointToUint64Ns(std::chrono::system_clock::now());
+            qa_coupling::couple(gr::settings::detail::settingsOf(block), "gain", "gain");
+            const float defaultGain  = block.settings.gain.value;
+            const float stagedOffset = block.settings.offset.value + 2.f;
+            const float offsetBefore = block.settings.offset.value;
             if (path == StagingPath::resetTag || path == StagingPath::resetCall) {
                 block.offsetFromReset = stagedOffset;
             } else {
@@ -3545,26 +2404,259 @@ const boost::ut::suite<"a value a callback stages during an apply"> callbackStag
 
             switch (path) {
             case StagingPath::resetTag:
-                block.settings().autoUpdate(qa_refusals::flagTag(gr::tag::RESET_DEFAULTS.key()));
+                qa_settings::enterTag(gr::settings::detail::settingsOf(block), qa_refusals::flagTag(gr::tag::RESET_DEFAULTS.key()));
                 block.applyChangedSettings();
                 break;
-            case StagingPath::storeTag:
-                block.settings().autoUpdate(Tag{0UZ, property_map{{std::pmr::string(gr::tag::STORE_DEFAULTS.key()), true}, {"gain", 2.f * defaultGain}}});
+            case StagingPath::changeTag:
+                qa_settings::enterTag(gr::settings::detail::settingsOf(block), Tag{0UZ, property_map{{"gain", 2.f * defaultGain}}});
                 block.applyChangedSettings();
                 break;
-            case StagingPath::contextActivation:
-                expect(block.settings().set({{"gain", 2.f * defaultGain}}, gr::SettingsCtx{now, "B"}).empty());
-                expect(block.settings().activateContext(gr::SettingsCtx{now, "B"}).has_value());
-                block.applyChangedSettings();
-                break;
-            case StagingPath::resetCall: block.settings().resetDefaults(); break;
+            case StagingPath::resetCall: std::ignore = block.resetDefaults(); break;
             }
 
-            expect(!block.offsetFromReset.has_value() && !block.offsetFromChange.has_value()) << describe(path) << " runs no staging callback";
-            expect(eq(block.offset.value, offsetBefore)) << describe(path) << " applies the staged offset within its own apply";
-            expect(block.settings().changed()) << describe(path) << " leaves the staged offset unmarked";
+            expect(!block.offsetFromReset.has_value() && !block.offsetFromChange.has_value()) << describe(path) << " runs no callback";
+            expect(fatal(block.ownCall.has_value())) << describe(path);
+            expect(!block.ownCall->has_value() && block.ownCall->error().front().reason.contains("own thread")) << describe(path) << " takes the block's own call";
+            expect(!gr::settings::detail::FrameworkAccess::hasWork(gr::settings::detail::settingsOf(block))) << describe(path) << " leaves a change pending";
             block.applyChangedSettings();
-            expect(eq(block.offset.value, stagedOffset)) << "the apply after " << describe(path) << " leaves the staged offset unapplied";
+            expect(eq(block.settings.offset.value, offsetBefore)) << "the apply after " << describe(path) << " applies the refused offset";
+            expect(block.settings.offset.value != stagedOffset);
         }
+    };
+};
+
+const boost::ut::suite<"a block's work call and its settings"> workCallTests = [] {
+    using namespace boost::ut;
+    using namespace qa_follows_tag;
+
+    "a work call that reads no input applies the change waiting for it first"_test = [] {
+        qa_settings::ChangeRecordingBlock block;
+        gr::PortOut<float>                upstream;
+        gr::PortIn<float>                 downstream;
+        expect(fatal(upstream.connect(block.in).has_value()));
+        expect(fatal(block.out.connect(downstream).has_value()));
+        block.init(std::make_shared<gr::Sequence>());
+        std::ignore = block.changeStateTo(gr::lifecycle::State::RUNNING);
+
+        const gr::Size_t size = 2U * block.settings.fft_size.value;
+        expect(block.set({{"fft_size", size}}, gr::settings::noWait).has_value());
+        expect(neq(block.settings.fft_size.value, size)) << "a running block applies the change at the call";
+        std::ignore = block.work();
+        expect(eq(block.settings.fft_size.value, size)) << "a starved work call leaves the change waiting";
+
+        // a set that waits returns once the next work call applied its change; the change is pending before that call
+        const gr::Size_t                                            waitedSize = 2U * size;
+        std::expected<gr::settings::Values, gr::settings::Rejected> waited;
+        std::thread                                                 caller([&block, &waited, waitedSize] { waited = block.set({{"fft_size", waitedSize}}); });
+        while (!gr::settings::detail::FrameworkAccess::hasWork(gr::settings::detail::settingsOf(block))) {
+            std::this_thread::yield();
+        }
+        std::ignore = block.work();
+        caller.join();
+        expect(waited.has_value() && waited->empty()) << "a set waiting on a starved block does not return applied after one work call";
+        expect(eq(block.settings.fft_size.value, waitedSize));
+    };
+
+    "a value a caller sets holds until the next tag, and the last of several tags is the one in force"_test = [] {
+        NotificationRecorder scheduler;
+        FollowingBlock       block;
+        gr::SettingsBase&    settings = gr::settings::detail::settingsOf(block);
+        std::ignore                   = settings.check({});
+        coupleRateAndLevel(settings);
+        gr::settings::detail::FrameworkAccess::attachScheduler(settings, &scheduler);
+        std::ignore = block.changeStateTo(gr::lifecycle::State::RUNNING);
+
+        expect(settings.set({{"sample_rate", 500.f}}, gr::settings::noWait).has_value());
+        std::ignore = gr::testing::applyStagedForTest(settings);
+        expect(eq(block.settings.sample_rate.value, 500.f)) << "the caller's value is not applied";
+        expect(gr::settings::detail::FrameworkAccess::isGiven(settings, "sample_rate")) << "the caller's value is not given";
+
+        for (const float taggedRate : {1000.f, 2000.f, 3000.f}) {
+            qa_settings::enterTag(settings, tagOf(gr::tag::SAMPLE_RATE.key(), taggedRate));
+        }
+        std::ignore = gr::testing::applyStagedForTest(settings);
+        expect(eq(block.settings.sample_rate.value, 3000.f)) << "the caller's value outlives the tags after it";
+        expect(settings.get<float>("sample_rate") == 3000.f) << "get() reads a rate other than the last tag's";
+        const bool tagNamed = std::ranges::any_of(scheduler.held, [](const gr::settings::Notification& n) { return n.key == "sample_rate" && n.what == gr::settings::NotificationKind::changed && n.reason == "a tag set the value"; });
+        expect(tagNamed) << "no reader learns that a tag set the rate";
+        gr::settings::detail::FrameworkAccess::attachScheduler(settings, nullptr);
+    };
+
+    "a block given a key it does not declare is refused at the add, and alone at its first call"_test = [] {
+        gr::Graph   flow;
+        std::string refusal;
+        try {
+            std::ignore = flow.emplaceBlock<FollowingBlock>({{"name", std::string("sink")}, {"aa", 1.f}});
+        } catch (const gr::exception& e) {
+            refusal = e.message;
+        }
+        expect(refusal.contains("block 'sink'") && refusal.contains("aa")) << refusal;
+        expect(flow.blocks().empty()) << "the refused block is in the graph";
+
+        FollowingBlock alone{property_map{{"name", std::string("sink")}, {"aa", 1.f}}};
+        const auto     first = alone.set({{"gain", 2.f}});
+        expect(!first.has_value() && gr::settings::describeRejected(first.error()).contains("aa")) << "the first call does not return the refusal of the constructed key";
+    };
+};
+
+namespace qa_changed {
+
+// names, at each apply, the settings whose `changed()` reads true
+struct ChangeWatcher : gr::Block<ChangeWatcher> {
+    gr::PortIn<float>  in;
+    gr::PortOut<float> out;
+
+    struct Settings {
+        gr::Annotated<float>              cutoff = 0.25f;
+        gr::Annotated<std::int32_t>       taps   = 31;
+        gr::Annotated<std::vector<float>> window = std::vector<float>{1.f};
+
+        GR_MAKE_REFLECTABLE(Settings, cutoff, taps, window);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(ChangeWatcher, in, out, settings);
+
+    std::vector<std::vector<std::string>> seen{};
+    std::optional<Settings>               copied{};
+    bool                                  throwInHook = false;
+
+    [[nodiscard]] constexpr float processOne(float x) const noexcept { return x; }
+
+    void applySettings(const Settings& s) {
+        std::vector<std::string> names;
+        if (s.cutoff.changed()) {
+            names.emplace_back("cutoff");
+        }
+        if (s.taps.changed()) {
+            names.emplace_back("taps");
+        }
+        if (s.window.changed()) {
+            names.emplace_back("window");
+        }
+        seen.push_back(std::move(names));
+        copied.emplace(s); // a copy constructed from `s`; an assignment to an earlier copy would keep that copy's flags
+        if (throwInHook) {
+            throw gr::exception("the device refuses the change");
+        }
+    }
+};
+
+// a hook that applies another block's settings on its own thread reads its own flags afterwards
+struct NestingWatcher : gr::Block<NestingWatcher> {
+    gr::PortIn<float>  in;
+    gr::PortOut<float> out;
+
+    struct Settings {
+        gr::Annotated<float>        gain = 1.f;
+        gr::Annotated<std::int32_t> taps = 31;
+
+        GR_MAKE_REFLECTABLE(Settings, gain, taps);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(NestingWatcher, in, out, settings);
+
+    ChangeWatcher*    other = nullptr;
+    std::vector<bool> gainChanged{};
+    std::vector<bool> tapsChanged{};
+
+    [[nodiscard]] constexpr float processOne(float x) const noexcept { return x * settings.gain; }
+
+    void applySettings(const Settings& s) {
+        if (other != nullptr) {
+            std::ignore = other->set({{"cutoff", 0.5f}});
+        }
+        gainChanged.push_back(s.gain.changed());
+        tapsChanged.push_back(s.taps.changed());
+    }
+};
+
+// holds its settings in a member named `config`: core finds the member by its type
+struct ConfigHolder : gr::Block<ConfigHolder> {
+    gr::PortIn<float>  in;
+    gr::PortOut<float> out;
+
+    struct Settings {
+        gr::Annotated<float>        gain = 1.f;
+        gr::Annotated<std::int32_t> taps = 31;
+
+        GR_MAKE_REFLECTABLE(Settings, gain, taps);
+    } config;
+
+    GR_MAKE_REFLECTABLE(ConfigHolder, in, out, config);
+
+    bool              hookGotOwnMember = false;
+    std::vector<bool> tapsChangedAfterAssign{};
+
+    [[nodiscard]] constexpr float processOne(float x) const noexcept { return x * config.gain; }
+
+    std::optional<gr::Refused> checkSettings(const Settings& s) const { return s.gain > 10.f ? std::optional(gr::Refused(s.gain, "above 10")) : std::nullopt; }
+
+    // assigns `taps` from the gain to pin that the block's own write leaves the setting's flag
+    void applySettings(Settings& s) {
+        hookGotOwnMember = std::addressof(s) == std::addressof(config);
+        if (s.gain.changed()) {
+            s.taps = static_cast<std::int32_t>(s.gain.value) * 10;
+        }
+        tapsChangedAfterAssign.push_back(s.taps.changed());
+    }
+};
+
+} // namespace qa_changed
+
+const boost::ut::suite<"a block asks what changed"> changedTests = [] {
+    using namespace boost::ut;
+    using namespace qa_changed;
+    using Names = std::vector<std::string>;
+
+    "changed() reads true for every setting at the setup, and afterwards for each setting whose value the batch changed"_test = [] {
+        ChangeWatcher block;
+        expect(fatal(block.check({}).has_value()));
+        expect(fatal(eq(block.seen.size(), 1UZ)));
+        expect(block.seen.back() == Names{"cutoff", "taps", "window"}) << "every setting, though each holds its default";
+
+        expect(block.set({{"cutoff", 0.1f}}).has_value());
+        expect(block.seen.back() == Names{"cutoff"});
+        expect(block.set({{"cutoff", 0.1f}, {"taps", 15}}).has_value());
+        expect(block.seen.back() == Names{"taps"}) << "a setting sent at its value is no change";
+        expect(block.set({{"window", std::vector<float>{1.f, 0.5f}}}).has_value());
+        expect(block.seen.back() == Names{"window"});
+    };
+
+    "changed() reads false outside the hook, after a hook that returns and after one that throws"_test = [] {
+        ChangeWatcher block;
+        expect(fatal(block.check({}).has_value()));
+        expect(!block.settings.cutoff.changed() && !block.settings.taps.changed() && !block.settings.window.changed()) << "after the setup";
+        expect(block.set({{"taps", 7}}).has_value());
+        expect(!block.settings.taps.changed()) << "after a hook that returns";
+
+        block.throwInHook = true;
+        std::ignore       = block.set({{"cutoff", 0.4f}});
+        expect(block.seen.back() == Names{"cutoff"}) << "the hook ran";
+        expect(eq(block.settings.cutoff.value, 0.25f)) << "the key the throw failed takes back its value";
+        expect(!block.settings.cutoff.changed()) << "after a hook that throws";
+    };
+
+    "a hook that applies another block's settings reads its own flags after that apply"_test = [] {
+        ChangeWatcher other;
+        expect(fatal(other.check({}).has_value()));
+        NestingWatcher block;
+        expect(fatal(block.check({}).has_value()));
+        block.other = &other;
+        expect(block.set({{"gain", 2.f}}).has_value());
+        expect(other.seen.back() == Names{"cutoff"}) << "the other block's hook ran inside this one's";
+        expect(block.gainChanged == std::vector<bool>{true, true}) << "the batch changed gain";
+        expect(block.tapsChanged == std::vector<bool>{true, false}) << "the batch left taps";
+    };
+
+    "a block names its Settings member as it likes, and its hooks take that member"_test = [] {
+        ConfigHolder block;
+        expect(fatal(block.check({}).has_value()));
+        expect(block.hookGotOwnMember) << "the hook's argument is the block's own member";
+        expect(block.set({{"gain", 2.f}}).has_value());
+        expect(eq(block.config.gain.value, 2.f));
+        expect(eq(block.config.taps.value, 20)) << "the hook's write reached the member";
+        expect(block.tapsChangedAfterAssign == std::vector<bool>{true, false}) << "the block's own write leaves the flag";
+        expect(!block.set({{"gain", 20.f}}).has_value()) << "the check reads the struct core fills";
+        expect(eq(block.get<float>("gain").value_or(0.f), 2.f));
     };
 };

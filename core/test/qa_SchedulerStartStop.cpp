@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstddef>
 #include <expected>
+#include <format>
 #include <memory>
 #include <memory_resource>
 #include <mutex>
@@ -701,12 +702,65 @@ const boost::ut::suite<"a worker task queued for a stopped run"> queuedWorkerTes
 const boost::ut::suite<"the stream-to-message ratio"> messageRatioTests = [] {
     using namespace boost::ut;
 
-    "a stream-to-message ratio of zero is refused"_test = [] {
+    "a stream-to-message ratio of zero is refused at the call"_test = [] {
         qa_start_stop::TestScheduler scheduler;
-        const gr::Size_t             ratioBefore = scheduler.process_stream_to_message_ratio.value;
-        std::ignore                              = scheduler.settings().setStaged({{"process_stream_to_message_ratio", 0U}});
-        const auto result                        = scheduler.settings().applyStagedParameters();
-        expect(result.failedParameters.contains("process_stream_to_message_ratio")) << "a ratio of zero must be refused";
-        expect(eq(scheduler.process_stream_to_message_ratio.value, ratioBefore)) << "a refused ratio must leave the setting alone";
+        const gr::Size_t             ratioBefore = scheduler.settings.process_stream_to_message_ratio.value;
+        const auto                   result      = scheduler.set({{"process_stream_to_message_ratio", 0U}}, gr::settings::noWait);
+        expect(!result.has_value() && result.error().front().key == "process_stream_to_message_ratio") << "a ratio of zero must be refused";
+        expect(eq(scheduler.settings.process_stream_to_message_ratio.value, ratioBefore)) << "a refused ratio must leave the setting alone";
+    };
+};
+
+const boost::ut::suite<"the subscribers of the scheduler's lifecycle"> lifecycleSubscriberTests = [] {
+    using namespace boost::ut;
+    using enum gr::lifecycle::State;
+
+    // the worker's message pass adds and removes subscribers while this thread pauses and resumes the run, and each
+    // change of the state notifies the subscribers on this thread
+    "a subscriber added during state changes on another thread leaves the kept subscriber its notifications"_test = [] {
+        constexpr std::size_t        nCycles = 50UZ;
+        qa_start_stop::TestScheduler scheduler;
+        gr::MsgPortOut               toScheduler;
+        gr::MsgPortIn                fromScheduler;
+        expect(fatal(toScheduler.connect(scheduler.msgIn).has_value()));
+        expect(fatal(scheduler.msgOut.connect(fromScheduler).has_value()));
+        {
+            gr::Graph flow;
+            auto&     source = flow.emplaceBlock<qa_start_stop::OnesSource>();
+            auto&     sink   = flow.emplaceBlock<qa_start_stop::CountingSink>();
+            expect(fatal(flow.connect<"out", "in">(source, sink).has_value()));
+            expect(fatal(scheduler.exchange(std::move(flow)).has_value()));
+        }
+        gr::sendMessage<gr::message::Command::Subscribe>(toScheduler, scheduler.unique_name, gr::block::property::kLifeCycleState, gr::property_map{}, "kept");
+
+        std::size_t nPausesSeen    = 0UZ;
+        const auto  isPauseForKept = [](const gr::Message& message) -> bool {
+            if (message.endpoint != gr::block::property::kLifeCycleState || message.clientRequestID != "kept" || !message.data.has_value()) {
+                return false;
+            }
+            const auto state = message.data->find(std::pmr::string("state"));
+            return state != message.data->end() && state->second.value_or(std::string_view{}) == "REQUESTED_PAUSE";
+        };
+        const auto takeNotifications = [&fromScheduler, &nPausesSeen, &isPauseForKept] {
+            auto messages = fromScheduler.streamReader().get();
+            nPausesSeen += static_cast<std::size_t>(std::ranges::count_if(messages, isPauseForKept));
+            std::ignore = messages.consume(messages.size());
+        };
+
+        std::thread runner([&scheduler] { std::ignore = scheduler.runAndWait(); });
+        expect(fatal(qa_start_stop::awaitCondition([&scheduler] { return scheduler.state() == RUNNING; }))) << "the scheduler did not start";
+        for (std::size_t cycle = 0UZ; cycle < nCycles; ++cycle) {
+            const std::string client = std::format("passing-{}", cycle);
+            gr::sendMessage<gr::message::Command::Subscribe>(toScheduler, scheduler.unique_name, gr::block::property::kLifeCycleState, gr::property_map{}, client);
+            expect(scheduler.changeStateTo(REQUESTED_PAUSE).has_value());
+            gr::sendMessage<gr::message::Command::Unsubscribe>(toScheduler, scheduler.unique_name, gr::block::property::kLifeCycleState, gr::property_map{}, client);
+            expect(fatal(qa_start_stop::awaitCondition([&scheduler] { return scheduler.state() == PAUSED; }))) << "the scheduler did not pause in cycle " << cycle;
+            expect(scheduler.changeStateTo(RUNNING).has_value());
+            takeNotifications();
+        }
+        expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
+        runner.join();
+        takeNotifications();
+        expect(eq(nPausesSeen, nCycles)) << "the kept subscriber missed a pause";
     };
 };

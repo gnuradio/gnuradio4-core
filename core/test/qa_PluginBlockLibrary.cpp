@@ -68,13 +68,13 @@ const boost::ut::suite<"PluginBlockLibrary"> pluginBlockLibraryTests = [] {
         expect(fatal(doubler != nullptr)) << "the first library's factory produced nothing";
         expect(fatal(tripler != nullptr)) << "the second library's factory produced nothing";
 
-        doubler->settings().init();
-        tripler->settings().init();
+        std::ignore = doubler->settings().check({});
+        std::ignore = tripler->settings().check({});
         expect(eq(std::string(doubler->typeName()), std::string("gr::testing::LibraryDoubler")));
         expect(eq(std::string(tripler->typeName()), std::string("gr::testing::LibraryTripler")));
         expect(eq(doubler->dynamicInputPorts().size(), 1UZ));
         expect(eq(tripler->dynamicOutputPorts().size(), 1UZ));
-        expect(that % doubler->settings().defaultParameters().contains("extra_gain"));
+        expect(that % gr::settings::heldValues(doubler->settings().get()).contains("extra_gain"));
     };
 
     "a library whose registrations replace another library's is kept mapped too"_test = [] {
@@ -93,7 +93,7 @@ const boost::ut::suite<"PluginBlockLibrary"> pluginBlockLibraryTests = [] {
         std::unique_ptr<BlockModel> duplicate = gr::globalBlockRegistry().create(kDuplicateKey, {});
         expect(fatal(duplicate != nullptr)) << "the surviving factory produced nothing";
 
-        duplicate->settings().init();
+        std::ignore = duplicate->settings().check({});
         expect(eq(std::string(duplicate->typeName()), std::string("gr::testing::LibraryDuplicate")));
         expect(eq(duplicate->dynamicInputPorts().size(), 1UZ));
         expect(eq(duplicate->dynamicOutputPorts().size(), 1UZ));

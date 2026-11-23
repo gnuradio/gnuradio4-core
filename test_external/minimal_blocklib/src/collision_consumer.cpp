@@ -30,9 +30,7 @@ namespace {
 int main() {
     gr::minimal_blocklib::Gain<float> fromMinimal;
     gr::other_blocklib::Gain<float>   fromOther;
-    fromMinimal.gain = 2.0F;
-    fromOther.gain   = 3.0F;
-    if (fromMinimal.processOne(3.0F) != 6.0F || fromOther.processOne(3.0F) != 9.0F) {
+    if (!fromMinimal.set("gain", 2.0F) || !fromOther.set("gain", 3.0F) || fromMinimal.processOne(3.0F) != 6.0F || fromOther.processOne(3.0F) != 9.0F) {
         std::println(stderr, "a directly instantiated block did not compute");
         return 1;
     }

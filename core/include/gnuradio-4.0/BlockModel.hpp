@@ -439,10 +439,6 @@ public:
      */
     virtual void init(std::shared_ptr<gr::Sequence> progress, std::string_view ioThreadPool) = 0;
 
-    // the error that kept init() from completing, if any: init() has no return value and a block's message
-    // port has no subscriber while the graph is built, so the user code it runs reaches no caller but this
-    [[nodiscard]] virtual std::optional<Error> initError() const { return {}; }
-
     /**
      * @brief returns scheduling hint that invoking the work(...) function may block on IO or system-calls
      */
@@ -469,6 +465,7 @@ public:
      * @brief the type of the node as a string, as the derived type named it on construction
      */
     [[nodiscard]] virtual std::string_view typeName() const;
+    [[nodiscard]] virtual std::string_view recipeType() const { return {}; } // a recipe composite's recipe, which a saved graph names it by
 
     /**
      * @brief user-defined name
@@ -515,6 +512,31 @@ public:
 
     virtual void processScheduledMessages() = 0;
 
+private:
+    friend struct Graph;
+    template<typename TSelf, typename TSubGraph>
+    friend class GraphWrapper;
+    template<BlockLike T, typename Ownership>
+    friend class BlockWrapper;
+
+    // lists the block's ports again after a setting resized a port collection; a model with no port loader keeps its list
+    void reloadDynamicPorts() {
+        initDynamicPorts();
+        if (_dynamicPortsLoader.instance == nullptr) {
+            return;
+        }
+        _dynamicInputPorts.clear();
+        _dynamicOutputPorts.clear();
+        _dynamicPortsLoader();
+    }
+
+    // adds `prefix` to the prefixes whose tag keys the output `port` drops, or removes it; a subgraph passes the call to
+    // the block inside it that holds the port. Returns whether this block or one inside it holds the port
+    virtual bool dropTagKeysAtOutput(const DynamicPort& port, std::string_view prefix, bool drops) {
+        return std::ranges::any_of(blocks(), [&port, prefix, drops](const std::shared_ptr<BlockModel>& inner) { return inner->dropTagKeysAtOutput(port, prefix, drops); });
+    }
+
+public:
     [[nodiscard]] virtual UICategory uiCategory() const { return UICategory::None; }
 
     // port and sample information
@@ -628,7 +650,6 @@ constexpr auto BLOCK_UNIQUE_NAME      = "unique_name"sv;
 constexpr auto BLOCK_META_INFORMATION = "meta_information"sv;
 constexpr auto BLOCK_PARAMETERS       = "parameters"sv;
 constexpr auto BLOCK_CATEGORY         = "block_category"sv;
-constexpr auto BLOCK_CTX_PARAMETERS   = "ctx_parameters"sv;
 constexpr auto BLOCK_TAG_COUPLINGS    = "tag_couplings"sv;
 
 constexpr auto BLOCK_INPUT_PORTS  = "input_ports"sv;
@@ -752,6 +773,15 @@ protected:
         }
     }
 
+    // every way of building a block by type (Graph::emplaceBlock, the registry, a plugin's factory) passes here: a block that
+    // cannot take its settings stops the build with the line to add, not with an unmatched call deep in the registry
+    static T fromSettings(gr::property_map&& settings) {
+        static_assert(std::is_constructible_v<T, gr::property_map>, "add 'using gr::Block<Name<T>>::Block;' inside this block (needed when a block has private members or its own constructor)");
+        if constexpr (std::is_constructible_v<T, gr::property_map>) {
+            return T(std::move(settings));
+        }
+    }
+
     static void blockWrapperDynamicPortsLoader(BlockModel* base) {
         auto* wrapper = static_cast<BlockWrapper*>(base);
         wrapper->dynamicPortsLoader();
@@ -759,8 +789,8 @@ protected:
 
 public:
     explicit BlockWrapper(gr::property_map initParameter = {})
-    requires(kOwning && std::is_constructible_v<T, property_map>)
-        : BlockModel(gr::meta::type_name<T>()), _block(std::move(initParameter)) {
+    requires kOwning
+        : BlockModel(gr::meta::type_name<T>()), _block(fromSettings(std::move(initParameter))) {
         initMessagePorts();
         _dynamicPortsLoader.fn       = &BlockWrapper::blockWrapperDynamicPortsLoader;
         _dynamicPortsLoader.instance = this;
@@ -794,14 +824,6 @@ public:
         }
     }
 
-    [[nodiscard]] std::optional<Error> initError() const override {
-        if constexpr (requires { blockRef()._initError; }) {
-            return blockRef()._initError;
-        } else {
-            return {};
-        }
-    }
-
     [[nodiscard]] constexpr const auto& blockRef() const noexcept {
         if constexpr (requires { *_block; }) {
             return *_block;
@@ -818,7 +840,20 @@ public:
         }
     }
 
-    [[nodiscard]] constexpr work::Result work(std::size_t requested_work = undefined_size) override { return blockRef().work(requested_work); }
+    // a block that defines its own `work()` runs none of the work function `gr::Block` provides, whose end copies the
+    // block's `Status` while a host wants it; the call here holds the same scope for it
+    [[nodiscard]] constexpr work::Result work(std::size_t requested_work = undefined_size) override {
+        if constexpr (requires {
+                          &T::work;
+                          settings::detail::settingsOf(blockRef());
+                      }) {
+            if constexpr (settings::detail::holdsStatusStruct<T>()) {
+                [[maybe_unused]] const settings::detail::StatusCopyAfterWork statusCopy(settings::detail::settingsOf(blockRef()));
+                return blockRef().work(requested_work);
+            }
+        }
+        return blockRef().work(requested_work);
+    }
 
     void requestFinish(std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) override {
         if constexpr (requires { blockRef().requestFinish(deadline); }) {
@@ -859,6 +894,34 @@ public:
 
     void processScheduledMessages() override { return blockRef().processScheduledMessages(); }
 
+private:
+    bool dropTagKeysAtOutput(const DynamicPort& port, std::string_view prefix, bool drops) override {
+        using TBlock = std::remove_cvref_t<decltype(blockRef())>;
+        bool held    = false;
+        if constexpr (TBlock::blockCategory == block::Category::NormalBlock) {
+            const auto mark = [&held, &port, prefix, drops](auto& candidate) {
+                if (held || DynamicPort(candidate, DynamicPort::non_owned_reference_tag{}) != port) {
+                    return;
+                }
+                held = true;
+                std::erase(candidate.droppedTagKeyPrefixes, prefix);
+                if (drops) {
+                    candidate.droppedTagKeyPrefixes.emplace_back(prefix);
+                }
+            };
+            auto visit = [this, &mark]<gr::detail::PortDescription CurrentPortType>(int, auto, CurrentPortType*) {
+                if constexpr (CurrentPortType::kIsDynamicCollection || CurrentPortType::kIsStaticCollection) {
+                    std::ranges::for_each(CurrentPortType::getPortObject(blockRef()), mark);
+                } else {
+                    mark(CurrentPortType::getPortObject(blockRef()));
+                }
+            };
+            traits::block::all_output_ports<TBlock>::for_each(visit, 0);
+        }
+        return held || BlockModel::dropTagKeysAtOutput(port, prefix, drops);
+    }
+
+public:
     // For blocks that contain nested blocks (Graphs, Schedulers)
     [[nodiscard]] std::span<std::shared_ptr<BlockModel>> blocks() noexcept override {
         if constexpr (requires { blockRef().blocks(); }) {
@@ -904,8 +967,8 @@ public:
     [[nodiscard]] property_map&              uiConstraints() noexcept override { return blockRef().ui_constraints; }
     [[nodiscard]] const property_map&        uiConstraints() const override { return blockRef().ui_constraints; }
     [[nodiscard]] std::string_view           uniqueName() const override { return blockRef().unique_name; }
-    [[nodiscard]] SettingsBase&              settings() override { return blockRef().settings(); }
-    [[nodiscard]] const SettingsBase&        settings() const override { return blockRef().settings(); }
+    [[nodiscard]] SettingsBase&              settings() override { return settings::detail::settingsOf(blockRef()); }
+    [[nodiscard]] const SettingsBase&        settings() const override { return settings::detail::settingsOf(blockRef()); }
     [[nodiscard]] void*                      raw() override { return std::addressof(blockRef()); }
 };
 

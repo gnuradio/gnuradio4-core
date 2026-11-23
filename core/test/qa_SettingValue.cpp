@@ -94,5 +94,6 @@ const boost::ut::suite<"setting value"> _settingValue = [] {
         expect(eq(gr::settings::kPendingNotRunning, std::string_view("not running")));
         expect(eq(gr::settings::kPendingTimeout, std::string_view("timeout")));
         expect(eq(gr::settings::kPendingOnWorker, std::string_view("applies at the block's next work call")));
+        expect(eq(gr::settings::kPendingNextStart, std::string_view("applies at the scheduler's next start")));
     };
 };

@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -96,6 +97,17 @@ GNURADIO_EXPORT const void*& applyingScheduler() noexcept;
 GNURADIO_EXPORT const void*& exchangingScheduler() noexcept;
 
 } // namespace gr::scheduler
+
+namespace gr::settings::detail {
+struct OwnThread;
+
+// the innermost mark of the blocks whose work function, hooks, `init()` or apply this thread runs, or none
+GNURADIO_EXPORT const OwnThread*& ownThreadMarks() noexcept;
+
+// the lock that the default reader of settings notifications holds while it prints one line
+GNURADIO_EXPORT std::mutex& notificationPrintLock() noexcept;
+
+} // namespace gr::settings::detail
 
 namespace gr::thread_pool {
 class Manager;

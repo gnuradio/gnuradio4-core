@@ -13,6 +13,8 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <ranges>
+#include <source_location>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -20,6 +22,8 @@
 #include <variant>
 #include <vector>
 
+#include <gnuradio-4.0/Exception.hpp>
+#include <gnuradio-4.0/Export.hpp>
 #include <gnuradio-4.0/Tag.hpp>
 #include <gnuradio-4.0/Tensor.hpp>
 #include <gnuradio-4.0/Value.hpp>
@@ -57,11 +61,33 @@ using Rejected = std::vector<Rejection>;
     return text;
 }
 
-// the causes of a call's pending value; where several apply, the first is given. A call on a scheduler's worker thread
-// never waits, since the wait could hold the thread that runs the block's work call. A read's pending value gives none
+// the refusal of settings where no result carries one: a constructor's, or the loader's while it builds a graph. The
+// message names the refused entries, which `rejected` holds, and `block` names the block or scheduler that refused
+// them. Its destructor is defined in gnuradio-shared-state, as that of gr::exception, so that a catch in one shared
+// object recognizes the type thrown in another
+struct GNURADIO_EXPORT RefusedSettings : gr::exception {
+    Rejected    rejected;
+    std::string block;                        // empty when the thrower names no block
+    bool        underNestedScheduler = false; // set by the level of a nested scheduler: no outer level prefixes `block`
+
+    RefusedSettings(std::string_view msg, Rejected entries, std::string_view blockName = {}, std::source_location location = std::source_location::current()) : gr::exception(msg, location), rejected(std::move(entries)), block(blockName) {}
+    RefusedSettings(const RefusedSettings&)            = default;
+    RefusedSettings(RefusedSettings&&)                 = default;
+    RefusedSettings& operator=(const RefusedSettings&) = default;
+    RefusedSettings& operator=(RefusedSettings&&)      = default;
+    ~RefusedSettings() override;
+};
+
+// the causes of a call's pending value; where several apply, the first is given. A `noWait` call, or one on a scheduler's
+// worker thread, waits for no apply, since the apply may need that thread. It names the work call, or the queue when
+// another thread held the block's settings; the next set, read, save, start or apply, or a tag the block reads, checks
+// the queued keys. A set() on a running scheduler returns each of its keys pending for its next start and waits for no
+// apply. A read's pending value gives no cause
 inline constexpr std::string_view kPendingNotRunning = "not running";
 inline constexpr std::string_view kPendingOnWorker   = "applies at the block's next work call";
+inline constexpr std::string_view kPendingQueued     = "queued while the block's settings are busy";
 inline constexpr std::string_view kPendingTimeout    = "timeout";
+inline constexpr std::string_view kPendingNextStart  = "applies at the scheduler's next start";
 
 // a call's timeout: `noWait` and any negative duration do not wait, and no timeout given waits the scheduler's
 // default, else `kDefaultTimeout`
@@ -78,6 +104,21 @@ inline constexpr bool kIsComplex<std::complex<T>> = true;
 
 template<typename T>
 concept SettingScalar = std::same_as<T, bool> || std::integral<T> || std::floating_point<T> || kIsComplex<T>;
+
+// two values are the same when equal or both not-a-number, part by part for a complex number and element by element
+// for a list of numbers
+template<typename T>
+[[nodiscard]] constexpr bool sameNumber(const T& left, const T& right) {
+    if constexpr (std::floating_point<T>) {
+        return left == right || (std::isnan(left) && std::isnan(right));
+    } else if constexpr (kIsComplex<T>) {
+        return sameNumber(left.real(), right.real()) && sameNumber(left.imag(), right.imag());
+    } else if constexpr (requires { requires std::floating_point<std::ranges::range_value_t<T>> || kIsComplex<std::ranges::range_value_t<T>>; }) {
+        return std::ranges::equal(left, right, [](const auto& one, const auto& two) { return sameNumber(one, two); });
+    } else {
+        return left == right;
+    }
+}
 
 // the reason `nearestNumber` gives for a number outside T, which the settings word with T's name
 inline constexpr std::string_view kOutsideType = "out of range for the type";

@@ -97,7 +97,7 @@ svg.flowgraph .arrow { fill: var(--accent); }
 <tbody>
 <tr><td>source<br>(source_1)</td><td>qa::RampSource</td><td>n_samples: 4096<br>name: &quot;source&quot;</td><td></td></tr>
 <tr><td>front_end</td><td>SUBGRAPH<br>(subgraph)</td><td></td><td></td></tr>
-<tr><td>sink</td><td>qa::RecordingSink</td><td>name: &quot;sink&quot;<br>[context fast @ 0] buffer_size: 512</td><td>role: &quot;terminal&quot;</td></tr>
+<tr><td>sink</td><td>qa::RecordingSink</td><td>name: &quot;sink&quot;</td><td>role: &quot;terminal&quot;</td></tr>
 </tbody>
 </table>
 </div>

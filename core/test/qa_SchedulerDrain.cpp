@@ -454,9 +454,14 @@ struct TailDecimator : gr::Block<TailDecimator, gr::Resampling<kDecimation, 1U, 
 struct ChunkDecimator : gr::Block<ChunkDecimator, gr::Resampling<kDecimation, 1U>> {
     gr::PortIn<int>  in;
     gr::PortOut<int> out;
-    bool             stop_now = false;
 
-    GR_MAKE_REFLECTABLE(ChunkDecimator, in, out, stop_now);
+    struct Settings {
+        bool stop_now = false;
+
+        GR_MAKE_REFLECTABLE(Settings, stop_now);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(ChunkDecimator, in, out, settings);
 
     gr::work::Status processBulk(gr::InputSpanLike auto& inSpan, gr::OutputSpanLike auto& outSpan) {
         const std::size_t chunk = static_cast<std::size_t>(this->input_chunk_size);
@@ -466,8 +471,8 @@ struct ChunkDecimator : gr::Block<ChunkDecimator, gr::Resampling<kDecimation, 1U
         return gr::work::Status::OK;
     }
 
-    void settingsChanged(const gr::property_map& /*oldSettings*/, const gr::property_map& /*newSettings*/) {
-        if (stop_now) {
+    void applySettings(const Settings& s) {
+        if (s.stop_now) {
             this->requestStop();
         }
     }
@@ -670,17 +675,22 @@ struct FirstSampleRelay : gr::Block<FirstSampleRelay> {
 struct TailInterpolator : gr::Block<TailInterpolator, gr::Resampling<1U, kInterpolation, true>> {
     gr::PortIn<int>  in;
     gr::PortOut<int> out;
-    bool             stop_now = false;
 
-    GR_MAKE_REFLECTABLE(TailInterpolator, in, out, stop_now);
+    struct Settings {
+        bool stop_now = false;
 
-    bool        _wholeTailOnly   = false;
-    std::size_t _epilogueTail    = 0UZ; // the input samples the epilogue was handed
-    std::size_t _epilogueSpan    = 0UZ; // the output span the epilogue was handed
-    std::size_t _epilogueWritten = 0UZ;
+        GR_MAKE_REFLECTABLE(Settings, stop_now);
+    } settings;
 
-    void settingsChanged(const gr::property_map& /*oldSettings*/, const gr::property_map& /*newSettings*/) {
-        if (stop_now) {
+    GR_MAKE_REFLECTABLE(TailInterpolator, in, out, settings);
+
+    bool        wholeTailOnly   = false;
+    std::size_t epilogueTail    = 0UZ; // the input samples the epilogue was handed
+    std::size_t epilogueSpan    = 0UZ; // the output span the epilogue was handed
+    std::size_t epilogueWritten = 0UZ;
+
+    void applySettings(const Settings& s) {
+        if (s.stop_now) {
             this->requestStop();
         }
     }
@@ -695,10 +705,10 @@ struct TailInterpolator : gr::Block<TailInterpolator, gr::Resampling<1U, kInterp
     }
 
     gr::work::Status processEpilogue(gr::InputSpanLike auto& inSpan, gr::OutputSpanLike auto& outSpan) {
-        _epilogueTail = inSpan.size();
-        _epilogueSpan = outSpan.size();
+        epilogueTail  = inSpan.size();
+        epilogueSpan  = outSpan.size();
         std::size_t n = std::min(inSpan.size(), outSpan.size() / kInterpolation);
-        if (_wholeTailOnly && n < inSpan.size()) {
+        if (wholeTailOnly && n < inSpan.size()) {
             n = 0UZ;
         }
         for (std::size_t i = 0UZ; i < n; ++i) {
@@ -707,7 +717,7 @@ struct TailInterpolator : gr::Block<TailInterpolator, gr::Resampling<1U, kInterp
             }
         }
         outSpan.publish(n * kInterpolation);
-        _epilogueWritten = n * kInterpolation;
+        epilogueWritten = n * kInterpolation;
         return gr::work::Status::OK;
     }
 };
@@ -758,16 +768,21 @@ struct TwoOutputTail : gr::Block<TwoOutputTail> {
     gr::PortIn<int>  in;
     gr::PortOut<int> first;
     gr::PortOut<int> second;
-    bool             stop_now = false;
 
-    GR_MAKE_REFLECTABLE(TwoOutputTail, in, first, second, stop_now);
+    struct Settings {
+        bool stop_now = false;
 
-    bool        _epilogueRan = false;
-    std::size_t _firstSpan   = 0UZ; // the output spans the epilogue was handed
-    std::size_t _secondSpan  = 0UZ;
+        GR_MAKE_REFLECTABLE(Settings, stop_now);
+    } settings;
 
-    void settingsChanged(const gr::property_map& /*oldSettings*/, const gr::property_map& /*newSettings*/) {
-        if (stop_now) {
+    GR_MAKE_REFLECTABLE(TwoOutputTail, in, first, second, settings);
+
+    bool        epilogueRan  = false;
+    std::size_t firstHanded  = 0UZ; // the output spans the epilogue was handed
+    std::size_t secondHanded = 0UZ;
+
+    void applySettings(const Settings& s) {
+        if (s.stop_now) {
             this->requestStop();
         }
     }
@@ -779,9 +794,9 @@ struct TwoOutputTail : gr::Block<TwoOutputTail> {
     }
 
     gr::work::Status processEpilogue(gr::InputSpanLike auto& inSpan, gr::OutputSpanLike auto& firstSpan, gr::OutputSpanLike auto& secondSpan) {
-        _epilogueRan        = true;
-        _firstSpan          = firstSpan.size();
-        _secondSpan         = secondSpan.size();
+        epilogueRan         = true;
+        firstHanded         = firstSpan.size();
+        secondHanded        = secondSpan.size();
         const std::size_t n = std::min({inSpan.size(), firstSpan.size(), secondSpan.size()});
         std::copy_n(inSpan.begin(), n, firstSpan.begin());
         std::copy_n(inSpan.begin(), n, secondSpan.begin());
@@ -972,7 +987,7 @@ void expectEpilogueWaitEndsUnderScheduler() {
 
     TScheduler scheduler;
     // a worker parked once per waiting call would take longer than the bound
-    const std::size_t parkedWaitMs = std::size_t{scheduler.timeout_ms.value} * kDrainStallCalls;
+    const std::size_t parkedWaitMs = std::size_t{scheduler.settings.timeout_ms.value} * kDrainStallCalls;
     const std::size_t boundMs      = static_cast<std::size_t>(std::chrono::duration_cast<std::chrono::milliseconds>(kRunBound).count());
     expect(fatal(gt(parkedWaitMs, boundMs)));
     expect(scheduler.exchange(std::move(flow)).has_value());
@@ -1326,22 +1341,23 @@ const boost::ut::suite<"end-of-stream drain"> drainTests = [] {
         qa_drain::publishSamples(upstream, nTail);
         qa_drain::publishSamples(block.out, held);
 
-        std::ignore                   = block.settings().setStaged({{"stop_now", true}});
+        std::ignore                   = block.changeStateTo(gr::lifecycle::State::RUNNING); // the work call applies the change
+        std::ignore                   = block.set({{"stop_now", true}}, gr::settings::noWait);
         const gr::work::Result result = block.work();
 
         expect(result.status == gr::work::Status::DONE);
         expect(block.state() == STOPPED);
-        expect(eq(block._epilogueTail, nTail));
-        expect(eq(block._epilogueSpan, room)) << "the epilogue was not handed the room its output has";
-        expect(eq(block._epilogueWritten, room - room % qa_drain::kInterpolation));
-        expect(eq(downstream.streamReader().available(), held + block._epilogueWritten)) << "the output does not hold what the epilogue wrote";
+        expect(eq(block.epilogueTail, nTail));
+        expect(eq(block.epilogueSpan, room)) << "the epilogue was not handed the room its output has";
+        expect(eq(block.epilogueWritten, room - room % qa_drain::kInterpolation));
+        expect(eq(downstream.streamReader().available(), held + block.epilogueWritten)) << "the output does not hold what the epilogue wrote";
     };
 
     "a block that writes nothing into a short span on a stop request ends its stream"_test = [] {
         gr::PortOut<int>           upstream;
         gr::PortIn<int>            downstream;
         qa_drain::TailInterpolator block;
-        block._wholeTailOnly    = true;
+        block.wholeTailOnly     = true;
         const std::size_t ring  = qa_drain::connectBetween(block, upstream, downstream);
         const std::size_t nTail = ring / 2UZ;
         const std::size_t room  = ring / 4UZ;
@@ -1350,13 +1366,14 @@ const boost::ut::suite<"end-of-stream drain"> drainTests = [] {
         qa_drain::publishSamples(upstream, nTail);
         qa_drain::publishSamples(block.out, held);
 
-        std::ignore                   = block.settings().setStaged({{"stop_now", true}});
+        std::ignore                   = block.changeStateTo(gr::lifecycle::State::RUNNING); // the work call applies the change
+        std::ignore                   = block.set({{"stop_now", true}}, gr::settings::noWait);
         const gr::work::Result result = block.work();
 
         expect(result.status == gr::work::Status::DONE);
         expect(block.state() == STOPPED);
-        expect(eq(block._epilogueSpan, room)) << "the epilogue was not handed the room its output has";
-        expect(eq(block._epilogueWritten, 0UZ));
+        expect(eq(block.epilogueSpan, room)) << "the epilogue was not handed the room its output has";
+        expect(eq(block.epilogueWritten, 0UZ));
         expect(eq(downstream.streamReader().available(), held)) << "the output holds samples the epilogue did not write";
         expect(qa_drain::endOfStreamIndex(downstream) == std::optional<std::size_t>(held)) << "the end of the stream does not follow the last sample written";
     };
@@ -1376,8 +1393,8 @@ const boost::ut::suite<"end-of-stream drain"> drainTests = [] {
         const gr::work::Result result = block.work();
 
         expect(result.status == gr::work::Status::DONE) << "the block waits for room its output can never have";
-        expect(eq(block._epilogueTail, nTail));
-        expect(eq(block._epilogueSpan, ring)) << "the epilogue was not handed the whole ring";
+        expect(eq(block.epilogueTail, nTail));
+        expect(eq(block.epilogueSpan, ring)) << "the epilogue was not handed the whole ring";
         expect(eq(downstream.streamReader().available(), ring - ring % qa_drain::kInterpolation)) << "the output does not hold what the epilogue wrote";
     };
 
@@ -1414,7 +1431,7 @@ const boost::ut::suite<"end-of-stream drain"> drainTests = [] {
         }
         expect(ended) << "the epilogue waits for room the downstream block never makes";
         expect(gt(nCalls, qa_drain::kDrainStallCalls)) << "the epilogue did not wait for the outputs to drain";
-        expect(eq(interpolator._epilogueSpan, ring - heldBack)) << "the epilogue was not handed the room the output has";
+        expect(eq(interpolator.epilogueSpan, ring - heldBack)) << "the epilogue was not handed the room the output has";
         std::ignore = decimator.work();
         expect(decimator.state() == STOPPED) << "the end of the stream did not reach the downstream block";
     };
@@ -1479,14 +1496,15 @@ const boost::ut::suite<"end-of-stream drain"> drainTests = [] {
 
         const gr::work::Result waited = block.work();
         expect(waited.status == gr::work::Status::INSUFFICIENT_OUTPUT_ITEMS) << "the epilogue did not wait for room in the fuller output";
-        expect(!block._epilogueRan);
+        expect(!block.epilogueRan);
         expect(eq(block.in.streamReader().available(), nTail)) << "the waiting epilogue consumed its tail";
 
-        std::ignore                   = block.settings().setStaged({{"stop_now", true}});
+        std::ignore                   = block.changeStateTo(gr::lifecycle::State::RUNNING); // the work call applies the change
+        std::ignore                   = block.set({{"stop_now", true}}, gr::settings::noWait);
         const gr::work::Result result = block.work();
         expect(result.status == gr::work::Status::DONE);
-        expect(eq(block._firstSpan, room)) << "the fuller output's span is not its room";
-        expect(eq(block._secondSpan, room)) << "the emptier output's span is not the fuller one's room";
+        expect(eq(block.firstHanded, room)) << "the fuller output's span is not its room";
+        expect(eq(block.secondHanded, room)) << "the emptier output's span is not the fuller one's room";
         expect(eq(secondDownstream.streamReader().available(), room));
     };
 
@@ -1920,7 +1938,7 @@ const boost::ut::suite<"end-of-stream drain"> drainTests = [] {
             qa_drain::publishSamples(upstream, qa_drain::kTail);
             upstream.publishEoSTag(gr::property_map{{gr::tag::END_OF_STREAM.key(), true}});
 
-            std::ignore                   = block.settings().setStaged({{"stop_now", stopNow}});
+            std::ignore                   = block.set({{"stop_now", stopNow}}, gr::settings::noWait);
             const gr::work::Result result = block.work();
 
             expect(result.status == gr::work::Status::DONE);

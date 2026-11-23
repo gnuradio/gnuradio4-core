@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <functional>
 #include <limits>
 #include <map>
 #include <print>
@@ -518,24 +519,31 @@ struct isBlockDependent {
 
 namespace block::property {
 // [[maybe_unused]]: names referenced only from Block.cpp (initStandardPropertyCallbacks) and user code — silences -Werror=unused-variable on TUs that include only the header.
-[[maybe_unused]] inline const char* const        kHeartbeat      = "Heartbeat";      ///< heartbeat property - the canary in the coal mine (supports block-specific subscribe/unsubscribe)
-[[maybe_unused]] inline static const char* const kEcho           = "Echo";           ///< basic property that receives any matching message and sends a mirror with it's serviceName/unique_name
-[[maybe_unused]] inline static const char* const kLifeCycleState = "LifecycleState"; ///< basic property that sets the block's @see lifecycle::StateMachine
-[[maybe_unused]] inline const char* const        kSetting        = "Settings";       ///< asynchronous message-based setting handling,
-                                                                                     // N.B. 'Set' Settings are first staged before being applied within the work(...) function (real-time/non-real-time decoupling)
-[[maybe_unused]] inline const char* const kStagedSetting = "StagedSettings";         ///< asynchronous message-based staging of settings
-
+[[maybe_unused]] inline const char* const        kHeartbeat      = "Heartbeat";        ///< heartbeat property - the canary in the coal mine (supports block-specific subscribe/unsubscribe)
+[[maybe_unused]] inline static const char* const kEcho           = "Echo";             ///< basic property that receives any matching message and sends a mirror with it's serviceName/unique_name
+[[maybe_unused]] inline static const char* const kLifeCycleState = "LifecycleState";   ///< basic property that sets the block's @see lifecycle::StateMachine
+[[maybe_unused]] inline const char* const        kSetting        = "Settings";         ///< asynchronous message-based setting handling,
+                                                                                       // N.B. 'Set' Settings are first staged before being applied within the work(...) function (real-time/non-real-time decoupling)
+[[maybe_unused]] inline const char* const        kStagedSetting   = "StagedSettings";  ///< a Set stages its settings as on kSetting, a Get returns the changes waiting to apply
 [[maybe_unused]] inline static const char* const kMetaInformation = "MetaInformation"; ///< asynchronous message-based retrieval of the static meta-information (i.e. Annotated<> interfaces, constraints, etc...)
 [[maybe_unused]] inline static const char* const kUiConstraints   = "UiConstraints";   ///< asynchronous message-based retrieval of user-defined UI constraints
+[[maybe_unused]] inline static const char* const kStoreDefaults   = "StoreDefaults";   ///< a Set makes the values in force the ones a reset returns to
+[[maybe_unused]] inline static const char* const kResetDefaults   = "ResetDefaults";   ///< a Set stages a reset to the defaults
+[[maybe_unused]] inline const char* const        kTagCouplings    = "TagCouplings";    ///< read or change the settings coupled to tag keys, @see SettingsBase::setTagCouplings
 
-[[maybe_unused]] inline static const char* const kStoreDefaults    = "StoreDefaults";    ///< store present settings as default, for counterpart @see kResetDefaults
-[[maybe_unused]] inline static const char* const kResetDefaults    = "ResetDefaults";    ///< retrieve and reset to default setting, for counterpart @see kStoreDefaults
-[[maybe_unused]] inline static const char* const kActiveContext    = "ActiveContext";    ///< retrieve and set active context
-[[maybe_unused]] inline const char* const        kSettingsCtx      = "SettingsCtx";      ///< retrieve/creates/remove a new stored context
-[[maybe_unused]] inline const char* const        kSettingsContexts = "SettingsContexts"; ///< retrieve/creates/remove a new stored context
-[[maybe_unused]] inline const char* const        kTagCouplings     = "TagCouplings";     ///< read or change the settings coupled to tag keys, @see SettingsBase::setTagCouplings
+[[maybe_unused]] inline const char* const kSettingsNotification = "SettingsNotification"; ///< the top scheduler's notifications of its blocks' settings, one per message
 
 } // namespace block::property
+
+namespace settings::detail {
+struct BlockAccess;
+
+// the failed instantiation names the member
+template<gr::meta::fixed_string kMemberName, bool kHidesCall>
+consteval void refuseSettingsCallName() {
+    static_assert(!kHidesCall, "a block's member takes the name of one of the block's settings calls, which are reserved: rename it");
+}
+} // namespace settings::detail
 
 /**
  * @brief Non-templated base providing accessor function pointers for the 12 standard propertyCallback implementations.
@@ -560,35 +568,23 @@ struct BlockBase {
     std::expected<void, Error> (*_cbChangeStateTo)(void*, lifecycle::State) = nullptr;
     std::string_view (*_cbUniqueName)(const void*)                          = nullptr;
     std::string_view (*_cbName)(const void*)                                = nullptr;
-    property_map& (*_cbMetaInformation)(void*)                              = nullptr;
-    property_map& (*_cbUiConstraints)(void*)                                = nullptr;
     const MsgPortInBuiltin& (*_cbMsgIn)(const void*)                        = nullptr;
     MsgPortOutBuiltin& (*_cbMsgOut)(void*)                                  = nullptr;
-
-    // the error that kept init() from completing, if any: init() has no return value and a block's message
-    // port has no subscriber while the graph is built, so the error waits here for the scheduler to read it
-    std::optional<Error> _initError;
+    const property_map& (*_cbMetaInformation)(const void*)                  = nullptr;
 
     // Hook for GraphWrapper to handle subgraph export port messages on any block type
     using SubgraphExportHandler                  = std::optional<Message> (*)(void* context, Message);
     SubgraphExportHandler _subgraphExportHandler = nullptr;
     void*                 _subgraphExportContext = nullptr;
 
-    // Hook for GraphWrapper to intercept staged settings on a recipe composite: exported
-    // parameter changes re-evaluate the recipe's expressions before the remainder reaches the
-    // wrapped block's own staged-settings handler
-    using RecipeParameterHandler                   = std::optional<Message> (*)(void* context, Message);
-    RecipeParameterHandler _recipeParameterHandler = nullptr;
-    void*                  _recipeParameterContext = nullptr;
-
-    std::map<std::string, PropertyCallback>      propertyCallbacks;
-    std::map<std::string, std::set<std::string>> propertySubscriptions;
+    std::map<std::string, PropertyCallback>                   propertyCallbacks;
+    std::map<std::string, std::set<std::string>, std::less<>> propertySubscriptions; // the clients each endpoint of this block notifies
 
     // replies that found msgOut full, oldest first. They are sent before any newer reply. They are at most as many as
     // msgOut holds.
     std::vector<Message> _unsentReplies;
 
-    // out-of-line so the 12-entry map literal is compiled once, not per Block<T>::Block body.
+    // out of line, so the map literal is compiled once, not per Block<T>::Block body
     void initStandardPropertyCallbacks() noexcept;
 
     // accessor helpers (delegate to function pointers, using _blockSelf for correct Block* address)
@@ -597,10 +593,9 @@ struct BlockBase {
     std::expected<void, Error> cbChangeStateTo(lifecycle::State s) { return _cbChangeStateTo(_blockSelf, s); }
     std::string_view           cbUniqueName() const { return _cbUniqueName(_blockSelf); }
     std::string_view           cbName() const { return _cbName(_blockSelf); }
-    property_map&              cbMetaInformation() { return _cbMetaInformation(_blockSelf); }
-    property_map&              cbUiConstraints() { return _cbUiConstraints(_blockSelf); }
     const MsgPortInBuiltin&    cbMsgIn() const { return _cbMsgIn(_blockSelf); }
     MsgPortOutBuiltin&         cbMsgOut() { return _cbMsgOut(_blockSelf); }
+    const property_map&        cbMetaInformation() const { return _cbMetaInformation(_blockSelf); }
 
     /**
      * Message plumbing, compiled once rather than stamped per block type.
@@ -623,7 +618,7 @@ struct BlockBase {
     // sends the kept replies that fit in msgOut, oldest first
     void sendUnsentReplies();
 
-    // 12 callback implementations (compiled once, not per block type)
+    // the property callbacks, compiled once, not per block type
     std::optional<Message> propertyCallbackHeartbeat(std::string_view propertyName, Message message);
     std::optional<Message> propertyCallbackEcho(std::string_view propertyName, Message message);
     std::optional<Message> propertyCallbackLifecycleState(std::string_view propertyName, Message message);
@@ -631,14 +626,10 @@ struct BlockBase {
     std::optional<Message> propertyCallbackStagedSettings(std::string_view propertyName, Message message);
     std::optional<Message> propertyCallbackStoreDefaults(std::string_view propertyName, Message message);
     std::optional<Message> propertyCallbackResetDefaults(std::string_view propertyName, Message message);
-    std::optional<Message> propertyCallbackActiveContext(std::string_view propertyName, Message message);
-    std::optional<Message> propertyCallbackSettingsCtx(std::string_view propertyName, Message message);
-    std::optional<Message> propertyCallbackSettingsContexts(std::string_view propertyName, Message message);
     std::optional<Message> propertyCallbackTagCouplings(std::string_view propertyName, Message message);
     std::optional<Message> propertyCallbackMetaInformation(std::string_view propertyName, Message message);
     std::optional<Message> propertyCallbackUiConstraints(std::string_view propertyName, Message message);
     std::optional<Message> propertyCallbackSubgraphExport(std::string_view propertyName, Message message);
-    std::optional<Message> propertyCallbackRecipeStagedSettings(std::string_view propertyName, Message message);
 };
 
 namespace block {
@@ -729,12 +720,11 @@ enum class Category {
  * - `kHeartbeat`: Monitors and reports the block's operational state.
  * - `kEcho`: Responds to messages by echoing them back, aiding in communication testing.
  * - `kLifeCycleState`: Manages and reports the block's lifecycle state.
- * - `kSetting` & `kStagedSetting`: Handle real-time and non-real-time configuration adjustments.
- * - `kStoreDefaults` & `kResetDefaults`: Facilitate storing and reverting to default settings.
- * - `kActiveContext`: Returns current active context and allows to set a new one
- * - `kSettingsCtx`: Manages Settings Contexts Add/Remove/Get
- * - `kSettingsContexts`: Returns all Contextxs
- * - `kTagCouplings`: Get returns the settings coupled to tag keys; Set changes them, an empty key removing a coupling
+ * - `kSetting`: a `Set` stages the settings it carries and gets no reply; a refused key goes out as a notification. A
+ *   subscriber is sent the block's settings after each work call that applied a change. A `Get` returns them.
+ * - `kStagedSetting`: a `Set` stages as on `kSetting`, a refusal being its error reply; a `Get` returns the changes waiting.
+ * - `kStoreDefaults` & `kResetDefaults`: a `Set` makes the values in force the defaults, or stages a reset to them.
+ * - `kTagCouplings`: a `Get` returns the settings coupled to tag keys; a `Set` changes them, an empty key removing one.
  * - `kMetaInformation`: returns static meta-information (i.e. Annotated<> interfaces, constraints, etc...) (N.B. does not affect Block operation)
  * - `kUiConstraints`: returns user-defined UI constraints (N.B. does not affect Block operation)
  *
@@ -777,8 +767,8 @@ enum class Category {
  */
 template<typename Derived, typename... Arguments>
 class Block : public lifecycle::StateMachine<Derived>, public BlockBase {
-    template<typename T, gr::meta::fixed_string description = "", typename... Args>
-    using A = Annotated<T, description, Args...>;
+    template<typename T, typename... Args>
+    using A = Annotated<T, Args...>;
 
 public:
     using base_t                     = Block<Derived, Arguments...>;
@@ -829,15 +819,15 @@ public:
     alignas(kCacheLine) std::shared_ptr<gr::Sequence> progress = std::make_shared<gr::Sequence>();
 
     using ResamplingValue = std::conditional_t<ResamplingControl::kIsConst, const gr::Size_t, gr::Size_t>;
-    using ResamplingLimit = Limits<1UL, std::numeric_limits<ResamplingValue>::max()>;
+    using ResamplingLimit = Limits<Min<gr::Size_t{1U}>>;
     using ResamplingDoc   = Doc<"For each `input_chunk_size` input samples, `output_chunk_size` output samples are published (in>out: Decimate, in<out: Interpolate, in==out: No change)">;
 
-    A<ResamplingValue, "input_chunk_size", ResamplingDoc, ResamplingLimit>  input_chunk_size                                                     = ResamplingControl::kInputChunkSize;
-    A<ResamplingValue, "output_chunk_size", ResamplingDoc, ResamplingLimit> output_chunk_size                                                    = ResamplingControl::kOutputChunkSize;
-    using StrideValue                                                                                                                            = std::conditional_t<StrideControl::kIsConst, const gr::Size_t, gr::Size_t>;
-    A<StrideValue, "stride", Doc<"samples between data processing. <N for overlap, >N for skip, =0 for back-to-back.">>       stride             = StrideControl::kStride;
-    A<bool, "disconnect on done", Doc<"If no downstream blocks, declare itself 'DONE' and disconnect from upstream blocks.">> disconnect_on_done = true;
-    A<std::string, "compute domain", Doc<"compute domain/IO thread pool name">>                                               compute_domain     = gr::thread_pool::kDefaultIoPoolId;
+    A<ResamplingValue, ResamplingDoc, ResamplingLimit> input_chunk_size                                                          = ResamplingControl::kInputChunkSize;
+    A<ResamplingValue, ResamplingDoc, ResamplingLimit> output_chunk_size                                                         = ResamplingControl::kOutputChunkSize;
+    using StrideValue                                                                                                            = std::conditional_t<StrideControl::kIsConst, const gr::Size_t, gr::Size_t>;
+    A<StrideValue, Doc<"samples between data processing. <N for overlap, >N for skip, =0 for back-to-back.">> stride             = StrideControl::kStride;
+    A<bool, Doc<"If no downstream blocks, declare itself 'DONE' and disconnect from upstream blocks.">>       disconnect_on_done = true;
+    A<std::string, Doc<"compute domain/IO thread pool name">>                                                 compute_domain     = gr::thread_pool::kDefaultIoPoolId;
 
     gr::Size_t strideCounter = 0UL; // leftover stride from previous calls
 
@@ -845,7 +835,7 @@ public:
     gr::meta::immutable<std::string> unique_name = std::format("{}#{}", gr::meta::type_name<Derived>(), unique_id);
 
     //
-    A<std::string, "user-defined name", Doc<"N.B. may not be unique -> ::unique_name">> name = gr::meta::type_name<Derived>();
+    A<std::string, Doc<"N.B. may not be unique -> ::unique_name">> name = gr::meta::type_name<Derived>();
     //
     constexpr static std::string_view description = [] {
         if constexpr (requires { typename Derived::Description; }) {
@@ -872,8 +862,8 @@ public:
         return ret;
     }
 
-    A<property_map, "ui-constraints", Doc<"store non-graph-processing information like UI block position etc.">>         ui_constraints;
-    A<property_map, "meta-information", Doc<"store static non-graph-processing information like Annotated<> info etc.">> meta_information = initMetaInfo();
+    A<property_map, Doc<"store non-graph-processing information like UI block position etc.">>       ui_constraints;
+    A<property_map, Doc<"store static non-graph-processing information like Annotated<> info etc.">> meta_information = initMetaInfo();
 
     GR_MAKE_REFLECTABLE(Block, input_chunk_size, output_chunk_size, stride, disconnect_on_done, compute_domain, unique_name, name, ui_constraints);
 
@@ -883,7 +873,7 @@ public:
     MsgPortInBuiltin  msgIn;
     MsgPortOutBuiltin msgOut;
 
-    // PropertyCallback, propertyCallbacks and propertySubscriptions are inherited from BlockBase
+    // PropertyCallback and propertyCallbacks are inherited from BlockBase
 
     std::pmr::memory_resource* _allocResource = std::pmr::get_default_resource(); // pmr resource for internal and derived-block pmr fields
 
@@ -929,8 +919,7 @@ public:
     std::size_t              _stagedPositionSum = std::numeric_limits<std::size_t>::max();
     std::vector<std::size_t> _nStagedTags; // per connected synchronous input, in port order
 
-    // intermediate non-real-time<->real-time setting states
-    CtxSettings<Derived> _settings;
+    settings::BlockSettingsOf<Derived> _settings;
 
     [[nodiscard]] constexpr auto&       self() noexcept { return *static_cast<Derived*>(this); }
     [[nodiscard]] constexpr const auto& self() const noexcept { return *static_cast<const Derived*>(this); }
@@ -941,10 +930,9 @@ protected: // BlockBase function-pointer plumbing — not part of the user API
     static std::expected<void, Error> cbChangeStateToImpl(void* self, lifecycle::State s) { return static_cast<Block*>(self)->changeStateTo(s); }
     static std::string_view           cbUniqueNameImpl(const void* self) { return static_cast<const Block*>(self)->unique_name; }
     static std::string_view           cbNameImpl(const void* self) { return static_cast<const Block*>(self)->name; }
-    static property_map&              cbMetaInformationImpl(void* self) { return static_cast<Block*>(self)->meta_information.value; }
-    static property_map&              cbUiConstraintsImpl(void* self) { return static_cast<Block*>(self)->ui_constraints.value; }
     static const MsgPortInBuiltin&    cbMsgInImpl(const void* self) { return static_cast<const Block*>(self)->msgIn; }
     static MsgPortOutBuiltin&         cbMsgOutImpl(void* self) { return static_cast<Block*>(self)->msgOut; }
+    static const property_map&        cbMetaInformationImpl(const void* self) { return static_cast<const Block*>(self)->meta_information.value; }
 
 public:
     template<typename TFunction, typename... Args>
@@ -967,10 +955,10 @@ public:
 public:
     Block() : Block(gr::property_map()) {}
     Block(std::initializer_list<std::pair<const std::pmr::string, pmt::Value>> initParameter) noexcept(false) : Block(property_map(initParameter)) {}
-    Block(property_map initParameters) noexcept(false)                                                     // N.B. throws in case of on contract violations
-        : lifecycle::StateMachine<Derived>(),                                                              //
-          inputStreamCache(static_cast<Derived&>(*this)), outputStreamCache(static_cast<Derived&>(*this)), //
-          _settings(CtxSettings<Derived>(*static_cast<Derived*>(this))) {                                  // N.B. safe delegated use of this (i.e. not used during construction)
+    Block(property_map initParameters) noexcept(false)                                                                       // N.B. throws in case of on contract violations
+        : lifecycle::StateMachine<Derived>(),                                                                                //
+          inputStreamCache(static_cast<Derived&>(*this)), outputStreamCache(static_cast<Derived&>(*this)),                   //
+          _settings(*static_cast<Derived*>(this), refl::reflectable<Derived> ? std::move(initParameters) : property_map{}) { // N.B. safe delegated use of this (i.e. not used during construction)
 
         // store the actual Block* address (differs from BlockBase's this due to multiple inheritance)
         _blockSelf = static_cast<void*>(this);
@@ -981,19 +969,15 @@ public:
         _cbChangeStateTo   = &Block::cbChangeStateToImpl;
         _cbUniqueName      = &Block::cbUniqueNameImpl;
         _cbName            = &Block::cbNameImpl;
-        _cbMetaInformation = &Block::cbMetaInformationImpl;
-        _cbUiConstraints   = &Block::cbUiConstraintsImpl;
         _cbMsgIn           = &Block::cbMsgInImpl;
         _cbMsgOut          = &Block::cbMsgOutImpl;
+        _cbMetaInformation = &Block::cbMetaInformationImpl;
 
         initStandardPropertyCallbacks();
 
         // check Block<T> contracts
         checkBlockContracts<decltype(*static_cast<Derived*>(this))>();
-
-        if constexpr (refl::reflectable<Derived>) {
-            settings().setInitBlockParameters(initParameters);
-        }
+        refuseSettingsCallNames();
     }
 
     Block(Block&& other) noexcept
@@ -1009,7 +993,7 @@ public:
           msgIn(std::move(other.msgIn)), msgOut(std::move(other.msgOut)),                                                //
           inputStreamCache(static_cast<Derived&>(*this)), outputStreamCache(static_cast<Derived&>(*this)),               //
           _inProcessOneDispatch{false}, _inputTagPresent{false}, _outputTagPending{false},                               //
-          _settings(CtxSettings<Derived>(*static_cast<Derived*>(this), std::move(other._settings)))                      //
+          _settings(*static_cast<Derived*>(this), std::move(other._settings))                                            //
     {
         _blockSelf       = static_cast<void*>(this);
         other._blockSelf = nullptr;
@@ -1018,6 +1002,8 @@ public:
     Block& operator=(Block&& other) noexcept = delete;
 
     ~Block() { // NOSONAR -- need to request the (potentially) running ioThread to stop
+        // the derived block's members are destroyed, so the stop below compares none of them with the values in force
+        settings::detail::FrameworkAccess::endFields(_settings);
         if (lifecycle::isActive(this->state())) {
             // Only happens in artificial cases likes qa_Block test. In practice blocks stay in zombie list if active
             emitErrorMessageIfAny("~Block()", this->changeStateTo(lifecycle::State::REQUESTED_STOP));
@@ -1052,59 +1038,212 @@ public:
         traits::block::all_input_ports<Derived>::for_each(setPortName);
         traits::block::all_output_ports<Derived>::for_each(setPortName);
 
-        settings().init();
-
-        // apply initial settings — forward params pend until a work call has an output span
-        _initError.reset();
-        try {
-            auto applyResult = settings().applyStagedParameters();
-            if (!applyResult.failedParameters.empty()) {
-                throw gr::exception(applyResult.refusal);
+        // init() throws when the settings refuse or fail a constructed value, and the graph does not take the block;
+        // settings that fail for any other reason leave the block not ready, and the graph takes it
+        if (std::expected<void, settings::Rejected> initialized = settings::detail::FrameworkAccess::init(_settings); !initialized) {
+            // a refused batch leaves the name field as built; the refusal names the block by its constructed name
+            std::string         refusedName = name;
+            const property_map& constructed = settings::detail::FrameworkAccess::constructedWith(_settings);
+            if (const auto it = constructed.find(std::pmr::string("name")); it != constructed.end()) {
+                if (const std::string_view given = it->second.value_or(std::string_view{}); given.data() != nullptr) {
+                    refusedName = given;
+                }
             }
-            if (!applyResult.appliedParameters.empty()) {
-                notifyListeners(block::property::kSetting, settings().get());
-            }
-            if constexpr (!noTagPropagation) {
-                mergeForwardParams(_pendingForwardParams, std::move(applyResult.forwardParameters));
-            }
-        } catch (const gr::exception& e) {
-            _initError = Error{std::format("Block '{}' init() throws: {}", std::string(unique_name), e.message), e.sourceLocation, e.errorTime};
-        } catch (const std::exception& e) {
-            _initError = Error{std::format("Block '{}' init() throws: {}", std::string(unique_name), e.what())};
-        } catch (...) {
-            _initError = Error{std::format("Block '{}' init() throws: {}", std::string(unique_name), "unknown unnamed error")};
-        }
-        if (_initError.has_value()) {
-            // a block that could not apply its settings is not initialized and has no caller to tell, so it
-            // keeps the error for the scheduler to report and enters the error state rather than claiming it
-            emitErrorMessage("init() - applyStagedParameters", *_initError);
-            emitErrorMessageIfAny("init(..) -> ERROR", this->changeStateTo(lifecycle::State::ERROR));
-            return;
+            throw settings::RefusedSettings(std::format("block '{}': {}", refusedName, settings::describeRejected(initialized.error())), initialized.error(), refusedName);
         }
         checkBlockArgumentContracts();
         if constexpr (gr::meta::kDebugBuild) {
             checkBlockParameterConsistency();
         }
-        // store default settings -> can be recovered with 'resetDefaults()'
-        settings().storeDefaults();
         emitErrorMessageIfAny("init(..) -> INITIALISED", this->changeStateTo(lifecycle::State::INITIALISED));
     }
 
     [[nodiscard]] constexpr bool isBlocking() const noexcept { return false; }
 
+private:
+    friend lifecycle::StateMachine<Derived>;
+
+    // the settings follow the lifecycle out of a run; a start or a resume moves them to running at its end, and a
+    // request to stop or to pause leaves them running until the block stops or pauses
+    void followLifecycleState(lifecycle::State newState) {
+        using enum lifecycle::State;
+        using settings::detail::BlockState;
+        copyStatusAtStateChange(newState);
+        if (newState == RUNNING || newState == REQUESTED_STOP || newState == REQUESTED_PAUSE) {
+            if constexpr (Derived::blockCategory == block::Category::ScheduledBlockGroup) {
+                if (newState == RUNNING) { // a scheduler starts until it releases its workers
+                    settings::detail::FrameworkAccess::markStarting(_settings, true);
+                }
+            }
+            return;
+        }
+        settings::detail::FrameworkAccess::moveState(_settings, newState == PAUSED ? BlockState::paused : (newState == ERROR ? BlockState::error : BlockState::stopped));
+    }
+
+    // the scheduler moves a blocking block to a stop, a pause or an error first, while a worker may be inside its work
+    // call: that thread is not the block's own
+    [[nodiscard]] bool movesOnSchedulerThread(lifecycle::State newState) noexcept {
+        using enum lifecycle::State;
+        return (newState == REQUESTED_STOP || newState == REQUESTED_PAUSE || newState == ERROR) && self().isBlocking();
+    }
+
+    // a normal block's lifecycle hooks run on its own thread, and core copies the block's `Status` when each returns.
+    // The scheduler runs a blocking block's stop and pause hooks first, while a worker may be inside its work call, and
+    // they count as another thread there. A hook that the block's own work call runs takes the work call's mark
+    [[nodiscard]] std::optional<settings::detail::LifecycleHook> lifecycleHookScope(lifecycle::State newState) noexcept {
+        if constexpr (Derived::blockCategory != block::Category::NormalBlock) {
+            return std::nullopt;
+        } else {
+            return std::optional<settings::detail::LifecycleHook>(std::in_place, _settings, !movesOnSchedulerThread(newState));
+        }
+    }
+
+    // each change of the lifecycle state copies a normal block's `Status`, whether or not the block has a hook for it: a
+    // host's read after a run finds the values the block left, a block without a stop hook included. A change on the
+    // scheduler's thread, as a hook there, leaves the copy to the block's next work call or message pass
+    void copyStatusAtStateChange(lifecycle::State newState) {
+        if constexpr (Derived::blockCategory == block::Category::NormalBlock && settings::detail::holdsStatusStruct<Derived>()) {
+            if (movesOnSchedulerThread(newState)) {
+                settings::detail::FrameworkAccess::wantStatus(_settings);
+            } else {
+                settings::detail::FrameworkAccess::copyStatus(_settings);
+            }
+        }
+    }
+
+    // a work call of a block that holds `Status` copies it at its end while a host wants it
+    [[nodiscard]] auto statusCopyAfterWork() noexcept {
+        if constexpr (settings::detail::holdsStatusStruct<Derived>()) {
+            return settings::detail::StatusCopyAfterWork(_settings);
+        } else {
+            return nullptr;
+        }
+    }
+
+    // a handler writes the block's `Status` as a work call does, and a message pass in which one ran copies it whether or
+    // not a host read a value before: a handler that runs after the block's last work call, as one does for a block whose
+    // work function returned DONE, reaches a host that reads once. A pass also makes the copy that a change on the
+    // scheduler's thread left wanted. The scheduler's pass at the end of a run reaches every block, and a host's read
+    // after the run finds the values the last hook left. No work call of the block runs meanwhile: the scheduler runs a
+    // block's message pass on the worker that makes its work calls, or while no job runs
+    void copyStatusAfterMessagePass(bool handlerRan) {
+        if constexpr (settings::detail::holdsStatusStruct<Derived>()) {
+            if (handlerRan || settings::detail::FrameworkAccess::statusWanted(_settings)) {
+                settings::detail::FrameworkAccess::copyStatus(_settings);
+            }
+        }
+    }
+
+    // a merged block's members run inside its work call, on its own thread
+    [[nodiscard]] auto memberThreadMarks() noexcept {
+        if constexpr (requires { Derived::kMarkedMembers; }) {
+            return settings::detail::OwnThreads<Derived::kMarkedMembers>(self());
+        } else {
+            return nullptr;
+        }
+    }
+
+    // a start or a resume: the settings held while the block did not run apply on this thread before the start hook,
+    // and a start's whole-state check may refuse it; a start hook that throws leaves the block in ERROR and its stop
+    // hook runs once
+    [[nodiscard]] std::expected<void, Error> runWithSettings(bool isStart, const std::source_location& location) {
+        using settings::detail::FrameworkAccess;
+        if (settings::Rejected refusals = FrameworkAccess::beginRun(_settings, isStart); !refusals.empty()) {
+            FrameworkAccess::endRun(_settings, isStart, true, std::nullopt);
+            return std::unexpected(Error(std::format("block '{}': start refused: {}", unique_name, settings::describeRejected(refusals)), location));
+        }
+        std::expected<void, Error> moved = lifecycle::StateMachine<Derived>::changeStateTo(lifecycle::State::RUNNING, location);
+        if (!moved && isStart && this->state() == lifecycle::State::ERROR) {
+            FrameworkAccess::endRun(_settings, true, false, moved.error().message);
+            if constexpr (requires(Derived& d) { d.stop(); }) {
+                try {
+                    const settings::detail::LifecycleHook ownHook(_settings, true);
+                    self().stop();
+                } catch (const std::exception& thrown) {
+                    emitErrorMessage("stop() after a failed start()", Error(thrown.what(), location));
+                } catch (...) {
+                    emitErrorMessage("stop() after a failed start()", Error("exception in stop()", location));
+                }
+            }
+            return moved;
+        }
+        FrameworkAccess::endRun(_settings, isStart, !moved, std::nullopt);
+        return moved;
+    }
+
+    friend struct settings::detail::BlockAccess;
+
+    template<typename TPointer>
+    static constexpr bool isMemberPointer(TPointer) noexcept {
+        return true;
+    }
+
+    // a member of the derived block named like a settings call hides that call from every holder of the block; the
+    // address of the name has the block's own member type only where the derived block declares no such member
+    template<typename TDerived = Derived>
+    static consteval void refuseSettingsCallNames() {
+        using settings::Rejected;
+        using settings::Timeout;
+        using settings::Values;
+        using settings::detail::refuseSettingsCallName;
+        refuseSettingsCallName<"set", !requires { isMemberPointer<std::expected<Values, Rejected> (Block::*)(const property_map&, Timeout)>(&TDerived::set); }>();
+        refuseSettingsCallName<"get", !requires { isMemberPointer<std::expected<settings::Value, Rejected> (Block::*)(std::string_view) const>(&TDerived::get); }>();
+        refuseSettingsCallName<"check", !requires { isMemberPointer<std::expected<void, Rejected> (Block::*)(const property_map&)>(&TDerived::check); }>();
+        refuseSettingsCallName<"ready", !requires { isMemberPointer<std::expected<void, Rejected> (Block::*)()>(&TDerived::ready); }>();
+        refuseSettingsCallName<"resetDefaults", !requires { isMemberPointer<std::expected<Values, Rejected> (Block::*)(Timeout)>(&TDerived::resetDefaults); }>();
+        refuseSettingsCallName<"writableMembers", !requires { isMemberPointer<std::set<std::string> (Block::*)() const>(&TDerived::writableMembers); }>();
+        refuseSettingsCallName<"setTagCouplings", !requires { isMemberPointer<std::expected<void, Rejected> (Block::*)(const property_map&)>(&TDerived::setTagCouplings); }>();
+        refuseSettingsCallName<"tagCouplings", !requires { isMemberPointer<property_map (Block::*)() const>(&TDerived::tagCouplings); }>();
+    }
+
+public:
     // tag access (#625): processBulk blocks use inSpan.tags() directly; processOne blocks use inputTagsPresent() + mergedInputTag()
 
+    // the block's settings object; a block's own member `settings` hides it, and a holder of `Block<Derived>&` still
+    // reaches it
     [[nodiscard]] constexpr const SettingsBase& settings() const noexcept { return _settings; }
+    [[nodiscard]] constexpr SettingsBase&       settings() noexcept { return _settings; }
 
-    [[nodiscard]] constexpr SettingsBase& settings() noexcept { return _settings; }
+    // a holder's settings calls: `set`, `get` and the others of `SettingsBase`, with their signatures there
+    [[nodiscard]] std::expected<settings::Values, settings::Rejected> set(const property_map& changes, settings::Timeout timeout = std::nullopt) { return _settings.set(changes, timeout); }
+    [[nodiscard]] std::expected<settings::Values, settings::Rejected> set(std::string_view key, pmt::Value value, settings::Timeout timeout = std::nullopt) { return _settings.set(key, std::move(value), timeout); }
+    [[nodiscard]] std::expected<void, settings::Rejected>             check(const property_map& changes) { return _settings.check(changes); }
+    [[nodiscard]] std::expected<void, settings::Rejected>             ready() { return _settings.ready(); }
+    [[nodiscard]] std::expected<settings::Value, settings::Rejected>  get(std::string_view key) const { return _settings.get(key); }
+    [[nodiscard]] std::expected<settings::Values, settings::Rejected> get(std::span<const std::string> keys = {}) const { return _settings.get(keys); }
+    template<typename T>
+    [[nodiscard]] std::expected<T, settings::Rejected> get(std::string_view key) const {
+        return _settings.template get<T>(key);
+    }
+    [[nodiscard]] std::set<std::string>                   writableMembers() const { return _settings.writableMembers(); }
+    std::expected<settings::Values, settings::Rejected>   resetDefaults(settings::Timeout timeout = std::nullopt) { return _settings.resetDefaults(timeout); }
+    [[nodiscard]] std::expected<void, settings::Rejected> setTagCouplings(const property_map& couplings) { return _settings.setTagCouplings(couplings); }
+    [[nodiscard]] property_map                            tagCouplings() const { return _settings.tagCouplings(); }
 
-    void setSettings(const CtxSettings<Derived>& settings) { _settings.assignFrom(settings); }
-    void setSettings(CtxSettings<Derived>&& settings) { _settings.assignFrom(std::move(settings)); }
+protected:
+    // reports the value the block runs for `key`, with `reason`, when it changes outside the apply hook: a read returns it
+    // in place of the value last set. Any thread of the block may call it; during the apply it changes nothing and
+    // notifies a failure, since the hook assigns the setting instead
+    void publish(std::string_view key, pmt::Value value, std::string_view reason = {}) { settings::detail::FrameworkAccess::publish(_settings, key, std::move(value), reason); }
 
-    /// copies the named members into the map that `settings().get()` returns and returns the number of members
-    /// copied, under the rules of `CtxSettingsBase::updateActiveParameters(keys)`
-    std::size_t updateActiveParameters(std::initializer_list<std::string_view> keys) noexcept { return _settings.updateActiveParameters(keys); }
+    // the device refused a setting: in the settings hook the failure takes back every key of the batch, in the start hook
+    // it marks a key the device lacks, and later the key fails and keeps its value in force
+    void fail(std::string_view key, std::string_view reason) { settings::detail::FrameworkAccess::fail(_settings, key, reason); }
+    template<settings::detail::MemberName TMember>
+    void fail(const TMember& member, std::string_view reason) {
+        settings::detail::FrameworkAccess::fail(_settings, member, reason);
+    }
+    // a caller, a saved graph or a constructed value gave the setting; a tag or a default does not
+    [[nodiscard]] bool isGiven(std::string_view key) const { return settings::detail::FrameworkAccess::isGiven(_settings, key); }
+    template<settings::detail::MemberName TMember>
+    [[nodiscard]] bool isGiven(const TMember& member) const {
+        return settings::detail::FrameworkAccess::isGiven(_settings, member);
+    }
+    // sends a setting downstream as a tag from the settings hook, ahead of the next sample; what the hook forwards at the
+    // block's setup is dropped, so a graph does not start with a tag from each block that no caller asked for
+    void forwardTag(std::string_view key, pmt::Value value) { settings::detail::FrameworkAccess::forwardTag(_settings, key, std::move(value)); }
 
+public:
     template<std::size_t Index, typename Self>
     friend constexpr auto& inputPort(Self* self) noexcept;
 
@@ -1518,9 +1657,9 @@ public:
     /// forward the tags a stream leaves at or past each input's read position to the end-of-stream index
     ///
     /// The tags reach as far as the first end-of-stream tag on any synchronous input. Their settings and port meta
-    /// information are applied first, as the ordinary path applies a chunk's tags before it forwards them. The forward
-    /// map the block's settingsChanged() fills for them leaves after them, with any forward map no earlier call
-    /// published. A block with a forwardTags() override is handed them there: the call passes processedIn 0, input
+    /// information are applied first, as the ordinary path applies a chunk's tags before it forwards them. The
+    /// settings the block's applySettings() forwards for them leave after them, with any forwarded settings no earlier
+    /// call published. A block with a forwardTags() override is handed them there: the call passes processedIn 0, input
     /// spans of no samples whose tags() holds each such tag at a relative index of 0 or more, and output spans of no
     /// samples on which offset 0 is the end-of-stream index. tags() also holds, at a negative index, tags behind the
     /// read position that no span retired, which an override must skip. The input's own end-of-stream tag is among
@@ -1562,7 +1701,7 @@ public:
                             continue;
                         }
                         if (!firstSampleSettingsApplied || tag.index > span.streamIndex) {
-                            settings().autoUpdate(Tag{0UZ, map});
+                            std::ignore = settings::detail::FrameworkAccess::tagEnters(_settings, map);
                         }
                         if (const auto res = port.metaInfo.updateFromTag(map); !res.has_value()) {
                             emitMessage("Block::forwardTagsAtEndOfStream - rejected tag", {{"error", res.error().message}});
@@ -1612,7 +1751,7 @@ private:
                     if (relIndex < firstIndex || (firstSampleSettingsApplied && relIndex <= 0)) {
                         continue;
                     }
-                    settings().autoUpdate(Tag{relIndex < 0 ? 0UZ : static_cast<std::size_t>(relIndex), tagMapRef.get()});
+                    std::ignore = settings::detail::FrameworkAccess::tagEnters(_settings, tagMapRef.get());
                 }
             },
             inputSpans);
@@ -1633,43 +1772,26 @@ private:
 
 public:
     void applyChangedSettings(bool publishForwardTags = true, property_map* capturedForwardParams = nullptr) {
-        if (!settings().changed()) {
+        if (!settings::detail::FrameworkAccess::hasWork(_settings) || !settings::detail::FrameworkAccess::workerApplies(_settings)) {
             return;
         }
-        invokeUserProvidedFunction("applyChangedSettings()", [this, publishForwardTags, capturedForwardParams] noexcept(false) {
-            std::ignore      = publishForwardTags;
-            std::ignore      = capturedForwardParams;
-            auto applyResult = settings().applyStagedParameters();
-            if constexpr (gr::meta::kDebugBuild) {
-                checkBlockParameterConsistency();
-            }
-
-            if constexpr (!noTagPropagation) {
-                if (publishForwardTags && !applyResult.forwardParameters.empty()) {
-                    if (capturedForwardParams) {
-                        mergeForwardParams(*capturedForwardParams, std::move(applyResult.forwardParameters));
-                    } else {
-                        publishTag(applyResult.forwardParameters, 0);
-                    }
+        std::ignore = settings::detail::FrameworkAccess::applyStagedParameters(_settings); // the settings notify each failed key; a failed apply never ends the run
+        if (propertySubscriptions.contains(block::property::kSetting)) {                   // the settings are read only for a subscriber
+            notifyListeners(block::property::kSetting, settings::heldValues(_settings.get()));
+        }
+        if constexpr (gr::meta::kDebugBuild) {
+            checkBlockParameterConsistency();
+        }
+        property_map forwarded = settings::detail::FrameworkAccess::takeForwarded(_settings);
+        if constexpr (!noTagPropagation) {
+            if (publishForwardTags && !forwarded.empty()) {
+                if (capturedForwardParams) {
+                    mergeForwardParams(*capturedForwardParams, std::move(forwarded));
+                } else {
+                    publishTag(forwarded, 0);
                 }
-            } else {
-                std::ignore = publishForwardTags;
-                std::ignore = capturedForwardParams;
             }
-
-            auto& appliedParametersMap = applyResult.appliedParameters;
-            if (!appliedParametersMap.empty()) {
-                notifyListeners(block::property::kStagedSetting, appliedParametersMap);
-            }
-            notifyListeners(block::property::kSetting, settings().get());
-            if (!applyResult.untaggedRefusal.empty()) {
-                emitErrorMessage("applyChangedSettings() - rejected settings", applyResult.untaggedRefusal);
-            }
-            // a tag carries keys from any block upstream. The block reports a tag value it refuses in a plain message
-            if (!applyResult.tagRefusal.empty()) {
-                emitMessage("applyChangedSettings() - rejected settings", {{"error", applyResult.tagRefusal}});
-            }
-        });
+        }
 
         // update input/output port caches
         inputStreamCache.invalidateConfig();
@@ -1848,7 +1970,9 @@ public:
     // the state machine's transition. A block that starts counts no drain stall and no handed samples of an earlier
     // run, and a block that resumes keeps its counts
     [[nodiscard]] std::expected<void, Error> changeStateTo(lifecycle::State newState, const std::source_location location = std::source_location::current()) {
-        if (newState == lifecycle::State::RUNNING && this->state() == lifecycle::State::INITIALISED) {
+        using enum lifecycle::State;
+        const lifecycle::State oldState = this->state();
+        if (newState == RUNNING && oldState == INITIALISED) {
             _finishRequested.store(false, std::memory_order_relaxed);
             _nDrainStalls     = 0UZ;
             _drainMark        = DrainWatermark{};
@@ -1856,6 +1980,12 @@ public:
             _nEpilogueWaits   = 0UZ;
             _epilogueWaitMark = DrainWatermark{};
             _nHandedPastRead.clear();
+        }
+        // a scheduler moves its own settings to running when it releases its workers
+        if constexpr (Derived::blockCategory != block::Category::ScheduledBlockGroup) {
+            if (newState == RUNNING && (oldState == INITIALISED || oldState == PAUSED || oldState == REQUESTED_PAUSE)) {
+                return runWithSettings(oldState == INITIALISED, location);
+            }
         }
         return lifecycle::StateMachine<Derived>::changeStateTo(newState, location);
     }
@@ -1884,8 +2014,8 @@ public:
 
     void rebindFieldsTo(std::pmr::memory_resource* mr) {
         _allocResource = mr;
-        refl::for_each_data_member_index<Derived>([this, mr](auto kIdx) {
-            auto& field     = refl::data_member<kIdx>(self());
+        settings::detail::forEachFlatMember<Derived>([this, mr]<typename TMember>(TMember) {
+            auto& field     = TMember::of(self());
             using F         = std::remove_cvref_t<decltype(field)>;
             using Unwrapped = unwrap_if_wrapped_t<F>;
             if constexpr (gr::PmrMigratable<F>) {
@@ -1897,18 +2027,16 @@ public:
     }
 
     constexpr void processScheduledMessages() {
-        using namespace std::chrono;
         if (!_unsentReplies.empty()) {
             sendUnsentReplies();
         }
-        // notifyListeners() is a no-op without a kHeartbeat subscriber, which is the common case on every poll,
-        // so the payload map is built only where a subscription exists.
-        if (propertySubscriptions.contains(block::property::kHeartbeat)) {
-            const std::uint64_t nanoseconds_count = static_cast<uint64_t>(duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count());
-            notifyListeners(block::property::kHeartbeat, pmt::Value::Map{{"heartbeat", nanoseconds_count}});
+        if (propertySubscriptions.contains(block::property::kHeartbeat)) { // the time is read only for a subscriber
+            const auto nanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+            notifyListeners(block::property::kHeartbeat, pmt::Value::Map{{"heartbeat", nanoseconds}});
         }
 
-        auto processPort = [this]<PortLike TPort>(TPort& inPort) {
+        bool handlerRan  = false;
+        auto processPort = [this, &handlerRan]<PortLike TPort>(TPort& inPort) {
             const auto available = inPort.available();
             if (available == 0UZ) {
                 return;
@@ -1916,10 +2044,12 @@ public:
             ReaderSpanLike auto inSpan = inPort.streamReader().get(available);
             if constexpr (traits::block::can_processMessagesForPortReaderSpan<Derived, TPort>) {
                 self().processMessages(inPort, inSpan);
+                handlerRan = true;
                 // User could have consumed the span in the custom processMessages handler
                 std::ignore = inSpan.tryConsume(inSpan.size());
             } else if constexpr (traits::block::can_processMessagesForPortStdSpan<Derived, TPort>) {
                 self().processMessages(inPort, static_cast<std::span<const Message>>(inSpan));
+                handlerRan = true;
                 if (auto consumed = inSpan.tryConsume(inSpan.size()); !consumed) {
                     throw gr::exception(std::format("Block {}::processScheduledMessages() could not consume the messages from the message port", unique_name));
                 }
@@ -1930,6 +2060,7 @@ public:
         };
         processPort(msgIn);
         for_each_port(processPort, inputPorts<PortType::MESSAGE>(&self()));
+        copyStatusAfterMessagePass(handlerRan);
     }
 
     /***
@@ -2310,7 +2441,7 @@ public:
         }
     }
 
-    // emitMessage, notifyListeners, emitErrorMessage and emitErrorMessageIfAny are inherited from BlockBase
+    // emitMessage, emitErrorMessage and emitErrorMessageIfAny are inherited from BlockBase
 
     /**
      * Central function managing the dispatch of work to the block implementation provided work implementation
@@ -2349,7 +2480,8 @@ public:
         using enum gr::work::Status;
         using TInputTypes = traits::block::stream_input_port_types<Derived>;
 
-        work::Status userReturnStatus = ERROR;
+        work::Status                userReturnStatus = ERROR;
+        [[maybe_unused]] const auto memberThreads    = memberThreadMarks(); // only the work function: the merged block's apply sets its members' keys as their caller
 
         if constexpr (HasProcessBulkFunction<Derived>) {
             invokeUserProvidedFunction("invokeProcessBulk", [&userReturnStatus, &inputSpans, &outputSpans, this] noexcept(HasNoexceptProcessBulkFunction<Derived>) { userReturnStatus = invokeProcessBulk(inputSpans, outputSpans); });
@@ -2430,10 +2562,7 @@ public:
                 this->requestStop();
             }
         }
-        if (this->state() == lifecycle::State::STOPPED) {
-            // flush any staged settings before shutdown so messages that arrived just before
-            // the block transitioned to STOPPED (e.g. kSetting/ui_constraints) still commit
-            applyChangedSettings();
+        if (this->state() == lifecycle::State::STOPPED) { // a stopped block's changes wait for its next start
             disconnectFromUpStreamParents();
             return work::Result{requestedWork, 0UZ, DONE};
         }
@@ -2685,7 +2814,7 @@ public:
             const std::size_t nTags   = static_cast<std::size_t>(std::ranges::distance(firstSampleTags));
             const std::size_t nStaged = samePositions ? std::min(_nStagedTags[input], nTags) : 0UZ;
             for (const Tag& tag : firstSampleTags | std::views::drop(static_cast<std::ptrdiff_t>(nStaged))) {
-                settings().autoUpdate(Tag{0UZ, tag.map});
+                std::ignore = settings::detail::FrameworkAccess::tagEnters(_settings, tag.map);
             }
             _nStagedTags[input] = nTags;
             ++input;
@@ -2857,6 +2986,15 @@ public:
         using enum gr::work::Status;
         using TInputTypes = traits::block::stream_input_port_types<Derived>;
 
+        // a block used alone sets up here, ahead of its own thread, where a setup does not run; one that is not ready, or
+        // whose setup fails, does no work
+        if (settings::detail::FrameworkAccess::hasWork(_settings) && !_settings.ready()) [[unlikely]] {
+            return {requestedWork, 0UZ, ERROR};
+        }
+        // the work call runs on the block's own thread, and so does each hook it runs, a blocking block's stop hook too
+        const settings::detail::OwnThread ownThread(_settings);
+        [[maybe_unused]] const auto       statusCopy = statusCopyAfterWork();
+
         if (std::optional<work::Result> earlyOut = checkLifecycle(requestedWork)) {
             return *earlyOut;
         }
@@ -2880,6 +3018,9 @@ public:
             outputStreamCache.invalidateStatistic();
         };
         applyChangedSettings(true, &_pendingForwardParams);
+        if constexpr (requires(Derived& merged) { merged.applyMemberSettings(); }) { // a merged block's members have no work call of their own
+            self().applyMemberSettings();
+        }
         SampleLimits limits = computeSampleLimits(requestedWork);
 
         if (limits.inputSkipBefore > 0) {
@@ -2887,7 +3028,7 @@ public:
         }
         // a tag at the call's first sample sets its settings before the call is sized
         const bool firstSampleSettingsApplied = limits.hasAnyTag && stageFirstSampleTagSettings();
-        if (firstSampleSettingsApplied && settings().changed()) {
+        if (firstSampleSettingsApplied && settings::detail::FrameworkAccess::hasWork(_settings)) {
             applyChangedSettings(true, &_pendingForwardParams);
             inputStreamCache.invalidateStatistic();
             outputStreamCache.invalidateStatistic();
@@ -3111,6 +3252,32 @@ public:
 
 }; // template<typename Derived, typename... Arguments> class Block : ...
 
+namespace settings::detail {
+
+struct BlockAccess {
+    template<typename TDerived, typename... TArguments>
+    [[nodiscard]] static constexpr SettingsBase& of(Block<TDerived, TArguments...>& block) noexcept {
+        return block._settings;
+    }
+    template<typename TDerived, typename... TArguments>
+    [[nodiscard]] static constexpr const SettingsBase& of(const Block<TDerived, TArguments...>& block) noexcept {
+        return block._settings;
+    }
+};
+
+// the settings object of a block, for the scheduler, the graph and the other parts of core; a holder of the block calls
+// `set`, `get` and the others on the block itself
+template<typename TDerived, typename... TArguments>
+[[nodiscard]] constexpr SettingsBase& settingsOf(Block<TDerived, TArguments...>& block) noexcept {
+    return BlockAccess::of(block);
+}
+template<typename TDerived, typename... TArguments>
+[[nodiscard]] constexpr const SettingsBase& settingsOf(const Block<TDerived, TArguments...>& block) noexcept {
+    return BlockAccess::of(block);
+}
+
+} // namespace settings::detail
+
 namespace detail {
 template<typename List, std::size_t Index = 0, typename StringFunction>
 inline constexpr auto for_each_type_to_string(StringFunction func) -> std::string {
@@ -3138,22 +3305,23 @@ void checkBlockContracts() {
     // N.B. some checks could be evaluated during compile time but the expressed intent is to do this during runtime to allow
     // for more verbose feedback on method signatures etc.
     if constexpr (refl::reflectable<TDecayedBlock>) {
-        []<std::size_t... Idxs>(std::index_sequence<Idxs...>) {
+        []<std::size_t... kFlat>(std::index_sequence<kFlat...>) {
             (
                 [] {
-                    using MemberType                            = refl::data_member_type<TDecayedBlock, Idxs>;
+                    using TMember                               = settings::detail::FlatMemberAt<TDecayedBlock, kFlat>;
+                    using MemberType                            = typename TMember::Type;
                     using RawType                               = std::remove_cvref_t<MemberType>;
                     using Type                                  = std::remove_cvref_t<unwrap_if_wrapped_t<RawType>>;
                     [[maybe_unused]] constexpr bool isAnnotated = !std::is_same_v<RawType, Type>;
                     // N.B. this function is compile-time ready but static_assert does not allow for configurable error
                     // messages
-                    if constexpr (!gr::settings::isReadableMember<Type>() && !traits::port::AnyPort<Type>) {
+                    if constexpr (!settings::detail::kIsSettingField<std::remove_cv_t<typename settings::detail::FieldValue<Type>::type>> && !traits::port::AnyPort<Type>) {
                         throw std::invalid_argument(std::format("block {} {}member '{}' has unsupported setting type '{}'", //
-                            gr::meta::type_name<TDecayedBlock>(), isAnnotated ? "" : "annotated ", refl::data_member_name<TDecayedBlock, Idxs>.view(), detail::shortTypeName<Type>()));
+                            gr::meta::type_name<TDecayedBlock>(), isAnnotated ? "" : "annotated ", TMember::kName.view(), detail::shortTypeName<Type>()));
                     }
                 }(),
                 ...);
-        }(std::make_index_sequence<refl::data_member_count<TDecayedBlock>>());
+        }(std::make_index_sequence<settings::detail::kFlatCount<TDecayedBlock>>());
     }
 
     using TDerived = typename TDecayedBlock::derived_t;
@@ -3246,19 +3414,18 @@ template<BlockLike TBlock>
     });
     ret += std::format("\n**Parameters:**\n");
     if constexpr (refl::reflectable<DerivedBlock>) {
-        refl::for_each_data_member_index<DerivedBlock>([&ret](auto kIdx) {
-            using RawType = std::remove_cvref_t<refl::data_member_type<DerivedBlock, kIdx>>;
+        settings::detail::forEachFlatMember<DerivedBlock>([&ret]<typename TMember>(TMember) {
+            using RawType = std::remove_cvref_t<typename TMember::Type>;
             using Type    = unwrap_if_wrapped_t<RawType>;
             if constexpr ((std::integral<Type> || std::floating_point<Type> || std::is_same_v<Type, std::string>)) {
                 if constexpr (is_annotated<RawType>()) {
-                    ret += std::format("{}{:10} {:<20} - annotated info: {} unit: [{}] documentation: {}{}\n",
-                        RawType::visible() ? "" : "_",                                                   //
-                        refl::type_name<Type>.view(), refl::data_member_name<DerivedBlock, kIdx>.view(), //
-                        RawType::description(), RawType::unit(),
-                        RawType::documentation(), //
+                    ret += std::format("{}{:10} {:<20} - unit: [{}] documentation: {}{}\n",
+                        RawType::visible() ? "" : "_",                       //
+                        refl::type_name<Type>.view(), TMember::kName.view(), //
+                        RawType::unit(), RawType::documentation(),           //
                         RawType::visible() ? "" : "_");
                 } else {
-                    ret += std::format("_{:10} {}_\n", refl::type_name<Type>.view(), refl::data_member_name<DerivedBlock, kIdx>.view());
+                    ret += std::format("_{:10} {}_\n", refl::type_name<Type>.view(), TMember::kName.view());
                 }
             }
         });
@@ -3503,60 +3670,6 @@ inline constexpr void for_each_port_and_reader_span(TFunction&& function, TPorts
         std::forward<TPortsTuple>(ports), std::forward<TSpansTuple>(spans));
 }
 } // namespace gr
-
-/**
- * Every block reflects the members `Block<>` declares on its behalf before its own, so their
- * settings thunks were stamped once per block type although the block never appears in them.
- * Naming their types through a block that adds nothing of its own keeps the list in step with
- * the GR_MAKE_REFLECTABLE above by construction; the static_asserts below fail loudly if a
- * member is added, removed or changes its writability.
- */
-namespace gr::block::detail {
-
-struct FrameworkMembersOnly : Block<FrameworkMembersOnly> {
-    GR_MAKE_REFLECTABLE(FrameworkMembersOnly);
-};
-
-inline constexpr std::size_t kFrameworkMemberCount = refl::data_member_count<FrameworkMembersOnly>;
-
-template<std::size_t kIdx>
-using FrameworkMemberRaw = std::remove_cvref_t<refl::data_member_type<FrameworkMembersOnly, kIdx>>;
-
-template<std::size_t kIdx>
-using FrameworkMemberType = unwrap_if_wrapped_t<FrameworkMemberRaw<kIdx>>;
-
-template<std::size_t kIdx>
-inline constexpr bool kFrameworkMemberIsReadable = settings::isReadableMember<FrameworkMemberType<kIdx>>();
-
-template<std::size_t kIdx>
-inline constexpr bool kFrameworkMemberIsWritable = settings::isWritableMember<FrameworkMemberType<kIdx>, refl::data_member_type<FrameworkMembersOnly, kIdx>>();
-
-} // namespace gr::block::detail
-
-// clang-format off
-#define GR_BLOCK_FRAMEWORK_READABLE_MEMBERS X(2) X(3) X(4) X(5) X(6) X(7)
-#define GR_BLOCK_FRAMEWORK_WRITABLE_MEMBERS X(3) X(4) X(6) X(7)
-
-namespace gr {
-
-static_assert(block::detail::kFrameworkMemberCount == 8UZ, "the framework member lists below no longer cover Block<>'s reflected members");
-
-#define X(kIdx)                                                                                                                                                          \
-    static_assert(block::detail::kFrameworkMemberIsReadable<kIdx>, "framework member " #kIdx " is listed as readable but no longer is");                                  \
-    extern template void detail::readMember<block::detail::FrameworkMemberRaw<kIdx>, block::detail::FrameworkMemberType<kIdx>>(const void*, std::string_view, property_map&);
-
-GR_BLOCK_FRAMEWORK_READABLE_MEMBERS
-#undef X
-
-#define X(kIdx)                                                                                                                                                          \
-    static_assert(block::detail::kFrameworkMemberIsWritable<kIdx>, "framework member " #kIdx " is listed as writable but no longer is");                                  \
-    extern template bool detail::applyStagedMember<block::detail::FrameworkMemberRaw<kIdx>, block::detail::FrameworkMemberType<kIdx>>(void*, std::string_view, const pmt::Value&, property_map&, property_map&, bool);
-
-GR_BLOCK_FRAMEWORK_WRITABLE_MEMBERS
-#undef X
-
-} // namespace gr
-// clang-format on
 
 template<>
 struct std::formatter<gr::work::Result, char> {

@@ -25,13 +25,16 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "build_configure.hpp"
+#include "settings_utils.hpp"
 
 /**
  * A graph built and run through gr::Runtime by name, against the same graph built with the typed API. Every writable
@@ -81,39 +84,52 @@ inline Collected takeCollected(const std::string& sinkName) {
     return result;
 }
 
-inline std::string messageOf(const auto& expected) { return expected.has_value() ? std::string{} : expected.error().message; }
+inline std::string messageOf(const auto& expected) {
+    if (expected.has_value()) {
+        return {};
+    }
+    if constexpr (std::same_as<std::remove_cvref_t<decltype(expected.error())>, gr::settings::Rejected>) {
+        return gr::settings::describeRejected(expected.error());
+    } else {
+        return expected.error().message;
+    }
+}
 
 /// counts up from zero and tags every `tag_every` samples. Both arms see one deterministic stream.
 struct RampSource : Block<RampSource> {
     PortOut<float> out;
 
-    Annotated<gr::Size_t, "n_samples", Doc<"samples to emit before finishing">>            n_samples = 4096U;
-    Annotated<gr::Size_t, "tag_every", Doc<"tag period in samples, 0 to disable tagging">> tag_every = 512U;
+    struct Settings {
+        Annotated<gr::Size_t, Doc<"samples to emit before finishing">>            n_samples = 4096U;
+        Annotated<gr::Size_t, Doc<"tag period in samples, 0 to disable tagging">> tag_every = 512U;
 
-    GR_MAKE_REFLECTABLE(RampSource, out, n_samples, tag_every);
+        GR_MAKE_REFLECTABLE(Settings, n_samples, tag_every);
+    } settings;
 
-    gr::Size_t _emitted = 0U;
+    GR_MAKE_REFLECTABLE(RampSource, out, settings);
+
+    gr::Size_t emitted = 0U;
 
     explicit RampSource(property_map init = {}) : Block<RampSource>(std::move(init)) {}
 
     work::Status processBulk(OutputSpanLike auto& outSpan) {
-        if (_emitted >= n_samples) {
+        if (emitted >= settings.n_samples) {
             outSpan.publish(0UZ);
             return work::Status::DONE;
         }
-        const std::size_t n = std::min(outSpan.size(), static_cast<std::size_t>(n_samples - _emitted));
+        const std::size_t n = std::min(outSpan.size(), static_cast<std::size_t>(settings.n_samples - emitted));
         if (n == 0UZ) {
             outSpan.publish(0UZ);
             return work::Status::INSUFFICIENT_OUTPUT_ITEMS;
         }
         for (std::size_t i = 0UZ; i < n; ++i) {
-            const gr::Size_t index = _emitted + static_cast<gr::Size_t>(i);
+            const gr::Size_t index = emitted + static_cast<gr::Size_t>(i);
             outSpan[i]             = static_cast<float>(index);
-            if (tag_every > 0U && index % tag_every == 0U) {
+            if (settings.tag_every > 0U && index % settings.tag_every == 0U) {
                 outSpan.publishTag(property_map{{"trigger_name", std::format("t{}", index)}}, i);
             }
         }
-        _emitted += static_cast<gr::Size_t>(n);
+        emitted += static_cast<gr::Size_t>(n);
         outSpan.publish(n);
         return work::Status::OK;
     }
@@ -123,16 +139,20 @@ struct Scale : Block<Scale> {
     PortIn<float>  in;
     PortOut<float> out;
 
-    Annotated<float, "gain">              gain    = 1.0f;
-    Annotated<std::string, "label">       label   = "scale";
-    Annotated<bool, "enabled">            enabled = true;
-    Annotated<std::vector<float>, "taps"> taps    = std::vector<float>{1.0f};
+    struct Settings {
+        Annotated<float>              gain    = 1.0f;
+        Annotated<std::string>        label   = "scale";
+        Annotated<bool>               enabled = true;
+        Annotated<std::vector<float>> taps    = std::vector<float>{1.0f};
 
-    GR_MAKE_REFLECTABLE(Scale, in, out, gain, label, enabled, taps);
+        GR_MAKE_REFLECTABLE(Settings, gain, label, enabled, taps);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(Scale, in, out, settings);
 
     explicit Scale(property_map init = {}) : Block<Scale>(std::move(init)) {}
 
-    [[nodiscard]] constexpr float processOne(float value) const noexcept { return enabled ? value * gain : value; }
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return settings.enabled ? value * settings.gain : value; }
 };
 
 /// the shape of a multi-input arithmetic block, whose inputs are one collection port addressed as "in#0"
@@ -140,17 +160,17 @@ struct SumInputs : Block<SumInputs> {
     std::vector<PortIn<float>> in;
     PortOut<float>             out;
 
-    Annotated<gr::Size_t, "n_inputs", Limits<1U, 8U>> n_inputs = 2U;
+    struct Settings {
+        Annotated<gr::Size_t, Limits<Min<1U>, Max<8U>>, PortCountFor<"in">> n_inputs = 2U;
 
-    GR_MAKE_REFLECTABLE(SumInputs, in, out, n_inputs);
+        GR_MAKE_REFLECTABLE(Settings, n_inputs);
+    } settings;
 
-    explicit SumInputs(property_map init = {}) : Block<SumInputs>(std::move(init)) { in.resize(n_inputs); }
+    GR_MAKE_REFLECTABLE(SumInputs, in, out, settings);
 
-    void settingsChanged(const property_map& oldSettings, const property_map& newSettings) {
-        if (newSettings.contains("n_inputs") && oldSettings.at("n_inputs") != newSettings.at("n_inputs")) {
-            in.resize(n_inputs);
-        }
-    }
+    explicit SumInputs(property_map init = {}) : Block<SumInputs>(std::move(init)) { in.resize(settings.n_inputs); }
+
+    void applySettings(const Settings& s) { in.resize(s.n_inputs); }
 
     template<InputSpanLike TInSpan>
     work::Status processBulk(const std::span<TInSpan>& inSpans, OutputSpanLike auto& outSpan) const {
@@ -219,20 +239,24 @@ struct CountingSink : Block<CountingSink> {
     }
 };
 
-/// counts the samples it consumes in a readable member, which the block writes while it runs
+/// counts the samples it consumes in a status value, which the block writes while it runs
 struct TallySink : Block<TallySink> {
     PortIn<float> in;
 
-    Annotated<gr::Size_t, "n_consumed", Doc<"samples consumed">> n_consumed = 0U;
+    struct Status {
+        Annotated<gr::Size_t, Doc<"samples consumed">> n_consumed = 0U;
 
-    GR_MAKE_REFLECTABLE(TallySink, in, n_consumed);
+        GR_MAKE_REFLECTABLE(Status, n_consumed);
+    } status;
+
+    GR_MAKE_REFLECTABLE(TallySink, in, status);
 
     explicit TallySink(property_map init = {}) : Block<TallySink>(std::move(init)) {}
 
     work::Status processBulk(InputSpanLike auto& inSpan) {
         const std::size_t n = inSpan.size();
-        n_consumed          = n_consumed.value + static_cast<gr::Size_t>(n);
         std::ignore         = inSpan.consume(n);
+        status.n_consumed   = static_cast<gr::Size_t>(status.n_consumed.value + n); // the count its settings read
         return work::Status::OK;
     }
 };
@@ -308,14 +332,98 @@ struct GatedStopSink : Block<GatedStopSink> {
     }
 };
 
+/// lets a LatchedStartSource's start() return once a case opens it, for at most ten seconds
+struct StartLatch {
+    std::mutex              mutex;
+    std::condition_variable changed;
+    bool                    entered = false;
+    bool                    isOpen  = false;
+};
+
+inline StartLatch& startLatch() {
+    static StartLatch latch;
+    return latch;
+}
+
+/// an endless source whose start() returns only once startLatch() opens
+struct LatchedStartSource : Block<LatchedStartSource> {
+    PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(LatchedStartSource, out);
+
+    explicit LatchedStartSource(property_map init = {}) : Block<LatchedStartSource>(std::move(init)) {}
+
+    void start() {
+        StartLatch&      latch = startLatch();
+        std::unique_lock lock(latch.mutex);
+        latch.entered = true;
+        latch.changed.notify_all();
+        std::ignore = latch.changed.wait_for(lock, std::chrono::seconds(10), [&latch] { return latch.isOpen; });
+    }
+
+    work::Status processBulk(OutputSpanLike auto& outSpan) {
+        outSpan.publish(0UZ);
+        return work::Status::OK;
+    }
+};
+
+/// closes startLatch(), then on its own thread asks the runtime's stop once a LatchedStartSource's start() has entered,
+/// and opens the latch once the stop moved the runtime on from running or ten seconds have passed
+inline std::thread stopDuringStart(gr::Runtime& runtime) {
+    {
+        StartLatch&     latch = startLatch();
+        std::lock_guard lock(latch.mutex);
+        latch.entered = false;
+        latch.isOpen  = false;
+    }
+    return std::thread([&runtime] {
+        using namespace std::chrono_literals;
+        StartLatch& latch = startLatch();
+        {
+            std::unique_lock lock(latch.mutex);
+            std::ignore = latch.changed.wait_for(lock, 10s, [&latch] { return latch.entered; });
+        }
+        std::ignore         = runtime.stopFor(0ns); // the request goes on on the runtime's own thread
+        const auto deadline = std::chrono::steady_clock::now() + 10s;
+        while (runtime.state() == gr::Runtime::State::Running && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        std::lock_guard lock(latch.mutex);
+        latch.isOpen = true;
+        latch.changed.notify_all();
+    });
+}
+
+/// a block without ports whose start() fails a gain above 10, which its device lacks, and which runs until stopped
+struct GainCappedAtStart : Block<GainCappedAtStart> {
+    struct Settings {
+        float gain = 1.f;
+
+        GR_MAKE_REFLECTABLE(Settings, gain);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(GainCappedAtStart, settings);
+
+    explicit GainCappedAtStart(property_map init = {}) : Block<GainCappedAtStart>(std::move(init)) {}
+
+    void start() {
+        if (settings.gain > 10.f) {
+            this->fail("gain", "the device runs a gain of 10 at most");
+        }
+    }
+
+    [[nodiscard]] work::Status processBulk() { return work::Status::OK; }
+};
+
 inline void registerTestBlocks() {
     static const bool registered = [] {
         BlockRegistry& registry = globalBlockRegistry();
-        return registry.insert<RampSource>("=qa::RampSource") && registry.insert<Scale>("=qa::Scale")                            //
-               && registry.insert<RecordingSink>("=qa::RecordingSink") && registry.insert<SumInputs>("=qa::SumInputs")           //
-               && registry.insert<EndlessSource>("=qa::EndlessSource") && registry.insert<CountingSink>("=qa::CountingSink")     //
-               && registry.insert<FailingStartSource>("=qa::FailingStartSource") && registry.insert<TallySink>("=qa::TallySink") //
-               && registry.insert<ReportingSource>("=qa::ReportingSource");
+        return registry.insert<RampSource>("=qa::RampSource") && registry.insert<Scale>("=qa::Scale")                                        //
+               && registry.insert<RecordingSink>("=qa::RecordingSink") && registry.insert<SumInputs>("=qa::SumInputs")                       //
+               && registry.insert<EndlessSource>("=qa::EndlessSource") && registry.insert<CountingSink>("=qa::CountingSink")                 //
+               && registry.insert<FailingStartSource>("=qa::FailingStartSource") && registry.insert<TallySink>("=qa::TallySink")             //
+               && registry.insert<ReportingSource>("=qa::ReportingSource") && registry.insert<LatchedStartSource>("=qa::LatchedStartSource") //
+               && registry.insert<GainCappedAtStart>("=qa::GainCappedAtStart");
     }();
     expect(registered) << "the test blocks must reach the global registry";
 }
@@ -409,15 +517,33 @@ inline bool sameTags(const std::vector<TagRecord>& lhs, const std::vector<TagRec
     return std::ranges::equal(lhs, rhs, [](const TagRecord& a, const TagRecord& b) { return a.index == b.index && a.map == b.map; });
 }
 
-/// a definitions root holding one recipe, `qa::LevelRecipe`, in a temporary directory; its exported parameter `level`
-/// has no default and is required
+/// a definitions root holding two recipes in a temporary directory. The exported parameter `level` of
+/// `qa::LevelRecipe` has no default and is required. `qa::CountRecipe` sizes the inputs of an inner `qa::SumInputs` by
+/// its exported parameter `count`
 struct LevelRecipeRoot {
     std::filesystem::path path = std::filesystem::temp_directory_path() / "gr4_qa_erased_runtime_recipe";
 
     LevelRecipeRoot() {
         std::filesystem::remove_all(path);
         std::filesystem::create_directories(path);
-        std::ofstream(path / "index.yaml") << "assets:\n  - file: level_recipe.yaml\n    created: \"2024-01-01-00:00:00\"\n    modified: \"2024-01-01-00:00:00\"\n    block_type: qa::LevelRecipe\n";
+        std::ofstream(path / "index.yaml") << "assets:\n  - file: level_recipe.yaml\n    created: \"2024-01-01-00:00:00\"\n    modified: \"2024-01-01-00:00:00\"\n    block_type: qa::LevelRecipe\n"
+                                              "  - file: count_recipe.yaml\n    created: \"2024-01-01-00:00:00\"\n    modified: \"2024-01-01-00:00:00\"\n    block_type: qa::CountRecipe\n";
+        std::ofstream(path / "count_recipe.yaml") << R"yaml(definition_metadata:
+  block_type: qa::CountRecipe
+blocks:
+  - id: SUBGRAPH
+    parameters:
+      name: count_recipe
+    exported_parameters:
+      - name: count
+        type: uint32
+    graph:
+      blocks:
+        - id: "qa::SumInputs"
+          parameters:
+            name: inner_sum
+            n_inputs: "=count"
+)yaml";
         std::ofstream(path / "level_recipe.yaml") << R"yaml(definition_metadata:
   block_type: qa::LevelRecipe
 blocks:
@@ -524,14 +650,14 @@ const boost::ut::suite<"a program's own loader"> programLoaderTests = [] {
             expect(!watched.expired()) << "the runtime does not keep its graph's loader";
             pluginScheduler = runtime->scheduler();
         }
-        const std::optional<pmt::Value> timeout = pluginScheduler.get(std::string("timeout_ms"));
-        expect(fatal(timeout.has_value() && timeout->get_if<gr::Size_t>() != nullptr)) << "the plugin scheduler's handle reports no timeout_ms";
-        expect(eq(*timeout->get_if<gr::Size_t>(), kChosenTimeout)) << "a plugin scheduler whose constructor takes no settings was not given the caller's";
+        const std::expected<gr::Size_t, settings::Rejected> timeout = pluginScheduler.get<gr::Size_t>("timeout_ms");
+        expect(fatal(timeout.has_value())) << "the plugin scheduler's handle reports no timeout_ms: " << messageOf(timeout);
+        expect(eq(*timeout, kChosenTimeout)) << "a plugin scheduler whose constructor takes no settings was not given the caller's";
         // the plugin's code stays mapped while a handle holds one of its objects
         expect(fatal(!watched.expired())) << "the handles do not keep the loader of their graph";
         expect(eq(pluginBlock.name(), std::string("source")));
         expect(pluginBlock.typeName().contains("fixed_source")) << pluginBlock.typeName();
-        expect(!pluginBlock.get().empty()) << "the plugin block's handle reads no settings";
+        expect(!settings::heldValues(pluginBlock.get()).empty()) << "the plugin block's handle reads no settings";
         expect(!pluginScheduler.writableMembers().empty()) << "the plugin scheduler's handle reads no settings";
 
         pluginBlock = BlockHandle{};
@@ -632,9 +758,9 @@ const boost::ut::suite<"erased runtime"> erasedRuntimeTests = [] {
         expect(scale->typeName().contains("Scale")) << scale->typeName();
 
         // a staged value lands on the caller's own object when the run applies it
-        expect(scale->get().contains(convert_string_domain(std::string("gain"))));
-        expect(scale->setStaged(property_map{{"taps", std::vector<float>{2.0f}}}).has_value());
-        expect(scale->setStaged(property_map{{"label", std::string("adopted")}}).has_value());
+        expect(settings::heldValues(scale->get()).contains(convert_string_domain(std::string("gain"))));
+        expect(scale->set(property_map{{"taps", std::vector<float>{2.0f}}}).has_value());
+        expect(scale->set(property_map{{"label", std::string("adopted")}}).has_value());
 
         expect(graph.connect(*source, "out", *scale, "in").has_value());
         expect(graph.connect(*scale, "out", *sink, "in").has_value());
@@ -649,8 +775,8 @@ const boost::ut::suite<"erased runtime"> erasedRuntimeTests = [] {
         const Collected added = takeCollected("add-erased");
         expect(reference.samples == added.samples) << "an added block changed the stream";
         expect(sameTags(reference.tags, added.tags)) << "an added block changed the tag sequence";
-        expect(eq(typedScale->label.value, std::string("adopted")));
-        expect(eq(typedScale->gain.value, 3.0f));
+        expect(eq(typedScale->settings.label.value, std::string("adopted")));
+        expect(eq(typedScale->settings.gain.value, 3.0f));
     };
 
     "add refuses a null block"_test = [] {
@@ -701,7 +827,7 @@ const boost::ut::suite<"erased runtime"> erasedRuntimeTests = [] {
             }
 
             const std::set<std::string> writable = handle->writableMembers();
-            const property_map          active   = handle->get();
+            const property_map          active   = settings::heldValues(handle->get());
             expect(!writable.empty()) << key << " reports no writable members";
 
             for (const std::string& member : writable) {
@@ -710,7 +836,7 @@ const boost::ut::suite<"erased runtime"> erasedRuntimeTests = [] {
                 if (value == active.end()) {
                     continue;
                 }
-                const auto staged = handle->setStaged(property_map{{convert_string_domain(member), value->second}});
+                const auto staged = handle->set(property_map{{convert_string_domain(member), value->second}}, settings::noWait);
                 expect(staged.has_value()) << std::format("{}: writable member '{}' was refused: {}", key, member, messageOf(staged));
             }
         }
@@ -741,14 +867,104 @@ const boost::ut::suite<"erased runtime"> erasedRuntimeTests = [] {
         expect(fatal(loaded.has_value())) << messageOf(loaded);
         const std::vector<BlockHandle> blocks = loaded->blocks();
         expect(fatal(eq(blocks.size(), 1UZ)));
-        expect(blocks.front().get(std::string("gain")) == std::optional<pmt::Value>(5.0f));
-        expect(blocks.front().get(std::string("label")) == std::optional<pmt::Value>(std::string("from-the-document")));
+        expect(blocks.front().get<float>("gain") == 5.0f);
+        expect(blocks.front().get<std::string>("label") == std::string("from-the-document"));
 
         std::optional<std::expected<RuntimeGraph, RuntimeError>> unknownName;
         expect(nothrow([&] { unknownName.emplace(RuntimeGraph::fromYaml(nullptr, document, {{"scal", {{"gain", 5.0f}}}})); }));
         expect(fatal(unknownName.has_value() && !unknownName->has_value()));
         expect(unknownName->error().message.contains("block 'scal'")) << unknownName->error().message;
         expect(eq(unknownName->error().where, std::string("RuntimeGraph::fromYaml")));
+    };
+
+    "a document value a block refuses is an error that holds the block's refusal"_test = [] {
+        registerTestBlocks();
+        constexpr std::string_view                      document = "blocks:\n  - id: qa::SumInputs\n    parameters:\n      name: sum\n      n_inputs: 9\n";
+        const std::expected<RuntimeGraph, RuntimeError> loaded   = RuntimeGraph::fromYaml(nullptr, document);
+        expect(fatal(!loaded.has_value())) << "a value outside the limits loaded";
+        expect(loaded.error().rejected == gr::settings::Rejected{{.key = "sum.n_inputs", .reason = "out of range [1, 8]: 9"}}) << loaded.error().message;
+        expect(loaded.error().message.contains("block 'sum'")) << loaded.error().message;
+        const std::expected<RuntimeGraph, RuntimeError> twoSums = RuntimeGraph::fromYaml(nullptr, "blocks:\n  - id: qa::SumInputs\n    parameters:\n      name: first\n      n_inputs: 2\n  - id: qa::SumInputs\n    parameters:\n      name: second\n      n_inputs: 9\n");
+        expect(fatal(!twoSums.has_value()));
+        expect(twoSums.error().rejected == gr::settings::Rejected{{.key = "second.n_inputs", .reason = "out of range [1, 8]: 9"}}) << "the entry names its block among blocks that declare the same key";
+
+        constexpr std::string_view                      unknownType = "blocks:\n  - id: qa::NoSuchBlock\n    parameters:\n      name: nope\n";
+        const std::expected<RuntimeGraph, RuntimeError> unknown     = RuntimeGraph::fromYaml(nullptr, unknownType);
+        expect(fatal(!unknown.has_value()));
+        expect(unknown.error().rejected.empty()) << "an error that no setting caused holds no refusal";
+    };
+
+    "a value a block or a scheduler refuses is an error that holds the refusal on every path that builds one"_test = [] {
+        registerTestBlocks();
+        const gr::settings::Rejected outOfLimits{{.key = "sum.n_inputs", .reason = "out of range [1, 8]: 9"}};
+        {
+            RuntimeGraph                                   graph;
+            const std::expected<BlockHandle, RuntimeError> emplaced = graph.emplace("qa::SumInputs", "sum", {{"n_inputs", gr::Size_t{9U}}});
+            expect(fatal(!emplaced.has_value())) << "emplace() took a value outside the limits";
+            expect(emplaced.error().rejected == outOfLimits) << emplaced.error().message;
+
+            const std::expected<BlockHandle, RuntimeError> added = graph.add(std::make_shared<BlockWrapper<SumInputs>>(property_map{{"n_inputs", gr::Size_t{9U}}}), "sum");
+            expect(fatal(!added.has_value())) << "add() took a value outside the limits";
+            expect(added.error().rejected == outOfLimits) << added.error().message;
+        }
+        const std::expected<Runtime, RuntimeError> undeclared = Runtime::create(RuntimeGraph{}, Runtime::kDefaultScheduler, {{"name", std::string("sched")}, {"no_such_key", gr::Size_t{1U}}});
+        expect(fatal(!undeclared.has_value())) << "create() took a key the scheduler does not declare";
+        expect(undeclared.error().rejected == gr::settings::Rejected{{.key = "sched.no_such_key", .reason = "unknown setting"}}) << undeclared.error().message;
+
+        const std::expected<Runtime, RuntimeError> refused = Runtime::create(RuntimeGraph{}, Runtime::kDefaultScheduler, {{"name", std::string("sched")}, {"process_stream_to_message_ratio", gr::Size_t{0U}}});
+        expect(fatal(!refused.has_value())) << "create() took a value outside the scheduler's limits";
+        expect(refused.error().rejected == gr::settings::Rejected{{.key = "sched.process_stream_to_message_ratio", .reason = "out of range [1, inf): 0"}}) << refused.error().message;
+    };
+
+    "a value refused in a block definition is an error that holds the refusal"_test = [] {
+        registerTestBlocks();
+        const LevelRecipeRoot root;
+        auto                  loader = std::make_shared<PluginLoader>(globalBlockRegistry(), globalSchedulerRegistry(), std::vector<std::string>{root.path.string()});
+
+        constexpr std::string_view                      innerDocument = "blocks:\n  - id: qa::CountRecipe\n    parameters:\n      name: counts\n      count: !!uint32 9\n";
+        const std::expected<RuntimeGraph, RuntimeError> inner         = RuntimeGraph::fromYaml(loader, innerDocument);
+        expect(fatal(!inner.has_value())) << "an inner block took a value outside its limits";
+        expect(inner.error().rejected == gr::settings::Rejected{{.key = "counts.inner_sum.n_inputs", .reason = "out of range [1, 8]: 9"}}) << inner.error().message;
+        expect(inner.error().message.contains("block 'counts'") && inner.error().message.contains("inner_sum")) << inner.error().message;
+        const std::expected<RuntimeGraph, RuntimeError> twoCounts = RuntimeGraph::fromYaml(loader, "blocks:\n  - id: qa::CountRecipe\n    parameters:\n      name: counts\n      count: !!uint32 2\n  - id: qa::CountRecipe\n    parameters:\n      name: more_counts\n      count: !!uint32 9\n");
+        expect(fatal(!twoCounts.has_value()));
+        expect(twoCounts.error().rejected == gr::settings::Rejected{{.key = "more_counts.inner_sum.n_inputs", .reason = "out of range [1, 8]: 9"}}) << "the entry names the block of the definition before the inner block";
+
+        constexpr std::string_view                      remainingDocument = "blocks:\n  - id: qa::CountRecipe\n    parameters:\n      name: counts\n      count: !!uint32 2\n      compute_domain: 7.0\n";
+        const std::expected<RuntimeGraph, RuntimeError> remaining         = RuntimeGraph::fromYaml(loader, remainingDocument);
+        expect(fatal(!remaining.has_value())) << "the definition took a setting of the wrong type";
+        expect(fatal(eq(remaining.error().rejected.size(), 1UZ))) << remaining.error().message;
+        expect(eq(remaining.error().rejected.front().key, std::string("counts.compute_domain"))) << remaining.error().message;
+
+        auto graph = recipeGraph(root);
+        expect(fatal(graph.has_value())) << messageOf(graph);
+        const std::expected<BlockHandle, RuntimeError> emplaced = graph->emplace("qa::CountRecipe", "counts", {{"count", gr::Size_t{9U}}});
+        expect(fatal(!emplaced.has_value())) << "emplace() built a definition whose inner block refused its value";
+        expect(emplaced.error().rejected == gr::settings::Rejected{{.key = "counts.inner_sum.n_inputs", .reason = "out of range [1, 8]: 9"}}) << emplaced.error().message;
+    };
+
+    "an entry refused inside a subgraph names the subgraph before the inner block, among subgraphs that hold one name"_test = [] {
+        registerTestBlocks();
+        constexpr std::string_view                      document = "blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: a\n    graph:\n      blocks:\n"
+                                                                   "        - id: qa::SumInputs\n          parameters:\n            name: g\n            n_inputs: 2\n"
+                                                                   "  - id: SUBGRAPH\n    parameters:\n      name: b\n    graph:\n      blocks:\n"
+                                                                   "        - id: qa::SumInputs\n          parameters:\n            name: g\n            n_inputs: 9\n";
+        const std::expected<RuntimeGraph, RuntimeError> loaded   = RuntimeGraph::fromYaml(nullptr, document);
+        expect(fatal(!loaded.has_value())) << "an inner block took a value outside its limits";
+        expect(loaded.error().rejected == gr::settings::Rejected{{.key = "b.g.n_inputs", .reason = "out of range [1, 8]: 9"}}) << loaded.error().message;
+        expect(loaded.error().message.contains("subgraph 'b'")) << loaded.error().message;
+    };
+
+    "an entry refused under a scheduler nested in a subgraph names the block alone, as a start does"_test = [] {
+        registerTestBlocks();
+        const std::string document = std::format("blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: a\n    graph:\n      blocks:\n"
+                                                 "        - id: SUBGRAPH\n          parameters:\n            name: s\n          scheduler:\n            id: {}\n"
+                                                 "          graph:\n            blocks:\n              - id: qa::SumInputs\n                parameters:\n                  name: g\n                  n_inputs: 9\n",
+            Runtime::kDefaultScheduler);
+        auto              loaded   = RuntimeGraph::fromYaml(nullptr, document);
+        expect(fatal(!loaded.has_value())) << "an inner block took a value outside its limits";
+        expect(loaded.error().rejected == gr::settings::Rejected{{.key = "g.n_inputs", .reason = "out of range [1, 8]: 9"}}) << loaded.error().message;
+        expect(loaded.error().message.contains("subgraph 'a'") && loaded.error().message.contains("subgraph 's'")) << loaded.error().message;
     };
 
     "a document the reader refuses is an error, never an exception"_test = [] {
@@ -778,8 +994,8 @@ const boost::ut::suite<"erased runtime"> erasedRuntimeTests = [] {
     "the scheduler's own settings are read through its handle, which outlives the runtime"_test = [] {
         registerTestBlocks();
         const auto timeoutOf = [](const BlockHandle& scheduler) {
-            const std::optional<pmt::Value> value = scheduler.get(std::string("timeout_ms"));
-            return value.has_value() && value->get_if<gr::Size_t>() != nullptr ? std::optional<gr::Size_t>(*value->get_if<gr::Size_t>()) : std::nullopt;
+            const std::expected<gr::Size_t, settings::Rejected> value = scheduler.get<gr::Size_t>("timeout_ms");
+            return value.has_value() ? std::optional<gr::Size_t>(*value) : std::nullopt;
         };
 
         auto withDefaults = Runtime::create(RuntimeGraph{});
@@ -872,7 +1088,7 @@ const boost::ut::suite<"erased runtime"> erasedRuntimeTests = [] {
         expect(graph.connect(*scale, "out", *sink, "in").has_value());
 
         const auto nameBefore = scale->name();
-        expect(fatal(scale->setStaged({{"name", std::string("after")}}).has_value()));
+        expect(fatal(scale->set({{"name", std::string("after")}}).has_value()));
         auto runtime = Runtime::create(std::move(graph));
         expect(fatal(runtime.has_value())) << messageOf(runtime);
         expect(runtime->runAndWait().has_value());
@@ -891,7 +1107,7 @@ const boost::ut::suite<"erased runtime"> erasedRuntimeTests = [] {
             auto         tally  = graph.emplace("qa::TallySink", tallyName);
             expect(fatal(source.has_value() && tally.has_value()));
             expect(graph.connect(*source, "out", *tally, "in").has_value());
-            expect(tally->get(std::string("n_consumed")) == std::optional<pmt::Value>(gr::Size_t{0U}));
+            expect(tally->get<gr::Size_t>("n_consumed") == gr::Size_t{0U});
             auto runtime = Runtime::create(std::move(graph));
             expect(fatal(runtime.has_value())) << messageOf(runtime);
             return std::pair{std::move(*runtime), *tally};
@@ -900,12 +1116,12 @@ const boost::ut::suite<"erased runtime"> erasedRuntimeTests = [] {
         auto [foreground, foregroundTally]          = tallyRun("tally-foreground");
         const std::expected<void, RuntimeError> ran = foreground.runAndWait();
         expect(fatal(ran.has_value())) << messageOf(ran);
-        expect(foregroundTally.get(std::string("n_consumed")) == std::optional<pmt::Value>(kSamples)) << "runAndWait() returned before the settings held the count the block wrote";
+        expect(foregroundTally.get<gr::Size_t>("n_consumed") == kSamples) << "runAndWait() returned before the settings held the count the block wrote";
 
         auto [background, backgroundTally] = tallyRun("tally-background");
         expect(fatal(background.start().has_value()));
         expect(fatal(background.waitFor(std::chrono::seconds(10)))) << "the finite run did not end";
-        expect(backgroundTally.get(std::string("n_consumed")) == std::optional<pmt::Value>(kSamples)) << "the run's end did not refresh the settings";
+        expect(backgroundTally.get<gr::Size_t>("n_consumed") == kSamples) << "the run's end did not refresh the settings";
     };
 };
 
@@ -919,8 +1135,8 @@ const boost::ut::suite<"background run"> backgroundRunTests = [] {
         registerTestBlocks();
         auto runtime = erasedChain("background-finite", 1024U, 2.0f);
         expect(fatal(runtime.has_value())) << messageOf(runtime);
-        const std::expected<void, RuntimeError> started = runtime->start();
-        expect(fatal(started.has_value())) << messageOf(started);
+        const std::expected<gr::settings::Values, gr::settings::Rejected> started = runtime->start();
+        expect(fatal(started.has_value())) << (started ? std::string{} : gr::settings::describeRejected(started.error()));
         expect(fatal(runtime->waitFor(10s))) << "the finite run did not end";
         const std::expected<void, RuntimeError> result = runtime->result();
         expect(result.has_value()) << messageOf(result);
@@ -929,16 +1145,16 @@ const boost::ut::suite<"background run"> backgroundRunTests = [] {
     };
 
     "start() returns its refusal as an expected error"_test = [] {
-        static_assert(std::same_as<decltype(std::declval<Runtime&>().start()), std::expected<void, RuntimeError>>);
+        static_assert(std::same_as<decltype(std::declval<Runtime&>().start()), std::expected<gr::settings::Values, gr::settings::Rejected>>);
         registerTestBlocks();
         auto runtime = endlessChain("start-refused");
         expect(fatal(runtime.has_value())) << messageOf(runtime);
         expect(fatal(runtime->start().has_value()));
 
-        const std::expected<void, RuntimeError> second = runtime->start();
+        const std::expected<gr::settings::Values, gr::settings::Rejected> second = runtime->start();
         expect(fatal(!second.has_value())) << "a second start() during the run was accepted";
-        expect(second.error().message.contains("a run is in progress")) << second.error().message;
-        expect(eq(second.error().where, std::string("Runtime::start")));
+        expect(fatal(eq(second.error().size(), 1UZ)));
+        expect(second.error().front().reason.contains("a run is in progress")) << second.error().front().reason;
         runtime->stop();
     };
 
@@ -953,6 +1169,128 @@ const boost::ut::suite<"background run"> backgroundRunTests = [] {
         }
     };
 
+    auto latchedRuntime = [](std::string_view sinkName) {
+        RuntimeGraph graph;
+        auto         source = graph.emplace("qa::LatchedStartSource", "latched");
+        auto         sink   = graph.emplace("qa::CountingSink", sinkName);
+        expect(fatal(source.has_value() && sink.has_value()));
+        expect(graph.connect(*source, "out", *sink, "in").has_value());
+        return Runtime::create(std::move(graph));
+    };
+
+    "a stop asked while a block's start hook runs leaves the graph stopped, start() returns the refusal and the result is success"_test = [&latchedRuntime] {
+        registerTestBlocks();
+        auto runtime = latchedRuntime("stop-during-start");
+        expect(fatal(runtime.has_value())) << messageOf(runtime);
+        std::thread                                                       stopper = stopDuringStart(*runtime);
+        const std::expected<gr::settings::Values, gr::settings::Rejected> started = runtime->start();
+        stopper.join();
+        expect(fatal(!started.has_value())) << "a start that a stop ended before the graph ran returned values";
+        expect(fatal(eq(started.error().size(), 1UZ))) << gr::settings::describeRejected(started.error());
+        expect(eq(started.error().front().reason, std::string("stopped during the start")));
+        expect(fatal(runtime->waitFor(10s))) << "the stopped run did not end";
+        const std::expected<void, RuntimeError> result = runtime->result();
+        expect(result.has_value()) << "a stop during the start failed the run: " << messageOf(result);
+        expect(runtime->state() == Runtime::State::Stopped) << "a stop during the start must leave the scheduler stopped, not in error";
+        expect(eq(countedSize("stop-during-start"), 0UZ)) << "a sample flowed after the stop";
+    };
+
+    "a key a start hook fails is a failed value of start(), named by its block, and the graph runs"_test = [] {
+        registerTestBlocks();
+        RuntimeGraph graph;
+        auto         capped = graph.emplace("qa::GainCappedAtStart", "capped", {{"gain", 30.f}});
+        expect(fatal(capped.has_value()));
+        const std::string key     = "capped.gain";
+        auto              runtime = Runtime::create(std::move(graph));
+        expect(fatal(runtime.has_value())) << messageOf(runtime);
+
+        const std::expected<gr::settings::Values, gr::settings::Rejected> started = runtime->start();
+        expect(fatal(started.has_value())) << (started ? std::string{} : gr::settings::describeRejected(started.error()));
+        expect(fatal(started->contains(key))) << std::format("start() returned no entry {}", key);
+        expect(started->at(key).state == gr::settings::Value::State::failed);
+        expect(started->at(key).reason.contains("at most")) << started->at(key).reason;
+        expect(runtime->state() == Runtime::State::Running) << "a key failed at the start stopped the graph";
+        runtime->stop();
+    };
+
+    "start() returns the values of the blocks of a nested scheduler"_test = [] {
+        registerTestBlocks();
+        const std::string document = std::format("blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: group\n    scheduler:\n      id: {}\n"
+                                                 "    graph:\n      blocks:\n        - id: qa::GainCappedAtStart\n          parameters:\n            name: inner\n            gain: 30.0\n",
+            Runtime::kDefaultScheduler);
+        auto              loaded   = RuntimeGraph::fromYaml(nullptr, document);
+        expect(fatal(loaded.has_value())) << messageOf(loaded);
+        const auto inner = loaded->find("inner");
+        expect(fatal(inner.has_value()));
+        const std::string key     = "inner.gain"; // a nested scheduler's block reads its own name
+        auto              runtime = Runtime::create(std::move(*loaded));
+        expect(fatal(runtime.has_value())) << messageOf(runtime);
+
+        const std::expected<gr::settings::Values, gr::settings::Rejected> started = runtime->start();
+        expect(fatal(started.has_value())) << (started ? std::string{} : gr::settings::describeRejected(started.error()));
+        expect(fatal(started->contains(key))) << std::format("start() returned no entry {} for the nested block", key);
+        expect(started->at(key).state == gr::settings::Value::State::failed);
+        runtime->stop();
+    };
+
+    "a value of start() names a block by its unique name where two blocks share its name"_test = [] {
+        registerTestBlocks();
+        RuntimeGraph graph;
+        auto         first  = graph.emplace("qa::GainCappedAtStart", "twin", {{"gain", 30.f}});
+        auto         second = graph.emplace("qa::GainCappedAtStart", "twin", {{"gain", 30.f}});
+        expect(fatal(first.has_value() && second.has_value()));
+        const std::string firstKey  = std::format("{}.gain", first->uniqueName());
+        const std::string secondKey = std::format("{}.gain", second->uniqueName());
+        auto              runtime   = Runtime::create(std::move(graph));
+        expect(fatal(runtime.has_value())) << messageOf(runtime);
+
+        const std::expected<gr::settings::Values, gr::settings::Rejected> started = runtime->start();
+        runtime->stop();
+        expect(fatal(started.has_value())) << (started ? std::string{} : gr::settings::describeRejected(started.error()));
+        expect(started->contains(firstKey)) << std::format("start() returned no entry {}", firstKey);
+        expect(started->contains(secondKey)) << std::format("start() returned no entry {}", secondKey);
+        expect(!started->contains("twin.gain")) << "a name two blocks share is no name of one block";
+    };
+
+    "an entry of a start's refusal names each block by the name the caller gave, and by its unique name where two blocks share it"_test = [] {
+        registerTestBlocks();
+        // each source's start() throws, and the start's refusal names the blocks that refused
+        const auto refusedStart = [](std::span<const std::string_view> sourceNames, std::string_view sinkPrefix, std::vector<std::string>& uniqueNames) {
+            RuntimeGraph graph;
+            for (std::size_t i = 0UZ; i < sourceNames.size(); ++i) {
+                auto source = graph.emplace("qa::FailingStartSource", sourceNames[i]);
+                auto sink   = graph.emplace("qa::RecordingSink", std::format("{}-{}", sinkPrefix, i));
+                expect(fatal(source.has_value() && sink.has_value()));
+                expect(fatal(graph.connect(*source, "out", *sink, "in").has_value()));
+                uniqueNames.push_back(source->uniqueName());
+            }
+            auto runtime = Runtime::create(std::move(graph), Runtime::kDefaultScheduler, {{"name", std::string("sched")}});
+            expect(fatal(runtime.has_value())) << messageOf(runtime);
+            const std::expected<gr::settings::Values, gr::settings::Rejected> started = runtime->start();
+            expect(fatal(!started.has_value())) << "a start that left the graph not running returned values";
+            expect(fatal(runtime->waitFor(10s))) << "the failing run did not end";
+            runtime->stop();
+            for (std::size_t i = 0UZ; i < sourceNames.size(); ++i) {
+                std::ignore = takeCollected(std::format("{}-{}", sinkPrefix, i));
+            }
+            return started.error();
+        };
+        const auto holdsKey = [](const gr::settings::Rejected& refused, std::string_view key) { return std::ranges::any_of(refused, [key](const gr::settings::Rejection& entry) { return entry.key == key; }); };
+
+        std::vector<std::string>     alone;
+        const std::string_view       aloneNames[] = {"failing"};
+        const gr::settings::Rejected named        = refusedStart(aloneNames, "start-named", alone);
+        expect(holdsKey(named, "failing")) << gr::settings::describeRejected(named);
+        expect(!holdsKey(named, alone.front())) << gr::settings::describeRejected(named);
+        expect(holdsKey(named, "sched")) << gr::settings::describeRejected(named);
+
+        std::vector<std::string>     twins;
+        const std::string_view       twinNames[] = {"twin", "twin"};
+        const gr::settings::Rejected shared      = refusedStart(twinNames, "start-named-twin", twins);
+        expect(holdsKey(shared, twins[0]) || holdsKey(shared, twins[1])) << gr::settings::describeRejected(shared);
+        expect(!holdsKey(shared, "twin")) << "a name two blocks share is no name of one block: " << gr::settings::describeRejected(shared);
+    };
+
     "a failed run's result carries the block's error"_test = [] {
         registerTestBlocks();
         RuntimeGraph graph;
@@ -964,7 +1302,9 @@ const boost::ut::suite<"background run"> backgroundRunTests = [] {
         auto              runtime = Runtime::create(std::move(graph));
         expect(fatal(runtime.has_value())) << messageOf(runtime);
 
-        expect(fatal(runtime->start().has_value()));
+        const std::expected<gr::settings::Values, gr::settings::Rejected> started = runtime->start();
+        expect(fatal(!started.has_value())) << "a start that left the graph not running returned values";
+        expect(std::ranges::any_of(started.error(), [](const gr::settings::Rejection& entry) { return entry.reason.contains("the source refused to start"); })) << gr::settings::describeRejected(started.error());
         expect(fatal(runtime->waitFor(10s))) << "the failing run did not end";
         const std::expected<void, RuntimeError> result = runtime->result();
         expect(fatal(!result.has_value())) << "a run whose block could not start reported success";
@@ -1156,7 +1496,6 @@ const boost::ut::suite<"events and send"> eventTests = [] {
 
     "the endpoint names are the framework's"_test = [] {
         expect(eq(Runtime::kSettingsEndpoint, std::string_view(block::property::kSetting)));
-        expect(eq(Runtime::kStagedSettingsEndpoint, std::string_view(block::property::kStagedSetting)));
         expect(eq(Runtime::kGraphGRCEndpoint, std::string_view(gr::scheduler::property::kGraphGRC)));
     };
 
@@ -1181,47 +1520,47 @@ const boost::ut::suite<"events and send"> eventTests = [] {
     // a reply is told from a notification by its command and matched to its request by its id
     "an event carries its message's command and request id"_test = [] {
         registerTestBlocks();
-        constexpr float kInitialGain = 2.0f;
-        constexpr float kStagedGain  = 5.0f;
-
         RuntimeGraph graph;
-        auto         source = graph.emplace("qa::RampSource", "source", {{"n_samples", gr::Size_t{1U << 20U}}, {"tag_every", gr::Size_t{0U}}});
-        auto         scale  = graph.emplace("qa::Scale", "scale", {{"gain", kInitialGain}});
-        auto         sink   = graph.emplace("qa::RecordingSink", "event-ids");
+        auto         source = graph.emplace("qa::EndlessSource", "source");
+        auto         scale  = graph.emplace("qa::Scale", "scale");
+        auto         sink   = graph.emplace("qa::CountingSink", "event-ids");
         expect(fatal(source.has_value() && scale.has_value() && sink.has_value()));
         expect(graph.connect(*source, "out", *scale, "in").has_value());
         expect(graph.connect(*scale, "out", *sink, "in").has_value());
-        const std::string scaleName(scale->uniqueName());
 
         auto runtime = Runtime::create(std::move(graph));
         expect(fatal(runtime.has_value())) << messageOf(runtime);
 
-        // queued before the run and handled by its first sweeps; the staged gain is applied while the graph runs
-        const std::string settings(Runtime::kSettingsEndpoint);
-        expect(runtime->send(RuntimeCommand::Get, scaleName, settings, {}, "get-1").has_value());
-        expect(runtime->send(RuntimeCommand::Subscribe, scaleName, settings, {}, "subscribe-2").has_value());
-        expect(runtime->send(RuntimeCommand::Set, scaleName, settings, {{"gain", kStagedGain}}).has_value());
-        expect(runtime->send(RuntimeCommand::Get, scaleName, settings).has_value());
+        // the scheduler takes the lifecycle endpoint's messages itself; the requests queued before the run are handled
+        // by its first sweeps, and the stop notifies the subscription of the states it passes
+        const std::string lifecycle(block::property::kLifeCycleState);
+        expect(runtime->send(RuntimeCommand::Get, "", lifecycle, {}, "get-1").has_value());
+        expect(runtime->send(RuntimeCommand::Subscribe, "", lifecycle, {}, "subscribe-2").has_value());
+        expect(runtime->send(RuntimeCommand::Get, "", lifecycle).has_value());
         const property_map absentEdge{{std::pmr::string(serialization_fields::EDGE_SOURCE_BLOCK), std::string("qa_no_such_block")}, {std::pmr::string(serialization_fields::EDGE_SOURCE_PORT), std::string("out")}};
         expect(runtime->send(RuntimeCommand::Set, "", gr::scheduler::property::kRemoveEdge, absentEdge, "remove-3").has_value());
-        expect(runtime->runAndWait().has_value());
-        std::ignore = takeCollected("event-ids");
+        expect(fatal(runtime->start().has_value()));
 
-        const std::vector<RuntimeEvent> events    = runtime->pollEvents();
-        const auto                      fromScale = [&events, &scaleName, &settings](RuntimeCommand command, std::string_view id) {
+        std::vector<RuntimeEvent> events;
+        const auto                fromLifecycle = [&events, &lifecycle](RuntimeCommand command, std::string_view id) {
             std::vector<RuntimeEvent> matching;
-            std::ranges::copy_if(events, std::back_inserter(matching), [&](const RuntimeEvent& event) { return event.source == scaleName && event.endpoint == settings && event.command == command && event.clientRequestID == id; });
+            std::ranges::copy_if(events, std::back_inserter(matching), [&](const RuntimeEvent& event) { return event.endpoint == lifecycle && event.command == command && event.clientRequestID == id; });
             return matching;
         };
+        for (const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10); fromLifecycle(RuntimeCommand::Final, "").empty() && std::chrono::steady_clock::now() < deadline;) {
+            std::ranges::move(runtime->pollEvents(), std::back_inserter(events));
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        runtime->stop();
+        std::ranges::move(runtime->pollEvents(), std::back_inserter(events));
+        expect(!fromLifecycle(RuntimeCommand::Notify, "subscribe-2").empty()) << "a Notify carries the subscription's id";
 
-        const std::vector<RuntimeEvent> replies = fromScale(RuntimeCommand::Final, "get-1");
+        const std::vector<RuntimeEvent> replies = fromLifecycle(RuntimeCommand::Final, "get-1");
         expect(fatal(eq(replies.size(), 1UZ))) << "a Get with an id is answered exactly once, by a Final carrying that id";
         expect(!replies.front().isError) << replies.front().text;
-        expect(floatAt(replies.front().data, "gain") == kInitialGain) << "the reply holds the settings the block had when it answered";
-
-        const std::vector<RuntimeEvent> notifications = fromScale(RuntimeCommand::Notify, "subscribe-2");
-        expect(std::ranges::any_of(notifications, [](const RuntimeEvent& event) { return floatAt(event.data, "gain").value_or(0.0f) == kStagedGain; })) << "a Notify carries the subscription's id and the staged value";
-        expect(eq(fromScale(RuntimeCommand::Final, "").size(), 1UZ)) << "the reply to a Get sent without an id carries an empty id";
+        expect(replies.front().data.contains("state")) << "the reply holds the scheduler's state";
+        expect(fromLifecycle(RuntimeCommand::Final, "subscribe-2").empty()) << "a Subscribe got a reply";
+        expect(eq(fromLifecycle(RuntimeCommand::Final, "").size(), 1UZ)) << "the reply to a Get sent without an id carries an empty id";
 
         const auto refused = std::ranges::find_if(events, [](const RuntimeEvent& event) { return event.isError && event.clientRequestID == "remove-3"; });
         expect(fatal(refused != events.end())) << "an error reply carries the id of its request";
@@ -1263,7 +1602,7 @@ const boost::ut::suite<"events and send"> eventTests = [] {
         expect(fatal(runtime.has_value())) << messageOf(runtime);
 
         for (std::size_t request = 0UZ; request < kRequests; ++request) {
-            expect(fatal(runtime->send(RuntimeCommand::Get, sinkName, Runtime::kSettingsEndpoint, {}, std::format("poll-{}", request)).has_value()));
+            expect(fatal(runtime->send(RuntimeCommand::Set, sinkName, block::property::kEcho, {}, std::format("poll-{}", request)).has_value()));
         }
         expect(runtime->runAndWait().has_value());
         std::ignore = takeCollected("all-pending");
@@ -1296,7 +1635,7 @@ const boost::ut::suite<"events and send"> eventTests = [] {
             senders.emplace_back([&runtime, &nRefused, &allReady, &sinkName, thread] {
                 allReady.arrive_and_wait();
                 for (std::size_t request = 0UZ; request < kRequestsPerThread; ++request) {
-                    if (!runtime->send(RuntimeCommand::Get, sinkName, Runtime::kSettingsEndpoint, {}, std::format("send-{}-{}", thread, request))) {
+                    if (!runtime->send(RuntimeCommand::Set, sinkName, block::property::kEcho, {}, std::format("send-{}-{}", thread, request))) {
                         nRefused.fetch_add(1UZ, std::memory_order_relaxed);
                     }
                 }
@@ -1409,11 +1748,11 @@ const boost::ut::suite<"refusals return"> refusalTests = [] {
 
         const auto recipe = graph->emplace("qa::LevelRecipe", "recipe", {{"level", 2.0f}, {"disconnect_on_done", false}});
         expect(fatal(recipe.has_value())) << messageOf(recipe);
-        const std::optional<pmt::Value> disconnects = recipe->get(std::string("disconnect_on_done"));
-        expect(disconnects.has_value() && !disconnects->value_or(true)) << "the setting the recipe does not export is not in force";
+        const std::expected<bool, settings::Rejected> disconnects = recipe->get<bool>("disconnect_on_done");
+        expect(disconnects.has_value() && !*disconnects) << "the setting the recipe does not export is not in force";
         const auto inner = graph->find("inner");
         expect(fatal(inner.has_value())) << messageOf(inner);
-        expect(eq(floatAt(inner->get(), "gain").value_or(0.0f), 2.0f)) << "the exported parameter did not reach the interior setting";
+        expect(eq(floatAt(settings::heldValues(inner->get()), "gain").value_or(0.0f), 2.0f)) << "the exported parameter did not reach the interior setting";
     };
 
     "a staged value the block cannot convert is an error, not an exception"_test = [] {
@@ -1421,11 +1760,11 @@ const boost::ut::suite<"refusals return"> refusalTests = [] {
         RuntimeGraph graph;
         auto         scale = graph.emplace("qa::Scale", "scale");
         expect(fatal(scale.has_value()));
-        std::optional<std::expected<void, RuntimeError>> refused;
-        expect(nothrow([&] { refused.emplace(scale->setStaged({{"gain", std::string("loud")}})); }));
+        std::optional<std::expected<settings::Values, settings::Rejected>> refused;
+        expect(nothrow([&] { refused.emplace(scale->set({{"gain", std::string("loud")}})); }));
         expect(fatal(refused.has_value() && !refused->has_value())) << "a value that does not convert was taken";
-        expect(refused->error().message.contains("gain")) << refused->error().message;
-        expect(eq(refused->error().where, std::string("BlockHandle::setStaged")));
+        expect(fatal(eq(refused->error().size(), 1UZ)));
+        expect(eq(refused->error().front().key, std::string("gain"))) << messageOf(*refused);
     };
 
     "a staged key the block does not declare is an error naming the key, and nothing is staged"_test = [] {
@@ -1435,13 +1774,13 @@ const boost::ut::suite<"refusals return"> refusalTests = [] {
         auto         scale = graph.add(std::shared_ptr<BlockModel>(scaleBlock), "scale");
         expect(fatal(scale.has_value())) << messageOf(scale);
 
-        const std::expected<void, RuntimeError> refused = scale->setStaged({{"gain", 5.0f}, {"qa_undeclared", 1.0f}});
+        const std::expected<settings::Values, settings::Rejected> refused = scale->set({{"gain", 5.0f}, {"qa_undeclared", 1.0f}});
         expect(fatal(!refused.has_value())) << "a key the block does not declare was taken";
-        expect(refused.error().message.contains("qa_undeclared")) << refused.error().message;
-        expect(scaleBlock->settings().stagedParameters().empty()) << "a refused call staged the declared key beside the undeclared one";
+        expect(std::ranges::any_of(refused.error(), [](const settings::Rejection& entry) { return entry.key == "qa_undeclared"; })) << messageOf(refused);
+        expect(scaleBlock->settings().get<float>("gain") != 5.0f) << "a refused call staged the declared key beside the undeclared one";
 
-        expect(scale->setStaged({{"gain", 5.0f}}).has_value()) << "a declared key alone is refused";
-        expect(!scaleBlock->settings().stagedParameters().empty()) << "a declared key was not staged";
+        expect(scale->set({{"gain", 5.0f}}).has_value()) << "a declared key alone is refused";
+        expect(scaleBlock->settings().get<float>("gain") == 5.0f) << "a declared key was not staged";
     };
 
     "a staged value the block cannot convert stages none of the keys beside it"_test = [] {
@@ -1458,14 +1797,13 @@ const boost::ut::suite<"refusals return"> refusalTests = [] {
         // The map's key order is not fixed. Each key takes a turn as the refused one, so in some call a key whose value
         // converts comes before it.
         const property_map accepted{{"gain", 5.0f}, {"enabled", false}, {"taps", std::vector<float>{2.0f}}};
-        const property_map before = scale->get();
+        const property_map before = settings::heldValues(scale->get());
         for (const std::string refusedKey : {"gain", "enabled", "taps"}) {
             property_map parameters = accepted;
             parameters.insert_or_assign(std::pmr::string(refusedKey), std::string("loud"));
-            const std::expected<void, RuntimeError> refused = scale->setStaged(parameters);
+            const std::expected<settings::Values, settings::Rejected> refused = scale->set(parameters);
             expect(fatal(!refused.has_value())) << refusedKey << ": a value that does not convert was taken";
-            expect(scaleBlock->settings().stagedParameters().empty()) << refusedKey << ": a refused call staged the keys whose values converted";
-            expect(!scaleBlock->settings().changed()) << refusedKey << ": a refused call marked the settings changed";
+            expect(settings::heldValues(scale->get()) == before) << refusedKey << ": a refused call staged the keys whose values converted";
         }
 
         auto runtime = Runtime::create(std::move(graph));
@@ -1473,7 +1811,7 @@ const boost::ut::suite<"refusals return"> refusalTests = [] {
         expect(runtime->runAndWait().has_value());
         std::ignore = takeCollected("refused-sink");
         for (const auto& [key, value] : before) {
-            expect(scale->get(std::string(std::string_view(key))) == std::optional<pmt::Value>(value)) << key << ": the run applied a value of a refused call";
+            expect(scale->get<pmt::Value>(std::string_view(key)) == value) << key << ": the run applied a value of a refused call";
         }
     };
 
@@ -1518,15 +1856,62 @@ const boost::ut::suite<"refusals return"> refusalTests = [] {
         registerTestBlocks();
         auto runtime = Runtime::create(RuntimeGraph{});
         expect(fatal(runtime.has_value())) << messageOf(runtime);
-        BlockHandle                     scheduler = runtime->scheduler();
-        const std::optional<pmt::Value> before    = scheduler.get(std::string("timeout_ms"));
-        expect(fatal(before.has_value()));
+        BlockHandle                                         scheduler = runtime->scheduler();
+        const std::expected<gr::Size_t, settings::Rejected> before    = scheduler.get<gr::Size_t>("timeout_ms");
+        expect(fatal(before.has_value())) << messageOf(before);
         expect(scheduler.writableMembers().contains("timeout_ms")) << "the scheduler does not list its own setting";
 
-        const std::expected<void, RuntimeError> refused = scheduler.setStaged({{"timeout_ms", gr::Size_t{77U}}});
-        expect(fatal(!refused.has_value())) << "the scheduler's handle staged a setting the scheduler never applies";
-        expect(refused.error().message.contains("Runtime::create()")) << refused.error().message;
-        expect(scheduler.get(std::string("timeout_ms")) == before) << "the refused call changed the scheduler's setting";
+        const std::expected<settings::Values, settings::Rejected> refused = scheduler.set({{"timeout_ms", gr::Size_t{77U}}});
+        expect(fatal(!refused.has_value())) << "the scheduler's handle set a setting outside Runtime::create()";
+        expect(fatal(eq(refused.error().size(), 1UZ)));
+        expect(refused.error().front().key.empty()) << "the handle's own refusal names a key";
+        expect(refused.error().front().reason.contains("Runtime::create()")) << messageOf(refused);
+        expect(!scheduler.check({{"timeout_ms", gr::Size_t{77U}}}).has_value()) << "the scheduler's handle checked a setting outside Runtime::create()";
+        expect(scheduler.get<gr::Size_t>("timeout_ms") == before) << "the refused call changed the scheduler's setting";
+    };
+
+    "a block's handle sets, checks and reads as the block's settings do, and an empty handle refuses each call"_test = [] {
+        registerTestBlocks();
+        RuntimeGraph graph;
+        auto         source = graph.emplace("qa::EndlessSource", "source");
+        auto         scale  = graph.emplace("qa::Scale", "scale", {{"gain", 2.0f}});
+        auto         sink   = graph.emplace("qa::CountingSink", "handle-forms");
+        expect(fatal(source.has_value() && scale.has_value() && sink.has_value()));
+        expect(graph.connect(*source, "out", *scale, "in").has_value());
+        expect(graph.connect(*scale, "out", *sink, "in").has_value());
+
+        const std::expected<settings::Values, settings::Rejected> stopped = scale->set("gain", 3.0f, settings::noWait);
+        expect(fatal(stopped.has_value() && stopped->contains("gain"))) << messageOf(stopped);
+        expect(eq(stopped->at("gain").reason, std::string(settings::kPendingNotRunning)));
+        expect(scale->get<float>("gain") == 3.0f) << "a read does not give the value that waits for the start";
+        const std::expected<settings::Value, settings::Rejected> undeclared = scale->get("qa_undeclared");
+        expect(fatal(!undeclared.has_value()));
+        expect(eq(undeclared.error().front().key, std::string("qa_undeclared")));
+        const std::expected<void, settings::Rejected> checked = scale->check({{"gain", std::string("loud")}});
+        expect(fatal(!checked.has_value())) << "the check took a value that does not convert";
+        expect(eq(checked.error().front().key, std::string("gain")));
+        expect(scale->get<float>("gain") == 3.0f) << "a check stored its value";
+
+        auto runtime = Runtime::create(std::move(graph));
+        expect(fatal(runtime.has_value())) << messageOf(runtime);
+        expect(fatal(runtime->start().has_value()));
+        // with no timeout the call waits for the running block's apply, so the key settles and the result holds no entry
+        const std::expected<settings::Values, settings::Rejected> applied = scale->set({{"gain", 5.0f}});
+        expect(applied.has_value() && applied->empty()) << messageOf(applied);
+        const std::expected<settings::Values, settings::Rejected> read = scale->get();
+        expect(fatal(read.has_value())) << messageOf(read);
+        const std::expected<settings::Values, settings::Rejected> restored = scale->set(gr::testing::writableValues(*scale, read), std::chrono::milliseconds(30000));
+        expect(restored.has_value() && restored->empty()) << messageOf(restored);
+        expect(scale->get<float>("gain") == 5.0f);
+        runtime->stop();
+
+        BlockHandle                                               empty;
+        const std::expected<settings::Values, settings::Rejected> setEmpty = empty.set({{"gain", 1.0f}});
+        expect(fatal(!setEmpty.has_value() && eq(setEmpty.error().size(), 1UZ)));
+        expect(setEmpty.error().front().key.empty());
+        expect(!empty.check({}).has_value());
+        expect(!empty.get().has_value());
+        expect(!empty.get<float>("gain").has_value());
     };
 };
 

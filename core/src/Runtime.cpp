@@ -9,6 +9,7 @@
 #include <gnuradio-4.0/Port.hpp>
 #include <gnuradio-4.0/RecipeInstantiation.hpp>
 #include <gnuradio-4.0/SchedulerModel.hpp>
+#include <gnuradio-4.0/Settings.hpp>
 #include <gnuradio-4.0/YamlPmt.hpp>
 
 #include "ShippedSchedulers.hpp"
@@ -17,12 +18,16 @@
 #include <condition_variable>
 #include <deque>
 #include <format>
+#include <functional>
+#include <map>
 #include <mutex>
 #include <ranges>
+#include <string>
 #include <system_error>
 #include <thread>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 namespace gr {
 
@@ -53,6 +58,20 @@ namespace {
 
 BlockModel* modelOf(const std::shared_ptr<void>& handle) noexcept { return static_cast<BlockModel*>(handle.get()); }
 
+// a refusal that names no key: by a handle itself, or of a run
+[[nodiscard]] settings::Rejected refusal(std::string reason) { return settings::Rejected{settings::Rejection{.key = {}, .reason = std::move(reason)}}; }
+
+// the settings a handle's `set` and `check` reach; the scheduler's are given to `Runtime::create()` alone
+[[nodiscard]] std::expected<SettingsBase*, settings::Rejected> settingsToWrite(const std::shared_ptr<void>& model, bool isScheduler) {
+    if (!model) {
+        return std::unexpected(refusal("empty block handle"));
+    }
+    if (isScheduler) {
+        return std::unexpected(refusal("scheduler settings only through Runtime::create()"));
+    }
+    return &modelOf(model)->settings();
+}
+
 std::shared_ptr<BlockModel> modelPtrOf(const std::shared_ptr<void>& handle) noexcept { return std::static_pointer_cast<BlockModel>(handle); }
 
 std::uint64_t toNanoseconds(std::chrono::system_clock::time_point when) { //
@@ -62,6 +81,49 @@ std::uint64_t toNanoseconds(std::chrono::system_clock::time_point when) { //
 RuntimeError toRuntimeError(const Error& error) { return RuntimeError{.message = error.message, .where = error.srcLoc(), .time = toNanoseconds(error.errorTime)}; }
 
 RuntimeError localError(std::string message, std::string_view where) { return RuntimeError{.message = std::move(message), .where = std::string(where), .time = 0ULL}; }
+
+// an error that settings refused, which carries the refused entries. An entry's key reads `<block>.<key>`, and an
+// entry that names no key reads `<block>`, the name the caller gave the block
+RuntimeError refusedError(std::string message, settings::Rejected rejected, std::string_view block, std::string_view where) {
+    RuntimeError error = localError(std::move(message), where);
+    if (!block.empty()) {
+        for (settings::Rejection& entry : rejected) {
+            entry.key = entry.key.empty() ? std::string(block) : std::format("{}.{}", block, entry.key);
+        }
+    }
+    error.rejected = std::move(rejected);
+    return error;
+}
+
+// the name an entry of a start or a resume gives each block of `root`, `root` included: the name the caller gave it, and
+// for a block inside a subgraph or a definition `<outer>.<inner>`, as the entries of its construction read. The blocks
+// of a nested scheduler read their own names, as at their construction. A name two blocks share gives each its unique
+// name
+std::map<const BlockModel*, std::string> entryNames(const BlockModel& root) {
+    const auto                                             given = [](const BlockModel& block) { return std::string(block.name().empty() ? block.uniqueName() : block.name()); };
+    std::vector<std::pair<const BlockModel*, std::string>> named{{&root, given(root)}};
+    const auto                                             walk = [&named, &given](const BlockModel& group, const std::string& prefix, const auto& self) -> void {
+        for (const std::shared_ptr<BlockModel>& block : group.blocks()) {
+            std::string name = prefix.empty() ? given(*block) : std::format("{}.{}", prefix, given(*block));
+            if (block->blockCategory() == block::Category::TransparentBlockGroup) {
+                self(*block, name, self);
+            } else if (block->blockCategory() == block::Category::ScheduledBlockGroup) {
+                self(*block, std::string{}, self);
+            }
+            named.emplace_back(block.get(), std::move(name));
+        }
+    };
+    walk(root, std::string{}, walk);
+    std::map<std::string, std::size_t, std::less<>> nUses;
+    for (const auto& [block, name] : named) {
+        ++nUses[name];
+    }
+    std::map<const BlockModel*, std::string> names;
+    for (auto& [block, name] : named) {
+        names.emplace(block, nUses.at(name) > 1UZ ? std::string(block->uniqueName()) : std::move(name));
+    }
+    return names;
+}
 
 // the loader given, or the process's own, which lives as long as the process and is held without ownership
 std::shared_ptr<PluginLoader> loaderOrGlobal(std::shared_ptr<PluginLoader> loader) {
@@ -165,12 +227,12 @@ struct Runtime::Impl {
     std::uint64_t                     nRunsReturned  = 0ULL; // runs whose scheduler call has returned
     std::uint64_t                     nRunsEnded     = 0ULL;
     std::uint64_t                     stoppedRun     = 0ULL;  // the last run whose stop was requested, 0 for none
+    std::uint64_t                     runningRun     = 0ULL;  // the last run whose scheduler moved its settings to running
     bool                              requestingStop = false; // a stop request has not returned
     std::expected<void, RuntimeError> lastResult;             // of the last run that ended, success before the first
 
     static constexpr std::size_t               kMaxPendingEvents = 1024UZ;
     static constexpr std::chrono::milliseconds kStopPollInterval{10}; // requestStop() reads the scheduler's state this often
-    static constexpr std::chrono::milliseconds kStartPollInterval{1}; // start() reads the scheduler's state this often
 
     Impl()                       = default;
     Impl(const Impl&)            = delete;
@@ -178,6 +240,9 @@ struct Runtime::Impl {
 
     ~Impl() {
         std::ignore = stopRun(std::nullopt);
+        if (scheduler) {
+            settings::detail::FrameworkAccess::onSettingsRunning(*scheduler, {}); // a handle may keep the scheduler past this runtime
+        }
         if (runThread.joinable()) {
             runThread.join();
         }
@@ -202,9 +267,6 @@ struct Runtime::Impl {
             result = std::unexpected(localError(error.what(), where));
         } catch (...) {
             result = std::unexpected(localError("the run threw an exception of unknown type", where));
-        }
-        if (Graph* graph = schedulerBlock->graph(); graph != nullptr) {
-            gr::graph::forEachBlock<block::Category::All>(*graph, [](const std::shared_ptr<BlockModel>& block) { block->settings().updateActiveParameters(); });
         }
         drain();
         return result;
@@ -295,6 +357,21 @@ struct Runtime::Impl {
             pending.pop_front();
         }
     }
+
+    // each key of the latest start or resume of every block the scheduler runs, those of its subgraphs and of the
+    // schedulers nested in it included, as `block.key`, the block named as a refusal of the start names it
+    [[nodiscard]] settings::Values runValues() const {
+        const std::map<const BlockModel*, std::string> names = entryNames(*schedulerBlock);
+        settings::Values                               values;
+        graph::forEachBlock<block::Category::All>(*schedulerBlock, [&values, &names](const std::shared_ptr<BlockModel>& block) {
+            const auto        named = names.find(block.get());
+            const std::string name  = named != names.end() ? named->second : std::string(block->uniqueName());
+            for (auto& [key, entry] : settings::detail::FrameworkAccess::runOutcome(block->settings())) {
+                values.insert_or_assign(std::format("{}.{}", name, key), std::move(entry));
+            }
+        });
+        return values;
+    }
 };
 
 BlockHandle::BlockHandle(std::shared_ptr<void> model, std::shared_ptr<PluginLoader> loader, bool isScheduler) noexcept : _loader(std::move(loader)), _model(std::move(model)), _isScheduler(isScheduler) {}
@@ -306,10 +383,8 @@ std::string BlockHandle::name() const {
     if (!_model) {
         return {};
     }
-    if (const std::optional<pmt::Value> named = modelOf(_model)->settings().get(std::string("name")); named.has_value()) {
-        if (const std::string_view value = named->value_or(std::string_view{}); value.data() != nullptr) {
-            return std::string(value);
-        }
+    if (const std::expected<std::string, settings::Rejected> named = modelOf(_model)->settings().get<std::string>("name"); named.has_value()) {
+        return *named;
     }
     return std::string(modelOf(_model)->name());
 }
@@ -318,40 +393,31 @@ std::string BlockHandle::uniqueName() const { return _model ? std::string(modelO
 
 std::string BlockHandle::typeName() const { return _model ? std::string(modelOf(_model)->typeName()) : std::string{}; }
 
-std::expected<void, RuntimeError> BlockHandle::setStaged(const property_map& parameters) {
-    constexpr std::string_view where = "BlockHandle::setStaged";
-    if (!_model) {
-        return std::unexpected(localError("block handle is empty", where));
-    }
-    if (_isScheduler) {
-        return std::unexpected(localError("a scheduler applies no staged setting -- give its settings to Runtime::create() as schedulerParameters", where));
-    }
-    SettingsBase&                settings = modelOf(_model)->settings();
-    const std::set<std::string>& declared = settings.writableMembers();
-
-    std::vector<std::string> undeclared;
-    for (const auto& [key, value] : parameters) {
-        if (std::string keyName{std::string_view(key)}; !declared.contains(keyName)) {
-            undeclared.push_back(std::move(keyName));
-        }
-    }
-    if (!undeclared.empty()) {
-        return std::unexpected(localError(std::format("block '{}' declares no setting [{}]", uniqueName(), commaSeparated(undeclared)), where));
-    }
-    try {
-        // every key is declared, and setStaged() returns only undeclared keys
-        std::ignore = settings.setStaged(parameters);
-    } catch (const gr::exception& error) { // a value that does not convert to its setting's type
-        return std::unexpected(localError(error.message, where));
-    } catch (const std::exception& error) {
-        return std::unexpected(localError(error.what(), where));
-    }
-    return {};
+std::expected<settings::Values, settings::Rejected> BlockHandle::set(const property_map& changes, settings::Timeout timeout) {
+    return settingsToWrite(_model, _isScheduler).and_then([&](SettingsBase* settings) { return settings->set(changes, timeout); });
 }
 
-property_map BlockHandle::get(std::span<const std::string> keys) const { return _model ? modelOf(_model)->settings().get(keys) : property_map{}; }
+std::expected<settings::Values, settings::Rejected> BlockHandle::set(std::string_view key, pmt::Value value, settings::Timeout timeout) {
+    return settingsToWrite(_model, _isScheduler).and_then([&](SettingsBase* settings) { return settings->set(key, std::move(value), timeout); });
+}
 
-std::optional<pmt::Value> BlockHandle::get(const std::string& key) const { return _model ? modelOf(_model)->settings().get(key) : std::nullopt; }
+std::expected<void, settings::Rejected> BlockHandle::check(const property_map& changes) {
+    return settingsToWrite(_model, _isScheduler).and_then([&](SettingsBase* settings) { return settings->check(changes); });
+}
+
+std::expected<settings::Value, settings::Rejected> BlockHandle::get(std::string_view key) const {
+    if (!_model) {
+        return std::unexpected(refusal("empty block handle"));
+    }
+    return modelOf(_model)->settings().get(key);
+}
+
+std::expected<settings::Values, settings::Rejected> BlockHandle::get(std::span<const std::string> keys) const {
+    if (!_model) {
+        return std::unexpected(refusal("empty block handle"));
+    }
+    return modelOf(_model)->settings().get(keys);
+}
 
 std::set<std::string> BlockHandle::writableMembers() const { return _model ? modelOf(_model)->settings().writableMembers() : std::set<std::string>{}; }
 
@@ -399,7 +465,9 @@ std::expected<BlockHandle, RuntimeError> RuntimeGraph::emplace(std::string_view 
         }
         model->setName(std::string(name)); // before addBlock, for init() to see the final name
         _impl->graph->addBlock(model);
-    } catch (const gr::exception& error) { // a constructor or init() refuses a parameter
+    } catch (const settings::RefusedSettings& refused) { // a constructor or init() refuses a parameter
+        return std::unexpected(refusedError(refused.message, refused.rejected, refused.block, where));
+    } catch (const gr::exception& error) {
         return std::unexpected(localError(error.message, where));
     } catch (const std::exception& error) {
         return std::unexpected(localError(error.what(), where));
@@ -420,7 +488,9 @@ std::expected<BlockHandle, RuntimeError> RuntimeGraph::add(std::shared_ptr<Block
     }
     try {
         _impl->graph->addBlock(block);
-    } catch (const gr::exception& error) { // init() refuses a parameter
+    } catch (const settings::RefusedSettings& refused) { // init() refuses a parameter
+        return std::unexpected(refusedError(refused.message, refused.rejected, refused.block, where));
+    } catch (const gr::exception& error) {
         return std::unexpected(localError(error.message, where));
     } catch (const std::exception& error) {
         return std::unexpected(localError(error.what(), where));
@@ -510,6 +580,8 @@ std::expected<RuntimeGraph, RuntimeError> RuntimeGraph::fromYaml(std::shared_ptr
             impl->documentUniqueNames.emplace(uniqueName, block);
         }
         return RuntimeGraph(std::move(impl));
+    } catch (const settings::RefusedSettings& refused) {
+        return std::unexpected(refusedError(refused.message, refused.rejected, refused.block, where));
     } catch (const gr::exception& error) {
         return std::unexpected(localError(error.message, where));
     } catch (const gr::Error& error) {
@@ -540,7 +612,9 @@ std::expected<Runtime, RuntimeError> Runtime::create(RuntimeGraph&& graph, std::
     std::shared_ptr<SchedulerModel> scheduler;
     try {
         scheduler = loader.instantiateScheduler(type, schedulerParameters);
-    } catch (const gr::exception& error) { // the scheduler's constructor refuses a value
+    } catch (const settings::RefusedSettings& refused) { // the scheduler's constructor refuses a value
+        return std::unexpected(refusedError(refused.message, refused.rejected, refused.block, where));
+    } catch (const gr::exception& error) {
         return std::unexpected(localError(error.message, where));
     } catch (const std::exception& error) {
         return std::unexpected(localError(error.what(), where));
@@ -552,40 +626,37 @@ std::expected<Runtime, RuntimeError> Runtime::create(RuntimeGraph&& graph, std::
     auto impl            = std::make_unique<Runtime::Impl>();
     impl->scheduler      = std::move(scheduler);
     impl->schedulerBlock = SchedulerModel::asBlockModelPtr(impl->scheduler);
+    settings::detail::FrameworkAccess::onSettingsRunning(*impl->scheduler, [state = impl.get()] {
+        std::lock_guard lock(state->runMutex);
+        state->runningRun = state->nRunsStarted;
+        state->runEnded.notify_all();
+    });
 
     // the scheduler's constructor files a key it does not declare as meta-information and keeps the default
     const std::set<std::string>& declared = impl->schedulerBlock->settings().writableMembers();
     for (const auto& [key, value] : schedulerParameters) {
         if (const std::string keyName{std::string_view(key)}; !declared.contains(keyName)) {
-            return std::unexpected(localError(std::format("scheduler type '{}' declares no setting '{}'", type, keyName), where));
-        }
-    }
-
-    // A plugin's scheduler may ignore its constructor's parameters. The parameters are applied to the built scheduler as a
-    // settings change.
-    if (!schedulerParameters.empty()) {
-        SettingsBase& settings = impl->schedulerBlock->settings();
-        try {
-            std::ignore = settings.set(schedulerParameters); // every key is declared, checked above
-            if (!settings.activateContext().has_value()) {
-                return std::unexpected(localError(std::format("scheduler type '{}' could not activate its settings", type), where));
-            }
-            if (const ApplyStagedParametersResult applied = settings.applyStagedParameters(); !applied.failedParameters.empty()) {
-                return std::unexpected(localError(applied.refusal, where));
-            }
-        } catch (const gr::exception& error) {
-            return std::unexpected(localError(error.message, where));
-        } catch (const std::exception& error) {
-            return std::unexpected(localError(error.what(), where));
+            return std::unexpected(refusedError(std::format("scheduler type '{}' declares no setting '{}'", type, keyName), settings::Rejected{settings::Rejection{.key = keyName, .reason = "unknown setting"}}, impl->schedulerBlock->name(), where));
         }
     }
 
     // A msgOut with no reader turns a child's error into an exception thrown on a worker thread, and the reason is lost.
+    // The scheduler reports there a pool name it does not know, which the parameters below may give.
     if (auto connected = impl->schedulerBlock->msgOut->connect(impl->events); !connected) {
         return std::unexpected(toRuntimeError(connected.error()));
     }
     if (auto connected = impl->commands.connect(*impl->schedulerBlock->msgIn); !connected) {
         return std::unexpected(toRuntimeError(connected.error()));
+    }
+
+    // A plugin's scheduler may ignore its constructor's parameters. The parameters are applied to the built scheduler as a
+    // settings change.
+    if (!schedulerParameters.empty()) {
+        // a stopped scheduler applies its settings at the call
+        const std::expected<settings::Values, settings::Rejected> applied = impl->schedulerBlock->settings().set(schedulerParameters);
+        if (const settings::Rejected refused = applied ? settings::detail::failedKeys(*applied) : applied.error(); !refused.empty()) {
+            return std::unexpected(refusedError(std::format("scheduler type '{}': {}", type, settings::describeRejected(refused)), refused, impl->schedulerBlock->name(), where));
+        }
     }
 
     impl->scheduler->setGraph(std::move(*graph._impl->graph));
@@ -605,40 +676,97 @@ std::expected<void, RuntimeError> Runtime::runAndWait() {
             return std::unexpected(localError("a run is in progress", where));
         }
         ++_impl->nRunsStarted;
+        settings::detail::FrameworkAccess::returnStartValues(*_impl->scheduler, false);
     }
     std::expected<void, RuntimeError> result = _impl->runToEnd(where);
     _impl->endRun(result);
     return result;
 }
 
-std::expected<void, RuntimeError> Runtime::start() {
-    constexpr std::string_view where = "Runtime::start";
+std::expected<settings::Values, settings::Rejected> Runtime::start() {
+    using settings::detail::FrameworkAccess;
     if (!_impl) {
-        return std::unexpected(localError("runtime handle is empty", where));
+        return std::unexpected(refusal("runtime handle is empty"));
     }
     Impl&            impl = *_impl;
     std::unique_lock lock(impl.runMutex);
     if (impl.runInProgress()) {
-        return std::unexpected(localError("a run is in progress", where));
+        return std::unexpected(refusal("a run is in progress"));
     }
     if (impl.runThread.joinable()) { // the thread of an ended run, which does not take runMutex again
         impl.runThread.join();
     }
     const std::uint64_t run = ++impl.nRunsStarted;
+    settings::detail::FrameworkAccess::returnStartValues(*impl.scheduler, true);
     try {
         impl.runThread = std::thread([&impl] { impl.endRun(impl.runToEnd("Runtime::start")); });
     } catch (const std::system_error& error) {
-        impl.lastResult = std::unexpected(localError(std::format("the run's thread did not start: {}", error.what()), where));
+        impl.lastResult = std::unexpected(localError(std::format("the run's thread did not start: {}", error.what()), "Runtime::start"));
         ++impl.nRunsReturned;
         ++impl.nRunsEnded;
-        return std::unexpected(impl.lastResult.error());
+        return std::unexpected(refusal(impl.lastResult.error().message));
     }
-    // the previous run left the scheduler in a state that is not active. An active state is this run's.
-    const auto runningOrReturned = [&impl, run] { return lifecycle::isActive(impl.schedulerBlock->state()) || impl.nRunsReturned >= run; };
-    while (!runningOrReturned()) {
-        std::ignore = impl.runEnded.wait_for(lock, Impl::kStartPollInterval);
+    // the scheduler's settings run once every block has started and its workers are released
+    impl.runEnded.wait(lock, [&impl, run] { return impl.runningRun >= run || impl.nRunsEnded >= run; });
+    // a run that ended on an error after its start returns the values, and result() reports the error. A start that
+    // failed returns the refusal. A stop asked during the start ends the run with no error and before the release, and
+    // the start returns no values for a graph that does not run
+    if (impl.runningRun < run && impl.lastResult.has_value()) {
+        return std::unexpected(settings::Rejected{settings::Rejection{.key = entryNames(*impl.schedulerBlock).at(impl.schedulerBlock.get()), .reason = "stopped during the start"}});
+    }
+    if (impl.runningRun < run && impl.scheduler->startError().has_value()) {
+        const std::map<const BlockModel*, std::string> names = entryNames(*impl.schedulerBlock);
+        settings::Rejected                             refused;
+        graph::forEachBlock<block::Category::All>(*impl.schedulerBlock, [&refused, &names](const std::shared_ptr<BlockModel>& block) {
+            const auto        named = names.find(block.get());
+            const std::string name  = named != names.end() ? named->second : std::string(block->uniqueName());
+            for (settings::Rejection entry : FrameworkAccess::runRefusals(block->settings())) {
+                entry.key = entry.key.empty() ? name : std::format("{}.{}", name, entry.key);
+                refused.push_back(std::move(entry));
+            }
+        });
+        refused.push_back(settings::Rejection{.key = names.at(impl.schedulerBlock.get()), .reason = impl.lastResult.error().message});
+        return std::unexpected(std::move(refused));
+    }
+    lock.unlock();
+    return impl.runValues();
+}
+
+std::expected<void, RuntimeError> Runtime::pause() {
+    constexpr std::string_view where = "Runtime::pause";
+    if (!_impl) {
+        return std::unexpected(localError("runtime handle is empty", where));
+    }
+    BlockModel& scheduler = *_impl->schedulerBlock;
+    if (scheduler.state() != lifecycle::State::RUNNING) {
+        return std::unexpected(localError(std::format("the scheduler is {}, not running", gr::meta::enumName(scheduler.state()).value_or("?")), where));
+    }
+    if (std::expected<void, Error> paused = scheduler.changeStateTo(lifecycle::State::REQUESTED_PAUSE); !paused) {
+        return std::unexpected(toRuntimeError(paused.error()));
+    }
+    if (scheduler.state() != lifecycle::State::PAUSED) { // a stop overtook the pause
+        return std::unexpected(localError(std::format("the scheduler is {}, not paused", gr::meta::enumName(scheduler.state()).value_or("?")), where));
     }
     return {};
+}
+
+std::expected<settings::Values, settings::Rejected> Runtime::resume() {
+    if (!_impl) {
+        return std::unexpected(refusal("runtime handle is empty"));
+    }
+    BlockModel& scheduler = *_impl->schedulerBlock;
+    const auto  refusal   = [&scheduler](std::string reason) { return settings::Rejected{settings::Rejection{.key = entryNames(scheduler).at(&scheduler), .reason = std::move(reason)}}; };
+    if (scheduler.state() != lifecycle::State::PAUSED) {
+        return std::unexpected(refusal(std::format("the scheduler is {}, not paused", gr::meta::enumName(scheduler.state()).value_or("?"))));
+    }
+    if (std::expected<void, Error> resumed = scheduler.changeStateTo(lifecycle::State::RUNNING); !resumed) {
+        return std::unexpected(refusal(resumed.error().message));
+    }
+    if (scheduler.state() != lifecycle::State::RUNNING) { // the resume could not connect an edge, or a stop overtook it
+        const std::optional<Error> failed = _impl->scheduler->startError();
+        return std::unexpected(refusal(failed ? failed->message : std::format("the scheduler is {} after the resume", gr::meta::enumName(scheduler.state()).value_or("?"))));
+    }
+    return _impl->runValues();
 }
 
 void Runtime::stop() {

@@ -49,8 +49,13 @@ set(_CORE_TESTS
     qa_Settings
     qa_SettingsBase
     qa_SettingsConcurrency
-    qa_SettingsTable
+    qa_SettingDeclaration
     qa_SettingValue
+    qa_BlockSettings
+    qa_SettingsLifecycle
+    qa_SettingsMessages
+    qa_SettingsCheck
+    qa_SettingsStatus
     qa_SubnormalFlush
     qa_RecipeParameters
     qa_TagForwarding
@@ -94,7 +99,8 @@ if(NOT GR_ENABLE_BLOCK_REGISTRY)
     REMOVE_ITEM
     _CORE_TESTS
     qa_BlockRegistration
-    qa_ErasedRuntime)
+    qa_ErasedRuntime
+    qa_SettingsMessages)
 endif()
 
 foreach(TEST_NAME IN LISTS _CORE_TESTS)
@@ -150,6 +156,59 @@ set_tests_properties(
              TIMEOUT
              300)
 
+# each settings annotation a block misuses, with the text of the guard that refuses it; a string as Annotated's second
+# argument meets the language's own refusal, a value where a type goes, worded by each compiler
+set(_COMPILE_FAIL_SETTINGS_TESTS
+    "cf_Settings_base_name_const|a block's member takes the name of a setting of its base block, which is reserved"
+    "cf_Settings_struct_check_without_member|a check that takes `const Settings& s` needs the block to reflect a member of type `Settings`"
+    "cf_Settings_hook_without_settings|the settings hook takes the block's settings"
+    "cf_Settings_call_name_member|a block's member takes the name of one of the block's settings calls, which are reserved"
+    "cf_Settings_status_setting_name|a member of struct Status takes the name of a setting of the block"
+    "cf_Settings_list_leaves_out_member|the GR_MAKE_REFLECTABLE of a block's struct Settings or Status lists each of its members"
+    "cf_PortCountFor_float|PortCountFor annotates an integer setting"
+    "cf_PortCountFor_no_collection|PortCountFor names a dynamic port collection of the block"
+    "cf_PortCountFor_twice|two settings size one port collection"
+    "cf_Settings_mutable_check|the check hook is `std::optional<gr::Refused> checkSettings.const Settings& s. const`"
+    "cf_Limits_type_cannot_hold|a predicate of Limits names a value the setting's type cannot hold"
+    "cf_Limits_short_form|Limits takes predicates alone: Min, Max, Over, Under and OneOf"
+    "cf_Limits_validator_form|Limits takes predicates alone: Min, Max, Over, Under and OneOf"
+    "cf_Limits_two_lower_ends|Limits holds one lower end at most: Min or Over"
+    "cf_Limits_two_upper_ends|Limits holds one upper end at most: Max or Under"
+    "cf_Limits_ends_out_of_order|the lower end of Limits lies below its upper end, or at it where Min and Max both include it"
+    "cf_Limits_oneof_empty|OneOf lists at least one value"
+    "cf_Limits_oneof_repeated|OneOf lists each value once"
+    "cf_Limits_oneof_excluded|each value OneOf lists passes the other predicates of Limits"
+    "cf_Limits_enum_end|Limits on an enumeration takes OneOf alone: Min, Max, Over and Under bound a number"
+    "cf_Limits_enum_other_type|a predicate of Limits names a value the setting's type cannot hold"
+    "cf_Annotated_name_string|expected a type|must be a type|expects a type")
+foreach(CASE IN LISTS _COMPILE_FAIL_SETTINGS_TESTS)
+  string(FIND "${CASE}" "|" SEPARATOR)
+  string(
+    SUBSTRING "${CASE}"
+              0
+              ${SEPARATOR}
+              TEST_NAME)
+  math(EXPR TEXT_START "${SEPARATOR} + 1")
+  string(
+    SUBSTRING "${CASE}"
+              ${TEXT_START}
+              -1
+              GUARD_TEXT)
+  add_executable(${TEST_NAME} EXCLUDE_FROM_ALL compile_fail/${TEST_NAME}.cpp)
+  target_include_directories(${TEST_NAME} PRIVATE ${CMAKE_BINARY_DIR}/include ${CMAKE_CURRENT_BINARY_DIR})
+  target_link_libraries(${TEST_NAME} PRIVATE gnuradio-options gnuradio-core)
+  add_test(NAME ${TEST_NAME} COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target ${TEST_NAME} --config
+                                     $<CONFIG>)
+  set_tests_properties(
+    ${TEST_NAME}
+    PROPERTIES PASS_REGULAR_EXPRESSION
+               "${GUARD_TEXT}"
+               RESOURCE_LOCK
+               gr_core_build_tree
+               TIMEOUT
+               300)
+endforeach()
+
 if(GR_ENABLE_BLOCK_REGISTRY)
   # The wiring half includes Runtime.hpp alone. The factory half is the only place a block type is named.
   add_executable(qa_RuntimeConsumer qa_RuntimeConsumer.cpp qa_RuntimeConsumerBlocks.cpp)
@@ -183,6 +242,7 @@ endif()
 
 # regression tests for control-plane wedges: a failure shows up as a hang, so cap them
 set(_CORE_DEADLOCK_TESTS
+    qa_BlockSettings
     qa_DestructionSafety
     qa_GraphEdit
     qa_MessagePlane
@@ -191,14 +251,18 @@ set(_CORE_DEADLOCK_TESTS
     qa_SchedulerLifecycle
     qa_SchedulerStartStop
     qa_SettingsConcurrency
+    qa_SettingsLifecycle
+    qa_SettingsMessages
+    qa_SettingsCheck
+    qa_SettingsStatus
     qa_reader_writer_lock)
 if(GR_ENABLE_BLOCK_REGISTRY)
   list(APPEND _CORE_DEADLOCK_TESTS qa_grc)
 endif()
 set_tests_properties(${_CORE_DEADLOCK_TESTS} PROPERTIES TIMEOUT 120)
 
-# two cases bound a block's reply to a parked run's settings request at a tenth of the park on the wall clock; with
-# other tests on the same CPUs the reply can exceed that bound
+# two cases bound a block's reply to a parked run's echo request at a tenth of the park on the wall clock; with other
+# tests on the same CPUs the reply can exceed that bound
 set_tests_properties(qa_SchedulerLifecycle PROPERTIES RUN_SERIAL TRUE)
 
 # a thread that outlives a case stalls the case's wait on the thread count
@@ -347,8 +411,6 @@ if(MSVC)
     # five of its eight cases look up a registration key under a spelling MSVC does not produce:
     # gnuradio/gnuradio4-core#253
     qa_BlockRegistration
-    # a block's Description resolves to the placeholder under MSVC: gnuradio/gnuradio4-core#252
-    qa_SettingsTable
     # two cases expect the dynamic linker's reasons for files it cannot load: gnuradio/gnuradio4-core#254
     qa_PluginBlockLibrary
     # MSVC refuses these blocks with C7595 before the guard whose diagnostic the tests look for:

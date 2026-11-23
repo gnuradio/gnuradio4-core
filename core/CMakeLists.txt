@@ -6,6 +6,8 @@ add_library(
   src/BlockModel.cpp
   src/Port.cpp
   src/Settings.cpp
+  src/CompositeSettings.cpp
+  src/SettingDeclaration.cpp
   src/SettingNotification.cpp
   src/SettingValue.cpp
   src/Graph.cpp
@@ -45,7 +47,7 @@ target_link_libraries(
 # archive to them, so a program that links gnuradio-core alone links.
 #
 # gnuradio-shared-state holds the values that gnuradio-4.0/SharedState.hpp declares and the type information of
-# DynamicPort's port interfaces and of gr::exception.
+# DynamicPort's port interfaces, of gr::exception and of gr::settings::RefusedSettings.
 #
 # gnuradio-blocklib-core holds the global block, scheduler and device listing registries. PluginLoader.cpp in the core
 # archive reads them, so a program that builds a gr::Graph needs the library. The library names no core library, so the

@@ -3,6 +3,9 @@
 #include <gnuradio-4.0/PluginLoader.hpp>
 #include <gnuradio-4.0/RecipeInstantiation.hpp>
 
+#include <charconv>
+#include <iterator>
+
 namespace gr {
 
 Graph::Graph(property_map settings) : gr::Block<Graph>(std::move(settings)), _pluginLoader(std::addressof(gr::globalPluginLoader())) {
@@ -134,10 +137,117 @@ std::pair<std::shared_ptr<BlockModel>, std::shared_ptr<BlockModel>> Graph::repla
             edge._destinationPort  = ports.destination;
         }
     }
+    unlinkSettings(*replaced);
     *found = newBlock;
+    linkSettings(*newBlock);
     sizeUnconnectedOptionalOutputs(*newBlock);
 
     return {replaced, newBlock};
+}
+
+namespace {
+// the index a port definition names in `collection` of `ports`, or nothing for a port of another collection
+[[nodiscard]] std::optional<std::size_t> indexInCollection(const PortDefinition& definition, BlockModel::DynamicPorts& ports, std::string_view collection) {
+    if (const auto* byIndex = std::get_if<PortDefinition::IndexBased>(&definition.definition)) {
+        if (byIndex->topLevel >= ports.size()) {
+            return std::nullopt;
+        }
+        const auto* named = std::get_if<BlockModel::NamedPortCollection>(&ports[byIndex->topLevel]);
+        return named != nullptr && named->name == collection ? std::optional(byIndex->subIndex) : std::nullopt;
+    }
+    const std::string_view name      = std::get<PortDefinition::StringBased>(definition.definition).name;
+    const std::size_t      separator = name.find('#');
+    if (separator == std::string_view::npos || name.substr(0UZ, separator) != collection) {
+        return std::nullopt;
+    }
+    std::size_t            index  = 0UZ;
+    const std::string_view digits = name.substr(separator + 1UZ);
+    if (std::from_chars(digits.data(), digits.data() + digits.size(), index).ec != std::errc()) {
+        return std::nullopt;
+    }
+    return index;
+}
+} // namespace
+
+std::optional<std::string> Graph::SettingsLink::edgeAtOrPast(std::string_view collection, std::size_t count) const {
+    for (const Edge& edge : graph->_edges) {
+        if (edge._sourceBlock.get() == block) {
+            if (const std::optional<std::size_t> index = indexInCollection(edge._sourcePortDefinition, block->dynamicOutputPorts(), collection); index && *index >= count) {
+                return std::format("{}#{}", collection, *index);
+            }
+        }
+        if (edge._destinationBlock.get() == block) {
+            if (const std::optional<std::size_t> index = indexInCollection(edge._destinationPortDefinition, block->dynamicInputPorts(), collection); index && *index >= count) {
+                return std::format("{}#{}", collection, *index);
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+void Graph::SettingsLink::refreshPorts() {
+    block->reloadDynamicPorts();
+    // the edges bind their ports again at the next start
+    for (Edge& edge : graph->_edges) {
+        if (edge._sourceBlock.get() == block || edge._destinationBlock.get() == block) {
+            edge._sourcePort      = edge._sourceBlock.get() == block ? nullptr : edge._sourcePort;
+            edge._destinationPort = edge._destinationBlock.get() == block ? nullptr : edge._destinationPort;
+            edge._state           = Edge::EdgeState::WaitingToBeConnected;
+        }
+    }
+}
+
+void Graph::linkSettings(BlockModel& block) {
+    if (block.blockCategory() == block::Category::ScheduledBlockGroup) { // a stopped scheduler applies its settings at the call, and a running one at its next start
+        return;
+    }
+    const std::unique_ptr<SettingsLink>& link = _settingsLinks.emplace_back(std::make_unique<SettingsLink>(*this, block));
+    settings::detail::FrameworkAccess::attachGraph(block.settings(), link.get());
+}
+
+void Graph::leaveScheduler(BlockModel& block) {
+    if (settings::detail::SchedulerLink* link = settings::detail::FrameworkAccess::schedulerLink(block.settings()); link != nullptr) {
+        settings::detail::FrameworkAccess::detachScheduler(block.settings(), link);
+    }
+    if (block.blockCategory() == block::Category::TransparentBlockGroup) {
+        std::ranges::for_each(block.blocks(), [](const std::shared_ptr<BlockModel>& inner) { leaveScheduler(*inner); });
+    }
+}
+
+void Graph::unlinkSettings(BlockModel& block) {
+    // a block kept past its scheduler would call a destroyed link. The scheduler that removes a block still running
+    // detaches it once its stop has run, and the stop's notifications reach that scheduler's readers
+    if (!lifecycle::isActive(block.state()) && block.state() != lifecycle::State::REQUESTED_STOP) {
+        leaveScheduler(block);
+    }
+    std::erase_if(_settingsLinks, [&block](const std::unique_ptr<SettingsLink>& link) {
+        if (link->block != &block) {
+            return false;
+        }
+        settings::detail::FrameworkAccess::detachGraph(link->block->settings(), link.get());
+        return true;
+    });
+}
+
+void Graph::unlinkAllSettings() {
+    for (const std::unique_ptr<SettingsLink>& link : _settingsLinks) {
+        settings::detail::FrameworkAccess::detachGraph(link->block->settings(), link.get());
+        leaveScheduler(*link->block);
+    }
+    _settingsLinks.clear();
+}
+
+std::vector<std::string> Graph::blocksAddedWithoutInit() const {
+    std::vector<std::string> names;
+    for (const std::shared_ptr<BlockModel>& block : _blocks) {
+        if (block->blockCategory() == block::Category::TransparentBlockGroup && block->graph() != nullptr) {
+            std::ranges::move(block->graph()->blocksAddedWithoutInit(), std::back_inserter(names));
+        }
+        if (block->blockCategory() != block::Category::ScheduledBlockGroup && std::ranges::none_of(_settingsLinks, [&block](const std::unique_ptr<SettingsLink>& link) { return link->block == block.get(); })) {
+            names.emplace_back(block->uniqueName());
+        }
+    }
+    return names;
 }
 
 std::optional<Message> Graph::propertyCallbackRegistryBlockTypes([[maybe_unused]] std::string_view propertyName, Message message) {

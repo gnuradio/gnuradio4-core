@@ -1,6 +1,14 @@
 #ifndef GNURADIO_BLOCK_MERGING_HPP
 #define GNURADIO_BLOCK_MERGING_HPP
 
+#include <algorithm>
+#include <iterator>
+#include <map>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
+
 #include <gnuradio-4.0/meta/Attributes.hpp>
 #include <gnuradio-4.0/meta/simd.hpp>
 
@@ -92,31 +100,40 @@ struct to_forward_descriptor : TDesc {
     }
 };
 
-/// Applies the keys of `params` the block declares. Returns the refusals, empty when the block takes every value.
-/// Each key is staged alone. A value that does not convert leaves the block's other keys staged and applied. Every
-/// refusal names the block by the name it holds after the apply. The block's type leads its refusals when that name
-/// differs from the type's name.
+/// Applies the keys of `params` the block declares, each staged and applied alone on this thread: a refused value
+/// leaves the block's other keys applied, and a running block takes the value without waiting for a work call of its
+/// own, which a member never has. Returns each refused or failed key with its refusal, empty when the block takes every
+/// value. Every refusal names the block by the name it holds after the apply. The block's type leads its refusals when
+/// that name differs from the type's name.
 template<typename B>
-[[nodiscard]] std::string applyForwardedSettings(B& block, const gr::property_map& params) {
-    std::string refusals;
+[[nodiscard]] std::vector<std::pair<std::string, std::string>> applyForwardedSettings(B& block, const gr::property_map& params) {
+    std::vector<std::pair<std::string, std::string>> refusals; // key, refusal
     if constexpr (refl::reflectable<std::remove_cvref_t<B>>) {
         if (params.empty()) {
             return refusals;
         }
-        gr::property_map unconverted;
+        const std::set<std::string>                                   declared = block.writableMembers();
+        std::vector<std::tuple<std::string, pmt::Value, std::string>> refused; // key, value, reasons
         for (const auto& [key, value] : params) {
-            try {
-                std::ignore = block.settings().setStaged(gr::property_map{{key, value}});
-            } catch (const gr::exception&) {
-                unconverted.insert_or_assign(key, value);
+            if (!declared.contains(std::string(key))) {
+                continue;
             }
+            const std::expected<settings::Values, settings::Rejected> staged   = block.set(gr::property_map{{key, value}}, settings::noWait);
+            settings::Rejected                                        rejected = staged ? settings::detail::failedKeys(*staged) : staged.error();
+            std::ranges::move(settings::detail::FrameworkAccess::applyStagedParameters(settings::detail::settingsOf(block)), std::back_inserter(rejected));
+            if (rejected.empty()) {
+                continue;
+            }
+            std::string reasons;
+            for (const settings::Rejection& entry : rejected) {
+                reasons += std::format("{}{}", reasons.empty() ? "" : "; ", entry.reason);
+            }
+            refused.emplace_back(std::string(key), value, std::move(reasons));
         }
-        refusals = block.settings().applyStagedParameters().refusal;
-        for (const auto& [key, value] : unconverted) {
-            refusals += std::format("{}block '{}' refuses {} = {}: the value does not convert to the setting's type", refusals.empty() ? "" : "; ", block.name.value, key, value);
-        }
-        if (const std::string typeName = gr::meta::type_name<std::remove_cvref_t<B>>(); !refusals.empty() && block.name.value != typeName) {
-            refusals = std::format("{}: {}", typeName, refusals);
+        const std::string typeName = gr::meta::type_name<std::remove_cvref_t<B>>();
+        for (const auto& [key, value, reasons] : refused) { // named once every key applied, so a name the map gives counts
+            std::string refusal = std::format("block '{}': {} = {}: {}", block.name.value, key, value, reasons);
+            refusals.emplace_back(key, block.name.value != typeName ? std::format("{}: {}", typeName, refusal) : std::move(refusal));
         }
     }
     return refusals;
@@ -126,14 +143,85 @@ template<typename B>
 template<typename... Bs>
 void forwardSettings(const gr::property_map& params, Bs&... blocks) {
     std::string refusals;
-    for (const std::string& refusal : {applyForwardedSettings(blocks, params)...}) {
-        if (!refusal.empty()) {
+    for (const std::vector<std::pair<std::string, std::string>>& refused : {applyForwardedSettings(blocks, params)...}) {
+        for (const auto& [key, refusal] : refused) {
             refusals += std::format("{}{}", refusals.empty() ? "" : "; ", refusal);
         }
     }
     if (!refusals.empty()) {
         throw gr::exception(refusals);
     }
+}
+
+/// Runs the pending apply of each member and of the members it merges, behind the same inline guard a block's own
+/// work call reads, so a value set on a member from another thread reaches the member's field. A failed key is
+/// notified by the member's settings.
+template<typename... Bs>
+void applyPendingMemberSettings(Bs&... blocks) {
+    const auto applyOne = []<typename B>(B& block) {
+        if constexpr (refl::reflectable<std::remove_cvref_t<B>>) {
+            std::ignore = settings::detail::FrameworkAccess::applyStagedParameters(settings::detail::settingsOf(block));
+        }
+        if constexpr (requires { block.applyMemberSettings(); }) {
+            block.applyMemberSettings();
+        }
+    };
+    (applyOne(blocks), ...);
+}
+
+template<typename B>
+[[nodiscard]] consteval std::size_t markedSettingsOf() {
+    if constexpr (std::is_void_v<B>) {
+        return 0UZ;
+    } else if constexpr (requires { B::kMarkedMembers; }) {
+        return (refl::reflectable<B> ? 1UZ : 0UZ) + B::kMarkedMembers;
+    } else {
+        return refl::reflectable<B> ? 1UZ : 0UZ;
+    }
+}
+
+/// The count of settings a merged block of `Bs` marks around its work call: each member's, and those of the members a
+/// member merges. A `void` member counts none.
+template<typename... Bs>
+[[nodiscard]] consteval std::size_t markedMembers() {
+    return (0UZ + ... + markedSettingsOf<Bs>());
+}
+
+/// Marks the calling thread as the own thread of each member and of the members it merges, so a member's own `set` is
+/// refused and its `Status` is copied at the end of the work call.
+template<typename TMarks, typename... Bs>
+void markMemberThreads(TMarks& marks, Bs&... blocks) noexcept {
+    const auto markOne = [&marks]<typename B>(B& block) {
+        if constexpr (refl::reflectable<std::remove_cvref_t<B>>) {
+            marks.mark(settings::detail::settingsOf(block));
+        }
+        if constexpr (requires { block.markMemberThreads(marks); }) {
+            block.markMemberThreads(marks);
+        }
+    };
+    (markOne(blocks), ...);
+}
+
+/// Applies the keys the merged block's apply changed, from a call, a tag or a message, at their values now in force, to
+/// every merged block. A key a merged block refuses or fails fails the merged block's key, with the refusals of each block
+/// that refused it.
+template<typename... Bs>
+[[nodiscard]] std::expected<void, settings::Rejected> forwardChangedToMembers(const gr::property_map& changed, Bs&... blocks) {
+    std::map<std::string, std::string, std::less<>> refusalsByKey;
+    for (const std::vector<std::pair<std::string, std::string>>& refused : {applyForwardedSettings(blocks, changed)...}) {
+        for (const auto& [key, refusal] : refused) {
+            std::string& joined = refusalsByKey[key];
+            joined += std::format("{}{}", joined.empty() ? "" : "; ", refusal);
+        }
+    }
+    if (refusalsByKey.empty()) {
+        return {};
+    }
+    settings::Rejected failed;
+    for (auto& [key, refusals] : refusalsByKey) {
+        failed.push_back(settings::Rejection{.key = key, .reason = std::move(refusals)});
+    }
+    return std::unexpected(std::move(failed));
 }
 
 template<typename B>
@@ -240,8 +328,9 @@ template<typename... Ts>
  * and the maps under "leftBlock" and "rightBlock" go to one each. The merged block itself takes no key from this map,
  * "name" included. A key that no member declares is ignored without an error. A member can also be reached directly,
  * through the public _leftBlock and _rightBlock here or path<I>() on SplitMergeCombine. A block meant for graph files
- * declares the settings it exposes and stages each on the member, with the member's settings().setStaged() and
- * applyStagedParameters(); set() on a member stores the value without applying it.
+ * declares the settings it exposes and sets each on the member with set(changes, settings::noWait); the
+ * merged block's next work call applies it. Each work call of the merged block runs the members' pending applies, so a
+ * value a member publishes from another thread reaches its field; it does not reach the merged block's settings.
  *
  * SplitMergeCombine, FeedbackMerge and FeedbackMergeWithTap follow the same rules.
  *
@@ -331,7 +420,17 @@ public:
         }
     }
 
-    void settingsChanged(const gr::property_map& /*oldSettings*/, const gr::property_map& newSettings) { detail::forwardSettings(newSettings, _leftBlock, _rightBlock); }
+    // in place of an apply hook, core hands the merged block the keys it changed, which its members take
+    std::expected<void, settings::Rejected> applyToMembers(const gr::property_map& changed) { return detail::forwardChangedToMembers(changed, _leftBlock, _rightBlock); }
+
+    void applyMemberSettings() { detail::applyPendingMemberSettings(_leftBlock, _rightBlock); }
+
+    static constexpr std::size_t kMarkedMembers = detail::markedMembers<Left, Right>();
+
+    template<typename TMarks>
+    void markMemberThreads(TMarks& marks) noexcept {
+        detail::markMemberThreads(marks, _leftBlock, _rightBlock);
+    }
 
     template<meta::any_simd... Ts>
     requires traits::block::can_processOne_simd<Left> and traits::block::can_processOne_simd<Right>
@@ -567,8 +666,19 @@ struct SplitMergeCombine<Paths...> : detail::MergedBlockBase<SplitMergeCombine<P
         }(std::make_index_sequence<sizeof...(Paths)>());
     }
 
-    void settingsChanged(const gr::property_map& /*oldSettings*/, const gr::property_map& newSettings) {
-        [&]<std::size_t... Is>(std::index_sequence<Is...>) { detail::forwardSettings(newSettings, std::get<Is>(_paths)...); }(std::make_index_sequence<sizeof...(Paths)>());
+    std::expected<void, settings::Rejected> applyToMembers(const gr::property_map& changed) {
+        return [&]<std::size_t... Is>(std::index_sequence<Is...>) { return detail::forwardChangedToMembers(changed, std::get<Is>(_paths)...); }(std::make_index_sequence<sizeof...(Paths)>());
+    }
+
+    void applyMemberSettings() {
+        [&]<std::size_t... Is>(std::index_sequence<Is...>) { detail::applyPendingMemberSettings(std::get<Is>(_paths)...); }(std::make_index_sequence<sizeof...(Paths)>());
+    }
+
+    static constexpr std::size_t kMarkedMembers = detail::markedMembers<Paths...>();
+
+    template<typename TMarks>
+    void markMemberThreads(TMarks& marks) noexcept {
+        [&]<std::size_t... Is>(std::index_sequence<Is...>) { detail::markMemberThreads(marks, std::get<Is>(_paths)...); }(std::make_index_sequence<sizeof...(Paths)>());
     }
 
     [[nodiscard]] constexpr OutputType processOne(InputType x) const noexcept {
@@ -665,8 +775,19 @@ struct SplitMergeCombine<OutputSigns<Vs...>, Paths...> : detail::MergedBlockBase
         }(std::make_index_sequence<sizeof...(Paths)>());
     }
 
-    void settingsChanged(const gr::property_map& /*oldSettings*/, const gr::property_map& newSettings) {
-        [&]<std::size_t... Is>(std::index_sequence<Is...>) { detail::forwardSettings(newSettings, std::get<Is>(_paths)...); }(std::make_index_sequence<sizeof...(Paths)>());
+    std::expected<void, settings::Rejected> applyToMembers(const gr::property_map& changed) {
+        return [&]<std::size_t... Is>(std::index_sequence<Is...>) { return detail::forwardChangedToMembers(changed, std::get<Is>(_paths)...); }(std::make_index_sequence<sizeof...(Paths)>());
+    }
+
+    void applyMemberSettings() {
+        [&]<std::size_t... Is>(std::index_sequence<Is...>) { detail::applyPendingMemberSettings(std::get<Is>(_paths)...); }(std::make_index_sequence<sizeof...(Paths)>());
+    }
+
+    static constexpr std::size_t kMarkedMembers = detail::markedMembers<Paths...>();
+
+    template<typename TMarks>
+    void markMemberThreads(TMarks& marks) noexcept {
+        [&]<std::size_t... Is>(std::index_sequence<Is...>) { detail::markMemberThreads(marks, std::get<Is>(_paths)...); }(std::make_index_sequence<sizeof...(Paths)>());
     }
 
     [[nodiscard]] constexpr OutputType processOne(InputType x) const noexcept {
@@ -751,7 +872,26 @@ public:
         }
     }
 
-    void settingsChanged(const gr::property_map& /*oldSettings*/, const gr::property_map& newSettings) { detail::forwardSettings(newSettings, _forward, _feedback); }
+    std::expected<void, settings::Rejected> applyToMembers(const gr::property_map& changed) { return detail::forwardChangedToMembers(changed, _forward, _feedback); }
+
+    void applyMemberSettings() {
+        if constexpr (std::is_same_v<void, Monitor>) {
+            detail::applyPendingMemberSettings(_forward, _feedback);
+        } else {
+            detail::applyPendingMemberSettings(_forward, _feedback, _monitor);
+        }
+    }
+
+    static constexpr std::size_t kMarkedMembers = detail::markedMembers<Forward, Feedback, Monitor>();
+
+    template<typename TMarks>
+    void markMemberThreads(TMarks& marks) noexcept {
+        if constexpr (std::is_same_v<void, Monitor>) {
+            detail::markMemberThreads(marks, _forward, _feedback);
+        } else {
+            detail::markMemberThreads(marks, _forward, _feedback, _monitor);
+        }
+    }
 
 public:
     template<typename... Ts>
@@ -851,9 +991,10 @@ public:
     gr::meta::immutable<std::string> unique_name = std::format("FeedbackMergeByIndex<{}:{},{}:{},feedback_to:{}>#{}", gr::meta::type_name<Forward>(), ForwardOutputPortIndex, gr::meta::type_name<Feedback>(), FeedbackOutputPortIndex, ForwardFeedbackInputPortIndex, this->unique_id);
 
     using OverridePortList = typename impl_t::OverridePortList;
+    using impl_t::applyMemberSettings;
+    using impl_t::applyToMembers;
     using impl_t::impl_t;
     using impl_t::processOne;
-    using impl_t::settingsChanged;
 
     void stateChanged(lifecycle::State newState) {
         if (auto result = this->_forward.changeStateTo(newState); !result) {
@@ -916,8 +1057,9 @@ public:
                 gr::PortType::STREAM, gr::PortDirection::OUTPUT, gr::detail::SinglePort,        //
                 /*KindExtraData=*/0, /*MemberIdx=*/refl::data_member_count<detail::MergedBlockBase<this_t, Forward, Feedback, Monitor>>>>>;
 
+    using impl_t::applyMemberSettings;
+    using impl_t::applyToMembers;
     using impl_t::impl_t;
-    using impl_t::settingsChanged;
 
     void stateChanged(lifecycle::State newState) {
         if (auto result = this->_forward.changeStateTo(newState); !result) {

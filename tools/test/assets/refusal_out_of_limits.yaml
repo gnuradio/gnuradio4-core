@@ -1,4 +1,4 @@
-# The block of refusal.yaml, given a gain outside the limits [0, 1] its setting declares.
+# The block of refusal.yaml, given a gain outside the range 0 to 1 its setting declares.
 blocks:
   - id: test::refusal
     parameters:

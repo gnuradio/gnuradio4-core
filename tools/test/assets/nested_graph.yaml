@@ -54,11 +54,6 @@ blocks:
       name: sink
     meta_information:
       role: terminal
-    ctx_parameters:
-      - context: fast
-        time: !!uint64 0
-        parameters:
-          buffer_size: 512
 connections:
   - [source_1, 0, front_end, 0]
   - [front_end, 0, sink, 0, 4096]

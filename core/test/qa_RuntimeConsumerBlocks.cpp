@@ -31,24 +31,28 @@ std::size_t totalSamples() { return gTotalSamples.load(); }
 struct Counter : gr::Block<Counter> {
     gr::PortOut<float> out;
 
-    gr::Annotated<gr::Size_t, "n_samples"> n_samples = 1024U;
+    struct Settings {
+        gr::Annotated<gr::Size_t> n_samples = 1024U;
 
-    GR_MAKE_REFLECTABLE(Counter, out, n_samples);
+        GR_MAKE_REFLECTABLE(Settings, n_samples);
+    } settings;
 
-    gr::Size_t _emitted = 0U;
+    GR_MAKE_REFLECTABLE(Counter, out, settings);
+
+    gr::Size_t emitted = 0U;
 
     explicit Counter(gr::property_map init = {}) : gr::Block<Counter>(std::move(init)) {}
 
     gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
-        if (_emitted >= n_samples) {
+        if (emitted >= settings.n_samples) {
             outSpan.publish(0UZ);
             return gr::work::Status::DONE;
         }
-        const std::size_t n = std::min(outSpan.size(), static_cast<std::size_t>(n_samples - _emitted));
+        const std::size_t n = std::min(outSpan.size(), static_cast<std::size_t>(settings.n_samples - emitted));
         for (std::size_t i = 0UZ; i < n; ++i) {
-            outSpan[i] = static_cast<float>(_emitted + static_cast<gr::Size_t>(i));
+            outSpan[i] = static_cast<float>(emitted + static_cast<gr::Size_t>(i));
         }
-        _emitted += static_cast<gr::Size_t>(n);
+        emitted += static_cast<gr::Size_t>(n);
         outSpan.publish(n);
         return gr::work::Status::OK;
     }
@@ -58,13 +62,17 @@ struct Gain : gr::Block<Gain> {
     gr::PortIn<float>  in;
     gr::PortOut<float> out;
 
-    gr::Annotated<float, "gain"> gain = 1.0f;
+    struct Settings {
+        gr::Annotated<float> gain = 1.0f;
 
-    GR_MAKE_REFLECTABLE(Gain, in, out, gain);
+        GR_MAKE_REFLECTABLE(Settings, gain);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(Gain, in, out, settings);
 
     explicit Gain(gr::property_map init = {}) : gr::Block<Gain>(std::move(init)) {}
 
-    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * settings.gain; }
 };
 
 struct Total : gr::Block<Total> {

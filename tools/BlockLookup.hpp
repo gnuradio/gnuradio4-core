@@ -68,8 +68,8 @@ struct OutputPort {
  * @brief The type of the items a block's output port carries, read from an instance of the block.
  *
  * A registry key is all a graph file gives, and only a block itself knows what its ports carry, so
- * the answer comes from a default-constructed instance: `settings().init()` copies the annotations
- * into the meta information and fills the port descriptions, and the block is never started. A key
+ * the answer comes from a default-constructed instance: the settings' `describe()` copies the annotations
+ * into the meta information and calls no block hook, and the block is never started. A key
  * no registry holds, a factory that refuses, and a port name the block does not declare each answer
  * with an empty string. The caller then prints no type at all, never a guess.
  *
@@ -119,7 +119,7 @@ private:
         std::vector<OutputPort> ports;
         if (instance != nullptr) {
             try {
-                instance->settings().init();
+                gr::settings::detail::FrameworkAccess::describe(instance->settings());
             } catch (...) {
                 // a block that refuses its own defaults still declares its ports
             }
