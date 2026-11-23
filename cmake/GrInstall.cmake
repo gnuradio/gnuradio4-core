@@ -58,7 +58,12 @@ Args:
     COMPONENT    install component for the resolved libraries
 ]]
 function(gr_install_runtime_dependencies)
-  cmake_parse_arguments("GR_DEPS" "" "SET;DESTINATION;COMPONENT" "" ${ARGN})
+  cmake_parse_arguments(
+    "GR_DEPS"
+    ""
+    "SET;DESTINATION;COMPONENT"
+    ""
+    ${ARGN})
 
   if(NOT GR_DEPS_SET)
     message(FATAL_ERROR "gr_install_runtime_dependencies: SET is required")
@@ -100,11 +105,19 @@ function(_gr_apply_headers_component OUT_VAR COMPONENT_NAME)
     list(APPEND RESULT "${ARG}")
     if(NEXT_IS_FILE_SET_NAME)
       set(NEXT_IS_FILE_SET_NAME FALSE)
-      list(APPEND RESULT COMPONENT "${COMPONENT_NAME}")
+      list(
+        APPEND
+        RESULT
+        COMPONENT
+        "${COMPONENT_NAME}")
     elseif(ARG STREQUAL "FILE_SET")
       set(NEXT_IS_FILE_SET_NAME TRUE)
     elseif(ARG MATCHES "^(PUBLIC_HEADER|PRIVATE_HEADER)$")
-      list(APPEND RESULT COMPONENT "${COMPONENT_NAME}")
+      list(
+        APPEND
+        RESULT
+        COMPONENT
+        "${COMPONENT_NAME}")
     endif()
   endforeach()
   set(${OUT_VAR}
@@ -141,8 +154,12 @@ Everything else - static, object and interface libraries, files, directories, ex
 skips that step. With MSVC each loadable target's PDB goes to the SYMBOLS component.
 #]]
 function(gr_install_artifact)
-  cmake_parse_arguments("GR_INSTALL" "" "COMPONENT;HEADERS_COMPONENT;ARCHIVE_COMPONENT;EXPORT" "TARGETS;DIRECTORY"
-                        ${ARGN})
+  cmake_parse_arguments(
+    "GR_INSTALL"
+    ""
+    "COMPONENT;HEADERS_COMPONENT;ARCHIVE_COMPONENT;EXPORT"
+    "TARGETS;DIRECTORY"
+    ${ARGN})
   if(NOT GR_INSTALL_COMPONENT)
     set(GR_INSTALL_COMPONENT "CORE")
   endif()
@@ -159,7 +176,10 @@ function(gr_install_artifact)
 
   if(GR_INSTALL_DIRECTORY)
     # COMPONENT has to precede any FILES_MATCHING/PATTERN rules; appended, it is a hard error
-    install(DIRECTORY ${GR_INSTALL_DIRECTORY} COMPONENT ${GR_INSTALL_COMPONENT} ${GR_INSTALL_UNPARSED_ARGUMENTS})
+    install(
+      DIRECTORY ${GR_INSTALL_DIRECTORY}
+      COMPONENT ${GR_INSTALL_COMPONENT}
+      ${GR_INSTALL_UNPARSED_ARGUMENTS})
     return()
   endif()
 
@@ -170,7 +190,11 @@ function(gr_install_artifact)
 
   if(NOT GR_INSTALL_TARGETS)
     # FILES, PROGRAMS, EXPORT, SCRIPT/CODE: no artifact kinds to place
-    install(${EXPORT_ARGS} ${GR_INSTALL_UNPARSED_ARGUMENTS} COMPONENT ${GR_INSTALL_COMPONENT})
+    install(
+      ${EXPORT_ARGS}
+      ${GR_INSTALL_UNPARSED_ARGUMENTS}
+      COMPONENT
+      ${GR_INSTALL_COMPONENT})
     return()
   endif()
 
@@ -181,7 +205,11 @@ function(gr_install_artifact)
     set(LIB_DEST "${CMAKE_INSTALL_LIBDIR}")
     # @loader_path, not @executable_path: @executable_path resolves against whatever process loaded a .dylib, so a
     # plugin opened by a host outside the prefix would look for its siblings next to that host.
-    file(RELATIVE_PATH BIN_TO_LIB "${CMAKE_INSTALL_FULL_BINDIR}" "${CMAKE_INSTALL_FULL_LIBDIR}")
+    file(
+      RELATIVE_PATH
+      BIN_TO_LIB
+      "${CMAKE_INSTALL_FULL_BINDIR}"
+      "${CMAKE_INSTALL_FULL_LIBDIR}")
     if(APPLE)
       set(INSTALL_RPATH "@loader_path/${BIN_TO_LIB}")
     else()
@@ -194,7 +222,10 @@ function(gr_install_artifact)
   set(RUNTIME_DEPENDENCY_ARGS)
   foreach(TARGET_NAME IN LISTS GR_INSTALL_TARGETS)
     get_target_property(TARGET_TYPE ${TARGET_NAME} TYPE)
-    if(NOT TARGET_TYPE MATCHES "^(EXECUTABLE|SHARED_LIBRARY|MODULE_LIBRARY)$")
+    if(NOT
+       TARGET_TYPE
+       MATCHES
+       "^(EXECUTABLE|SHARED_LIBRARY|MODULE_LIBRARY)$")
       continue()
     endif()
     get_target_property(EXISTING_RPATH ${TARGET_NAME} INSTALL_RPATH)
@@ -217,7 +248,10 @@ function(gr_install_artifact)
 
   _gr_apply_headers_component(FORWARDED_ARGS "${GR_INSTALL_HEADERS_COMPONENT}" ${GR_INSTALL_UNPARSED_ARGUMENTS})
   install(
-    TARGETS ${GR_INSTALL_TARGETS} ${EXPORT_ARGS} ${RUNTIME_DEPENDENCY_ARGS} ${FORWARDED_ARGS}
+    TARGETS ${GR_INSTALL_TARGETS}
+            ${EXPORT_ARGS}
+            ${RUNTIME_DEPENDENCY_ARGS}
+            ${FORWARDED_ARGS}
     RUNTIME DESTINATION ${BIN_DEST} COMPONENT ${GR_INSTALL_COMPONENT}
     LIBRARY DESTINATION ${LIB_DEST} COMPONENT ${GR_INSTALL_COMPONENT}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT ${GR_INSTALL_ARCHIVE_COMPONENT})

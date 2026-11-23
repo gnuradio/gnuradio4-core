@@ -2,9 +2,12 @@
 
 # Every GR 4 package installs into one prefix but keeps its own config directory, so finding this package says nothing
 # about where its siblings are. Adding the prefix lets a project that finds gnuradio4 find the other GR 4 packages, and
-# the third-party packages an installer placed beside them, without being told. It holds in the scope find_package()
-# was called from, so a call made inside a function does not pass it on.
-if(NOT "${PACKAGE_PREFIX_DIR}" IN_LIST CMAKE_PREFIX_PATH)
+# the third-party packages an installer placed beside them, without being told. It holds in the scope find_package() was
+# called from, so a call made inside a function does not pass it on.
+if(NOT
+   "${PACKAGE_PREFIX_DIR}"
+   IN_LIST
+   CMAKE_PREFIX_PATH)
   list(APPEND CMAKE_PREFIX_PATH "${PACKAGE_PREFIX_DIR}")
 endif()
 

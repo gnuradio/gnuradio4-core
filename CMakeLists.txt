@@ -51,7 +51,11 @@ find_package(PkgConfig QUIET)
 # read from the header that defines it, so the two cannot disagree.
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/core/include/gnuradio-4.0/BlockRegistry.hpp" _grPluginAbiDefine
      REGEX "^#define[ \t]+GR_PLUGIN_CURRENT_ABI_VERSION[ \t]+[0-9]+")
-string(REGEX MATCH "[0-9]+$" GR_PLUGIN_API_VERSION "${_grPluginAbiDefine}")
+string(
+  REGEX MATCH
+        "[0-9]+$"
+        GR_PLUGIN_API_VERSION
+        "${_grPluginAbiDefine}")
 if(NOT GR_PLUGIN_API_VERSION)
   message(FATAL_ERROR "Could not read GR_PLUGIN_CURRENT_ABI_VERSION from core/include/gnuradio-4.0/BlockRegistry.hpp")
 endif()
@@ -327,7 +331,10 @@ add_subdirectory(blocklib_generator)
 
 add_library(gnuradio-options INTERFACE)
 add_library(gnuradio4::gnuradio-options ALIAS gnuradio-options)
-gr_install_artifact(TARGETS gnuradio-options EXPORT gnuradio4Targets COMPONENT DEVELOP)
+gr_install_artifact(
+  TARGETS gnuradio-options
+  EXPORT gnuradio4Targets
+  COMPONENT DEVELOP)
 
 if(MSVC)
   target_compile_options(

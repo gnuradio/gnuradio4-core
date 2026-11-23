@@ -99,14 +99,17 @@ gr_install_artifact(
 # the whole include directory is the public surface, and it is installed as it is laid out: a PUBLIC_HEADER list would
 # flatten the subdirectories into a second copy beside the first
 if(GR_ENABLE_BLOCK_REGISTRY)
-  gr_install_artifact(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-                      COMPONENT DEVELOP)
+  gr_install_artifact(
+    DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    COMPONENT DEVELOP)
 else()
   gr_install_artifact(
     DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     COMPONENT DEVELOP
-    PATTERN "Runtime.hpp" EXCLUDE)
+    PATTERN "Runtime.hpp"
+    EXCLUDE)
 endif()
 
 add_subdirectory(src)

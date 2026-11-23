@@ -110,7 +110,8 @@ function(setup_test_no_asan TEST_NAME)
       TEST ${TEST_NAME}
       APPEND
       PROPERTY ENVIRONMENT_MODIFICATION
-               "$<$<BOOL:${_dll_dirs}>:PATH=path_list_prepend:$<JOIN:${_dll_dirs},$<SEMICOLON>PATH=path_list_prepend:>>")
+               "$<$<BOOL:${_dll_dirs}>:PATH=path_list_prepend:$<JOIN:${_dll_dirs},$<SEMICOLON>PATH=path_list_prepend:>>"
+    )
   endif()
 endfunction()
 
@@ -123,8 +124,8 @@ function(setup_test TEST_NAME)
   setup_test_no_asan(${TEST_NAME})
 endfunction()
 
-# Puts the directories holding the shared libraries a test loads, directly or through a tool it
-# runs, on PATH. Windows resolves them there and has no RPATH equivalent. A no-op elsewhere.
+# Puts the directories holding the shared libraries a test loads, directly or through a tool it runs, on PATH. Windows
+# resolves them there and has no RPATH equivalent. A no-op elsewhere.
 function(gr_test_add_dll_directories)
   if(NOT WIN32)
     return()

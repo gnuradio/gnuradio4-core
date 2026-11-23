@@ -41,28 +41,37 @@ if(NOT EXISTS "${GR_INNOSETUP_TEMPLATE_DIR}/gr_install_flow.iss.in")
   set(GR_INNOSETUP_TEMPLATE_DIR "${CMAKE_CURRENT_LIST_DIR}/packaging/innosetup")
 endif()
 
-# Regenerates the installer scripts and CPack wiring from whatever has been
-# declared so far. Both public macros call it, so they may be used in any order.
+# Regenerates the installer scripts and CPack wiring from whatever has been declared so far. Both public macros call it,
+# so they may be used in any order.
 macro(_gr_innosetup_generate)
   if(NOT GR_PLUGIN_API_VERSION)
     message(FATAL_ERROR "gr_configure_innosetup_installer: GR_PLUGIN_API_VERSION is not set")
   endif()
 
   # the installer script reads these as flat strings
-  string(JOIN "|" GR_INSTALLER_COMPONENT_PACKAGES ${GR_INNOSETUP_COMPONENT_PACKAGES})
-  string(JOIN "|" GR_INSTALLER_PLUGIN_PACKAGES ${GR_INNOSETUP_PLUGIN_PACKAGES})
-  string(JOIN "," GR_INSTALLER_PRESELECTED_COMPONENTS ${GR_INNOSETUP_PRESELECTED_COMPONENTS})
+  string(
+    JOIN
+    "|"
+    GR_INSTALLER_COMPONENT_PACKAGES
+    ${GR_INNOSETUP_COMPONENT_PACKAGES})
+  string(
+    JOIN
+    "|"
+    GR_INSTALLER_PLUGIN_PACKAGES
+    ${GR_INNOSETUP_PLUGIN_PACKAGES})
+  string(
+    JOIN
+    ","
+    GR_INSTALLER_PRESELECTED_COMPONENTS
+    ${GR_INNOSETUP_PRESELECTED_COMPONENTS})
 
-  # Recorded against every package this installer registers, so that anything
-  # reading the manifest can tell a release install from a debug one. Once the
-  # two share an install root this list is the only thing that does, so a wrong
+  # Recorded against every package this installer registers, so that anything reading the manifest can tell a release
+  # install from a debug one. Once the two share an install root this list is the only thing that does, so a wrong
   # answer is worse than a missing one.
   #
-  # A single config generator settles this now. A multi config generator does
-  # not choose until pack time, long after this script is written, so there is
-  # nothing to read and GR_PACKAGE_CONFIGURATION has to say which configuration
-  # is being packaged. Defaulting silently would register a Debug install as
-  # Release, so the guess is at least announced.
+  # A single config generator settles this now. A multi config generator does not choose until pack time, long after
+  # this script is written, so there is nothing to read and GR_PACKAGE_CONFIGURATION has to say which configuration is
+  # being packaged. Defaulting silently would register a Debug install as Release, so the guess is at least announced.
   if(GR_PACKAGE_CONFIGURATION)
     set(GR_INSTALLER_CONFIGURATION "${GR_PACKAGE_CONFIGURATION}")
   elseif(CMAKE_BUILD_TYPE)
@@ -71,56 +80,51 @@ macro(_gr_innosetup_generate)
     set(GR_INSTALLER_CONFIGURATION "Release")
     get_property(_gr_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
     if(_gr_multi_config)
-      message(
-        WARNING
-          "GR4 installer: recording this package as a Release install, because CMAKE_BUILD_TYPE is empty "
-          "under a multi-config generator. Set GR_PACKAGE_CONFIGURATION to the configuration you intend to "
-          "package, or a Debug package will be registered as Release.")
+      message(WARNING "GR4 installer: recording this package as a Release install, because CMAKE_BUILD_TYPE is empty "
+                      "under a multi-config generator. Set GR_PACKAGE_CONFIGURATION to the configuration you intend to "
+                      "package, or a Debug package will be registered as Release.")
     endif()
   endif()
 
-  # One folder for every GR 4 package, keyed on the plugin ABI like everything
-  # else and spelled exactly as GrBundleStartMenuLeaf() in gr_install_flow.iss.in
-  # spells it, so a CPack generated shortcut and one the superbuild installer
-  # creates land in the same place. Set here rather than in each project's
-  # CPackConfig so the two cannot drift apart; GR_START_MENU still overrides it.
+  # One folder for every GR 4 package, keyed on the plugin ABI like everything else and spelled exactly as
+  # GrBundleStartMenuLeaf() in gr_install_flow.iss.in spells it, so a CPack generated shortcut and one the superbuild
+  # installer creates land in the same place. Set here rather than in each project's CPackConfig so the two cannot drift
+  # apart; GR_START_MENU still overrides it.
   if(NOT GR_START_MENU)
     set(GR_START_MENU "GNU Radio 4 (v${GR_PLUGIN_API_VERSION})")
   endif()
   set(CPACK_INNOSETUP_PROGRAM_MENU_FOLDER "${GR_START_MENU}")
 
-  # Carried into CPackConfig.cmake, which is the only file the superbuild
-  # installer reads back from a module's build tree. It needs the manifest
-  # package names to ask whether a module's debug build is already installed,
-  # and those are not CPACK_PACKAGE_NAME.
+  # Carried into CPackConfig.cmake, which is the only file the superbuild installer reads back from a module's build
+  # tree. It needs the manifest package names to ask whether a module's debug build is already installed, and those are
+  # not CPACK_PACKAGE_NAME.
   set(CPACK_GR4_MANIFEST_PACKAGES "${GR_INSTALLER_COMPONENT_PACKAGES}")
 
   set(GR_MANIFEST_TOOL "${GR_INNOSETUP_TEMPLATE_DIR}/gr_manifest.ps1")
   set(_GR_INNO_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/packaging/innosetup")
   configure_file("${GR_INNOSETUP_TEMPLATE_DIR}/gr_install_flow.iss.in" "${_GR_INNO_OUTPUT_DIR}/gr_install_flow.iss"
                  @ONLY)
-  configure_file("${GR_INNOSETUP_TEMPLATE_DIR}/gr_installer_files.iss.in" "${_GR_INNO_OUTPUT_DIR}/gr_installer_files.iss"
-                 @ONLY)
+  configure_file("${GR_INNOSETUP_TEMPLATE_DIR}/gr_installer_files.iss.in"
+                 "${_GR_INNO_OUTPUT_DIR}/gr_installer_files.iss" @ONLY)
 
-  # CPack writes these values into CPackConfig.cmake verbatim; without this the
-  # backslashes and braces of the Inno Setup constants below fail to re-parse
+  # CPack writes these values into CPackConfig.cmake verbatim; without this the backslashes and braces of the Inno Setup
+  # constants below fail to re-parse
   set(CPACK_VERBATIM_VARIABLES ON)
 
   set(CPACK_INNOSETUP_EXTRA_SCRIPTS "${_GR_INNO_OUTPUT_DIR}/gr_installer_files.iss")
   set(CPACK_INNOSETUP_CODE_FILES "${_GR_INNO_OUTPUT_DIR}/gr_install_flow.iss")
 
-  # The ABI version is appended here, once, rather than being baked into each
-  # project's APP_ID: installations built against different plugin ABIs are
-  # different products and need an Add/Remove entry each, while releases that
-  # share an ABI must keep one entry between them and upgrade in place.
+  # The ABI version is appended here, once, rather than being baked into each project's APP_ID: installations built
+  # against different plugin ABIs are different products and need an Add/Remove entry each, while releases that share an
+  # ABI must keep one entry between them and upgrade in place.
   set(CPACK_INNOSETUP_SETUP_AppId "${GR_INNOSETUP_APP_ID}_v${GR_PLUGIN_API_VERSION}")
   # the manifest, not Inno's own registry entry, decides where we install
   set(CPACK_INNOSETUP_SETUP_DefaultDirName "{code:GrGetInstallRoot}")
   set(CPACK_INNOSETUP_SETUP_UsePreviousAppDir "no")
   # per-user by default, so no UAC prompt and {autopf} resolves to %LOCALAPPDATA%\Programs
   set(CPACK_INNOSETUP_SETUP_PrivilegesRequired "lowest")
-  # ...but the user, or the unified installer running this one silently, may
-  # ask for a machine-wide install instead. Without this, /ALLUSERS is refused.
+  # ...but the user, or the unified installer running this one silently, may ask for a machine-wide install instead.
+  # Without this, /ALLUSERS is refused.
   set(CPACK_INNOSETUP_SETUP_PrivilegesRequiredOverridesAllowed "commandline dialog")
   set(CPACK_INNOSETUP_SETUP_AppVersion "${CPACK_PACKAGE_VERSION}")
   set(CPACK_INNOSETUP_SETUP_VersionInfoVersion "${CPACK_PACKAGE_VERSION}")
@@ -156,7 +160,12 @@ Args:
                            anything else meant to be on by default belongs here
 #]]
 macro(gr_configure_innosetup_installer)
-  cmake_parse_arguments(GR_INNO "" "APP_ID" "PACKAGES;PRESELECTED_COMPONENTS" ${ARGN})
+  cmake_parse_arguments(
+    GR_INNO
+    ""
+    "APP_ID"
+    "PACKAGES;PRESELECTED_COMPONENTS"
+    ${ARGN})
 
   if(NOT GR_INNO_APP_ID)
     message(FATAL_ERROR "gr_configure_innosetup_installer: APP_ID is required and must be stable across releases")
@@ -191,7 +200,12 @@ Args:
                the destination to the component's install directory
 #]]
 macro(gr_configure_innosetup_plugins)
-  cmake_parse_arguments(GR_INNO_PLUGIN "" "" "PACKAGES;COMPONENTS" ${ARGN})
+  cmake_parse_arguments(
+    GR_INNO_PLUGIN
+    ""
+    ""
+    "PACKAGES;COMPONENTS"
+    ${ARGN})
 
   set(GR_INNOSETUP_PLUGIN_PACKAGES ${GR_INNO_PLUGIN_PACKAGES})
   set(GR_INNOSETUP_PLUGIN_COMPONENTS ${GR_INNO_PLUGIN_COMPONENTS})

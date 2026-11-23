@@ -19,18 +19,21 @@ cpack_add_component(
   DISPLAY_NAME "Runtime"
   DESCRIPTION "GNU Radio 4 core runtime libraries"
   REQUIRED)
-cpack_add_component(DEVELOP DISPLAY_NAME "Development files"
-                    DESCRIPTION "Headers, import libraries and CMake/pkg-config files needed to build against GR 4")
-# MSVC only in practice: GrInstall.cmake puts each target's PDB here, and
-# nothing else produces separate debug information.
-# DISABLED, so it is off unless asked for. The preselection that would
-# otherwise deselect it is skipped once the package is installed, which would
-# quietly start shipping the whole PDB payload on every upgrade.
-cpack_add_component(SYMBOLS DISPLAY_NAME "Debug symbols"
-                    DESCRIPTION "Program database files for debugging the installed binaries" DISABLED)
+cpack_add_component(
+  DEVELOP
+  DISPLAY_NAME "Development files"
+  DESCRIPTION "Headers, import libraries and CMake/pkg-config files needed to build against GR 4")
+# MSVC only in practice: GrInstall.cmake puts each target's PDB here, and nothing else produces separate debug
+# information. DISABLED, so it is off unless asked for. The preselection that would otherwise deselect it is skipped
+# once the package is installed, which would quietly start shipping the whole PDB payload on every upgrade.
+cpack_add_component(
+  SYMBOLS
+  DISPLAY_NAME "Debug symbols"
+  DESCRIPTION "Program database files for debugging the installed binaries"
+  DISABLED)
 
-# APPLE implies UNIX, so macOS must be excluded here or it selects the Debian
-# generator and `--target package` tries to build a .deb on a Mac.
+# APPLE implies UNIX, so macOS must be excluded here or it selects the Debian generator and `--target package` tries to
+# build a .deb on a Mac.
 if(UNIX AND NOT APPLE)
   if(NOT CPACK_GENERATOR)
     set(CPACK_GENERATOR "DEB")
@@ -38,8 +41,8 @@ if(UNIX AND NOT APPLE)
 
   set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
   set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
-  # When installing to a non-standard prefix (e.g. /opt/gnuradio4), dpkg-shlibdeps
-  # cannot find the package's own private libraries. Point it to the install lib dir.
+  # When installing to a non-standard prefix (e.g. /opt/gnuradio4), dpkg-shlibdeps cannot find the package's own private
+  # libraries. Point it to the install lib dir.
   set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS_PRIVATE_DIRS "${CMAKE_INSTALL_PREFIX}/lib")
   if(CMAKE_BUILD_TYPE STREQUAL "Debug" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     set(CPACK_DEBIAN_DEBUGINFO_PACKAGE ON)
@@ -48,13 +51,13 @@ endif()
 
 if(APPLE)
   set(CPACK_GENERATOR "productbuild")
-  # without an explicit list CPack builds a monolithic package and the component
-  # selection the unified installer is built around is lost
+  # without an explicit list CPack builds a monolithic package and the component selection the unified installer is
+  # built around is lost
   set(CPACK_COMPONENTS_ALL CORE DEVELOP Unspecified)
 
   include("${CMAKE_CURRENT_LIST_DIR}/GrProductBuild.cmake")
-  # the identifier identifies gr-core to pkgutil across releases: never reuse it
-  # in another GR installer and never change it between versions
+  # the identifier identifies gr-core to pkgutil across releases: never reuse it in another GR installer and never
+  # change it between versions
   gr_configure_productbuild_installer(
     IDENTIFIER
     "org.gnuradio.gr4.core"
@@ -65,8 +68,7 @@ if(APPLE)
     PRESELECTED_COMPONENTS
     CORE
     DEVELOP)
-  # gr-core owns the shared layout, so it ships the one uninstaller that serves
-  # every GR 4 package
+  # gr-core owns the shared layout, so it ships the one uninstaller that serves every GR 4 package
   gr_install_productbuild_uninstaller(COMPONENT CORE)
 endif()
 
@@ -75,20 +77,23 @@ if(WIN32)
   set(CPACK_INNOSETUP_USE_CMAKE_BOOL_FORMAT ON)
   set(CPACK_INNOSETUP_USE_MODERN_WIZARD ON)
   set(CPACK_INNOSETUP_ALLOW_CUSTOM_DIRECTORY ON)
-  # fallback only: gr_configure_innosetup_installer() takes the install root from
-  # the shared manifest when a GR 4 installation already exists
+  # fallback only: gr_configure_innosetup_installer() takes the install root from the shared manifest when a GR 4
+  # installation already exists
   set(CPACK_INNOSETUP_INSTALL_ROOT "{autopf}")
   set(CPACK_PACKAGE_INSTALL_DIRECTORY "GNURadio4")
-  # The Start Menu folder is GR_START_MENU, defaulted and applied by
-  # GrInnoSetup.cmake below so that every GR 4 package agrees on it.
-  # without an explicit list CPack builds a monolithic installer and ignores
-  # /COMPONENTS, which the superbuild installer uses to select DEVELOP and
-  # SYMBOLS. SYMBOLS is Windows-only: there are no PDBs to ship elsewhere.
-  set(CPACK_COMPONENTS_ALL CORE DEVELOP SYMBOLS Unspecified)
+  # The Start Menu folder is GR_START_MENU, defaulted and applied by GrInnoSetup.cmake below so that every GR 4 package
+  # agrees on it. without an explicit list CPack builds a monolithic installer and ignores /COMPONENTS, which the
+  # superbuild installer uses to select DEVELOP and SYMBOLS. SYMBOLS is Windows-only: there are no PDBs to ship
+  # elsewhere.
+  set(CPACK_COMPONENTS_ALL
+      CORE
+      DEVELOP
+      SYMBOLS
+      Unspecified)
 
   include("${CMAKE_CURRENT_LIST_DIR}/GrInnoSetup.cmake")
-  # the AppId identifies gr-core to Windows across releases: never reuse it in
-  # another GR installer and never change it between versions
+  # the AppId identifies gr-core to Windows across releases: never reuse it in another GR installer and never change it
+  # between versions
   gr_configure_innosetup_installer(
     APP_ID
     "{{043E5E17-27A5-4253-823F-A19BC3A7BA86}"

@@ -53,8 +53,8 @@ if(NOT EXISTS "${GR_PRODUCTBUILD_TEMPLATE_DIR}/gr_postinstall.sh.in")
   set(GR_PRODUCTBUILD_TEMPLATE_DIR "${CMAKE_CURRENT_LIST_DIR}/packaging/productbuild")
 endif()
 
-# The shared layout. Changing either of these splits an installation in two, so
-# they are not cache variables: every GR package must agree on them.
+# The shared layout. Changing either of these splits an installation in two, so they are not cache variables: every GR
+# package must agree on them.
 set(GR_PRODUCTBUILD_INSTALL_ROOT "/usr/local/gnuradio4")
 set(GR_PRODUCTBUILD_SHARED_ROOT "/Library/Application Support/.gnuradio-4")
 set(GR_PRODUCTBUILD_IDENTIFIER_NAMESPACE "org.gnuradio.gr4")
@@ -63,18 +63,29 @@ set(GR4_MACOS_SIGN_IDENTITY
     ""
     CACHE STRING "Developer ID Installer identity for the macOS component packages; empty leaves them unsigned")
 
-# Regenerates the installer scripts and CPack wiring from whatever has been
-# declared so far. Both public macros call it, so they may be used in any order.
+# Regenerates the installer scripts and CPack wiring from whatever has been declared so far. Both public macros call it,
+# so they may be used in any order.
 macro(_gr_productbuild_generate)
   if(NOT GR_PLUGIN_API_VERSION)
     message(FATAL_ERROR "gr_configure_productbuild_installer: GR_PLUGIN_API_VERSION is not set")
   endif()
 
-  # the installer scripts read these as flat strings, in the same shapes the
-  # Inno Setup templates use
-  string(JOIN "|" GR_INSTALLER_COMPONENT_PACKAGES ${GR_PRODUCTBUILD_COMPONENT_PACKAGES})
-  string(JOIN "|" GR_INSTALLER_PLUGIN_PACKAGES ${GR_PRODUCTBUILD_PLUGIN_PACKAGES})
-  string(JOIN "," GR_INSTALLER_PRESELECTED_COMPONENTS ${GR_PRODUCTBUILD_PRESELECTED_COMPONENTS})
+  # the installer scripts read these as flat strings, in the same shapes the Inno Setup templates use
+  string(
+    JOIN
+    "|"
+    GR_INSTALLER_COMPONENT_PACKAGES
+    ${GR_PRODUCTBUILD_COMPONENT_PACKAGES})
+  string(
+    JOIN
+    "|"
+    GR_INSTALLER_PLUGIN_PACKAGES
+    ${GR_PRODUCTBUILD_PLUGIN_PACKAGES})
+  string(
+    JOIN
+    ","
+    GR_INSTALLER_PRESELECTED_COMPONENTS
+    ${GR_PRODUCTBUILD_PRESELECTED_COMPONENTS})
 
   set(GR_PRODUCTBUILD_PLUGIN_ROOT "${GR_PRODUCTBUILD_SHARED_ROOT}/plugins/v${GR_PLUGIN_API_VERSION}")
 
@@ -85,19 +96,19 @@ macro(_gr_productbuild_generate)
 
   set(_gr_pb_components ${CPACK_COMPONENTS_ALL})
   if(NOT _gr_pb_components)
-    # without an explicit list CPack builds a monolithic package and the
-    # component selection this whole mechanism exists for is lost
-    message(
-      WARNING
-        "gr_configure_productbuild_installer: CPACK_COMPONENTS_ALL is not set, "
-        "the macOS installer will offer a single component")
+    # without an explicit list CPack builds a monolithic package and the component selection this whole mechanism exists
+    # for is lost
+    message(WARNING "gr_configure_productbuild_installer: CPACK_COMPONENTS_ALL is not set, "
+                    "the macOS installer will offer a single component")
     set(_gr_pb_components "Unspecified")
   endif()
 
-  # A REGISTER_COMPONENT that is not built is the quiet failure mode here: the
-  # files install, nothing registers, and the package is invisible to every
-  # other GR installer and to gr4-uninstall.
-  if(NOT GR_PRODUCTBUILD_REGISTER_COMPONENT IN_LIST _gr_pb_components)
+  # A REGISTER_COMPONENT that is not built is the quiet failure mode here: the files install, nothing registers, and the
+  # package is invisible to every other GR installer and to gr4-uninstall.
+  if(NOT
+     GR_PRODUCTBUILD_REGISTER_COMPONENT
+     IN_LIST
+     _gr_pb_components)
     message(
       FATAL_ERROR
         "gr_configure_productbuild_installer: REGISTER_COMPONENT is "
@@ -117,34 +128,31 @@ macro(_gr_productbuild_generate)
   foreach(_gr_pb_component IN LISTS _gr_pb_components)
     set(_gr_pb_component_scripts "${_gr_pb_scripts_dir}/${_gr_pb_component}")
 
-    # the downgrade guard belongs on every component: any one of them can be the
-    # first to write files over a newer install.
-    # NEWLINE_STYLE LF on every generated script: a CRLF line ending leaves a
-    # stray carriage return on the #! line, and a pkg script that cannot start
-    # fails the install with no useful message.
-    configure_file("${GR_PRODUCTBUILD_TEMPLATE_DIR}/gr_preinstall.sh.in" "${_gr_pb_component_scripts}/preinstall"
-                   @ONLY NEWLINE_STYLE LF FILE_PERMISSIONS ${_gr_pb_script_permissions})
+    # the downgrade guard belongs on every component: any one of them can be the first to write files over a newer
+    # install. NEWLINE_STYLE LF on every generated script: a CRLF line ending leaves a stray carriage return on the #!
+    # line, and a pkg script that cannot start fails the install with no useful message.
+    configure_file("${GR_PRODUCTBUILD_TEMPLATE_DIR}/gr_preinstall.sh.in" "${_gr_pb_component_scripts}/preinstall" @ONLY
+                   NEWLINE_STYLE LF FILE_PERMISSIONS ${_gr_pb_script_permissions})
 
-    # pkgbuild --scripts takes a directory, so the manifest tool rides along
-    # beside the scripts that call it
-    file(COPY "${GR_PRODUCTBUILD_TEMPLATE_DIR}/gr_manifest.sh" DESTINATION "${_gr_pb_component_scripts}"
-         FILE_PERMISSIONS ${_gr_pb_script_permissions})
+    # pkgbuild --scripts takes a directory, so the manifest tool rides along beside the scripts that call it
+    file(
+      COPY "${GR_PRODUCTBUILD_TEMPLATE_DIR}/gr_manifest.sh"
+      DESTINATION "${_gr_pb_component_scripts}"
+      FILE_PERMISSIONS ${_gr_pb_script_permissions})
 
-    # one registration per package, not per component: REGISTER_COMPONENT is
-    # REQUIRED, so it is installed whatever else the user selected
+    # one registration per package, not per component: REGISTER_COMPONENT is REQUIRED, so it is installed whatever else
+    # the user selected
     if(_gr_pb_component STREQUAL GR_PRODUCTBUILD_REGISTER_COMPONENT)
-      configure_file("${GR_PRODUCTBUILD_TEMPLATE_DIR}/gr_postinstall.sh.in"
-                     "${_gr_pb_component_scripts}/postinstall" @ONLY NEWLINE_STYLE LF
-                     FILE_PERMISSIONS ${_gr_pb_script_permissions})
+      configure_file("${GR_PRODUCTBUILD_TEMPLATE_DIR}/gr_postinstall.sh.in" "${_gr_pb_component_scripts}/postinstall"
+                     @ONLY NEWLINE_STYLE LF FILE_PERMISSIONS ${_gr_pb_script_permissions})
     else()
       # a stale postinstall from an earlier configure would register twice
       file(REMOVE "${_gr_pb_component_scripts}/postinstall")
     endif()
   endforeach()
 
-  # The arguments are written to a file rather than baked into the custom target
-  # so that a later gr_configure_productbuild_plugins() call is picked up
-  # without having to redefine the target.
+  # The arguments are written to a file rather than baked into the custom target so that a later
+  # gr_configure_productbuild_plugins() call is picked up without having to redefine the target.
   set(_gr_pb_args "# Generated by gr-core cmake/GrProductBuild.cmake, do not edit.\n")
   string(APPEND _gr_pb_args "set(GR4_PB_BINARY_DIR [==[${CMAKE_BINARY_DIR}]==])\n")
   string(APPEND _gr_pb_args "set(GR4_PB_PACKAGE_NAME [==[${CPACK_PACKAGE_NAME}]==])\n")
@@ -152,8 +160,7 @@ macro(_gr_productbuild_generate)
   string(APPEND _gr_pb_args "set(GR4_PB_SUMMARY [==[${CPACK_PACKAGE_DESCRIPTION_SUMMARY}]==])\n")
   string(APPEND _gr_pb_args "set(GR4_PB_IDENTIFIER [==[${GR_PRODUCTBUILD_IDENTIFIER}]==])\n")
   string(APPEND _gr_pb_args "set(GR4_PB_COMPONENTS [==[${_gr_pb_components}]==])\n")
-  string(APPEND _gr_pb_args
-         "set(GR4_PB_REGISTER_COMPONENT [==[${GR_PRODUCTBUILD_REGISTER_COMPONENT}]==])\n")
+  string(APPEND _gr_pb_args "set(GR4_PB_REGISTER_COMPONENT [==[${GR_PRODUCTBUILD_REGISTER_COMPONENT}]==])\n")
   string(APPEND _gr_pb_args "set(GR4_PB_PLUGIN_COMPONENTS [==[${GR_PRODUCTBUILD_PLUGIN_COMPONENTS}]==])\n")
   string(APPEND _gr_pb_args "set(GR4_PB_INSTALL_ROOT [==[${GR_PRODUCTBUILD_INSTALL_ROOT}]==])\n")
   string(APPEND _gr_pb_args "set(GR4_PB_PLUGIN_ROOT [==[${GR_PRODUCTBUILD_PLUGIN_ROOT}]==])\n")
@@ -170,12 +177,12 @@ macro(_gr_productbuild_generate)
     string(APPEND _gr_pb_args "set(GR4_PB_DISPLAY_${_gr_pb_component} [==[${_gr_pb_display}]==])\n")
   endforeach()
 
-  # file(WRITE), not file(CONFIGURE): everything above is already interpolated,
-  # and a lone '@' in an install path would otherwise be taken as a substitution
+  # file(WRITE), not file(CONFIGURE): everything above is already interpolated, and a lone '@' in an install path would
+  # otherwise be taken as a substitution
   file(WRITE "${_gr_pb_dir}/args.cmake" "${_gr_pb_args}")
 
-  # the uninstaller is payload, not a build-time script, so it is configured
-  # into the build tree and installed from there
+  # the uninstaller is payload, not a build-time script, so it is configured into the build tree and installed from
+  # there
   configure_file("${GR_PRODUCTBUILD_TEMPLATE_DIR}/gr4-uninstall.in" "${_gr_pb_dir}/gr4-uninstall" @ONLY
                  NEWLINE_STYLE LF FILE_PERMISSIONS ${_gr_pb_script_permissions})
 
@@ -199,8 +206,7 @@ macro(_gr_productbuild_generate)
       gr4-component-pkgs
       COMMAND "${CMAKE_COMMAND}" "-DARGS_FILE:FILEPATH=${_gr_pb_dir}/args.cmake" -P
               "${GR_PRODUCTBUILD_TEMPLATE_DIR}/BuildComponentPackages.cmake"
-      USES_TERMINAL
-      VERBATIM
+      USES_TERMINAL VERBATIM
       COMMENT "Building the ${CPACK_PACKAGE_NAME} component packages")
   endif()
 endmacro()
@@ -233,10 +239,16 @@ Args:
                         else meant to be on by default belongs here
 #]]
 macro(gr_configure_productbuild_installer)
-  cmake_parse_arguments(GR_PB "" "IDENTIFIER;REGISTER_COMPONENT" "PACKAGES;PRESELECTED_COMPONENTS" ${ARGN})
+  cmake_parse_arguments(
+    GR_PB
+    ""
+    "IDENTIFIER;REGISTER_COMPONENT"
+    "PACKAGES;PRESELECTED_COMPONENTS"
+    ${ARGN})
 
   if(NOT GR_PB_IDENTIFIER)
-    message(FATAL_ERROR "gr_configure_productbuild_installer: IDENTIFIER is required and must be stable across releases")
+    message(
+      FATAL_ERROR "gr_configure_productbuild_installer: IDENTIFIER is required and must be stable across releases")
   endif()
 
   set(GR_PRODUCTBUILD_IDENTIFIER "${GR_PB_IDENTIFIER}")
@@ -273,7 +285,12 @@ Args:
                package is built with the plugin root as its install location
 #]]
 macro(gr_configure_productbuild_plugins)
-  cmake_parse_arguments(GR_PB_PLUGIN "" "" "PACKAGES;COMPONENTS" ${ARGN})
+  cmake_parse_arguments(
+    GR_PB_PLUGIN
+    ""
+    ""
+    "PACKAGES;COMPONENTS"
+    ${ARGN})
 
   set(GR_PRODUCTBUILD_PLUGIN_PACKAGES ${GR_PB_PLUGIN_PACKAGES})
   set(GR_PRODUCTBUILD_PLUGIN_COMPONENTS ${GR_PB_PLUGIN_COMPONENTS})
@@ -295,7 +312,12 @@ Args:
     COMPONENT  the CPack component the uninstaller belongs to (default: CORE)
 #]]
 macro(gr_install_productbuild_uninstaller)
-  cmake_parse_arguments(GR_PB_UNINSTALL "" "COMPONENT" "" ${ARGN})
+  cmake_parse_arguments(
+    GR_PB_UNINSTALL
+    ""
+    "COMPONENT"
+    ""
+    ${ARGN})
 
   if(NOT GR_PB_UNINSTALL_COMPONENT)
     set(GR_PB_UNINSTALL_COMPONENT "CORE")
@@ -304,6 +326,8 @@ macro(gr_install_productbuild_uninstaller)
     message(FATAL_ERROR "gr_install_productbuild_uninstaller: call gr_configure_productbuild_installer() first")
   endif()
 
-  install(PROGRAMS "${CMAKE_CURRENT_BINARY_DIR}/packaging/productbuild/gr4-uninstall" DESTINATION bin
-          COMPONENT ${GR_PB_UNINSTALL_COMPONENT})
+  install(
+    PROGRAMS "${CMAKE_CURRENT_BINARY_DIR}/packaging/productbuild/gr4-uninstall"
+    DESTINATION bin
+    COMPONENT ${GR_PB_UNINSTALL_COMPONENT})
 endmacro()
