@@ -28,6 +28,9 @@ jobs:
           fetch-depth: 1
       - name: Setup VS Dev Prompt
         uses: step-security/msvc-dev-cmd@22c98154b708dbd743e6f27a933cf6ceba3305c4 # v1.13.1
+        # the action sets up x64 tools by default, which the ARM runner runs under emulation
+        with:
+          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
       # gnuradio4-deps applies the MSVC patches to vir-simd and provides Boost.UT, magic_enum and cpp-httplib; it
       # prepends its prefix to CMAKE_PREFIX_PATH and PATH for the steps below
       - name: Build the third-party dependencies
