@@ -687,6 +687,11 @@ endif()
 
 # Configure and install the pkg-config file TODO: This should become more granular - .pc for each in-tree module
 set(GR4_PKGCONFIG_PLUGIN_LIB "")
+# a pkg-config consumer needs the cache line override the CMake targets carry on gnuradio-meta's interface
+set(GR4_PKGCONFIG_CACHE_LINE_CFLAG "")
+if(GR_CACHE_LINE_SIZE)
+  set(GR4_PKGCONFIG_CACHE_LINE_CFLAG " -DGR_CACHE_LINE_SIZE=${GR_CACHE_LINE_SIZE}")
+endif()
 configure_file(cmake/gnuradio4.pc.in ${CMAKE_CURRENT_BINARY_DIR}/gnuradio4.pc @ONLY)
 
 gr_install_artifact(

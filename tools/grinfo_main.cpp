@@ -95,9 +95,9 @@ Usage: grinfo [command] [options]
   --help, -h         this text
 
 Blocks and schedulers come from the directories named by --plugin-dir, from the
-colon-separated list in GNURADIO4_PLUGIN_DIRECTORIES, and from the plugin
-directory of this installation, which is always searched. A directory named
-twice is searched once.
+list in GNURADIO4_PLUGIN_DIRECTORIES (separated by ';' on Windows and ':'
+elsewhere), and from the plugin directory of this installation, which is always
+searched. A directory named twice is searched once.
 
 <name> is a registry key with its template parameters,
 gr::blocks::basic::Convert<int16, float32>, or a name without them,

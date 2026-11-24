@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <sstream>
 #include <string>
@@ -879,9 +880,28 @@ public:
 /// prefix given when the build was configured. It stays that path when the installed files are moved.
 [[nodiscard]] std::string_view installedPluginDirectory() noexcept;
 
+/// The separator between the directories of GNURADIO4_PLUGIN_DIRECTORIES: the platform's own path-list separator, so a
+/// Windows path keeps its drive letter.
+#ifdef _WIN32
+inline constexpr char kPluginDirectorySeparator = ';';
+#else
+inline constexpr char kPluginDirectorySeparator = ':';
+#endif
+
+/// The directories of a GNURADIO4_PLUGIN_DIRECTORIES value, in order, without the empty ones.
+[[nodiscard]] inline std::vector<std::string> splitPluginDirectories(std::string_view list) {
+    std::vector<std::string> directories;
+    for (const auto directory : list | std::views::split(kPluginDirectorySeparator)) {
+        if (!directory.empty()) {
+            directories.emplace_back(directory.begin(), directory.end());
+        }
+    }
+    return directories;
+}
+
 /// The process's loader. The first call builds it, and every gr::Graph constructor makes a call. Building the loader
-/// opens every shared object in the colon-separated directories of GNURADIO4_PLUGIN_DIRECTORIES, or in
-/// installedPluginDirectory() when the variable is not set. A directory that does not exist is skipped.
+/// opens every shared object in the directories of GNURADIO4_PLUGIN_DIRECTORIES, or in installedPluginDirectory() when
+/// the variable is not set. A directory that does not exist is skipped.
 PluginLoader& globalPluginLoader();
 
 } // namespace gr

@@ -1,5 +1,6 @@
 #include <atomic>
 #include <cassert>
+#include <functional>
 #include <future>
 #include <gnuradio-4.0/Scheduler.hpp>
 #include <iostream>
@@ -45,8 +46,22 @@ struct RefuseStart : gr::Block<RefuseStart> {
 struct RefuseStop : gr::Block<RefuseStop> {
     gr::PortIn<float> in;
     GR_MAKE_REFLECTABLE(RefuseStop, in);
-    void stop() { throw gr::exception("deliberate retirement failure"); }
-    void processOne(float) const noexcept {}
+    struct Stats {
+        std::atomic<std::size_t> samples{0}, stops{0};
+    };
+    std::shared_ptr<Stats> stats = std::make_shared<Stats>();
+    void                   stop() {
+        ++stats->stops;
+        throw gr::exception("deliberate retirement failure");
+    }
+    void processOne(float) const noexcept { ++stats->samples; }
+};
+struct StopCallback : gr::Block<StopCallback> {
+    gr::PortIn<float> in;
+    GR_MAKE_REFLECTABLE(StopCallback, in);
+    std::function<void()> onStop;
+    void                  stop() { onStop(); }
+    void                  processOne(float) const noexcept {}
 };
 template<class Predicate>
 void await(Predicate predicate) {
@@ -288,8 +303,69 @@ void drainDuringComposition() {
     assert(stats->errors.load() == 0);
 }
 
+// A stop hook error is reported, but fully retiring its block must preserve the running stream.
+// Exercise both explicit removal and rollback after a later block refuses adoption.
 template<gr::scheduler::ExecutionPolicy policy>
-void quarantine() {
+void stopHookFailure(bool rollback) {
+    gr::SchedulerWrapper<gr::scheduler::Simple<policy>> scheduler;
+    gr::SchedulerModel&                                 api = scheduler;
+    gr::MsgPortIn                                       messages;
+    require(api.asBlockModel()->msgOut->connect(messages));
+    gr::Graph graph;
+    auto&     source = graph.emplaceBlock<Source>();
+    auto&     sink   = graph.emplaceBlock<Sink>();
+    auto      stats  = sink.stats;
+    require(graph.connect<"out", "in">(source, sink));
+    api.setGraph(std::move(graph));
+    require(api.start());
+    await([&] { return stats->samples.load() > 10000; });
+
+    std::shared_ptr<RefuseStop::Stats>         retired;
+    std::vector<std::weak_ptr<gr::BlockModel>> blocks;
+    auto                                       branch = api.compose([&](gr::CompositionEditor& edit) {
+        auto& added = edit.emplaceBlock<RefuseStop>();
+        retired     = added.stats;
+        edit.connect(source, "out", added, "in");
+        if (rollback) {
+            auto& bad = edit.emplaceBlock<RefuseStart>();
+            edit.connect(source, "out", bad, "in");
+        }
+        auto owned = api.asBlockModel()->graph()->blocks().subspan(2);
+        blocks.assign(owned.begin(), owned.end());
+    });
+    if (rollback) {
+        assert(!branch);
+        assert(branch.error().message.find("deliberate adoption failure") != std::string::npos);
+    } else {
+        require(branch);
+        await([&] { return retired->samples.load() > 10000; });
+        require(api.removeBranch(branch->branch));
+        assert(!api.removeBranch(branch->branch));
+    }
+    assert(retired->stops.load() == 1);
+    assert(api.asBlockModel()->graph()->blocks().size() == 2);
+    assert(!scheduler.blockRef().compositionInconsistent());
+    assert(scheduler.blockRef().state() == gr::lifecycle::State::RUNNING);
+    await([&] { return std::ranges::all_of(blocks, [](const auto& weak) { return weak.expired(); }); });
+    const auto before = stats->samples.load();
+    await([&] { return stats->samples.load() >= before + 10000; });
+    assert(stats->errors.load() == 0);
+    bool reported = false;
+    await([&] {
+        auto replies = messages.streamReader().get();
+        for (const auto& reply : replies) {
+            if (!reply.data && reply.data.error().message.find("deliberate retirement failure") != std::string::npos) {
+                reported = true;
+            }
+        }
+        assert(replies.consume(replies.size()));
+        return reported;
+    });
+    api.stop();
+}
+
+template<gr::scheduler::ExecutionPolicy policy>
+void quarantine(bool rollback) {
     gr::SchedulerWrapper<gr::scheduler::Simple<policy>> scheduler;
     gr::SchedulerModel&                                 api = scheduler;
     gr::Graph                                           graph;
@@ -307,12 +383,25 @@ void quarantine() {
     });
     require(prior);
     auto failed = api.compose([&](gr::CompositionEditor& edit) {
-        auto& stop = edit.emplaceBlock<RefuseStop>();
+        auto& stop = edit.emplaceBlock<StopCallback>();
         edit.connect(source, "out", stop, "in");
-        auto& start = edit.emplaceBlock<RefuseStart>();
-        edit.connect(source, "out", start, "in");
+        // Inject a structural retirement failure: the stop hook removes its own graph entry,
+        // so retireCompositionBlock() cannot complete removeBlockByName().
+        stop.onStop = [&, name = std::string(stop.unique_name)] { require(api.asBlockModel()->graph()->removeBlockByName(name)); };
+        if (rollback) {
+            auto& start = edit.emplaceBlock<RefuseStart>();
+            edit.connect(source, "out", start, "in");
+        }
     });
-    assert(!failed);
+    if (rollback) {
+        assert(!failed);
+        assert(failed.error().message == "composition rollback failed; execution is inconsistent and must be stopped");
+    } else {
+        require(failed);
+        auto removed = api.removeBranch(failed->branch);
+        assert(!removed);
+        assert(removed.error().message == "branch retirement failed; execution is inconsistent and must be stopped");
+    }
     assert(scheduler.blockRef().compositionInconsistent());
     assert(scheduler.blockRef().state() == gr::lifecycle::State::ERROR);
     assert(!api.compose([](auto&) { assert(false); }));
@@ -368,8 +457,14 @@ int main() {
         destruction<gr::scheduler::ExecutionPolicy::multiThreaded>();
         drainDuringComposition<gr::scheduler::ExecutionPolicy::singleThreaded>();
         drainDuringComposition<gr::scheduler::ExecutionPolicy::multiThreaded>();
-        quarantine<gr::scheduler::ExecutionPolicy::singleThreaded>();
-        quarantine<gr::scheduler::ExecutionPolicy::multiThreaded>();
+        stopHookFailure<gr::scheduler::ExecutionPolicy::singleThreaded>(false);
+        stopHookFailure<gr::scheduler::ExecutionPolicy::multiThreaded>(false);
+        stopHookFailure<gr::scheduler::ExecutionPolicy::singleThreaded>(true);
+        stopHookFailure<gr::scheduler::ExecutionPolicy::multiThreaded>(true);
+        quarantine<gr::scheduler::ExecutionPolicy::singleThreaded>(false);
+        quarantine<gr::scheduler::ExecutionPolicy::multiThreaded>(false);
+        quarantine<gr::scheduler::ExecutionPolicy::singleThreaded>(true);
+        quarantine<gr::scheduler::ExecutionPolicy::multiThreaded>(true);
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';
         return 1;
