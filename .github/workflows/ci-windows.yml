@@ -28,10 +28,10 @@ jobs:
           fetch-depth: 1
       - name: Setup VS Dev Prompt
         uses: step-security/msvc-dev-cmd@22c98154b708dbd743e6f27a933cf6ceba3305c4 # v1.13.1
-      # the superbuild applies the MSVC patches to vir-simd and provides Boost.UT, magic_enum and cpp-httplib; it
+      # gnuradio4-deps applies the MSVC patches to vir-simd and provides Boost.UT, magic_enum and cpp-httplib; it
       # prepends its prefix to CMAKE_PREFIX_PATH and PATH for the steps below
       - name: Build the third-party dependencies
-        uses: johnwparent/gnuradio4-superbuild@f23ee97613a606c8f70cdd6a40a8ade47e7ce9ad
+        uses: gnuradio/gnuradio4-deps@fa6f02f0a3e5c07b58f7cf3a3da4800f9ac93488
         with:
           enable-python3: OFF
           generator: Ninja
