@@ -1,0 +1,8 @@
+; Extra sections merged into the CPack-generated Inno Setup script.
+; Configured by CMake, see cmake/GrInnoSetup.cmake.
+
+[Files]
+; bundled copy, extracted to {tmp} and used while setup runs
+Source: "@GR_MANIFEST_TOOL@"; Flags: dontcopy noencryption
+; shared copy, the only one the uninstaller and third-party plugin installers can reach
+Source: "@GR_MANIFEST_TOOL@"; DestDir: "{code:GrGetToolsDir}"; Flags: ignoreversion uninsneveruninstall

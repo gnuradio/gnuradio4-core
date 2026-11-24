@@ -1,0 +1,711 @@
+{
+  Shared GNU Radio 4 Windows installer flow.
+
+  Every GR4 installer (gr-core, gr-blocks, ... and the combined superbuild
+  installer) compiles this file into its [Code] section.  It gives them all
+  one install layout, described by a manifest under
+  %LOCALAPPDATA%\.gnuradio-4\manifest\v<api>\manifest.json:
+
+    - the first installer to run picks the layout and writes the manifest
+    - every later installer reuses that layout and only adds its own entries
+    - reinstalling or upgrading a component proceeds silently, downgrading
+      asks the user first
+
+  Everything is keyed on the plugin ABI version, the install root and the
+  Add/Remove entry included, so two GR 4 installations built against
+  different ABIs are separate products that coexist.  Releases that share an
+  ABI are one product and upgrade in place, which is the common case.  A
+  release and a debug build of one package are also one product: they share
+  an install root and an uninstall entry, told apart by the debug postfix on
+  the files and by the configurations recorded against the package.
+
+  Configured by CMake, see cmake/GrInnoSetup.cmake.
+}
+
+const
+  GrApiVersion = '@GR_PLUGIN_API_VERSION@';
+  GrComponentPackages = '@GR_INSTALLER_COMPONENT_PACKAGES@';
+  GrPluginPackages = '@GR_INSTALLER_PLUGIN_PACKAGES@';
+  GrPreselectedComponents = '@GR_INSTALLER_PRESELECTED_COMPONENTS@';
+  GrManifestToolName = 'gr_manifest.ps1';
+  GrAppDataDirName = '.gnuradio-4';
+  GrInstallDirName = 'GNURadio4';
+  { which build this installer carries, recorded against every package it
+    registers so a release and a debug install can be told apart }
+  GrBuildConfiguration = '@GR_INSTALLER_CONFIGURATION@';
+  { a line must never start with '#', the preprocessor would read it as a directive }
+  GrEol = #13#10;
+  GrParagraph = #13#10#13#10;
+
+var
+  GrManifestLoaded: Boolean;
+  GrMachineManifestLoaded: Boolean;
+  GrMachineEntries: TArrayOfString;
+  GrManifestPresent: Boolean;
+  GrManifestUnreadable: Boolean;
+  GrManifestToolFailed: Boolean;
+  GrManifestEntries: TArrayOfString;
+  GrInstallRoot: String;
+  GrPluginRoot: String;
+  GrManifestToolPath: String;
+  GrManifestToolResolved: Boolean;
+
+// Everything below hangs off this one root, so the install scope is decided here
+// and nowhere else: the common application data folder is C:\ProgramData for a
+// machine-wide install, the local one is the user profile for a per-user install.
+// Admin mode is only reachable when the installer's
+// PrivilegesRequiredOverridesAllowed lets the user pick it.
+function GrAppDataRoot(): String;
+begin
+  if IsAdminInstallMode then
+    Result := AddBackslash(ExpandConstant('{commonappdata}')) + GrAppDataDirName
+  else
+    Result := AddBackslash(ExpandConstant('{localappdata}')) + GrAppDataDirName;
+end;
+
+{ The machine-wide manifest, read by a per-user install so it can see what is
+  already installed for everyone. Never written unless we are in admin mode. }
+function GrMachineManifestPath(): String;
+begin
+  Result := AddBackslash(ExpandConstant('{commonappdata}')) + GrAppDataDirName +
+    '\manifest\v' + GrApiVersion + '\manifest.json';
+end;
+
+function GrToolsDir(): String;
+begin
+  Result := AddBackslash(GrAppDataRoot()) + 'tools';
+end;
+
+function GrManifestPath(): String;
+begin
+  Result := AddBackslash(GrAppDataRoot()) + 'manifest\v' + GrApiVersion + '\manifest.json';
+end;
+
+function GrDefaultPluginRoot(): String;
+begin
+  Result := AddBackslash(GrAppDataRoot()) + 'plugins\v' + GrApiVersion;
+end;
+
+{ The directory that holds every ABI's install root.  Created by whichever
+  package installs first and removed by whichever uninstalls last. }
+function GrInstallParent(): String;
+begin
+  Result := AddBackslash(ExpandConstant('{autopf}')) + GrInstallDirName;
+end;
+
+{ The ABI version is part of the install path, not only of the manifest and
+  plugin trees: two installations built against different plugin ABIs ship
+  identically named binaries, so a shared root would have them overwrite each
+  other.  Releases sharing an ABI still land in the same place and upgrade. }
+function GrDefaultInstallRoot(): String;
+begin
+  Result := AddBackslash(GrInstallParent()) + 'v' + GrApiVersion;
+end;
+
+function GrSplit(const Text, Delimiter: String): TArrayOfString;
+var
+  Remaining: String;
+  SeparatorPos, Count: Integer;
+begin
+  SetArrayLength(Result, 0);
+  Remaining := Text;
+  Count := 0;
+  while Remaining <> '' do
+  begin
+    Count := Count + 1;
+    SetArrayLength(Result, Count);
+    SeparatorPos := Pos(Delimiter, Remaining);
+    if SeparatorPos = 0 then
+    begin
+      Result[Count - 1] := Remaining;
+      Remaining := '';
+    end
+    else
+    begin
+      Result[Count - 1] := Copy(Remaining, 1, SeparatorPos - 1);
+      Remaining := Copy(Remaining, SeparatorPos + Length(Delimiter), Length(Remaining));
+    end;
+  end;
+end;
+
+function GrEntryName(const Entry: String): String;
+var
+  SeparatorPos: Integer;
+begin
+  SeparatorPos := Pos('=', Entry);
+  if SeparatorPos = 0 then
+    Result := Entry
+  else
+    Result := Copy(Entry, 1, SeparatorPos - 1);
+end;
+
+function GrEntryValue(const Entry: String): String;
+var
+  SeparatorPos: Integer;
+begin
+  SeparatorPos := Pos('=', Entry);
+  if SeparatorPos = 0 then
+    Result := ''
+  else
+    Result := Copy(Entry, SeparatorPos + 1, Length(Entry));
+end;
+
+function GrValueOf(const Entries: TArrayOfString; const Key: String): String;
+var
+  Index: Integer;
+begin
+  Result := '';
+  for Index := 0 to GetArrayLength(Entries) - 1 do
+    if GrEntryName(Entries[Index]) = Key then
+    begin
+      Result := GrEntryValue(Entries[Index]);
+      Exit;
+    end;
+end;
+
+function GrManifestValue(const Key: String): String;
+begin
+  Result := GrValueOf(GrManifestEntries, Key);
+end;
+
+function GrResolveManifestTool(): String;
+begin
+  if GrManifestToolResolved then
+  begin
+    Result := GrManifestToolPath;
+    Exit;
+  end;
+  GrManifestToolResolved := True;
+
+  { the bundled copy is authoritative during setup; the uninstaller carries no
+    embedded files and falls back to the shared copy under %LOCALAPPDATA% }
+  try
+    ExtractTemporaryFile(GrManifestToolName);
+    GrManifestToolPath := ExpandConstant('{tmp}\' + GrManifestToolName);
+  except
+    GrManifestToolPath := '';
+  end;
+
+  if not FileExists(GrManifestToolPath) then
+  begin
+    GrManifestToolPath := AddBackslash(GrToolsDir()) + GrManifestToolName;
+    if not FileExists(GrManifestToolPath) then
+      GrManifestToolPath := '';
+  end;
+  Result := GrManifestToolPath;
+end;
+
+function GrRunManifestToolAt(const ManifestPath, Arguments: String; var Output: TArrayOfString): Boolean;
+var
+  ToolPath, OutputPath, CommandLine: String;
+  ResultCode: Integer;
+begin
+  SetArrayLength(Output, 0);
+  ToolPath := GrResolveManifestTool();
+  if ToolPath = '' then
+  begin
+    Result := False;
+    Exit;
+  end;
+
+  OutputPath := ExpandConstant('{tmp}\gr_manifest_result.txt');
+  DeleteFile(OutputPath);
+  CommandLine := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ToolPath + '"' +
+    ' -ManifestPath "' + ManifestPath + '" -OutFile "' + OutputPath + '"' +
+    ' -ApiVersion "' + GrApiVersion + '" ' + Arguments;
+
+  Result := Exec('powershell.exe', CommandLine, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
+  LoadStringsFromFile(OutputPath, Output);
+end;
+
+function GrRunManifestTool(const Arguments: String; var Output: TArrayOfString): Boolean;
+begin
+  Result := GrRunManifestToolAt(GrManifestPath(), Arguments, Output);
+end;
+
+procedure GrLoadManifest();
+var
+  Output: TArrayOfString;
+  Value: String;
+begin
+  if GrManifestLoaded then
+    Exit;
+  GrManifestLoaded := True;
+  GrInstallRoot := GrDefaultInstallRoot();
+  GrPluginRoot := GrDefaultPluginRoot();
+
+  if not GrRunManifestTool('-Action query', Output) then
+  begin
+    { reported by the caller, which knows whether this is an install or an uninstall }
+    GrManifestToolFailed := True;
+    Exit;
+  end;
+
+  GrManifestEntries := Output;
+  { the manifest exists but is not valid JSON: register moves it aside and starts over }
+  GrManifestUnreadable := GrManifestValue('manifest-unreadable') = '1';
+  GrManifestPresent := GrManifestValue('manifest-present') = '1';
+  if not GrManifestPresent then
+    Exit;
+
+  Value := GrManifestValue('install-root');
+  if Value <> '' then
+    GrInstallRoot := Value;
+  Value := GrManifestValue('plugin-root');
+  if Value <> '' then
+    GrPluginRoot := Value;
+end;
+
+{ What a machine-wide install has already put on this computer. A per-user
+  install can add to it but never writes to it, so this is read-only and its
+  roots are ignored: only the inventory matters, for the downgrade check and
+  for reporting a package as present. }
+procedure GrLoadMachineManifest();
+var
+  Output: TArrayOfString;
+begin
+  if GrMachineManifestLoaded then
+    Exit;
+  GrMachineManifestLoaded := True;
+  if IsAdminInstallMode then
+    Exit;
+  if GrRunManifestToolAt(GrMachineManifestPath(), '-Action query', Output) then
+    GrMachineEntries := Output;
+end;
+
+function GrGetInstallRoot(Param: String): String;
+begin
+  GrLoadManifest();
+  Result := GrInstallRoot;
+end;
+
+function GrGetPluginRoot(Param: String): String;
+begin
+  GrLoadManifest();
+  Result := GrPluginRoot;
+end;
+
+{ used by gr_installer_files.iss to place the shared copy of the manifest tool }
+function GrGetToolsDir(Param: String): String;
+begin
+  Result := GrToolsDir();
+end;
+
+function GrNormaliseVersion(const Version: String): String;
+var
+  SeparatorPos: Integer;
+begin
+  Result := Trim(Version);
+  SeparatorPos := Pos('-', Result);
+  if SeparatorPos > 0 then
+    Result := Copy(Result, 1, SeparatorPos - 1);
+  SeparatorPos := Pos('+', Result);
+  if SeparatorPos > 0 then
+    Result := Copy(Result, 1, SeparatorPos - 1);
+end;
+
+function GrCompareVersions(const Left, Right: String): Integer;
+var
+  LeftPacked, RightPacked: Int64;
+begin
+  if StrToVersion(GrNormaliseVersion(Left), LeftPacked) and StrToVersion(GrNormaliseVersion(Right), RightPacked) then
+    Result := ComparePackedVersion(LeftPacked, RightPacked)
+  else
+    Result := CompareText(Trim(Left), Trim(Right));
+end;
+
+{ ThisScopeOnly picks between two different questions.
+
+  False asks what exists on this computer at all, machine-wide installs
+  included, which is the honest answer to "is this package present".
+
+  True asks what *this* install is going to touch, and that is what every
+  decision here wants.  A per-user install neither replaces nor upgrades a
+  machine-wide one: they have separate roots, separate manifests and separate
+  uninstall entries.  Answering such a decision from the merged view makes
+  the installer act on files it cannot write. }
+function GrVersionOf(const Section, PackageName: String; ThisScopeOnly: Boolean): String;
+begin
+  Result := GrManifestValue(Section + '.' + PackageName);
+  if (Result <> '') or ThisScopeOnly then
+    Exit;
+  GrLoadMachineManifest();
+  Result := GrValueOf(GrMachineEntries, Section + '.' + PackageName);
+end;
+
+{ Which build configurations of a package are on this machine, comma
+  separated, e.g. 'Release,Debug'.  Empty when the package is absent, and
+  also when it was recorded by a schema 1 manifest, which did not track them. }
+{ The fallback is gated on the package being absent from this scope, not on
+  the configuration list being empty.  A schema 1 manifest records the package
+  with no configurations at all, and reading the machine install's list in its
+  place would attribute a Debug install to a per-user Release one. }
+function GrInstalledConfigurations(const Section, PackageName: String; ThisScopeOnly: Boolean): String;
+begin
+  if GrManifestValue(Section + '.' + PackageName) <> '' then
+  begin
+    Result := GrManifestValue(Section + '-config.' + PackageName);
+    Exit;
+  end;
+  if ThisScopeOnly then
+  begin
+    Result := '';
+    Exit;
+  end;
+  GrLoadMachineManifest();
+  Result := GrValueOf(GrMachineEntries, Section + '-config.' + PackageName);
+end;
+
+{ Scoped to this install: the bundle uses it to decide which installers to
+  run, and those run in the scope the bundle chose. }
+function GrConfigurationIsInstalled(const Section, PackageName, Configuration: String): Boolean;
+var
+  Entries: TArrayOfString;
+  Index: Integer;
+begin
+  Result := False;
+  Entries := GrSplit(GrInstalledConfigurations(Section, PackageName, True), ',');
+  for Index := 0 to GetArrayLength(Entries) - 1 do
+    if CompareText(Trim(Entries[Index]), Configuration) = 0 then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+function GrAnyPackageInstalled(const Packages, Section: String; ThisScopeOnly: Boolean): Boolean;
+var
+  Entries: TArrayOfString;
+  Index: Integer;
+begin
+  Result := False;
+  Entries := GrSplit(Packages, '|');
+  for Index := 0 to GetArrayLength(Entries) - 1 do
+    if GrVersionOf(Section, GrEntryName(Entries[Index]), ThisScopeOnly) <> '' then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+function GrPackageIsInstalled(ThisScopeOnly: Boolean): Boolean;
+begin
+  Result := GrAnyPackageInstalled(GrComponentPackages, 'component', ThisScopeOnly) or
+    GrAnyPackageInstalled(GrPluginPackages, 'plugin', ThisScopeOnly);
+end;
+
+function GrConfirmDowngradesIn(const Packages, Section: String): Boolean;
+var
+  Entries: TArrayOfString;
+  Index: Integer;
+  PackageName, InstalledVersion, PackagedVersion: String;
+begin
+  Result := True;
+  Entries := GrSplit(Packages, '|');
+  for Index := 0 to GetArrayLength(Entries) - 1 do
+  begin
+    PackageName := GrEntryName(Entries[Index]);
+    PackagedVersion := GrEntryValue(Entries[Index]);
+    { this scope only: warning that we are about to replace newer files is
+      false when those files belong to a machine-wide install we cannot write }
+    InstalledVersion := GrVersionOf(Section, PackageName, True);
+    if (InstalledVersion = '') or (GrCompareVersions(InstalledVersion, PackagedVersion) <= 0) then
+      Continue;
+
+    Result := SuppressibleMsgBox(Format(
+      '%s %s is already installed, but this package contains the older version %s.' + GrParagraph +
+      'Installing it replaces the newer files and may break plugins built against %s.' + GrParagraph +
+      'Do you want to continue?', [PackageName, InstalledVersion, PackagedVersion, InstalledVersion]),
+      mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO) = IDYES;
+    if not Result then
+      Exit;
+  end;
+end;
+
+function GrConfirmDowngrades(): Boolean;
+begin
+  Result := GrConfirmDowngradesIn(GrComponentPackages, 'component') and
+    GrConfirmDowngradesIn(GrPluginPackages, 'plugin');
+end;
+
+function GrRegisterInManifest(): Boolean;
+var
+  Output: TArrayOfString;
+  Arguments: String;
+begin
+  Arguments := Format('-Action register -InstallRoot "%s" -PluginRoot "%s" -Components "%s" -Plugins "%s"' +
+    ' -Configuration "%s"', [
+    RemoveBackslashUnlessRoot(ExpandConstant('{app}')), RemoveBackslashUnlessRoot(GrPluginRoot),
+    GrComponentPackages, GrPluginPackages, GrBuildConfiguration]);
+  Result := GrRunManifestTool(Arguments, Output);
+end;
+
+function GrUnregisterFromManifest(var ManifestRemoved: Boolean): Boolean;
+var
+  Output: TArrayOfString;
+  Arguments: String;
+begin
+  ManifestRemoved := False;
+  Arguments := Format('-Action unregister -Components "%s" -Plugins "%s"', [
+    GrComponentPackages, GrPluginPackages]);
+  Result := GrRunManifestTool(Arguments, Output);
+  if Result then
+    ManifestRemoved := GrValueOf(Output, 'manifest-removed') = '1';
+end;
+
+procedure GrRemoveEmptyDirTree(const Dir: String);
+var
+  SearchRec: TFindRec;
+  Children: TArrayOfString;
+  Count, Index: Integer;
+begin
+  { collect first: removing a subdirectory while enumerating its parent is not safe }
+  Count := 0;
+  SetArrayLength(Children, 0);
+  if FindFirst(AddBackslash(Dir) + '*', SearchRec) then
+  try
+    repeat
+      if ((SearchRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0) and
+         (SearchRec.Name <> '.') and (SearchRec.Name <> '..') then
+      begin
+        Count := Count + 1;
+        SetArrayLength(Children, Count);
+        Children[Count - 1] := AddBackslash(Dir) + SearchRec.Name;
+      end;
+    until not FindNext(SearchRec);
+  finally
+    FindClose(SearchRec);
+  end;
+
+  for Index := 0 to Count - 1 do
+    GrRemoveEmptyDirTree(Children[Index]);
+  RemoveDir(Dir);
+end;
+
+procedure GrPruneAppDataTree();
+var
+  AppDataRoot: String;
+begin
+  { only reached once the manifest is gone, so nothing else claims these paths.
+    RemoveDir refuses non-empty directories, which keeps user data safe. }
+  AppDataRoot := GrAppDataRoot();
+  DeleteFile(AddBackslash(GrToolsDir()) + GrManifestToolName);
+  RemoveDir(GrToolsDir());
+  { our own backup of an unparseable manifest, written by the repair path }
+  DeleteFile(GrManifestPath() + '.corrupt');
+  RemoveDir(ExtractFileDir(GrManifestPath()));
+  RemoveDir(AddBackslash(AppDataRoot) + 'manifest');
+  RemoveDir(GrPluginRoot);
+  RemoveDir(AddBackslash(AppDataRoot) + 'plugins');
+  RemoveDir(AppDataRoot);
+end;
+
+// Shortcut names carry the ABI version for the same reason the install root
+// does: two installations built against different plugin ABIs coexist, so
+// their Start Menu entries must not collide either.
+//
+// The two below are scripted constants, used by gr-super's [Icons] section so
+// that the names the bundle creates and the names this uninstaller removes
+// cannot drift apart. They deliberately yield a bare name rather than a path:
+// the Inno Setup compiler rejects an [Icons] Name it cannot see a literal
+// path separator in, so the section spells out the {autoprograms} and
+// {autodesktop} constants itself and takes only the varying part from here.
+function GrBundleSuffix(Param: String): String;
+begin
+  Result := ' (v' + GrApiVersion + ')';
+end;
+
+function GrBundleStartMenuLeaf(Param: String): String;
+begin
+  Result := 'GNU Radio 4' + GrBundleSuffix('');
+end;
+
+function GrBundleStartMenuDir(): String;
+begin
+  Result := AddBackslash(ExpandConstant('{autoprograms}')) + GrBundleStartMenuLeaf('');
+end;
+
+function GrBundleShellIcon(): String;
+begin
+  Result := AddBackslash(GrBundleStartMenuDir()) + 'GNU Radio 4 Shell';
+end;
+
+function GrBundleDevShellIcon(): String;
+begin
+  Result := AddBackslash(GrBundleStartMenuDir()) + 'GNU Radio 4 Developer Shell';
+end;
+
+function GrBundleDesktopIcon(): String;
+begin
+  Result := AddBackslash(ExpandConstant('{autodesktop}')) + 'GNU Radio 4 Shell' + GrBundleSuffix('');
+end;
+
+// The bundle also places files no module owns, such as the packages the
+// development files need, and lists them in this file, one path relative to
+// the install root per line. The list is the bundle's, so a payload that grows
+// needs no change here.
+function GrBundleFileList(): String;
+begin
+  Result := AddBackslash(ExpandConstant('{app}')) + 'share\gnuradio4\bundle-files.txt';
+end;
+
+// Only the listed files go. A directory they share with another package, such
+// as include\boost with Boost's own headers, is left to GrRemoveEmptyDirTree,
+// which removes it once nothing is in it. A list or a file that is not there
+// is no fault: the payload is installed only with some development files.
+procedure GrRemoveBundleListedFiles();
+var
+  Lines: TArrayOfString;
+  Index: Integer;
+  Entry: String;
+begin
+  if not LoadStringsFromFile(GrBundleFileList(), Lines) then
+    Exit;
+  for Index := 0 to GetArrayLength(Lines) - 1 do
+  begin
+    Entry := Trim(Lines[Index]);
+    StringChangeEx(Entry, '/', '\', True);
+    { an entry that could name a file outside the install root is not the bundle's to remove }
+    if (Entry = '') or (Pos(':', Entry) > 0) or (Copy(Entry, 1, 1) = '\') or (Pos('..', Entry) > 0) then
+      Continue;
+    DeleteFile(AddBackslash(ExpandConstant('{app}')) + Entry);
+  end;
+  DeleteFile(GrBundleFileList());
+end;
+
+// The unified superbuild installer has no uninstaller of its own: it only
+// drops a launcher and its shortcuts next to the modules, and leaves their
+// removal to whichever module installer is uninstalled last. The file names
+// are a fixed contract with gr-super cmake/gr4_bundle.iss.in.
+procedure GrRemoveBundleExtras();
+var
+  AppDir: String;
+begin
+  GrRemoveBundleListedFiles();
+  AppDir := AddBackslash(ExpandConstant('{app}'));
+  DeleteFile(AppDir + 'gr4-env.cmd');
+  DeleteFile(AppDir + 'gr4-env.ps1');
+  DeleteFile(AppDir + 'gr4-shell.cmd');
+  DeleteFile(AppDir + 'gr4-dev-shell.cmd');
+  DeleteFile(AppDir + 'gr4.ico');
+  DeleteFile(GrBundleDesktopIcon() + '.lnk');
+  DeleteFile(GrBundleShellIcon() + '.lnk');
+  DeleteFile(GrBundleDevShellIcon() + '.lnk');
+  RemoveDir(RemoveBackslashUnlessRoot(GrBundleStartMenuDir()));
+end;
+
+function GrHasInstallDirOverride(): Boolean;
+begin
+  Result := Pos('/DIR=', Uppercase(GetCmdTail)) > 0;
+end;
+
+<event('InitializeSetup')>
+function GrInitializeSetup(): Boolean;
+begin
+  GrLoadManifest();
+
+  { neither problem may silently redirect the install }
+  if GrManifestToolFailed then
+    SuppressibleMsgBox('The GNU Radio 4 install manifest could not be inspected:' + GrEol + GrManifestPath() +
+      GrParagraph + 'Windows PowerShell is required. Setup will continue with the default install locations, ' +
+      'and other GR 4 packages may not find this installation.', mbError, MB_OK, IDOK)
+  else if GrManifestUnreadable then
+    SuppressibleMsgBox('The GNU Radio 4 install manifest is not valid JSON:' + GrEol + GrManifestPath() +
+      GrParagraph + 'It will be kept as manifest.json.corrupt and replaced with a new one describing the ' +
+      'default install locations.', mbError, MB_OK, IDOK);
+
+  { The same split the /DIR guard below refuses, reached the other way: the
+    scope dialog. A per-user install does not extend a machine-wide one, it
+    starts a second installation with its own root, manifest and uninstall
+    entry, and modules spread across the two cannot load each other. Saying so
+    is the difference between a deliberate second copy and a split nobody
+    meant to make. Only when a person is there to read it: the unified
+    installer runs these silently and has already chosen one scope for all. }
+  if (not WizardSilent()) and (not IsAdminInstallMode) and
+     GrPackageIsInstalled(False) and not GrPackageIsInstalled(True) then
+    SuppressibleMsgBox('GNU Radio 4 is already installed for all users on this computer.' + GrParagraph +
+      'Setup is running for the current user only, so this will be a second, separate installation in:' +
+      GrEol + GrInstallRoot + GrParagraph +
+      'To add to the existing installation instead, cancel and run this installer as an administrator.',
+      mbInformation, MB_OK, IDOK);
+
+  { the recorded layout is shared by every GR 4 package, so a command line that
+    moves this one alone would silently split the installation in two }
+  if GrManifestPresent and GrHasInstallDirOverride() then
+  begin
+    SuppressibleMsgBox('GNU Radio 4 is already installed in:' + GrEol + GrInstallRoot + GrParagraph +
+      'That location is shared by every GR 4 package and recorded in:' + GrEol + GrManifestPath() +
+      GrParagraph + '/DIR cannot override it. Uninstall the existing packages first to choose a new location.',
+      mbError, MB_OK, IDOK);
+    Result := False;
+    Exit;
+  end;
+
+  Result := GrConfirmDowngrades();
+end;
+
+<event('InitializeWizard')>
+procedure GrInitializeWizard();
+begin
+  { This scope only. A machine-wide install of the same package is not this
+    user's install: treating it as one would skip the defaults on their first
+    per-user install and silently hand them CPack's selection instead. }
+  if (GrPreselectedComponents <> '') and not GrPackageIsInstalled(True) and
+     (Pos('/COMPONENTS=', Uppercase(GetCmdTail)) = 0) then
+    WizardSelectComponents(GrPreselectedComponents);
+end;
+
+<event('ShouldSkipPage')>
+function GrShouldSkipPage(PageID: Integer): Boolean;
+begin
+  { the layout is fixed once any GR4 package has been installed }
+  Result := (PageID = wpSelectDir) and GrManifestPresent;
+end;
+
+<event('CurStepChanged')>
+procedure GrCurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep <> ssPostInstall then
+    Exit;
+  if not GrRegisterInManifest() then
+    SuppressibleMsgBox('The files were installed, but the GNU Radio 4 install manifest could not be updated:' +
+      GrEol + GrManifestPath() + GrParagraph + 'Plugin installers may not find this installation.',
+      mbError, MB_OK, IDOK);
+end;
+
+<event('CurUninstallStepChanged')>
+procedure GrCurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  ManifestRemoved: Boolean;
+begin
+  if CurUninstallStep <> usPostUninstall then
+    Exit;
+
+  { plugins may deliberately outlive the runtime, so the manifest keeps the
+    recorded layout until its last entry is gone and a later reinstall of this
+    package lands in the same place without asking again }
+  GrLoadManifest();
+  if not GrUnregisterFromManifest(ManifestRemoved) then
+  begin
+    SuppressibleMsgBox('The GNU Radio 4 install manifest still lists this package as installed:' + GrEol +
+      GrManifestPath() + GrParagraph + 'Remove the entry by hand, otherwise the next installer will treat this ' +
+      'package as still present.', mbError, MB_OK, IDOK);
+    Exit;
+  end;
+
+  if ManifestRemoved then
+  begin
+    GrPruneAppDataTree();
+    GrRemoveBundleExtras();
+    { the shared prefix keeps the directories that whichever package installed
+      first created: no other uninstall log claims them, so nothing else removes
+      them. RemoveDir leaves anything still holding files alone. }
+    GrRemoveEmptyDirTree(RemoveBackslashUnlessRoot(ExpandConstant('{app}')));
+    { the ABI directory's parent belongs to us too, and no uninstall log
+      claims it either, but only when the default layout was used: a root the
+      user chose has a parent that is none of our business }
+    if CompareText(RemoveBackslashUnlessRoot(ExpandConstant('{app}')),
+      RemoveBackslashUnlessRoot(GrDefaultInstallRoot())) = 0 then
+      RemoveDir(RemoveBackslashUnlessRoot(GrInstallParent()));
+  end;
+end;

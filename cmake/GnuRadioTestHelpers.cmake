@@ -44,9 +44,9 @@ function(gr_qa_pch_anchor RESULT_VAR)
     target_include_directories(${_anchor} PRIVATE ${CMAKE_BINARY_DIR}/include ${CMAKE_CURRENT_FUNCTION_LIST_DIR})
     target_link_libraries(
       ${_anchor}
-      PRIVATE gnuradio-options
-              gnuradio-core
-              gnuradio-blocklib-core
+      PRIVATE gnuradio4::gnuradio-options
+              gnuradio4::gnuradio-core
+              gnuradio4::gnuradio-blocklib-core
               ut
               ${GR_TEST_HELPER_LIBRARIES})
     gnuradio4_precompile_headers(${_anchor})
@@ -82,13 +82,13 @@ function(setup_test_no_asan TEST_NAME)
   target_include_directories(${TEST_NAME} PRIVATE ${CMAKE_BINARY_DIR}/include ${CMAKE_CURRENT_BINARY_DIR})
   target_link_libraries(
     ${TEST_NAME}
-    PRIVATE gnuradio-options
-            gnuradio-core
-            gnuradio-blocklib-core
+    PRIVATE gnuradio4::gnuradio-options
+            gnuradio4::gnuradio-core
+            gnuradio4::gnuradio-blocklib-core
             ut
             ${GR_TEST_HELPER_LIBRARIES})
-  if(TARGET gnuradio-plugin)
-    target_link_libraries(${TEST_NAME} PRIVATE gnuradio-plugin)
+  if(TARGET gnuradio4::gnuradio-plugin)
+    target_link_libraries(${TEST_NAME} PRIVATE gnuradio4::gnuradio-plugin)
   endif()
   if(MSVC)
     # boost.ut nests a lambda per test inside the suite lambda, and /Od gives every local its own slot, so the frames
@@ -102,6 +102,17 @@ function(setup_test_no_asan TEST_NAME)
   endif()
   add_test(NAME ${TEST_NAME} COMMAND ${CMAKE_CROSSCOMPILING_EMULATOR} ${CMAKE_CURRENT_BINARY_DIR}/${TEST_NAME})
   gr_test_add_dll_directories(${TEST_NAME})
+  # Windows finds the DLLs a test links on PATH. An installed block library's DLL is in the plugin directory, which is
+  # neither beside the test nor in bin, so every directory holding one of the test's DLLs goes on PATH.
+  if(WIN32)
+    set(_dll_dirs "$<TARGET_RUNTIME_DLL_DIRS:${TEST_NAME}>")
+    set_property(
+      TEST ${TEST_NAME}
+      APPEND
+      PROPERTY ENVIRONMENT_MODIFICATION
+               "$<$<BOOL:${_dll_dirs}>:PATH=path_list_prepend:$<JOIN:${_dll_dirs},$<SEMICOLON>PATH=path_list_prepend:>>"
+    )
+  endif()
 endfunction()
 
 function(setup_test TEST_NAME)
@@ -113,13 +124,13 @@ function(setup_test TEST_NAME)
   setup_test_no_asan(${TEST_NAME})
 endfunction()
 
-# Puts the directories holding the shared libraries a test loads, directly or through a tool it
-# runs, on PATH. Windows resolves them there and has no RPATH equivalent. A no-op elsewhere.
+# Puts the directories holding the shared libraries a test loads, directly or through a tool it runs, on PATH. Windows
+# resolves them there and has no RPATH equivalent. A no-op elsewhere.
 function(gr_test_add_dll_directories)
   if(NOT WIN32)
     return()
   endif()
-  set(_gr_test_dll_dirs "PATH=path_list_prepend:$<TARGET_FILE_DIR:gnuradio-blocklib-core>")
+  set(_gr_test_dll_dirs "PATH=path_list_prepend:$<TARGET_FILE_DIR:gnuradio4::gnuradio-blocklib-core>")
   foreach(_gr_test IN LISTS ARGV)
     set_property(
       TEST ${_gr_test}

@@ -29,11 +29,14 @@ if(GR_ENABLE_BLOCK_REGISTRY)
   # where this installation puts its plugins, which the tool searches whatever the caller and the environment name
   target_compile_definitions(gnuradio-rungraph
                              PRIVATE GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY="${GR_INSTALLED_PLUGIN_DIRECTORY}")
-  install(
+  gr_install_artifact(
     TARGETS gnuradio-rungraph
     EXPORT gnuradio4Targets
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
-  install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+    COMPONENT DEVELOP)
+  gr_install_artifact(
+    DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    COMPONENT DEVELOP)
 endif()
 
 # under Emscripten the library is built alone, without the programs and their tests
@@ -57,7 +60,12 @@ endif()
 # where this installation puts its plugins, which the tool searches whatever the caller and the environment name
 target_compile_definitions(graphdoc PRIVATE GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY="${GR_INSTALLED_PLUGIN_DIRECTORY}")
 set_target_properties(graphdoc PROPERTIES INSTALL_RPATH "${GR_TOOLS_INSTALL_RPATH}")
-install(TARGETS graphdoc RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+# exported, so a downstream project names the installed tools as gnuradio4::graphdoc, gnuradio4::rungraph and
+# gnuradio4::grinfo instead of searching the prefix for them
+gr_install_artifact(
+  TARGETS graphdoc
+  EXPORT gnuradio4Targets
+  COMPONENT CORE)
 
 # rungraph, the program over gnuradio-rungraph
 if(GR_ENABLE_BLOCK_REGISTRY)
@@ -67,7 +75,10 @@ if(GR_ENABLE_BLOCK_REGISTRY)
     target_link_libraries(rungraph PRIVATE gnuradio-plugin)
   endif()
   set_target_properties(rungraph PROPERTIES INSTALL_RPATH "${GR_TOOLS_INSTALL_RPATH}")
-  install(TARGETS rungraph RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  gr_install_artifact(
+    TARGETS rungraph
+    EXPORT gnuradio4Targets
+    COMPONENT CORE)
 endif()
 
 # grinfo, a consumer of the installed headers and of ShippedSchedulers.hpp as gnuradio-rungraph is. It reports the
@@ -86,7 +97,10 @@ if(GR_ENABLE_BLOCK_REGISTRY)
     grinfo PRIVATE GR_TOOLS_CORE_VERSION="${PROJECT_VERSION}" GR_TOOLS_INSTALLED_PREFIX="${CMAKE_INSTALL_PREFIX}"
                    GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY="${GR_INSTALLED_PLUGIN_DIRECTORY}")
   set_target_properties(grinfo PROPERTIES INSTALL_RPATH "${GR_TOOLS_INSTALL_RPATH}")
-  install(TARGETS grinfo RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  gr_install_artifact(
+    TARGETS grinfo
+    EXPORT gnuradio4Targets
+    COMPONENT CORE)
 endif()
 
 if(ENABLE_TESTING)
