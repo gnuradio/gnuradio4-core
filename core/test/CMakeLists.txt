@@ -347,6 +347,10 @@ if(MSVC)
     qa_BlockRegistration
     qa_SettingsTable
     qa_PluginBlockLibrary
+    # MSVC refuses these blocks with C7595 before the guard whose diagnostic the tests look for:
+    # gnuradio/gnuradio4-core#251
+    cf_KeepsTagOffsets_forwardtags_deduced
+    cf_Resampling_forwardtags_deduced
     # these time out; qa_SchedulerStartStop only intermittently
     qa_SchedulerDrain
     qa_SchedulerExchange
