@@ -507,9 +507,9 @@ const boost::ut::suite<"segmented tag store"> _tagStoreTests = [] {
         std::optional<decltype(store.new_reader())> leaving{store.new_reader()}; // holds the first tags while the writer reserves
         writePositioned(writer, 2UZ * kSlotsPerSegment);
 
-        const std::size_t     published = writer.position();
-        constexpr std::size_t kReserved = 6UZ * kSlotsPerSegment; // outgrows the first index, so the writer frees inside the reservation
-        auto                  reader    = [&] {
+        const std::size_t            published = writer.position();
+        static constexpr std::size_t kReserved = 6UZ * kSlotsPerSegment; // outgrows the first index, so the writer frees inside the reservation
+        auto                         reader    = [&] {
             auto span = writer.tryReserve(kReserved);
             expect(fatal(eq(span.size(), kReserved)));
             leaving.reset();
