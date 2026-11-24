@@ -1,6 +1,46 @@
 @PACKAGE_INIT@
 
+# Every GR 4 package installs into one prefix but keeps its own config directory, so finding this package says nothing
+# about where its siblings are. Adding the prefix lets a project that finds gnuradio4 find the other GR 4 packages, and
+# the third-party packages an installer placed beside them, without being told. It holds in the scope find_package() was
+# called from, so a call made inside a function does not pass it on.
+if(NOT
+   "${PACKAGE_PREFIX_DIR}"
+   IN_LIST
+   CMAKE_PREFIX_PATH)
+  list(APPEND CMAKE_PREFIX_PATH "${PACKAGE_PREFIX_DIR}")
+endif()
+
+# the plugin ABI version that keys the installed GR 4 layout. The superbuild reads this line back from the file, so it
+# stays a literal set() at the start of a line.
+set(GR_PLUGIN_API_VERSION "@GR_PLUGIN_API_VERSION@")
+
 include(CMakeFindDependencyMacro)
+
+find_dependency(magic_enum 0.9.3 CONFIG)
+find_dependency(vir-simd CONFIG)
+
+# vir-simd installs no version file, so its minimum is checked from its header
+include("${CMAKE_CURRENT_LIST_DIR}/VirSimdVersion.cmake")
+gr_require_vir_simd_version(0.4.4 REASON_VARIABLE _gr_vir_simd_problem)
+if(_gr_vir_simd_problem)
+  set(gnuradio4_FOUND FALSE)
+  set(gnuradio4_NOT_FOUND_MESSAGE "${_gr_vir_simd_problem}")
+  return()
+endif()
+
+# The installed UnitTestHelper.hpp and gnuradio4::ut-benchmark include Boost.UT. A consumer that builds tests needs it.
+# Any other consumer takes it when it is there, and one that links gnuradio4::ut-benchmark without it is stopped by the
+# missing Boost::ut target.
+if(ENABLE_TESTING)
+  find_dependency(ut 2.3.1 CONFIG)
+else()
+  find_package(
+    ut
+    2.3.1
+    CONFIG
+    QUIET)
+endif()
 
 # Optional transitive dependencies of exported targets.
 if(@ENABLE_TBB@)
@@ -12,6 +52,20 @@ include("${CMAKE_CURRENT_LIST_DIR}/GnuRadio4PrecompileHeaders.cmake")
 
 if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/gnuradio4PluginTargets.cmake")
   include("${CMAKE_CURRENT_LIST_DIR}/gnuradio4PluginTargets.cmake")
+endif()
+
+# add_ut_test() and setup_test() for downstream test suites; they need a target named 'ut' (Boost.UT)
+include("${CMAKE_CURRENT_LIST_DIR}/GnuRadioTestHelpers.cmake")
+
+# gr_install_artifact() and gr_install_runtime_dependencies(), so downstream installs share the GR 4 layout
+include("${CMAKE_CURRENT_LIST_DIR}/GrInstall.cmake")
+
+# gr_configure_innosetup_installer() and gr_configure_productbuild_installer(), so downstream installers share the GR 4
+# install layout and manifest
+if(WIN32)
+  include("${CMAKE_CURRENT_LIST_DIR}/GrInnoSetup.cmake")
+elseif(APPLE)
+  include("${CMAKE_CURRENT_LIST_DIR}/GrProductBuild.cmake")
 endif()
 
 check_required_components(gnuradio4)

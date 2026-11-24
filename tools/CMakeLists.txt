@@ -14,6 +14,32 @@ else()
 endif()
 list(APPEND GR_TOOLS_INSTALL_RPATH ${CMAKE_INSTALL_RPATH})
 
+# where an installed tool finds its prefix and plugins, relative to its own directory so the tree can move; see
+# InstalledLocation.hpp. A plugin directory outside the prefix stays absolute.
+file(
+  RELATIVE_PATH
+  _gr_tools_bin_to_prefix
+  "${CMAKE_INSTALL_FULL_BINDIR}"
+  "${CMAKE_INSTALL_PREFIX}")
+cmake_path(
+  IS_PREFIX
+  CMAKE_INSTALL_PREFIX
+  "${GR_INSTALLED_PLUGIN_DIRECTORY}"
+  NORMALIZE
+  _gr_tools_plugins_in_prefix)
+if(_gr_tools_plugins_in_prefix)
+  file(
+    RELATIVE_PATH
+    _gr_tools_plugin_directory
+    "${CMAKE_INSTALL_PREFIX}"
+    "${GR_INSTALLED_PLUGIN_DIRECTORY}")
+else()
+  set(_gr_tools_plugin_directory "${GR_INSTALLED_PLUGIN_DIRECTORY}")
+endif()
+set(GR_TOOLS_INSTALLED_LOCATION_DEFINITIONS
+    GR_TOOLS_INSTALLED_PREFIX="${CMAKE_INSTALL_PREFIX}" GR_TOOLS_BIN_TO_PREFIX="${_gr_tools_bin_to_prefix}"
+    GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY="${_gr_tools_plugin_directory}")
+
 # rungraph's body, as a library: gr::tools::runGraph takes main's arguments and returns the exit status. It builds its
 # graph by name, which needs the registry, and is built only with it. A program that links its block families instead of
 # loading plugins, as under Emscripten, calls it from its own main. Its source includes core's internal
@@ -27,13 +53,15 @@ if(GR_ENABLE_BLOCK_REGISTRY)
   target_include_directories(gnuradio-rungraph PRIVATE ${PROJECT_SOURCE_DIR}/core/src)
   target_link_libraries(gnuradio-rungraph PUBLIC gnuradio-options gnuradio-core gnuradio-blocklib-core)
   # where this installation puts its plugins, which the tool searches whatever the caller and the environment name
-  target_compile_definitions(gnuradio-rungraph
-                             PRIVATE GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY="${GR_INSTALLED_PLUGIN_DIRECTORY}")
-  install(
+  target_compile_definitions(gnuradio-rungraph PRIVATE ${GR_TOOLS_INSTALLED_LOCATION_DEFINITIONS})
+  gr_install_artifact(
     TARGETS gnuradio-rungraph
     EXPORT gnuradio4Targets
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
-  install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+    COMPONENT DEVELOP)
+  gr_install_artifact(
+    DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    COMPONENT DEVELOP)
 endif()
 
 # under Emscripten the library is built alone, without the programs and their tests
@@ -55,9 +83,14 @@ if(TARGET gnuradio-plugin)
   target_link_libraries(graphdoc PRIVATE gnuradio-plugin)
 endif()
 # where this installation puts its plugins, which the tool searches whatever the caller and the environment name
-target_compile_definitions(graphdoc PRIVATE GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY="${GR_INSTALLED_PLUGIN_DIRECTORY}")
+target_compile_definitions(graphdoc PRIVATE ${GR_TOOLS_INSTALLED_LOCATION_DEFINITIONS})
 set_target_properties(graphdoc PROPERTIES INSTALL_RPATH "${GR_TOOLS_INSTALL_RPATH}")
-install(TARGETS graphdoc RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+# exported, so a downstream project names the installed tools as gnuradio4::graphdoc, gnuradio4::rungraph and
+# gnuradio4::grinfo instead of searching the prefix for them
+gr_install_artifact(
+  TARGETS graphdoc
+  EXPORT gnuradio4Targets
+  COMPONENT CORE)
 
 # rungraph, the program over gnuradio-rungraph
 if(GR_ENABLE_BLOCK_REGISTRY)
@@ -67,7 +100,10 @@ if(GR_ENABLE_BLOCK_REGISTRY)
     target_link_libraries(rungraph PRIVATE gnuradio-plugin)
   endif()
   set_target_properties(rungraph PROPERTIES INSTALL_RPATH "${GR_TOOLS_INSTALL_RPATH}")
-  install(TARGETS rungraph RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  gr_install_artifact(
+    TARGETS rungraph
+    EXPORT gnuradio4Targets
+    COMPONENT CORE)
 endif()
 
 # grinfo, a consumer of the installed headers and of ShippedSchedulers.hpp as gnuradio-rungraph is. It reports the
@@ -82,11 +118,13 @@ if(GR_ENABLE_BLOCK_REGISTRY)
   endif()
   # what this installation is and where it puts its plugins; the project version is not in config.hpp, so the build
   # hands it over too
-  target_compile_definitions(
-    grinfo PRIVATE GR_TOOLS_CORE_VERSION="${PROJECT_VERSION}" GR_TOOLS_INSTALLED_PREFIX="${CMAKE_INSTALL_PREFIX}"
-                   GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY="${GR_INSTALLED_PLUGIN_DIRECTORY}")
+  target_compile_definitions(grinfo PRIVATE GR_TOOLS_CORE_VERSION="${PROJECT_VERSION}"
+                                            ${GR_TOOLS_INSTALLED_LOCATION_DEFINITIONS})
   set_target_properties(grinfo PROPERTIES INSTALL_RPATH "${GR_TOOLS_INSTALL_RPATH}")
-  install(TARGETS grinfo RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  gr_install_artifact(
+    TARGETS grinfo
+    EXPORT gnuradio4Targets
+    COMPONENT CORE)
 endif()
 
 if(ENABLE_TESTING)

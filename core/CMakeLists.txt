@@ -35,8 +35,8 @@ target_link_libraries(
   PUBLIC gnuradio-options
          gnuradio-meta
          gnuradio-shared-state
-         magic_enum
-         vir)
+         magic_enum::magic_enum
+         vir-simd::vir-simd)
 
 # two libraries hold what a program and every shared object it loads must share one copy of. Each compiles the core
 # headers it needs and links no compiled core library. gnuradio-core links both PUBLIC: the link goes from the core
@@ -56,7 +56,7 @@ else()
 endif()
 add_library(gnuradio4::gnuradio-shared-state ALIAS gnuradio-shared-state)
 target_include_directories(gnuradio-shared-state PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include/)
-target_link_libraries(gnuradio-shared-state PRIVATE gnuradio-options gnuradio-meta magic_enum)
+target_link_libraries(gnuradio-shared-state PRIVATE gnuradio-options gnuradio-meta magic_enum::magic_enum)
 if(WIN32)
   target_compile_definitions(gnuradio-shared-state PRIVATE BUILDING_MYPLUGIN)
 endif()
@@ -72,7 +72,7 @@ target_include_directories(gnuradio-blocklib-core PUBLIC $<BUILD_INTERFACE:${CMA
                                                          $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_include_directories(gnuradio-blocklib-core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include/
                                                           ${CMAKE_CURRENT_BINARY_DIR}/include)
-target_link_libraries(gnuradio-blocklib-core PRIVATE gnuradio-options gnuradio-meta magic_enum)
+target_link_libraries(gnuradio-blocklib-core PRIVATE gnuradio-options gnuradio-meta magic_enum::magic_enum)
 if(WIN32)
   target_compile_definitions(gnuradio-blocklib-core PRIVATE BUILDING_MYPLUGIN)
   target_compile_definitions(gnuradio-core PUBLIC BUILDING_MYPLUGIN)
@@ -84,25 +84,32 @@ configure_file("${PROJECT_SOURCE_DIR}/cmake/config.hpp.in"
                "${CMAKE_CURRENT_BINARY_DIR}/include/gnuradio-4.0/config.hpp" @ONLY)
 # TODO: install configure file... but not really meaningful for header only library, since compile flags are defined by
 # the user...
-install(FILES "${CMAKE_CURRENT_BINARY_DIR}/include/gnuradio-4.0/config.hpp"
-        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/gnuradio-4.0")
+gr_install_artifact(
+  FILES "${CMAKE_CURRENT_BINARY_DIR}/include/gnuradio-4.0/config.hpp"
+  DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/gnuradio-4.0"
+  COMPONENT DEVELOP)
 
-install(
+# the shared libraries are the runtime; the core archive and the import libraries are only needed to build against GR
+gr_install_artifact(
   TARGETS gnuradio-core gnuradio-blocklib-core gnuradio-shared-state
   EXPORT gnuradio4Targets
-  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  COMPONENT CORE
+  ARCHIVE_COMPONENT DEVELOP)
 
 # the whole include directory is the public surface, and it is installed as it is laid out: a PUBLIC_HEADER list would
 # flatten the subdirectories into a second copy beside the first
 if(GR_ENABLE_BLOCK_REGISTRY)
-  install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-else()
-  install(
+  gr_install_artifact(
     DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-    PATTERN "Runtime.hpp" EXCLUDE)
+    COMPONENT DEVELOP)
+else()
+  gr_install_artifact(
+    DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    COMPONENT DEVELOP
+    PATTERN "Runtime.hpp"
+    EXCLUDE)
 endif()
 
 add_subdirectory(src)

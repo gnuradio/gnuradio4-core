@@ -1,6 +1,10 @@
 #ifndef UNITTESTHELPER_HPP
 #define UNITTESTHELPER_HPP
 
+// Boost.UT exports itself as a module where the compiler advertises modules, which plain header inclusion cannot take
+#ifndef BOOST_UT_DISABLE_MODULE
+#define BOOST_UT_DISABLE_MODULE
+#endif
 #include <boost/ut.hpp>
 #include <concepts>
 #include <cstddef>

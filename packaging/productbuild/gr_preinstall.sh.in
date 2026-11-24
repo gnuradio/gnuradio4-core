@@ -1,0 +1,138 @@
+#!/bin/sh
+#
+# GNU Radio 4 component package preinstall: the downgrade guard.
+#
+# This is the macOS counterpart of GrConfirmDowngrades() in
+# packaging/innosetup/gr_install_flow.iss.in.  Configured by CMake, see
+# cmake/GrProductBuild.cmake.
+#
+# Inno Setup can ask the user whether to proceed with a downgrade and defaults
+# to No.  A pkg preinstall script has no UI at all: it can only let the install
+# proceed or fail it.  Refusing preserves the guarantee the Windows prompt is
+# actually protecting -- never silently replace newer files with older ones and
+# break plugins built against the newer runtime -- and GR4_ALLOW_DOWNGRADE=1
+# keeps it scriptable.  This is a deliberate difference, not an oversight; see
+# docs/packaging.md in gr-super.
+#
+# Anything printed here lands in /var/log/install.log, which is the only channel
+# a pkg script has for explaining itself.
+
+set -u
+
+api_version='@GR_PLUGIN_API_VERSION@'
+component_packages='@GR_INSTALLER_COMPONENT_PACKAGES@'
+plugin_packages='@GR_INSTALLER_PLUGIN_PACKAGES@'
+
+shared_root='/Library/Application Support/.gnuradio-4'
+manifest_path="${shared_root}/manifest/v${api_version}/manifest.json"
+
+script_dir=$(cd "$(dirname "$0")" && pwd)
+manifest_tool="${script_dir}/gr_manifest.sh"
+
+log() {
+    echo "gnuradio4: $*"
+}
+
+if [ ! -f "${manifest_path}" ]; then
+    # nothing installed yet, nothing to downgrade
+    exit 0
+fi
+
+if [ ! -f "${manifest_tool}" ]; then
+    log "the manifest tool is missing from this package, skipping the downgrade check"
+    exit 0
+fi
+
+query_output=$(mktemp -t gr_manifest_query) || exit 0
+# shellcheck disable=SC2064
+trap "rm -f '${query_output}'" EXIT
+
+if ! sh "${manifest_tool}" --action query --manifest-path "${manifest_path}" \
+        --out-file "${query_output}" --api-version "${api_version}"; then
+    log "the install manifest could not be inspected, skipping the downgrade check"
+    exit 0
+fi
+
+# Strips SemVer pre-release and build metadata, as GrNormaliseVersion does.
+normalise_version() {
+    value="${1%%-*}"
+    value="${value%%+*}"
+    printf '%s' "${value}"
+}
+
+# Prints 'newer' when $1 is a strictly higher version than $2. Non-numeric
+# fields fall back to a string comparison, matching GrCompareVersions' use of
+# CompareText when StrToVersion fails.
+compare_versions() {
+    left=$(normalise_version "$1")
+    right=$(normalise_version "$2")
+    [ "${left}" != "${right}" ] || return 0
+
+    index=1
+    while [ "${index}" -le 4 ]; do
+        left_field=$(printf '%s' "${left}" | cut -d. -f"${index}")
+        right_field=$(printf '%s' "${right}" | cut -d. -f"${index}")
+        [ -n "${left_field}" ] || left_field=0
+        [ -n "${right_field}" ] || right_field=0
+
+        case "${left_field}${right_field}" in
+            *[!0-9]*)
+                if [ "${left}" \> "${right}" ]; then printf 'newer'; fi
+                return 0
+                ;;
+        esac
+
+        if [ "${left_field}" -gt "${right_field}" ]; then
+            printf 'newer'
+            return 0
+        fi
+        if [ "${left_field}" -lt "${right_field}" ]; then
+            return 0
+        fi
+        index=$((index + 1))
+    done
+}
+
+downgrades=''
+
+check_section() {
+    # $1 reported prefix ('component' or 'plugin'), $2 '|'-separated name=version
+    remaining="$2"
+    while [ -n "${remaining}" ]; do
+        case "${remaining}" in
+            *'|'*) entry="${remaining%%|*}"; remaining="${remaining#*|}" ;;
+            *) entry="${remaining}"; remaining='' ;;
+        esac
+        [ -n "${entry}" ] || continue
+
+        name="${entry%%=*}"
+        packaged="${entry#*=}"
+        installed=$(sed -n "s/^$1\.${name}=//p" "${query_output}" | head -n 1)
+        [ -n "${installed}" ] || continue
+
+        if [ "$(compare_versions "${installed}" "${packaged}")" = 'newer' ]; then
+            downgrades="${downgrades}  ${name}: ${installed} is installed, this package contains ${packaged}
+"
+        fi
+    done
+}
+
+check_section component "${component_packages}"
+check_section plugin "${plugin_packages}"
+
+if [ -z "${downgrades}" ]; then
+    exit 0
+fi
+
+if [ "${GR4_ALLOW_DOWNGRADE:-}" = '1' ]; then
+    log "proceeding with a downgrade because GR4_ALLOW_DOWNGRADE=1:"
+    printf '%s' "${downgrades}"
+    exit 0
+fi
+
+log "refusing to install: this package is older than what is already installed."
+printf '%s' "${downgrades}"
+log "Installing it would replace the newer files and may break plugins built"
+log "against the newer runtime. Uninstall the newer packages first with"
+log "gr4-uninstall, or set GR4_ALLOW_DOWNGRADE=1 to override."
+exit 1

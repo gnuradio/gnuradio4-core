@@ -7,6 +7,29 @@ additional_commands:
       DEPENDS: "*"
       HEADERS: "*"
       SOURCES: "*"
+  gr_install_artifact:
+    flags:
+      - USE_SOURCE_PERMISSIONS
+      - EXCLUDE
+      - FILES_MATCHING
+    kwargs:
+      TARGETS: "*"
+      FILES: "*"
+      PROGRAMS: "*"
+      DIRECTORY: "*"
+      EXPORT: 1
+      FILE: 1
+      NAMESPACE: 1
+      DESTINATION: 1
+      COMPONENT: 1
+      HEADERS_COMPONENT: 1
+      ARCHIVE_COMPONENT: 1
+      PATTERN: 1
+  gr_install_runtime_dependencies:
+    kwargs:
+      SET: 1
+      DESTINATION: 1
+      COMPONENT: 1
 bullet_char: "*"
 dangle_parens: false
 disabled_codes:

@@ -47,6 +47,22 @@ include(GNUInstallDirs)
 set(GR_INSTALLED_PLUGIN_DIRECTORY "${CMAKE_INSTALL_FULL_LIBDIR}/gnuradio-4/plugins")
 find_package(PkgConfig QUIET)
 
+# The plugin ABI version keys every installed GR 4 layout, so installations built against different ABIs coexist. It is
+# read from the header that defines it, so the two cannot disagree.
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/core/include/gnuradio-4.0/BlockRegistry.hpp" _grPluginAbiDefine
+     REGEX "^#define[ \t]+GR_PLUGIN_CURRENT_ABI_VERSION[ \t]+[0-9]+")
+string(
+  REGEX MATCH
+        "[0-9]+$"
+        GR_PLUGIN_API_VERSION
+        "${_grPluginAbiDefine}")
+if(NOT GR_PLUGIN_API_VERSION)
+  message(FATAL_ERROR "Could not read GR_PLUGIN_CURRENT_ABI_VERSION from core/include/gnuradio-4.0/BlockRegistry.hpp")
+endif()
+
+option(GR_PACKAGING "Bundle the third-party libraries the installed binaries load, for building an installer" OFF)
+include(cmake/GrInstall.cmake)
+
 set(CMAKE_POSITION_INDEPENDENT_CODE TRUE)
 
 # limit parallel compile/link jobs to prevent OOM with template-heavy TUs override with -DGR_BUILD_PARALLEL_LEVEL=<N>
@@ -243,7 +259,6 @@ option(ENABLE_EXAMPLES "Enable Example Builds" ${GR_TOPLEVEL_PROJECT})
 option(ENABLE_TESTING "Enable Test Builds" ${GR_TOPLEVEL_PROJECT})
 option(ENABLE_TOOLS "Enable the command-line tools" ON)
 option(MIT_ONLY "Exclude modules with non-MIT/Apache-compatible licences" OFF)
-option(GR_USE_FETCHCONTENT_DEPS "Allow CMake to download selected third-party dependencies with FetchContent" OFF)
 
 # Test executables check correctness, so a lower optimization level roughly halves their compile time and peak memory.
 # Benchmarks pin their own level. Empty keeps the build type's default.
@@ -316,7 +331,10 @@ add_subdirectory(blocklib_generator)
 
 add_library(gnuradio-options INTERFACE)
 add_library(gnuradio4::gnuradio-options ALIAS gnuradio-options)
-install(TARGETS gnuradio-options EXPORT gnuradio4Targets)
+gr_install_artifact(
+  TARGETS gnuradio-options
+  EXPORT gnuradio4Targets
+  COMPONENT DEVELOP)
 
 if(MSVC)
   target_compile_options(
@@ -378,9 +396,8 @@ endif()
 
 # Keep third party header diagnostic warnings out of GR's builds
 option(DISABLE_EXTERNAL_DEPS_WARNINGS "Treat external dependency headers as SYSTEM includes" ON)
-set(CMAKE_EXT_DEP_WARNING_GUARD "")
-if(DISABLE_EXTERNAL_DEPS_WARNINGS)
-  set(CMAKE_EXT_DEP_WARNING_GUARD SYSTEM)
+if(NOT DISABLE_EXTERNAL_DEPS_WARNINGS)
+  set(CMAKE_NO_SYSTEM_FROM_IMPORTED ON)
 endif()
 
 # Initialize a variable to hold all the compiler flags -> exported into global config.h(.in)
@@ -493,148 +510,61 @@ if(EMSCRIPTEN)
     "SHELL:-s ENVIRONMENT=web,worker,node")
 endif()
 
-# include header-only libraries that have been inlined to simplify builds w/o requiring access to the internet
-if(NOT (TARGET magic_enum))
-  add_library(magic_enum INTERFACE)
-  add_library(gnuradio4::magic_enum ALIAS magic_enum)
-  target_include_directories(
-    magic_enum ${CMAKE_EXT_DEP_WARNING_GUARD} INTERFACE $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/third_party/magic_enum/>
-                                                        $<INSTALL_INTERFACE:include>)
+find_package(
+  magic_enum
+  0.9.3
+  CONFIG
+  REQUIRED)
 
-  set(magic_enum_public_headers third_party/magic_enum/magic_enum.hpp third_party/magic_enum/magic_enum_utility.hpp)
-  set_target_properties(magic_enum PROPERTIES PUBLIC_HEADER "${magic_enum_public_headers}")
-  install(
-    TARGETS magic_enum
-    EXPORT gnuradio4Targets
-    PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-endif()
+find_package(vir-simd CONFIG REQUIRED)
+include(cmake/VirSimdVersion.cmake)
+gr_require_vir_simd_version(0.4.4)
 
-include(FetchContent)
-
-set(BOOST_UT_DISABLE_MODULE
-    ON
-    CACHE BOOL "Disable UT Module Support" FORCE)
-add_compile_definitions(BOOST_UT_DISABLE_MODULE)
-if(EMSCRIPTEN OR GR_USE_FETCHCONTENT_DEPS)
-  FetchContent_Declare(
+if(ENABLE_TESTING)
+  add_compile_definitions(BOOST_UT_DISABLE_MODULE)
+  find_package(
     ut
-    GIT_REPOSITORY https://github.com/boost-ext/ut.git
-    GIT_TAG 53e17f25119598c6458d30351b260193096ba67e # latest tag as of 2023-04-02
-    EXCLUDE_FROM_ALL)
-
-  FetchContent_Declare(
-    vir-simd
-    GIT_REPOSITORY https://github.com/mattkretz/vir-simd.git
-    GIT_TAG v0.4.4
-    EXCLUDE_FROM_ALL)
-else()
-  find_package(ut CONFIG QUIET)
+    2.3.1
+    CONFIG
+    REQUIRED)
   if(TARGET Boost::ut AND NOT TARGET ut)
     add_library(ut ALIAS Boost::ut)
   elseif(TARGET boost::ut AND NOT TARGET ut)
     add_library(ut ALIAS boost::ut)
   endif()
-  if(NOT TARGET ut)
-    find_path(GR_BOOST_UT_INCLUDE_DIR boost/ut.hpp)
-    if(NOT GR_BOOST_UT_INCLUDE_DIR)
-      message(FATAL_ERROR "Boost.UT was not found. Install libboost-ext-ut-dev, ut-devel, or a source-built Boost.UT.")
-    endif()
-    add_library(ut INTERFACE)
-    target_include_directories(ut INTERFACE ${GR_BOOST_UT_INCLUDE_DIR})
-  endif()
 
-  find_path(vir-simd_SOURCE_DIR vir/simd.h)
-  if(NOT vir-simd_SOURCE_DIR)
-    message(
-      FATAL_ERROR
-        "vir-simd was not found. Install the vir headers under an include path, for example /usr/local/include/vir.")
-  endif()
-endif()
-
-if(EMSCRIPTEN)
-  FetchContent_Declare(
-    cpp-httplib
-    GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
-    GIT_TAG v0.18.1
-    EXCLUDE_FROM_ALL)
-else()
-  find_package(httplib CONFIG QUIET)
-  if(NOT TARGET httplib::httplib)
-    if(NOT PkgConfig_FOUND)
-      message(
-        FATAL_ERROR "cpp-httplib was not found and pkg-config is unavailable. Install cpp-httplib development files.")
+  # only the HTTP asset test of a native build serves files; Emscripten builds fetch through the browser
+  if(NOT EMSCRIPTEN)
+    # cpp-httplib's version file accepts only its own minor version, so a version passed to find_package would pin
+    # 0.18.x (a package that sets no version is taken as it is)
+    find_package(httplib CONFIG REQUIRED)
+    if(httplib_VERSION AND httplib_VERSION VERSION_LESS 0.18.1)
+      message(FATAL_ERROR "cpp-httplib ${httplib_VERSION} was found, 0.18.1 or newer is required")
     endif()
-
-    pkg_search_module(
-      CPP_HTTPLIB
-      QUIET
-      IMPORTED_TARGET
-      cpp-httplib
-      httplib)
-    if(NOT CPP_HTTPLIB_FOUND)
-      message(FATAL_ERROR "cpp-httplib was not found. Install libcpp-httplib-dev, cpp-httplib-devel, or cpp-httplib.")
-    endif()
-    add_library(
-      httplib::httplib
-      INTERFACE
-      IMPORTED
-      GLOBAL)
-    target_link_libraries(httplib::httplib INTERFACE PkgConfig::CPP_HTTPLIB)
   endif()
 endif()
 
 set(GR_HTTP_ENABLED FALSE)
 
-set(GR_FETCH_MAKE_AVAILABLE_DEPS)
-if(EMSCRIPTEN OR GR_USE_FETCHCONTENT_DEPS)
-  list(
-    APPEND
-    GR_FETCH_MAKE_AVAILABLE_DEPS
-    ut
-    vir-simd)
-endif()
-if(EMSCRIPTEN)
-  list(APPEND GR_FETCH_MAKE_AVAILABLE_DEPS cpp-httplib)
-endif()
-
-if(GR_FETCH_MAKE_AVAILABLE_DEPS)
-  FetchContent_MakeAvailable(${GR_FETCH_MAKE_AVAILABLE_DEPS})
-endif()
-
 if(EMSCRIPTEN AND TARGET ut)
   # Boost.UT upstream adds -fwasm-exceptions which conflicts with our -fexceptions (JS exceptions). JS-based exceptions
   # are required for Asyncify compatibility. Remove and replace.
-  get_target_property(_ut_copts ut INTERFACE_COMPILE_OPTIONS)
-  get_target_property(_ut_lopts ut INTERFACE_LINK_OPTIONS)
+  get_target_property(_ut_target ut ALIASED_TARGET)
+  if(NOT _ut_target)
+    set(_ut_target ut)
+  endif()
+  get_target_property(_ut_copts ${_ut_target} INTERFACE_COMPILE_OPTIONS)
+  get_target_property(_ut_lopts ${_ut_target} INTERFACE_LINK_OPTIONS)
   if(_ut_copts)
     list(REMOVE_ITEM _ut_copts -fwasm-exceptions)
     list(APPEND _ut_copts -fexceptions)
-    set_target_properties(ut PROPERTIES INTERFACE_COMPILE_OPTIONS "${_ut_copts}")
+    set_target_properties(${_ut_target} PROPERTIES INTERFACE_COMPILE_OPTIONS "${_ut_copts}")
   endif()
   if(_ut_lopts)
     list(REMOVE_ITEM _ut_lopts -fwasm-exceptions)
     list(APPEND _ut_lopts -fexceptions)
-    set_target_properties(ut PROPERTIES INTERFACE_LINK_OPTIONS "${_ut_lopts}")
+    set_target_properties(${_ut_target} PROPERTIES INTERFACE_LINK_OPTIONS "${_ut_lopts}")
   endif()
-endif()
-
-add_library(vir INTERFACE)
-add_library(gnuradio4::vir ALIAS vir)
-target_include_directories(
-  vir ${CMAKE_EXT_DEP_WARNING_GUARD} INTERFACE $<BUILD_INTERFACE:${vir-simd_SOURCE_DIR}/>
-                                               $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-if(MSVC)
-  target_compile_definitions(vir INTERFACE NOMINMAX)
-endif()
-install(TARGETS vir EXPORT gnuradio4Targets)
-
-# Install these headers only when they are the copy this project fetched and pinned above. Nothing else provides that
-# copy, and an isolated prefix needs it, because the exported vir target points consumers at ${CMAKE_INSTALL_INCLUDEDIR}
-# and the installed CMake package declares no dependency on an external vir-simd. When vir-simd was instead found on the
-# system, the headers belong to whatever provides them and are already on the default include path, so copying them here
-# would stage the same files from a second place.
-if(EMSCRIPTEN OR GR_USE_FETCHCONTENT_DEPS)
-  install(DIRECTORY ${vir-simd_SOURCE_DIR}/vir DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 endif()
 
 # check for CPython and Numpy dependencies
@@ -662,7 +592,9 @@ if(Python3_FOUND AND NOT EMSCRIPTEN)
   endif()
 endif()
 
-add_subdirectory(bench) # custom ut addon for microbenchmarking
+# the microbenchmark harness, a Boost.UT add-on, is installed whatever the build runs; core's own benchmarks are built
+# with its tests
+add_subdirectory(bench)
 
 add_subdirectory(core)
 add_subdirectory(meta)
@@ -762,9 +694,10 @@ if(GR_CACHE_LINE_SIZE)
 endif()
 configure_file(cmake/gnuradio4.pc.in ${CMAKE_CURRENT_BINARY_DIR}/gnuradio4.pc @ONLY)
 
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/gnuradio4.pc DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig # Standard location
-        # for .pc files
-)
+gr_install_artifact(
+  FILES ${CMAKE_CURRENT_BINARY_DIR}/gnuradio4.pc
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
+  COMPONENT DEVELOP)
 
 set(GR_CMAKECONFIG_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/cmake/gnuradio4")
 
@@ -776,24 +709,43 @@ write_basic_package_version_file(
   VERSION "${GR4_PKG_VERSION}"
   COMPATIBILITY SameMajorVersion)
 
-install(
+gr_install_artifact(
   EXPORT gnuradio4Targets
   FILE gnuradio4Targets.cmake
   NAMESPACE gnuradio4::
-  DESTINATION "${GR_CMAKECONFIG_INSTALL_DIR}")
+  DESTINATION "${GR_CMAKECONFIG_INSTALL_DIR}"
+  COMPONENT DEVELOP)
 
 if(TARGET gnuradio-plugin)
-  install(
+  gr_install_artifact(
     EXPORT gnuradio4PluginTargets
     FILE gnuradio4PluginTargets.cmake
     NAMESPACE gnuradio4::
-    DESTINATION "${GR_CMAKECONFIG_INSTALL_DIR}")
+    DESTINATION "${GR_CMAKECONFIG_INSTALL_DIR}"
+    COMPONENT DEVELOP)
 endif()
 
-install(
-  FILES "${CMAKE_CURRENT_BINARY_DIR}/gnuradio4Config.cmake" "${CMAKE_CURRENT_BINARY_DIR}/gnuradio4ConfigVersion.cmake"
+# the modules a downstream GR 4 project builds, tests, installs and packages with; gnuradio4Config.cmake includes them
+gr_install_artifact(
+  FILES "${CMAKE_CURRENT_BINARY_DIR}/gnuradio4Config.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/gnuradio4ConfigVersion.cmake"
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GnuRadio4PrecompileHeaders.cmake"
-  DESTINATION "${GR_CMAKECONFIG_INSTALL_DIR}")
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/VirSimdVersion.cmake"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GnuRadioTestHelpers.cmake"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GrInstall.cmake"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GrInnoSetup.cmake"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GrProductBuild.cmake"
+  DESTINATION "${GR_CMAKECONFIG_INSTALL_DIR}"
+  COMPONENT DEVELOP)
+
+# installer templates shared by every downstream GR installer. Both trees are installed on every platform: the
+# superbuild reads them back out of the install prefix and decides there which one it needs. USE_SOURCE_PERMISSIONS
+# keeps the shell scripts executable, since pkgbuild refuses a --scripts directory it cannot run.
+gr_install_artifact(
+  DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/packaging/innosetup" "${CMAKE_CURRENT_SOURCE_DIR}/packaging/productbuild"
+  DESTINATION "${GR_CMAKECONFIG_INSTALL_DIR}/packaging"
+  COMPONENT DEVELOP
+  USE_SOURCE_PERMISSIONS)
 
 # print effective options
 message(STATUS "================================================")

@@ -74,9 +74,9 @@ struct Result {
 
 enum class Streams { both, standardOutput };
 
-// runs the tool with `arguments` and collects what it wrote to `streams` and the status it exited with
-[[nodiscard]] Result run(const std::vector<std::string>& arguments, Streams streams = Streams::both) {
-    std::string command = std::format("\"{}\"", fromEnvironment("GR_TOOLS_GRINFO"));
+// runs `program` with `arguments` and collects what it wrote to `streams` and the status it exited with
+[[nodiscard]] Result runProgram(const std::filesystem::path& program, const std::vector<std::string>& arguments, Streams streams = Streams::both) {
+    std::string command = std::format("\"{}\"", program.string());
     for (const std::string& argument : arguments) {
         command += std::format(" \"{}\"", argument);
     }
@@ -104,6 +104,22 @@ enum class Streams { both, standardOutput };
     return result;
 }
 
+// runs the built tool
+[[nodiscard]] Result run(const std::vector<std::string>& arguments, Streams streams = Streams::both) { return runProgram(fromEnvironment("GR_TOOLS_GRINFO"), arguments, streams); }
+
+// sets `name` to `value`, or removes it when there is none; an empty value removes it on Windows
+inline void setVariable(const std::string& name, const std::optional<std::string>& value) {
+#ifdef _WIN32
+    ::_putenv_s(name.c_str(), value.value_or("").c_str());
+#else
+    if (value.has_value()) {
+        ::setenv(name.c_str(), value->c_str(), 1);
+    } else {
+        ::unsetenv(name.c_str());
+    }
+#endif
+}
+
 // sets or clears one environment variable for the programs a case runs, and puts back the value it found
 class EnvironmentVariable {
     std::string                _name;
@@ -114,19 +130,9 @@ public:
         if (const char* found = std::getenv(_name.c_str()); found != nullptr) {
             _found = found;
         }
-        if (value.has_value()) {
-            ::setenv(_name.c_str(), value->c_str(), 1);
-        } else {
-            ::unsetenv(_name.c_str());
-        }
+        setVariable(_name, value);
     }
-    ~EnvironmentVariable() {
-        if (_found.has_value()) {
-            ::setenv(_name.c_str(), _found->c_str(), 1);
-        } else {
-            ::unsetenv(_name.c_str());
-        }
-    }
+    ~EnvironmentVariable() { setVariable(_name, _found); }
     EnvironmentVariable(const EnvironmentVariable&)            = delete;
     EnvironmentVariable& operator=(const EnvironmentVariable&) = delete;
 };
@@ -397,6 +403,18 @@ constexpr std::array<std::string_view, 5> kExternalReferences{"<script", "<link"
     const std::size_t end   = text.find('}', at);
     return begin == std::string_view::npos || end == std::string_view::npos ? std::string_view{} : text.substr(begin, end - begin + 1UZ);
 }
+
+// the string a JSON document holds under `key`, for a value with no escaped characters in it
+[[nodiscard]] std::optional<std::string> jsonString(std::string_view text, std::string_view key) {
+    const std::string opening = std::format("\"{}\": \"", key);
+    const std::size_t begin   = text.find(opening);
+    if (begin == std::string_view::npos) {
+        return std::nullopt;
+    }
+    const std::size_t valueBegin = begin + opening.size();
+    const std::size_t valueEnd   = text.find('"', valueBegin);
+    return valueEnd == std::string_view::npos ? std::nullopt : std::optional<std::string>(text.substr(valueBegin, valueEnd - valueBegin));
+}
 #endif
 
 } // namespace qa_grinfo
@@ -458,7 +476,7 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
     // The text report cuts a long path to its tail and wraps a long value across lines. The text arms join the lines and
     // look for the path's last component; the JSON arms look for the whole path.
     "version reports the data cache directory in use, the one GR_DATA_CACHE_DIR names when it is set"_test = [] {
-        const std::string named        = (std::filesystem::temp_directory_path() / "gr4_qa_grinfo_cache").string();
+        const std::string named        = (std::filesystem::temp_directory_path() / "gr4_qa_grinfo_cache").generic_string();
         const std::string fromVariable = "gr4_qa_grinfo_cache, from GR_DATA_CACHE_DIR";
         {
             const EnvironmentVariable unset("GR_DATA_CACHE_DIR", std::nullopt);
@@ -497,6 +515,47 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         expect(version.output.contains("not-loaded")) << "the plugin whose ABI version does not match" << version.output;
         expect(version.output.contains("Good Math Plugin")) << "a plugin that did load" << version.output;
         expect(version.output.contains("block keys")) << version.output;
+    };
+
+    // An installer places the tree wherever its user chooses, so the tool may hold no path of the machine it was built
+    // on. The case installs the tool and one plugin into a scratch tree, then moves the tree.
+    "an installed grinfo finds its prefix and plugins from where it runs, and follows the tree when it moves"_test = [] {
+        namespace fs                        = std::filesystem;
+        const fs::path binDirectoryInPrefix = fromEnvironment("GR_TOOLS_INSTALL_BINDIR");
+        if (binDirectoryInPrefix.is_absolute()) {
+            return; // the programs install outside the prefix, so the tree cannot move as one
+        }
+        const fs::path scratch = fs::temp_directory_path() / "gr4_qa_grinfo_install";
+        fs::remove_all(scratch);
+        const fs::path built      = fromEnvironment("GR_TOOLS_GRINFO");
+        const fs::path firstRoot  = scratch / "first";
+        const fs::path secondRoot = scratch / "second";
+        fs::create_directories(firstRoot / binDirectoryInPrefix);
+        fs::copy_file(built, firstRoot / binDirectoryInPrefix / built.filename());
+        const EnvironmentVariable noDirectories("GNURADIO4_PLUGIN_DIRECTORIES", std::nullopt);
+        auto                      versionOf = [&](const fs::path& root) { return runProgram(root / binDirectoryInPrefix / built.filename(), {"version", "--json"}, Streams::standardOutput); };
+
+        const Result      empty  = versionOf(firstRoot);
+        const std::string prefix = fs::weakly_canonical(firstRoot).generic_string();
+        expect(eq(empty.exitCode, 0)) << empty.output;
+        expect(eq(jsonString(empty.output, "installPrefix").value_or(""), prefix)) << empty.output;
+        const std::string pluginDirectory = jsonString(empty.output, "installedPluginDirectory").value_or("");
+        expect(pluginDirectory.starts_with(prefix + "/")) << "the plugin directory lies in the tree the tool runs from" << empty.output;
+
+        fs::create_directories(pluginDirectory);
+        // a block plugin is a shared library, not a MODULE, so its suffix differs from moduleFileName()'s on macOS
+        const fs::path plugin = fromEnvironment("GR_TOOLS_GOOD_BASE_PLUGIN");
+        fs::copy_file(plugin, fs::path(pluginDirectory) / plugin.filename());
+        const Result installed = versionOf(firstRoot);
+        expect(eq(installed.exitCode, 0)) << installed.output;
+        expect(installed.output.contains("\"name\": \"Good Base Plugin\"")) << "the plugin of the tree is loaded" << installed.output;
+
+        fs::rename(firstRoot, secondRoot);
+        const Result moved = versionOf(secondRoot);
+        expect(eq(moved.exitCode, 0)) << moved.output;
+        expect(eq(jsonString(moved.output, "installPrefix").value_or(""), fs::weakly_canonical(secondRoot).generic_string())) << moved.output;
+        expect(moved.output.contains("\"name\": \"Good Base Plugin\"")) << "the moved tree still finds its plugin" << moved.output;
+        fs::remove_all(scratch);
     };
 
     "a library is listed by its own name under the directory that held it"_test = [] {
@@ -681,12 +740,12 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
     "a shared object that is neither a plugin nor a block library is reported as an ordinary library and counted"_test = [] {
         const Result text = run({"version", "--plugin-dir", fromEnvironment("GR_TOOLS_TEST_ORDINARY_LIBRARY")}, Streams::standardOutput);
         expect(eq(text.exitCode, 0)) << text.output;
-        expect(withSingleSpaces(text.output).contains("libordinary_library.so ordinary-library 0 0")) << "the file's row names its kind" << text.output;
+        expect(withSingleSpaces(text.output).contains(std::format("{} ordinary-library 0 0", moduleFileName("ordinary_library")))) << "the file's row names its kind" << text.output;
         expect(withSingleSpaces(text.output).contains("ordinary libraries 1 ")) << "the directory holds one such file" << text.output;
 
         const Result json = run({"version", "--json", "--plugin-dir", fromEnvironment("GR_TOOLS_TEST_ORDINARY_LIBRARY")}, Streams::standardOutput);
         expect(eq(json.exitCode, 0)) << json.output;
-        expect(withSingleSpaces(json.output).contains("libordinary_library.so\", \"kind\": \"ordinary-library\"")) << "the file's entry names its kind" << json.output;
+        expect(withSingleSpaces(json.output).contains(std::format("{}\", \"kind\": \"ordinary-library\"", moduleFileName("ordinary_library")))) << "the file's entry names its kind" << json.output;
         const std::size_t rows = occurrences(json.output, "\"kind\": \"ordinary-library\"");
         expect(eq(rows, 1UZ)) << json.output;
         expect(json.output.contains(std::format("\"ordinaryLibraries\": {},", rows))) << "the total counts the entries of that kind" << json.output;
@@ -757,7 +816,10 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         expect(markdown.output.contains("## gr::testing::LibraryDoubler\n")) << "the block named in full" << markdown.output;
         expect(markdown.output.contains("| out | output | float32 |")) << markdown.output;
         expect(markdown.output.contains("| extra_gain | float32 | 1.000000 | dB | yes |")) << markdown.output;
+#ifndef _MSC_VER
+        // the description is the placeholder under MSVC; see "block on a bare name prints its ports and its settings"
         expect(markdown.output.contains("doubles its input")) << "the description the block declares" << markdown.output;
+#endif
 
         const Result html = run(overTestDirectories({"block", "LibraryDoubler", "--html"}), Streams::standardOutput);
         expect(eq(html.exitCode, 0)) << html.output;

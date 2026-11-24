@@ -14,6 +14,7 @@
 
 #ifdef GR_ENABLE_BLOCK_REGISTRY
 #include "BlockLookup.hpp"
+#include "InstalledLocation.hpp"
 #endif
 
 namespace {
@@ -44,9 +45,10 @@ The connection table names the type each connection carries. That one column
 comes from the blocks themselves: the tool constructs the source block of a
 connection and reads the type off the named output port. Blocks come from the
 registry linked into this program, from the directories named by --plugin-dir,
-from the colon-separated list in GNURADIO4_PLUGIN_DIRECTORIES, and from the
-plugin directory of this installation, which is always searched. A block no
-registry holds and a port a block does not declare leave the column blank.
+from the list in GNURADIO4_PLUGIN_DIRECTORIES (separated by ';' on Windows and
+':' elsewhere), and from the plugin directory of this installation, which is
+always searched. A block no registry holds and a port a block does not declare
+leave the column blank.
 Everything else in the document is read from the file alone, so a graph whose
 blocks this build does not provide is still described.
 
@@ -108,7 +110,7 @@ int main(int argc, char** argv) {
     }
 
 #ifdef GR_ENABLE_BLOCK_REGISTRY
-    const std::vector<Directory> directories = searchDirectories(pluginDirectories, GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY);
+    const std::vector<Directory> directories = searchDirectories(pluginDirectories, gr::tools::installedPluginDirectory());
     std::vector<std::string>     paths;
     bool                         searchable = true;
     for (const Directory& directory : directories) {

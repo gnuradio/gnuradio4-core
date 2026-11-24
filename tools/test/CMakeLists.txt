@@ -124,7 +124,7 @@ if(TARGET grinfo)
   set_property(
     TEST qa_GrInfo
     APPEND
-    PROPERTY ENVIRONMENT "GR_TOOLS_GRINFO=$<TARGET_FILE:grinfo>")
+    PROPERTY ENVIRONMENT "GR_TOOLS_GRINFO=$<TARGET_FILE:grinfo>" "GR_TOOLS_INSTALL_BINDIR=${CMAKE_INSTALL_BINDIR}")
   add_dependencies(qa_GrInfo grinfo)
   set_tests_properties(qa_GrInfo PROPERTIES TIMEOUT 60)
   if(INTERNAL_ENABLE_BLOCK_PLUGINS)
@@ -134,6 +134,7 @@ if(TARGET grinfo)
       APPEND
       PROPERTY ENVIRONMENT
                "GR_TOOLS_CORE_TEST_PLUGINS=${CMAKE_BINARY_DIR}/core/test/plugins"
+               "GR_TOOLS_GOOD_BASE_PLUGIN=$<TARGET_FILE:GoodBasePlugin>"
                "GR_TOOLS_TEST_BLOCK_LIBRARY=${CMAKE_BINARY_DIR}/core/test/block_library"
                "GR_TOOLS_TEST_SCHEDULER_LIBRARY=${CMAKE_BINARY_DIR}/core/test/scheduler_library"
                "GR_TOOLS_TEST_PLUGIN_ABI=${CMAKE_BINARY_DIR}/core/test/plugin_abi"
@@ -160,9 +161,4 @@ if(TARGET grinfo)
     # the device cases read a block library and a plugin that register device listings of invented units
     add_dependencies(qa_GrInfo device_listing_library device_listing_plugin)
   endif()
-endif()
-
-# Does not yet pass under MSVC: exit statuses around compute_domain differ from the expectations.
-if(MSVC AND TARGET rungraph)
-  set_tests_properties(qa_RunGraph PROPERTIES DISABLED TRUE)
 endif()

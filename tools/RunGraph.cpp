@@ -46,6 +46,7 @@
 #include <gnuradio-4.0/config.hpp>
 #include <gnuradio-4.0/formatter/ValueFormatter.hpp>
 
+#include "InstalledLocation.hpp"
 #include "ShippedSchedulers.hpp"
 
 namespace {
@@ -90,8 +91,8 @@ Usage: rungraph --graph <file> [options]
 )"
 #ifdef INTERNAL_ENABLE_BLOCK_PLUGINS
                                     R"(The blocks come from the directories named by --plugin-dir, from GNURADIO4_PLUGIN_DIRECTORIES,
-the colon-separated list the framework's own plugin loader reads, and from the plugin directory
-of this installation, which is always searched.)"
+the list the framework's own plugin loader reads (separated by ';' on Windows and ':' elsewhere),
+and from the plugin directory of this installation, which is always searched.)"
 #else
                                     R"(The blocks come from the block libraries linked into this program, which loads no plugins.
 From the directories named by --plugin-dir, by GNURADIO4_PLUGIN_DIRECTORIES and the plugin
@@ -354,15 +355,14 @@ struct Options {
         add(directory);
     }
     if (const char* environment = std::getenv("GNURADIO4_PLUGIN_DIRECTORIES"); environment != nullptr) {
-        const std::string_view list(environment);
-        for (std::size_t start = 0UZ; start < list.size();) {
-            const std::size_t separator = list.find(':', start);
-            const std::size_t end       = separator == std::string_view::npos ? list.size() : separator;
-            add(list.substr(start, end - start));
-            start = end + 1UZ;
+        for (const std::string& directory : gr::splitPluginDirectories(environment)) {
+            add(directory);
         }
     }
-    add(GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY);
+    add(gr::tools::installedPluginDirectory());
+    for (const std::string& directory : gr::sharedPluginDirectories()) {
+        add(directory);
+    }
     return directories;
 }
 

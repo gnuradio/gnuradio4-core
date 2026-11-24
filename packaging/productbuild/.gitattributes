@@ -1,0 +1,9 @@
+# These are macOS shell scripts and shell script templates. A CRLF checkout
+# leaves a stray carriage return on the #! line, which the kernel reports as
+# "bad interpreter" -- and a pkg pre/postinstall script that cannot start fails
+# the install with no useful message. core.autocrlf is enabled on at least one
+# development machine, so pin them rather than rely on the clone's settings.
+*.sh    text eol=lf
+*.sh.in text eol=lf
+gr4-uninstall.in text eol=lf
+BuildComponentPackages.cmake text eol=lf

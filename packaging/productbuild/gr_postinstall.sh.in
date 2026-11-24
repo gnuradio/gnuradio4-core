@@ -1,0 +1,84 @@
+#!/bin/sh
+#
+# GNU Radio 4 component package postinstall: records this package in the shared
+# install manifest.
+#
+# This is the macOS counterpart of GrRegisterInManifest(), called from
+# GrCurStepChanged() at ssPostInstall in
+# packaging/innosetup/gr_install_flow.iss.in.  Configured by CMake, see
+# cmake/GrProductBuild.cmake.
+#
+# It is attached to one component per module -- the REQUIRED one -- rather than
+# to every component, so a module registers its packages exactly once however
+# many of its components the user selected.  Registration is an upsert, so a
+# repeat run is harmless.
+#
+# Anything printed here lands in /var/log/install.log.
+
+set -u
+
+api_version='@GR_PLUGIN_API_VERSION@'
+install_root='@GR_PRODUCTBUILD_INSTALL_ROOT@'
+shared_root='@GR_PRODUCTBUILD_SHARED_ROOT@'
+plugin_root='@GR_PRODUCTBUILD_PLUGIN_ROOT@'
+component_packages='@GR_INSTALLER_COMPONENT_PACKAGES@'
+plugin_packages='@GR_INSTALLER_PLUGIN_PACKAGES@'
+identifier='@GR_PRODUCTBUILD_IDENTIFIER@'
+
+manifest_path="${shared_root}/manifest/v${api_version}/manifest.json"
+tools_dir="${shared_root}/tools"
+
+script_dir=$(cd "$(dirname "$0")" && pwd)
+
+log() {
+    echo "gnuradio4: $*"
+}
+
+# The shared copy is the only one gr4-uninstall and third-party plugin
+# installers can reach: the package that carried this script is gone by the time
+# they run.  This mirrors the second [Files] entry in gr_installer_files.iss.in,
+# which installs gr_manifest.ps1 to %LOCALAPPDATA%\.gnuradio-4\tools with
+# uninsneveruninstall.  Every component package carries a copy, so it does not
+# matter which module installs first.
+if [ -f "${script_dir}/gr_manifest.sh" ]; then
+    if mkdir -p "${tools_dir}" 2>/dev/null; then
+        cp -f "${script_dir}/gr_manifest.sh" "${tools_dir}/gr_manifest.sh" 2>/dev/null &&
+            chmod 0755 "${tools_dir}/gr_manifest.sh" 2>/dev/null
+    fi
+fi
+
+manifest_tool="${script_dir}/gr_manifest.sh"
+if [ ! -f "${manifest_tool}" ]; then
+    manifest_tool="${tools_dir}/gr_manifest.sh"
+fi
+
+if [ ! -f "${manifest_tool}" ]; then
+    log "the files were installed, but the manifest tool is missing, so"
+    log "${manifest_path} was not updated. Plugin installers may not find this installation."
+    exit 0
+fi
+
+query_output=$(mktemp -t gr_manifest_register) || exit 0
+# shellcheck disable=SC2064
+trap "rm -f '${query_output}'" EXIT
+
+if sh "${manifest_tool}" --action register \
+        --manifest-path "${manifest_path}" \
+        --out-file "${query_output}" \
+        --api-version "${api_version}" \
+        --install-root "${install_root}" \
+        --plugin-root "${plugin_root}" \
+        --identifier "${identifier}" \
+        --components "${component_packages}" \
+        --plugins "${plugin_packages}"; then
+    log "registered in ${manifest_path}"
+    exit 0
+fi
+
+# Matching Windows: a failed registration warns but never fails an install whose
+# files are already on disc.
+log "the files were installed, but the install manifest could not be updated:"
+log "${manifest_path}"
+sed -n 's/^message=/gnuradio4: /p' "${query_output}" 2>/dev/null
+log "Plugin installers may not find this installation."
+exit 0

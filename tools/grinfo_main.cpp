@@ -44,6 +44,7 @@
 
 #include "BlockLookup.hpp"
 #include "DocWriter.hpp"
+#include "InstalledLocation.hpp"
 #include "ShippedSchedulers.hpp"
 
 #ifdef INTERNAL_ENABLE_BLOCK_PLUGINS
@@ -95,9 +96,9 @@ Usage: grinfo [command] [options]
   --help, -h         this text
 
 Blocks and schedulers come from the directories named by --plugin-dir, from the
-colon-separated list in GNURADIO4_PLUGIN_DIRECTORIES, and from the plugin
-directory of this installation, which is always searched. A directory named
-twice is searched once.
+list in GNURADIO4_PLUGIN_DIRECTORIES (separated by ';' on Windows and ':'
+elsewhere), and from the plugin directory of this installation, which is always
+searched. A directory named twice is searched once.
 
 <name> is a registry key with its template parameters,
 gr::blocks::basic::Convert<int16, float32>, or a name without them,
@@ -1536,6 +1537,13 @@ void writeTotals(JsonWriter& json, const Totals& totals) {
     json.endObject();
 }
 
+// the data cache directory in use, written with '/' as the report writes every path whatever the platform
+[[nodiscard]] gr::DataCacheDirectory reportedDataCacheDirectory() {
+    gr::DataCacheDirectory dataCache = gr::dataCacheDirectory();
+    dataCache.path                   = std::filesystem::path(dataCache.path).generic_string();
+    return dataCache;
+}
+
 void reportVersionAsJson(const Context& context) {
     JsonWriter json;
     json.beginObject();
@@ -1557,9 +1565,9 @@ void reportVersionAsJson(const Context& context) {
 #endif
     json.member("compilerId", CXX_COMPILER_ID);
     json.member("compilerVersion", CXX_COMPILER_VERSION);
-    json.member("installPrefix", GR_TOOLS_INSTALLED_PREFIX);
-    json.member("installedPluginDirectory", GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY);
-    const gr::DataCacheDirectory dataCache = gr::dataCacheDirectory();
+    json.member("installPrefix", gr::tools::installedPrefix());
+    json.member("installedPluginDirectory", gr::tools::installedPluginDirectory());
+    const gr::DataCacheDirectory dataCache = reportedDataCacheDirectory();
     json.member("dataCacheDirectory", dataCache.path);
     json.member("dataCacheOrigin", nameOf(dataCache.origin));
     json.member("whyNotUserDataCacheDirectory", dataCache.whyNotUser);
@@ -1664,9 +1672,10 @@ void reportVersionAsJson(const Context& context) {
     facts.emplace_back("plugin system", "disabled");
 #endif
     facts.emplace_back("compiler", std::format("{} {}", CXX_COMPILER_ID, CXX_COMPILER_VERSION));
-    facts.emplace_back("install prefix", GR_TOOLS_INSTALLED_PREFIX);
-    facts.emplace_back("plugin directory", underPrefix(GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY, GR_TOOLS_INSTALLED_PREFIX));
-    facts.emplace_back("data cache", dataCacheFact(gr::dataCacheDirectory()));
+    const std::string prefix = gr::tools::installedPrefix();
+    facts.emplace_back("install prefix", prefix);
+    facts.emplace_back("plugin directory", underPrefix(gr::tools::installedPluginDirectory(), prefix));
+    facts.emplace_back("data cache", dataCacheFact(reportedDataCacheDirectory()));
     return facts;
 }
 
@@ -2313,7 +2322,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    std::vector<Directory> directories = searchDirectories(options.pluginDirectories, GR_TOOLS_INSTALLED_PLUGIN_DIRECTORY);
+    std::vector<Directory> directories = searchDirectories(options.pluginDirectories, gr::tools::installedPluginDirectory());
     bool                   searchable  = true;
     for (const Directory& directory : directories) {
         if (directory.origin == "option" && !directory.present) {
