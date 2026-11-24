@@ -54,7 +54,8 @@ foreach(_arm hook plain)
   set_tests_properties(qa_RulesOverride_${_arm} PROPERTIES TIMEOUT 60)
 endforeach()
 
-# Does not yet pass under MSVC. The plain arm does, and stays enabled.
+# Does not yet pass under MSVC: the project default replaces the hook's RelWithDebInfo flags,
+# gnuradio/gnuradio4-core#256. The plain arm passes, and stays enabled.
 if(MSVC)
   set_tests_properties(qa_RulesOverride_hook PROPERTIES DISABLED TRUE)
 endif()

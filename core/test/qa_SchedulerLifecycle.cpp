@@ -7299,4 +7299,4 @@ const boost::ut::suite<"a block whose work() call holds while a sweep stops it">
     };
 };
 
-int main() { /* tests are statically registered */ }
+int main() { return boost::ut::cfg<boost::ut::override>.run(); }

@@ -3473,4 +3473,4 @@ const boost::ut::suite<"edits that give a block a reader or take its last one"> 
 #endif
 };
 
-int main() { /* tests are statically registered */ }
+int main() { return boost::ut::cfg<boost::ut::override>.run(); }

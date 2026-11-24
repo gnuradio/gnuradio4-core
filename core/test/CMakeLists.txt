@@ -343,15 +343,20 @@ endif()
 # Cases that do not yet pass under MSVC, listed individually so each can be re-enabled on its own.
 if(MSVC)
   set_tests_properties(
-    # five of its eight cases look up a registration key under a spelling MSVC does not produce
+    # five of its eight cases look up a registration key under a spelling MSVC does not produce:
+    # gnuradio/gnuradio4-core#253
     qa_BlockRegistration
+    # a block's Description resolves to the placeholder under MSVC: gnuradio/gnuradio4-core#252
     qa_SettingsTable
+    # two cases expect the dynamic linker's reasons for files it cannot load: gnuradio/gnuradio4-core#254
     qa_PluginBlockLibrary
-    # these time out; qa_SchedulerStartStop only intermittently
+    # MSVC refuses these blocks with C7595 before the guard whose diagnostic the tests look for:
+    # gnuradio/gnuradio4-core#251
+    cf_KeepsTagOffsets_forwardtags_deduced
+    cf_Resampling_forwardtags_deduced
+    # their untaken-remainder cases fail under the multithreaded and blocking policies: gnuradio/gnuradio4-core#255
     qa_SchedulerDrain
-    qa_SchedulerExchange
     qa_SchedulerLifecycle
-    qa_SchedulerStartStop
     PROPERTIES DISABLED TRUE)
 endif()
 add_ut_test(qa_FiniteSchedulerCompletion)

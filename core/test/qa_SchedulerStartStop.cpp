@@ -711,4 +711,4 @@ const boost::ut::suite<"the stream-to-message ratio"> messageRatioTests = [] {
     };
 };
 
-int main() { /* tests are statically registered */ }
+int main() { return boost::ut::cfg<boost::ut::override>.run(); }
