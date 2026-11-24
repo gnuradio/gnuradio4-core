@@ -4,6 +4,7 @@
 #include <array>
 #include <charconv>
 #include <cstdio>
+#include <filesystem>
 #include <format>
 #include <optional>
 #include <string>
@@ -226,6 +227,8 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
         expect(withoutValue.output.contains("--set takes <key>=<value>")) << withoutValue.output;
     };
 
+#ifndef _WIN32
+    // cmd.exe, which runs the command line on Windows, ends it at the newline the value holds
     "a --set whose value holds a second key is refused"_test = [] {
         const Result schedulerSetting = run({"--graph", "unread.yaml", "--set", "timeout_ms=10\nno_such_setting: 1"});
         expect(eq(schedulerSetting.exitCode, 2)) << schedulerSetting.output;
@@ -238,6 +241,7 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
         expect(blockSetting.output.contains("the value of --set count holds more than one key")) << blockSetting.output;
         expect(!blockSetting.output.contains("unread.yaml")) << blockSetting.output;
     };
+#endif
 
     "a scheduler key the registry does not hold is refused with the keys it holds"_test = [] {
         const Result refused = run({"--graph", "unread.yaml", "--scheduler", "no::such::Scheduler"});
@@ -455,8 +459,9 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
 
         const Result ran = run(arguments);
         expect(eq(ran.exitCode, 0)) << ran.output;
-        expect(ran.output.contains(std::format("rungraph: loaded {}/libordinary_library.so (no plugin entry point; this load registered nothing)\n", fromEnvironment("GR_TOOLS_TEST_ORDINARY_LIBRARY")))) << ran.output;
-        expect(!ran.output.contains("libordinary_library.so did not load")) << ran.output;
+        const std::string library = (std::filesystem::path(fromEnvironment("GR_TOOLS_TEST_ORDINARY_LIBRARY")) / moduleFileName("ordinary_library")).string();
+        expect(ran.output.contains(std::format("rungraph: loaded {} (no plugin entry point; this load registered nothing)\n", library))) << ran.output;
+        expect(!ran.output.contains(std::format("{} did not load", moduleFileName("ordinary_library")))) << ran.output;
         expect(ran.output.contains("the graph ended on its own")) << ran.output;
     };
 
@@ -477,7 +482,7 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
         const Result verbose = run(arguments);
         expect(eq(verbose.exitCode, 0)) << verbose.output;
         expect(verbose.output.contains(std::format("rungraph: searching {}\n", fromEnvironment("GR_TOOLS_CORE_TEST_PLUGINS")))) << verbose.output;
-        expect(verbose.output.contains("libbad_plugin.so did not load: ")) << "the plugin that fails is reported with its reason" << verbose.output;
+        expect(verbose.output.contains(std::format("{} did not load: ", moduleFileName("bad_plugin")))) << "the plugin that fails is reported with its reason" << verbose.output;
         expect(verbose.output.contains("rungraph:   good::fixed_source<float32>\n")) << "a key a plugin of the directory brought is listed" << verbose.output;
     };
 
