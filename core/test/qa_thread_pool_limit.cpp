@@ -23,8 +23,9 @@ constexpr std::size_t kQueuedRuns         = 100UZ;
 // small pool limit; restoring it at once keeps the kernel from refusing threads below the original limit. The kernel
 // checks the limit only when a thread starts, and no thread starts while the lowered limit is in force. The test lowers
 // the limit only on Linux without EMBEDDED, where the pool reads RLIMIT_NPROC and counts every thread of the process.
-// Elsewhere, or where the soft limit cannot be lowered, threadLimit is zero.
-const std::size_t threadLimit = [] {
+// Elsewhere, or where the soft limit cannot be lowered, threadLimit is zero. A named function rather than a lambda, which
+// would be implicitly constexpr: where it only returns zero, threadLimit would be a constant and every test of it constant.
+std::size_t readLoweredThreadLimit() {
 #if defined(__linux__) && !defined(__EMSCRIPTEN__) && !defined(EMBEDDED)
     rlimit original{};
     if (getrlimit(RLIMIT_NPROC, &original) == 0) {
@@ -38,7 +39,8 @@ const std::size_t threadLimit = [] {
     }
 #endif
     return 0UZ;
-}();
+}
+const std::size_t threadLimit = readLoweredThreadLimit();
 
 // The kernel counts a thread until the thread has finished exiting, which can be after its join returns. The pool reads
 // that count at its limit check.
