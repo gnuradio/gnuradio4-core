@@ -553,6 +553,7 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
 #ifndef _MSC_VER
         // Block::description resolves to its placeholder under MSVC: the initialiser tests the CRTP
         // Derived for a Description, and MSVC evaluates it while Derived is still incomplete.
+        // gnuradio/gnuradio4-core#252
         expect(block.output.contains("doubles its input")) << "the description the block declares" << block.output;
 #endif
     };
