@@ -1417,10 +1417,10 @@ const boost::ut::suite<"MultiProducerStrategy"> _multiProducerStrategy1 = [] {
     "MultiProducerStrategy - two producers publishing adjacent slots never leave the cursor behind"_test = [] {
         using Strategy = gr::MultiProducerStrategy<std::dynamic_extent, gr::NoWaitStrategy>;
 
-        constexpr std::size_t kProducers        = 2UZ;
-        constexpr std::size_t cap               = 16UZ;
-        constexpr std::size_t kRounds           = 100'000UZ;
-        constexpr std::size_t kSpinsBeforeYield = 1UZ << 10UZ;
+        constexpr std::size_t        kProducers        = 2UZ;
+        constexpr std::size_t        cap               = 16UZ;
+        constexpr std::size_t        kRounds           = 100'000UZ;
+        static constexpr std::size_t kSpinsBeforeYield = 1UZ << 10UZ;
 
         Strategy strategy(cap);
         auto     reader = std::make_shared<gr::Sequence>();

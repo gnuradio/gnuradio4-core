@@ -530,9 +530,9 @@ const boost::ut::suite<"the scheduler's messages to its children"> childMessageT
 
     // a burst larger than the free room in the ring reaches every child once the slow block reads its messages
     "a child slow in work() costs no child its messages"_test = [] {
-        constexpr std::string_view kPoolName = "qa_start_stop_two_cpu";
-        constexpr std::size_t      nMessages = 5000UZ;
-        qa_start_stop::ScopedPool  pool(kPoolName, std::make_shared<gr::thread_pool::ThreadPoolWrapper>(std::make_unique<gr::thread_pool::BasicThreadPool>(kPoolName, gr::thread_pool::TaskType::CPU_BOUND, 2U, 2U), "CPU"));
+        constexpr std::string_view   kPoolName = "qa_start_stop_two_cpu";
+        static constexpr std::size_t nMessages = 5000UZ;
+        qa_start_stop::ScopedPool    pool(kPoolName, std::make_shared<gr::thread_pool::ThreadPoolWrapper>(std::make_unique<gr::thread_pool::BasicThreadPool>(kPoolName, gr::thread_pool::TaskType::CPU_BOUND, 2U, 2U), "CPU"));
 
         gr::Graph flow;
         auto&     slow = flow.emplaceBlock<qa_start_stop::SlowSource>();
