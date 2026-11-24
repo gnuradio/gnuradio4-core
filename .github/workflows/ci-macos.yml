@@ -47,7 +47,7 @@ jobs:
       # Homebrew provides cpp-httplib but none of Boost.UT, vir-simd and magic_enum, so the superbuild provides those
       # three and prepends its prefix to CMAKE_PREFIX_PATH
       - name: Build the remaining dependencies
-        uses: johnwparent/gnuradio4-superbuild@f23ee97613a606c8f70cdd6a40a8ade47e7ce9ad
+        uses: gnuradio/gnuradio4-deps@f23ee97613a606c8f70cdd6a40a8ade47e7ce9ad
         with:
           enable-httplib: OFF
           enable-python3: OFF

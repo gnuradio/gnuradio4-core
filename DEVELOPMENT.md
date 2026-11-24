@@ -63,14 +63,14 @@ Required libraries, found through their CMake package files:
 - cpp-httplib >= 0.18.1, only when building tests natively
 
 Native package availability varies by distribution. The
-[gr-deps superbuild](https://github.com/johnwparent/gnuradio4-superbuild)
+[gr-deps superbuild](https://github.com/gnuradio/gnuradio4-deps)
 builds all four into one prefix of your choosing; point CMake at it, or at any
 other install of them, with `CMAKE_PREFIX_PATH`. Cross builds that search a
 sysroot, such as Emscripten's, need the packages inside that sysroot or a root
 added through `CMAKE_FIND_ROOT_PATH`.
 
 ```bash
-cmake -S gnuradio4-superbuild -B build-deps -DCMAKE_INSTALL_PREFIX=<deps prefix>
+cmake -S gnuradio4-deps -B build-deps -DCMAKE_INSTALL_PREFIX=<deps prefix>
 cmake --build build-deps
 ```
 
