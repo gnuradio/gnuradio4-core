@@ -32,6 +32,19 @@ const std::string kServerBase = "http://127.0.0.1:" + std::to_string(HTTP_SERVER
 const std::string kCacheDir   = gr::detail::YamlDefinitionsLoader::assetsCacheDir() + "/asset_cache";
 const bool        kSkipRemote = true;
 
+// sets the variable, or clears it when there is no value; Windows has no setenv, and _putenv_s clears on an empty value
+void setVariable(const std::string& name, const std::optional<std::string>& value) {
+#ifdef _WIN32
+    ::_putenv_s(name.c_str(), value.value_or("").c_str());
+#else
+    if (value.has_value()) {
+        ::setenv(name.c_str(), value->c_str(), 1);
+    } else {
+        ::unsetenv(name.c_str());
+    }
+#endif
+}
+
 // sets or clears one environment variable for the length of a case, and puts back the value it found
 class EnvironmentVariable {
     std::string                _name;
@@ -42,19 +55,9 @@ public:
         if (const char* found = std::getenv(_name.c_str()); found != nullptr) {
             _found = found;
         }
-        if (value.has_value()) {
-            ::setenv(_name.c_str(), value->c_str(), 1);
-        } else {
-            ::unsetenv(_name.c_str());
-        }
+        setVariable(_name, value);
     }
-    ~EnvironmentVariable() {
-        if (_found.has_value()) {
-            ::setenv(_name.c_str(), _found->c_str(), 1);
-        } else {
-            ::unsetenv(_name.c_str());
-        }
-    }
+    ~EnvironmentVariable() { setVariable(_name, _found); }
     EnvironmentVariable(const EnvironmentVariable&)            = delete;
     EnvironmentVariable& operator=(const EnvironmentVariable&) = delete;
 };
