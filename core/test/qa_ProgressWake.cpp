@@ -131,4 +131,4 @@ const boost::ut::suite<"progress wake"> progressWake = [] {
     };
 };
 
-int main() { /* tests are statically registered */ }
+int main() { return boost::ut::cfg<boost::ut::override>.run(); }

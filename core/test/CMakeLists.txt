@@ -354,12 +354,9 @@ if(MSVC)
     # gnuradio/gnuradio4-core#251
     cf_KeepsTagOffsets_forwardtags_deduced
     cf_Resampling_forwardtags_deduced
-    # these time out, qa_SchedulerStartStop only intermittently. qa_SchedulerDrain and qa_SchedulerLifecycle also fail
-    # their untaken-remainder cases under the multithreaded and blocking policies: gnuradio/gnuradio4-core#255
+    # their untaken-remainder cases fail under the multithreaded and blocking policies: gnuradio/gnuradio4-core#255
     qa_SchedulerDrain
-    qa_SchedulerExchange
     qa_SchedulerLifecycle
-    qa_SchedulerStartStop
     PROPERTIES DISABLED TRUE)
 endif()
 add_ut_test(qa_FiniteSchedulerCompletion)

@@ -1989,4 +1989,4 @@ const boost::ut::suite<"end-of-stream drain"> drainTests = [] {
     };
 };
 
-int main() { /* tests are statically registered */ }
+int main() { return boost::ut::cfg<boost::ut::override>.run(); }
