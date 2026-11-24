@@ -107,7 +107,7 @@ RUN apt-get update && \
 # for native builds and once into the Emscripten sysroot, where the Emscripten toolchain file roots its package
 # searches. All of them are header-only with architecture-independent package files, so the host compiler configures
 # both.
-ARG GR_DEPS_REPOSITORY=https://github.com/johnwparent/gnuradio4-superbuild.git
+ARG GR_DEPS_REPOSITORY=https://github.com/gnuradio/gnuradio4-deps.git
 ARG GR_DEPS_REF=f23ee97613a606c8f70cdd6a40a8ade47e7ce9ad
 ENV GR_DEPS_PREFIX=/opt/gr-deps
 

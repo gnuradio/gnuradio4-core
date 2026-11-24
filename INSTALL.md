@@ -88,7 +88,7 @@ sudo apt install -y cmake g++ git pkg-config python3 python3-dev
 
 Ubuntu 24.04 does not package all native dependencies used by the default core build. Install magic_enum
 (>= 0.9.3), vir-simd (>= 0.4.4) and, for tests, Boost.UT (>= 2.3.1) and cpp-httplib (>= 0.18.1) from source, and pass their install prefix in `CMAKE_PREFIX_PATH`. The
-[gr-deps superbuild](https://github.com/johnwparent/gnuradio4-superbuild) builds all four into one prefix.
+[gr-deps superbuild](https://github.com/gnuradio/gnuradio4-deps) builds all four into one prefix.
 
 ## macOS via Homebrew
 
