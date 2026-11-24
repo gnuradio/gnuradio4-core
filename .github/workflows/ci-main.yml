@@ -7,7 +7,7 @@ on:
 jobs:
   build:
     name: "${{ matrix.name }}"
-    runs-on: "ubuntu-latest"
+    runs-on: ${{ matrix.runs-on }}
     concurrency:
       group: ${{ github.workflow }}-${{ github.run_id }}-${{ matrix.name }}
       cancel-in-progress: false
@@ -20,6 +20,7 @@ jobs:
       matrix:
         include:
           - name: "Ubuntu 24.04 | gcc-14 | Release"
+            runs-on: ubuntu-latest
             cache_key: ubuntu-2404-gcc14-release
             image: ghcr.io/gnuradio/ci:ubuntu-24.04-4.0
             cc: gcc-14
@@ -27,6 +28,7 @@ jobs:
             cmake-build-type: Release
             cmake_flags: "-DADDRESS_SANITIZER=ON"
           - name: "Ubuntu 26.04 | gcc | Release"
+            runs-on: ubuntu-latest
             cache_key: ubuntu-2604-gcc-release
             image: ghcr.io/gnuradio/ci:ubuntu-26.04-4.0
             cc: gcc
@@ -34,6 +36,7 @@ jobs:
             cmake-build-type: Release
             cmake_flags: "-DADDRESS_SANITIZER=ON"
           - name: "Ubuntu 26.04 | gcc | Debug"
+            runs-on: ubuntu-latest
             cache_key: ubuntu-2604-gcc-debug
             image: ghcr.io/gnuradio/ci:ubuntu-26.04-4.0
             cc: gcc
@@ -41,6 +44,7 @@ jobs:
             cmake-build-type: Debug
             cmake_flags: "-DADDRESS_SANITIZER=OFF"
           - name: "Ubuntu 24.04 | clang-20 | Release"
+            runs-on: ubuntu-latest
             cache_key: ubuntu-2404-clang20-release
             image: ghcr.io/gnuradio/ci:ubuntu-24.04-4.0
             cc: clang-20
@@ -48,6 +52,7 @@ jobs:
             cmake-build-type: Release
             cmake_flags: "-DADDRESS_SANITIZER=ON"
           - name: "Fedora 44 | clang | Release"
+            runs-on: ubuntu-latest
             cache_key: fedora-44-clang-release
             image: ghcr.io/gnuradio/ci:fedora-44-4.0
             cc: clang
@@ -55,6 +60,7 @@ jobs:
             cmake-build-type: Release
             cmake_flags: "-DADDRESS_SANITIZER=ON"
           - name: "Ubuntu 24.04 | Emscripten | Release"
+            runs-on: ubuntu-latest
             cache_key: ubuntu-2404-emscripten-release
             image: ghcr.io/gnuradio/ci:ubuntu-24.04-4.0-emscripten
             cc: emcc
@@ -62,12 +68,21 @@ jobs:
             cmake-build-type: Release
             cmake_flags: "-DENABLE_COVERAGE=OFF -DCMAKE_CROSSCOMPILING_EMULATOR=${SYSTEM_NODE}"
           - name: "Ubuntu 24.04 | Emscripten | Debug"
+            runs-on: ubuntu-latest
             cache_key: ubuntu-2404-emscripten-debug
             image: ghcr.io/gnuradio/ci:ubuntu-24.04-4.0-emscripten
             cc: emcc
             cmake_wrapper: emcmake
             cmake-build-type: Debug
             cmake_flags: "-DENABLE_COVERAGE=OFF -DCMAKE_CROSSCOMPILING_EMULATOR=${SYSTEM_NODE}"
+          - name: "Fedora 44 | gcc | Release | aarch64"
+            runs-on: ubuntu-24.04-arm
+            cache_key: fedora-44-gcc-release-aarch64
+            image: ghcr.io/gnuradio/ci:fedora-44-4.0
+            cc: gcc
+            cxx: g++
+            cmake-build-type: Release
+            cmake_flags: "-DADDRESS_SANITIZER=OFF"
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
