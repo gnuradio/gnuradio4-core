@@ -1,0 +1,73 @@
+name: "GNURadio Windows CI"
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  win-build:
+    strategy:
+      matrix:
+        os:
+          - windows-latest # vs26
+          - windows-2022 # vs22
+          - windows-11-arm # vs26 - arm
+    runs-on: ${{ matrix.os }}
+    name: "GR4-build-win32-${{ matrix.os }}"
+    steps:
+      - name: Checkout GR Core
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          fetch-depth: 1
+      - name: Setup VS Dev Prompt
+        uses: step-security/msvc-dev-cmd@22c98154b708dbd743e6f27a933cf6ceba3305c4 # v1.13.1
+        # the action sets up x64 tools by default, which the ARM runner runs under emulation
+        with:
+          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+      # gnuradio4-deps applies the MSVC patches to vir-simd and provides Boost.UT, magic_enum and cpp-httplib; it
+      # prepends its prefix to CMAKE_PREFIX_PATH and PATH for the steps below
+      - name: Build the third-party dependencies
+        uses: gnuradio/gnuradio4-deps@fa6f02f0a3e5c07b58f7cf3a3da4800f9ac93488
+        with:
+          enable-python3: OFF
+          generator: Ninja
+      - name: Configure and Generate
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_COLOR_DIAGNOSTICS=ON
+          -DDISABLE_EXTERNAL_DEPS_WARNINGS=ON
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          -DENABLE_COVERAGE=OFF
+      - name: Build
+        run: |
+          cmake --build build
+      - name: Test
+        run: |
+          ctest --test-dir build --output-on-failure --timeout 120 --no-tests=error
+      - name: Execute main binary
+        working-directory: ${{ github.workspace }}/build
+        run: .\core\src\main.exe
+      - name: Install
+        run: cmake --install build --prefix "${{ github.workspace }}/install"
+
+      - name: Build installed SDK smoke project
+        run: |
+          cmake -S test_external/minimal_blocklib -B build-smoke -G Ninja -DCMAKE_PREFIX_PATH="${{ github.workspace }}/install"
+          cmake --build build-smoke
+      # Windows has no rpath: the consumers find the core and block-library DLLs through PATH
+      - name: Run installed SDK smoke consumers
+        run: |
+          $dllDirs = Get-ChildItem build-smoke -Recurse -Filter *.dll | ForEach-Object DirectoryName | Sort-Object -Unique
+          $env:PATH = (@("${{ github.workspace }}\install\bin") + $dllDirs + $env:PATH) -join ";"
+          foreach ($consumer in "minimal_blocklib_consumer_Shared", "minimal_blocklib_consumer_Static", "minimal_blocklib_collision_Shared", "minimal_blocklib_collision_Static", "minimal_blocklib_named_registry") {
+            & ".\build-smoke\$consumer.exe"
+            if ($LASTEXITCODE -ne 0) { throw "$consumer exited with $LASTEXITCODE" }
+          }
