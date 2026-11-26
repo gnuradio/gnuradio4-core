@@ -418,21 +418,31 @@ const boost::ut::suite<"RecipeParameters"> recipeParameterTests = [] {
         using enum gr::recipe::Expression::OpKind;
         constexpr std::int64_t kMax = std::numeric_limits<std::int64_t>::max();
         constexpr std::int64_t kMin = std::numeric_limits<std::int64_t>::min();
-        expect(checkedArithmetic(add, kMax - 1, 1) == kMax);
-        expect(!checkedArithmetic(add, kMax, 1).has_value());
-        expect(checkedArithmetic(add, kMin + 1, -1) == kMin);
-        expect(!checkedArithmetic(add, kMin, -1).has_value());
-        expect(checkedArithmetic(subtract, kMin + 1, 1) == kMin);
-        expect(!checkedArithmetic(subtract, kMin, 1).has_value());
-        expect(!checkedArithmetic(subtract, 0, kMin).has_value()) << "-INT64_MIN is not an int64";
-        expect(checkedArithmetic(subtract, -1, kMin) == kMax);
-        expect(checkedArithmetic(multiply, kMin, 1) == kMin);
-        expect(!checkedArithmetic(multiply, kMin, -1).has_value());
-        expect(!checkedArithmetic(multiply, -1, kMin).has_value());
-        expect(checkedArithmetic(multiply, std::int64_t{-4611686018427387904}, 2) == kMin);
-        expect(!checkedArithmetic(multiply, std::int64_t{4611686018427387904}, 2).has_value());
-        expect(!checkedArithmetic(multiply, std::int64_t{-4611686018427387905}, 2).has_value());
-        expect(checkedArithmetic(multiply, 0, kMin) == std::int64_t{0});
+        static_assert(checkedArithmetic(add, kMax - 1, 1) == kMax);
+        static_assert(!checkedArithmetic(add, kMax, 1).has_value());
+        static_assert(checkedArithmetic(add, kMin + 1, -1) == kMin);
+        static_assert(!checkedArithmetic(add, kMin, -1).has_value());
+        static_assert(checkedArithmetic(subtract, kMin + 1, 1) == kMin);
+        static_assert(!checkedArithmetic(subtract, kMin, 1).has_value());
+        static_assert(!checkedArithmetic(subtract, 0, kMin).has_value(), "-INT64_MIN is not an int64");
+        static_assert(checkedArithmetic(subtract, -1, kMin) == kMax);
+        static_assert(checkedArithmetic(multiply, kMin, 1) == kMin);
+        static_assert(!checkedArithmetic(multiply, kMin, -1).has_value());
+        static_assert(!checkedArithmetic(multiply, -1, kMin).has_value());
+        static_assert(checkedArithmetic(multiply, std::int64_t{-4611686018427387904}, 2) == kMin);
+        static_assert(!checkedArithmetic(multiply, std::int64_t{4611686018427387904}, 2).has_value());
+        static_assert(!checkedArithmetic(multiply, std::int64_t{-4611686018427387905}, 2).has_value());
+        static_assert(checkedArithmetic(multiply, 0, kMin) == std::int64_t{0});
+        static_assert(!checkedArithmetic(divide, 6, 3).has_value(), "only add, subtract and multiply are evaluated");
+        static_assert(!checkedArithmetic(negate, 6, 3).has_value(), "only add, subtract and multiply are evaluated");
+    };
+
+    "integer evaluation refuses an operation it does not support instead of invoking undefined behaviour"_test = [] {
+        using enum gr::recipe::Expression::OpKind;
+        const gr::recipe::Expression handBuilt{.ops = {{.kind = pushInteger, .integer = 6}, {.kind = pushInteger, .integer = 3}, {.kind = divide}}, .source = "6 / 3", .integerMode = true};
+        const auto                   refused = evaluate(handBuilt, {});
+        expect(!refused.has_value()) << "an integer-mode expression holding a division is refused";
+        expect(refused.error().message.contains("does not support")) << refused.error().message;
     };
 
     "declaration validation refuses duplicates, reserved names, unknown types and mistyped defaults"_test = [] {
