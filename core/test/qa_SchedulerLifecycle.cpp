@@ -7298,5 +7298,3 @@ const boost::ut::suite<"a block whose work() call holds while a sweep stops it">
         qa_sched::expectInWorkStopDuringGraphReplacementReturns();
     };
 };
-
-int main() { /* tests are statically registered */ }

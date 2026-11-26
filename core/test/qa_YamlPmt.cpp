@@ -1349,5 +1349,3 @@ rates:
         expect(fuzzy_eq(formatResult(yaml::deserialize("value: !!float32 1e3x")), "Error in 1:18: Invalid floating-point-type value '1e3x' (error: trailing characters)"sv));
     };
 };
-
-int main() { /* tests are statically executed */ }

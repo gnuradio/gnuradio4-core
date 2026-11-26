@@ -160,5 +160,3 @@ const boost::ut::suite<"block registration"> blockRegistrationTests = [] {
         expect(!registry.contains("qa::Scale<std::int16_t>")) << "the literal spelling";
     };
 };
-
-int main() { /* tests are statically registered */ }

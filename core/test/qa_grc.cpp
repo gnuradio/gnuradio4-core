@@ -1608,5 +1608,3 @@ const boost::ut::suite<"GRC load refusals"> grcRefusalTests = [] {
         expect(readOnly.empty()) << "a read-only member the writer stores in a context loads" << readOnly;
     };
 };
-
-int main() { /* tests are run by the ut suite */ }

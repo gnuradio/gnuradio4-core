@@ -59,5 +59,3 @@ using ScalarResult = decltype(std::declval<const Merged&>().processOne(0, 0));
 static_assert(std::is_same_v<ScalarResult, int>, "a scalar argument pack keeps the result scalar");
 
 } // namespace qa_block_merging
-
-int main() { /* tests are statically executed */ }

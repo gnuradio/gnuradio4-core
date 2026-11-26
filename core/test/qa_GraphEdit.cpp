@@ -3472,5 +3472,3 @@ const boost::ut::suite<"edits that give a block a reader or take its last one"> 
     };
 #endif
 };
-
-int main() { /* tests are statically registered */ }

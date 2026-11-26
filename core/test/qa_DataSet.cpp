@@ -159,5 +159,3 @@ const boost::ut::suite<"DataSet timestamp sentinel"> _dataSetTimestamp = [] {
         expect(neq(dataSet.timestamp, std::int64_t{0})) << "the smallest recordable time must not read as unset";
     };
 };
-
-int main() { /* tests are statically executed */ }

@@ -165,5 +165,3 @@ const boost::ut::suite<"PluginBlockLibrary"> pluginBlockLibraryTests = [] {
         expect(that % loader.failedPlugins().empty()) << "a file that was never opened did not fail to load";
     };
 };
-
-int main() { /* not needed for UT */ }

@@ -138,5 +138,3 @@ const boost::ut::suite<"shorten type name tests"> _shorten_type_name = [] {
         expect(eq(gr::meta::shorten_type_name("Outer<Inner>"sv), "Outer<Inner>"sv));
     };
 };
-
-int main() { /* tests are statically executed */ }

@@ -346,5 +346,3 @@ const boost::ut::suite<"settings concurrency"> settingsConcurrencyTests = [] {
         expect(eq(sink->sample_rate.value, 1.0f)) << "an unconvertible value reached the member";
     };
 };
-
-int main() { /* tests are statically registered */ }

@@ -70,5 +70,3 @@ const boost::ut::suite<"Portable Type names"> typeNameTests = [] {
 };
 
 } // namespace gr::testing
-
-int main() { /* tests are statically executed */ }

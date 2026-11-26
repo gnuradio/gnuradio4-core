@@ -264,5 +264,3 @@ const boost::ut::suite<"PluginAbiVersion"> pluginAbiVersionTests = [] {
         expect(registry.abiVersion("test::no_such_scheduler") == std::nullopt);
     };
 };
-
-int main() { /* not needed for UT */ }

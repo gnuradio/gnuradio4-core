@@ -164,5 +164,3 @@ const boost::ut::suite<"the subnormal flush of a scheduler"> schedulerFlushTests
         expect(failures.empty()) << failures;
     };
 };
-
-int main() { /* tests are statically registered */ }

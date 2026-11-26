@@ -323,5 +323,3 @@ static_assert(gr::meta::enumValues<Status>().size() == 4);
 static_assert(!gr::meta::reflectionBackendProvider().empty());
 
 } // namespace enum_reflection_test
-
-int main() { /* tests are statically executed */ }

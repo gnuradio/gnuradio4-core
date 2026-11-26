@@ -991,5 +991,3 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         expect(missing.output.contains("no block named NoSuchBlockIsRegistered is registered")) << missing.output;
     };
 };
-
-int main() { /* not needed for UT */ }

@@ -53,5 +53,3 @@ const boost::ut::suite basicTests = [] {
     };
 };
 } // namespace gr::reader_writer_lock_test
-
-int main() { /* tests are statically executed */ }

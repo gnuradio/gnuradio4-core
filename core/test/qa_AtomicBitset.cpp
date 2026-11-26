@@ -171,5 +171,3 @@ const boost::ut::suite AtomicBitsetTests = [] {
         }
     };
 };
-
-int main() { /* not needed for UT */ }

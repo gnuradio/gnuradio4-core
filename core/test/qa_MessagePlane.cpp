@@ -347,5 +347,3 @@ const boost::ut::suite<"replies kept for a full message output"> keptReplyTests 
         expect(sched._unforwardedReplies.empty());
     };
 };
-
-int main() { /* tests are statically registered */ }

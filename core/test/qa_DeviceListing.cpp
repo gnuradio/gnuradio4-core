@@ -185,5 +185,3 @@ const boost::ut::suite<"DeviceListing"> deviceListingTests = [] {
         expect(eq(gr::globalDeviceListingRegistry().listings().size(), nHeldBefore)) << "the registry holds as many words as before the load";
     };
 };
-
-int main() { /* not needed for UT */ }

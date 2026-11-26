@@ -127,5 +127,3 @@ const boost::ut::suite<"destruction safety"> destructionSafetyTests = [] {
         expect(lt(stopDuration.count(), 0.5 * period.count())) << "the stop waited for the timer's next tick";
     };
 };
-
-int main() { /* tests are statically registered */ }

@@ -259,5 +259,3 @@ const boost::ut::suite<"block message plumbing"> blockMessageTests = [] {
         expect(block.settings().getStored("gain", SettingsCtx{0U, std::string("qa")}) == std::optional<pmt::Value>(2.f)) << "the setting the block has still takes";
     };
 };
-
-int main() { /* tests are statically registered */ }

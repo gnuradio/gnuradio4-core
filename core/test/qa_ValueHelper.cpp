@@ -1286,5 +1286,3 @@ const boost::ut::suite<"edge cases"> _edge_cases = [] {
         expect(result->at("deep").is_map());
     };
 };
-
-int main() { /* boost::ut auto-runs */ }

@@ -65,5 +65,3 @@ const boost::ut::suite<"simdize eligibility"> simdEligibilityTests = [] {
         expect(not qa_simd::isSimdized<qa_simd::ComplexAggregate>);
     };
 };
-
-int main() { /* tests are statically registered */ }

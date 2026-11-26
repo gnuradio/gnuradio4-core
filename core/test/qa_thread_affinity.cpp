@@ -248,5 +248,3 @@ const boost::ut::suite ThreadAffinityTests = [] {
 
 #endif
 };
-
-int main() { /* tests are statically executed */ }

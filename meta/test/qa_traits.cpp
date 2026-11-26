@@ -68,5 +68,3 @@ static_assert(IsNoexceptMemberFunction<decltype(&Test::constFunc)>);
 static_assert(!IsNoexceptMemberFunction<decltype(&Test::constFuncNotNoexcept)>);
 
 } // namespace gr::meta
-
-int main() { /* tests are statically executed */ }

@@ -78,7 +78,23 @@ function(gr_qa_attach_shared_pch)
   endforeach()
 endfunction()
 
+# The main() of the tests, which runs the Boost.UT suites before exit() rather than from a destructor during it. On
+# Windows, exit() holds a lock that a test thread needs to first initialise a function-local static, so joining that
+# thread during exit() deadlocks. A failing run at exit also calls exit() a second time. It is a static library, so a
+# test that defines its own main() keeps it: the linker takes main() from an archive only when nothing else defines it.
+function(gr_ut_main_library RESULT_VAR)
+  set(_library gr_ut_main)
+  if(NOT TARGET ${_library})
+    add_library(${_library} STATIC ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/GnuRadioTestMain.cpp)
+    target_link_libraries(${_library} PRIVATE gnuradio-options ut)
+  endif()
+  set(${RESULT_VAR}
+      ${_library}
+      PARENT_SCOPE)
+endfunction()
+
 function(setup_test_no_asan TEST_NAME)
+  gr_ut_main_library(_utMain)
   target_include_directories(${TEST_NAME} PRIVATE ${CMAKE_BINARY_DIR}/include ${CMAKE_CURRENT_BINARY_DIR})
   target_link_libraries(
     ${TEST_NAME}
@@ -86,6 +102,7 @@ function(setup_test_no_asan TEST_NAME)
             gnuradio-core
             gnuradio-blocklib-core
             ut
+            ${_utMain}
             ${GR_TEST_HELPER_LIBRARIES})
   if(TARGET gnuradio-plugin)
     target_link_libraries(${TEST_NAME} PRIVATE gnuradio-plugin)

@@ -1988,5 +1988,3 @@ const boost::ut::suite<"end-of-stream drain"> drainTests = [] {
         expect(eq(downstream.streamReader().available(), kStopAt + 1UZ)) << "the call publishes up to the sample that requested the stop";
     };
 };
-
-int main() { /* tests are statically registered */ }

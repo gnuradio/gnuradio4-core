@@ -281,5 +281,3 @@ const boost::ut::suite<"gr::Ratio"> _ratio = [] { // NOSONAR
         check(neg, -1, 7);
     };
 };
-
-int main() { /* tests are statically executed */ }

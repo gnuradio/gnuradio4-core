@@ -27,5 +27,3 @@ const boost::ut::suite<"PluginGlobalDefault"> globalDefaultTests = [] {
         expect(fatal(loader.isBlockAvailable("good::fixed_source<float64>"))) << "the block of a plugin in the installed directory is not offered";
     };
 };
-
-int main() { /* not needed for UT */ }

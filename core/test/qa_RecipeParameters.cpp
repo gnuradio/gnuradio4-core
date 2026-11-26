@@ -1221,5 +1221,3 @@ blocks:
         expect(refusal.error().message.contains("recipe_unknown_parameter")) << refusal.error().message;
     };
 };
-
-int main() { /* not needed for ut */ }

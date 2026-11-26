@@ -526,5 +526,3 @@ const boost::ut::suite<"PMR conversion helpers"> _pmrConversion = [] {
         std::pmr::set_default_resource(previous);
     };
 };
-
-int main() { /* not needed for UT */ }

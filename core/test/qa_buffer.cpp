@@ -2577,5 +2577,3 @@ const boost::ut::suite<"CircularBuffer::Writer::resource"> writerResourceTests =
         expect(eq(writer.resource(), static_cast<std::pmr::memory_resource*>(&customResource)));
     };
 };
-
-int main() { /* not needed for UT */ }

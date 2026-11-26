@@ -204,5 +204,3 @@ const boost::ut::suite<"settings table"> _settingsTable = [] {
         expect(eq(std::string(active.begin()->second.value_or(std::string_view{})), std::string("square")));
     };
 };
-
-int main() { /* not needed by the UT framework */ }

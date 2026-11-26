@@ -93,5 +93,3 @@ const boost::ut::suite<"processOne SIMD width"> processOneSimdWidthTests = [] {
         expect(eq(probe._widestCall, kExpectedLanes));
     };
 };
-
-int main() { /* tests are statically executed */ }

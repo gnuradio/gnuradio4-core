@@ -241,5 +241,3 @@ const suite<"ComputeDomain::parse"> _parseTests = [] {
         expect(eq(d.deviceIndex, 0));
     };
 };
-
-int main() { /* not needed for UT */ }
