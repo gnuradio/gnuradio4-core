@@ -1438,5 +1438,3 @@ const boost::ut::suite<"TensorView"> _tensorView = [] {
         };
     };
 };
-
-int main() { /* tests are statically executed */ }

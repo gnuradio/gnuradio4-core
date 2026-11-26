@@ -168,5 +168,3 @@ const boost::ut::suite<"MergeView tests"> _MergeViewTests = [] {
         expect(std::ranges::equal(pass1, pass2));
     };
 };
-
-int main() {}

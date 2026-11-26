@@ -699,5 +699,3 @@ const boost::ut::suite<"segmented tag store"> _tagStoreTests = [] {
         };
     }
 };
-
-int main() { /* tests are statically executed */ }

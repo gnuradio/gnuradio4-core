@@ -548,5 +548,3 @@ const boost::ut::suite<"a managed subgraph's progress"> nestedProgressTests = []
         expect(le(nWithBusy, 2UZ * nAlone + 4UZ)) << "a subgraph's work behind no shared ring must not wake the parked parent";
     };
 };
-
-int main() { /* tests are statically registered */ }

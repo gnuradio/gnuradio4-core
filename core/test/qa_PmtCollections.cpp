@@ -830,5 +830,3 @@ const boost::ut::suite<"gr::pmr::vector"> _pmr = [] {
         expect(v[0] == 11 && v[1] == 22 && v[2] == 33);
     };
 };
-
-int main() { /* not needed for UT */ }

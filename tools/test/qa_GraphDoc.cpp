@@ -733,5 +733,3 @@ const boost::ut::suite<"GraphDoc"> graphDocTests = [] {
         expect(markdown.find("| blocks\\[0\\] | 42 |") != std::string::npos) << markdown;
     };
 };
-
-int main() { /* not needed for UT */ }

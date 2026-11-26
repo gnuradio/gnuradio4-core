@@ -1592,5 +1592,3 @@ const boost::ut::suite<"strided tag propagation"> _stridedTagPropagation = [] {
         expectFramesOnStride<SkippingForwarder>("forwardTags() override", result.samples, kSamples);
     };
 };
-
-int main() { /* not needed by the UT framework */ }

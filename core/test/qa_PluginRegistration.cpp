@@ -331,5 +331,3 @@ const boost::ut::suite<"PluginRegistration"> pluginRegistrationTests = [] {
 
     "a block of a shared object whose port value type is a local class of a static function cannot replace the program's block of the same name"_test = [] { expectSharedObjectStageRefused<gr::testing::LocalSample>("test::local_stage"); };
 };
-
-int main() { /* not needed for UT */ }

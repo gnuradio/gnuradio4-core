@@ -471,5 +471,3 @@ const boost::ut::suite<"buffer zero-reader gating"> bufferZeroReaderTests = [] {
         testReaderChurnAgainstProducer<CircularBufferMulti>("MPSC");
     };
 };
-
-int main() { /* tests are statically registered */ }

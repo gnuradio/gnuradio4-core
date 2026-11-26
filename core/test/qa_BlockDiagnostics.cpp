@@ -348,5 +348,3 @@ const boost::ut::suite<"block diagnostics"> _blockDiagnostics = [] {
         expect(gt(sink.nConsumed, 0UZ)) << "the sink must actually have consumed samples for this scenario to prove anything";
     };
 };
-
-int main() { /* not needed by the UT framework */ }

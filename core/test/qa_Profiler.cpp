@@ -404,5 +404,3 @@ const boost::ut::suite<"gr::profiling concepts"> _6 = [] {
     };
 };
 #endif
-
-int main() { /* tests are statically registered as suites */ }

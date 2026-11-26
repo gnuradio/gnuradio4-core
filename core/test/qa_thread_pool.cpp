@@ -1085,5 +1085,3 @@ const boost::ut::suite<"gr::thread_pool Manager WASM"> _wasm = [] {
         expect(gt(io->numThreads(), cpu->numThreads())) << "IO thread count should exceed CPU";
     };
 };
-
-int main() { /* tests are statically executed */ }

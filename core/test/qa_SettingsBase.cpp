@@ -80,5 +80,3 @@ const boost::ut::suite<"an out-of-tree SettingsBase implementation"> settingsBas
         expect(base.tagCouplings().empty());
     };
 };
-
-int main() { /* tests are statically registered */ }

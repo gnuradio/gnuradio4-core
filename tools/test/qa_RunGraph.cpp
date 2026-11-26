@@ -774,5 +774,3 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
     };
 #endif
 };
-
-int main() { /* not needed for UT */ }

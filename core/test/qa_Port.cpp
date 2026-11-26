@@ -1521,5 +1521,3 @@ const boost::ut::suite<"Port rings on first use"> _ringsOnFirstUse = [] { // NOS
         }
     };
 };
-
-int main() { /* tests are statically executed */ }

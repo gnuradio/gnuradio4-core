@@ -179,5 +179,3 @@ const boost::ut::suite<"values shared with a shared object"> sharedObjectStateTe
         expect(libraryProbe(block).providerResource == std::pmr::null_memory_resource()) << "the shared object's code did not find the program's provider";
     };
 };
-
-int main() { /* tests are statically registered */ }

@@ -2331,5 +2331,3 @@ const boost::ut::suite<"std::hash<Value>"> _hashTests = [] {
         expect(hashes.size() == 100_ul);
     };
 };
-
-int main() { /* boost::ut auto-runs */ }

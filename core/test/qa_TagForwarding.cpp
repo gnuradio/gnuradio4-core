@@ -918,5 +918,3 @@ const boost::ut::suite<"tag forwarding"> _tagForwarding = [] {
         }
     };
 };
-
-int main() { /* not needed by the UT framework */ }

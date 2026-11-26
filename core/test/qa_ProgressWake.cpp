@@ -130,5 +130,3 @@ const boost::ut::suite<"progress wake"> progressWake = [] {
         untimed.join();
     };
 };
-
-int main() { /* tests are statically registered */ }

@@ -710,5 +710,3 @@ const boost::ut::suite<"the stream-to-message ratio"> messageRatioTests = [] {
         expect(eq(scheduler.process_stream_to_message_ratio.value, ratioBefore)) << "a refused ratio must leave the setting alone";
     };
 };
-
-int main() { /* tests are statically registered */ }

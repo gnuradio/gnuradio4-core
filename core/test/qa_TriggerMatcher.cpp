@@ -269,5 +269,3 @@ const boost::ut::suite<"BasicTriggerNameCtxMatcher"> triggerTest = [] {
         expect(nothrow([&] { expect(!trigger::BasicTriggerNameCtxMatcher::isSingleTrigger(state)); }));
     };
 };
-
-int main() { /* not needed for UT */ }

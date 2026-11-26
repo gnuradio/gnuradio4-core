@@ -267,5 +267,3 @@ const boost::ut::suite PortApiTests = [] {
     };
 #endif
 };
-
-int main() { /* tests are statically executed */ }

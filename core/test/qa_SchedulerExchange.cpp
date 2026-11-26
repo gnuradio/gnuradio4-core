@@ -1209,5 +1209,3 @@ const boost::ut::suite<"scheduler graph exchange"> schedulerExchangeTests = [] {
         expect(qa_exchange::awaitState(scheduler, STOPPED)) << "the scheduler did not stop";
     };
 };
-
-int main() { /* tests are statically registered */ }

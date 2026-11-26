@@ -290,5 +290,3 @@ const boost::ut::suite<"gr::thread_pool global thread limit"> threadLimitTests =
         expect(!dependentRan.load()) << "the refused task never runs";
     });
 };
-
-int main() { /* tests are statically executed */ }

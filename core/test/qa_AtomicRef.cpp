@@ -130,5 +130,3 @@ const suite<"gr::atomic_ref"> _0 = [] {
         expect(eq(a1.load_acquire(), 8UZ));
     };
 };
-
-int main() { /* not needed for UT */ }

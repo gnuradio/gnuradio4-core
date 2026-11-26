@@ -3568,5 +3568,3 @@ const boost::ut::suite<"a value a callback stages during an apply"> callbackStag
         }
     };
 };
-
-int main() { /* not needed by the UT framework */ }

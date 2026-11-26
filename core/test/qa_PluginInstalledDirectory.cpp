@@ -20,5 +20,3 @@ const boost::ut::suite<"PluginInstalledDirectory"> installedDirectoryTests = [] 
         expect(eq(std::filesystem::path(directory).parent_path().filename().string(), std::string("gnuradio-4")));
     };
 };
-
-int main() { /* not needed for UT */ }

@@ -287,5 +287,3 @@ const boost::ut::suite<"simd elementary functions"> simdMathTests = [] {
         expect(eq(gr::meta::pow(2.0, 0.5), std::pow(2.0, 0.5)));
     };
 };
-
-int main() { /* tests are statically registered */ }

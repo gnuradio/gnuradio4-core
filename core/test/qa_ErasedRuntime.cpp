@@ -1554,5 +1554,3 @@ const boost::ut::suite<"native graph adoption"> nativeAdoptionTests = [] {
     };
     "null native graph is refused"_test = [] { expect(throws<std::invalid_argument>([] { std::ignore = RuntimeGraph::adopt({}, {}); })); };
 };
-
-int main() { /* tests are statically registered */ }

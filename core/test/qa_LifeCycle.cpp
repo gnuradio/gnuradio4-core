@@ -370,5 +370,3 @@ const boost::ut::suite StateMachineTest = [] {
         expect(eq(machine.resetCalled, 2)) << "reset() called once";
     };
 };
-
-int main() { /* tests are statically executed */ }

@@ -252,5 +252,3 @@ const boost::ut::suite enumFormatter = [] {
 };
 
 } // namespace gr::meta::test
-
-int main() { /* tests are statically executed */ }

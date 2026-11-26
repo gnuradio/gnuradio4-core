@@ -122,5 +122,3 @@ const boost::ut::suite<"rungraph library"> runGraphLibraryTests = [] {
         expect(second.output.contains("rungraph: the graph ended on its own")) << "the signal to the first call does not stop the second" << second.output;
     };
 };
-
-int main() { /* not needed for UT */ }
