@@ -390,7 +390,7 @@ struct Parser {
     }
 };
 
-/// int64 addition, subtraction or multiplication, or nullopt where the exact result is outside int64
+/// int64 addition, subtraction or multiplication, or nullopt where the exact result is outside int64 or `kind` is none of these
 [[nodiscard]] constexpr std::optional<std::int64_t> checkedArithmetic(Expression::OpKind kind, std::int64_t left, std::int64_t right) noexcept {
     constexpr std::int64_t kMax = std::numeric_limits<std::int64_t>::max();
     constexpr std::int64_t kMin = std::numeric_limits<std::int64_t>::min();
@@ -409,13 +409,21 @@ struct Parser {
         if (left == 0 || right == 0) {
             return std::int64_t{0};
         }
-        const bool overflows = left > 0 ? (right > 0 ? left > kMax / right : right < kMin / left) : (right > 0 ? left < kMin / right : right < kMax / left);
-        if (overflows) {
+        const bool bothPositive = left > 0 && right > 0;
+        const bool bothNegative = left < 0 && right < 0;
+        if (bothPositive && left > kMax / right) {
+            return std::nullopt;
+        }
+        if (bothNegative && left < kMax / right) {
+            return std::nullopt;
+        }
+        // mixed signs: kMin / -1 itself overflows, so kMin is divided by the positive operand only
+        if (!bothPositive && !bothNegative && std::min(left, right) < kMin / std::max(left, right)) {
             return std::nullopt;
         }
         return left * right;
     }
-    default: std::unreachable();
+    default: return std::nullopt;
     }
 }
 
@@ -475,7 +483,9 @@ struct Parser {
                 stack.back() = std::clamp(stack.back(), low, high);
                 break;
             }
-            default: {
+            case Expression::OpKind::add:
+            case Expression::OpKind::subtract:
+            case Expression::OpKind::multiply: {
                 const std::int64_t right = stack.back();
                 stack.pop_back();
                 std::int64_t& left = stack.back();
@@ -487,6 +497,7 @@ struct Parser {
                 left = *result;
                 break;
             }
+            default: return std::unexpected(gr::Error(std::format("recipe_expression_conversion: '{}' holds an operation integer evaluation does not support", detail::printableEcho(expression.source))));
             }
         }
         if (stack.empty()) {
