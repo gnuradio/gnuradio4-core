@@ -15,7 +15,7 @@ Evaluate existing tests for:
 - Numerical stability: NaN, Inf, denormals, precision loss near boundaries
 - All `processOne` / `processBulk` code paths exercised
 - Tag propagation tested (if block reads/writes tags)
-- `settingsChanged` tested (if block implements it)
+- `applySettings` tested (if block implements it)
 - State transitions: start → stop → start, reset cycles
 - Aliasing scenarios: input buffer == output buffer (where applicable)
 - Template instantiation coverage: all supported value types tested

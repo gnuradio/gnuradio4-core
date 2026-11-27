@@ -82,18 +82,22 @@ using gr::testing::moduleFileName;
 struct CountedSource : gr::Block<CountedSource> {
     gr::PortOut<float> out;
 
-    gr::Size_t n_samples_max = 0U;
+    struct Settings {
+        gr::Size_t n_samples_max = 0U;
 
-    GR_MAKE_REFLECTABLE(CountedSource, out, n_samples_max);
+        GR_MAKE_REFLECTABLE(Settings, n_samples_max);
+    } settings;
 
-    gr::Size_t _nProduced = 0U;
+    GR_MAKE_REFLECTABLE(CountedSource, out, settings);
+
+    gr::Size_t nProduced = 0U;
 
     gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
-        const auto nToPublish = std::min(static_cast<gr::Size_t>(outSpan.size()), n_samples_max - _nProduced);
+        const auto nToPublish = std::min(static_cast<gr::Size_t>(outSpan.size()), settings.n_samples_max - nProduced);
         std::ranges::fill_n(outSpan.begin(), static_cast<std::ptrdiff_t>(nToPublish), 1.0f);
         outSpan.publish(nToPublish);
-        _nProduced += nToPublish;
-        return _nProduced == n_samples_max ? gr::work::Status::DONE : gr::work::Status::OK;
+        nProduced += nToPublish;
+        return nProduced == settings.n_samples_max ? gr::work::Status::DONE : gr::work::Status::OK;
     }
 };
 
@@ -214,7 +218,7 @@ const boost::ut::suite<"PluginAbiVersion"> pluginAbiVersionTests = [] {
         const std::expected<void, Error> result = scheduler->runAndWait();
         expect(result.has_value()) << (result.has_value() ? std::string() : result.error().message);
         expect(scheduler->stopAfterDrain(std::chrono::milliseconds(50))) << "a scheduler rebuilt at the host ABI supports the drain entry";
-        expect(eq(source._nProduced, kTerminalCount));
+        expect(eq(source.nProduced, kTerminalCount));
         expect(eq(sink._nReceived, kTerminalCount)) << "the run reached its terminal count";
     };
 

@@ -134,9 +134,9 @@ struct CountingSink : gr::Block<CountingSink<counter>> {
 
 using FirstSink         = CountingSink<&gFirstGraphSamples>;
 using SecondSink        = CountingSink<&gSecondGraphSamples>;
-using TestScheduler     = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>;
-using SerialScheduler   = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>;
-using BlockingScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking>;
+using TestScheduler     = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multi_threaded>;
+using SerialScheduler   = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded>;
+using BlockingScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded_blocking>;
 
 // exposes the handler of a graph replacement by message, to call it from a thread of the test's choosing
 struct GrcProbe : SerialScheduler {
@@ -146,9 +146,9 @@ struct GrcProbe : SerialScheduler {
 
 // a single-threaded scheduler whose customExchange() hook reports that exchange() has passed its state checks and
 // returns only once the test releases it. The test then decides what the scheduler does before the swap continues.
-struct GatedScheduler : gr::scheduler::SchedulerBase<GatedScheduler, gr::scheduler::ExecutionPolicy::singleThreaded> {
-    using gr::scheduler::SchedulerBase<GatedScheduler, gr::scheduler::ExecutionPolicy::singleThreaded>::SchedulerBase;
-    using gr::scheduler::SchedulerBase<GatedScheduler, gr::scheduler::ExecutionPolicy::singleThreaded>::propertyCallbackGraphGRC;
+struct GatedScheduler : gr::scheduler::SchedulerBase<GatedScheduler, gr::scheduler::ExecutionPolicy::single_threaded> {
+    using gr::scheduler::SchedulerBase<GatedScheduler, gr::scheduler::ExecutionPolicy::single_threaded>::SchedulerBase;
+    using gr::scheduler::SchedulerBase<GatedScheduler, gr::scheduler::ExecutionPolicy::single_threaded>::propertyCallbackGraphGRC;
 
     std::atomic<bool>* _exchangeEntered  = nullptr;
     std::atomic<bool>* _exchangeReleased = nullptr;
@@ -348,8 +348,8 @@ enum class PendingAtReset { unread, none, waiting, claimed };
 // a multi-threaded scheduler that reads the pending swap or restart at its first reset. Its job lists are those of a
 // multi-threaded Simple scheduler. The worker that takes the first lifecycle command from msgIn runs
 // _beforeLifecycleCommands once, before it handles the command
-struct PendingExchangeProbe : gr::scheduler::SchedulerBase<PendingExchangeProbe, gr::scheduler::ExecutionPolicy::multiThreaded> {
-    using Base = gr::scheduler::SchedulerBase<PendingExchangeProbe, gr::scheduler::ExecutionPolicy::multiThreaded>;
+struct PendingExchangeProbe : gr::scheduler::SchedulerBase<PendingExchangeProbe, gr::scheduler::ExecutionPolicy::multi_threaded> {
+    using Base = gr::scheduler::SchedulerBase<PendingExchangeProbe, gr::scheduler::ExecutionPolicy::multi_threaded>;
     using Base::Base;
 
     std::atomic<PendingAtReset> _pendingAtFirstReset{PendingAtReset::unread};
@@ -1085,7 +1085,7 @@ const boost::ut::suite<"scheduler graph exchange"> schedulerExchangeTests = [] {
     "a stop request satisfied by STOPPED leaves the next run running"_test = [] {
         qa_exchange::gFirstGraphSamples = 0UZ;
 
-        qa_exchange::SatisfiedStopGate<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler;
+        qa_exchange::SatisfiedStopGate<gr::scheduler::ExecutionPolicy::single_threaded> scheduler;
         expect(scheduler.exchange(qa_exchange::makeFirstGraph()).has_value());
         expect(scheduler.changeStateTo(INITIALISED).has_value());
         std::thread firstRun([&scheduler] { std::ignore = scheduler.changeStateTo(RUNNING); });
@@ -1125,9 +1125,9 @@ const boost::ut::suite<"scheduler graph exchange"> schedulerExchangeTests = [] {
         qa_exchange::gFirstGraphSamples  = 0UZ;
         qa_exchange::gSecondGraphSamples = 0UZ;
 
-        std::atomic<bool>                                                             stopEntered{false};
-        std::atomic<bool>                                                             stopReleased{false};
-        qa_exchange::SatisfiedStopGate<gr::scheduler::ExecutionPolicy::multiThreaded> scheduler;
+        std::atomic<bool>                                                              stopEntered{false};
+        std::atomic<bool>                                                              stopReleased{false};
+        qa_exchange::SatisfiedStopGate<gr::scheduler::ExecutionPolicy::multi_threaded> scheduler;
         {
             gr::Graph flow;
             auto&     source = flow.emplaceBlock<qa_exchange::HeldStopSource>();

@@ -66,7 +66,7 @@ Usage: rungraph --graph <file> [options]
 )"
 #endif
                                     R"(  --scheduler <key>  the registry key of the scheduler that runs the graph;
-                     gr::scheduler::Simple<singleThreaded> without it
+                     gr::scheduler::Simple<single_threaded> without it
   --seconds <s>      stop the graph after <s> seconds; without it the run ends when the graph does
   --show <name>      print the settings of the block named <name> when the run ends; repeatable
   --set, -s <key>=<value>
@@ -101,10 +101,10 @@ lists.)"
                                     R"( A directory named twice is searched once.
 
 rungraph registers core's Simple scheduler under one key per execution policy:
-gr::scheduler::Simple<singleThreaded> runs every block on one thread,
-gr::scheduler::Simple<multiThreaded> spreads the blocks over the threads of the processing pool,
-gr::scheduler::Simple<singleThreadedBlocking> runs on one thread and sleeps while no block
-makes progress, and gr::scheduler::Simple<multiThreadedBlocking> spreads the blocks over the
+gr::scheduler::Simple<single_threaded> runs every block on one thread,
+gr::scheduler::Simple<multi_threaded> spreads the blocks over the threads of the processing pool,
+gr::scheduler::Simple<single_threaded_blocking> runs on one thread and sleeps while no block
+makes progress, and gr::scheduler::Simple<multi_threaded_blocking> spreads the blocks over the
 pool's threads, each of which sleeps while its own blocks make no progress.)"
 #ifdef INTERNAL_ENABLE_BLOCK_PLUGINS
                                     R"( A plugin or a block
@@ -396,7 +396,7 @@ void reportPlugins(const gr::PluginLoader& loader, const std::vector<std::string
 // the time this is called, so a member that moved while the block ran is read as the block left it.
 void showSettings(std::string_view label, const gr::BlockHandle& block) {
     std::vector<std::pair<std::string, std::string>> lines;
-    for (const auto& [key, value] : block.get()) {
+    for (const auto& [key, value] : gr::settings::heldValues(block.get())) {
         lines.emplace_back(std::string(key.begin(), key.end()), std::format("{}", value));
     }
     std::ranges::sort(lines);
@@ -624,7 +624,7 @@ enum class SchedulerProblem { cannotBuild, refusesSettings };
 void reportScheduler(const gr::BlockHandle& scheduler, std::string_view key, const gr::property_map& settings) {
     std::println(stderr, "{}: scheduler {}", kProgram, key);
     for (const auto& [name, _] : settings) {
-        if (const std::optional<gr::pmt::Value> value = scheduler.get(std::string(name.begin(), name.end())); value.has_value()) {
+        if (const std::expected<gr::pmt::Value, gr::settings::Rejected> value = scheduler.get<gr::pmt::Value>(std::string_view(name.data(), name.size())); value.has_value()) {
             std::println(stderr, "{}: scheduler setting {} = {}", kProgram, std::string_view(name.data(), name.size()), *value);
         }
     }
@@ -757,8 +757,8 @@ void takeReportedErrors(gr::Runtime& runtime, ReportedErrors& errors) {
 [[nodiscard]] bool expectationsHold(const std::vector<Expectation>& expectations, const std::vector<gr::BlockHandle>& blocks, double tolerance) {
     bool allHold = true;
     for (std::size_t i = 0UZ; i < expectations.size(); ++i) {
-        const Expectation&                  expectation = expectations[i];
-        const std::optional<gr::pmt::Value> received    = blocks[i].get(expectation.key);
+        const Expectation&                                          expectation = expectations[i];
+        const std::expected<gr::pmt::Value, gr::settings::Rejected> received    = blocks[i].get<gr::pmt::Value>(expectation.key);
         if (!received.has_value()) {
             std::println(stderr, "{}: {}.{} is not set, expected {}", kProgram, expectation.block, expectation.key, describe(expectation.value));
             allHold = false;
@@ -783,7 +783,7 @@ void takeReportedErrors(gr::Runtime& runtime, ReportedErrors& errors) {
     }
     bool allHeld = true;
     for (std::size_t i = 0UZ; i < expectations.size(); ++i) {
-        if (!(*blocks)[i].get(expectations[i].key).has_value()) {
+        if (!(*blocks)[i].get<gr::pmt::Value>(expectations[i].key).has_value()) {
             std::println(stderr, "{}: --expect names the setting '{}' of block '{}', and the block holds no setting of that name", kProgram, expectations[i].key, expectations[i].block);
             allHeld = false;
         }
@@ -887,11 +887,8 @@ int runGraph(int argc, const char* const* argv) {
         std::println(stderr, "{}: the scheduler {} could not be built: {}", kProgram, options.scheduler, runtime.error().message);
         return 2;
     }
-    if (const std::expected<void, gr::RuntimeError> started = runtime->start(); !started.has_value()) {
-        const std::string reason = withoutLocation(started.error().message, started.error().where);
-        std::println(stderr, "{}: the graph stopped: {}", kProgram, reason);
-        return failedRunStatus(options.expectedErrors, {reason});
-    }
+    // a start that leaves the graph not running ends the run; the run's result below reports the reason
+    std::ignore = runtime->start();
 
     const auto     start        = std::chrono::steady_clock::now();
     const auto     boundReached = [&options, start] { return options.seconds > 0.0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >= options.seconds; };

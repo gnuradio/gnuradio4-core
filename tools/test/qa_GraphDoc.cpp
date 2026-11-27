@@ -210,7 +210,7 @@ struct Refusal {
 /// resolves, each with the sentence the tool gives for it and the text the importer refuses it with.
 /// The importer finds two absent keys by a lookup that throws std::out_of_range, with the message
 /// of a standard library container.
-constexpr std::array<Refusal, 25> kRefusals{{
+constexpr std::array<Refusal, 22> kRefusals{{
     {"no_id.yaml", "blocks:\n  - parameters:\n      name: source\n", "Missing field id in YAML object", "Missing field id in YAML object"},
     {"id_not_a_string.yaml", "blocks:\n  - id: 42\n    parameters:\n      name: source\n", "Field id in YAML object has an incorrect type", "Field id in YAML object"},
     {"no_parameters.yaml", "blocks:\n  - id: qa::Scale\n", "Missing field parameters in YAML object", "Missing field parameters in YAML object"},
@@ -224,9 +224,6 @@ constexpr std::array<Refusal, 25> kRefusals{{
     {"exported_port_of_three.yaml", "blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: inner\n    graph:\n      blocks:\n        - id: qa::Scale\n          parameters:\n            name: gain\n      exported_ports:\n        - [gain, INPUT, in]\n", "Unable to parse exported port (3 instead of 4 elements)", "Unable to parse exported port (3 instead of 4 elements)"},
     {"exported_port_field.yaml", "blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: inner\n    graph:\n      blocks:\n        - id: qa::Scale\n          parameters:\n            name: gain\n      exported_ports:\n        - [gain, INPUT, in, 4]\n", "Required fields for exported ports missing", "Required fields for exported ports missing"},
     {"exported_port_block.yaml", "blocks:\n  - id: SUBGRAPH\n    parameters:\n      name: inner\n    graph:\n      blocks:\n        - id: qa::Scale\n          parameters:\n            name: gain\n      exported_ports:\n        - [nothere, INPUT, in, in]\n", "exported_ports[0] names block 'nothere': no block of its level carries that name", "Unknown block 'nothere'"},
-    {"contexts_not_a_list.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\n    ctx_parameters: 5\n", "Unable to create block 'gain' of type 'qa::Scale': ctx_parameters is not a list", "ctx_parameters is not a list"},
-    {"context_not_a_map.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\n    ctx_parameters:\n      - fast\n", "a ctx_parameters entry is not a map", "a ctx_parameters entry is not a map"},
-    {"context_without_time.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\n    ctx_parameters:\n      - context: fast\n        parameters:\n          buffer_size: 512\n", "a ctx_parameters entry needs a context, a context_time and a parameters map", ""},
     {"connection_not_a_list.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\nconnections: [42]\n", "Unable to parse connection (not a list)", "Unable to parse connection (not a list)"},
     {"connection_of_three.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\nconnections:\n  - [gain, out, gain]\n", "Unable to parse connection (3 instead of >=4 elements)", "Unable to parse connection (3 instead of >=4 elements)"},
     {"connection_block_field.yaml", "blocks:\n  - id: qa::Scale\n    parameters:\n      name: gain\nconnections:\n  - [7, out, gain, in]\n", "Invalid blockField", "Invalid blockField"},
@@ -273,12 +270,6 @@ blocks:
         depth: leaf_value
     meta_information:
       role: origin
-    ctx_parameters:
-      - context: fast
-        time: !!uint64 3
-        parameters:
-          buffer_size: 512
-        note: context_extra
     layout_hint: top-left
   - id: SUBGRAPH
     block_category: ScheduledBlockGroup
@@ -303,7 +294,7 @@ connections:
 )";
 
 /// every scalar the file above carries, each of which the document has to hold
-constexpr std::array<std::string_view, 22> kEveryKeyScalars{"Keys fixture", "7", "source_1", "NormalBlock", "source", "64", "leaf_value", "origin", "fast", "3", "512", "context_extra", "top-left", "ScheduledBlockGroup", "front_end", "gr::scheduler::Simple", "workers", "cpu_two", "nested_metadata", "gain", "4096", "extra_element"};
+constexpr std::array<std::string_view, 18> kEveryKeyScalars{"Keys fixture", "7", "source_1", "NormalBlock", "source", "64", "leaf_value", "origin", "top-left", "ScheduledBlockGroup", "front_end", "gr::scheduler::Simple", "workers", "cpu_two", "nested_metadata", "gain", "4096", "extra_element"};
 
 /// every block name and type, and both ends of every connection, at every level of the fixture
 constexpr std::array<std::string_view, 7> kBlockNames{"source", "front_end", "sink", "pre_gain", "inner_chain", "fine_gain", "combiner"};
@@ -338,7 +329,6 @@ const boost::ut::suite<"GraphDoc"> graphDocTests = [] {
             expect(document.find(endpoint) != std::string::npos) << std::format("connection endpoint '{}' is missing from the document", endpoint);
         }
         expect(document.find("4096") != std::string::npos) << "the minimum buffer size of the second connection is missing";
-        expect(document.find("\\[context fast @ 0\\]") != std::string::npos) << "the context parameters of the sink are missing";
     };
 
     "each subgraph has its own section, exported ports and diagram"_test = [] {
@@ -710,7 +700,6 @@ const boost::ut::suite<"GraphDoc"> graphDocTests = [] {
         expect(markdown.find("| thread_pool | \"workers\" |") != std::string::npos) << "the parameters of the scheduler that manages a subgraph" << markdown;
         expect(markdown.find("| inner_note | \"nested_metadata\" |") != std::string::npos) << "the definition metadata of a nested level" << markdown;
         expect(markdown.find("| scheduler.affinity |") != std::string::npos) << "a key of the scheduler map nothing renders" << markdown;
-        expect(markdown.find("| ctx_parameters\\[0\\].note |") != std::string::npos) << "a key of a context entry nothing renders" << markdown;
         expect(markdown.find("| connections\\[0\\]\\[5\\] |") != std::string::npos) << "a connection element past the buffer size" << markdown;
     };
 

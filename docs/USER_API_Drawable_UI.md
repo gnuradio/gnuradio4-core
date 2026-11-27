@@ -27,29 +27,33 @@ This enables blocks to render visualizations, controls, and status information w
 template<typename T>
 requires std::is_arithmetic_v<T>
 struct PlotSink : gr::Block<PlotSink<T>, gr::Drawable<gr::UICategory::Content, "ImGui">> {
-    template<typename U, gr::meta::fixed_string description = "", typename... Args>
-    using A = gr::Annotated<U, description, Args...>;
+    template<typename U, typename... Args>
+    using A = gr::Annotated<U, Args...>;
 
     gr::PortIn<T> in;
 
-    A<gr::Size_t, "history length", gr::Doc<"samples retained in ring buffer">> n_history = 1000UZ;
+    struct Settings {
+        A<gr::Size_t, gr::Doc<"samples retained in ring buffer">> n_history = 1000UZ;
 
-    GR_MAKE_REFLECTABLE(PlotSink, in, n_history);
+        GR_MAKE_REFLECTABLE(Settings, n_history);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(PlotSink, in, settings);
 
     mutable std::mutex  _drawMutex; // guards _history between process*() and draw()
     std::vector<T>      _history;
 
-    void settingsChanged(const gr::property_map& /*oldSettings*/, gr::property_map& newSettings) {
-        if (newSettings.contains("n_history")) {
+    void applySettings(const Settings& s, const Settings& old) {
+        if (s.n_history != old.n_history) {
             std::lock_guard lock(_drawMutex);
-            _history.reserve(n_history);
+            _history.reserve(s.n_history);
         }
     }
 
     constexpr void processOne(T sample) noexcept {
         std::lock_guard lock(_drawMutex);
         _history.push_back(sample);
-        if (_history.size() > n_history) {
+        if (_history.size() > settings.n_history) {
             _history.erase(_history.begin());
         }
     }
@@ -68,15 +72,15 @@ struct PlotSink : gr::Block<PlotSink<T>, gr::Drawable<gr::UICategory::Content, "
 template<typename T>
 requires std::is_arithmetic_v<T>
 struct SliderControl : gr::Block<SliderControl<T>, gr::Drawable<gr::UICategory::Toolbar, "ImGui">> {
-    template<typename U, gr::meta::fixed_string description = "", typename... Args>
-    using A = gr::Annotated<U, description, Args...>;
+    template<typename U, typename... Args>
+    using A = gr::Annotated<U, Args...>;
 
     gr::PortOut<gr::property_map, gr::Async> out;
 
-    A<std::string, "target key", gr::Doc<"settings key to emit (e.g. 'sample_rate', 'gain')">> target_key = "gain";
-    A<T, "value">     value     = T{0.5};
-    A<T, "min value"> min_value = T{0};
-    A<T, "max value"> max_value = T{1};
+    A<std::string, gr::Doc<"settings key to emit (e.g. 'sample_rate', 'gain')">> target_key = "gain";
+    A<T>     value     = T{0.5};
+    A<T> min_value = T{0};
+    A<T> max_value = T{1};
 
     GR_MAKE_REFLECTABLE(SliderControl, out, target_key, value, min_value, max_value);
 
@@ -194,28 +198,8 @@ gr::work::Status draw(const gr::property_map& config = {}) noexcept;
 
 ### Optional: Layout Hints via `ui_constraints`
 
-Blocks can store toolkit-specific layout preferences in the `ui_constraints` property:
-
-```cpp
-struct SettingsPanel : gr::Block<SettingsPanel, gr::Drawable<gr::UICategory::Panel, "ImGui">> {
-    // inherited from Block<>: A<property_map, "ui-constraints"> ui_constraints;
-
-    GR_MAKE_REFLECTABLE(SettingsPanel);
-
-    void start() {
-        ui_constraints.value = {
-            {"preferred_width", 300},
-            {"preferred_height", 200},
-            {"dockable", true}
-        };
-    }
-
-    gr::work::Status draw(const gr::property_map& /*config*/ = {}) noexcept {
-        renderSettingsPanel(); // toolkit-specific
-        return gr::work::Status::OK;
-    }
-};
-```
+A host stores the hints with `block.set("ui_constraints", gr::property_map{{"preferred_width", 300}})`, or a graph file
+gives them; the block and the toolkit read them from `ui_constraints`.
 
 Interpretation of these hints is entirely toolkit-specific.
 
@@ -345,23 +329,27 @@ The `config` parameter in `draw(const property_map& config)` follows a similar p
 template<typename T>
 requires std::is_arithmetic_v<T>
 struct ChartMonitor : gr::Block<ChartMonitor<T>, gr::Drawable<gr::UICategory::Content, "console">> {
-    template<typename U, gr::meta::fixed_string description = "", typename... Args>
-    using A = gr::Annotated<U, description, Args...>;
+    template<typename U, typename... Args>
+    using A = gr::Annotated<U, Args...>;
 
     gr::PortIn<T> in;
 
-    A<gr::Size_t, "history length", gr::Doc<"samples in ring buffer">> n_history  = 1000UZ;
-    A<bool, "reset view", gr::Doc<"trigger view reset on next draw">>  reset_view = false;
+    struct Settings {
+        A<gr::Size_t, gr::Doc<"samples in ring buffer">> n_history  = 1000UZ;
+        A<bool, gr::Doc<"trigger view reset on next draw">>  reset_view = false;
 
-    GR_MAKE_REFLECTABLE(ChartMonitor, in, n_history, reset_view);
+        GR_MAKE_REFLECTABLE(Settings, n_history, reset_view);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(ChartMonitor, in, settings);
 
     mutable std::mutex _drawMutex;
     std::vector<T>     _history;
 
-    void settingsChanged(const gr::property_map& /*oldSettings*/, gr::property_map& newSettings) {
-        if (newSettings.contains("n_history")) {
+    void applySettings(const Settings& s, const Settings& old) {
+        if (s.n_history != old.n_history) {
             std::lock_guard lock(_drawMutex);
-            _history.reserve(n_history);
+            _history.reserve(s.n_history);
         }
     }
 
@@ -389,15 +377,15 @@ template<typename T>
 requires std::is_arithmetic_v<T>
 struct ParameterSlider : gr::Block<ParameterSlider<T>,
                                    gr::Drawable<gr::UICategory::Toolbar, "console">> {
-    template<typename U, gr::meta::fixed_string description = "", typename... Args>
-    using A = gr::Annotated<U, description, Args...>;
+    template<typename U, typename... Args>
+    using A = gr::Annotated<U, Args...>;
 
     MsgPortOut out;
 
-    A<std::string, "target key", gr::Doc<"settings key to emit">> target_key = "gain";
-    A<T, "value">                                                  value     = T{1};
-    A<T, "min value">                                              min_value = T{0};
-    A<T, "max value">                                              max_value = T{10};
+    A<std::string, gr::Doc<"settings key to emit">> target_key = "gain";
+    A<T>                                                  value     = T{1};
+    A<T>                                              min_value = T{0};
+    A<T>                                              max_value = T{10};
 
     GR_MAKE_REFLECTABLE(ParameterSlider, out, target_key, value, min_value, max_value);
 

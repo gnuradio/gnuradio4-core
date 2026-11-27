@@ -11,11 +11,16 @@ template<typename T>
 struct Scale : public gr::Block<Scale<T>> {
     gr::PortIn<T>  in;
     gr::PortOut<T> out;
-    T              factor = T{1};
 
-    GR_MAKE_REFLECTABLE(Scale, in, out, factor);
+    struct Settings {
+        T factor = T{1};
 
-    constexpr T processOne(T value) const noexcept { return value * factor; }
+        GR_MAKE_REFLECTABLE(Settings, factor);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(Scale, in, out, settings);
+
+    constexpr T processOne(T value) const noexcept { return value * settings.factor; }
 };
 
 } // namespace gr::named_registry_blocklib

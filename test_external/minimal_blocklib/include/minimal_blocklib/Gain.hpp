@@ -11,11 +11,16 @@ template<typename T>
 struct Gain : public gr::Block<Gain<T>> {
     gr::PortIn<T>  in;
     gr::PortOut<T> out;
-    T              gain = T{1};
 
-    GR_MAKE_REFLECTABLE(Gain, in, out, gain);
+    struct Settings {
+        T gain = T{1};
 
-    constexpr T processOne(T value) const noexcept { return value * gain; }
+        GR_MAKE_REFLECTABLE(Settings, gain);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(Gain, in, out, settings);
+
+    constexpr T processOne(T value) const noexcept { return value * settings.gain; }
 };
 
 } // namespace gr::minimal_blocklib

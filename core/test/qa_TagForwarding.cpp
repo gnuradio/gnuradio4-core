@@ -9,6 +9,7 @@
 #include <ranges>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <gnuradio-4.0/Graph.hpp>
@@ -442,17 +443,21 @@ struct MappedForwarder : Block<MappedForwarder, Resampling<kDecim, 1U, true>> {
     PortIn<float>  in;
     PortOut<float> out;
 
-    float sample_rate = 1000.f;
+    struct Settings {
+        float sample_rate = 1000.f;
 
-    GR_MAKE_REFLECTABLE(MappedForwarder, in, out, sample_rate);
+        GR_MAKE_REFLECTABLE(Settings, sample_rate);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(MappedForwarder, in, out, settings);
 
     bool        skipDeferred = true; // the resampler's guard: ignore what an earlier chunk already handled
     std::size_t nDeferred    = 0UZ;
     std::size_t nPublished   = 0UZ;
-    std::size_t retuneAfter  = 0UZ; // output samples after which the block stages a new sample_rate, 0 = never
+    std::size_t retuneAfter  = 0UZ; // output samples after which a host sets a new sample_rate, 0 = never
     float       retuneTo     = 2000.f;
 
-    std::size_t _produced = 0UZ;
+    std::size_t produced = 0UZ;
 
     template<typename TInputSpans, typename TOutputSpans>
     void forwardTags(TInputSpans& inputSpans, TOutputSpans& outputSpans, std::size_t processedIn) {
@@ -490,29 +495,39 @@ struct MappedForwarder : Block<MappedForwarder, Resampling<kDecim, 1U, true>> {
         }
         std::ignore = inSpan.consume(n * kDecim);
         outSpan.publish(n);
-        _produced += n;
-        if (retuneAfter > 0UZ && _produced >= retuneAfter && sample_rate != retuneTo) {
-            std::ignore = settings().setStaged(property_map{{"sample_rate", retuneTo}});
+        produced += n;
+        if (retuneAfter > 0UZ && produced >= retuneAfter && settings.sample_rate != retuneTo) {
+            setFromHost(retuneTo);
         }
         return work::Status::OK;
     }
 
-    void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings, property_map& forwardSettings) {
-        if (newSettings.contains("sample_rate")) {
-            forwardSettings.insert_or_assign(std::pmr::string(gr::tag::SAMPLE_RATE.key()), sample_rate);
+    // a host's call, made on another thread and finished before the work call goes on: the block's own thread refuses it
+    void setFromHost(float rate) {
+        std::thread host([this, rate] { std::ignore = this->set(property_map{{"sample_rate", rate}}, gr::settings::noWait); });
+        host.join();
+    }
+
+    void applySettings(const Settings& s, const Settings& old) {
+        if (s.sample_rate != old.sample_rate) {
+            this->forwardTag(gr::tag::SAMPLE_RATE.key(), s.sample_rate);
         }
     }
 };
 
-/// stages a setting inside its own work call and stops. The framework applies it while it still holds the output
+/// has a host set a setting during its own work call, and stops. The framework applies it while it still holds the output
 /// span, and the block's forward map carries the new rate under gr:sample_rate.
 struct StageAndStop : Block<StageAndStop> {
     PortIn<float>  in;
     PortOut<float> out;
 
-    float sample_rate = 1000.f;
+    struct Settings {
+        float sample_rate = 1000.f;
 
-    GR_MAKE_REFLECTABLE(StageAndStop, in, out, sample_rate);
+        GR_MAKE_REFLECTABLE(Settings, sample_rate);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(StageAndStop, in, out, settings);
 
     std::size_t stopAfter  = 2UZ * kChunk;
     float       retuneTo   = 2000.f;
@@ -526,16 +541,22 @@ struct StageAndStop : Block<StageAndStop> {
         outSpan.publish(n);
         produced += n;
         if (produced >= stopAfter) {
-            lastWindow  = n;
-            std::ignore = settings().setStaged(property_map{{"sample_rate", retuneTo}});
+            lastWindow = n;
+            setFromHost(retuneTo);
             this->requestStop();
         }
         return work::Status::OK;
     }
 
-    void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings, property_map& forwardSettings) {
-        if (newSettings.contains("sample_rate")) {
-            forwardSettings.insert_or_assign(std::pmr::string(gr::tag::SAMPLE_RATE.key()), sample_rate);
+    // as MappedForwarder::setFromHost()
+    void setFromHost(float rate) {
+        std::thread host([this, rate] { std::ignore = this->set(property_map{{"sample_rate", rate}}, gr::settings::noWait); });
+        host.join();
+    }
+
+    void applySettings(const Settings& s, const Settings& old) {
+        if (s.sample_rate != old.sample_rate) {
+            this->forwardTag(gr::tag::SAMPLE_RATE.key(), s.sample_rate);
         }
     }
 };
@@ -559,7 +580,7 @@ void runChain(const std::vector<std::size_t>& tagAt, TInspect&& inspect, auto&& 
     expect(flow.connect<"out", "in">(source, middle).has_value());
     expect(flow.connect<"out", "in">(middle, sink).has_value());
 
-    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler{};
     expect(scheduler.exchange(std::move(flow)).has_value());
     expect(scheduler.runAndWait().has_value());
 
@@ -594,7 +615,7 @@ template<typename... TMiddle>
     auto       chain = std::apply([&](auto&... blocks) { return std::tie(source, blocks..., sink); }, middle);
     [&]<std::size_t... I>(std::index_sequence<I...>) { (link(std::get<I>(chain), std::get<I + 1UZ>(chain)), ...); }(std::make_index_sequence<sizeof...(TMiddle) + 1UZ>{});
 
-    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler{};
     expect(scheduler.exchange(std::move(flow)).has_value());
     expect(scheduler.runAndWait().has_value());
 
@@ -686,7 +707,7 @@ const boost::ut::suite<"tag forwarding"> _tagForwarding = [] {
         expect(flow.connect<"out", "in">(source, middle).has_value());
         expect(flow.connect<"out", "in">(middle, sink).has_value());
 
-        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler{};
         expect(scheduler.exchange(std::move(flow)).has_value());
         expect(scheduler.runAndWait().has_value());
 
@@ -706,7 +727,7 @@ const boost::ut::suite<"tag forwarding"> _tagForwarding = [] {
         expect(flow.connect<"out", "in">(source, middle).has_value());
         expect(flow.connect<"out", "in">(middle, sink).has_value());
 
-        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler{};
         expect(scheduler.exchange(std::move(flow)).has_value());
         expect(scheduler.runAndWait().has_value());
 
@@ -776,7 +797,7 @@ const boost::ut::suite<"tag forwarding"> _tagForwarding = [] {
             });
     };
 
-    "a block that stages a setting and stops forwards it through its open output span"_test = [] {
+    "a block a host sets during its work call, and that stops, forwards the setting through its open output span"_test = [] {
         gr::Graph flow;
         auto&     source      = flow.emplaceBlock<Source>(gr::property_map{{"name", std::string("src")}});
         auto&     middle      = flow.emplaceBlock<StageAndStop>(gr::property_map{{"name", std::string("mid")}});
@@ -785,7 +806,7 @@ const boost::ut::suite<"tag forwarding"> _tagForwarding = [] {
         expect(flow.connect<"out", "in">(source, middle).has_value());
         expect(flow.connect<"out", "in">(middle, sink).has_value());
 
-        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler{};
         expect(scheduler.exchange(std::move(flow)).has_value());
         expect(scheduler.runAndWait().has_value());
 
@@ -905,7 +926,7 @@ const boost::ut::suite<"tag forwarding"> _tagForwarding = [] {
         expect(flow.connect<"out", "in1">(longSource, add).has_value());
         expect(flow.connect<"out", "in">(add, sink).has_value());
 
-        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler{};
         expect(scheduler.exchange(std::move(flow)).has_value());
         expect(scheduler.runAndWait().has_value());
 

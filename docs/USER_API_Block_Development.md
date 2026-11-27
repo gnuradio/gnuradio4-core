@@ -6,8 +6,9 @@ library code lives in `gnuradio4-library`. Use those downstream repositories for
 full production block examples.
 
 GR4 blocks are `struct`s that inherit from `gr::Block<Derived>` via CRTP.
-Settings are (optionally) declared as `Annotated<T, "name", ...>` fields and exposed
-through compile-time reflection via `GR_MAKE_REFLECTABLE`. Blocks implement exactly one
+A block declares its settings in a nested `struct Settings`, whose members are often
+`Annotated<T, ...>` fields, and exposes them through compile-time reflection via
+`GR_MAKE_REFLECTABLE`. Blocks implement exactly one
 processing function — `processOne` (per-sample), `processBulk` (span-based), or `work(..)` (advanced, from scratch).
 
 Focus on **your algorithm** — the framework handles scheduling, buffer management, tag
@@ -35,15 +36,19 @@ struct Gain : gr::Block<Gain<T>> {
     gr::PortIn<T>  in;
     gr::PortOut<T> out;
 
-    gr::Annotated<float, "gain", gr::Doc<"linear gain">, gr::Unit<"dB">> gain = 1.0f;
+    struct Settings {
+        gr::Annotated<float, gr::Doc<"linear gain">> gain = 1.0f;
 
-    GR_MAKE_REFLECTABLE(Gain, in, out, gain);
+        GR_MAKE_REFLECTABLE(Settings, gain);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(Gain, in, out, settings);
 
     // t_or_simd<T> accepts both scalar T and SIMD vector types — the framework
     // automatically vectorises processOne calls when the method is const & noexcept
     template<gr::meta::t_or_simd<T> V>
     [[nodiscard]] constexpr V processOne(const V& a) const noexcept {
-        return a * static_cast<T>(gain);
+        return a * static_cast<T>(settings.gain);
     }
 };
 
@@ -65,18 +70,28 @@ struct MyBlock : gr::Block<MyBlock<T>> {
     gr::PortIn<T>  in;
     gr::PortOut<T> out;
 
-    // 3. settings & public fields
-    gr::Annotated<float, "sample_rate", gr::Doc<"signal sample rate">, gr::Unit<"Hz">> sample_rate = 1.f;
+    // 3. settings, the values the block reports, & public fields
+    struct Settings {
+        gr::Annotated<float, gr::Doc<"signal sample rate">, gr::Unit<"Hz">> sample_rate = 1.f;
+
+        GR_MAKE_REFLECTABLE(Settings, sample_rate);
+    } settings;
+
+    struct Status {
+        gr::Size_t overflows = 0U;
+
+        GR_MAKE_REFLECTABLE(Status, overflows);
+    } status;
 
     // 4. GR_MAKE_REFLECTABLE
-    GR_MAKE_REFLECTABLE(MyBlock, in, out, sample_rate);
+    GR_MAKE_REFLECTABLE(MyBlock, in, out, settings, status);
 
     // 5. private state (prefixed _)
     float _cachedCoeff = 0.f;
 
     // 6. lifecycle methods: start(), stop(), reset(), pause(), resume()
     // 7. processing: processOne() XOR processBulk()
-    // 8. settingsChanged(...)
+    // 8. checkSettings(const Settings& s) const, applySettings(Settings& s) or applySettings(Settings& s, const Settings& old)
     // 9. helper methods
 };
 ```
@@ -85,7 +100,7 @@ struct MyBlock : gr::Block<MyBlock<T>> {
 > constructor that initialises the CRTP chain, reflection metadata, settings pipeline,
 > and port buffers. Custom constructors bypass this and break settings deserialisation,
 > `property_map` initialisation (via `emplaceBlock<T>({...})`), and lifecycle contracts.
-> Use default field initialisers for state, and `settingsChanged()` or `start()` for
+> Use default member values for state, and `applySettings()` or `start()` for
 > derived initialisation logic.
 
 ## Ports
@@ -99,17 +114,23 @@ gr::PortOut<float> out;      // single output
 
 ### Dynamic ports
 
-Resize in `settingsChanged` when the count setting changes:
+Declare the count setting `PortCountFor` the collection, and resize the collection in
+`applySettings` when the count changed. Such a setting changes only while the graph is stopped,
+and never removes a connected port:
 
 ```cpp
 std::vector<gr::PortIn<T, gr::Async>>  inputs{};
 std::vector<gr::PortOut<T, gr::Async>> outputs{};
 
-gr::Annotated<gr::Size_t, "n_inputs", gr::Visible, gr::Limits<1U, 32U>> n_inputs = 2U;
+struct Settings {
+    gr::Annotated<gr::Size_t, gr::Visible, gr::Limits<gr::Min<1U>, gr::Max<32U>>, gr::PortCountFor<"inputs">> n_inputs = 2U;
 
-void settingsChanged(const gr::property_map& /*old*/, const gr::property_map& newSettings) {
-    if (newSettings.contains("n_inputs")) {
-        inputs.resize(n_inputs);
+    GR_MAKE_REFLECTABLE(Settings, n_inputs);
+} settings;
+
+void applySettings(const Settings& s) {
+    if (s.n_inputs.changed()) {
+        inputs.resize(s.n_inputs);
     }
 }
 ```
@@ -134,41 +155,57 @@ Downstream examples: dynamic-port and hardware-backed blocks in `gnuradio4-block
 
 ## Settings & `Annotated<T, ...>`
 
-### Plain fields vs. `Annotated<T, ...>`
+### The two structs
 
-Any reflected field (listed in `GR_MAKE_REFLECTABLE`) is a setting — `Annotated<>` is
-optional but recommended:
+A block declares each setting of its own as a member of its nested `struct Settings`, and each
+value it reports as a member of its nested `struct Status`. Both list their members in their
+own `GR_MAKE_REFLECTABLE`, and the block lists one member of each type in its. Core finds the two
+members by their types; the examples here name them `settings` and `status`:
 
 ```cpp
-// plain field — works, but no metadata for UIs, documentation generators, or unit validation
-float sample_rate = 48000.f;
+struct Settings {
+    float                                                                    gain_db     = 0.f;
+    gr::Annotated<float, gr::Unit<"Hz">, gr::Limits<gr::Over<0.f>>> sample_rate = 48000.f;
 
-// annotated — carries description, unit, visibility, and value-range limits
-gr::Annotated<float, "sample_rate", gr::Doc<"signal sample rate">, gr::Unit<"Hz">,
-              gr::Visible, gr::Limits<1.f, 1e9f>> sample_rate = 48000.f;
+    GR_MAKE_REFLECTABLE(Settings, gain_db, sample_rate);
+} settings;
+
+struct Status {
+    float      current_gain_db = 0.f;
+    gr::Size_t overflows       = 0U;
+
+    GR_MAKE_REFLECTABLE(Status, current_gain_db, overflows);
+} status;
+
+GR_MAKE_REFLECTABLE(MyBlock, in, out, settings, status);
 ```
 
-Use `Annotated<>` when a setting should appear in auto-generated runtime documentation,
-UI settings panels, or when you want automatic quantity/unit annotation and range validation.
-Plain fields suffice for internal parameters that are not user-facing.
+A host names each member by its own name, `gain_db` or `overflows`; the structs add no prefix. The
+compiler refuses a name that both structs hold, and a block that declares a setting as a direct
+member of its own. A block without settings declares no `Settings`.
+
+A plain member works; `Annotated<>` adds a description, a unit, visibility and limits. Use it
+when a setting appears in generated documentation or a settings panel, or when its value has limits.
 
 ### Full syntax
 
 ```cpp
-gr::Annotated<T, "snake_case_name", Doc<"...">, Unit<"[V]">, Visible, Limits<min, max>>
+gr::Annotated<T, Doc<"...">, Unit<"[V]">, Visible, Limits<Min<lo>, Under<hi>>>
 ```
 
-| Annotation         | Purpose                                         |
-| ------------------ | ----------------------------------------------- |
-| `Doc<"...">`       | human-readable description                      |
-| `Unit<"[V]">`      | physical SI unit (ISO 80000-1:2022)             |
-| `Visible`          | show in UI settings panels                      |
-| `Limits<min, max>` | value range validation (compile-time constants) |
+The variable's name is the setting's name: `Annotated` takes no name string, and every argument after `T` is a type.
+
+| Annotation    | Purpose                                                           |
+| ------------- | ----------------------------------------------------------------- |
+| `Doc<"...">`  | human-readable description                                        |
+| `Unit<"[V]">` | physical SI unit (ISO 80000-1:2022)                               |
+| `Visible`     | show in UI settings panels                                        |
+| `Limits<...>` | the predicates a number must pass (see "Limits and enumerations") |
 
 A block declares no tag that sets a setting, and the framework infers nothing from a setting's name.
 The application or the graph couples a setting to a tag key per block instance, with
-`settings().setTagCouplings()`, a graph file's `tag_couplings` or a `TagCouplings` message. A block
-that hands a value downstream writes it into the forward map of `settingsChanged()`. The tag mechanics
+`block.setTagCouplings()` or a graph file's `tag_couplings`. A block
+that hands a value downstream names it with `this->forwardTag(key, value)` in `applySettings()`. The tag mechanics
 document (`USER_API_Tag_mechanics.md`) gives the full rules.
 
 ### Shorthand alias
@@ -176,17 +213,26 @@ document (`USER_API_Tag_mechanics.md`) gives the full rules.
 Blocks with many settings often define a local alias:
 
 ```cpp
-template<typename U, gr::meta::fixed_string description = "", typename... Arguments>
-using A = gr::Annotated<U, description, Arguments...>;
+template<typename U, typename... Arguments>
+using A = gr::Annotated<U, Arguments...>;
 
-A<gr::Size_t, "n_inputs", gr::Visible, gr::Limits<1U, 32U>> n_inputs = 0U;
+struct Settings {
+    A<gr::Size_t, gr::Visible, gr::Limits<gr::Min<1U>, gr::Max<32U>>> n_inputs = 1U;
+
+    GR_MAKE_REFLECTABLE(Settings, n_inputs);
+} settings;
 ```
 
 ### Supported types
 
 Scalars (`float`, `double`, `int`, ...), `std::string`, enums, `std::vector<T>`,
-`std::array<T, N>`, `gr::Tensor<T>`, and `std::complex<T>`. The
+`std::array<T, N>`, `gr::Tensor<T>`, `std::complex<T>` and `gr::property_map`. The
 `gnuradio4-library` package additionally provides `gr::UncertainValue<T>`.
+
+A `gr::property_map` setting holds values by names the block learns at run time, such as the gain
+stages a device names when it opens. It is one value: a `set()` gives the whole map, and a change of
+one entry moves the key. `Limits` do not apply to it; the block's `checkSettings` refuses an entry,
+naming the key.
 
 ### When to use `std::vector<T>` vs. `std::array<T, N>` vs. `gr::Tensor<T>`
 
@@ -201,11 +247,17 @@ For simple 1D settings, prefer `std::vector<T>` (runtime-sized) or `std::array<T
 
 ### `GR_MAKE_REFLECTABLE`
 
-Lists the block type followed by **all** reflected members (ports and settings).
+Lists the block type followed by **all** reflected members: the ports and the members of types
+`Settings` and `Status`.
 The macro enables compile-time reflection, serialisation, and the settings pipeline.
+`gr::Block` adds its own settings `input_chunk_size`, `output_chunk_size`, `stride`, `disconnect_on_done`,
+`compute_domain`, `name`, `ui_constraints` and the read-only `unique_name`. These names are reserved: a block
+that declares a member of one of them fails to compile, whether or not the base's setting can be written.
+`notification_level` is a scheduler's: a block that declares it fails its initialization, so a graph
+refuses to add it.
 
 ```cpp
-GR_MAKE_REFLECTABLE(MyBlock, in, out, sample_rate, threshold);
+GR_MAKE_REFLECTABLE(MyBlock, in, out, settings, status);
 ```
 
 ### `property_map` wire format
@@ -219,17 +271,210 @@ the `snake_case` setting name and values are `pmt::Value`.
 
 Downstream examples: richly annotated hardware and oscillator blocks in `gnuradio4-blocks`.
 
+### Per-setting annotations
+
+Further `Annotated<>` arguments declare how the settings treat a member:
+
+| Annotation                          | Effect                                                                                                                                                                       |
+| ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `StoppedOnly`                       | a change is refused while the graph runs or is paused                                                                                                                        |
+| `PortCountFor<"inputs", "outputs">` | the count of the named dynamic port collections; the block resizes them in `applySettings()`; refused while the graph runs or is paused, or when it removes a connected port |
+
+```cpp
+gr::Annotated<gr::Size_t, gr::PortCountFor<"inputs">> n_inputs = 2U;
+gr::Annotated<std::string, gr::StoppedOnly>           serial;
+```
+
+The compiler refuses `PortCountFor` on a non-integer member, a name that is no dynamic port collection
+of the block, and a collection two members size. A `const` or `gr::meta::immutable<>` member is
+read-only. The block's metadata carries `<key>::type` for every key, and `<key>::update_policy`,
+`::port_count_for`, `::access`, `::minimum` and `::maximum` where they apply. Beside each end,
+`::minimum_excluded` and `::maximum_excluded` say whether it is excluded; `::one_of` holds the
+values of a `OneOf` in the setting's type, and `::limits` the limits as one text, `"> 0 and < 0.5"`,
+which `grinfo` prints.
+
+### Limits and enumerations
+
+A limit on one value is written beside its declaration, as predicates in `Limits`, all of which must
+hold:
+
+```cpp
+gr::Annotated<gr::Size_t, gr::Limits<gr::Min<1U>, gr::Max<64U>>>       taps       = 31U;
+gr::Annotated<float, gr::Limits<gr::Over<0.f>, gr::Under<0.5f>>>     cutoff     = 0.25f;
+gr::Annotated<float, gr::Limits<gr::Over<0.f>, gr::Max<1.f>>>        weight     = 1.f;
+gr::Annotated<gr::Size_t, gr::Limits<gr::Min<1U>>>                   length     = 8U;
+gr::Annotated<gr::Size_t, gr::Limits<gr::OneOf<1U, 2U, 4U>>>     decimation = 2U;
+```
+
+`Min` and `Max` include their value, `Over` and `Under` exclude it, and `OneOf` holds for a value
+equal to one it lists. A NaN fails every predicate, and a floating-point setting with any predicate
+refuses positive and negative infinity with `"not finite"` and a NaN with `"not a number"`; a setting
+without limits takes all three as sent.
+`Limits` takes these predicates and nothing else. A value outside the ends is refused with the range
+and the value, `"out of range (0, 0.5): 0.7"`, `"out of range [1, inf): 0"`, where a bracket includes
+its end and a parenthesis excludes it, and an end no value of the setting's type can break reads as an
+infinity. A value a `OneOf` does not list is refused with the list and the value, `"not one of: 1, 2, 4: 3"`. A
+declared default outside them holds the block not ready with `"default out of range (0, 0.5): 0.7"`
+until a value inside them is set.
+
+The compiler refuses a list of predicates that is faulty, with one sentence each: a value the
+setting's type cannot hold, two lower or two upper ends, a lower end at or above the upper end (equal ends pass
+when `Min` and `Max` both include it), a `OneOf` with no value or one that repeats a value, and a
+`OneOf` value another predicate excludes. Two numbers or a test function in place of the predicates are
+refused with `"Limits takes predicates alone: Min, Max, Over, Under and OneOf"`. Any other rule on a value, and
+every rule that relates settings, goes into `checkSettings`.
+
+A choice among named options is an `enum class` member. Its enumerators are spelled in lower case
+with underscores, as the standard library spells its own (`std::memory_order::relaxed`):
+`msb_first`. A host, a tag and a graph file send that spelling exactly; core refuses any other name
+with the list and the name, `"not one of: msb_first, lsb_first: msb"`, and returns the enumerator as spelled. The
+block carries no check for it.
+
+A block that takes part of a shared enumeration lists the enumerators it takes in `OneOf`:
+
+```cpp
+gr::Annotated<Taper, gr::Limits<gr::OneOf<Taper::hann, Taper::hamming>>> taper = Taper::hann;
+```
+
+Any other enumerator is refused with `"not one of: hann, hamming: blackman"`, and the metadata key
+`taper::one_of` lists those names beside `taper::enum_values`, which lists the whole enumeration. On an
+enumeration `OneOf` is the one predicate: `Min`, `Max`, `Over` and `Under` bound a number, and the
+compiler refuses them there, as it refuses a `OneOf` that repeats an enumerator or names one of another
+enumeration.
+
 ### Changing a setting while the graph runs
 
-`settings().set(params)` stores `params` against a timestamped settings context; a running block picks
-them up only when that context is activated, so on a live graph the call reports success and changes
-nothing. To retune a running block use `settings().setStaged(params)`, which the block applies at the
-top of its next `work()` call.
+`block.set(params)` checks `params` and returns `std::expected<Values, Rejected>`. On a block no
+graph holds and that does not run, the change applies at the call. A block of a graph that does not
+run holds it until its next start, and `set()` returns the key pending, "not running". A
+`PortCountFor` setting applies at the call. On a running block the change waits for the top of the
+block's next `work()` call; how long `set()` waits for it is in "Threads" below.
 
-A block that assigns a reflected member while it runs makes the new value readable with
-`this->updateActiveParameters({"key", ...})`, which copies the named members into the map that
-`settings().get()` and a settings `Get` message return. The block calls it on the thread that writes
-those members, for example at the end of its work function.
+A change of a `StoppedOnly` or `PortCountFor` setting is refused while the block runs or is paused,
+`"not allowed while running"`; a value equal to the one in force is no change. A value that no state
+takes, one its type, its `Limits` or the block's check refuses, is refused in the same answer for
+both reasons, the stop's first: `"bounded: not allowed while running; bounded: out of range (-inf,
+10]: 20"`. One corrected call after one stop then serves the caller.
+
+A `Rejected` result means no key of the call took effect; each `Rejection` names a refused key and
+its reason. The `Values` of an accepted call hold a `gr::settings::Value` for each key not in force
+as sent, and none for a key that is: an empty `Values` means every key took. An entry's `state` is
+`value` for a substitute the block published, with its reason; `pending` for a key that waits, with
+the cause "not running", "timeout", "applies at the block's next work call" for a `noWait` call or a
+call from a scheduler's worker thread, "queued while the block's settings are busy" for such a call
+that found another thread holding the block's settings, or "applies at the scheduler's next start"
+for a key a running scheduler holds; or `failed` for a key whose apply failed, with the reason.
+`block.check(params)` refuses as `set()` would and stores nothing; on a block not yet set up it
+first runs the setup, apply hook included. `block.get(key)` returns the key's `Value`: the value
+in force, a substitute the block published with its reason, or, on a block that does not run, a
+value set that waits for the next start. `get(keys)` and `get()` return `Values` for the keys asked
+or for every key, and `get<T>(key)` returns the value as `T`, refused when `T` cannot hold it
+without loss.
+
+A host reads a status value as it reads a setting, `block.get("overflows")`, and `set()` refuses it
+with `"read-only status"`. Core copies `Status` for a host after each hook and, while a host reads
+or a watcher follows it, after each work call. Rule 3 of "Threads" below names the thread that
+writes `status`.
+
+Inside `applySettings()` the block assigns a setting it replaces, `s.gain = v`.
+`this->publish("key", value, reason)` reports a value that changes when no `set()` waits, such as a
+device that later runs another value than the one set. The
+settings keep the published value and its reason beside the value last set until the next write of
+the key, and `get()` returns the published value with its reason. A key the block does not declare,
+or a value its field cannot hold, raises an error notification. A `publish` during the apply, from
+the hook or the reset hook, changes nothing and raises one `failed` notification,
+`"publish not allowed in applySettings()"`: the hook assigns the setting.
+
+A setting is given at construction, `Block({{"gain", 2.f}})`, or by `set()`; neither the block's
+constructor nor a host assigns `block.settings.gain` itself. At the setup a setting that no caller
+gave and that differs from the value a default-constructed `Settings` holds holds the block not
+ready with `"gain: assigned directly"`, until a call gives it at construction or by `set()`. After
+the setup a setting written outside `applySettings()`, by the block or from outside, raises an error
+notification naming it, `"assigned outside applySettings()"`, at the next apply or when the block
+stops, and takes back its value in force.
+`BlockModel::setName()` on a block set up is a `set()` of `name` with `noWait`: a save returns the
+new name at once, `get("name")` too unless the block runs, and `name()`
+returns it once the block applies it, at the start on a stopped graph; a scheduler-managed subgraph
+that runs applies it at its scheduler's next start. It returns the result of the `set()`, a refusal
+included. A host writes the UI map with `set("ui_constraints", ...)`; `uiConstraints()` reads it.
+
+A notification names the block, the key and a reason: `failed` at the `error` level for a key that
+failed, `changed` at `info` for a key that moved. The nearest scheduler's `notification_level`,
+`warning` by default, sets the lowest level that passes. A scheduler at `off` prints nothing; its
+installed readers still receive warnings and errors. A block's own `off` sends nothing. Until a host
+reads them, the top scheduler prints the first notification of each block, key and level to standard
+error, then a count at each tenfold. A host reads them by `installReader(reader)` on the scheduler, which hands each `gr::settings::Notification` to
+`reader`, or by a subscription to the scheduler's `SettingsNotification` endpoint
+(`gr::Runtime::kSettingsNotificationEndpoint`), whose events carry `level`, `what`, `block`, `key`,
+`reason` and `replaced`. A block no scheduler holds prints its notifications to standard error at
+once.
+
+### Threads
+
+The settings of a block take one lock, the block's own. These rules hold for every block, scheduler
+and host:
+
+1. The block's work function, its lifecycle hooks and `applySettings()` run one at a time: on the
+   block's own thread while it runs, and on the caller's thread for a change that applies at the
+   call. A merged block's members run inside its work call. A blocking block's stop and pause hooks
+   run while its work call may still be inside `work()`, and its next work call copies the `Status`
+   they wrote. A block that overrides `work()` and does not call the base's runs its code as another
+   thread.
+2. A block never calls `set()` or `resetDefaults()` on its own settings; it assigns the setting in
+   `applySettings()`. From its own thread the call is refused with
+   `"not allowed on the block's own thread"`, as are `check` and `setTagCouplings` from a settings
+   hook.
+3. The block writes `status` only on its own thread. A value from another of its threads goes by
+   `this->publish(key, value)`.
+4. `checkSettings()` reads only its argument. It runs on the caller's thread under the block's
+   settings lock.
+5. `applySettings()` runs under the block's settings lock, and every other thread's read of the
+   block's settings waits until it returns. The hook calls no other block's settings.
+6. An apply or check hook does not wait for another thread of its own block that calls the block's
+   settings, such as `publish()` or `fail()`: that thread waits for the hook; a hook does not take a
+   lock that such a thread holds while it calls the block's settings.
+7. A scheduler declares no `Status`, and each of its keys a host sets while it runs applies at its
+   next start.
+8. A host that calls a scheduler's control directly (`start`, `stop`, `pause`, `resume`, the wait
+   for a run, graph edits) calls it from one thread at a time. The settings calls (`set`, `get`,
+   `check`) may come from any thread, beside the control and the notifications. The Runtime adds no
+   threading rule of its own: its calls follow the rules of the scheduler and block calls they make.
+   `stop()`, `stopFor()`, `waitFor()` and `result()` may be called from any thread outside the run;
+   a thread of the run stops it with `stopFor(std::chrono::nanoseconds::zero())`.
+9. `set()` waits for the block's apply up to its timeout. With `noWait`, or from a scheduler's
+   worker thread, it waits for no apply on another thread and only tries the block's lock. On a
+   block used alone that does not run, the call applies its keys on its own thread. While another
+   thread holds the block's settings, for example during an apply, the block queues each key of
+   such a call and keeps the latest value of each key; only an undeclared or read-only key refuses
+   the call. A recipe composite also refuses a parameter whose value its type cannot hold or whose
+   binding fails; while another call holds the composite, that refusal is the composite's `failed`
+   notification. The next `set()`, `resetDefaults()`, `get()`, save, start or apply checks the
+   queued keys as one call before its own, and so does a tag the block reads: one whose key the
+   block follows, or a reset of the defaults. A refused key raises a `failed` notification with the
+   reason and keeps its value in force, and the other queued keys apply. A running block applies
+   them at its next work call, and a block used alone that does not run at its next set or work
+   call. On a block that runs, a slider dragged across 1 to 6 while the block applies 1 ends at 6,
+   with one apply after the first, at the next work call. A recipe composite passes such a set
+   of a parameter on to each inner block it sets as a no-wait set of that block's keys, so each
+   inner block's queue keeps the latest value; while another call holds the composite, the
+   latest value of each parameter waits for that call to end and is passed on then. The
+   composite stores the parameter before its inner blocks check it; an inner block that refuses
+   raises its own `failed` notification, naming its key, and the composite keeps the parameter.
+   A waiting `set()` checks every inner block before it stores the parameter. A tag on a
+   parameter's key that meets an inner block another thread holds leaves that block's value in
+   its queue, which lands with that block's next apply rather than at the tag's sample. A tag that
+   meets another call on the composite sets the parameter, as a no-wait set does, when that call
+   ends. A
+   `get()` waits while the block applies, a device's retune included.
+10. A waiting `set()` or a `resetDefaults()` that cannot take the block's lock within its timeout is
+    refused and stores nothing: `"timed out after <N> ms waiting for the block's settings"`. With
+    no timeout, or for `resetDefaults()` with `noWait`, the bound is the scheduler's settings
+    timeout, 1 s by default. A waiting set of a recipe composite's parameter first waits for any
+    other call on the composite to end.
+11. A reader runs on a worker of the run, or on the thread that stops the run or whose start fails,
+    one notification at a time. The run is stopped by the caller of a scheduler's `stop()`, or under
+    the Runtime by the Runtime's own stop thread. A reader may `set()` with `noWait`, and it stops
+    the run with `stopFor(std::chrono::nanoseconds::zero())`.
 
 ## Processing functions
 
@@ -508,71 +753,238 @@ Downstream examples: hardware-backed lifecycle and finite-source blocks in
 
 ## Settings change callback
 
-Called automatically when settings are updated, **before** the next processing call.
-
-A callback refuses every value in `newSettings` by throwing. Each setting named in
-`newSettings` then takes back its value from `oldSettings`, in the member and in
-`settings().get()`. When `set()` left a refused value in the stored set the batch was applied
-from, that set takes the value from `oldSettings` as well. A context that the batch activates,
-or that the callback activates before it throws, keeps its stored set as it is. When the
-callback refuses a batch that activates another context, the context active before the
-activation is active again. A batch that `removeContext()` staged keeps the context it falls
-back to. When `removeContext()` removed the context active before the activation, the default
-context is active instead. A reset activates the default context: when the callback refuses a
-batch with a reset, the context active before the batch is active again. A coupled setting
-follows its tag key after that refusal only when it followed it before the reset. A set the
-callback stored with `set()` stays, and its keys decide which settings follow. A setting whose
-`Limits` refuse its value from `oldSettings` keeps the refused value. When tags alone carried
-every value in `newSettings`, the block reports the refusal in a plain message, as it reports a
-tag value outside a setting's `Limits`. Otherwise it reports the exception as an error on its
-message output. The block publishes none of the forward map a refusing callback filled.
-
-### 2-argument variant
+A rule that relates settings belongs in the optional check, which refuses a call before any key of
+it merges. The check takes each value as within its own `Limits`:
 
 ```cpp
-void settingsChanged(const gr::property_map& oldSettings,
-                     const gr::property_map& newSettings) {
-    if (newSettings.contains("sample_rate") || newSettings.contains("frequency")) {
-        _coeff = computeCoefficient(sample_rate, frequency);
-    }
-}
+std::optional<gr::Refused> checkSettings(const Settings& s) const;
 ```
 
-### 3-argument variant (modify downstream tags)
+Core may call the check often, for a `check()` that stores nothing as for a `set()`. It changes
+nothing in the block and returns quickly, and its thread is rule 4 of "Threads". The compiler
+refuses a check that is not `const`.
+
+`s` holds every setting at the value the call would put in force. `gr::Refused(s.map_out, "length
+differs from map_in")` refuses the setting by its member, `gr::Refused("...")` names none, and
+`add()` collects several. A refusal that names no setting is reported against each setting the call
+changes; at the block's setup and at a start it stays against the block. A throw from the check is
+its refusal with the thrown message. A reason is worded as an error message, as core words its own:
+short, in lower case, no sentence, with the value and the bound where it has them, `"above 20 dB in
+linear mode: 23"`, `"not a power of 2"`. Core puts the key ahead of it, `"fft_length: not a power of 2"`,
+and the block ahead of that where a caller reads several, `"block 'fft': fft_length: not a power of 2"`.
+An entry of a `gr::RuntimeError`'s `rejected` names the block in its key, `fft.fft_length`, and a
+scheduler's own key by the scheduler's name; an entry that names no key reads the block's name alone.
+The name is the one the caller gave the block. A block inside a subgraph or a definition reads the path from the
+outermost block, `rx.inner_fft.fft_length`, while a block of a nested scheduler reads its own given
+name, `inner_fft.fft_length`, as at its construction. A refusal of `Runtime::start()` or
+`Runtime::resume()` and the values each returns name each block the same way, and a name that two
+blocks share by each block's unique name, since neither the loader nor `Graph` refuses a repeated name. At load a
+refusal keeps the name as given, and its message names each subgraph it passed. A name or a key
+may hold a dot, `channel.1.frequency`, so a host that needs the block and the key apart gives its blocks
+names without one.
+A rule that relates two settings names both, with the setting a host most likely changes attached.
+
+The apply hook runs **before** the next processing call, once per
+batch of changes that moves a value, after core writes the new values into the block's `Settings`
+member. It takes that member as `s`:
 
 ```cpp
-void settingsChanged(const gr::property_map& oldSettings,
-                     const gr::property_map& newSettings,
-                     gr::property_map& forwardSettings) {
-    if (newSettings.contains("sample_rate")) {
-        forwardSettings[gr::tag::SAMPLE_RATE.key()] = sample_rate.value;
-    }
-}
+void applySettings(const Settings& s); // or void applySettings(const Settings& s, const Settings& old);
 ```
 
-The framework publishes this map on the block's outputs. It writes no tag for a setting itself.
+The hook takes `s` as `Settings&` where it assigns a setting, and `const` otherwise. A block that
+names its member other than `settings` receives that member. A form without `s` is refused by the
+compiler.
+
+Its thread and its lock are rules 5 and 6 of "Threads".
+
+A block learns what changed from the setting, `if (s.cutoff.changed())`. `changed()` is a member of
+`Annotated`, so a setting the hook asks about is declared as one. It reads true for every setting at
+the block's setup, so a block builds its state there the same way it rebuilds it later, and
+afterwards for a setting whose value differs from the one before the batch. It reads false outside
+the hook, also after a hook that throws. The hook's own assignment to a setting leaves its flag, also
+an assignment from another setting such as `s.gain = old.gain`, and a copy of `Settings` constructed
+from `s` carries the flags `s` held. `old` holds the values before the batch, the
+declared defaults at the setup; it serves a block that needs the earlier value itself, such as the
+size of a step. Inside the hook the block may:
+
+- assign one of its own settings, `s.trigger = false;` or `s.gain_db = nearest;`: a
+  host reads and saves the assigned value; one that differs from the value before the batch is
+  announced at `info` as the caller's change, and one outside the setting's `Limits` fails the key.
+  It serves a command the block takes back and a value rounded to what a device has; a value others depend on, such as
+  `sample_rate`, keeps the setting and reports the value in force as `current_sample_rate` in
+  `Status`;
+- fail a key where doing the thing fails, `this->fail(s.level, "runs 10 at most")`. At the setup
+  a failure refuses the block;
+- hand a value downstream, `this->forwardTag("gr:sample_rate", rate)`; what the hook forwards at the
+  setup is dropped.
+
+A throw from the hook, a `fail()` of any setting or status value, and an assigned value outside its
+limits each take back every key the batch changed and every setting the hook assigned, none
+announced as changed. A block that runs another value than the one set assigns it in the hook. The
+host sees the failure under each key: the text of a throw, or the reason under the key the block
+failed or assigned and that key before the reason under any other, as in
+`attenuation_db: not reachable`. Core restores the settings and does not run the hook again, so a
+hook builds its new state first and commits it last, after the last place it can fail.
+
+Each way of reporting what the block runs serves one case:
+
+- a member of `Status`: a value only the block sets, such as a level it measures; a host reads it
+  and never sets or saves it;
+- an assignment in the hook: the block replaces the value set, a command it takes back or a value
+  rounded to what the device has; a host reads and saves the assigned value;
+- `this->publish(key, value, reason)`: the device runs another value than the one set, reported
+  after the hook; a read returns it with its reason, and a host saves the value set;
+- `this->fail(key, reason)`: the device could not take the value set; the key fails with `reason`.
+  In the hook the batch goes back; in the start hook the key is one the device lacks, and a read
+  lists it no more.
+
+A block that both sets a value and reports the value in force splits it into a pair: the setting
+`gain_db` and the status value `current_gain_db`.
+
+```cpp
+struct Leveler : gr::Block<Leveler> {
+    gr::PortIn<float>  in;
+    gr::PortOut<float> out;
+
+    struct Settings {
+        gr::Annotated<float, gr::Limits<gr::Min<0.f>, gr::Max<1.f>>>     target  = 0.5f;
+        gr::Annotated<float, gr::Doc<"start gain">, gr::Limits<gr::Over<0.f>>> gain    = 1.f;
+        bool                                                                       restart = false;
+
+        GR_MAKE_REFLECTABLE(Settings, target, gain, restart);
+    } settings;
+
+    struct Status {
+        float      current_gain = 1.f;
+        gr::Size_t count        = 0U;
+
+        GR_MAKE_REFLECTABLE(Status, current_gain, count);
+    } status;
+
+    GR_MAKE_REFLECTABLE(Leveler, in, out, settings, status);
+
+    float _step = 0.f;
+
+    // takes back `restart`, a command
+    void applySettings(Settings& s) {
+        _step = 0.01f * s.target;
+        if (s.gain.changed() || s.restart) {
+            status.current_gain = s.gain;
+            s.restart           = false;
+        }
+    }
+
+    [[nodiscard]] gr::work::Status processBulk(std::span<const float> input, std::span<float> output) {
+        float level = 0.f;
+        for (std::size_t i = 0UZ; i < input.size(); ++i) {
+            output[i] = status.current_gain * input[i];
+            level     = std::max(level, std::abs(output[i]));
+        }
+        status.current_gain = level > settings.target ? std::max(status.current_gain - _step, 0.01f) : status.current_gain + _step;
+        ++status.count;
+        return gr::work::Status::OK;
+    }
+};
+```
+
+The framework publishes the forwarded settings on the block's outputs. It writes no tag for a
+setting itself.
 
 ### Common patterns
 
 **Dynamic port resize:**
 
 ```cpp
-if (newSettings.contains("n_inputs"))  { inputs.resize(n_inputs); }
-if (newSettings.contains("n_outputs")) { outputs.resize(n_outputs); }
+if (s.n_inputs.changed())  { inputs.resize(s.n_inputs); }
+if (s.n_outputs.changed()) { outputs.resize(s.n_outputs); }
 ```
 
-**XOR constraint (mutually exclusive settings):**
+The hook resizes only a collection that a `PortCountFor` setting names, here
+`gr::Annotated<gr::Size_t, gr::PortCountFor<"inputs">> n_inputs`. The block's list of ports follows
+a collection only through such a setting: one that a plain setting sizes keeps its old ports in the
+list, a connection to a new port is refused, and on a graph the size changes at the next start, after
+the graph was wired. The compiler cannot see a hook's body, so core compares the size of every other
+dynamic collection around the hook: a resize fails the batch with `"port collection 'inputs': resized
+by applySettings() without PortCountFor"`, and the collection takes back its size. The comparison
+reports the fault and does not make it safe: on a running block the hook may run inside a work call
+whose open spans point into the ports the resize moved or destroyed, which is undefined behavior. A collection that only the
+constructor sizes, from a template argument or a constructor value, needs no such setting.
+
+**A device value rounded to what the device has:**
 
 ```cpp
-if (newSettings.contains("frequency_shift") && !newSettings.contains("phase_increment")) {
-    phase_increment = 2.f * std::numbers::pi_v<float> * frequency_shift / sample_rate;
-} else if (!newSettings.contains("frequency_shift") && newSettings.contains("phase_increment")) {
-    frequency_shift = phase_increment / (2.f * std::numbers::pi_v<float>) * sample_rate;
+if (s.gain_db.changed()) {
+    s.gain_db = device.nearestGain(s.gain_db); // a host reads the rounded gain
+    device.setGain(s.gain_db);
 }
 ```
 
 Downstream examples: mutually exclusive settings and dynamic-port validation in
 `gnuradio4-blocks`.
+
+### A block that applies on its own thread
+
+A device block whose own reader thread talks to the device applies its settings on that thread, so
+that no other thread reaches the device. The reader calls `this->applyChangedSettings()` at a
+bounded interval, also while the device delivers nothing, since a `set()` waits for that apply
+(rule 9 of "Threads"). The call marks the thread as the block's own; it applies nothing where no
+change waits.
+
+```cpp
+void readerLoop() {
+    while (_running) {
+        this->applyChangedSettings(); // runs applySettings() here when a change waits
+        if (const std::optional<Reading> reading = _device.read(kPollInterval)) {
+            this->publish("rssi", reading->rssi);
+            _ring.push(reading->samples);
+        }
+    }
+}
+```
+
+Such a block reports every `Status` value by `this->publish(key, value)` and assigns no `Status`
+member in any hook: the scheduler's worker copies `Status`, and the hooks here run on the reader
+thread (rule 3 of "Threads"). A published value stays only until the member's next copy finds the
+member changed. A setting the hook assigns, a value it rounds, is assigned as on any block.
+
+### A scheduler's own settings
+
+A scheduler derived from `SchedulerBase` declares its settings in a struct derived from
+`gr::scheduler::SchedulerSettings`, which holds core's keys (`timeout_ms`, `poolName`,
+`settings_timeout_ms` and the others), and names it as the base's fourth template argument:
+
+```cpp
+struct ChunkSettings : gr::scheduler::SchedulerSettings {
+    gr::Annotated<gr::Size_t, gr::Doc<"samples per pass">, gr::Limits<gr::Min<1U>, gr::Max<64U>>, gr::StoppedOnly> chunk_size = 4U;
+    gr::Annotated<gr::Size_t, gr::Doc<"samples past the chunk">>                                                burst      = 0U;
+
+    GR_MAKE_REFLECTABLE(ChunkSettings, chunk_size, burst); // its own members only
+};
+
+struct ChunkScheduler : gr::scheduler::SchedulerBase<ChunkScheduler, gr::scheduler::ExecutionPolicy::single_threaded, gr::profiling::null::Profiler, ChunkSettings> {
+    using SchedulerBase::SchedulerBase;
+
+    std::optional<gr::Refused> checkSettings(const Settings& s) const; // optional, sees every key
+    void                       applySettings(const Settings& s);       // optional, after core applies its keys
+};
+```
+
+The scheduler's `settings` member is of that struct, and each key carries its limits, documentation
+and update policy in the metadata as a block's does. A key without `StoppedOnly`, core's
+`settings_timeout_ms` and `notification_level` among them, is held while the scheduler runs and
+applies at its next start; `set()` returns it pending, "applies at the scheduler's next start", and
+does not wait. The compiler refuses a member named like one of core's keys. A scheduler
+that names no fourth argument has core's keys alone, as the schedulers core ships.
+
+A scheduler with a check, an apply hook or keys of its own is set up once it is
+constructed: by `SchedulerWrapper`'s constructor, which a graph file, the registry and `Runtime`
+use, else at its first settings call, its initialization or its start, whichever comes first. One
+built by hand holds the declared defaults in its members until then, and a value it refuses at
+construction surfaces at that first use, at a start as `"scheduler 'name': chunk_size: ..."`. A
+scheduler declares no `Status`; the compiler refuses one. Core's apply runs as the base's
+`applySchedulerSettings()`. The compiler refuses a derived member of that name, and a derived
+`Settings` other than the fourth argument.
 
 ## Tags & streaming metadata
 
@@ -697,10 +1109,8 @@ The constants in `gr::tag::` hold the `gr:` keys.
 | `"gr:trigger_time"`                   | `uint64_t`    | UTC timestamp [ns]                 |
 | `"gr:trigger_offset"`                 | `float`       | sample delay w.r.t. trigger [s]    |
 | `"gr:context"`                        | `std::string` | multiplexing context key           |
-| `"gr:ctx_time"`                       | `uint64_t`    | time the context takes effect [ns] |
 | `"gr:end_of_stream"`                  | `bool`        | end-of-stream marker               |
 | `"gr:reset_default"`                  | `bool`        | reset block to stored defaults     |
-| `"gr:store_default"`                  | `bool`        | store current settings as defaults |
 
 Downstream examples: tag source, tag monitor, and clock source blocks in
 `gnuradio4-blocks`.
@@ -813,20 +1223,21 @@ meaning.
 
 ## Dos and don'ts
 
-| Do                                                   | Don't                                                                                                  |
-| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| use `struct` (default)                               | use `class` without a genuine invariant                                                                |
-| `snake_case` for reflected settings                  | `camelCase` for settings                                                                               |
-| `lowerCamelCase` for methods                         | `snake_case` for methods                                                                               |
-| `Annotated<T, "name", ...>` for user-facing settings | bare fields for user-facing settings (no UI metadata)                                                  |
-| `[[nodiscard]]`, `constexpr`, `noexcept`             | omit attributes on processing functions                                                                |
-| `std::expected` / `std::optional` for errors         | throw exceptions in library code                                                                       |
-| `vir::simd` / `std::simd` for SIMD                   | raw compiler intrinsics                                                                                |
-| `gr::pmt::Value` for type-erased values              | `std::variant` for wire-format data                                                                    |
-| default field initialisers + `settingsChanged()`     | custom constructors/destructors (break CRTP init, settings pipeline, `emplaceBlock` property_map init) |
-| `std::ranges` / `std::algorithms` for transforms     | manual `for` loops when an algorithm exists                                                            |
-| lean on the framework — focus on your algorithm      | re-implement scheduling, buffering, or tag forwarding                                                  |
-| verify APIs against actual headers                   | assume/hallucinate API methods                                                                         |
+| Do                                                 | Don't                                                                                                  |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| use `struct` (default)                             | use `class` without a genuine invariant                                                                |
+| `snake_case` for reflected settings                | `camelCase` for settings                                                                               |
+| `lowerCamelCase` for methods                       | `snake_case` for methods                                                                               |
+| settings in `struct Settings`, reports in `Status` | settings as direct members of the block                                                                |
+| `Annotated<T, ...>` for user-facing settings       | bare fields for user-facing settings (no UI metadata)                                                  |
+| `[[nodiscard]]`, `constexpr`, `noexcept`           | omit attributes on processing functions                                                                |
+| `std::expected` / `std::optional` for errors       | throw exceptions in library code                                                                       |
+| `vir::simd` / `std::simd` for SIMD                 | raw compiler intrinsics                                                                                |
+| `gr::pmt::Value` for type-erased values            | `std::variant` for wire-format data                                                                    |
+| default member values + `applySettings()`          | custom constructors/destructors (break CRTP init, settings pipeline, `emplaceBlock` property_map init) |
+| `std::ranges` / `std::algorithms` for transforms   | manual `for` loops when an algorithm exists                                                            |
+| lean on the framework — focus on your algorithm    | re-implement scheduling, buffering, or tag forwarding                                                  |
+| verify APIs against actual headers                 | assume/hallucinate API methods                                                                         |
 
 ## Advanced: custom `work()` function
 

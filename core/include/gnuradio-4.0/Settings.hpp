@@ -2,1095 +2,1088 @@
 #define GNURADIO_SETTINGS_HPP
 
 #include <array>
+#include <atomic>
+#include <cassert>
 #include <chrono>
 #include <concepts>
-#include <format>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <expected>
 #include <functional>
-#include <initializer_list>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
 #include <span>
-#include <unordered_map>
-#include <variant>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
-#include <gnuradio-4.0/AtomicRef.hpp>
-#include <gnuradio-4.0/BlockTraits.hpp>
-#include <gnuradio-4.0/PmtTypeHelpers.hpp>
-#include <gnuradio-4.0/SettingsCtx.hpp>
+#include <gnuradio-4.0/SettingDeclaration.hpp>
+#include <gnuradio-4.0/SettingNotification.hpp>
+#include <gnuradio-4.0/SettingValue.hpp>
+#include <gnuradio-4.0/SharedState.hpp>
 #include <gnuradio-4.0/Tag.hpp>
-#include <gnuradio-4.0/ValueHelper.hpp>
-#include <gnuradio-4.0/annotated.hpp>
-#include <gnuradio-4.0/meta/formatter.hpp>
-#include <gnuradio-4.0/meta/immutable.hpp>
-#include <gnuradio-4.0/meta/reflection.hpp>
+#include <gnuradio-4.0/Value.hpp>
+
+namespace gr {
+struct SettingsBase;
+} // namespace gr
+
+namespace gr::settings {
+
+// the prefix of the tag keys a recipe composite adds to a tag that enters it, one per inner setting a parameter
+// drives; the composite's unique name follows it, and an output port that leaves that composite drops them
+inline constexpr std::string_view kInnerTagKeyPrefix = "gr:composite:";
+
+using ValueMap = std::map<std::string, pmt::Value, std::less<>>;
+using KeySet   = std::set<std::string, std::less<>>;
+
+template<typename TBlock>
+struct BlockSettingsOf;
+
+namespace detail {
+
+struct CompositeSettings;
+
+// the graph that holds a block, as its settings see it
+struct GraphLink {
+    virtual ~GraphLink() = default;
+    // the name of the first port of `collection` at or past `count` that an edge holds, or nothing
+    [[nodiscard]] virtual std::optional<std::string> edgeAtOrPast(std::string_view collection, std::size_t count) const = 0;
+    // rebuilds what the graph derives from the block's ports after a port key resized a collection
+    virtual void refreshPorts() = 0;
+};
+
+// the scheduler that holds a block's graph, as its settings see it; a block no scheduler holds has none
+struct SchedulerLink {
+    virtual ~SchedulerLink() = default;
+    // wakes the idle workers, unless the scheduler neither runs nor starts or this thread is one of its workers
+    virtual void wake() = 0;
+    // holds a notification for the scheduler's next delivery
+    virtual void push(Notification notification) = 0;
+    // whether this thread is a worker of any scheduler, which waits for no apply, since the apply may need it
+    [[nodiscard]] virtual bool isWorkerThread() const = 0;
+    // the level of the nearest scheduler up that has one of its own, read at each notification
+    [[nodiscard]] virtual std::optional<NotificationLevel> level() const = 0;
+    // the wait of a call that names no timeout
+    [[nodiscard]] virtual std::chrono::milliseconds defaultTimeout() const = 0;
+    // the named block has left its scheduler for good, and the default reader at the top forgets its counts
+    virtual void retire(std::string_view /*block*/) {}
+    // a block of that name joins the scheduler, and the default reader at the top forgets the counts of the name
+    virtual void join(std::string_view /*block*/) {}
+    // delivers what the scheduler holds, for a scheduler nested in it that does not run and whose delivery no
+    // message pass of its parent would carry on
+    virtual void deliver() {}
+};
+
+enum class BlockState : std::uint8_t { stopped, running, paused, error };
+
+struct PendingChange {
+    pmt::Value value{};
+    bool       given = false; // a caller sent the key; a tag gives none of the keys it sets
+};
+
+struct PendingChanges {
+    std::map<std::string, PendingChange, std::less<>> keys{};
+    bool                                              reset = false;
+
+    [[nodiscard]] bool empty() const noexcept { return keys.empty() && !reset; }
+};
+
+// the value the block published by key for a setting it does not hold a member of, beside the value last set
+struct PublishedValue {
+    pmt::Value  value{};
+    std::string reason{};
+};
+
+// the state a check reads: the block's own, under the block lock its caller holds through the merge
+struct CheckState {
+    const PendingChanges&                                     pending;
+    const PendingChanges*                                     applying;
+    const ValueMap&                                           inForce;
+    const std::map<std::string, PublishedValue, std::less<>>& published; // each key's value the block published in place of the value last set
+    GraphLink*                                                graphLink = nullptr;
+    BlockState                                                state     = BlockState::stopped;
+    bool                                                      starting  = false;
+    bool                                                      setUp     = true; // false while the block's initialization checks its constructed values
+};
+
+struct Merged {
+    ValueMap       sent{};
+    std::uint64_t  batch         = 0U;
+    GraphLink*     graphLink     = nullptr;
+    SchedulerLink* schedulerLink = nullptr;
+    BlockState     stateNoted    = BlockState::stopped;
+    bool           waking        = false;
+    bool           changesPorts  = false;
+};
+
+struct CheckedCall {
+    ValueMap   converted{};
+    KeySet     given{};
+    KeySet     displaced{};
+    bool       changesPorts = false;
+    BlockState stateNoted   = BlockState::stopped;
+};
+
+struct Failure {
+    std::uint64_t batch = 0U;
+    std::string   reason{};
+};
+
+// a judgment of the block's setup; no entries when its settings passed
+struct SetUpVerdict {
+    Rejected entries{};
+    bool     notReady = false; // the entries hold the block not ready; else they refuse the values given to it
+    Merged   merged{};
+};
+
+// the key whose field in the block lies at `field`, or none
+[[nodiscard]] std::optional<std::string_view> keyOfField(const DeclarationTable& table, void* block, const void* field);
+
+// a hook names a key by a setting member of its block; a string that is no member names the key by its text
+template<typename TName>
+[[nodiscard]] std::string_view keyNamed(const DeclarationTable& table, void* block, const TName& name) {
+    const std::optional<std::string_view> key = keyOfField(table, block, std::addressof(name));
+    if constexpr (std::is_convertible_v<const TName&, std::string_view>) {
+        return key.value_or(std::string_view(name));
+    } else {
+        assert(key.has_value() && "a settings hook names a setting member of its own block");
+        return key.value_or(std::string_view{});
+    }
+}
+
+// an argument that names a member; text as a literal, a pointer or a `std::string_view` takes the text form
+template<typename T>
+concept MemberName = !std::is_array_v<T> && !std::is_pointer_v<T> && !std::same_as<std::remove_cv_t<T>, std::string_view>;
+
+// one member of the block's `Status` as a key and its value
+struct StatusValue {
+    std::string_view key;
+    pmt::Value       value{};
+};
+
+// the latest start or resume of a block
+struct Run {
+    std::uint64_t              batch   = 0U;
+    bool                       isStart = false;
+    ValueMap                   keys{};     // each key the run covers with the value it wrote; an empty value for a key the device lacks
+    Rejected                   refusals{}; // the whole-state check's
+    std::optional<std::string> hookFailure{};
+};
+
+} // namespace detail
+
+/**
+ * @brief The state a call would produce over the pending changes and the values in force, which the check judges.
+ *
+ * At the block's initialization and at a start's check of the whole state every setting that holds a value is changed,
+ * so a rule over several keys checks them all.
+ */
+class CallView {
+    friend struct gr::SettingsBase;
+
+    const detail::DeclarationTable* _table;
+    const ValueMap*                 _converted;
+    const KeySet*                   _displaced;
+    const detail::CheckState*       _held;
+    bool                            _wholeState;
+
+    CallView(const detail::DeclarationTable& table, const ValueMap& converted, const KeySet& displaced, const detail::CheckState& held, bool wholeState = false) : _table(&table), _converted(&converted), _displaced(&displaced), _held(&held), _wholeState(wholeState || !held.setUp) {}
+
+    [[nodiscard]] std::optional<pmt::Value> state(std::string_view key) const;
+    [[nodiscard]] bool                      changed(std::string_view key) const; // the call holds the key at a value other than the one it would replace
+};
+
+} // namespace gr::settings
 
 namespace gr {
 
-namespace settings {
+namespace settings::detail {
 
-template<typename T>
-constexpr bool isSupportedVectorOrTensorType() {
-    if constexpr (gr::meta::vector_type<T> || gr::meta::array_type<T> || is_tensor<T>) {
-        using ValueType = typename T::value_type;
-        // TODO(follow-up PR): remove pmt::Value as collection element — it bypasses C++ type safety and breaks settings introspection
-        return std::is_arithmetic_v<ValueType> || std::is_same_v<ValueType, std::string> || std::is_same_v<ValueType, std::pmr::string> || std::is_same_v<ValueType, std::complex<double>> || std::is_same_v<ValueType, std::complex<float>> || std::is_enum_v<ValueType> || std::is_same_v<ValueType, pmt::Value>;
-    } else {
-        return false;
+// the settings a call would produce, which the check reads, each by its tag key; a key without a value holds none
+struct Proposal {
+    [[nodiscard]] virtual std::optional<pmt::Value> after(std::string_view tagKey) const = 0;
+
+protected:
+    ~Proposal() = default;
+};
+
+} // namespace settings::detail
+
+/**
+ * @brief What a check hook returns for settings it refuses: `Refused(member, reason)` names the setting at fault,
+ * `Refused(reason)` names none, and `add` collects several. A refusal that holds no entry refuses nothing.
+ *
+ * A refusal that names no setting is reported against each setting the call changes; at the block's setup and at a
+ * start it stays against the block.
+ */
+struct Refused {
+    struct Entry {
+        const void* field = nullptr; // the member named
+        std::string key{};           // the key named by text, for an entry with no member
+        std::string reason{};
+    };
+
+    std::vector<Entry> entries{};
+
+    Refused() = default;
+    explicit Refused(std::string_view reason) { add(reason); }
+    Refused(std::string_view key, std::string_view reason) { add(key, reason); }
+    template<settings::detail::MemberName TMember>
+    Refused(const TMember& member, std::string_view reason) {
+        add(member, reason);
+    }
+
+    void add(std::string_view reason) { entries.push_back(Entry{.reason = std::string(reason)}); }
+    void add(std::string_view key, std::string_view reason) { entries.push_back(Entry{.key = std::string(key), .reason = std::string(reason)}); }
+    // a text that is no member of the block names the key by its text
+    template<settings::detail::MemberName TMember>
+    void add(const TMember& member, std::string_view reason) {
+        Entry entry{.field = std::addressof(member), .reason = std::string(reason)};
+        if constexpr (std::is_convertible_v<const TMember&, std::string_view>) {
+            entry.key = std::string(std::string_view(member));
+        }
+        entries.push_back(std::move(entry));
+    }
+};
+
+namespace settings::detail {
+struct FrameworkAccess;
+
+/**
+ * @brief Marks this thread as the block's own for the life of the object: the thread runs the block's work function,
+ * one of its lifecycle hooks, `init()` or an apply.
+ *
+ * A merged block's work call marks each member as well. The hooks of a scheduler or a graph carry no mark, nor do the
+ * stop and pause hooks of a blocking block that the scheduler runs while a worker may be inside its work call; a hook
+ * that the block's work call runs carries the work call's mark. On its own thread a block's `set` and `resetDefaults`
+ * are refused. The marks nest, one per block. The list of marks is held in gnuradio-shared-state (`ownThreadMarks()`),
+ * so a check in the code of one shared object sees a mark that the code of another set on the same thread.
+ */
+struct OwnThread {
+    const SettingsBase* settings;
+    const OwnThread*    outer;
+
+    // out of line: inlined into a caller's frame, the constructor's store of `this` in the thread-local list reads to
+    // GCC as a dangling pointer, though the destructor puts back the outer mark before the object ends
+    explicit OwnThread(const SettingsBase& blockSettings) noexcept;
+    OwnThread(const OwnThread&)            = delete;
+    OwnThread& operator=(const OwnThread&) = delete;
+    ~OwnThread() { ownThreadMarks() = outer; }
+};
+
+/**
+ * @brief Marks this thread as the own thread of each member of a merged block for the life of the object.
+ *
+ * `TMerged` calls `mark()` once for each of its members' settings, at most `kCount` times; the marks end in the
+ * reverse order. At the end each member's `Status` is copied as the work call of a block used alone copies it.
+ */
+template<std::size_t kCount>
+class OwnThreads {
+    std::array<std::optional<OwnThread>, kCount> _marks{};
+    std::array<SettingsBase*, kCount>            _members{};
+    std::size_t                                  _nMarked = 0UZ;
+
+public:
+    template<typename TMerged>
+    explicit OwnThreads(TMerged& merged) noexcept {
+        merged.markMemberThreads(*this);
+    }
+    OwnThreads(const OwnThreads&)            = delete;
+    OwnThreads& operator=(const OwnThreads&) = delete;
+    ~OwnThreads();
+
+    void mark(SettingsBase& memberSettings) noexcept {
+        _members[_nMarked] = &memberSettings;
+        _marks[_nMarked++].emplace(memberSettings);
+    }
+};
+} // namespace settings::detail
+
+/**
+ * @brief The settings of one block: the pending changes, the values in force, the record of keys a caller gave, and
+ * the calls that check, stage, apply and read them.
+ *
+ * Every change enters by one check and merge; one apply puts the pending changes in force and calls the block's settings
+ * hook. A block no graph holds and that does not run applies each call on the caller's thread; a running block's
+ * changes wait for its applying thread, which calls `applyStagedParameters()` before its work.
+ *
+ * A `set()` with `noWait`, or from a scheduler's worker thread, only tries the block lock; a composite passes its
+ * parameters on to its inner blocks as such sets. While another thread holds the lock, the call puts its keys in a slot,
+ * keeps the latest value of each key and returns them pending. The next merge, read, save, start or apply under the
+ * lock checks and merges the slot as one call before its own work; a running block applies it at its next work call. A
+ * refused key raises a failed notification, and the slot's other keys apply.
+ */
+struct SettingsBase {
+private:
+    using ValueMap = settings::ValueMap;
+    using KeySet   = settings::KeySet;
+    using Timeout  = settings::Timeout;
+    using Values   = settings::Values;
+    using Value    = settings::Value;
+    using Rejected = settings::Rejected;
+
+    friend struct settings::detail::FrameworkAccess;
+    friend struct settings::detail::CompositeSettings;
+
+    const settings::detail::DeclarationTable& _table;
+    void*                                     _block;
+    property_map*                             _described; // the block's map of described settings, or null
+    property_map                              _constructedWith;
+    ValueMap                                  _coreFields{}; // the fields of the keys the core declares, read and written under the block lock
+
+    mutable std::timed_mutex             _lock;             // a waiting set() takes it within its timeout; one that does not wait only tries it
+    mutable std::mutex                   _slotLock;         // over `_slot`, taken after the block lock and with no other lock taken in its hold
+    property_map                         _slot{};           // the latest value of each key a set() that did not wait left while another thread held the block lock
+    bool                                 _draining = false; // the slot's keys are under their check; block lock
+    mutable std::mutex                   _settledLock;      // over `_settledCount`, which a waiting set() reads without the block lock
+    mutable std::condition_variable      _settled;
+    std::uint64_t                        _settledCount = 0U; // moves at each change a waiting set() judges again; written under both locks
+    mutable std::atomic<std::thread::id> _lockHolder{};      // the thread that holds the block lock, whose hooks call back into these settings under its hold
+
+    ValueMap                                                             _inForce{};
+    ValueMap                                                             _toWrite{}; // an empty value removes the key's entry
+    settings::detail::PendingChanges                                     _pending{};
+    std::shared_ptr<const settings::detail::PendingChanges>              _applying{};
+    ValueMap                                                             _record{};
+    std::uint64_t                                                        _version       = 0U;
+    std::uint64_t                                                        _nextBatch     = 1U;
+    std::uint64_t                                                        _applyingBatch = 0U;
+    std::uint64_t                                                        _appliedBatch  = 0U;
+    std::map<std::string, settings::detail::Failure, std::less<>>        _failures{};
+    std::map<std::string, settings::detail::PublishedValue, std::less<>> _published{}; // a key the block publishes by key alone, until the next write of it
+    std::map<std::string, std::string, std::less<>>                      _couplings{}; // setting's tag key to the tag key that sets it
+    std::atomic<std::uint8_t>                                            _ownLevel{kNoLevel};
+    settings::detail::BlockState                                         _state       = settings::detail::BlockState::stopped;
+    bool                                                                 _starting    = false;
+    bool                                                                 _fieldsEnded = false; // the block's base destructor runs: its own members are destroyed
+    ValueMap                                                             _storedDefaults{};
+    bool                                                                 _setUp = false;
+    Rejected                                                             _notReady{};     // what holds the block not ready after its setup; block lock
+    std::optional<std::uint64_t>                                         _startChecked{}; // the version a scheduler's check before its start passed
+    settings::detail::GraphLink*                                         _graphLink = nullptr;
+    std::atomic<settings::detail::SchedulerLink*>                        _schedulerLink{nullptr}; // read without the block lock: a nested scheduler reads its parent's level and timeout through it
+    std::atomic<bool>                                                    _hasWork{true};          // set while the block is not set up, so a work call on a block used alone initializes it
+    property_map                                                         _toForward{};            // the applying thread's
+    property_map*                                                        _forwarding   = nullptr; // the running settings hook's forwards; the applying thread's
+    std::map<std::string, std::string, std::less<>>*                     _hookFailures = nullptr; // the keys the running apply hook fails, with the reason, which take back its batch; the applying thread's
+    settings::detail::Run                                                _run{};
+    settings::detail::CompositeSettings*                                 _composite = nullptr;     // the parameters of a recipe composite, whose own keys these settings are
+    std::atomic<settings::detail::CompositeSettings*>                    _compositeEntry{nullptr}; // the composite whose input enters at this block
+    std::map<std::string, std::string, std::less<>>                      _innerTagKeys{};          // inner tag key to the setting it sets; block lock
+    std::atomic<std::size_t>                                             _nTagReasons{0UZ};        // the couplings, the inner tag keys and the composite entry: what makes the block read a tag
+    mutable std::atomic<bool>                                            _statusWanted{false};     // a work call or a message pass copies the block's `Status` while set
+
+    static constexpr std::uint8_t kNoLevel = 0xFFU;
+
+protected:
+    SettingsBase(const settings::detail::DeclarationTable& table, void* block, property_map* described, property_map constructedWith);
+    // takes the state of `other`, whose block moved to `block`, as a moved block takes its settings
+    SettingsBase(SettingsBase&& other, void* block, property_map* described) noexcept;
+
+public:
+    SettingsBase(const SettingsBase&)            = delete;
+    SettingsBase& operator=(const SettingsBase&) = delete;
+    SettingsBase& operator=(SettingsBase&&)      = delete;
+    virtual ~SettingsBase()                      = default;
+
+    [[nodiscard]] std::expected<Values, Rejected> set(const property_map& changes, Timeout timeout = std::nullopt);
+    [[nodiscard]] std::expected<Values, Rejected> set(std::string_view key, pmt::Value value, Timeout timeout = std::nullopt);
+
+    // Refuses as `set` would and stores nothing. On a block not yet set up it first runs the setup, apply hook included,
+    // and is not const for that. Its own judgment runs no apply hook: a setup the apply hook refused stays refused until
+    // the call gives a value that refusal names.
+    [[nodiscard]] std::expected<void, Rejected> check(const property_map& changes);
+
+    // nothing when the block is ready; else what holds it: a setting no caller gave a valid value, or the check's
+    // refusal of the settings it holds. A `set` that makes the settings valid makes the block ready
+    [[nodiscard]] std::expected<void, Rejected> ready();
+
+    [[nodiscard]] std::expected<Value, Rejected>  get(std::string_view key) const;
+    [[nodiscard]] std::expected<Values, Rejected> get(std::span<const std::string> keys = {}) const;
+
+    template<typename T>
+    [[nodiscard]] std::expected<T, Rejected> get(std::string_view key) const {
+        return get(key).and_then([](const Value& entry) { return entry.as<T>(); }).transform_error([key](Rejected rejected) {
+            for (settings::Rejection& entry : rejected) {
+                entry.key = std::string(key);
+            }
+            return rejected;
+        });
+    }
+
+    // the settings a call may name, block-wide and each member key the block holds; read-only keys are left out
+    [[nodiscard]] std::set<std::string> writableMembers() const;
+
+    // a set of the values in force when the block's initialization ended, then the reset hook
+    std::expected<Values, Rejected> resetDefaults(Timeout timeout = std::nullopt);
+
+    // couples settings to tag keys: setting to `domain:name`; an empty key removes the coupling; a tag that carries the
+    // key sets the setting from its sample on
+    [[nodiscard]] std::expected<void, Rejected> setTagCouplings(const property_map& couplings);
+    [[nodiscard]] property_map                  tagCouplings() const;
+
+protected:
+    // the block author's calls, which `gr::Block` offers its block
+    // the value the block now holds for `key`, from any of its threads: the key keeps it beside the value last set, with
+    // `reason`, until the next write of the key, and a read returns it at once. From a settings hook it changes nothing
+    // and notifies a failure: the apply hook assigns the setting
+    void publish(std::string_view key, pmt::Value value, std::string_view reason = {});
+    // the device refused `key`: in the apply hook, a failure of any key or status value takes back each key the batch
+    // changed, as a throw does, and at the setup refuses the block as a refused constructed value does; in a start, it
+    // marks a key the device lacks; elsewhere the key fails and keeps its value in force
+    void fail(std::string_view key, std::string_view reason);
+    // the members of the block's `Status`, on the block's own thread: each value that differs from the copy published
+    // last becomes the copy a read returns, and one that replaces a value is announced
+    void reportStatus(std::span<const settings::detail::StatusValue> values);
+    // the copy of the block's `Status` a host reads, made after each apply hook and lifecycle hook and each message pass
+    // in which a handler ran, and after a work call or another message pass while a watcher follows the status values,
+    // a host read one since the last copy or a change on the scheduler's thread left it wanted
+    void               copyStatus();
+    [[nodiscard]] bool isGiven(std::string_view key) const;
+    // from the settings hook, on the applying thread; what the hook forwards at the block's setup is dropped
+    void forwardTag(std::string_view tagKey, pmt::Value value);
+
+    // a block's settings initialize at its first `set`, `check` or work call; a graph that adds the block and a
+    // scheduler built alone initialize them here, to refuse a constructed value at once. Settings that fail for a
+    // reason other than a constructed value leave the block not ready, and `init()` succeeds
+    std::expected<void, Rejected> init();
+    [[nodiscard]] bool            heldNotReady() const;
+    // a work call runs this before it reads its ports; with nothing pending it reads one atomic flag; it returns the failed keys
+    Rejected applyStagedParameters() {
+        if (!_hasWork.load(std::memory_order_acquire)) [[likely]] {
+            return {};
+        }
+        return applyWhenDue();
+    }
+    // writes the block's metadata and described defaults from its declarations; checks nothing and calls no hook
+    void describe();
+    void moveState(settings::detail::BlockState state);
+    void markStarting(bool starting); // a start runs from its first step to its last
+    void endFields();                 // from the block's base destructor: no later call reads a reflected field
+    // a start or a resume up to the start hook: the changes held while the block did not run apply, and a start's
+    // check reads the whole state; returns that check's refusals
+    [[nodiscard]] Rejected beginRun(bool isStart);
+    // a scheduler's check of the block before any block of its graph starts: what holds the block not ready, else the
+    // check of the whole state with the changes waiting to apply; kept as the latest start's refusals
+    [[nodiscard]] Rejected checkStart();
+    // the end of a start or a resume: the block runs, or stays stopped for a refusal, or is in error when the start hook threw
+    void endRun(bool isStart, bool refused, std::optional<std::string> hookFailure);
+    // each key of the latest run with its outcome
+    [[nodiscard]] Values   runOutcome() const;
+    [[nodiscard]] Rejected runRefusals() const; // the latest start's check refusals and the start hook's throw
+    [[nodiscard]] bool     isRunning() const;
+    // a graph's block applies on its worker only while it runs; a start or a resume applies what waited meanwhile
+    [[nodiscard]] bool workerApplies() const;
+    void               attachGraph(settings::detail::GraphLink* link);
+    void               detachGraph(const settings::detail::GraphLink* link); // when `link` is the one attached
+    void               attachScheduler(settings::detail::SchedulerLink* link);
+    void               detachScheduler(settings::detail::SchedulerLink* link); // when `link` is the one attached
+    property_map       takeForwarded();
+    // the keys a saved graph writes: the record with the given keys waiting to apply over it; before `init()` the constructed values
+    [[nodiscard]] property_map savedValues() const;
+    [[nodiscard]] bool         hasWork() const noexcept { return _hasWork.load(std::memory_order_acquire); }
+
+    // the check and the merge in one hold of the block lock. `tagSets` names the keys a tag sets, which the merge leaves
+    // ungiven; it is null for any other source
+    [[nodiscard]] std::expected<settings::detail::Merged, Rejected> checkAndMerge(const property_map& changes, const KeySet* tagSets, bool reset);
+    // a tag's settings, each by its full key, and its reset mark; returns the refusals it notified
+    Rejected tagEnters(const property_map& coupled, bool resetDefaults);
+    // a tag as the stream carries it: each coupled key it holds, and its reset key
+    Rejected tagEnters(const property_map& tagMap);
+
+    // each refused key as an error notification, for a call no caller waits for
+    void notifyRefused(const Rejected& refused) const;
+
+private:
+    // the check takes the block's `Settings` filled from the proposal
+    [[nodiscard]] virtual bool                   hasCheckHook() const noexcept = 0;
+    [[nodiscard]] virtual std::optional<Refused> runCheckHook(const settings::detail::Proposal& /*proposal*/) const { return std::nullopt; }
+    [[nodiscard]] virtual bool                   hasApplyHook() const noexcept = 0;
+    // the apply hook takes the block's own `Settings`, and may take the `Settings` before the change. `changed` holds the
+    // keys whose value the batch changed. The values before the change are each written key's value a read returned in
+    // `previousValues`, else the field in `fieldsBefore`, which is null at the setup
+    [[nodiscard]] virtual bool applyTakesSettings() const noexcept { return false; }
+    virtual void               runSettingsApplyHook(const property_map& /*changed*/, const ValueMap& /*previousValues*/, const ValueMap* /*fieldsBefore*/) {}
+    // a merged block's path in place of the apply hook: each changed key at its value now in force goes to its members, and
+    // a key a member refuses or fails fails the merged block's key
+    [[nodiscard]] virtual std::expected<void, Rejected> runMembersApply(const property_map& /*changed*/) { return {}; }
+    virtual void                                        runResetHook() = 0;
+    // each writable setting of the block's `Settings` at the value a default-constructed `Settings` holds
+    [[nodiscard]] virtual ValueMap    structDefaults() const { return {}; }
+    virtual void                      publishStatus() {} // reads the block's `Status` and reports it
+    virtual void                      describeBlock() = 0;
+    [[nodiscard]] virtual bool        isSubgraph() const noexcept { return false; } // no work call reaches a subgraph's block
+    [[nodiscard]] virtual std::string uniqueName() const = 0;
+
+    // the block lock, taken unless this thread holds it already: a hook runs under the hold of its caller, and the calls
+    // it makes into its own block's settings go on under that hold
+    class BlockLock {
+        const SettingsBase& _settings;
+        bool                _owns = false;
+
+    public:
+        explicit BlockLock(const SettingsBase& settings) : _settings(settings) { lock(); }
+        // takes the lock only up to `deadline`, none for no bound; `held()` tells whether it did
+        BlockLock(const SettingsBase& settings, std::optional<std::chrono::steady_clock::time_point> deadline) : _settings(settings) { lockUntil(deadline); }
+        BlockLock(const BlockLock&)            = delete;
+        BlockLock& operator=(const BlockLock&) = delete;
+        ~BlockLock() { unlock(); }
+
+        void               lock();
+        bool               lockUntil(std::optional<std::chrono::steady_clock::time_point> deadline);
+        void               unlock();
+        [[nodiscard]] bool held() const noexcept { return _settings.holdsLock(); }
+    };
+
+    struct Threshold {
+        settings::NotificationLevel level = settings::NotificationLevel::warning;
+        bool                        quiet = false; // an inherited "off" marks the notification for the readers a host installed alone
+    };
+
+    [[nodiscard]] std::optional<pmt::Value> readField(const settings::detail::KeyRef& ref, std::string_view tagKey) const;
+    [[nodiscard]] bool                      writeField(const settings::detail::KeyRef& ref, std::string_view tagKey, const pmt::Value& value);
+    void                                    eraseField(const settings::detail::KeyRef& ref, std::string_view tagKey);
+    [[nodiscard]] ValueMap                  readFields(bool published) const;         // the published keys' fields, or every other key's
+    [[nodiscard]] bool                      fieldsHold(const ValueMap& values) const; // readFields(false) would return `values` without its published keys
+    void                                    rereadField(ValueMap& values, std::string_view key) const;
+    [[nodiscard]] ValueMap                  sourceBeforeInit() const;
+    void                                    eraseMembersPastCount(const settings::detail::KeyRef& countRef);
+    [[nodiscard]] KeySet                    writePublished();
+    [[nodiscard]] bool                      isPublishedKey(std::string_view key) const;
+    [[nodiscard]] std::optional<pmt::Value> heldValue(std::string_view key) const; // the value a read of the key returns
+    [[nodiscard]] bool                      holdsInForce(std::string_view tagKey, const pmt::Value& value) const;
+    void                                    storeDefaultsFrom(const ValueMap& values);
+    [[nodiscard]] std::string               tagKeyOrSent(std::string_view key) const;
+
+    [[nodiscard]] std::expected<void, Rejected> firstUse();
+    // the setup over the constructed values with `changes` over them, merged and applied with `store` when it passes
+    [[nodiscard]] settings::detail::SetUpVerdict setUpWith(const property_map& changes, bool store);
+    // a `set` or a `check` on a block that is not set up, judged whole as its setup; none when the block is set up meanwhile
+    [[nodiscard]] std::optional<std::expected<Values, Rejected>> setUpByCall(const property_map& changes, bool store);
+    // `check()` with each hold of the block lock taken up to `deadline`, none for no bound; a composite's set calls it on
+    // each inner block
+    [[nodiscard]] std::expected<void, Rejected> checkWithin(const property_map& changes, std::optional<std::chrono::steady_clock::time_point> deadline, std::chrono::steady_clock::time_point calledAt);
+    [[nodiscard]] Rejected                      applyWhenDue();
+    // under the block lock the caller holds through its merge, with the check hook
+    [[nodiscard]] std::expected<settings::detail::CheckedCall, Rejected> checkChanges(const property_map& changes);
+    // the check hook over the state `view` reads
+    [[nodiscard]] std::expected<void, Rejected> runCheck(const settings::CallView& view) const;
+    [[nodiscard]] Rejected                      wholeStateRefusals();                                                          // the check hook's over the pending changes and the values in force
+    [[nodiscard]] Rejected                      refusedDefaults(const KeySet& given) const;                                    // each declared default of a key not given that its own range refuses
+    [[nodiscard]] settings::detail::Merged      merge(const settings::detail::CheckedCall& checked, bool fromTag, bool reset); // in the hold of the check
+    [[nodiscard]] bool                          applyAtCall(const settings::detail::Merged& merged);
+    Rejected                                    apply();
+    [[nodiscard]] Values                        resultOf(std::uint64_t batch, const ValueMap& sent) const;
+    [[nodiscard]] std::optional<std::string>    failedReason(std::string_view key, std::uint64_t batch, const pmt::Value& sent) const;
+    [[nodiscard]] Values                        wait(const settings::detail::Merged& merged, std::optional<std::chrono::steady_clock::time_point> deadline);
+    void                                        wakeWaiters(); // under the block lock, after a change a waiting set() judges
+    // false for a call with `noWait` or a negative timeout, or on a scheduler's worker thread: it only tries the block lock
+    [[nodiscard]] bool waitsForLock(Timeout timeout) const;
+    // a call that does not wait found the block lock held: each key the declarations alone refuse refuses the call, else
+    // the keys go to the slot and return pending
+    [[nodiscard]] std::expected<Values, Rejected> slotChanges(const property_map& changes);
+    // under the block lock, before a merge, a read or an apply: the slot's keys checked and merged as one call; none
+    // before the setup or while an apply runs
+    void drainSlot();
+    void storeHasWork(bool hasWork); // under the slot lock, so a key the slot takes meanwhile keeps the flag raised
+    // the end of a set()'s wait for the block lock and for its apply: its timeout, or the scheduler's default for one
+    // that names none or does not wait; none past the clock's range
+    [[nodiscard]] std::optional<std::chrono::steady_clock::time_point>  lockDeadline(std::chrono::steady_clock::time_point calledAt, Timeout timeout) const;
+    [[nodiscard]] Rejected                                              lockTimedOut(const property_map& changes, std::chrono::steady_clock::time_point calledAt) const;
+    [[nodiscard]] Values                                                finish(const settings::detail::Merged& merged, std::chrono::steady_clock::time_point calledAt, Timeout timeout);
+    [[nodiscard]] std::expected<Values, Rejected>                       readOwn(std::span<const std::string> keys) const;
+    void                                                                notify(settings::NotificationLevel level, settings::NotificationKind what, std::string_view key, std::string_view reason) const;
+    [[nodiscard]] std::optional<Threshold>                              threshold() const;
+    [[nodiscard]] bool                                                  passes(settings::NotificationLevel level) const;
+    [[nodiscard]] bool                                                  onOwnThread() const noexcept;
+    [[nodiscard]] bool                                                  holdsLock() const noexcept;
+    [[nodiscard]] bool                                                  isSetUp() const;
+    [[nodiscard]] std::vector<std::pair<std::string_view, std::size_t>> unsizedCollectionSizes() const;                   // each reflected port collection no port key sizes, with its size
+    void                                                                restoreUnpublishedFields(const ValueMap& fields); // reports each reflected field in `fields` that differs from its value in force, and writes that value back
+    void                                                                failLater(std::string_view tagKey, std::string_view reason);
+    void                                                                failAtStart(std::string_view tagKey, std::string_view reason);
+};
+
+namespace settings::detail {
+
+// the framework's entry points on a block's settings, for the block, its graph and its scheduler; no caller's call
+struct FrameworkAccess {
+    static std::expected<void, Rejected> init(SettingsBase& settings) { return settings.init(); }
+    static Rejected                      applyStagedParameters(SettingsBase& settings) { return settings.applyStagedParameters(); }
+    static void                          describe(SettingsBase& settings) { settings.describe(); }
+    static void                          moveState(SettingsBase& settings, BlockState state) { settings.moveState(state); }
+    static bool                          isSetUp(const SettingsBase& settings) { return settings.isSetUp(); }
+    static void                          endFields(SettingsBase& settings) { settings.endFields(); }
+    static Rejected                      beginRun(SettingsBase& settings, bool isStart) { return settings.beginRun(isStart); }
+    static Rejected                      checkStart(SettingsBase& settings) { return settings.checkStart(); }
+    static void                          endRun(SettingsBase& settings, bool isStart, bool refused, std::optional<std::string> hookFailure) { settings.endRun(isStart, refused, std::move(hookFailure)); }
+    static Values                        runOutcome(const SettingsBase& settings) { return settings.runOutcome(); }
+    static Rejected                      runRefusals(const SettingsBase& settings) { return settings.runRefusals(); }
+    static bool                          isRunning(const SettingsBase& settings) { return settings.isRunning(); }
+    static bool                          workerApplies(const SettingsBase& settings) { return settings.workerApplies(); }
+    static void                          markStarting(SettingsBase& settings, bool starting) { settings.markStarting(starting); }
+    static void                          attachGraph(SettingsBase& settings, GraphLink* link) { settings.attachGraph(link); }
+    static void                          detachGraph(SettingsBase& settings, const GraphLink* link) { settings.detachGraph(link); }
+    static void                          attachScheduler(SettingsBase& settings, SchedulerLink* link) { settings.attachScheduler(link); }
+    static void                          detachScheduler(SettingsBase& settings, SchedulerLink* link) { settings.detachScheduler(link); }
+    static SchedulerLink*                schedulerLink(const SettingsBase& settings) noexcept { return settings._schedulerLink.load(std::memory_order_acquire); }
+    // the level key's value in force when it names a level, read without the block lock
+    static std::optional<NotificationLevel> ownLevel(const SettingsBase& settings) noexcept {
+        const std::uint8_t own = settings._ownLevel.load(std::memory_order_relaxed);
+        return own == SettingsBase::kNoLevel ? std::nullopt : std::optional(static_cast<NotificationLevel>(own));
+    }
+    static property_map        takeForwarded(SettingsBase& settings) { return settings.takeForwarded(); }
+    static const property_map& constructedWith(const SettingsBase& settings) noexcept { return settings._constructedWith; }
+    static property_map        savedValues(const SettingsBase& settings) { return settings.savedValues(); }
+    static bool                hasWork(const SettingsBase& settings) noexcept { return settings.hasWork(); }
+    static Rejected            tagEnters(SettingsBase& settings, const property_map& tagMap) { return settings.tagEnters(tagMap); }
+    // `composite` holds the parameters of the recipe composite whose own keys `settings` are, and outlives every call on them
+    static void                     attachComposite(SettingsBase& settings, CompositeSettings* composite) noexcept { settings._composite = composite; }
+    static std::vector<std::string> parameterNames(const SettingsBase& settings); // a recipe composite's parameters, else none
+
+    static void notifyRefused(const SettingsBase& settings, const Rejected& refused) { settings.notifyRefused(refused); }
+    static void notify(const SettingsBase& settings, NotificationLevel level, NotificationKind what, std::string_view key, std::string_view reason) { settings.notify(level, what, key, reason); }
+
+    // the block author's calls
+    static void publish(SettingsBase& settings, std::string_view key, pmt::Value value, std::string_view reason = {}) { settings.publish(key, std::move(value), reason); }
+    static void fail(SettingsBase& settings, std::string_view key, std::string_view reason) { settings.fail(key, reason); }
+    template<MemberName TMember>
+    static void fail(SettingsBase& settings, const TMember& member, std::string_view reason) {
+        settings.fail(keyNamed(settings._table, settings._block, member), reason);
+    }
+    // copies the block's `Status` for a host, on the block's own thread
+    static void copyStatus(SettingsBase& settings) { settings.copyStatus(); }
+    // a watcher follows the block's `Status`, or a host read a status value since the last copy; one relaxed load
+    [[nodiscard]] static bool statusWanted(const SettingsBase& settings) noexcept { return settings._statusWanted.load(std::memory_order_relaxed); }
+    // the block's next work call or message pass copies its `Status`
+    static void wantStatus(SettingsBase& settings) noexcept { settings._statusWanted.store(true, std::memory_order_relaxed); }
+    static bool isGiven(const SettingsBase& settings, std::string_view key) { return settings.isGiven(key); }
+    template<MemberName TMember>
+    static bool isGiven(const SettingsBase& settings, const TMember& member) {
+        return settings.isGiven(keyNamed(settings._table, settings._block, member));
+    }
+    static void forwardTag(SettingsBase& settings, std::string_view tagKey, pmt::Value value) { settings.forwardTag(tagKey, std::move(value)); }
+
+    // the framework's calls on a scheduler, private to it
+    template<typename TScheduler>
+    static void onSettingsRunning(TScheduler& scheduler, std::function<void()> signal) {
+        scheduler.onSettingsRunning(std::move(signal));
+    }
+    template<typename TScheduler>
+    static void returnStartValues(TScheduler& scheduler, bool returned) {
+        scheduler.returnStartValues(returned);
+    }
+    // the graph's call for a scheduler's start, private to the graph
+    template<typename TGraph>
+    static std::vector<std::string> blocksAddedWithoutInit(const TGraph& graph) {
+        return graph.blocksAddedWithoutInit();
+    }
+};
+
+/**
+ * @brief The scope of a work call of a block that holds `Status`: at its end the block's `Status` is copied for a host
+ * while a watcher follows it or a host read a status value since the last copy. The test is one load of one flag.
+ */
+struct StatusCopyAfterWork {
+    SettingsBase& settings;
+
+    explicit StatusCopyAfterWork(SettingsBase& blockSettings) noexcept : settings(blockSettings) {}
+    StatusCopyAfterWork(const StatusCopyAfterWork&)            = delete;
+    StatusCopyAfterWork& operator=(const StatusCopyAfterWork&) = delete;
+    ~StatusCopyAfterWork() {
+        if (FrameworkAccess::statusWanted(settings)) [[unlikely]] {
+            FrameworkAccess::copyStatus(settings);
+        }
+    }
+};
+
+/**
+ * @brief The scope of one lifecycle hook of a normal block. On the block's own thread it marks that thread and copies
+ * the block's `Status` when the hook returns. A blocking block's stop and pause hooks run on the scheduler's thread
+ * while a worker may be inside the work call: the block's next work call or message pass copies their values instead.
+ */
+struct LifecycleHook {
+    std::optional<OwnThread> mark{};
+    SettingsBase&            settings;
+
+    LifecycleHook(SettingsBase& blockSettings, bool onOwnThread) noexcept : settings(blockSettings) {
+        if (onOwnThread) {
+            mark.emplace(blockSettings);
+        }
+    }
+    LifecycleHook(const LifecycleHook&)            = delete;
+    LifecycleHook& operator=(const LifecycleHook&) = delete;
+    ~LifecycleHook() {
+        if (mark) {
+            FrameworkAccess::copyStatus(settings);
+        } else {
+            FrameworkAccess::wantStatus(settings);
+        }
+    }
+};
+
+template<std::size_t kCount>
+OwnThreads<kCount>::~OwnThreads() {
+    for (std::size_t member = 0UZ; member < _nMarked; ++member) {
+        if (FrameworkAccess::statusWanted(*_members[member])) [[unlikely]] {
+            FrameworkAccess::copyStatus(*_members[member]);
+        }
     }
 }
 
-template<typename T>
-constexpr bool isReadableMember() {
-    auto isReadableImmutable = [] {
-        if constexpr (gr::meta::is_immutable<T>{}) {
-            return isReadableMember<typename T::value_type>();
-        } else if constexpr (is_annotated<T>{}) {
-            return isReadableMember<typename T::value_type>();
+} // namespace settings::detail
 
+} // namespace gr
+
+namespace gr::settings {
+
+namespace detail {
+
+// a type that names a member, whatever its signature, makes `&Probe<T>::name` ambiguous
+struct HookNames {
+    int settingsChanged;
+    int applySettings;
+    int checkSettings;
+};
+template<typename T>
+struct HookNameProbe : T, HookNames {};
+
+// a final type takes no probe, so it is tested by the member's address, which misses an overloaded or templated member
+template<typename T>
+concept NamesSettingsChanged = std::is_class_v<T> && ((std::is_final_v<T> && requires { &T::settingsChanged; }) || (!std::is_final_v<T> && !requires { &HookNameProbe<T>::settingsChanged; }));
+template<typename T>
+concept NamesApplySettings = std::is_class_v<T> && ((std::is_final_v<T> && requires { &T::applySettings; }) || (!std::is_final_v<T> && !requires { &HookNameProbe<T>::applySettings; }));
+template<typename T>
+concept NamesCheckSettings = std::is_class_v<T> && ((std::is_final_v<T> && requires { &T::checkSettings; }) || (!std::is_final_v<T> && !requires { &HookNameProbe<T>::checkSettings; }));
+
+template<typename TBlock>
+concept CheckTakesSettingsStruct = requires { static_cast<std::optional<Refused> (TBlock::*)(const typename TBlock::Settings&) const>(&TBlock::checkSettings); };
+
+template<typename TBlock>
+concept ApplyTakesNothing = requires { static_cast<void (TBlock::*)()>(&TBlock::applySettings); };
+template<typename TBlock>
+concept ApplyTakesSettings = requires { static_cast<void (TBlock::*)(typename TBlock::Settings&)>(&TBlock::applySettings); } || requires { static_cast<void (TBlock::*)(const typename TBlock::Settings&)>(&TBlock::applySettings); };
+template<typename TBlock>
+concept ApplyTakesSettingsAndOld = requires { static_cast<void (TBlock::*)(typename TBlock::Settings&, const typename TBlock::Settings&)>(&TBlock::applySettings); } || requires { static_cast<void (TBlock::*)(const typename TBlock::Settings&, const typename TBlock::Settings&)>(&TBlock::applySettings); };
+
+// a scheduler's apply of the keys every scheduler holds, run before the scheduler's own apply hook
+template<typename TBlock>
+concept AppliesSchedulerSettings = requires(TBlock& scheduler, const typename TBlock::Settings& settings) { scheduler.applySchedulerSettings(settings, settings); };
+
+// a merged block's own path, which hands the changed keys to its members and returns the keys they refuse or fail
+template<typename TBlock>
+concept AppliesToMembers = requires(TBlock& merged, const property_map& changed) {
+    { merged.applyToMembers(changed) } -> std::same_as<std::expected<void, Rejected>>;
+};
+
+} // namespace detail
+
+template<typename TBlock>
+concept HasSettingsCheck = detail::CheckTakesSettingsStruct<TBlock>;
+
+template<typename TBlock>
+concept HasSettingsApply = detail::ApplyTakesSettings<TBlock> || detail::ApplyTakesSettingsAndOld<TBlock>;
+
+template<typename TBlock>
+concept HasSettingsReset = requires(TBlock& block) { block.reset(); };
+
+/**
+ * @brief The settings of one block of type TBlock: its declarations, its fields and its hooks.
+ *
+ * Both hooks need the block to reflect one member of type `Settings`, whatever its name. The check hook runs on the
+ * caller's thread under the block's settings lock: `std::optional<gr::Refused> checkSettings(const Settings& s) const`.
+ * Core may call it often, for a `check` that stores nothing as for a `set`: it reads its argument alone, changes nothing
+ * in the block, and returns quickly; the compiler refuses one that is not `const`. The settings hook runs on the
+ * applying thread under that lock: `void applySettings(Settings& s)` or `void applySettings(Settings& s, const Settings& old)`, with `s` const
+ * where the hook assigns nothing. `s` is the block's own member, which holds the new values; `old` holds the values
+ * before them, and at the setup the declared defaults. For the hook's call `s.x.changed()` tells whether the batch
+ * changed the `Annotated` setting `x`; at the setup every setting is changed. Each hook is optional, and `reset()` runs
+ * after a reset's defaults apply. A rule about values lives in the check hook, which refuses the whole call before a
+ * write; the apply hook fails a key, by `fail` or a throw, only where doing the thing fails. A throw from the check is
+ * its refusal naming no setting, with the thrown message; one from the apply fails each key the call changed. On a
+ * scheduler the core's `applySchedulerSettings()` applies the keys of `SchedulerSettings` before the scheduler's hook.
+ */
+template<typename TBlock>
+struct BlockSettingsOf : SettingsBase {
+private:
+    TBlock&               _block;
+    std::shared_ptr<void> _statusCopied{}; // the block's `Status` as reported last, held by pointer since `TBlock` is incomplete here
+
+public:
+    explicit BlockSettingsOf(TBlock& block, property_map constructedWith = {}) : SettingsBase(detail::declarationTable<TBlock>(), std::addressof(block), describedMapOf(block), std::move(constructedWith)), _block(block) {
+        static_assert(!detail::NamesSettingsChanged<TBlock>, "the settings hook is `applySettings`, and a member named settingsChanged is no hook");
+        static_assert(!detail::ApplyTakesNothing<TBlock>, "the settings hook takes the block's settings, as `void applySettings(Settings& s)` or `void applySettings(Settings& s, const Settings& old)`");
+        static_assert(!detail::NamesApplySettings<TBlock> || HasSettingsApply<TBlock> || detail::ApplyTakesNothing<TBlock>, "the settings hook is `void applySettings(Settings& s)` or `void applySettings(Settings& s, const Settings& old)`, with `s` const where it assigns nothing");
+        static_assert(!HasSettingsApply<TBlock> || detail::holdsSettingsStruct<TBlock>(), "an apply hook that takes `Settings& s` needs the block to reflect a member of type `Settings`");
+        static_assert(!detail::NamesCheckSettings<TBlock> || HasSettingsCheck<TBlock>, "the check hook is `std::optional<gr::Refused> checkSettings(const Settings& s) const`");
+        static_assert(!detail::CheckTakesSettingsStruct<TBlock> || detail::holdsSettingsStruct<TBlock>(), "a check that takes `const Settings& s` needs the block to reflect a member of type `Settings`");
+    }
+
+    // the settings of a block moved to `newOwner`, taken from the settings of the block it moved from
+    BlockSettingsOf(TBlock& newOwner, BlockSettingsOf&& other) noexcept : SettingsBase(std::move(other), std::addressof(newOwner), describedMapOf(newOwner)), _block(newOwner), _statusCopied(std::move(other._statusCopied)) {}
+
+private:
+    static property_map* describedMapOf(TBlock& block) {
+        if constexpr (DescribedBlock<TBlock>) {
+            return std::addressof(block.describedSettings);
+        } else {
+            return nullptr;
+        }
+    }
+
+    [[nodiscard]] bool hasCheckHook() const noexcept override { return HasSettingsCheck<TBlock>; }
+
+    [[nodiscard]] bool isSubgraph() const noexcept override {
+        if constexpr (requires { TBlock::blockCategory; }) {
+            using Category = std::remove_cvref_t<decltype(TBlock::blockCategory)>;
+            return TBlock::blockCategory == Category::TransparentBlockGroup;
         } else {
             return false;
+        }
+    }
+
+    [[nodiscard]] bool hasApplyHook() const noexcept override { return HasSettingsApply<TBlock> || detail::AppliesSchedulerSettings<TBlock> || detail::AppliesToMembers<TBlock>; }
+
+    [[nodiscard]] std::expected<void, settings::Rejected> runMembersApply([[maybe_unused]] const property_map& changed) override {
+        if constexpr (detail::AppliesToMembers<TBlock>) {
+            return _block.applyToMembers(changed);
+        } else {
+            return {};
+        }
+    }
+
+    [[nodiscard]] std::optional<Refused> runCheckHook([[maybe_unused]] const detail::Proposal& proposal) const override {
+        if constexpr (detail::CheckTakesSettingsStruct<TBlock>) {
+            return checkProposedStruct(proposal);
+        } else {
+            return std::nullopt;
+        }
+    }
+
+    // the check judges a `Settings` filled from the proposal, the state the call would put in force, never a copy of the
+    // block's own `Settings`; a refusal that names a member of the copy names the block's own member
+    [[nodiscard]] std::optional<Refused> checkProposedStruct(const detail::Proposal& proposal) const {
+        typename TBlock::Settings proposed{};
+        detail::forEachFlatMember<TBlock>([&proposal, &proposed]<typename TMember>(TMember) {
+            if constexpr (TMember::kInStruct && !TMember::kInStatus) {
+                using RawType = std::remove_cvref_t<typename TMember::Type>;
+                using Type    = std::remove_cv_t<typename detail::FieldValue<unwrap_if_wrapped_t<RawType>>::type>;
+                if constexpr (detail::kIsSettingField<Type> && !std::is_const_v<typename TMember::Type> && !gr::meta::is_immutable<RawType>::value) {
+                    if (const std::optional<pmt::Value> value = proposal.after(TMember::kName.view()); value) {
+                        std::ignore = detail::writeMember(TMember::inStruct(proposed), *value);
+                    }
+                }
+            }
+        });
+        std::optional<Refused> refused = std::as_const(_block).checkSettings(std::as_const(proposed));
+        if (!refused) {
+            return refused;
+        }
+        for (Refused::Entry& entry : refused->entries) {
+            detail::forEachFlatMember<TBlock>([this, &entry, &proposed]<typename TMember>(TMember) {
+                if constexpr (TMember::kInStruct && !TMember::kInStatus) {
+                    if (entry.field == std::addressof(TMember::inStruct(proposed))) {
+                        entry.field = std::addressof(TMember::of(_block));
+                    }
+                }
+            });
+        }
+        return refused;
+    }
+
+    [[nodiscard]] bool applyTakesSettings() const noexcept override { return HasSettingsApply<TBlock> || detail::AppliesSchedulerSettings<TBlock>; }
+
+    void runSettingsApplyHook([[maybe_unused]] const property_map& changed, [[maybe_unused]] const settings::ValueMap& previousValues, [[maybe_unused]] const settings::ValueMap* fieldsBefore) override {
+        if constexpr ((HasSettingsApply<TBlock> || detail::AppliesSchedulerSettings<TBlock>) && detail::holdsSettingsStruct<TBlock>()) {
+            typename TBlock::Settings& own = detail::settingsStructOf(_block);
+            const ChangedForHook       marks(own, fieldsBefore == nullptr ? nullptr : &changed);
+            if constexpr (detail::ApplyTakesSettingsAndOld<TBlock> || detail::AppliesSchedulerSettings<TBlock>) {
+                const typename TBlock::Settings old = settingsBefore(previousValues, fieldsBefore);
+                if constexpr (detail::AppliesSchedulerSettings<TBlock>) {
+                    _block.applySchedulerSettings(own, old);
+                }
+                if constexpr (detail::ApplyTakesSettingsAndOld<TBlock>) {
+                    _block.applySettings(own, old);
+                } else if constexpr (HasSettingsApply<TBlock>) {
+                    _block.applySettings(own);
+                }
+            } else {
+                _block.applySettings(own);
+            }
+        }
+    }
+
+    // each `Annotated` setting of `own` reads changed for the life of the object: all of them for a null `changed`, else
+    // those `changed` names. The flags clear when the hook returns or throws. `TSettings` is `TBlock::Settings`, named
+    // as a template parameter since `TBlock` is incomplete where the class is instantiated
+    template<typename TSettings>
+    struct ChangedForHook {
+        TSettings& own;
+
+        ChangedForHook(TSettings& ownSettings, const property_map* changed) : own(ownSettings) {
+            markChanged(own, [changed](std::string_view key) { return changed == nullptr || changed->contains(key); });
+        }
+        ChangedForHook(const ChangedForHook&)            = delete;
+        ChangedForHook& operator=(const ChangedForHook&) = delete;
+        ~ChangedForHook() {
+            markChanged(own, [](std::string_view) { return false; });
         }
     };
-    // TODO(follow-up PR): remove pmt::Value as settings type — it erases type information, prevents validation, and complicates GRC YAML serialisation
-    return std::is_arithmetic_v<T> || std::is_same_v<T, std::string> || std::is_same_v<T, std::pmr::string> || isSupportedVectorOrTensorType<T>() || std::is_same_v<T, property_map> //
-           || std::is_same_v<T, std::complex<double>> || std::is_same_v<T, std::complex<float>> || std::is_enum_v<T> || std::is_same_v<T, pmt::Value> || isReadableImmutable();
-}
 
-template<typename T, typename TMember>
-constexpr bool isWritableMember() {
-    return isReadableMember<T>() && !std::is_const_v<T> && !std::is_const_v<TMember> && !gr::meta::is_immutable<TMember>{};
-}
-
-inline constexpr uint64_t convertTimePointToUint64Ns(const std::chrono::time_point<std::chrono::system_clock>& tp) {
-    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(tp.time_since_epoch()).count();
-    return static_cast<uint64_t>(ns);
-}
-
-inline auto nullMatchPred = [](auto, auto, auto) { return std::nullopt; };
-
-} // namespace settings
-
-struct ApplyStagedParametersResult {
-    property_map forwardParameters; // parameters that should be forwarded to dependent child blocks
-    property_map appliedParameters;
-    property_map failedParameters; // staged values the block's setter or its settingsChanged() rejected -- neither applied nor forwarded
-    std::string  refusal;          // the block, the key, the value and the reason of each failed parameter; empty when none failed
-    std::string  tagRefusal;       // the part of `refusal` whose values a tag staged, the set of a context a gr:context tag activates included
-    std::string  untaggedRefusal;  // the rest of `refusal`: values setStaged(), a reset or a context activated other than by a tag staged
-};
-
-namespace detail {
-
-#if defined(__EMSCRIPTEN__) || (defined(__APPLE__) && defined(__aarch64__))
-template<typename TValue>
-auto castToGrSizeIfNeeded(const TValue& value) {
-    if constexpr (std::is_same_v<TValue, std::size_t>) {
-        return static_cast<gr::Size_t>(value);
-    } else {
-        return value;
-    }
-};
-#else
-template<typename TValue>
-auto castToGrSizeIfNeeded(const TValue& value) {
-    return value;
-};
-#endif
-
-template<typename T>
-auto unwrap_decorated_value(const T& value) {
-    if constexpr (AnnotatedType<T>) {
-        return castToGrSizeIfNeeded(value.value);
-    } else if constexpr (meta::ImmutableType<T>) {
-        return castToGrSizeIfNeeded(value.value());
-    } else {
-        return castToGrSizeIfNeeded(value);
-    }
-}
-
-template<typename T>
-const auto& unwrap_decorated_reference(const T& value) {
-    if constexpr (AnnotatedType<T>) {
-        return value.value;
-    } else if constexpr (meta::ImmutableType<T>) {
-        return value.value();
-    } else {
-        return value;
-    }
-};
-
-template<typename TCollection>
-auto collectionToTensor(const TCollection& collection) {
-    using TValue       = typename TCollection::value_type;
-    using TTensorValue = std::conditional_t<std::is_same_v<std::string, TValue> || std::is_same_v<std::pmr::string, TValue>, pmt::Value, TValue>;
-    Tensor<TTensorValue> result(extents_from, {collection.size()});
-    std::ranges::copy(collection, result.begin());
-    return result;
-}
-
-template<typename T, typename U = unwrap_if_wrapped_t<std::remove_cvref_t<T>>>
-constexpr bool isEnumOrAnnotatedEnum = std::is_enum_v<U>;
-
-template<typename T>
-requires isEnumOrAnnotatedEnum<T>
-std::expected<T, std::string> tryExtractEnumValue(const pmt::Value& pmt, std::string_view key) {
-
-    auto str = pmt.value_or(std::string_view{});
-    if (str.data() == nullptr) {
-        return std::unexpected(std::format("Field '{}' expects enum string, got different type", key));
-    }
-
-    if (auto opt = gr::meta::parseEnum<T>(str); opt.has_value()) {
-        return *opt;
-    }
-
-    return std::unexpected(std::format("Invalid enum value '{}' for key '{}'", str, key));
-}
-
-template<typename T, typename U = std::remove_cvref_t<T>>
-requires isEnumOrAnnotatedEnum<U>
-std::string enumToString(T&& enum_value) {
-    if constexpr (is_annotated<U>()) {
-        return std::string(gr::meta::enumName(enum_value.value).value_or(""));
-    } else {
-        return std::string(gr::meta::enumName(enum_value).value_or(""));
-    }
-}
-
-} // namespace detail
-
-/**
- * @brief a concept verifying whether a processing block optionally provides a `settingsChanged` callback to react to
- * block configuration changes and/or to influence forwarded downstream parameters.
- *
- * Implementers may have:
- * 1. `settingsChanged(oldSettings, newSettings)`
- * 2. `settingsChanged(oldSettings, newSettings, forwardSettings)`
- *    - where `forwardSettings` is for influencing subsequent blocks. E.g., a decimating block might adjust the `sample_rate` for downstream blocks.
- *
- * `newSettings` names only the settings whose value moved, each under its new value; `oldSettings` holds all of the
- * block's settings as they were before, and a batch that moves no value does not call back. Activating another
- * context is an event rather than a value change: it always calls back and always names the newly active context
- * under `gr::tag::CONTEXT`, whether or not any value moved with it.
- *
- * The callback refuses every value in `newSettings` by throwing. Each member named in `newSettings` then takes back its
- * value from `oldSettings`, and `settings().get()` returns that value. When `set()` left a refused value in the stored
- * set the batch was applied from, that set takes the value from `oldSettings` as well. A context that the batch
- * activates, or that the callback activates before it throws, keeps its stored set as it is. When the callback refuses
- * a batch that activates another context, the context active before the activation is active again. A batch that
- * `removeContext()` staged keeps the context it falls back to. When `removeContext()` removed the context active before
- * the activation, the default context is active instead. A reset activates the default context: when the callback
- * refuses a batch with a reset, the context active before the batch is active again. Each coupled setting then follows
- * its tag key only when it did before the reset, even when the callback called `setTagCouplings()` before it threw. The
- * refusal puts back which settings follow their keys; a coupling table the callback wrote with `setTagCouplings()`
- * stays. A set the callback stored with `set()` stays, and its keys decide which settings follow. A member whose limits
- * refuse its value from `oldSettings` keeps the refused value. A `gr:context` tag stages the context it activates and
- * the values of that context's stored set. When tags alone staged every value in `newSettings`, the apply returns the
- * refusal in `refusal` and `tagRefusal`, as it returns a tag value the limits refuse. Otherwise the exception reaches
- * the caller.
- */
-template<typename BlockType>
-concept HasSettingsChangedCallback = requires(BlockType* block, const property_map& oldSettings, property_map& newSettings) {
-    { block->settingsChanged(oldSettings, newSettings) };
-} or requires(BlockType* block, const property_map& oldSettings, property_map& newSettings, property_map& forwardSettings) {
-    { block->settingsChanged(oldSettings, newSettings, forwardSettings) };
-};
-
-/**
- * @brief a concept verifying whether a processing block optionally provides a `reset` callback to react to
- * block reset requests (being called after the settings have been reverted(.
- */
-template<typename TBlock>
-concept HasSettingsResetCallback = requires(TBlock* block) {
-    { block->reset() };
-};
-
-namespace settings {
-/**
- * @brief Convert the given `value` to type `T`. If conversion fails or return diagnostic text.
- */
-template<typename T>
-[[nodiscard]] std::expected<T, std::string> convertParameter(std::string_view key, const pmt::Value& value) {
-    if constexpr (std::is_enum_v<T>) {
-        return detail::tryExtractEnumValue<T>(value, key);
-    } else {
-        if constexpr (std::is_same_v<T, std::string> || std::is_same_v<T, std::pmr::string>) {
-            auto sv = value.value_or(std::string_view{});
-            if (sv.data()) {
-                return T(sv);
-            } else {
-                return std::unexpected(std::format("value {} for key '{}' has wrong type {} {}, needs {}", value, key, value.value_type(), value.container_type(), std::string(meta::type_name<T>())));
-            }
-
-        } else if constexpr (meta::array_or_vector_type<T>) {
-            using TValue      = typename T::value_type;
-            using TTensorElem = std::conditional_t<std::is_same_v<TValue, std::string> || std::is_same_v<TValue, std::pmr::string>, pmt::Value, TValue>;
-
-            // an untagged YAML list parses to a sequence of type-erased values, and each element of such
-            // a sequence converts by the rule of a scalar setting of the element type
-            if constexpr (!std::is_same_v<TTensorElem, pmt::Value>) {
-                if (const auto* elements = value.get_if<Tensor<pmt::Value>>(); elements != nullptr) {
-                    T converted;
-                    if constexpr (meta::array_type<T>) {
-                        if (elements->size() != std::tuple_size_v<T>) {
-                            return std::unexpected(std::format("tensor size {} does not match array size {}", elements->size(), std::tuple_size_v<T>));
-                        }
-                    } else {
-                        converted.resize(elements->size());
-                    }
-                    auto out = converted.begin();
-                    for (const pmt::Value& element : *elements) {
-                        const auto elementValue = pmt::convert_safely<TValue>(element);
-                        if (!elementValue) {
-                            return std::unexpected(std::format("element {} of key '{}' does not convert to {}: {}", element, key, std::string(meta::type_name<TValue>()), elementValue.error()));
-                        }
-                        *out++ = *elementValue;
-                    }
-                    return converted;
-                }
-            }
-
-            const auto* tensorValue = value.get_if<Tensor<TTensorElem>>();
-            if (!tensorValue) {
-                return std::unexpected(std::format("Value {} is not a tensor of {}", value, meta::type_name<TTensorElem>()));
-            }
-            T converted;
-            if constexpr (meta::array_type<T>) {
-                if (tensorValue->size() != std::tuple_size_v<T>) {
-                    return std::unexpected(std::format("tensor size {} does not match array size {}", tensorValue->size(), std::tuple_size_v<T>));
-                }
-            } else {
-                converted.resize(tensorValue->size());
-            }
-            if constexpr (std::is_same_v<TValue, std::string> || std::is_same_v<TValue, std::pmr::string>) {
-                std::ranges::transform(*tensorValue, converted.begin(), [](const pmt::Value& in) { return TValue(in.value_or(std::string_view{})); });
-            } else {
-                std::ranges::copy(*tensorValue, converted.begin());
-            }
-            return converted;
-
-        } else {
-            constexpr bool strictChecks = false;
-            auto           converted    = pmt::convert_safely<T, strictChecks>(value);
-            if (!converted) {
-                return std::unexpected(std::format("value {} for key '{}' has wrong type {} {}, needs {}", value, key, value.value_type(), value.container_type(), std::string(meta::type_name<T>())));
-            }
-            return *converted;
-        }
-    }
-}
-
-} // namespace settings
-
-namespace detail {
-// Free templates (not CtxSettings<TBlock>::) so the bodies instantiate once per Type
-// instead of once per (TBlock, Type). Deliberately not `inline`: an explicit instantiation
-// declaration does not suppress the implicit instantiation of an inline function, and the
-// list at the end of this header exists to keep these bodies out of every block's TU.
-template<typename Type>
-std::optional<std::string> setParameterImpl(std::string_view key, const pmt::Value& value, property_map& newParameters) {
-    if (auto convertedValue = settings::convertParameter<Type>(key, value); convertedValue) [[likely]] {
-        const auto keyStr = std::pmr::string(key);
-        if constexpr (detail::isEnumOrAnnotatedEnum<Type>) {
-            newParameters.insert_or_assign(keyStr, detail::enumToString(convertedValue.value()));
-        } else if constexpr (meta::array_or_vector_type<Type>) {
-            newParameters.insert_or_assign(keyStr, pmt::Value(detail::collectionToTensor(*convertedValue)));
-        } else {
-            newParameters.insert_or_assign(keyStr, detail::castToGrSizeIfNeeded(convertedValue.value()));
-        }
-        return std::nullopt;
-    } else {
-        return convertedValue.error();
-    }
-}
-
-// the Tensor<pmt::Value> that set() stages for a list-of-strings setting, from a Tensor<std::pmr::string> or from a
-// Tensor<pmt::Value> of strings; nothing for any other value
-[[nodiscard]] std::optional<Tensor<pmt::Value>> stagedStringList(const pmt::Value& value);
-
-template<typename Type>
-bool autoUpdateImpl(std::string_view key, const pmt::Value& value, const std::set<std::string>& autoUpdateParams, property_map& stagedParameters) {
-    const auto keyStr = std::string(key);
-    if (!autoUpdateParams.contains(keyStr)) {
-        return false;
-    }
-    const auto keyPmr = std::pmr::string(key);
-    if constexpr (std::is_enum_v<Type>) {
-        if (value.holds<std::string>()) {
-            stagedParameters.insert_or_assign(keyPmr, value);
-            return true;
-        }
-#if defined(__EMSCRIPTEN__) || (defined(__APPLE__) && defined(__aarch64__))
-    } else if constexpr (std::is_same_v<Type, std::size_t> && !std::is_same_v<std::size_t, gr::Size_t>) {
-        if (value.holds<gr::Size_t>()) {
-            stagedParameters.insert_or_assign(keyPmr, value);
-            return true;
-        }
-#endif
-    } else if constexpr (std::is_same_v<Type, std::string> || std::is_same_v<Type, std::pmr::string>) {
-        if (value.holds<std::pmr::string>()) {
-            stagedParameters.insert_or_assign(keyPmr, value);
-            return true;
-        }
-    } else if constexpr (meta::array_or_vector_type<Type>) {
-        using TValue = typename Type::value_type;
-        if constexpr (std::is_same_v<TValue, std::string> || std::is_same_v<TValue, std::pmr::string>) {
-            if (auto list = stagedStringList(value); list.has_value()) {
-                stagedParameters.insert_or_assign(keyPmr, std::move(*list));
-                return true;
-            }
-            return false;
-        } else if (value.holds<Tensor<TValue>>()) {
-            auto converted = pmt::convertTo<Tensor<TValue>>(value);
-            if (converted.has_value()) {
-                stagedParameters.insert_or_assign(keyPmr, std::move(*converted));
-                return true;
-            }
-            return false;
-        }
-    } else {
-        if (value.holds<Type>()) {
-            stagedParameters.insert_or_assign(keyPmr, value);
-            return true;
-        }
-        if constexpr (std::is_arithmetic_v<Type> && !std::is_same_v<Type, bool>) {
-            if (const auto converted = pmt::convert_numerically<Type>(value); converted) {
-                stagedParameters.insert_or_assign(keyPmr, detail::castToGrSizeIfNeeded(*converted));
-                return true;
-            }
-        }
-    }
-    return false;
-}
-} // namespace detail
-
-namespace settings {
-
-/**
- * @brief Convert a staged `pmt::Value` to the member type `Type` on the apply path.
- *
- * One instantiation per member type, shared by every block declaring a member of that type,
- * rather than one per (block, member).
- */
-template<typename Type>
-[[nodiscard]] std::expected<Type, std::string> extractStagedValue(const pmt::Value& stagedValue, std::string_view key) {
-    std::expected<Type, std::string> maybeValue;
-    if constexpr (std::is_enum_v<Type>) {
-        maybeValue = detail::tryExtractEnumValue<Type>(stagedValue, key);
-    } else if constexpr (std::is_same_v<Type, std::string> || std::is_same_v<Type, std::pmr::string>) {
-        auto str = stagedValue.value_or(std::string_view{});
-        if (str.data() != nullptr) {
-            maybeValue = Type(str);
-        } else {
-            maybeValue = std::unexpected("Unexpected type in stagedValue");
-        }
-    } else if constexpr (meta::array_or_vector_type<Type>) {
-        using TValue       = typename Type::value_type;
-        using TTensorValue = std::conditional_t<std::is_same_v<std::string, TValue> || std::is_same_v<std::pmr::string, TValue>, pmt::Value, TValue>;
-        auto tensor        = checked_access_ptr<const Tensor<TTensorValue>, false>{stagedValue.get_if<Tensor<TTensorValue>>()};
-        if (tensor != nullptr) {
-            maybeValue = settings::convertParameter<Type>(key, stagedValue);
-        } else {
-            maybeValue = std::unexpected("Unexpected type in stagedValue");
-        }
-#if defined(__EMSCRIPTEN__) || (defined(__APPLE__) && defined(__aarch64__))
-    } else if constexpr (std::is_same_v<Type, std::size_t> && !std::is_same_v<std::size_t, gr::Size_t>) {
-        auto ptr = checked_access_ptr<const gr::Size_t, false>{stagedValue.get_if<gr::Size_t>()};
-        if (ptr != nullptr) {
-            maybeValue = static_cast<std::size_t>(*ptr);
-        } else {
-            maybeValue = std::unexpected("Unexpected type in stagedValue");
-        }
-#endif
-    } else {
-        auto ptr = checked_access_ptr<const Type, false>{stagedValue.get_if<Type>()};
-        if (ptr != nullptr) {
-            maybeValue = *ptr;
-        } else {
-            maybeValue = std::unexpected("Unexpected type in stagedValue");
-        }
-    }
-    return maybeValue;
-}
-
-// the type-independent tail of the apply path, compiled once in Settings.cpp
-[[nodiscard]] bool recordAppliedValue(std::string_view key, const pmt::Value& stagedValue, property_map& appliedParameters, property_map& stagedForCallback, bool hasSettingsChangedCallback);
-
-/**
- * @brief One reflected member of a block, as the compiled settings machinery sees it.
- *
- * The accessors reach the block through an erased pointer, so the only code a block type
- * contributes per member is the accessor pair; everything that reads this table is compiled
- * once in Settings.cpp. A null accessor means the member does not take part in that path:
- * `setParameter`/`autoUpdate`/`applyStaged` are set for writable members, `readParameter`
- * for readable ones.
- */
-struct MemberDescriptor {
-    using MemberAddress     = void* (*)(void* block);
-    using ParameterSetter   = std::optional<std::string> (*)(std::string_view key, const pmt::Value& value, property_map& newParameters);
-    using AutoUpdateHandler = bool (*)(std::string_view key, const pmt::Value& value, const std::set<std::string>& autoUpdateParams, property_map& stagedParameters);
-    using StagedApplier     = bool (*)(void* member, std::string_view key, const pmt::Value& stagedValue, property_map& appliedParameters, property_map& stagedForCallback, bool hasSettingsChangedCallback);
-    using ParameterReader   = void (*)(const void* member, std::string_view key, property_map& parameters);
-    using TypeNameReader    = std::string (*)();
-    using LimitsCheck       = std::optional<std::string> (*)(std::string_view key, const pmt::Value& value);
-
-    std::string_view name{};
-
-    /// the block type's only per-member contribution: where the member sits inside the block
-    MemberAddress address{nullptr};
-
-    ParameterSetter   setParameter{nullptr};
-    AutoUpdateHandler autoUpdate{nullptr};
-    StagedApplier     applyStaged{nullptr};
-    ParameterReader   readParameter{nullptr};
-
-    /// set for a writable member with `Limits<>`: the reason when the value converts and the limits refuse it
-    LimitsCheck refuseByLimits{nullptr};
-
-    bool             isAnnotated{false};
-    std::string_view description{};
-    std::string_view documentation{};
-    std::string_view unit{};
-    bool             visible{false};
-
-    bool                              isEnum{false};
-    TypeNameReader                    enumTypeName{nullptr};
-    std::span<const std::string_view> enumValueNames{};
-};
-
-/**
- * @brief What a block type contributes to the settings machinery beyond its member list:
- * the optional user callbacks and the framework members reached through them.
- */
-struct BlockHooks {
-    using MetaInformationAccessor = property_map& (*)(void* block);
-    using DescriptionReader       = std::string_view (*)(const void* block);
-    using NameReader              = std::string_view (*)(const void* block);
-    using SettingsChangedInvoker  = void (*)(void* block, property_map& oldSettings, property_map& newSettings, property_map& forwardSettings);
-    using ResetInvoker            = void (*)(void* block);
-
-    std::span<const MemberDescriptor> members{};
-    bool                              reflectable{false};
-
-    MetaInformationAccessor metaInformation{nullptr};
-    DescriptionReader       blockDescription{nullptr};
-    NameReader              blockName{nullptr};
-    SettingsChangedInvoker  settingsChanged{nullptr};
-    ResetInvoker            reset{nullptr};
-};
-
-/**
- * @brief The per-block-type settings table: the reflected member list, the block's hooks and
- * the lookups derived from them once. One instance per block type, reached through
- * `settings::blockDescriptor<TBlock>()`.
- */
-struct BlockDescriptor {
-    explicit BlockDescriptor(const BlockHooks& blockHooks);
-
-    BlockHooks                                                    hooks;
-    std::set<std::string>                                         writableMembers{};
-    std::unordered_map<std::string_view, const MemberDescriptor*> writableByName{};
-    std::vector<const MemberDescriptor*>                          readableMembers{};
-};
-
-} // namespace settings
-
-namespace detail {
-
-/// the only thing a block type contributes per member: a pointer adjustment, reflected once.
-/// const-qualified reflected members are read-only by the writable-member gate, so no writer
-/// ever reaches this address and shedding the qualifier here cannot enable a mutation
-template<typename TBlock, std::size_t kIdx>
-void* memberAddress(void* block) {
-    return const_cast<void*>(static_cast<const void*>(std::addressof(refl::data_member<kIdx>(*static_cast<TBlock*>(block)))));
-}
-
-template<typename RawType, typename Type>
-bool applyStagedMember(void* memberPointer, std::string_view key, const pmt::Value& stagedValue, property_map& appliedParameters, property_map& stagedForCallback, bool hasSettingsChangedCallback) {
-    RawType& member = *static_cast<RawType*>(memberPointer);
-
-    std::expected<Type, std::string> maybeValue = settings::extractStagedValue<Type>(stagedValue, key);
-
-    if constexpr (is_annotated<RawType>()) {
-        if (maybeValue && member.validate_and_set(*maybeValue)) {
-            return settings::recordAppliedValue(key, stagedValue, appliedParameters, stagedForCallback, hasSettingsChangedCallback);
-        }
-        return false;
-    } else {
-        if (!maybeValue) {
-            return false;
-        }
-        member = *maybeValue;
-        return settings::recordAppliedValue(key, stagedValue, appliedParameters, stagedForCallback, hasSettingsChangedCallback);
-    }
-}
-
-/// the reason a refusal gives for a value the limits refuse
-template<typename TLimit>
-std::string describeLimits() {
-    constexpr bool kHasValidator = !std::is_null_pointer_v<std::remove_cv_t<decltype(TLimit::ValidatorFunc)>>;
-    if constexpr (TLimit::MinRange == TLimit::MaxRange) {
-        return "refused by its validator";
-    } else if constexpr (kHasValidator) {
-        return std::format("outside the limits [{}, {}] or refused by its validator", TLimit::MinRange, TLimit::MaxRange);
-    } else {
-        return std::format("outside the limits [{}, {}]", TLimit::MinRange, TLimit::MaxRange);
-    }
-}
-
-template<typename RawType, typename Type>
-std::optional<std::string> refuseByLimits(std::string_view key, const pmt::Value& value) {
-    using Limit                                      = typename RawType::LimitType;
-    const std::expected<Type, std::string> converted = settings::convertParameter<Type>(key, value);
-    if (!converted || Limit::validate(*converted)) {
-        return std::nullopt;
-    }
-    return describeLimits<Limit>();
-}
-
-template<typename RawType, typename Type>
-void readMember(const void* memberPointer, std::string_view key, property_map& parameters) {
-    const auto     keyPmr = std::pmr::string(key);
-    const RawType& member = *static_cast<const RawType*>(memberPointer);
-    if constexpr (detail::isEnumOrAnnotatedEnum<RawType>) {
-        parameters.insert_or_assign(keyPmr, detail::enumToString(member));
-    } else if constexpr (meta::array_or_vector_type<Type>) {
-        parameters.insert_or_assign(keyPmr, pmt::Value(detail::collectionToTensor(detail::unwrap_decorated_reference(member))));
-    } else {
-        parameters.insert_or_assign(keyPmr, detail::unwrap_decorated_value(member));
-    }
-}
-
-template<typename TBlock>
-property_map& blockMetaInformation(void* block) {
-    auto& metaInformation = static_cast<TBlock*>(block)->meta_information;
-    if constexpr (AnnotatedType<std::remove_cvref_t<decltype(metaInformation)>>) {
-        return metaInformation.value;
-    } else {
-        return metaInformation;
-    }
-}
-
-template<typename TBlock>
-std::string_view readBlockDescription(const void* block) {
-    return detail::unwrap_decorated_reference(static_cast<const TBlock*>(block)->description);
-}
-
-template<typename TBlock>
-std::string_view readBlockName(const void* block) {
-    return detail::unwrap_decorated_reference(static_cast<const TBlock*>(block)->name);
-}
-
-template<typename TBlock>
-void invokeSettingsChanged(void* block, property_map& oldSettings, property_map& newSettings, [[maybe_unused]] property_map& forwardSettings) {
-    TBlock* self = static_cast<TBlock*>(block);
-    if constexpr (requires { self->settingsChanged(oldSettings, newSettings); }) {
-        self->settingsChanged(oldSettings, newSettings);
-    } else if constexpr (requires { self->settingsChanged(oldSettings, newSettings, forwardSettings); }) {
-        self->settingsChanged(oldSettings, newSettings, forwardSettings);
-    }
-}
-
-template<typename TBlock>
-void invokeReset(void* block) {
-    static_cast<TBlock*>(block)->reset();
-}
-
-} // namespace detail
-
-namespace settings {
-
-template<typename TEnum>
-inline constexpr auto kEnumValueNames = [] {
-    constexpr auto                              values = gr::meta::enumValues<TEnum>();
-    std::array<std::string_view, values.size()> names{};
-    for (std::size_t i = 0UZ; i < values.size(); ++i) {
-        names[i] = gr::meta::enumName(values[i]).value_or(std::string_view{});
-    }
-    return names;
-}();
-
-template<typename TBlock>
-inline constexpr auto kMemberDescriptors = [] {
-    std::array<MemberDescriptor, refl::data_member_count<TBlock>> table{};
-    if constexpr (refl::reflectable<TBlock>) {
-        refl::for_each_data_member_index<TBlock>([&table](auto kIdx) {
-            using MemberType = refl::data_member_type<TBlock, kIdx>;
-            using RawType    = std::remove_cvref_t<MemberType>;
-            using Type       = unwrap_if_wrapped_t<RawType>;
-
-            MemberDescriptor& entry = table[kIdx];
-            entry.name              = refl::data_member_name<TBlock, kIdx>.view();
-            entry.address           = &detail::memberAddress<TBlock, kIdx>;
-
-            if constexpr (settings::isReadableMember<Type>()) {
-                entry.readParameter = &detail::readMember<RawType, Type>;
-            }
-            if constexpr (settings::isWritableMember<Type, MemberType>()) {
-                entry.setParameter = &detail::setParameterImpl<Type>;
-                entry.autoUpdate   = &detail::autoUpdateImpl<Type>;
-                entry.applyStaged  = &detail::applyStagedMember<RawType, Type>;
-                if constexpr (AnnotatedType<RawType>) {
-                    if constexpr (!std::is_same_v<typename RawType::LimitType, EmptyLimit>) {
-                        entry.refuseByLimits = &detail::refuseByLimits<RawType, Type>;
-                    }
-                }
-            }
-            if constexpr (AnnotatedType<RawType>) {
-                entry.isAnnotated   = true;
-                entry.description   = RawType::description();
-                entry.documentation = RawType::documentation();
-                entry.unit          = RawType::unit();
-                entry.visible       = RawType::visible();
-            }
-            if constexpr (std::is_enum_v<Type>) {
-                entry.isEnum         = true;
-                entry.enumTypeName   = &gr::meta::type_name<Type>;
-                entry.enumValueNames = std::span<const std::string_view>(kEnumValueNames<Type>);
+    template<typename TSettings>
+    static void markChanged(TSettings& own, auto isChanged) {
+        detail::forEachFlatMember<TBlock>([&own, &isChanged]<typename TMember>(TMember) {
+            if constexpr (TMember::kInStruct && !TMember::kInStatus && AnnotatedType<std::remove_cvref_t<typename TMember::Type>> && !std::is_const_v<std::remove_reference_t<typename TMember::Type>>) {
+                TMember::inStruct(own)._changed = isChanged(TMember::kName.view());
             }
         });
     }
-    return table;
-}();
 
-template<typename TBlock>
-[[nodiscard]] constexpr BlockHooks makeBlockHooks() {
-    BlockHooks hooks;
-    hooks.members     = std::span<const MemberDescriptor>(kMemberDescriptors<TBlock>);
-    hooks.reflectable = refl::reflectable<TBlock>;
-
-    constexpr bool hasMetaInformation = requires(TBlock block) {
-        {
-            unwrap_if_wrapped_t<decltype(block.meta_information)> {}
-        } -> std::same_as<property_map>;
-    };
-    if constexpr (hasMetaInformation) {
-        hooks.metaInformation = &detail::blockMetaInformation<TBlock>;
-        if constexpr (requires(TBlock block) { block.description; }) {
-            hooks.blockDescription = &detail::readBlockDescription<TBlock>;
+    // the `Settings` the block held before the change, converted from the values the apply restores on a throw; the
+    // declared defaults at the setup
+    [[nodiscard]] static auto settingsBefore(const settings::ValueMap& previousValues, const settings::ValueMap* fieldsBefore) {
+        typename TBlock::Settings old{};
+        if (fieldsBefore == nullptr) {
+            return old;
         }
+        detail::forEachFlatMember<TBlock>([&previousValues, fieldsBefore, &old]<typename TMember>(TMember) {
+            if constexpr (TMember::kInStruct && !TMember::kInStatus) {
+                using RawType = std::remove_cvref_t<typename TMember::Type>;
+                using Type    = std::remove_cv_t<typename detail::FieldValue<unwrap_if_wrapped_t<RawType>>::type>;
+                if constexpr (detail::kIsSettingField<Type> && !std::is_const_v<typename TMember::Type> && !gr::meta::is_immutable<RawType>::value) {
+                    const std::string_view key      = TMember::kName.view();
+                    const auto             previous = previousValues.find(key);
+                    const auto             field    = fieldsBefore->find(key);
+                    if (previous != previousValues.end()) {
+                        assignStored(TMember::inStruct(old), previous->second);
+                    } else if (field != fieldsBefore->end()) {
+                        assignStored(TMember::inStruct(old), field->second);
+                    }
+                }
+            }
+        });
+        return old;
     }
-    if constexpr (requires(const TBlock& block) {
-                      { detail::unwrap_decorated_reference(block.name) } -> std::convertible_to<std::string_view>;
-                  }) {
-        hooks.blockName = &detail::readBlockName<TBlock>;
-    }
-    if constexpr (HasSettingsChangedCallback<TBlock>) {
-        hooks.settingsChanged = &detail::invokeSettingsChanged<TBlock>;
-    }
-    if constexpr (HasSettingsResetCallback<TBlock>) {
-        hooks.reset = &detail::invokeReset<TBlock>;
-    }
-    return hooks;
-}
 
-template<typename TBlock>
-[[nodiscard]] const BlockDescriptor& blockDescriptor() {
-    static const BlockDescriptor descriptor{makeBlockHooks<TBlock>()};
-    return descriptor;
-}
-
-} // namespace settings
-
-struct SettingsBase {
-    struct CtxSettingsPair {
-        SettingsCtx  context;
-        property_map settings;
-    };
-    virtual ~SettingsBase() = default;
-
-    /**
-     * @brief returns if there are stored settings that haven't been applied yet.
-     */
-    [[nodiscard]] virtual bool changed() const noexcept    = 0;
-    virtual void               setChanged(bool b) noexcept = 0;
-
-    /**
-     * @brief Set initial parameters provided in the Block constructor to ensure they are available during Settingd::init()
-     */
-    virtual void setInitBlockParameters(const property_map& parameters) = 0;
-
-    /**
-     * @brief initialize settings, set init parameters provided in the Block constructor
-     */
-    virtual void init() = 0;
-
-    /**
-     * @brief Add new key-value pairs to stored parameters.
-     * N.B. settings become staged after calling activateContext(), and after executing 'applyStagedParameters()' settings are applied (usually done early on in the 'Block::work()' function)
-     * Throws for a value that does not convert to the member's type. Throws for a value outside the limits, with a
-     * message that names the block, the key, the value and the limits. Throws for a new context once the block stores
-     * kMaxContexts, and for a set at a later time once its context holds kMaxPendingSets of them.
-     * @return key-value pairs that could not be set
-     */
-    [[nodiscard]] virtual property_map set(const property_map& parameters, SettingsCtx ctx = {}) = 0;
-
-    /**
-     * @brief Add new key-value pairs to stagedParameters. The changes do not affect storedParameters.
-     * @return key-value pairs that could not be set
-     */
-    [[nodiscard]] virtual property_map setStaged(const property_map& parameters) = 0;
-
-    virtual void storeDefaults() = 0;
-    virtual void resetDefaults() = 0;
-
-    /**
-     * @brief return the name of the active context
-     */
-    [[nodiscard]] virtual const SettingsCtx& activeContext() const noexcept = 0;
-
-    /**
-     * @brief removes the given context
-     * @return true on success
-     */
-    [[nodiscard]] virtual bool removeContext(SettingsCtx ctx) = 0;
-
-    /**
-     * @brief Set new activate context and set staged parameters
-     * @return best match context or std::nullopt if best match context is not found in storage
-     */
-    [[nodiscard]] virtual std::optional<SettingsCtx> activateContext(SettingsCtx ctx = {}) = 0;
-
-    /**
-     * @brief stages the value of each tag key a setting is coupled to, for the settings in `autoUpdateParameters()`
-     *
-     * A `gr:reset_default` or `gr:store_default` key stages a reset or a store. A context key switches the context.
-     */
-    virtual void autoUpdate(const Tag& tag) = 0;
-
-    /**
-     * @brief couples settings to tag keys
-     *
-     * Each entry maps a setting's name to a tag key, `domain:name`, held as a string. A tag that carries the key sets
-     * the setting. An empty key removes the setting's coupling. A setting follows at most one key, and one key may
-     * set several settings. An entry for a coupled setting replaces its key. The table belongs to the block: it holds
-     * in every context, and a reset leaves it as it is.
-     *
-     * A coupled setting follows its key from this call on, whatever set it before. The values the block's `init()`
-     * applies leave it following. A later `set()` of the setting stops it following until a reset. A reset makes
-     * every coupled setting follow again, in every context. A reset that `settingsChanged()` refuses leaves each
-     * setting following as before, unless the callback stored a set with `set()`: that set stays, and its keys decide
-     * which settings follow.
-     *
-     * Throws for a name that is not a writable setting, a key that is not a string, a malformed key, and a key the
-     * framework acts on itself (`gr::tag::kControlKeys`). The message names the entry, and the table is left as it
-     * was.
-     */
-    virtual void setTagCouplings(const property_map& couplings) = 0;
-
-    /// the coupled settings, each mapped to its tag key as a string
-    [[nodiscard]] virtual property_map tagCouplings() const = 0;
-
-    /**
-     * @brief return all (or for selected multiple keys) available active block settings as key-value pairs
-     */
-    [[nodiscard]] virtual property_map get(std::span<const std::string> parameter_keys = {}) const noexcept = 0;
-
-    /**
-     * @brief return available active block setting as key-value pair for a single key
-     */
-    [[nodiscard]] virtual std::optional<pmt::Value> get(const std::string& parameter_key) const noexcept = 0;
-
-    /**
-     * @brief return all (or for selected multiple keys) stored block settings for provided context as key-value pairs
-     */
-    [[nodiscard]] virtual std::optional<property_map> getStored(std::span<const std::string> parameterKeys = {}, SettingsCtx ctx = {}) const noexcept = 0;
-
-    /**
-     * @brief return available stored block setting for provided context as key-value pair for a single key
-     */
-    [[nodiscard]] virtual std::optional<pmt::Value> getStored(const std::string& parameter_key, SettingsCtx ctx = {}) const noexcept = 0;
-
-    /**
-     * @brief return number of all sets of stored parameters
-     */
-    [[nodiscard]] virtual gr::Size_t getNStoredParameters() const noexcept = 0;
-
-    /**
-     * @brief return number of sets of auto update parameters
-     */
-    [[nodiscard]] virtual gr::Size_t getNAutoUpdateParameters() const noexcept = 0;
-
-    /**
-     * @brief return _storedParameters
-     */
-    [[nodiscard]] virtual std::map<pmt::Value, std::vector<CtxSettingsPair>, settings::PMTCompare> getStoredAll() const noexcept = 0;
-
-    /**
-     * @brief returns the staged/not-yet-applied new parameters
-     */
-    [[nodiscard]] virtual property_map stagedParameters() const = 0;
-
-    /**
-     * @brief the member names set() and loadParametersFromPropertyMap() accept
-     *
-     * A block's readable members are a superset of these: input_chunk_size, output_chunk_size and stride
-     * are const unless the block is declared Resampling<>/Stride<>, and unique_name is immutable. A
-     * consumer writing parameters out for someone else to read back needs to know which is which.
-     */
-    [[nodiscard]] virtual const std::set<std::string>& writableMembers() const = 0;
-
-    /// the member names get() reports and a stored context holds: the writable members and the read-only ones
-    [[nodiscard]] virtual std::set<std::string> readableMembers() const = 0;
-
-    [[nodiscard]] virtual std::set<std::string> autoUpdateParameters(SettingsCtx ctx = {}) noexcept = 0;
-
-    [[nodiscard]] virtual property_map defaultParameters() const noexcept = 0;
-
-    [[nodiscard]] virtual property_map activeParameters() const noexcept = 0;
-
-    /**
-     * @brief synchronise map-based with actual block field-based settings
-     * returns map with key-value tags that should be forwarded
-     * to dependent/child blocks.
-     */
-    [[nodiscard]] virtual ApplyStagedParametersResult applyStagedParameters() = 0;
-
-    /**
-     * @brief synchronises the map-based with the block's field-based parameters
-     * (N.B. usually called after the staged parameters have been synchronised)
-     */
-    virtual void updateActiveParameters() noexcept = 0;
-
-    /**
-     * @brief Loads parameters from a property_map by matching pmt keys to TBlock's writable data members.
-     * Handles type conversion and special cases, such as std::vector<bool>.
-     */
-    virtual void loadParametersFromPropertyMap(const property_map& parameters, SettingsCtx ctx = {}) = 0;
-
-}; // struct SettingsBase
-
-/**
- * @brief Non-templated implementation of the settings machinery.
- *
- * The owning block is reached through an erased pointer and its reflected members through
- * `settings::BlockDescriptor`, so every body below is compiled once in `Settings.cpp` rather
- * than instantiated per block type.
- */
-class CtxSettingsBase : public SettingsBase {
-public:
-    using MatchPredicate = std::function<std::optional<bool>(const pmt::Value&, const pmt::Value&, std::size_t)>;
-
-protected:
-    void*                            _block      = nullptr;
-    const settings::BlockDescriptor* _descriptor = nullptr;
-
-    mutable bool       _changed{false};
-    mutable std::mutex _mutex{};
-
-    // key: SettingsCtx.context, value: queue of parameters with the same SettingsCtx.context but for different time
-    mutable std::map<pmt::Value, std::vector<CtxSettingsPair>, settings::PMTCompare> _storedParameters{};
-    property_map                                                                     _defaultParameters{};
-    property_map                                                                     _initBlockParameters{};
-    std::map<SettingsCtx, std::set<std::string>>                                     _autoUpdateParameters{};
-    MatchPredicate                                                                   _matchPred = settings::nullMatchPred;
-    SettingsCtx                                                                      _activeCtx{};
-    bool                                                                             _contextActivated{false};   ///< set when `_activeCtx.context` moved, consumed by the next apply
-    std::optional<SettingsCtx>                                                       _contextBeforeActivation{}; ///< active before the first activation since the last apply; a refused apply makes it active again while the activated context is still active
-    std::optional<std::map<SettingsCtx, std::set<std::string>>>                      _autoUpdateBeforeReset{};   ///< the keys that followed tags in each set before a reset made every coupled setting follow; a refused apply puts them back
-    property_map                                                                     _stagedParameters{};
-    std::set<std::string, std::less<>>                                               _taggedKeys{};   ///< the keys of `_stagedParameters` whose value a tag staged last, and `context` when a tag activated a context
-    std::map<std::string, std::string, std::less<>>                                  _tagCouplings{}; ///< setting name to the tag key that sets it
-    property_map                                                                     _activeParameters{};
-
-    const std::size_t _timePrecisionTolerance = 100; // ns, now used for emscripten
-
-    CtxSettingsBase(void* block, const settings::BlockDescriptor& descriptor) noexcept;
-
-public:
-    // Settings configuration
-    std::uint64_t expiry_time{std::numeric_limits<std::uint64_t>::max()};
-
-    static constexpr std::size_t kMaxContexts    = 256UZ; ///< the most context names a block stores, the default context included
-    static constexpr std::size_t kMaxPendingSets = 16UZ;  ///< the most sets one context holds for a time after now
-
-    [[nodiscard]] const std::set<std::string>& writableMembers() const override;
-    [[nodiscard]] std::set<std::string>        readableMembers() const override;
-
-    [[nodiscard]] bool changed() const noexcept override;
-    void               setChanged(bool b) noexcept override;
-    void               setInitBlockParameters(const property_map& parameters) override;
-
-    void init() override;
-
-    [[nodiscard]] const SettingsCtx& activeContext() const noexcept override;
-
-    [[nodiscard]] property_map defaultParameters() const noexcept override;
-    [[nodiscard]] property_map activeParameters() const noexcept override;
-
-    [[nodiscard]] property_map              get(std::span<const std::string> parameterKeys = {}) const noexcept override;
-    [[nodiscard]] std::optional<pmt::Value> get(const std::string& parameterKey) const noexcept override;
-
-    [[nodiscard]] std::optional<property_map> getStored(std::span<const std::string> parameterKeys = {}, SettingsCtx ctx = {}) const noexcept override;
-    [[nodiscard]] std::optional<pmt::Value>   getStored(const std::string& parameterKey, SettingsCtx ctx = {}) const noexcept override;
-
-    [[nodiscard]] gr::Size_t getNStoredParameters() const noexcept override;
-    [[nodiscard]] gr::Size_t getNAutoUpdateParameters() const noexcept override;
-
-    [[nodiscard]] std::map<pmt::Value, std::vector<CtxSettingsPair>, settings::PMTCompare> getStoredAll() const noexcept override;
-
-    [[nodiscard]] property_map stagedParameters() const override;
-
-    [[nodiscard]] std::set<std::string> autoUpdateParameters(SettingsCtx ctx = {}) noexcept override;
-
-    [[nodiscard]] property_map set(const property_map& parameters, SettingsCtx ctx = {}) override;
-    [[nodiscard]] property_map setStaged(const property_map& parameters) override;
-
-    void storeDefaults() override;
-    void resetDefaults() override;
-
-    [[nodiscard]] std::optional<SettingsCtx> activateContext(SettingsCtx ctx = {}) override;
-    [[nodiscard]] bool                       removeContext(SettingsCtx ctx) override;
-
-    void autoUpdate(const Tag& tag) override;
-
-    void                       setTagCouplings(const property_map& couplings) override;
-    [[nodiscard]] property_map tagCouplings() const override;
-
-    [[nodiscard]] ApplyStagedParametersResult applyStagedParameters() override;
-
-    void updateActiveParameters() noexcept override;
-
-    /// copies the named members into the map that `get()` returns and returns the number of members copied.
-    /// A block calls this on the thread that writes those members, for example from its work function. The other
-    /// members keep the values the map last took for them. A key that names no readable member copies nothing.
-    /// The next applied change notifies the subscribers to the settings.
-    std::size_t updateActiveParameters(std::initializer_list<std::string_view> keys) noexcept;
-
-    void loadParametersFromPropertyMap(const property_map& parameters, SettingsCtx ctx = {}) override;
-
-    void assignFrom(const CtxSettingsBase& other);
-    void assignFrom(CtxSettingsBase&& other) noexcept;
-
-protected:
-    // *Impl bodies run without taking _mutex, for callers that already hold it
-    // a refusal names the block by `blockName`, or by its own name when that is empty
-    [[nodiscard]] property_map setImpl(const property_map& parameters, SettingsCtx ctx, std::string_view blockName = {});
-    [[nodiscard]] property_map setStagedImpl(const property_map& parameters);
-    struct ResetDefaultsResult {
-        property_map failedParameters; // the defaults the limits or the members refuse
-        bool         refused = false;  // the limits refused a default, and nothing was stored or applied
-    };
-    // checks the defaults against their limits, then stores and applies them. The caller runs the block's reset() once, after its whole change is applied
-    // reentrantLock is the caller's hold on _mutex, released around settingsChanged() as in applyStagedParametersImpl()
-    [[nodiscard]] ResetDefaultsResult resetDefaultsImpl(std::unique_lock<std::mutex>& reentrantLock);
-    // checks the defaults against their limits, then stores them and activates the default context, which stages
-    // the defaults a reset restores. It returns the defaults the limits refuse; with any refused, nothing is stored
-    // or staged.
-    [[nodiscard]] property_map stageDefaultsImpl();
-    // reentrantLock is the caller's hold on _mutex; the apply releases it around settingsChanged() and reset()
-    [[nodiscard]] ApplyStagedParametersResult          applyStagedParametersImpl(std::unique_lock<std::mutex>& reentrantLock);
-    void                                               updateActiveParametersImpl() noexcept;
-    void                                               storeCurrentParameters(property_map& parameters);
-    [[nodiscard]] bool                                 isActiveValueImpl(const std::pmr::string& key, const pmt::Value& value) const;
-    [[nodiscard]] std::optional<SettingsCtx>           activateContextImpl(SettingsCtx ctx);
-    [[nodiscard]] bool                                 removeContextImpl(SettingsCtx ctx);
-    [[nodiscard]] std::optional<pmt::Value>            findBestMatchCtx(const pmt::Value& contextToSearch) const;
-    [[nodiscard]] std::optional<SettingsCtx>           findBestMatchSettingsCtx(const SettingsCtx& ctx) const;
-    [[nodiscard]] std::optional<SettingsCtx>           findCurrentDefaultCtx() const; // the default context's set that activating it picks now
-    [[nodiscard]] std::optional<property_map>          getBestMatchStoredParameters(const SettingsCtx& ctx) const;
-    [[nodiscard]] std::optional<std::set<std::string>> getBestMatchAutoUpdateParameters(const SettingsCtx& ctx) const;
-    void                                               resolveDuplicateTimestamp(SettingsCtx& ctx);
-    void                                               addStoredParameters(const property_map& newParameters, const SettingsCtx& ctx);
-    void                                               removeExpiredStoredParameters();
-    [[nodiscard]] std::optional<std::string>           contextInTag(const Tag& tag) const;
-    [[nodiscard]] std::optional<std::uint64_t>         contextTimeInTag(const Tag& tag) const;
-    [[nodiscard]] std::optional<SettingsCtx>           createSettingsCtxFromTag(const Tag& tag) const;
-    [[nodiscard]] std::string                          describeRefusal(std::string_view key, const pmt::Value& value, std::string_view blockName = {}) const;
-    [[nodiscard]] std::string                          describeRefusals(const property_map& refused) const;
-    // writes the values in `oldSettings` back to the members `refused` names, and to the stored set of `batchCtx`, the context active when the batch was applied, where it holds the refused value
-    void restoreRefusedImpl(const property_map& refused, const property_map& oldSettings, const SettingsCtx& batchCtx, bool contextActivated);
-    // on a refusal: makes `earlier` active while `refused` is still active, or the default context when no set of `earlier`'s context is stored; a record of `refused` takes the same context
-    void restoreContextImpl(const SettingsCtx& earlier, const SettingsCtx& refused);
-}; // class CtxSettingsBase
-
-/**
- * @brief The typed face of the settings machinery: it binds a block to its
- * `settings::BlockDescriptor` and checks the block's optional callback signatures. All behavior
- * lives in `CtxSettingsBase`.
- */
-template<typename TBlock>
-class CtxSettings : public CtxSettingsBase {
-public:
-    [[nodiscard]] static const std::set<std::string>& allWritableMembers() { return settings::blockDescriptor<TBlock>().writableMembers; }
-
-    explicit CtxSettings(TBlock& block, MatchPredicate matchPred = settings::nullMatchPred) noexcept : CtxSettingsBase(std::addressof(block), settings::blockDescriptor<TBlock>()) {
-        _matchPred = std::move(matchPred);
-        if constexpr (requires { &TBlock::settingsChanged; }) { // if settingsChanged is defined
-            static_assert(HasSettingsChangedCallback<TBlock>, "if provided, settingsChanged must have either a `(const property_map& old, property_map& new, property_map& fwd)`"
-                                                              "or `(const property_map& old, property_map& new)` paremeter signatures.");
+    // a value in force holds the field's own type, so a list of the field's element type is copied once, unchecked;
+    // any other value converts as a write converts it
+    template<typename TMember>
+    static void assignStored(TMember& member, const pmt::Value& stored) {
+        using Type = unwrap_if_wrapped_t<std::remove_cvref_t<TMember>>;
+        if constexpr (gr::meta::vector_type<Type> && requires { stored.get_if<Tensor<typename Type::value_type>>(); }) {
+            if (const Tensor<typename Type::value_type>* list = stored.get_if<Tensor<typename Type::value_type>>(); list != nullptr) {
+                if constexpr (AnnotatedType<std::remove_cvref_t<TMember>>) {
+                    member.value.assign(list->begin(), list->end());
+                } else {
+                    member.assign(list->begin(), list->end());
+                }
+                return;
+            }
         }
+        std::ignore = detail::writeMember(member, stored);
+    }
 
-        if constexpr (requires { &TBlock::reset; }) { // if reset is defined
-            static_assert(HasSettingsResetCallback<TBlock>, "if provided, reset() may have no function parameters");
+    [[nodiscard]] settings::ValueMap structDefaults() const override {
+        settings::ValueMap defaults;
+        if constexpr (detail::holdsSettingsStruct<TBlock>()) {
+            const typename TBlock::Settings constructed{};
+            detail::forEachFlatMember<TBlock>([&constructed, &defaults]<typename TMember>(TMember) {
+                if constexpr (TMember::kInStruct && !TMember::kInStatus) {
+                    using RawType = std::remove_cvref_t<typename TMember::Type>;
+                    using Type    = std::remove_cv_t<typename detail::FieldValue<unwrap_if_wrapped_t<RawType>>::type>;
+                    if constexpr (detail::kIsSettingField<Type> && !std::is_const_v<typename TMember::Type> && !gr::meta::is_immutable<RawType>::value) {
+                        defaults.insert_or_assign(std::string(TMember::kName.view()), detail::storedValue(detail::undecorated(TMember::inStruct(constructed))));
+                    }
+                }
+            });
+        }
+        return defaults;
+    }
+
+    void runResetHook() override {
+        if constexpr (HasSettingsReset<TBlock>) {
+            _block.reset();
         }
     }
 
-    // Not safe as CtxSettings has a pointer back to the block
-    // that owns it
-    CtxSettings(const CtxSettings& other)            = delete;
-    CtxSettings(CtxSettings&& other)                 = delete;
-    CtxSettings& operator=(const CtxSettings& other) = delete;
-    CtxSettings& operator=(CtxSettings&& other)      = delete;
+    // the block's member of its type `Status`
+    [[nodiscard]] static const auto& statusOf(const TBlock& block) {
+        constexpr std::size_t kIdx = static_cast<std::size_t>(std::ranges::find(detail::kOuterKinds<TBlock>, detail::OuterKind::status) - detail::kOuterKinds<TBlock>.begin());
+        return refl::data_member<kIdx>(block);
+    }
 
-    CtxSettings(TBlock& block, const CtxSettings& other) : CtxSettingsBase(std::addressof(block), settings::blockDescriptor<TBlock>()) { assignFrom(other); }
+    // the status values that differ from their copy in `copied`, each then copied there; a type without `==` counts as
+    // changed; a not-a-number that stays one, alone, in a list or in a complex number, does not. A value the block gave by
+    // `publish()` on an unchanged key of its `Status` stays
+    void collectChangedStatus(auto& copied, std::vector<detail::StatusValue>& values) {
+        detail::forEachFlatMember<TBlock>([this, &copied, &values]<typename TMember>(TMember) {
+            using Type = std::remove_cv_t<typename detail::FieldValue<unwrap_if_wrapped_t<std::remove_cvref_t<typename TMember::Type>>>::type>;
+            if constexpr (TMember::kInStatus && detail::kIsSettingField<Type>) {
+                const auto& now    = TMember::of(std::as_const(_block));
+                auto&       before = TMember::inStruct(copied);
+                if constexpr (std::equality_comparable<std::remove_cvref_t<decltype(detail::undecorated(now))>>) {
+                    if (detail::sameNumber(detail::undecorated(now), detail::undecorated(before))) {
+                        return;
+                    }
+                }
+                values.push_back(detail::StatusValue{.key = TMember::kName.view(), .value = detail::storedValue(detail::undecorated(now))});
+                before = now;
+            }
+        });
+    }
 
-    CtxSettings(TBlock& block, CtxSettings&& other) noexcept : CtxSettingsBase(std::addressof(block), settings::blockDescriptor<TBlock>()) { assignFrom(std::move(other)); }
-}; // class CtxSettings
+    // every status value of the block
+    void collectStatus(std::vector<detail::StatusValue>& values) const {
+        detail::forEachFlatMember<TBlock>([this, &values]<typename TMember>(TMember) {
+            using Type = std::remove_cv_t<typename detail::FieldValue<unwrap_if_wrapped_t<std::remove_cvref_t<typename TMember::Type>>>::type>;
+            if constexpr (TMember::kInStatus && detail::kIsSettingField<Type>) {
+                values.push_back(detail::StatusValue{.key = TMember::kName.view(), .value = detail::storedValue(detail::undecorated(TMember::of(std::as_const(_block))))});
+            }
+        });
+    }
 
-} // namespace gr
+    // reports the status values that changed since the copy before, and every value at the first copy. The members are
+    // compared in their own types: an unchanged `Status` costs no conversion to a `pmt::Value`, no allocation and no lock
+    void publishStatus() override {
+        if constexpr (detail::holdsStatusStruct<TBlock>()) {
+            using Status = typename TBlock::Status;
+            std::vector<detail::StatusValue> values;
+            if constexpr (std::is_copy_constructible_v<Status> && std::is_copy_assignable_v<Status>) {
+                if (_statusCopied == nullptr) {
+                    _statusCopied = std::make_shared<Status>(statusOf(_block));
+                    collectStatus(values);
+                } else {
+                    collectChangedStatus(*static_cast<Status*>(_statusCopied.get()), values);
+                }
+            } else {
+                collectStatus(values);
+            }
+            if (!values.empty()) {
+                reportStatus(values);
+            }
+        }
+    }
 
-/**
- * The settings machinery a member contributes depends on the member's TYPE, never on the block
- * declaring it, so the four leaves below are compiled once in Settings.cpp for the types the
- * framework and the block library actually use. Every block reflects the eight members
- * `Block<>` declares on its behalf, so without this list every block's translation unit paid
- * for the bool/string/property_map/Size_t conversion tier again.
- *
- * The list is an optimization, not a contract: a member of an unlisted type instantiates its
- * leaves in the using translation unit exactly as before.
- */
-// clang-format off
-#define GR_SETTINGS_MEMBER_TYPES \
-    X(bool)                      \
-    X(std::int8_t)               \
-    X(std::int16_t)              \
-    X(std::int32_t)              \
-    X(std::int64_t)              \
-    X(std::uint8_t)              \
-    X(std::uint16_t)             \
-    X(std::uint32_t)             \
-    X(std::uint64_t)             \
-    X(float)                     \
-    X(double)                    \
-    X(std::complex<float>)       \
-    X(std::complex<double>)      \
-    X(std::string)               \
-    X(std::pmr::string)          \
-    X(gr::property_map)
+    void describeBlock() override { detail::describe(_block); }
 
-namespace gr {
-
-#define X(T)                                                                                                                       \
-    extern template std::optional<std::string> detail::setParameterImpl<T>(std::string_view, const pmt::Value&, property_map&);     \
-    extern template bool detail::autoUpdateImpl<T>(std::string_view, const pmt::Value&, const std::set<std::string>&, property_map&); \
-    extern template std::expected<T, std::string> settings::convertParameter<T>(std::string_view, const pmt::Value&);               \
-    extern template std::expected<T, std::string> settings::extractStagedValue<T>(const pmt::Value&, std::string_view);
-
-GR_SETTINGS_MEMBER_TYPES
-#undef X
-
-} // namespace gr
-// clang-format on
-
-namespace std {
-template<>
-struct hash<gr::SettingsCtx> {
-    [[nodiscard]] size_t operator()(const gr::SettingsCtx& ctx) const noexcept { return ctx.hash(); }
+    [[nodiscard]] std::string uniqueName() const override {
+        if constexpr (requires { std::string(detail::undecorated(_block.unique_name)); }) {
+            return std::string(detail::undecorated(_block.unique_name));
+        } else {
+            return std::string(gr::meta::type_name<TBlock>());
+        }
+    }
 };
-} // namespace std
+
+} // namespace gr::settings
 
 #endif // GNURADIO_SETTINGS_HPP

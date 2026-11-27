@@ -8,7 +8,7 @@
  * A registry entry is a key, an alias and a factory pointer, so producing one must not instantiate
  * the block. The generated registration units include this header alone -- `BlockRegistration` stays
  * incomplete here and is only ever passed on by reference -- so they instantiate no `Block<T>`,
- * `BlockWrapper<T>`, `CtxSettings<T>` or `Port<T, ...>`. The materialization lives in the generated
+ * `BlockWrapper<T>`, `settings::BlockSettingsOf<T>` or `Port<T, ...>`. The materialization lives in the generated
  * definition unit that defines the factory, one per registered (block, type), which is the only
  * place `BlockRegistry.hpp` and the block header are parsed.
  *

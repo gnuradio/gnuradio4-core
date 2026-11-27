@@ -33,11 +33,15 @@ struct Tunable : gr::Block<Tunable> {
     gr::PortIn<float>  in;
     gr::PortOut<float> out;
 
-    gr::Annotated<float, "gain"> gain = 1.0f;
+    struct Settings {
+        gr::Annotated<float> gain = 1.0f;
 
-    GR_MAKE_REFLECTABLE(Tunable, in, out, gain);
+        GR_MAKE_REFLECTABLE(Settings, gain);
+    } settings;
 
-    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
+    GR_MAKE_REFLECTABLE(Tunable, in, out, settings);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * settings.gain; }
 };
 
 // a gain the block takes between 0 and 1
@@ -45,11 +49,15 @@ struct LimitedGain : gr::Block<LimitedGain> {
     gr::PortIn<float>  in;
     gr::PortOut<float> out;
 
-    gr::Annotated<float, "gain", gr::Limits<0.f, 1.f>> gain = 0.5f;
+    struct Settings {
+        gr::Annotated<float, gr::Limits<gr::Min<0.f>, gr::Max<1.f>>> gain = 0.5f;
 
-    GR_MAKE_REFLECTABLE(LimitedGain, in, out, gain);
+        GR_MAKE_REFLECTABLE(Settings, gain);
+    } settings;
 
-    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
+    GR_MAKE_REFLECTABLE(LimitedGain, in, out, settings);
+
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * settings.gain; }
 };
 
 struct Source : gr::Block<Source> {
@@ -255,7 +263,7 @@ struct LoaderCanary : gr::Block<LoaderCanary> {
     [[nodiscard]] constexpr float processOne() const noexcept { return 0.0f; }
 };
 
-using TestScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>;
+using TestScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multi_threaded>;
 
 // ends its stream at its first call
 struct EndingSource : gr::Block<EndingSource> {
@@ -504,13 +512,17 @@ inline std::atomic<float> gLevel{0.0f};
 struct LevelSource : gr::Block<LevelSource> {
     gr::PortOut<float> out;
 
-    gr::Annotated<float, "level"> level = 1.0f;
+    struct Settings {
+        gr::Annotated<float> level = 1.0f;
 
-    GR_MAKE_REFLECTABLE(LevelSource, out, level);
+        GR_MAKE_REFLECTABLE(Settings, level);
+    } settings;
 
-    [[nodiscard]] float processOne() const noexcept { return level; }
+    GR_MAKE_REFLECTABLE(LevelSource, out, settings);
 
-    void settingsChanged(const gr::property_map&, const gr::property_map&) { gLevel.store(level); }
+    [[nodiscard]] float processOne() const noexcept { return settings.level; }
+
+    void applySettings(const Settings& s) { gLevel.store(s.level); }
 };
 
 // passes its first kPassed samples, counted in gHeldPassed, and keeps every later one at its input
@@ -669,19 +681,23 @@ struct StopProbe : gr::Block<StopProbe> {
 inline std::function<gr::lifecycle::State()> gSchedulerState;
 inline std::atomic<bool>                     gRacingEntered{false};
 
-// a Tunable whose settingsChanged() reports that it has begun in gRacingEntered and returns once gSchedulerState reads a
+// a Tunable whose applySettings() reports that it has begun in gRacingEntered and returns once gSchedulerState reads a
 // stopping scheduler. The scheduler applies the settings while it builds the block as a replacement
 struct RacingStage : gr::Block<RacingStage> {
     gr::PortIn<float>  in;
     gr::PortOut<float> out;
 
-    gr::Annotated<float, "gain"> gain = 1.0f;
+    struct Settings {
+        gr::Annotated<float> gain = 1.0f;
 
-    GR_MAKE_REFLECTABLE(RacingStage, in, out, gain);
+        GR_MAKE_REFLECTABLE(Settings, gain);
+    } settings;
 
-    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * gain; }
+    GR_MAKE_REFLECTABLE(RacingStage, in, out, settings);
 
-    void settingsChanged(const gr::property_map&, const gr::property_map&) {
+    [[nodiscard]] constexpr float processOne(float value) const noexcept { return value * settings.gain; }
+
+    void applySettings([[maybe_unused]] const Settings& s) {
         if (!gSchedulerState) {
             return;
         }
@@ -1280,9 +1296,9 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         }();
         expect(fatal(emplaced != nullptr)) << "the emplaced block is not in the graph";
 
-        const auto gain = emplaced->settings().get("gain");
+        const std::expected<float, gr::settings::Rejected> gain = emplaced->get<float>("gain");
         expect(fatal(gain.has_value())) << "the emplaced block reports no gain setting";
-        expect(eq(gain->value_or(0.0f), 4.5f)) << "the emplaced block kept its constructor default instead of the serialized value";
+        expect(eq(gain.value_or(0.0f), 4.5f)) << "the emplaced block kept its constructor default instead of the serialized value";
 
         expect(scheduler.changeStateTo(REQUESTED_STOP).has_value());
     };
@@ -1290,7 +1306,7 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
     "a block emplaced from yaml with a value its setting refuses gets an error and stays out of the graph"_test = [] {
         qa_edit::registerTestBlocks();
         const qa_edit::RefusedEmplacement refused = qa_edit::emplaceRefusedYaml(std::format("id: {}\nparameters:\n  name: stage\n  gain: !!float32 2\n", gr::meta::type_name<qa_edit::LimitedGain>()));
-        expect(refused.refusal.contains("block 'stage'") && refused.refusal.contains("[0, 1]")) << "the reply carries the refusal, got: " << refused.refusal;
+        expect(refused.refusal.contains("block 'stage'") && refused.refusal.contains("gain: out of range [0, 1]: 2")) << "the reply carries the refusal, got: " << refused.refusal;
         expect(eq(refused.namesAfter, refused.namesBefore)) << "the refused block is in the graph";
     };
 
@@ -1304,7 +1320,7 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
     "a subgraph emplaced from yaml with an inner value its setting refuses gets an error and stays out of the graph"_test = [] {
         qa_edit::registerTestBlocks();
         const qa_edit::RefusedEmplacement refused = qa_edit::emplaceRefusedYaml(std::format("id: SUBGRAPH\nparameters:\n  name: group\ngraph:\n  blocks:\n    - id: {}\n      parameters:\n        name: stage\n        gain: !!float32 2\n", gr::meta::type_name<qa_edit::LimitedGain>()), gr::scheduler::property::kBlockEmplaced);
-        expect(refused.refusal.contains("block 'stage'") && refused.refusal.contains("[0, 1]")) << "the reply carries the refusal, got: " << refused.refusal;
+        expect(refused.refusal.contains("block 'stage'") && refused.refusal.contains("gain: out of range [0, 1]: 2")) << "the reply carries the refusal, got: " << refused.refusal;
         expect(eq(refused.namesAfter, refused.namesBefore)) << "the refused subgraph is in the graph";
     };
 
@@ -1389,15 +1405,15 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         const std::string namesBefore   = qa_edit::blockNames(flow);
 
         const std::string refused = qa_edit::refusal([&] { std::ignore = flow.emplaceBlock(tunableType, {{"gian", 2.0f}}); });
-        expect(refused.starts_with("settings could not be applied") && refused.contains("gian")) << "the refusal must reach the caller as thrown, got: " << refused;
+        expect(refused.contains("gian: unknown setting")) << "the refusal must reach the caller as thrown, got: " << refused;
         expect(eq(flow.blocks().size(), nBlocksBefore)) << "the block stayed in the graph after throwing: " << refused;
         expect(eq(qa_edit::blockNames(flow), namesBefore)) << "the graph holds other blocks after throwing: " << refused;
 
         const std::shared_ptr<gr::BlockModel>& accepted = flow.emplaceBlock(tunableType, {{"gain", 2.0f}});
         expect(eq(flow.blocks().size(), nBlocksBefore + 1UZ)) << "a block with settings it declares must join the graph";
-        const std::optional<gr::pmt::Value> gain = accepted->settings().get("gain");
+        const std::expected<float, gr::settings::Rejected> gain = accepted->get<float>("gain");
         expect(fatal(gain.has_value())) << "the accepted block reports no gain setting";
-        expect(eq(gain->value_or(0.0f), 2.0f)) << "the accepted block must apply its settings";
+        expect(eq(gain.value_or(0.0f), 2.0f)) << "the accepted block must apply its settings";
     };
 
     "a block emplaced by name with a value its setting refuses stays out of the graph"_test = [] {
@@ -1410,7 +1426,7 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         const std::string namesBefore   = qa_edit::blockNames(flow);
 
         const std::string refused = qa_edit::refusal([&] { std::ignore = flow.emplaceBlock(tunableType, {{"gain", std::string("loud")}}); });
-        expect(refused.contains("'gain'")) << "the refusal must reach the caller as thrown, got: " << refused;
+        expect(refused.contains("gain: not a decimal number")) << "the refusal must reach the caller as thrown, got: " << refused;
         expect(eq(flow.blocks().size(), nBlocksBefore)) << "the block stayed in the graph after throwing: " << refused;
         expect(eq(qa_edit::blockNames(flow), namesBefore)) << "the graph holds other blocks after throwing: " << refused;
     };
@@ -1588,13 +1604,13 @@ const boost::ut::suite<"graph editing"> graphEditTests = [] {
         const std::string namesBefore   = qa_edit::blockNames(flow);
 
         const std::string refused = qa_edit::refusal([&] { std::ignore = flow.emplaceBlock<qa_edit::Tunable>({{"gian", 2.0f}}); });
-        expect(refused.starts_with("settings could not be applied") && refused.contains("gian")) << "the refusal must reach the caller as thrown, got: " << refused;
+        expect(refused.contains("gian: unknown setting")) << "the refusal must reach the caller as thrown, got: " << refused;
         expect(eq(flow.blocks().size(), nBlocksBefore)) << "the block stayed in the graph after throwing: " << refused;
         expect(eq(qa_edit::blockNames(flow), namesBefore)) << "the graph holds other blocks after throwing: " << refused;
 
         auto& accepted = flow.emplaceBlock<qa_edit::Tunable>({{"gain", 2.0f}});
         expect(eq(flow.blocks().size(), nBlocksBefore + 1UZ)) << "a block with settings it declares must join the graph";
-        expect(eq(accepted.gain.value, 2.0f)) << "the accepted block must apply its settings";
+        expect(eq(accepted.settings.gain.value, 2.0f)) << "the accepted block must apply its settings";
         expect(accepted.state() == INITIALISED) << "the accepted block must be initialized";
     };
 
@@ -2446,7 +2462,7 @@ const boost::ut::suite<"messages after a job list ends"> laterMessageTests = [] 
     using namespace boost::ut;
     using enum gr::lifecycle::State;
 
-    // under multiThreaded each job list has a worker of its own, and a worker leaves once every block of its job list
+    // under multi_threaded each job list has a worker of its own, and a worker leaves once every block of its job list
     // is done. Here the first job list ends at once and the second runs until the stop.
     "the scheduler replies after its first job list has ended"_test = [] {
         constexpr std::string_view kPoolName = "qa_edit_two_threads";
@@ -2687,17 +2703,17 @@ const boost::ut::suite<"a replacement in a running graph"> runningReplacementTes
     using enum gr::lifecycle::State;
     using namespace gr::scheduler::property;
 
-    "a replacement in a multi-threaded run passes on the samples queued at its ports"_test = [] { qa_edit::expectQueuedSamplesPassReplacement<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>>(); };
+    "a replacement in a multi-threaded run passes on the samples queued at its ports"_test = [] { qa_edit::expectQueuedSamplesPassReplacement<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multi_threaded>>(); };
 
-    "a replacement in a multi-threaded blocking run passes on the samples queued at its ports"_test = [] { qa_edit::expectQueuedSamplesPassReplacement<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreadedBlocking>>(); };
+    "a replacement in a multi-threaded blocking run passes on the samples queued at its ports"_test = [] { qa_edit::expectQueuedSamplesPassReplacement<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multi_threaded_blocking>>(); };
 
-    "a replacement in a single-threaded run passes on the samples queued at its ports"_test = [] { qa_edit::expectQueuedSamplesPassReplacement<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>>(); };
+    "a replacement in a single-threaded run passes on the samples queued at its ports"_test = [] { qa_edit::expectQueuedSamplesPassReplacement<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded>>(); };
 
-    "a replacement in a single-threaded blocking run passes on the samples queued at its ports"_test = [] { qa_edit::expectQueuedSamplesPassReplacement<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking>>(); };
+    "a replacement in a single-threaded blocking run passes on the samples queued at its ports"_test = [] { qa_edit::expectQueuedSamplesPassReplacement<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded_blocking>>(); };
 
-    "a replacement in a multi-threaded run joins the job list of the block it replaces, and the reply names that job list"_test = [] { qa_edit::expectReplacementJoinsJobList<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>>(); };
+    "a replacement in a multi-threaded run joins the job list of the block it replaces, and the reply names that job list"_test = [] { qa_edit::expectReplacementJoinsJobList<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multi_threaded>>(); };
 
-    "a replacement in a multi-threaded blocking run joins the job list of the block it replaces, and the reply names that job list"_test = [] { qa_edit::expectReplacementJoinsJobList<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreadedBlocking>>(); };
+    "a replacement in a multi-threaded blocking run joins the job list of the block it replaces, and the reply names that job list"_test = [] { qa_edit::expectReplacementJoinsJobList<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multi_threaded_blocking>>(); };
 
     "a replacement inside a subgraph of a running graph runs"_test = [] {
         qa_edit::registerTestBlocks();
@@ -2773,7 +2789,7 @@ const boost::ut::suite<"a replacement in a running graph"> runningReplacementTes
         expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
     };
 
-    // the replacement's settingsChanged() holds the edit until the stop has begun
+    // the replacement's applySettings() holds the edit until the stop has begun
     "a stop that begins during a replacement leaves the replacement out of the run"_test = [] {
         qa_edit::registerTestBlocks();
         qa_edit::gRacingEntered.store(false);
@@ -2990,9 +3006,9 @@ const boost::ut::suite<"edits that give a block a reader or take its last one"> 
         expect(qa_edit::awaitCondition([&scheduler] { return scheduler.state() == STOPPED; })) << "the scheduler did not stop";
     };
 
-    "an edge emplaced in a multi-threaded run restarts its stopped source, and the reply names it"_test = [] { qa_edit::expectEmplacedEdgeRestartsStoppedSource<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>>(); };
+    "an edge emplaced in a multi-threaded run restarts its stopped source, and the reply names it"_test = [] { qa_edit::expectEmplacedEdgeRestartsStoppedSource<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multi_threaded>>(); };
 
-    "an edge emplaced in a single-threaded run restarts its stopped source, and the reply names it"_test = [] { qa_edit::expectEmplacedEdgeRestartsStoppedSource<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>>(); };
+    "an edge emplaced in a single-threaded run restarts its stopped source, and the reply names it"_test = [] { qa_edit::expectEmplacedEdgeRestartsStoppedSource<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded>>(); };
 
 #ifndef GR_TEST_WITHOUT_BLOCK_REGISTRY // replacement by name resolves the type through the registry
     // the source stops without an end-of-stream tag, and the stage keeps waiting on its input

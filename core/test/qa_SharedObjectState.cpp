@@ -178,4 +178,26 @@ const boost::ut::suite<"values shared with a shared object"> sharedObjectStateTe
         expect(fatal(block != nullptr)) << "the shared object's probe was not created";
         expect(libraryProbe(block).providerResource == std::pmr::null_memory_resource()) << "the shared object's code did not find the program's provider";
     };
+
+    // A block's own thread is marked by the code that runs its work, hooks or apply, and a `set` on that thread is
+    // refused. The mark is set and asked for by the code of different shared objects, both ways
+    "a mark of a block's own thread set by a shared object's code is seen by the program's code, and the reverse"_test = [] {
+        expect(fatal(loadCrossObjectLibrary())) << "the shared object did not load";
+        const std::shared_ptr<gr::BlockModel> block = gr::globalBlockRegistry().create(kLibraryProbe, gr::property_map{});
+        expect(fatal(block != nullptr)) << "the shared object's probe was not created";
+        gr::testing::CrossObjectProbe& probe = libraryProbe(block);
+        expect(fatal(probe.setByConstructingCode(probe).has_value())) << "a set off the probe's own thread is refused";
+
+        const auto setByProgram    = [](gr::testing::CrossObjectProbe& marked) { return gr::settings::detail::settingsOf(marked).set(gr::property_map{}); };
+        const auto markedByLibrary = probe.askOnOwnThreadOfConstructingCode(probe, setByProgram);
+        expect(!markedByLibrary.has_value()) << "the program's code missed the mark that the shared object's code set";
+
+        gr::testing::CrossObjectProbe::SetResult markedByProgram;
+        {
+            const gr::settings::detail::OwnThread mark(gr::settings::detail::settingsOf(probe));
+            markedByProgram = probe.setByConstructingCode(probe);
+        }
+        expect(!markedByProgram.has_value()) << "the shared object's code missed the mark that the program's code set";
+        expect(probe.setByConstructingCode(probe).has_value()) << "the mark outlived its scope";
+    };
 };

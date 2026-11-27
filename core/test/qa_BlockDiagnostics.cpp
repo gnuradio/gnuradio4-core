@@ -269,7 +269,7 @@ const boost::ut::suite<"block diagnostics"> _blockDiagnostics = [] {
         expect(flow.connect<"out", "in">(source, stuck).has_value());
         expect(flow.connect<"out", "in">(stuck, sink).has_value());
 
-        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler{};
         expect(scheduler.exchange(std::move(flow)).has_value());
 
         std::jthread runner([&scheduler] { std::ignore = scheduler.runAndWait(); });
@@ -304,7 +304,7 @@ const boost::ut::suite<"block diagnostics"> _blockDiagnostics = [] {
         auto&     stuck  = flow.emplaceBlock<AsyncStuckSink>();
         expect(flow.connect<"out", "in">(source, stuck).has_value());
 
-        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler{};
         expect(scheduler.exchange(std::move(flow)).has_value());
 
         std::jthread runner([&scheduler] { std::ignore = scheduler.runAndWait(); });
@@ -334,7 +334,7 @@ const boost::ut::suite<"block diagnostics"> _blockDiagnostics = [] {
         auto&     sink   = flow.emplaceBlock<AsyncDiscardingSink>();
         expect(flow.connect<"out", "in">(source, sink).has_value());
 
-        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler{};
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler{};
         expect(scheduler.exchange(std::move(flow)).has_value());
 
         std::jthread runner([&scheduler] { std::ignore = scheduler.runAndWait(); });

@@ -27,8 +27,7 @@ namespace {
 
 int main() {
     gr::named_registry_blocklib::Scale<float> direct;
-    direct.factor = 4.0F;
-    if (direct.processOne(3.0F) != 12.0F) {
+    if (!direct.set("factor", 4.0F) || direct.processOne(3.0F) != 12.0F) {
         std::println(stderr, "the directly instantiated block did not compute");
         return 1;
     }

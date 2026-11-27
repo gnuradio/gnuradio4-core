@@ -17,7 +17,7 @@
  */
 namespace gr::testing {
 
-using LibraryScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>;
+using LibraryScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded>;
 
 std::unique_ptr<gr::SchedulerModel> makeLibraryScheduler(gr::property_map parameters) { return std::make_unique<gr::SchedulerWrapper<LibraryScheduler>>(std::move(parameters)); }
 

@@ -36,6 +36,7 @@
  * - a scheduler that cannot be built
  * - the errors a block and the scheduler report while the graph runs
  * - each refusal of a setting and each failure at start or while running of the fixture's blocks, each with its status and its reason
+ * - a setting a block's device fails while the graph runs, which the scheduler's default reader prints
  * - a failure --expect-error expects, and one it does not
  * - the settings --expect requires after the run, met and not met
  * - the samples of each block's call, bounded by the scheduler setting max_work_items
@@ -193,7 +194,7 @@ struct Result {
 #endif
 
 // the schedulers rungraph registers itself, one per execution policy of core's Simple scheduler
-constexpr std::array<std::string_view, 4UZ> kOwnSchedulers{"gr::scheduler::Simple<singleThreaded>", "gr::scheduler::Simple<multiThreaded>", "gr::scheduler::Simple<singleThreadedBlocking>", "gr::scheduler::Simple<multiThreadedBlocking>"};
+constexpr std::array<std::string_view, 4UZ> kOwnSchedulers{"gr::scheduler::Simple<single_threaded>", "gr::scheduler::Simple<multi_threaded>", "gr::scheduler::Simple<single_threaded_blocking>", "gr::scheduler::Simple<multi_threaded_blocking>"};
 
 } // namespace qa_rungraph
 
@@ -321,21 +322,21 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
     };
 
     // A --set value is refused as a graph file's value would be. A value outside the block's limits gets the
-    // framework's message. A value the block's settingsChanged() throws on is refused when the scheduler initializes
-    // the block, before start() runs.
+    // framework's message. A value the block's applySettings() throws on is refused when the graph file loads, since
+    // the hook runs when the graph takes the block, before start() runs.
     "a --set value the block refuses is refused as the graph file's value would be"_test = [] {
         std::vector<std::string> outOfLimits = startChainRun();
         outOfLimits.insert(outOfLimits.end(), {"--set", "first.gain=2", "--show", "first"});
 
         const Result refusedByLimits = run(outOfLimits);
-        expect(refusedByLimits.output.contains("block 'first' refuses gain = 2: outside the limits [0, 1]")) << refusedByLimits.output;
+        expect(refusedByLimits.output.contains("block 'first': gain: out of range [0, 1]: 2")) << refusedByLimits.output;
         expect(!refusedByLimits.output.contains("first: gain = 2")) << "the block keeps a value inside its limits" << refusedByLimits.output;
 
-        std::vector<std::string> refusedBySettingsChanged = startChainRun();
-        refusedBySettingsChanged.insert(refusedBySettingsChanged.end(), {"--set", "first.sample_rate=-1"});
+        std::vector<std::string> refusedByHook = startChainRun();
+        refusedByHook.insert(refusedByHook.end(), {"--set", "first.sample_rate=-1"});
 
-        const Result refusedByBlock = run(refusedBySettingsChanged);
-        expect(refusedByBlock.output.contains("init() throws: sample_rate -1 is not positive")) << refusedByBlock.output;
+        const Result refusedByBlock = run(refusedByHook);
+        expect(refusedByBlock.output.contains("block 'first': ") && refusedByBlock.output.contains("sample_rate -1 is not positive")) << refusedByBlock.output;
     };
 
     "a --set value the block forwards reaches the block downstream in place of the graph file's"_test = [] {
@@ -370,7 +371,7 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
         const Result schedulerRefused = run({"--graph", "unread.yaml", "--set", "timeout_ms=many"});
         expect(eq(schedulerRefused.exitCode, 2)) << schedulerRefused.output;
         const std::string_view schedulerLine = lineHolding(schedulerRefused.output, "a scheduler setting could not be applied: ");
-        expect(schedulerLine.contains("value \"many\" for key 'timeout_ms'")) << schedulerRefused.output;
+        expect(schedulerLine.contains("timeout_ms: not a decimal number")) << schedulerRefused.output;
         expect(!schedulerLine.contains(".cpp:") && !schedulerLine.contains(".hpp:")) << "a scheduler setting's refusal names no file and line of the library" << schedulerRefused.output;
 
         std::vector<std::string> member = settingsChainRun();
@@ -380,7 +381,7 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
         const Result memberRefused = run(member);
         expect(eq(memberRefused.exitCode, 1)) << memberRefused.output;
         const std::string_view memberLine = lineHolding(memberRefused.output, " did not load: ");
-        expect(memberLine.contains("value \"many\" for key 'event_count'")) << memberRefused.output;
+        expect(memberLine.contains("event_count: not a decimal number")) << memberRefused.output;
         expect(!memberLine.contains(".cpp:") && !memberLine.contains(".hpp:")) << "a member's refusal names no file and line of the library" << memberRefused.output;
     };
 
@@ -490,7 +491,7 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
     "--verbose reports the scheduler before the graph file is read"_test = [] {
         const Result unread = run({"--graph", "unread.yaml", "--plugin-dir", fromEnvironment("GR_TOOLS_CORE_TEST_PLUGINS"), "--verbose", "--set", "timeout_ms=37"});
         expect(eq(unread.exitCode, 1)) << unread.output;
-        expect(unread.output.contains("rungraph: scheduler gr::scheduler::Simple<singleThreaded>\n")) << unread.output;
+        expect(unread.output.contains("rungraph: scheduler gr::scheduler::Simple<single_threaded>\n")) << unread.output;
         expect(unread.output.contains("rungraph: scheduler setting timeout_ms = 37")) << unread.output;
     };
 
@@ -555,9 +556,9 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
             std::string_view         reason;
         };
         const std::vector<Refusal> refusals{
-            {"a graph file value of the wrong type", fixtureRun(assetPath("refusal_wrong_type.yaml")), R"(value "many" for key 'count' has wrong type)"},
-            {"a graph file value outside the limits", fixtureRun(assetPath("refusal_out_of_limits.yaml")), "outside the limits [0, 1]"},
-            {"settingsChanged() throws", failingIn("settingsChanged"), "the fixture refuses its settings"},
+            {"a graph file value of the wrong type", fixtureRun(assetPath("refusal_wrong_type.yaml")), "count: not a decimal number"},
+            {"a graph file value outside the limits", fixtureRun(assetPath("refusal_out_of_limits.yaml")), "gain: out of range [0, 1]: 2"},
+            {"applySettings() throws", failingIn("applySettings"), "the fixture refuses its settings"},
             {"start() throws", failingIn("start"), "the fixture refuses to start"},
             {"processBulk() throws", failingIn("processBulk"), "the fixture fails in processBulk"},
             {"work() returns ERROR", failingIn("work"), "its work() returned ERROR"},
@@ -574,6 +575,13 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
         }
     };
 
+    "a setting the block's device fails after the start is printed once, and the run goes on to its bound"_test = [] {
+        const std::vector<std::string> arguments{"--graph", assetPath("refusal.yaml"), "--plugin-dir", fromEnvironment("GR_TOOLS_FIXTURE_PLUGINS"), "--seconds", "0.5", "--set", "refusal.fails_in=device"};
+        const Result                   ran = run(arguments);
+        expect(eq(ran.exitCode, 0)) << ran.output;
+        expect(eq(occurrences(ran.output, "failed 'gain': the fixture's device lost the gain"), 1UZ)) << "the default reader did not print the failure once" << ran.output;
+    };
+
     "--expect-error ends a run that fails with each text it names with status 0"_test = [] {
         std::vector<std::string> oneText = failingIn("start");
         oneText.insert(oneText.end(), {"--expect-error", "refuses to start"});
@@ -588,7 +596,7 @@ const boost::ut::suite<"RunGraph"> runGraphTests = [] {
         expect(eq(both.exitCode, 0)) << both.output;
 
         std::vector<std::string> atLoad = fixtureRun(assetPath("refusal_wrong_type.yaml"));
-        atLoad.insert(atLoad.end(), {"--expect-error", "for key 'count' has wrong type"});
+        atLoad.insert(atLoad.end(), {"--expect-error", "count: not a decimal number"});
         const Result loadFailure = run(atLoad);
         expect(eq(loadFailure.exitCode, 0)) << "a failure at load counts" << loadFailure.output;
 

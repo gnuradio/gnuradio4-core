@@ -224,9 +224,9 @@ auto& iir = graph.emplaceBlock<IIR>({{"feedback", property_map{{"gain", 0.95f}}}
 ```
 
 A block meant for graph files declares the settings it exposes, holds the merged block
-and, in `settingsChanged`, passes each setting on to a member with the member's
-`settings().setStaged()` and `applyStagedParameters()`; `set()` on a member stores the
-value without applying it.
+and, in `applySettings`, sets each on the member with `member.set(changes, settings::noWait)`.
+A merged block nothing starts applies the change at the call; one whose holder passes it its
+lifecycle states applies it at its next work call while it runs.
 
 ---
 

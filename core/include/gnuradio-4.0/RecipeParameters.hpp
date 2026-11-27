@@ -741,6 +741,14 @@ struct SequenceElement {
     pmt::Value                literal;
 };
 
+/// One derived entry of a map-valued setting: the keys from the setting's map down to the entry, and the expression or
+/// the substituted parameter it derives from.
+struct MapEntry {
+    std::vector<std::string>   path;
+    std::optional<Expression>  expression;
+    std::optional<std::size_t> substituted;
+};
+
 /// One derived interior setting: which block (as a name path from the composite's interior
 /// downward, through nested subgraphs), which setting, and the expression that derives it.
 struct Binding {
@@ -754,6 +762,10 @@ struct Binding {
     /// whole, so the binding carries the whole sequence and rebuilds it on every change; one binding per key
     /// keeps the transaction and the refusal exactly as they are for a scalar.
     std::vector<SequenceElement> sequence;
+    /// Set instead of `expression` when the setting is a map with derived entries, at any depth: the map as derived at
+    /// instantiation, whose entries `mapEntries` derives again on every change.
+    property_map          map;
+    std::vector<MapEntry> mapEntries;
 };
 
 /// The value a binding produces for one set of parameter values.
@@ -780,35 +792,40 @@ struct Binding {
         }
         return pmt::Value(Tensor<pmt::Value>(elements.begin(), elements.end()));
     }
+    if (!binding.mapEntries.empty()) {
+        property_map map = binding.map;
+        for (const MapEntry& entry : binding.mapEntries) {
+            property_map* level = &map;
+            for (std::size_t depth = 0UZ; level != nullptr && depth + 1UZ < entry.path.size(); ++depth) {
+                const auto inner = level->find(std::pmr::string(entry.path[depth]));
+                level            = inner == level->end() ? nullptr : inner->second.get_if<property_map>();
+            }
+            if (level == nullptr || entry.path.empty()) {
+                return std::unexpected(gr::Error("recipe_map_entry: a derived entry's map is gone"));
+            }
+            if (entry.substituted.has_value()) {
+                if (*entry.substituted >= values.size()) {
+                    return std::unexpected(gr::Error("recipe_parameter_index: a substituted parameter is out of range"));
+                }
+                level->insert_or_assign(std::pmr::string(entry.path.back()), values[*entry.substituted]);
+                continue;
+            }
+            auto evaluated = evaluate(*entry.expression, values);
+            if (!evaluated.has_value()) {
+                return std::unexpected(evaluated.error());
+            }
+            level->insert_or_assign(std::pmr::string(entry.path.back()), std::move(*evaluated));
+        }
+        return pmt::Value(std::move(map));
+    }
     return evaluate(binding.expression, values);
 }
 
-/// True when two derived values are equal. `pmt::Value` compares a Tensor by identity, and a
-/// sequence is rebuilt whole on every evaluation, so a sequence is compared element by element here;
-/// every other alternative defers to the value's own equality. Where equality cannot tell, the
-/// answer is "differs", so the engine restages a key it need not have rather than skipping one
-/// it owed.
-[[nodiscard]] inline bool derivedValuesAgree(const pmt::Value& left, const pmt::Value& right) {
-    const auto* leftElements  = left.get_if<Tensor<pmt::Value>>();
-    const auto* rightElements = right.get_if<Tensor<pmt::Value>>();
-    if (leftElements != nullptr && rightElements != nullptr) {
-        return std::ranges::equal(*leftElements, *rightElements);
-    }
-    return left == right;
-}
-
-/// What a live composite carries: its declarations, its bindings, the current parameter values,
-/// and what was last staged for each binding. A staged change to an exported parameter
-/// re-evaluates against a trial copy of the values and commits them only when every interior
-/// block accepted its derived settings.
+/// The declarations, the bindings and the parameter values at instantiation of a recipe composite.
 struct AttachedBindings {
     std::vector<ParameterDeclaration> declarations;
     std::vector<Binding>              bindings;
     std::vector<pmt::Value>           values;
-    /// aligned with `bindings`: the value the engine last staged for each, so a change stages
-    /// only the keys that moved. Empty before the first application, which therefore stages
-    /// every bound key. An entry is empty again after a refused change staged its binding.
-    std::vector<std::optional<pmt::Value>> lastStaged;
 };
 
 } // namespace gr::recipe

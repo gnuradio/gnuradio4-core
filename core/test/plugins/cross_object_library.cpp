@@ -52,7 +52,7 @@ std::unique_ptr<gr::SchedulerModel> makeCrossObjectScheduler(gr::property_map pa
 
 const bool registeredScheduler [[maybe_unused]] = gr::globalSchedulerRegistry().insert("test::cross_object_scheduler", "", makeCrossObjectScheduler);
 
-std::unique_ptr<gr::SchedulerModel> makeMultiThreadedScheduler(gr::property_map parameters) { return std::make_unique<gr::SchedulerWrapper<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>>>(std::move(parameters)); }
+std::unique_ptr<gr::SchedulerModel> makeMultiThreadedScheduler(gr::property_map parameters) { return std::make_unique<gr::SchedulerWrapper<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multi_threaded>>>(std::move(parameters)); }
 
 const bool registeredMultiThreaded [[maybe_unused]] = gr::globalSchedulerRegistry().insert("test::cross_object_multi_threaded", "", makeMultiThreadedScheduler);
 

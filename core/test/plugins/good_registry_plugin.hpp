@@ -29,30 +29,50 @@ struct start_recorder : gr::Block<start_recorder<T>> {
     gr::PortIn<T>  in;
     gr::PortOut<T> out;
 
-    std::string                                        resource;          // the name start() opens
-    std::string                                        resource_at_start; // the name start() read
-    gr::Annotated<float, "gain", gr::Limits<0.f, 1.f>> gain        = 1.f;
-    float                                              sample_rate = 1.f; // forwarded downstream, refused at zero or less
+    struct Settings {
+        std::string                                                  resource; // the name start() opens
+        gr::Annotated<float, gr::Limits<gr::Min<0.f>, gr::Max<1.f>>> gain        = 1.f;
+        float                                                        sample_rate = 1.f; // tagged downstream, refused at zero or less
 
-    GR_MAKE_REFLECTABLE(start_recorder, in, out, resource, resource_at_start, gain, sample_rate);
+        GR_MAKE_REFLECTABLE(Settings, resource, gain, sample_rate);
+    } settings;
+
+    struct Status {
+        std::string resource_at_start; // the name start() read
+
+        GR_MAKE_REFLECTABLE(Status, resource_at_start);
+    } status;
+
+    GR_MAKE_REFLECTABLE(start_recorder, in, out, settings, status);
+
+    bool rateTagged = false; // this run's first sample carries the rate
 
     void start() {
-        resource_at_start = resource;
-        if (resource.empty()) {
+        status.resource_at_start = settings.resource;
+        if (settings.resource.empty()) {
             throw gr::exception("no resource to open");
         }
+        rateTagged = false;
     }
 
-    [[nodiscard]] constexpr T processOne(T value) const noexcept { return value; }
+    // the setup forwards no tag, so the rate the block starts with goes downstream on its first sample, and each later
+    // change by the hook's forward
+    [[nodiscard]] T processOne(T value) {
+        if (!rateTagged) {
+            rateTagged = true;
+            this->publishTag(gr::property_map{{gr::tag::SAMPLE_RATE.key(), settings.sample_rate}}, 0UZ);
+        }
+        return value;
+    }
 
-    void settingsChanged(const gr::property_map& /*oldSettings*/, const gr::property_map& newSettings, gr::property_map& forwardSettings) {
-        if (!newSettings.contains("sample_rate")) {
+    void applySettings(const Settings& s, const Settings& old) {
+        if (s.sample_rate == old.sample_rate) {
             return;
         }
-        if (!(sample_rate > 0.f)) {
-            throw gr::exception(std::format("sample_rate {} is not positive", sample_rate));
+        if (!(s.sample_rate > 0.f)) {
+            throw gr::exception(std::format("sample_rate {} is not positive", s.sample_rate));
         }
-        forwardSettings.insert_or_assign(std::pmr::string(gr::tag::SAMPLE_RATE.key()), sample_rate);
+        this->forwardTag(gr::tag::SAMPLE_RATE.key(), s.sample_rate);
     }
 };
 

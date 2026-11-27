@@ -6,6 +6,8 @@
 #include <array>
 #include <gnuradio-4.0/meta/reflection.hpp>
 #include <gnuradio-4.0/meta/utils.hpp>
+#include <set>
+#include <string>
 
 #include "Port.hpp"
 #include "PortTraits.hpp"
@@ -22,7 +24,6 @@ namespace work {
 enum class Status;
 struct Result;
 } // namespace work
-struct SettingsBase;
 
 template<typename T>
 concept HasWork = requires(T t, std::size_t requested_work) {
@@ -38,7 +39,7 @@ concept BlockLike = requires(T t, std::size_t requested_work) {
 
     { t.isBlocking() } noexcept -> std::same_as<bool>;
 
-    { t.settings() } -> std::same_as<SettingsBase&>;
+    { t.writableMembers() } -> std::same_as<std::set<std::string>>;
 
     // N.B. TODO discuss these requirements
     requires !std::is_copy_constructible_v<T>;

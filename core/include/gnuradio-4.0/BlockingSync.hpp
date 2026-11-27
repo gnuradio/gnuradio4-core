@@ -29,14 +29,24 @@ concept IsClockPortType = requires {
 template<typename T>
 concept HasClockPort = requires(T t) { { t.clk_in } -> IsClockPortType; } || requires(T t) { { t.clk } -> IsClockPortType; };
 
+// a block with a `struct Settings` holds its settings in its member of that type, another as its own members
 template<typename T>
-concept HasSampleRate = requires(T t) { { t.sample_rate } -> std::convertible_to<float>; };
+constexpr const auto& timingSettings(const T& block) {
+    if constexpr (gr::settings::detail::holdsSettingsStruct<T>()) {
+        return gr::settings::detail::settingsStructOf(block);
+    } else {
+        return block;
+    }
+}
 
 template<typename T>
-concept HasChunkSize = requires(T t) { { t.chunk_size } -> std::convertible_to<gr::Size_t>; };
+concept HasSampleRate = requires(const T& t) { { timingSettings(t).sample_rate } -> std::convertible_to<float>; };
 
 template<typename T>
-concept HasUseInternalThread = requires(T t) { { t.use_internal_thread } -> std::convertible_to<bool>; };
+concept HasChunkSize = requires(const T& t) { { timingSettings(t).chunk_size } -> std::convertible_to<gr::Size_t>; };
+
+template<typename T>
+concept HasUseInternalThread = requires(const T& t) { { timingSettings(t).use_internal_thread } -> std::convertible_to<bool>; };
 
 template<typename T>
 constexpr auto& getClockPort(T& block) {
@@ -74,7 +84,7 @@ constexpr const auto& getClockPort(const T& block) {
  *    No timer thread. Samples computed from elapsed time when scheduler calls processBulk.
  *    Suitable for HW drivers with external timing.
  *
- * Requirements for derived class:
+ * Requirements for derived class, members of its `struct Settings settings` where it has one:
  * - `sample_rate` member (float, required)
  * - `chunk_size` member (gr::Size_t, optional - defaults to sample_rate/10)
  * - `use_internal_thread` member (bool, optional - defaults to true)
@@ -87,9 +97,9 @@ constexpr const auto& getClockPort(const T& block) {
  *     PortIn<std::uint8_t, Optional> clk_in;
  *     PortOut<T> out;
  *
- *     Annotated<float, "sample_rate"> sample_rate = 1000.f;
- *     Annotated<gr::Size_t, "chunk_size"> chunk_size = 100;       // optional
- *     Annotated<bool, "use_internal_thread"> use_internal_thread = true; // optional
+ *     Annotated<float> sample_rate = 1000.f;
+ *     Annotated<gr::Size_t> chunk_size = 100;       // optional
+ *     Annotated<bool> use_internal_thread = true; // optional
  *
  *     void start() { this->blockingSyncStart(); }
  *     void stop()  { this->blockingSyncStop(); }
@@ -145,13 +155,13 @@ private:
     [[nodiscard]] constexpr const Derived& self() const noexcept { return *static_cast<const Derived*>(this); }
 
     [[nodiscard]] float getSampleRate() const {
-        static_assert(blocking_sync::detail::HasSampleRate<Derived>, "Derived class must have 'sample_rate' member");
-        return static_cast<float>(self().sample_rate);
+        static_assert(blocking_sync::detail::HasSampleRate<Derived>, "Derived class must have 'sample_rate' member, in its struct Settings where it has one");
+        return static_cast<float>(blocking_sync::detail::timingSettings(self()).sample_rate);
     }
 
     [[nodiscard]] gr::Size_t getChunkSize() const {
         if constexpr (blocking_sync::detail::HasChunkSize<Derived>) {
-            return static_cast<gr::Size_t>(self().chunk_size);
+            return static_cast<gr::Size_t>(blocking_sync::detail::timingSettings(self()).chunk_size);
         } else {
             return static_cast<gr::Size_t>(std::max(1.f, getSampleRate() / 10.f));
         }
@@ -159,7 +169,7 @@ private:
 
     [[nodiscard]] bool useInternalThread() const {
         if constexpr (blocking_sync::detail::HasUseInternalThread<Derived>) {
-            return static_cast<bool>(self().use_internal_thread);
+            return static_cast<bool>(blocking_sync::detail::timingSettings(self()).use_internal_thread);
         }
         return true;
     }

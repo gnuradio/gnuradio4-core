@@ -116,21 +116,46 @@ inline RecipeParameterSplit splitRecipeParameters(PluginLoader& loader, std::str
     return split;
 }
 
-/// loads a split's `remaining` keys into `block`'s settings; a refusal names the block, its type and the refused key
-inline std::expected<void, gr::Error> loadRemainingSettings(BlockModel& block, std::string_view blockName, std::string_view blockType, const property_map& remaining) {
-    try {
-        block.settings().loadParametersFromPropertyMap(remaining);
-    } catch (const gr::exception& refusal) {
-        return std::unexpected(gr::Error(std::format("Unable to create block '{}' of type '{}': {}", blockName, blockType, refusal.message), refusal.sourceLocation));
+/// loads a split's `remaining` keys into `block`'s settings, and each key the block declares no setting of into its
+/// `meta_information`. Throws `settings::RefusedSettings` for a refused key, naming the block and its type
+inline void loadRemainingSettings(BlockModel& block, std::string_view blockName, std::string_view blockType, const property_map& remaining) {
+    const std::set<std::string> writable = block.writableMembers();
+    property_map                changes;
+    for (const auto& [key, value] : remaining) {
+        if (writable.contains(std::string(key))) {
+            changes.insert_or_assign(key, value);
+        } else {
+            block.metaInformation().insert_or_assign(key, value);
+        }
     }
-    return {};
+    const std::expected<settings::Values, settings::Rejected> loaded = block.set(changes);
+    if (const settings::Rejected refused = loaded ? settings::detail::failedKeys(*loaded) : loaded.error(); !refused.empty()) {
+        throw settings::RefusedSettings(std::format("Unable to create block '{}' of type '{}': {}", blockName, blockType, settings::describeRejected(refused)), refused, blockName);
+    }
+}
+
+/// builds a block of the definition-backed type `blockType` from its exported parameters. A setting refused inside the
+/// definition throws `settings::RefusedSettings` with its entries, naming the block and its type; the refusing block
+/// reads `<block>.<inner block>`, so that two blocks of one definition give two names, and a block under a scheduler
+/// the definition holds reads its path from that scheduler, as at a start
+inline std::expected<std::shared_ptr<BlockModel>, gr::Error> instantiateDefinition(PluginLoader& loader, std::string_view blockType, std::string_view blockName, const property_map& exported) {
+    try {
+        return loader.instantiateOrError(blockType, exported);
+    } catch (const settings::RefusedSettings& refused) {
+        const bool                keepsName     = blockName.empty() || refused.underNestedScheduler;
+        const std::string         refusingBlock = refused.block.empty() ? std::string(blockName) : (keepsName ? refused.block : std::format("{}.{}", blockName, refused.block));
+        settings::RefusedSettings named(std::format("Unable to create block '{}' of type '{}': {}", blockName, blockType, refused.message), refused.rejected, refusingBlock);
+        named.underNestedScheduler = refused.underNestedScheduler;
+        throw named;
+    }
 }
 
 /// builds a block of a definition-backed type from `split.exported`, labels it `blockName` when that is not empty and
-/// loads `split.remaining` as its settings. A refusal names the block, its type and the reason. The value is null when
-/// the loader builds nothing for `blockType`.
+/// loads `split.remaining` as its settings. A refusal names the block, its type and the reason. A refused setting, of
+/// the block or of a block inside it, throws `settings::RefusedSettings`. The value is null when the loader builds
+/// nothing for `blockType`.
 inline std::expected<std::shared_ptr<BlockModel>, gr::Error> instantiateRecipe(PluginLoader& loader, std::string_view blockType, std::string_view blockName, const RecipeParameterSplit& split) {
-    std::expected<std::shared_ptr<BlockModel>, gr::Error> instantiated = loader.instantiateOrError(blockType, split.exported);
+    std::expected<std::shared_ptr<BlockModel>, gr::Error> instantiated = instantiateDefinition(loader, blockType, blockName, split.exported);
     if (!instantiated.has_value()) {
         return std::unexpected(gr::Error(std::format("Unable to create block '{}' of type '{}': {}", blockName, blockType, instantiated.error().message)));
     }
@@ -138,11 +163,9 @@ inline std::expected<std::shared_ptr<BlockModel>, gr::Error> instantiateRecipe(P
         return instantiated;
     }
     if (!blockName.empty()) {
-        (*instantiated)->setName(std::string(blockName));
+        std::ignore = (*instantiated)->setName(std::string(blockName));
     }
-    if (auto loaded = loadRemainingSettings(**instantiated, blockName, blockType, split.remaining); !loaded.has_value()) {
-        return std::unexpected(loaded.error());
-    }
+    loadRemainingSettings(**instantiated, blockName, blockType, split.remaining);
     return instantiated;
 }
 

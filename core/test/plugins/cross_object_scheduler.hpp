@@ -16,8 +16,8 @@ namespace gr::testing {
  * A shared object and the program that loads it both compile this type, and each holds its own copy of the type's
  * code. The object registers it, so an instance from the registry runs its workers with the object's code.
  */
-struct CrossObjectScheduler : gr::scheduler::SchedulerBase<CrossObjectScheduler, gr::scheduler::ExecutionPolicy::singleThreaded> {
-    using Base = gr::scheduler::SchedulerBase<CrossObjectScheduler, gr::scheduler::ExecutionPolicy::singleThreaded>;
+struct CrossObjectScheduler : gr::scheduler::SchedulerBase<CrossObjectScheduler, gr::scheduler::ExecutionPolicy::single_threaded> {
+    using Base = gr::scheduler::SchedulerBase<CrossObjectScheduler, gr::scheduler::ExecutionPolicy::single_threaded>;
     using Base::_pool;
     using Base::Base;
     using Base::swapAllowedFromThisThread;

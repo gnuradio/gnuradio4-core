@@ -4,13 +4,17 @@
 #include <array>
 #include <cmath>
 #include <concepts>
+#include <cstdint>
 #include <format>
 #include <limits>
 #include <memory_resource>
+#include <span>
 #include <sstream>
+#include <string>
 #include <string_view>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include <gnuradio-4.0/meta/formatter.hpp>
 #include <gnuradio-4.0/meta/utils.hpp>
@@ -66,6 +70,30 @@ static_assert(!Documentation<EmptyUnit>);
  * @brief Annotates field etc. that the entity is visible from a UI perspective.
  */
 struct Visible {};
+
+/**
+ * @brief Annotates a setting the block takes only while the graph is stopped: its settings refuse a change of it while
+ * the graph runs or is paused. A setting without it applies while the block runs.
+ */
+struct StoppedOnly {};
+
+/**
+ * @brief Annotates an integer setting as the port count of one or more dynamic port collections of its block.
+ *
+ * The block resizes each named collection to the setting's value in its settings hook; the setting changes only while
+ * the graph is stopped.
+ */
+template<gr::meta::fixed_string... collections>
+requires(sizeof...(collections) > 0UZ)
+struct PortCountFor {
+    static constexpr std::array<std::string_view, sizeof...(collections)> value{std::string_view(collections)...};
+};
+
+template<typename T>
+struct is_port_count_for : std::false_type {};
+
+template<gr::meta::fixed_string... collections>
+struct is_port_count_for<PortCountFor<collections...>> : std::true_type {};
 
 /**
  * @brief Disable the default tag forwarder.
@@ -354,107 +382,460 @@ template<LimitNumber Target, LimitNumber Source>
         return value == infinity || value == -infinity || !(value < castUnlessSame<Source>(std::numeric_limits<Target>::lowest()) || value > castUnlessSame<Source>(std::numeric_limits<Target>::max()));
     }
 }
+// value >= bound, or value > bound where kExcluded, compared exactly whatever the two number types; false for a NaN
+template<bool kExcluded, typename TValue, typename TBound>
+[[nodiscard]] constexpr bool aboveLowerEnd(const TValue& value, const TBound& bound) noexcept {
+    if constexpr (std::is_integral_v<TValue> && std::is_integral_v<TBound> && LimitNumber<TValue> && LimitNumber<TBound>) {
+        if constexpr (kExcluded) {
+            return std::cmp_greater(comparableInteger(value), comparableInteger(bound));
+        } else {
+            return std::cmp_greater_equal(comparableInteger(value), comparableInteger(bound));
+        }
+    } else if constexpr (std::is_floating_point_v<TValue> && std::is_integral_v<TBound> && LimitNumber<TBound>) {
+        constexpr TValue twoToDigits = kTwoToDigits<TValue, TBound>;
+        constexpr TValue lowest      = std::is_signed_v<TBound> ? -twoToDigits : TValue{0};
+        if (!(value >= lowest)) { // a NaN, or a value below every bound of TBound
+            return false;
+        }
+        if (value >= twoToDigits) {
+            return true;
+        }
+        // value >= bound exactly when floor(value) >= bound, and value > bound exactly when ceil(value) > bound; the value
+        // truncated toward zero is its floor unless the value lies below it, and its ceil unless the value lies above it
+        // (Clang with libstdc++ cannot evaluate std::floor or std::ceil in a constant expression)
+        const TBound truncated = static_cast<TBound>(value);
+        if constexpr (kExcluded) {
+            return value > static_cast<TValue>(truncated) ? truncated >= bound : truncated > bound;
+        } else {
+            return value < static_cast<TValue>(truncated) ? truncated > bound : truncated >= bound;
+        }
+    } else if constexpr (LimitNumber<TValue> && LimitNumber<TBound>) {
+        using Common = std::common_type_t<TValue, TBound>;
+        if constexpr (kExcluded) {
+            return castUnlessSame<Common>(value) > castUnlessSame<Common>(bound);
+        } else {
+            return castUnlessSame<Common>(value) >= castUnlessSame<Common>(bound);
+        }
+    } else if constexpr (kExcluded) {
+        return value > bound;
+    } else {
+        return value >= bound;
+    }
+}
+
+// value <= bound, or value < bound where kExcluded, compared exactly whatever the two number types; false for a NaN
+template<bool kExcluded, typename TValue, typename TBound>
+[[nodiscard]] constexpr bool belowUpperEnd(const TValue& value, const TBound& bound) noexcept {
+    if constexpr (std::is_integral_v<TValue> && std::is_integral_v<TBound> && LimitNumber<TValue> && LimitNumber<TBound>) {
+        if constexpr (kExcluded) {
+            return std::cmp_less(comparableInteger(value), comparableInteger(bound));
+        } else {
+            return std::cmp_less_equal(comparableInteger(value), comparableInteger(bound));
+        }
+    } else if constexpr (std::is_floating_point_v<TValue> && std::is_integral_v<TBound> && LimitNumber<TBound>) {
+        constexpr TValue twoToDigits = kTwoToDigits<TValue, TBound>;
+        constexpr TValue lowest      = std::is_signed_v<TBound> ? -twoToDigits : TValue{0};
+        if (!(value < twoToDigits)) { // a NaN, or a value above every bound of TBound
+            return false;
+        }
+        if (value < lowest) {
+            return true;
+        }
+        // value <= bound exactly when ceil(value) <= bound, and value < bound exactly when floor(value) < bound
+        const TBound truncated = static_cast<TBound>(value);
+        if constexpr (kExcluded) {
+            return value < static_cast<TValue>(truncated) ? truncated <= bound : truncated < bound;
+        } else {
+            return value > static_cast<TValue>(truncated) ? truncated < bound : truncated <= bound;
+        }
+    } else if constexpr (LimitNumber<TValue> && LimitNumber<TBound>) {
+        using Common = std::common_type_t<TValue, TBound>;
+        if constexpr (kExcluded) {
+            return castUnlessSame<Common>(value) < castUnlessSame<Common>(bound);
+        } else {
+            return castUnlessSame<Common>(value) <= castUnlessSame<Common>(bound);
+        }
+    } else if constexpr (kExcluded) {
+        return value < bound;
+    } else {
+        return value <= bound;
+    }
+}
+
+// an enumerator equals an enumerator of its own enumeration alone
+template<typename TValue, typename TListed>
+[[nodiscard]] constexpr bool equalsListed(const TValue& value, const TListed& listed) noexcept {
+    if constexpr (std::is_enum_v<TValue> || std::is_enum_v<TListed>) {
+        if constexpr (std::same_as<TValue, TListed>) {
+            return value == listed;
+        } else {
+            return false;
+        }
+    } else {
+        return aboveLowerEnd<false>(value, listed) && belowUpperEnd<false>(value, listed);
+    }
+}
+
+// a limit's value as a host reads it: a number, never a character; a floating-point value in the shortest text that
+// reads back the same value; an enumerator by its name
+template<typename TValue>
+[[nodiscard]] std::string limitValueText(TValue value) {
+    if constexpr (std::is_enum_v<TValue>) {
+        return std::string(gr::meta::enumName(value).value_or(std::string_view{}));
+    } else if constexpr (std::is_integral_v<TValue>) {
+        return std::format("{}", comparableInteger(value));
+    } else {
+        return std::format("{}", value);
+    }
+}
+
+// whether a setting of type T holds `value` exactly; an enumeration holds its own enumerators alone, and a type other
+// than a number or an enumeration holds any
+template<typename T, typename TValue>
+[[nodiscard]] constexpr bool typeHolds(const TValue& value) noexcept {
+    if constexpr (std::is_enum_v<T> || std::is_enum_v<TValue>) {
+        return std::same_as<T, TValue>;
+    } else if constexpr (LimitNumber<T> && LimitNumber<TValue>) {
+        return castKeepsValue<T>(value) && equalsListed(castUnlessSame<T>(value), value);
+    } else {
+        return true;
+    }
+}
+} // namespace detail
+
+enum class LimitEnd : std::uint8_t { none, lower, upper };
+
+/**
+ * @brief A predicate of `Limits` on one end of a value's range: `Min` and `Max` include the bound, `Over` and `Under`
+ * exclude it. A NaN fails each of them.
+ *
+ * A predicate states its test, `holds`, and the text a host reads in the limits, `text`, in one place; `end` tells
+ * the settings which end of the range it is, and `none` marks a predicate that is no end, as `OneOf`.
+ */
+template<LimitEnd kEnd, bool kExcluded, auto kBound>
+struct EndPredicate {
+    static_assert(detail::LimitNumber<decltype(kBound)>, "an end of Limits is a number");
+
+    static constexpr LimitEnd end      = kEnd;
+    static constexpr bool     excluded = kExcluded;
+    static constexpr auto     bound    = kBound;
+
+    template<typename T>
+    [[nodiscard]] static constexpr bool holds(const T& value) noexcept {
+        if constexpr (kEnd == LimitEnd::lower) {
+            return detail::aboveLowerEnd<kExcluded>(value, kBound);
+        } else {
+            return detail::belowUpperEnd<kExcluded>(value, kBound);
+        }
+    }
+
+    [[nodiscard]] static std::string text() {
+        constexpr std::string_view relation = kEnd == LimitEnd::lower ? (kExcluded ? ">" : ">=") : (kExcluded ? "<" : "<=");
+        return std::format("{} {}", relation, detail::limitValueText(kBound));
+    }
+
+    template<typename T>
+    [[nodiscard]] static constexpr bool fitsIn() noexcept {
+        return detail::typeHolds<T>(kBound);
+    }
+};
+
+template<auto kBound>
+inline constexpr EndPredicate<LimitEnd::lower, false, kBound> Min{};
+template<auto kBound>
+inline constexpr EndPredicate<LimitEnd::upper, false, kBound> Max{};
+template<auto kBound>
+inline constexpr EndPredicate<LimitEnd::lower, true, kBound> Over{};
+template<auto kBound>
+inline constexpr EndPredicate<LimitEnd::upper, true, kBound> Under{};
+
+namespace detail {
+template<auto... kValues>
+[[nodiscard]] consteval bool listedOnce() {
+    if constexpr (sizeof...(kValues) < 2UZ) {
+        return true;
+    } else {
+        return []<auto kFirst, auto... kRest>() { return (!equalsListed(kFirst, kRest) && ...) && listedOnce<kRest...>(); }.template operator()<kValues...>();
+    }
+}
+
+template<auto... kValues>
+[[nodiscard]] consteval bool listsOneEnumeration() {
+    if constexpr (sizeof...(kValues) == 0UZ) {
+        return false;
+    } else {
+        return []<auto kFirst, auto... kRest>() { return std::is_enum_v<decltype(kFirst)> && (std::same_as<decltype(kFirst), decltype(kRest)> && ...); }.template operator()<kValues...>();
+    }
+}
 } // namespace detail
 
 /**
- * @brief Represents limits and optional validation for an Annotated<..> type.
+ * @brief The predicate of `Limits` that a value equals one of `kValues`: numbers, or enumerators of one enumeration,
+ * for a setting that takes part of a shared enumeration. A NaN equals none.
+ */
+template<auto... kValues>
+struct OneOfPredicate {
+    static constexpr bool kEnumerators = detail::listsOneEnumeration<kValues...>();
+
+    static_assert(sizeof...(kValues) > 0UZ, "OneOf lists at least one value");
+    static_assert((detail::LimitNumber<decltype(kValues)> && ...) || kEnumerators, "OneOf lists numbers, or enumerators of one enumeration");
+    static_assert(detail::listedOnce<kValues...>(), "OneOf lists each value once");
+
+    static constexpr LimitEnd end = LimitEnd::none;
+
+    template<typename T>
+    [[nodiscard]] static constexpr bool holds(const T& value) noexcept {
+        return (detail::equalsListed(value, kValues) || ...);
+    }
+
+    [[nodiscard]] static std::string text() {
+        std::string listed;
+        ((listed += std::format("{}{}", listed.empty() ? "" : ", ", detail::limitValueText(kValues))), ...);
+        return std::format("one of: {}", listed);
+    }
+
+    template<typename T>
+    [[nodiscard]] static constexpr bool fitsIn() noexcept {
+        return (detail::typeHolds<T>(kValues) && ...);
+    }
+
+    // whether each listed value passes the predicate `TOther`; an end bounds a number, so no enumerator passes it
+    template<typename TOther>
+    [[nodiscard]] static constexpr bool listedPass() noexcept {
+        if constexpr (kEnumerators && TOther::end != LimitEnd::none) {
+            return false;
+        } else {
+            return (TOther::holds(kValues) && ...);
+        }
+    }
+
+    template<typename T>
+    [[nodiscard]] static std::vector<T> listedAs() {
+        return {detail::castUnlessSame<T>(kValues)...};
+    }
+};
+
+template<auto... kValues>
+inline constexpr OneOfPredicate<kValues...> OneOf{};
+
+namespace detail {
+
+template<typename T>
+concept LimitPredicate = requires {
+    { T::end } -> std::convertible_to<LimitEnd>;
+    { T::text() } -> std::convertible_to<std::string>;
+};
+
+// One template argument of `Limits`: a type, a value or a text. It takes a text so that `Limits` refuses it with its
+// own message.
+template<typename T>
+struct LimitArgument {
+    using Type = T;
+    T value;
+
+    explicit(false) constexpr LimitArgument(T argument) noexcept(std::is_nothrow_copy_constructible_v<T>) : value(argument) {}
+
+    template<std::size_t N>
+    requires std::same_as<T, gr::meta::fixed_string<N - 1UZ>>
+    explicit(false) consteval LimitArgument(const char (&text)[N]) noexcept : value(text) {}
+};
+
+template<std::size_t N>
+LimitArgument(const char (&)[N]) -> LimitArgument<gr::meta::fixed_string<N - 1UZ>>;
+
+template<LimitArgument kArgument>
+using LimitArgumentType = typename std::remove_cvref_t<decltype(kArgument)>::Type;
+
+template<LimitArgument... kArguments>
+inline constexpr bool kPredicatesAlone = (LimitPredicate<LimitArgumentType<kArguments>> && ...);
+
+template<typename TLower, typename TUpper>
+[[nodiscard]] consteval bool endsInOrder() {
+    if constexpr (TLower::excluded || TUpper::excluded) {
+        return belowUpperEnd<true>(TLower::bound, TUpper::bound);
+    } else {
+        return belowUpperEnd<false>(TLower::bound, TUpper::bound);
+    }
+}
+
+// whether each lower end of the list lies below each upper end, or at it where both include it
+template<typename... TPredicates>
+requires(sizeof...(TPredicates) == 0UZ)
+[[nodiscard]] consteval bool limitEndsInOrder() {
+    return true;
+}
+
+template<typename... TPredicates>
+[[nodiscard]] consteval bool limitEndsInOrder() {
+    bool       inOrder = true;
+    const auto against = [&inOrder]<typename TLower>() {
+        if constexpr (TLower::end == LimitEnd::lower) {
+            const auto pair = [&inOrder]<typename TUpper>() {
+                if constexpr (TUpper::end == LimitEnd::upper) {
+                    inOrder = inOrder && endsInOrder<TLower, TUpper>();
+                }
+            };
+            (pair.template operator()<TPredicates>(), ...);
+        }
+    };
+    (against.template operator()<TPredicates>(), ...);
+    return inOrder;
+}
+
+template<typename T>
+inline constexpr bool kIsOneOf = false;
+template<auto... kValues>
+inline constexpr bool kIsOneOf<OneOfPredicate<kValues...>> = true;
+
+// whether each value a `OneOf` of the list names passes every other predicate of the list
+template<typename... TPredicates>
+requires(sizeof...(TPredicates) == 0UZ)
+[[nodiscard]] consteval bool listedValuesPass() {
+    return true;
+}
+
+template<typename... TPredicates>
+[[nodiscard]] consteval bool listedValuesPass() {
+    bool       pass  = true;
+    const auto check = [&pass]<typename TListing>() {
+        if constexpr (kIsOneOf<TListing>) {
+            ((pass = pass && (std::same_as<TListing, TPredicates> || TListing::template listedPass<TPredicates>())), ...);
+        }
+    };
+    (check.template operator()<TPredicates>(), ...);
+    return pass;
+}
+
+// the arguments of `Limits` where one of them is no predicate: `Limits` refuses them, and they name no value
+template<bool kPredicates, typename... TArguments>
+struct PredicateLimits {
+    using Predicates                   = gr::meta::typelist<>;
+    static constexpr bool kOneOfAlone  = true;
+    static constexpr bool kNoPredicate = true;
+
+    template<typename T>
+    [[nodiscard]] static constexpr bool fitsIn() noexcept {
+        return true;
+    }
+};
+
+template<typename... TPredicates>
+struct PredicateLimits<true, TPredicates...> {
+    using Predicates                   = gr::meta::typelist<TPredicates...>;
+    static constexpr bool kOneOfAlone  = (kIsOneOf<TPredicates> && ...);
+    static constexpr bool kNoPredicate = sizeof...(TPredicates) == 0UZ;
+
+    static_assert((0UZ + ... + (TPredicates::end == LimitEnd::lower ? 1UZ : 0UZ)) <= 1UZ, "Limits holds one lower end at most: Min or Over");
+    static_assert((0UZ + ... + (TPredicates::end == LimitEnd::upper ? 1UZ : 0UZ)) <= 1UZ, "Limits holds one upper end at most: Max or Under");
+    static_assert(limitEndsInOrder<TPredicates...>(), "the lower end of Limits lies below its upper end, or at it where Min and Max both include it");
+    static_assert(listedValuesPass<TPredicates...>(), "each value OneOf lists passes the other predicates of Limits");
+
+    template<typename T>
+    [[nodiscard]] static constexpr bool fitsIn() noexcept {
+        return (TPredicates::template fitsIn<T>() && ...);
+    }
+};
+
+} // namespace detail
+
+/**
+ * @brief The limits of an Annotated<..> value: predicates that must all hold, each beside the value's declaration.
  *
- * The `Limits` structure defines lower and upper bounds for a value of type `T`.
- * Additionally, it allows for an optional custom validation function to be provided.
- * This function should take a value of type `T` and return a `bool`, indicating
- * whether the value passes the custom validation or not.
+ * `Min<v>` and `Max<v>` include their value, `Over<v>` and `Under<v>` exclude it, and `OneOf<a, b, c>` holds for a
+ * value equal to one of them. A NaN fails every predicate, and limits with any predicate refuse positive and negative
+ * infinity. On a setting of an enumeration type, `OneOf` lists the enumerators the block takes, and is the one
+ * predicate allowed. The compiler refuses a list of predicates that contradict each other, an end or a listed value the
+ * setting's type cannot hold, and any argument other than a predicate; a rule no predicate states belongs in the
+ * block's `checkSettings`.
  *
  * Example:
  * ```
- * Annotated<float, "example float", Visible, Limits<0.f, 1024.f>>             exampleVar1;
- * // or:
- * constexpr auto isPowerOfTwo = [](const int &val) { return val > 0 && (val & (val - 1)) == 0; };
- * Annotated<float, "example float", Visible, Limits<0.f, 1024.f, isPowerOfTwo>> exampleVar2;
- * // or:
- * Annotated<float, "example float", Visible, Limits<0.f, 1024.f, [](const int &val) { return val > 0 && (val & (val - 1)) == 0; }>> exampleVar2;
+ * Annotated<gr::Size_t, Limits<Min<1U>, Max<64U>>>          taps;
+ * Annotated<float, Limits<Over<0.f>, Under<0.5f>>>        cutoff;
+ * Annotated<gr::Size_t, Limits<OneOf<1U, 2U, 4U>>>    decimation;
+ * Annotated<Window, Limits<OneOf<Window::hann, Window::hamming>>> window;
  * ```
  */
-template<auto LowerLimit, decltype(LowerLimit) UpperLimit, auto Validator = nullptr>
-requires(requires(decltype(Validator) f, decltype(LowerLimit) v) {
-    { f(v) } -> std::same_as<bool>;
-} || Validator == nullptr)
-struct Limits {
-    using ValueType                                    = decltype(LowerLimit);
-    static constexpr ValueType           MinRange      = LowerLimit;
-    static constexpr ValueType           MaxRange      = UpperLimit;
-    static constexpr decltype(Validator) ValidatorFunc = Validator;
+template<detail::LimitArgument... kArguments>
+struct Limits : detail::PredicateLimits<detail::kPredicatesAlone<kArguments...>, detail::LimitArgumentType<kArguments>...> {
+    static_assert(detail::kPredicatesAlone<kArguments...>, "Limits takes predicates alone: Min, Max, Over, Under and OneOf");
 
-    static constexpr bool validate(const ValueType& value) noexcept {
-        if constexpr (LowerLimit == UpperLimit) { // ignore range checks
-            if constexpr (Validator != nullptr) {
-                try {
-                    return Validator(value);
-                } catch (...) {
-                    return false;
-                }
-            } else {
-                return true; // if no validator and limits are same, return true by default
-            }
-        }
-        if constexpr (Validator != nullptr) {
-            try {
-                return value >= LowerLimit && value <= UpperLimit && Validator(value);
-            } catch (...) {
+    using Predicates = typename detail::PredicateLimits<detail::kPredicatesAlone<kArguments...>, detail::LimitArgumentType<kArguments>...>::Predicates;
+
+    // a number of another type is compared with each predicate before it converts to the setting's type: -0.5 lies below
+    // a limit of 0
+    template<typename U>
+    [[nodiscard]] static constexpr bool validate(const U& value) noexcept {
+        if constexpr (!Limits::kNoPredicate && std::is_floating_point_v<U>) {
+            if (value == std::numeric_limits<U>::infinity() || value == -std::numeric_limits<U>::infinity()) {
                 return false;
             }
-        } else {
-            return value >= LowerLimit && value <= UpperLimit;
         }
-        return true;
-    }
-
-    // compares a number of another type with the limits before converting it to ValueType: -0.5 lies below a limit of 0
-    // the validator receives the number converted to ValueType; a number outside ValueType's range is refused first
-    template<typename U>
-    requires(!std::same_as<U, ValueType>)
-    static constexpr bool validate(const U& value) noexcept {
-        if constexpr (detail::LimitNumber<U> && detail::LimitNumber<ValueType>) {
-            if constexpr (LowerLimit != UpperLimit) {
-                if (!detail::withinBounds(value, LowerLimit, UpperLimit)) {
-                    return false;
-                }
-            }
-            if constexpr (Validator == nullptr) {
-                return true;
-            } else {
-                return detail::castKeepsValue<ValueType>(value) && validate(static_cast<ValueType>(value));
-            }
-        } else {
-            return validate(static_cast<ValueType>(value));
-        }
+        return []<typename... TPredicates>(gr::meta::typelist<TPredicates...>, const U& held) { return (TPredicates::holds(held) && ...); }(Predicates{}, value);
     }
 };
 
 template<typename T>
 struct is_limits : std::false_type {};
 
-template<auto LowerLimit, decltype(LowerLimit) UpperLimit, auto Validator>
-struct is_limits<Limits<LowerLimit, UpperLimit, Validator>> : std::true_type {};
+template<detail::LimitArgument... kArguments>
+struct is_limits<Limits<kArguments...>> : std::true_type {};
 
 template<typename T>
 concept Limit = is_limits<T>::value;
 
-using EmptyLimit = Limits<0, 0>; // nomen-est-omen
+using EmptyLimit = Limits<>; // nomen-est-omen
 
 static_assert(Limit<EmptyLimit>);
+
+namespace settings {
+template<typename TBlock>
+struct BlockSettingsOf;
+}
 
 /**
  * @brief Annotated is a template class that acts as a transparent wrapper around another type.
  * It allows adding additional meta-information to a type, such as documentation, unit, and visibility.
  * The meta-information is supplied as template parameters.
+ *
+ * As a member of a block's `Settings`, `changed()` tells the block's `applySettings` whether the batch it applies
+ * changed this setting; at the block's setup every setting is changed. Core sets the flags of the block's own
+ * `Settings` for the hook's call and clears them when it returns. A copy constructed from a setting keeps its flag;
+ * an assignment keeps the flag of the setting assigned to.
  */
-template<typename T, gr::meta::fixed_string description_ = "", typename... Arguments>
+template<typename T, typename... Arguments>
 struct Annotated {
     using value_type = T;
     using LimitType  = typename gr::meta::typelist<Arguments...>::template find_or_default<is_limits, EmptyLimit>;
+
+    static_assert(!std::is_enum_v<std::remove_cv_t<T>> || LimitType::kOneOfAlone, "Limits on an enumeration takes OneOf alone: Min, Max, Over and Under bound a number");
+    static_assert(std::is_enum_v<std::remove_cv_t<T>> || LimitType::kNoPredicate || detail::LimitNumber<std::remove_cv_t<T>>, "Limits annotates a number setting, or an enumeration with OneOf");
+    static_assert((std::is_enum_v<std::remove_cv_t<T>> && !LimitType::kOneOfAlone) || LimitType::template fitsIn<std::remove_cv_t<T>>(), "a predicate of Limits names a value the setting's type cannot hold");
+
     T value;
 
-    Annotated() = default;
+private:
+    template<typename TBlock>
+    friend struct settings::BlockSettingsOf;
+
+    bool _changed = false; // core sets it for the apply hook's call and clears it when the hook returns or throws
+
+public:
+    Annotated()                 = default;
+    Annotated(const Annotated&) = default;
+    Annotated(Annotated&&)      = default;
+
+    // an assignment from another setting takes its value and leaves this setting's flag, which tells the hook what the
+    // batch changed
+    constexpr Annotated& operator=(const Annotated& other) noexcept(std::is_nothrow_copy_assignable_v<T>) {
+        this->value = other.value;
+        return *this;
+    }
+
+    constexpr Annotated& operator=(Annotated&& other) noexcept(std::is_nothrow_move_assignable_v<T>) {
+        this->value = std::move(other.value);
+        return *this;
+    }
 
     template<typename U>
     requires std::constructible_from<T, U> && (!std::same_as<std::remove_cvref_t<U>, Annotated>)
@@ -463,24 +844,26 @@ struct Annotated {
     template<typename U>
     requires std::assignable_from<T&, U>
     Annotated& operator=(U&& input) noexcept(std::is_nothrow_assignable_v<T, U>) {
-        value = static_cast<T>(std::forward<U>(input));
+        this->value = static_cast<T>(std::forward<U>(input));
         return *this;
     }
 
-    inline explicit(false) constexpr operator T&() noexcept { return value; }
+    inline explicit(false) constexpr operator T&() noexcept { return this->value; }
 
-    inline explicit(false) constexpr operator const T&() const noexcept { return value; }
+    inline explicit(false) constexpr operator const T&() const noexcept { return this->value; }
 
-    constexpr bool operator==(const Annotated& other) const noexcept { return value == other.value; }
+    [[nodiscard]] constexpr bool changed() const noexcept { return _changed; }
+
+    constexpr bool operator==(const Annotated& other) const noexcept { return this->value == other.value; }
 
     template<typename U>
     constexpr bool operator==(const U& other) const noexcept {
         if constexpr (requires { other.value; }) {
-            return value == other.value;
+            return this->value == other.value;
         } else if constexpr (std::is_convertible_v<const T&, std::string_view> && std::is_convertible_v<const U&, std::string_view>) {
-            return std::string_view(value) == std::string_view(other);
+            return std::string_view(this->value) == std::string_view(other);
         } else {
-            return value == other;
+            return this->value == other;
         }
     }
 
@@ -488,11 +871,11 @@ struct Annotated {
     requires std::is_same_v<std::remove_cvref_t<U>, T>
     [[nodiscard]] constexpr bool validate_and_set(U&& value_) {
         if constexpr (std::is_same_v<LimitType, EmptyLimit>) {
-            value = std::forward<U>(value_);
+            this->value = std::forward<U>(value_);
             return true;
         } else {
             if (LimitType::validate(value_)) {
-                value = std::forward<U>(value_);
+                this->value = std::forward<U>(value_);
                 return true;
             } else {
                 return false;
@@ -503,12 +886,10 @@ struct Annotated {
     operator std::string_view() const noexcept
     requires(std::is_same_v<T, std::string> || std::is_same_v<T, std::pmr::string>)
     {
-        return std::string_view(value);
+        return std::string_view(this->value);
     }
 
     // meta-information
-    inline static constexpr std::string_view description() noexcept { return std::string_view{description_}; }
-
     inline static constexpr std::string_view documentation() noexcept {
         using Documentation = typename gr::meta::typelist<Arguments...>::template find_or_default<is_doc, EmptyDoc>;
         return std::string_view{Documentation::value};
@@ -521,46 +902,59 @@ struct Annotated {
 
     inline static constexpr bool visible() noexcept { return gr::meta::typelist<Arguments...>::template contains<Visible>; }
 
+    inline static constexpr bool stoppedOnly() noexcept { return gr::meta::typelist<Arguments...>::template contains<StoppedOnly>; }
+
+    // the dynamic port collections the setting sizes; empty for any other setting
+    inline static constexpr std::span<const std::string_view> portCountFor() noexcept {
+        static_assert((0UZ + ... + std::size_t{is_port_count_for<Arguments>::value}) <= 1UZ, "a setting declares at most one PortCountFor");
+        using Collections = typename gr::meta::typelist<Arguments...>::template find_or_default<is_port_count_for, void>;
+        if constexpr (std::is_void_v<Collections>) {
+            return {};
+        } else {
+            return Collections::value;
+        }
+    }
+
     // forwarding member functions
     template<typename... Args>
     constexpr auto operator()(Args&&... args) -> decltype(auto) {
-        return value(std::forward<Args>(args)...);
+        return this->value(std::forward<Args>(args)...);
     }
 
     template<typename... Args>
     constexpr auto operator()(Args&&... args) const -> decltype(auto) {
-        return value(std::forward<Args>(args)...);
+        return this->value(std::forward<Args>(args)...);
     }
 
     template<typename Arg>
     constexpr auto operator[](Arg&& arg) -> decltype(auto) {
-        return value[std::forward<Arg>(arg)];
+        return this->value[std::forward<Arg>(arg)];
     }
 
     template<typename Arg>
     constexpr auto operator[](Arg&& arg) const -> decltype(auto) {
-        return value[std::forward<Arg>(arg)];
+        return this->value[std::forward<Arg>(arg)];
     }
 
     template<typename Arg>
     constexpr auto operator->*(Arg&& arg) -> decltype(auto) {
-        return value.*std::forward<Arg>(arg);
+        return this->value.*std::forward<Arg>(arg);
     }
 
     template<typename Arg>
     constexpr auto operator->*(Arg&& arg) const -> decltype(auto) {
-        return value.*std::forward<Arg>(arg);
+        return this->value.*std::forward<Arg>(arg);
     }
 
-    constexpr T*       operator->() noexcept { return &value; }
-    constexpr const T* operator->() const noexcept { return &value; }
+    constexpr T*       operator->() noexcept { return &this->value; }
+    constexpr const T* operator->() const noexcept { return &this->value; }
 };
 
 template<typename T>
 struct is_annotated : std::false_type {};
 
-template<typename T, gr::meta::fixed_string str, typename... Args>
-struct is_annotated<gr::Annotated<T, str, Args...>> : std::true_type {};
+template<typename T, typename... Args>
+struct is_annotated<gr::Annotated<T, Args...>> : std::true_type {};
 
 template<typename T>
 concept AnnotatedType = is_annotated<T>::value;
@@ -570,8 +964,8 @@ struct unwrap_if_wrapped {
     using type = T;
 };
 
-template<typename U, gr::meta::fixed_string str, typename... Args>
-struct unwrap_if_wrapped<gr::Annotated<U, str, Args...>> {
+template<typename U, typename... Args>
+struct unwrap_if_wrapped<gr::Annotated<U, Args...>> {
     using type = U;
 };
 
@@ -587,8 +981,8 @@ using unwrap_if_wrapped_t = typename unwrap_if_wrapped<T>::type;
 template<typename... Ts>
 struct gr::meta::typelist<gr::SupportedTypes<Ts...>> : gr::meta::typelist<Ts...> {};
 
-template<typename T, gr::meta::fixed_string description, typename... Arguments>
-struct std::formatter<gr::Annotated<T, description, Arguments...>> {
+template<typename T, typename... Arguments>
+struct std::formatter<gr::Annotated<T, Arguments...>> {
     using Type = std::remove_const_t<T>;
     std::formatter<Type> value_formatter;
 
@@ -598,14 +992,14 @@ struct std::formatter<gr::Annotated<T, description, Arguments...>> {
     }
 
     template<typename FormatContext>
-    constexpr auto format(const gr::Annotated<T, description, Arguments...>& annotated, FormatContext& ctx) const {
+    constexpr auto format(const gr::Annotated<T, Arguments...>& annotated, FormatContext& ctx) const {
         return value_formatter.format(annotated.value, ctx);
     }
 };
 
 namespace gr {
-template<typename T, gr::meta::fixed_string description, typename... Arguments>
-inline std::ostream& operator<<(std::ostream& os, const gr::Annotated<T, description, Arguments...>& v) {
+template<typename T, typename... Arguments>
+inline std::ostream& operator<<(std::ostream& os, const gr::Annotated<T, Arguments...>& v) {
     // TODO: add switch for printing only brief and/or meta-information
     return os << std::format("{}", v.value);
 }

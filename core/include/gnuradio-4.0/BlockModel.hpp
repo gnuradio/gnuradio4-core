@@ -200,6 +200,10 @@ struct hash<gr::Edge> {
 
 namespace gr {
 
+namespace settings::detail {
+struct ModelAccess;
+}
+
 class BlockModel {
 public:
     struct NamedPortCollection {
@@ -439,10 +443,6 @@ public:
      */
     virtual void init(std::shared_ptr<gr::Sequence> progress, std::string_view ioThreadPool) = 0;
 
-    // the error that kept init() from completing, if any: init() has no return value and a block's message
-    // port has no subscriber while the graph is built, so the user code it runs reaches no caller but this
-    [[nodiscard]] virtual std::optional<Error> initError() const { return {}; }
-
     /**
      * @brief returns scheduling hint that invoking the work(...) function may block on IO or system-calls
      */
@@ -469,12 +469,13 @@ public:
      * @brief the type of the node as a string, as the derived type named it on construction
      */
     [[nodiscard]] virtual std::string_view typeName() const;
+    [[nodiscard]] virtual std::string_view recipeType() const { return {}; } // a recipe composite's recipe, which a saved graph names it by
 
     /**
      * @brief user-defined name
      * N.B. may not be unique -> ::uniqueName
      */
-    virtual void setName(std::string name) noexcept = 0;
+    virtual std::expected<settings::Values, settings::Rejected> setName(std::string name) noexcept = 0;
 
     /**
      * @brief used to store static non-graph-processing information like Annotated<> info etc.
@@ -485,9 +486,8 @@ public:
 
     /**
      * @brief used to store non-graph-processing information like UI block position etc.
+     * N.B. a host writes it with set("ui_constraints", ...), which keeps it in force and saves it
      */
-    [[nodiscard]] virtual property_map& uiConstraints() noexcept = 0;
-
     [[nodiscard]] virtual const property_map& uiConstraints() const = 0;
 
     /**
@@ -496,9 +496,21 @@ public:
      */
     [[nodiscard]] virtual std::string_view uniqueName() const = 0;
 
-    [[nodiscard]] virtual SettingsBase& settings() = 0;
-
-    [[nodiscard]] virtual const SettingsBase& settings() const = 0;
+    // the block's settings calls, with the signatures and results of a typed block's
+    [[nodiscard]] std::expected<settings::Values, settings::Rejected> set(const property_map& changes, settings::Timeout timeout = std::nullopt) { return settingsObject().set(changes, timeout); }
+    [[nodiscard]] std::expected<settings::Values, settings::Rejected> set(std::string_view key, pmt::Value value, settings::Timeout timeout = std::nullopt) { return settingsObject().set(key, std::move(value), timeout); }
+    [[nodiscard]] std::expected<void, settings::Rejected>             check(const property_map& changes) { return settingsObject().check(changes); }
+    [[nodiscard]] std::expected<void, settings::Rejected>             ready() { return settingsObject().ready(); }
+    [[nodiscard]] std::expected<settings::Value, settings::Rejected>  get(std::string_view key) const { return settingsObject().get(key); }
+    [[nodiscard]] std::expected<settings::Values, settings::Rejected> get(std::span<const std::string> keys = {}) const { return settingsObject().get(keys); }
+    template<typename T>
+    [[nodiscard]] std::expected<T, settings::Rejected> get(std::string_view key) const {
+        return settingsObject().template get<T>(key);
+    }
+    [[nodiscard]] std::set<std::string>                   writableMembers() const { return settingsObject().writableMembers(); }
+    std::expected<settings::Values, settings::Rejected>   resetDefaults(settings::Timeout timeout = std::nullopt) { return settingsObject().resetDefaults(timeout); }
+    [[nodiscard]] std::expected<void, settings::Rejected> setTagCouplings(const property_map& couplings) { return settingsObject().setTagCouplings(couplings); }
+    [[nodiscard]] property_map                            tagCouplings() const { return settingsObject().tagCouplings(); }
 
     [[nodiscard]] virtual work::Result work(std::size_t requested_work) = 0;
 
@@ -515,6 +527,35 @@ public:
 
     virtual void processScheduledMessages() = 0;
 
+private:
+    friend struct Graph;
+    template<typename TSelf, typename TSubGraph>
+    friend class GraphWrapper;
+    template<BlockLike T, typename Ownership>
+    friend class BlockWrapper;
+    friend struct settings::detail::ModelAccess;
+
+    [[nodiscard]] virtual SettingsBase&       settingsObject()       = 0;
+    [[nodiscard]] virtual const SettingsBase& settingsObject() const = 0;
+
+    // lists the block's ports again after a setting resized a port collection; a model with no port loader keeps its list
+    void reloadDynamicPorts() {
+        initDynamicPorts();
+        if (_dynamicPortsLoader.instance == nullptr) {
+            return;
+        }
+        _dynamicInputPorts.clear();
+        _dynamicOutputPorts.clear();
+        _dynamicPortsLoader();
+    }
+
+    // adds `prefix` to the prefixes whose tag keys the output `port` drops, or removes it; a subgraph passes the call to
+    // the block inside it that holds the port. Returns whether this block or one inside it holds the port
+    virtual bool dropTagKeysAtOutput(const DynamicPort& port, std::string_view prefix, bool drops) {
+        return std::ranges::any_of(blocks(), [&port, prefix, drops](const std::shared_ptr<BlockModel>& inner) { return inner->dropTagKeysAtOutput(port, prefix, drops); });
+    }
+
+public:
     [[nodiscard]] virtual UICategory uiCategory() const { return UICategory::None; }
 
     // port and sample information
@@ -617,6 +658,20 @@ inline bool Edge::hasSameInput(const Edge& other, PortType type) const {
     return type == PortType::ANY || port::decodePortType(input.value()->portMaskInfo()) == type;
 }
 
+namespace settings::detail {
+
+struct ModelAccess {
+    [[nodiscard]] static SettingsBase&       of(BlockModel& model) noexcept { return model.settingsObject(); }
+    [[nodiscard]] static const SettingsBase& of(const BlockModel& model) noexcept { return model.settingsObject(); }
+};
+
+// the settings object of a type-erased block, for core's own use; a holder of the block calls `set`, `get` and the
+// others on the block
+[[nodiscard]] inline SettingsBase&       settingsOf(BlockModel& model) noexcept { return ModelAccess::of(model); }
+[[nodiscard]] inline const SettingsBase& settingsOf(const BlockModel& model) noexcept { return ModelAccess::of(model); }
+
+} // namespace settings::detail
+
 namespace serialization_fields {
 using namespace std::string_view_literals;
 using namespace std::string_literals;
@@ -628,7 +683,6 @@ constexpr auto BLOCK_UNIQUE_NAME      = "unique_name"sv;
 constexpr auto BLOCK_META_INFORMATION = "meta_information"sv;
 constexpr auto BLOCK_PARAMETERS       = "parameters"sv;
 constexpr auto BLOCK_CATEGORY         = "block_category"sv;
-constexpr auto BLOCK_CTX_PARAMETERS   = "ctx_parameters"sv;
 constexpr auto BLOCK_TAG_COUPLINGS    = "tag_couplings"sv;
 
 constexpr auto BLOCK_INPUT_PORTS  = "input_ports"sv;
@@ -752,6 +806,15 @@ protected:
         }
     }
 
+    // every way of building a block by type (Graph::emplaceBlock, the registry, a plugin's factory) passes here: a block that
+    // cannot take its settings stops the build with the line to add, not with an unmatched call deep in the registry
+    static T fromSettings(gr::property_map&& settings) {
+        static_assert(std::is_constructible_v<T, gr::property_map>, "add 'using gr::Block<Name<T>>::Block;' inside this block (needed when a block has private members or its own constructor)");
+        if constexpr (std::is_constructible_v<T, gr::property_map>) {
+            return T(std::move(settings));
+        }
+    }
+
     static void blockWrapperDynamicPortsLoader(BlockModel* base) {
         auto* wrapper = static_cast<BlockWrapper*>(base);
         wrapper->dynamicPortsLoader();
@@ -759,8 +822,8 @@ protected:
 
 public:
     explicit BlockWrapper(gr::property_map initParameter = {})
-    requires(kOwning && std::is_constructible_v<T, property_map>)
-        : BlockModel(gr::meta::type_name<T>()), _block(std::move(initParameter)) {
+    requires kOwning
+        : BlockModel(gr::meta::type_name<T>()), _block(fromSettings(std::move(initParameter))) {
         initMessagePorts();
         _dynamicPortsLoader.fn       = &BlockWrapper::blockWrapperDynamicPortsLoader;
         _dynamicPortsLoader.instance = this;
@@ -794,14 +857,6 @@ public:
         }
     }
 
-    [[nodiscard]] std::optional<Error> initError() const override {
-        if constexpr (requires { blockRef()._initError; }) {
-            return blockRef()._initError;
-        } else {
-            return {};
-        }
-    }
-
     [[nodiscard]] constexpr const auto& blockRef() const noexcept {
         if constexpr (requires { *_block; }) {
             return *_block;
@@ -818,7 +873,20 @@ public:
         }
     }
 
-    [[nodiscard]] constexpr work::Result work(std::size_t requested_work = undefined_size) override { return blockRef().work(requested_work); }
+    // a block that defines its own `work()` runs none of the work function `gr::Block` provides, whose end copies the
+    // block's `Status` while a host wants it; the call here holds the same scope for it
+    [[nodiscard]] constexpr work::Result work(std::size_t requested_work = undefined_size) override {
+        if constexpr (requires {
+                          &T::work;
+                          settings::detail::settingsOf(blockRef());
+                      }) {
+            if constexpr (settings::detail::holdsStatusStruct<T>()) {
+                [[maybe_unused]] const settings::detail::StatusCopyAfterWork statusCopy(settings::detail::settingsOf(blockRef()));
+                return blockRef().work(requested_work);
+            }
+        }
+        return blockRef().work(requested_work);
+    }
 
     void requestFinish(std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) override {
         if constexpr (requires { blockRef().requestFinish(deadline); }) {
@@ -859,6 +927,34 @@ public:
 
     void processScheduledMessages() override { return blockRef().processScheduledMessages(); }
 
+private:
+    bool dropTagKeysAtOutput(const DynamicPort& port, std::string_view prefix, bool drops) override {
+        using TBlock = std::remove_cvref_t<decltype(blockRef())>;
+        bool held    = false;
+        if constexpr (TBlock::blockCategory == block::Category::NormalBlock) {
+            const auto mark = [&held, &port, prefix, drops](auto& candidate) {
+                if (held || DynamicPort(candidate, DynamicPort::non_owned_reference_tag{}) != port) {
+                    return;
+                }
+                held = true;
+                std::erase(candidate.droppedTagKeyPrefixes, prefix);
+                if (drops) {
+                    candidate.droppedTagKeyPrefixes.emplace_back(prefix);
+                }
+            };
+            auto visit = [this, &mark]<gr::detail::PortDescription CurrentPortType>(int, auto, CurrentPortType*) {
+                if constexpr (CurrentPortType::kIsDynamicCollection || CurrentPortType::kIsStaticCollection) {
+                    std::ranges::for_each(CurrentPortType::getPortObject(blockRef()), mark);
+                } else {
+                    mark(CurrentPortType::getPortObject(blockRef()));
+                }
+            };
+            traits::block::all_output_ports<TBlock>::for_each(visit, 0);
+        }
+        return held || BlockModel::dropTagKeysAtOutput(port, prefix, drops);
+    }
+
+public:
     // For blocks that contain nested blocks (Graphs, Schedulers)
     [[nodiscard]] std::span<std::shared_ptr<BlockModel>> blocks() noexcept override {
         if constexpr (requires { blockRef().blocks(); }) {
@@ -898,15 +994,26 @@ public:
     [[nodiscard]] std::expected<void, Error> changeStateTo(lifecycle::State newState) noexcept override { return blockRef().changeStateTo(newState); }
     [[nodiscard]] lifecycle::State           state() const noexcept override { return blockRef().state(); }
     [[nodiscard]] std::string_view           name() const override { return blockRef().name; }
-    void                                     setName(std::string name) noexcept override { blockRef().name = std::move(name); }
     [[nodiscard]] property_map&              metaInformation() noexcept override { return blockRef().meta_information; } // TODO: to be removed (read-only)
     [[nodiscard]] const property_map&        metaInformation() const override { return blockRef().meta_information; }
-    [[nodiscard]] property_map&              uiConstraints() noexcept override { return blockRef().ui_constraints; }
     [[nodiscard]] const property_map&        uiConstraints() const override { return blockRef().ui_constraints; }
     [[nodiscard]] std::string_view           uniqueName() const override { return blockRef().unique_name; }
-    [[nodiscard]] SettingsBase&              settings() override { return blockRef().settings(); }
-    [[nodiscard]] const SettingsBase&        settings() const override { return blockRef().settings(); }
     [[nodiscard]] void*                      raw() override { return std::addressof(blockRef()); }
+
+    // once the block is set up, a new name is a set() of `name` with noWait: a save returns it at once, a read too unless
+    // the block runs, and name() returns it once the block applies it, which a scheduler-managed subgraph that runs does
+    // at its scheduler's next start; a refusal of the set() is the result
+    std::expected<settings::Values, settings::Rejected> setName(std::string name) noexcept override {
+        if (!settings::detail::FrameworkAccess::isSetUp(settingsObject())) {
+            blockRef().name = std::move(name);
+            return settings::Values{};
+        }
+        return settingsObject().set("name", pmt::Value(std::move(name)), settings::noWait);
+    }
+
+private:
+    [[nodiscard]] SettingsBase&       settingsObject() override { return settings::detail::settingsOf(blockRef()); }
+    [[nodiscard]] const SettingsBase& settingsObject() const override { return settings::detail::settingsOf(blockRef()); }
 };
 
 namespace detail {

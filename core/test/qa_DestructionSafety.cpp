@@ -30,10 +30,14 @@ struct Sink : gr::Block<Sink> {
 struct TimedSource : gr::Block<TimedSource>, gr::BlockingSync<TimedSource> {
     gr::PortOut<float> out;
 
-    gr::Annotated<float, "sample rate">     sample_rate = 100000.0f;
-    gr::Annotated<gr::Size_t, "chunk size"> chunk_size  = 16U;
+    struct Settings {
+        gr::Annotated<float>      sample_rate = 100000.0f;
+        gr::Annotated<gr::Size_t> chunk_size  = 16U;
 
-    GR_MAKE_REFLECTABLE(TimedSource, out, sample_rate, chunk_size);
+        GR_MAKE_REFLECTABLE(Settings, sample_rate, chunk_size);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(TimedSource, out, settings);
 
     ~TimedSource() {
         // leave the active states before ~Block() reaches back into this (already-destroyed) derived class
@@ -54,7 +58,7 @@ struct TimedSource : gr::Block<TimedSource>, gr::BlockingSync<TimedSource> {
     }
 };
 
-using InnerScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>;
+using InnerScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multi_threaded>;
 
 [[nodiscard]] gr::Graph makeGraph() {
     using namespace boost::ut;
@@ -113,7 +117,7 @@ const boost::ut::suite<"destruction safety"> destructionSafetyTests = [] {
     "a BlockingSync block stops its timer without waiting for the next tick"_test = [] {
         gr::Graph  flow;
         auto&      block  = flow.emplaceBlock<qa_destroy::TimedSource>({{"sample_rate", 16.0f}, {"chunk_size", 16U}});
-        const auto period = std::chrono::duration<double>(static_cast<double>(block.chunk_size.value) / static_cast<double>(block.sample_rate.value));
+        const auto period = std::chrono::duration<double>(static_cast<double>(block.settings.chunk_size.value) / static_cast<double>(block.settings.sample_rate.value));
         expect(fatal(ge(period, std::chrono::duration<double>(0.5)))) << "the settings must give a chunk period that a stop can be timed against";
 
         const std::size_t progressBefore = block.progress->value();

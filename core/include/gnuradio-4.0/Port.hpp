@@ -12,10 +12,13 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <typeinfo>
 #include <utility>
 #include <variant>
+#include <vector>
 
 #include <gnuradio-4.0/Export.hpp>
 #include <gnuradio-4.0/PmtTypeHelpers.hpp>
@@ -196,14 +199,14 @@ Follows the ISO 80000-1:2022 Quantities and Units conventions:
   * https://blog.ansi.org/iso-80000-1-2022-quantities-and-units/
 )*">; // long-term goal: enable compile-time checks based on https://github.com/mpusz/mp-units (N.B. will become part of C++26)
 
-    Annotated<std::string, "data type name", Visible, Doc<"portable port data type name">>                           data_type = "<unknown>";
-    Annotated<std::string, "port name", Visible, Doc<"port name">>                                                   name;
-    Annotated<float, "sample rate", Visible, Doc<"sampling rate in samples per second (Hz)">>                        sample_rate = 1.f;
-    Annotated<std::string, "signal name", Doc<"name of the signal">>                                                 signal_name = "<unnamed>";
-    Annotated<std::string, "signal quantity", Doc<"physical quantity (e.g., 'voltage'). Follows ISO 80000-1:2022.">> signal_quantity{};
-    Annotated<std::string, "signal unit", Doc<"unit of measurement (e.g., '[V]', '[m]'). Follows ISO 80000-1:2022">> signal_unit{};
-    Annotated<float, "signal min", Doc<"minimum expected signal value">>                                             signal_min = std::numeric_limits<float>::lowest();
-    Annotated<float, "signal max", Doc<"maximum expected signal value">>                                             signal_max = std::numeric_limits<float>::max();
+    Annotated<std::string, Visible, Doc<"portable port data type name">>                              data_type = "<unknown>";
+    Annotated<std::string, Visible, Doc<"port name">>                                                 name;
+    Annotated<float, Visible, Doc<"sampling rate in samples per second (Hz)">>                        sample_rate = 1.f;
+    Annotated<std::string, Doc<"name of the signal">>                                                 signal_name = "<unnamed>";
+    Annotated<std::string, Doc<"physical quantity (e.g., 'voltage'). Follows ISO 80000-1:2022.">>     signal_quantity{};
+    Annotated<std::string, Doc<"unit of measurement (e.g., '[V]', '[m]'). Follows ISO 80000-1:2022">> signal_unit{};
+    Annotated<float, Doc<"minimum expected signal value">>                                            signal_min = std::numeric_limits<float>::lowest();
+    Annotated<float, Doc<"maximum expected signal value">>                                            signal_max = std::numeric_limits<float>::max();
 
     GR_MAKE_REFLECTABLE(PortMetaInfo, data_type, name, sample_rate, signal_name, signal_quantity, signal_unit, signal_min, signal_max);
 
@@ -490,6 +493,23 @@ concept PortDescription = requires {
 };
 } // namespace detail
 
+namespace detail {
+// whether a key of `map` begins with one of `prefixes`
+[[nodiscard]] inline bool holdsKeyWithPrefix(const property_map& map, std::span<const std::string> prefixes) noexcept {
+    return std::ranges::any_of(map, [prefixes](const auto& entry) { return std::ranges::any_of(prefixes, [key = std::string_view(entry.first)](const std::string& prefix) { return key.starts_with(prefix); }); });
+}
+
+[[nodiscard]] inline property_map withoutKeysWithPrefix(const property_map& map, std::span<const std::string> prefixes) {
+    property_map kept;
+    for (const auto& [key, value] : map) {
+        if (std::ranges::none_of(prefixes, [keyView = std::string_view(key)](const std::string& prefix) { return keyView.starts_with(prefix); })) {
+            kept.insert_or_assign(key, value);
+        }
+    }
+    return kept;
+}
+} // namespace detail
+
 /**
  * @brief 'ports' are interfaces that allows data to flow between blocks in a graph, similar to RF connectors.
  * Each block can have zero or more input/output ports. When connecting ports, either a single-step or a two-step
@@ -674,17 +694,19 @@ struct Port {
         // diagnostic reads.
         std::size_t* portTagsDropped{nullptr};
 
-        constexpr OutputSpan(std::size_t nSamples, WriterType& streamWriter, TagWriterType& tagsWriter, std::size_t streamOffset, bool connected, bool sync, std::size_t* portDropCounter = nullptr) noexcept //
+        std::span<const std::string> droppedTagKeyPrefixes{}; // the port's: a tag published here loses each key they begin
+
+        constexpr OutputSpan(std::size_t nSamples, WriterType& streamWriter, TagWriterType& tagsWriter, std::size_t streamOffset, bool connected, bool sync, std::size_t* portDropCounter = nullptr, std::span<const std::string> droppedPrefixes = {}) noexcept //
         requires(spanReservePolicy == WriterSpanReservePolicy::Reserve)
             : WriterSpanType<spanReleasePolicy>(streamWriter.template reserve<spanReleasePolicy>(nSamples)), //
               tags(tagsWriter.template reserve<SpanReleasePolicy::ProcessNone>(tagsWriter.available())),     //
-              streamIndex{streamOffset}, isConnected(connected), isSync(sync), portTagsDropped(portDropCounter) {}
+              streamIndex{streamOffset}, isConnected(connected), isSync(sync), portTagsDropped(portDropCounter), droppedTagKeyPrefixes(droppedPrefixes) {}
 
-        constexpr OutputSpan(std::size_t nSamples_, WriterType& streamWriter, TagWriterType& tagsWriter, std::size_t streamOffset, bool connected, bool sync, std::size_t* portDropCounter = nullptr) noexcept //
+        constexpr OutputSpan(std::size_t nSamples_, WriterType& streamWriter, TagWriterType& tagsWriter, std::size_t streamOffset, bool connected, bool sync, std::size_t* portDropCounter = nullptr, std::span<const std::string> droppedPrefixes = {}) noexcept //
         requires(spanReservePolicy == WriterSpanReservePolicy::TryReserve)
             : WriterSpanType<spanReleasePolicy>(streamWriter.template tryReserve<spanReleasePolicy>(nSamples_)), //
               tags(tagsWriter.template tryReserve<SpanReleasePolicy::ProcessNone>(tagsWriter.available())),      //
-              streamIndex{streamOffset}, isConnected(connected), isSync(sync), portTagsDropped(portDropCounter) {}
+              streamIndex{streamOffset}, isConnected(connected), isSync(sync), portTagsDropped(portDropCounter), droppedTagKeyPrefixes(droppedPrefixes) {}
 
         OutputSpan(const OutputSpan&)                = delete;
         OutputSpan& operator=(const OutputSpan&)     = delete;
@@ -704,6 +726,12 @@ struct Port {
         inline constexpr void publishTag(TPropertyMap&& tagData, std::size_t tagOffset = 0UZ) noexcept {
             // Do not publish tags if port is not connected, as it can lead to a tag buffer overflow.
             if (!isConnected) {
+                return;
+            }
+            if (!droppedTagKeyPrefixes.empty() && detail::holdsKeyWithPrefix(tagData, droppedTagKeyPrefixes)) {
+                if (property_map kept = detail::withoutKeysWithPrefix(tagData, droppedTagKeyPrefixes); !kept.empty()) {
+                    publishTag(std::move(kept), tagOffset);
+                }
                 return;
             }
 
@@ -765,6 +793,9 @@ public:
     // dropped annotation, and has its own counter.
     std::size_t nTagsDropped{0UZ};
     std::size_t nEoSTagsLost{0UZ}; // end-of-stream markers this port could not publish
+
+    // an output that leaves a composite drops the inner tag keys of that composite, which begin with its prefix here
+    std::vector<std::string> droppedTagKeyPrefixes{};
 
 private:
     // A port builds its stream and tag rings when it is sized or connected. Otherwise the first call that hands
@@ -1124,20 +1155,26 @@ public:
     auto reserve(std::size_t nSamples)
     requires(kIsOutput)
     {
-        return OutputSpan<spanReleasePolicy, WriterSpanReservePolicy::Reserve>(nSamples, streamWriter(), tagWriter(), streamWriter().position(), this->isConnected(), this->isSynchronous(), &nTagsDropped);
+        return OutputSpan<spanReleasePolicy, WriterSpanReservePolicy::Reserve>(nSamples, streamWriter(), tagWriter(), streamWriter().position(), this->isConnected(), this->isSynchronous(), &nTagsDropped, droppedTagKeyPrefixes);
     }
 
     template<SpanReleasePolicy spanReleasePolicy>
     auto tryReserve(std::size_t nSamples)
     requires(kIsOutput)
     {
-        return OutputSpan<spanReleasePolicy, WriterSpanReservePolicy::TryReserve>(nSamples, streamWriter(), tagWriter(), streamWriter().position(), this->isConnected(), this->isSynchronous(), &nTagsDropped);
+        return OutputSpan<spanReleasePolicy, WriterSpanReservePolicy::TryReserve>(nSamples, streamWriter(), tagWriter(), streamWriter().position(), this->isConnected(), this->isSynchronous(), &nTagsDropped, droppedTagKeyPrefixes);
     }
 
     template<PropertyMapType TPropertyMap>
     inline constexpr void publishTag(TPropertyMap&& tagData, std::size_t tagOffset = 0UZ) noexcept
     requires(kIsOutput)
     {
+        if (isConnected() && !droppedTagKeyPrefixes.empty() && detail::holdsKeyWithPrefix(tagData, droppedTagKeyPrefixes)) {
+            if (property_map kept = detail::withoutKeysWithPrefix(tagData, droppedTagKeyPrefixes); !kept.empty()) {
+                publishTag(std::move(kept), tagOffset);
+            }
+            return;
+        }
         if (isConnected()) {
             // two reserved, one published: the store's last free slot is held back for the
             // end-of-stream marker exactly as the reservation's last slot is, so a tag flood

@@ -408,38 +408,44 @@ struct CappingRelay : Block<CappingRelay> {
     PortIn<float>  in;
     PortOut<float> out;
 
-    float sample_rate     = 1000.f;
-    float gain            = 1.f;
-    float max_gain        = kGainCeiling;
-    float max_sample_rate = kRateCeiling;
+    struct Settings {
+        float sample_rate     = 1000.f;
+        float gain            = 1.f;
+        float max_gain        = kGainCeiling;
+        float max_sample_rate = kRateCeiling;
 
-    GR_MAKE_REFLECTABLE(CappingRelay, in, out, sample_rate, gain, max_gain, max_sample_rate);
+        GR_MAKE_REFLECTABLE(Settings, sample_rate, gain, max_gain, max_sample_rate);
+    } settings;
 
-    void settingsChanged(const property_map& /*oldSettings*/, const property_map& /*newSettings*/) {
-        gain        = std::min(gain, max_gain);
-        sample_rate = std::min(sample_rate, max_sample_rate);
+    GR_MAKE_REFLECTABLE(CappingRelay, in, out, settings);
+
+    // caps the gain and the sample rate at their maxima
+    void applySettings(Settings& s) {
+        s.gain        = std::min(s.gain, s.max_gain);
+        s.sample_rate = std::min(s.sample_rate, s.max_sample_rate);
     }
 
     [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
 };
-
-/// writes half of a changed sample rate into a block's forward map under kHalfRateKey
-void forwardHalfRate(const property_map& newSettings, float sampleRate, property_map& forward) {
-    if (newSettings.contains("sample_rate")) {
-        forward.insert_or_assign(std::pmr::string(kHalfRateKey), sampleRate / 2.f);
-    }
-}
 
 /// hands half its sample rate on under kHalfRateKey through its own forward map
 struct HalfRateRelay : Block<HalfRateRelay> {
     PortIn<float>  in;
     PortOut<float> out;
 
-    float sample_rate = 1.f;
+    struct Settings {
+        float sample_rate = 1.f;
 
-    GR_MAKE_REFLECTABLE(HalfRateRelay, in, out, sample_rate);
+        GR_MAKE_REFLECTABLE(Settings, sample_rate);
+    } settings;
 
-    void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings, property_map& forward) { forwardHalfRate(newSettings, sample_rate, forward); }
+    GR_MAKE_REFLECTABLE(HalfRateRelay, in, out, settings);
+
+    void applySettings(const Settings& s, const Settings& old) {
+        if (s.sample_rate != old.sample_rate) {
+            this->forwardTag(kHalfRateKey, s.sample_rate / 2.f);
+        }
+    }
 
     [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
 };
@@ -449,17 +455,25 @@ struct WaitingHalfRateRelay : Block<WaitingHalfRateRelay> {
     PortIn<float>  in;
     PortOut<float> out;
 
-    float sample_rate = 1.f;
+    struct Settings {
+        float sample_rate = 1.f;
 
-    GR_MAKE_REFLECTABLE(WaitingHalfRateRelay, in, out, sample_rate);
+        GR_MAKE_REFLECTABLE(Settings, sample_rate);
+    } settings;
 
-    bool _waited = false;
+    GR_MAKE_REFLECTABLE(WaitingHalfRateRelay, in, out, settings);
 
-    void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings, property_map& forward) { forwardHalfRate(newSettings, sample_rate, forward); }
+    bool waited = false;
+
+    void applySettings(const Settings& s, const Settings& old) {
+        if (s.sample_rate != old.sample_rate) {
+            this->forwardTag(kHalfRateKey, s.sample_rate / 2.f);
+        }
+    }
 
     work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
-        if (!_waited) {
-            _waited     = true;
+        if (!waited) {
+            waited      = true;
             std::ignore = inSpan.consume(0UZ);
             outSpan.publish(0UZ);
             return work::Status::INSUFFICIENT_INPUT_ITEMS;
@@ -477,11 +491,19 @@ struct HalfRateDecimator : Block<HalfRateDecimator, Resampling<2U, 1U, true>> {
     PortIn<float>  in;
     PortOut<float> out;
 
-    float sample_rate = 1.f;
+    struct Settings {
+        float sample_rate = 1.f;
 
-    GR_MAKE_REFLECTABLE(HalfRateDecimator, in, out, sample_rate);
+        GR_MAKE_REFLECTABLE(Settings, sample_rate);
+    } settings;
 
-    void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings, property_map& forward) { forwardHalfRate(newSettings, sample_rate, forward); }
+    GR_MAKE_REFLECTABLE(HalfRateDecimator, in, out, settings);
+
+    void applySettings(const Settings& s, const Settings& old) {
+        if (s.sample_rate != old.sample_rate) {
+            this->forwardTag(kHalfRateKey, s.sample_rate / 2.f);
+        }
+    }
 
     work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
         const std::size_t n = std::min(outSpan.size(), inSpan.size() / 2UZ);
@@ -533,10 +555,14 @@ struct UnmarkedRelay : Block<UnmarkedRelay> {
     PortIn<float>  in;
     PortOut<float> out;
 
-    float sample_rate = 1000.f;
-    float gain        = 1.f;
+    struct Settings {
+        float sample_rate = 1000.f;
+        float gain        = 1.f;
 
-    GR_MAKE_REFLECTABLE(UnmarkedRelay, in, out, sample_rate, gain);
+        GR_MAKE_REFLECTABLE(Settings, sample_rate, gain);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(UnmarkedRelay, in, out, settings);
 
     [[nodiscard]] constexpr float processOne(float value) const noexcept { return value; }
 };
@@ -610,12 +636,17 @@ struct SkippingDecimator : Block<SkippingDecimator, Resampling<4U, 1U, true>, St
     PortIn<float>  in;
     PortOut<float> out;
 
-    float sample_rate     = 1000.f;
-    float max_sample_rate = kRateCeiling;
+    struct Settings {
+        float sample_rate     = 1000.f;
+        float max_sample_rate = kRateCeiling;
 
-    GR_MAKE_REFLECTABLE(SkippingDecimator, in, out, sample_rate, max_sample_rate);
+        GR_MAKE_REFLECTABLE(Settings, sample_rate, max_sample_rate);
+    } settings;
 
-    void settingsChanged(const property_map& /*oldSettings*/, const property_map& /*newSettings*/) { sample_rate = std::min(sample_rate, max_sample_rate); }
+    GR_MAKE_REFLECTABLE(SkippingDecimator, in, out, settings);
+
+    // caps the sample rate at its maximum
+    void applySettings(Settings& s) { s.sample_rate = std::min(s.sample_rate, s.max_sample_rate); }
 
     work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
         if (inSpan.empty() || outSpan.empty()) {
@@ -633,11 +664,19 @@ struct SkippingHalfRateDecimator : Block<SkippingHalfRateDecimator, Resampling<4
     PortIn<float>  in;
     PortOut<float> out;
 
-    float sample_rate = 1.f;
+    struct Settings {
+        float sample_rate = 1.f;
 
-    GR_MAKE_REFLECTABLE(SkippingHalfRateDecimator, in, out, sample_rate);
+        GR_MAKE_REFLECTABLE(Settings, sample_rate);
+    } settings;
 
-    void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings, property_map& forward) { forwardHalfRate(newSettings, sample_rate, forward); }
+    GR_MAKE_REFLECTABLE(SkippingHalfRateDecimator, in, out, settings);
+
+    void applySettings(const Settings& s, const Settings& old) {
+        if (s.sample_rate != old.sample_rate) {
+            this->forwardTag(kHalfRateKey, s.sample_rate / 2.f);
+        }
+    }
 
     work::Status processBulk(InputSpanLike auto& inSpan, OutputSpanLike auto& outSpan) {
         if (inSpan.empty() || outSpan.empty()) {
@@ -741,7 +780,7 @@ template<typename TBuild>
     gr::Graph flow;
     Sink*     sink = build(flow);
 
-    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler;
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler;
     expect(scheduler.exchange(std::move(flow)).has_value());
     expect(scheduler.runAndWait().has_value());
 
@@ -760,7 +799,7 @@ template<typename... TMiddle>
     std::tuple<TMiddle&...> middle = [&]<std::size_t... I>(std::index_sequence<I...>) { return std::tuple<TMiddle&...>{flow.emplaceBlock<TMiddle>(middleSettings[I])...}; }(std::index_sequence_for<TMiddle...>{});
     auto&                   sink   = flow.emplaceBlock<Sink>(gr::property_map{{"name", std::string("snk")}});
     if (!firstCouplings.empty()) {
-        std::get<0UZ>(middle).settings().setTagCouplings(firstCouplings);
+        expect(std::get<0UZ>(middle).setTagCouplings(firstCouplings).has_value());
     }
 
     const auto link = [&flow](auto& from, auto& to) { expect(flow.connect<"out", "in">(from, to).has_value()); };
@@ -834,7 +873,7 @@ template<typename TMiddle>
     expect(flow.connect<"out", "in">(source, middle).has_value());
     expect(flow.connect<"out", "in">(middle, sink).has_value());
 
-    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler;
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler;
     expect(scheduler.exchange(std::move(flow)).has_value());
     expect(scheduler.runAndWait().has_value());
     return RecordedRun{.nSamples = sink.nSamples, .tags = sink.tags};
@@ -857,12 +896,12 @@ template<typename TMiddle>
     auto& middle      = flow.emplaceBlock<TMiddle>(gr::property_map{{"name", std::string("mid")}});
     auto& sink        = flow.emplaceBlock<EndSink>(gr::property_map{{"name", std::string("snk")}});
     if (!couplings.empty()) {
-        middle.settings().setTagCouplings(couplings);
+        expect(middle.setTagCouplings(couplings).has_value());
     }
     expect(flow.connect<"out", "in">(source, middle).has_value());
     expect(flow.connect<"out", "in">(middle, sink).has_value());
 
-    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler;
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler;
     expect(scheduler.exchange(std::move(flow)).has_value());
     expect(scheduler.runAndWait().has_value());
 
@@ -1276,7 +1315,7 @@ const boost::ut::suite<"uniform tag propagation"> _uniformTagPropagation = [] {
         sink.in.min_samples                 = kInputMinimum;
         sink.in.max_samples                 = 7UZ;
         expect(flow.connect<"out", "in">(source, sink).has_value());
-        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler;
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler;
         expect(scheduler.exchange(std::move(flow)).has_value());
         expect(scheduler.runAndWait().has_value());
         expectTagIndices("two samples consumed per call", sink.tags, tags | std::views::transform(&TagRecord::index) | std::ranges::to<std::vector>());
@@ -1313,7 +1352,7 @@ const boost::ut::suite<"uniform tag propagation"> _uniformTagPropagation = [] {
         auto& sink            = flow.emplaceBlock<RecordingSink>(gr::property_map{{"name", std::string("snk")}});
         expect(flow.connect<"out", "in">(source, middle).has_value());
         expect(flow.connect<"out", "in">(middle, sink).has_value());
-        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> scheduler;
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded> scheduler;
         expect(scheduler.exchange(std::move(flow)).has_value());
         expect(scheduler.runAndWait().has_value());
 

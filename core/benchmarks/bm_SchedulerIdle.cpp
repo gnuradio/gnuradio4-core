@@ -38,7 +38,7 @@
 /**
  * @brief What an idle graph, a loaded chain and a late sample cost under each execution policy of `Simple`.
  *
- * Five arms: the four policies, and multiThreadedBlocking with pool_park_count 0. The workers of that arm park at the
+ * Five arms: the four policies, and multi_threaded_blocking with pool_park_count 0. The workers of that arm park at the
  * first pass at the idle back-off's longest sleep. The default arm spends five more passes at that sleep first.
  *
  *   - throughput: a source, a chain of 4 or 16 processOne blocks and a sink, in samples per second. Each arm repeats
@@ -48,14 +48,14 @@
  *     with no graph running, which is the floor of the process. The idle rows also give the value of each round.
  *   - wake: a source whose worker waits inside work() until the sink's worker is idle, then publishes one chunk. The
  *     latency is the time from the publication to the sink's receipt. A multi-threaded policy runs the source and the
- *     sink on two workers. Under multiThreaded the sink's worker sleeps in the idle back-off. Under
- *     multiThreadedBlocking it is parked, and the publication's progress notify wakes it. A single-threaded policy
+ *     sink on two workers. Under multi_threaded the sink's worker sleeps in the idle back-off. Under
+ *     multi_threaded_blocking it is parked, and the publication's progress notify wakes it. A single-threaded policy
  *     calls the sink in the pass that published the chunk.
  *   - poll delay: a source that polls the clock in work() and publishes one chunk at its first call after a due time.
  *     Nothing advances the progress sequence at the due time. The delay is the time from the due time to the
  *     publication. A worker parked on the progress sequence calls the source again when its park times out, after up
  *     to timeout_ms.
- *   - message reply: a settings request that the caller's thread sends into msgIn of a run whose source never
+ *   - message reply: an echo request that the caller's thread sends into msgIn of a run whose source never
  *     publishes. Where the policy parks idle workers, the request goes out once every worker of the run waits on the
  *     progress sequence. The latency is the time from the send to the reply on msgOut.
  *
@@ -378,7 +378,7 @@ template<ExecutionPolicy policy>
     return std::chrono::duration<double, std::micro>(source._publishedAt - source._due).count();
 }
 
-// the time from a settings request that the caller's thread sends into msgIn to the reply on msgOut, with the run idle
+// the time from an echo request that the caller's thread sends into msgIn to the reply on msgOut, with the run idle
 // and, where the policy parks idle workers, every worker parked; `allParked` reports whether they were
 template<ExecutionPolicy policy>
 [[nodiscard]] double messageReplyUs(const gr::property_map& settings, bool& pinned, bool& allParked) {
@@ -417,7 +417,7 @@ template<ExecutionPolicy policy>
         }
         std::ignore                    = takeReply("");
         const Clock::time_point sentAt = Clock::now();
-        gr::sendMessage<gr::message::Command::Get>(toScheduler, scheduler.unique_name, gr::block::property::kSetting, gr::property_map{}, "bm-request");
+        gr::sendMessage<gr::message::Command::Set>(toScheduler, scheduler.unique_name, gr::block::property::kEcho, gr::property_map{}, "bm-request");
         bool replied = false;
         while (!replied && Clock::now() - sentAt < std::chrono::seconds(1)) {
             replied = takeReply("bm-request");
@@ -450,10 +450,10 @@ template<typename TMeasure>
 void forPolicy(ExecutionPolicy policy, TMeasure&& measure) {
     using enum ExecutionPolicy;
     switch (policy) {
-    case singleThreaded: measure.template operator()<singleThreaded>(); break;
-    case singleThreadedBlocking: measure.template operator()<singleThreadedBlocking>(); break;
-    case multiThreaded: measure.template operator()<multiThreaded>(); break;
-    case multiThreadedBlocking: measure.template operator()<multiThreadedBlocking>(); break;
+    case single_threaded: measure.template operator()<single_threaded>(); break;
+    case single_threaded_blocking: measure.template operator()<single_threaded_blocking>(); break;
+    case multi_threaded: measure.template operator()<multi_threaded>(); break;
+    case multi_threaded_blocking: measure.template operator()<multi_threaded_blocking>(); break;
     }
 }
 
@@ -490,11 +490,11 @@ inline const boost::ut::suite<"scheduler idle cost"> _scheduler_idle = [] {
     registerPool();
 
     static const std::array<Arm, 5UZ> arms{{
-        {"singleThreaded", singleThreaded, std::nullopt},
-        {"singleThreadedBlocking", singleThreadedBlocking, std::nullopt},
-        {"multiThreaded", multiThreaded, std::nullopt},
-        {"multiThreadedBlocking", multiThreadedBlocking, std::nullopt},
-        {"multiThreadedBlocking/park0", multiThreadedBlocking, 0U},
+        {"single_threaded", single_threaded, std::nullopt},
+        {"single_threaded_blocking", single_threaded_blocking, std::nullopt},
+        {"multi_threaded", multi_threaded, std::nullopt},
+        {"multi_threaded_blocking", multi_threaded_blocking, std::nullopt},
+        {"multi_threaded_blocking/park0", multi_threaded_blocking, 0U},
     }};
 
     for (const std::size_t nChain : {4UZ, 16UZ}) {

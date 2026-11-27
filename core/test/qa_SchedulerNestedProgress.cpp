@@ -18,8 +18,8 @@ namespace qa_nested {
 
 using Clock   = std::chrono::steady_clock;
 using Millis  = std::chrono::duration<double, std::milli>;
-using Parent  = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreadedBlocking>;
-using Nested  = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>;
+using Parent  = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded_blocking>;
+using Nested  = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded>;
 using Managed = gr::SchedulerWrapper<Nested>;
 
 // The parent parks for kParkMs once a pass of its own blocks moves nothing. Its watchdog stays beyond every case.
@@ -187,8 +187,8 @@ struct DrainSink : gr::Block<DrainSink> {
 };
 
 // a scheduler that supplies its own worker, the smallest loop that runs a job list
-struct OwnWorkerScheduler : gr::scheduler::SchedulerBase<OwnWorkerScheduler, gr::scheduler::ExecutionPolicy::multiThreaded> {
-    using Base = gr::scheduler::SchedulerBase<OwnWorkerScheduler, gr::scheduler::ExecutionPolicy::multiThreaded>;
+struct OwnWorkerScheduler : gr::scheduler::SchedulerBase<OwnWorkerScheduler, gr::scheduler::ExecutionPolicy::multi_threaded> {
+    using Base = gr::scheduler::SchedulerBase<OwnWorkerScheduler, gr::scheduler::ExecutionPolicy::multi_threaded>;
     using Base::SchedulerBase;
 
     void customInit() {

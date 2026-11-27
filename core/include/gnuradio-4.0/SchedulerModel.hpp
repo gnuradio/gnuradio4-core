@@ -110,6 +110,18 @@ public:
     // Unsupported scheduler implementations reject the operation without invoking the callback.
     [[nodiscard]] virtual std::expected<CompositionResult, Error> compose(const std::function<void(CompositionEditor&)>&) { return std::unexpected(Error("scheduler does not support guarded composition")); }
     [[nodiscard]] virtual std::expected<void, Error>              removeBranch(const CompositionBranch&) { return std::unexpected(Error("scheduler does not support guarded branch removal")); }
+
+private:
+    friend struct settings::detail::FrameworkAccess;
+
+    // `signal` runs on the starting thread each time the scheduler's settings move to running: once its workers are
+    // released at a start, and at a resume. Set it before the first start. A model that runs no settings never calls it
+    virtual void onSettingsRunning(std::function<void()> /*signal*/) {}
+
+    // whether the caller of runAndWait() returns the start's values itself; otherwise runAndWait() reports each value
+    // in force that differs from the one the start gave as a notification at info. A model that reports no start values
+    // ignores it
+    virtual void returnStartValues(bool /*returned*/) {}
 };
 
 // A scheduler that holds a nested scheduler and exports its ports hands it the progress sequences of the graphs beyond
@@ -129,8 +141,13 @@ class SchedulerWrapper : public GraphWrapper<TScheduler, gr::Graph>, public Sche
     static_assert(std::is_same_v<TScheduler, std::remove_reference_t<TScheduler>>);
 
 public:
+    // the scheduler's settings are set up once it is constructed; a value it refuses throws RefusedSettings
     explicit SchedulerWrapper(const gr::property_map& props = {}) //
-        : GraphWrapper<TScheduler, gr::Graph>(props) {}
+        : GraphWrapper<TScheduler, gr::Graph>(props) {
+        if (std::optional<settings::RefusedSettings> refused = this->blockRef().setUpSettings(); refused) {
+            throw std::move(*refused);
+        }
+    }
 
     SchedulerWrapper(const SchedulerWrapper& other)            = delete;
     SchedulerWrapper(SchedulerWrapper&& other)                 = delete;
@@ -183,6 +200,11 @@ public:
 
     [[nodiscard]] std::optional<Error> startError() const override { return this->blockRef().startError(); }
 
+private:
+    void onSettingsRunning(std::function<void()> signal) override { this->blockRef().onSettingsRunning(std::move(signal)); }
+    void returnStartValues(bool returned) override { this->blockRef().returnStartValues(returned); }
+
+public:
     [[nodiscard]] std::expected<CompositionResult, Error> compose(const std::function<void(CompositionEditor&)>& callback) override {
         std::lock_guard lock(_compositionCallsMutex);
         if constexpr (requires { this->blockRef().compose(callback); }) {
@@ -267,19 +289,11 @@ private:
             return std::unexpected(Error(std::format("sub-scheduler '{}' is {} and cannot be started", sched.unique_name, gr::meta::enumName(sched.state()).value_or(""))));
         }
 
-        // the scheduler holds its pool threads for as long as it runs. It takes the default IO pool in place of the
-        // default CPU pool when no pool is staged. A staged pool applies here. The capacity check below and the start
-        // then read the pool the workers use.
-        const auto poolStaged = [&sched] { return sched.settings().stagedParameters().contains(std::pmr::string("poolName")); };
-        if (!poolStaged() && std::string_view(sched.poolName.value) == gr::thread_pool::kDefaultCpuPoolId) {
-            if (property_map refused = sched.settings().setStaged({{"poolName", std::string(gr::thread_pool::kDefaultIoPoolId)}}); !refused.empty()) {
-                return std::unexpected(Error(std::format("sub-scheduler '{}' refused the pool '{}'", sched.unique_name, gr::thread_pool::kDefaultIoPoolId)));
-            }
-        }
-        if (poolStaged()) {
-            if (auto applied = sched.applyStagedSettings(); !applied.has_value()) {
-                return applied;
-            }
+        // the scheduler holds its pool threads for as long as it runs, so with no pool named it chooses the default IO
+        // pool, as a nested scheduler does. The capacity check below and the start then read the pool the workers use.
+        sched.runsOnOwnThread();
+        if (auto applied = sched.applyStagedSettings(); !applied.has_value()) {
+            return applied;
         }
 
         if (requireWorkerCapacity) {

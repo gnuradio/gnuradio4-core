@@ -14,7 +14,7 @@
  */
 namespace {
 
-using StaleScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>;
+using StaleScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::single_threaded>;
 
 std::unique_ptr<gr::SchedulerModel> makeStaleScheduler(gr::property_map parameters) { return std::make_unique<gr::SchedulerWrapper<StaleScheduler>>(std::move(parameters)); }
 

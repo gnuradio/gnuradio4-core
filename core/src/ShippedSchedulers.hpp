@@ -6,13 +6,13 @@
 namespace gr::detail {
 
 /// the key of the scheduler a graph runs on when the caller names none
-inline constexpr std::string_view kDefaultSchedulerKey = "gr::scheduler::Simple<singleThreaded>";
+inline constexpr std::string_view kDefaultSchedulerKey = "gr::scheduler::Simple<single_threaded>";
 
 /**
  * @brief Registers core's `Simple` scheduler into `gr::globalSchedulerRegistry()` under one key per execution policy.
  *
- * The keys are `gr::scheduler::Simple<singleThreaded>`, `<multiThreaded>`, `<singleThreadedBlocking>` and
- * `<multiThreadedBlocking>`. The key names the policy in words, where the type name spells it as a cast of an integer.
+ * The keys are `gr::scheduler::Simple<single_threaded>`, `<multi_threaded>`, `<single_threaded_blocking>` and
+ * `<multi_threaded_blocking>`. The key names the policy in words, where the type name spells it as a cast of an integer.
  * Each scheduler is registered under that key alone. A listing of the registry names it once.
  *
  * The first call registers, and a later call does nothing. A key the registry already holds keeps its entry.

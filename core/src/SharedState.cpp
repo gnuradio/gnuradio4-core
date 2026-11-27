@@ -124,6 +124,20 @@ const void*& exchangingScheduler() noexcept {
 
 } // namespace gr::scheduler
 
+namespace gr::settings::detail {
+
+const OwnThread*& ownThreadMarks() noexcept {
+    thread_local const OwnThread* innermost = nullptr;
+    return innermost;
+}
+
+std::mutex& notificationPrintLock() noexcept {
+    static std::mutex printLock;
+    return printLock;
+}
+
+} // namespace gr::settings::detail
+
 namespace gr::thread_pool::detail {
 
 Manager& threadPoolManager() {

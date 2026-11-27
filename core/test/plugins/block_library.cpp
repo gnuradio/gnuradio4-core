@@ -1,3 +1,5 @@
+#include <algorithm>
+
 #include <gnuradio-4.0/Block.hpp>
 #include <gnuradio-4.0/BlockRegistry.hpp>
 
@@ -15,13 +17,27 @@ struct LibraryDoubler : gr::Block<LibraryDoubler> {
     gr::PortIn<float>  in;
     gr::PortOut<float> out;
 
-    gr::Annotated<float, "extra gain", gr::Visible, gr::Doc<"applied on top of the doubling">, gr::Unit<"dB">> extra_gain = 1.0f;
+    struct Settings {
+        gr::Annotated<float, gr::Visible, gr::Doc<"applied on top of the doubling">, gr::Unit<"dB">, gr::Limits<gr::Over<0.f>, gr::Max<100.f>>> extra_gain = 1.0f;
 
-    GR_MAKE_REFLECTABLE(LibraryDoubler, in, out, extra_gain);
+        GR_MAKE_REFLECTABLE(Settings, extra_gain);
+    } settings;
+
+    struct Status {
+        gr::Annotated<float, gr::Doc<"largest output seen">> peak = 0.0f;
+
+        GR_MAKE_REFLECTABLE(Status, peak);
+    } status;
+
+    GR_MAKE_REFLECTABLE(LibraryDoubler, in, out, settings, status);
 
     explicit LibraryDoubler(gr::property_map init = {}) : gr::Block<LibraryDoubler>(std::move(init)) {}
 
-    [[nodiscard]] constexpr float processOne(float value) const noexcept { return 2.0f * extra_gain * value; }
+    [[nodiscard]] float processOne(float value) noexcept {
+        const float doubled = 2.0f * settings.extra_gain * value;
+        status.peak         = std::max(status.peak.value, doubled);
+        return doubled;
+    }
 };
 
 const bool registered [[maybe_unused]] = gr::globalBlockRegistry().insert<LibraryDoubler>("=test::library_doubler");

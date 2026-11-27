@@ -5,6 +5,7 @@
 #include <bit>
 #include <chrono>
 #include <deque>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <queue>
@@ -13,6 +14,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -177,14 +179,14 @@ inline static const char* const kInputWithoutEdge = "InputWithoutEdge"; // names
 } // namespace property
 
 enum class ExecutionPolicy {
-    singleThreaded,         ///
-    multiThreaded,          ///
-    singleThreadedBlocking, /// blocks with a time-out if none of the blocks in the graph made progress (N.B. a CPU/battery power-saving measures)
-    multiThreadedBlocking   /// multiThreaded, and each worker blocks with a time-out while the blocks of its own job list make no progress
+    single_threaded,          ///
+    multi_threaded,           ///
+    single_threaded_blocking, /// blocks with a time-out if none of the blocks in the graph made progress (N.B. a CPU/battery power-saving measures)
+    multi_threaded_blocking   /// multi_threaded, and each worker blocks with a time-out while the blocks of its own job list make no progress
 };
 
 // the policies that run one worker per job list on the thread pool
-[[nodiscard]] constexpr bool isMultiThreaded(ExecutionPolicy policy) noexcept { return policy == ExecutionPolicy::multiThreaded || policy == ExecutionPolicy::multiThreadedBlocking; }
+[[nodiscard]] constexpr bool isMultiThreaded(ExecutionPolicy policy) noexcept { return policy == ExecutionPolicy::multi_threaded || policy == ExecutionPolicy::multi_threaded_blocking; }
 
 using JobLists = std::vector<std::vector<std::shared_ptr<BlockModel>>>;
 
@@ -192,15 +194,40 @@ using JobLists = std::vector<std::vector<std::shared_ptr<BlockModel>>>;
 // that worker can tell that waiting for the job count to reach zero would include itself
 inline thread_local const void*& tActiveSchedulerWorker = activeSchedulerWorker();
 
-template<typename Derived, ExecutionPolicy execution = ExecutionPolicy::singleThreaded, profiling::ProfilerLike TProfiler = profiling::null::Profiler>
+/**
+ * @brief The settings every scheduler derived from `SchedulerBase` holds.
+ *
+ * A derived scheduler that declares settings of its own derives its struct from this one, lists only its own members in
+ * the struct's GR_MAKE_REFLECTABLE, and names the struct as the last template argument of `SchedulerBase`. Its keys
+ * then join these: limits, documentation, unit and `StoppedOnly` per key as on a block, and its `checkSettings` and
+ * `applySettings` take the whole struct. The core applies its own keys before the derived scheduler's apply hook runs.
+ */
+struct SchedulerSettings {
+    Annotated<gr::Size_t, Unit<"ms">, Doc<"longest wait of an idle or paused worker">, StoppedOnly>                                          timeout_ms                      = 100U;
+    Annotated<gr::Size_t, Unit<"ms">, Doc<"sleep timeout for watchdog">, StoppedOnly>                                                        watchdog_timeout                = 1000U;
+    Annotated<gr::Size_t, Doc<"inactive traversals before single-threaded parking, or watchdog periods before a stall report">, StoppedOnly> timeout_inactivity_count        = 5U;
+    Annotated<gr::Size_t, Doc<"number of stream to msg processing">, Limits<Min<1U>>, StoppedOnly>                                           process_stream_to_message_ratio = 16U;
+    Annotated<gr::Size_t, Doc<"idle passes at the longest back-off sleep before a pool worker parks">, StoppedOnly>                          pool_park_count                 = 5U;
+    Annotated<std::string, Doc<"thread pool of the workers, empty for the scheduler's choice">, StoppedOnly>                                 poolName{};
+    Annotated<std::size_t, Doc<"number of work items per work scheduling interval (controls latency)">, StoppedOnly>                         max_work_items = std::numeric_limits<std::size_t>::max(); // TODO: check whether we can keep this std::size_t or more consistently to gr::Size_t
+    Annotated<property_map, Doc<"scheduler implementation specific settings">, StoppedOnly>                                                  sched_settings{};
+    Annotated<bool, Doc<"subnormals read and written as zero on this scheduler's own workers">, StoppedOnly>                                 flush_subnormals    = true;
+    Annotated<gr::Size_t, Unit<"ms">, Doc<"default wait of a block's settings call, 0 to inherit">>                                          settings_timeout_ms = 0U;
+
+    GR_MAKE_REFLECTABLE(SchedulerSettings, timeout_ms, watchdog_timeout, timeout_inactivity_count, process_stream_to_message_ratio, pool_park_count, max_work_items, poolName, sched_settings, flush_subnormals, settings_timeout_ms);
+};
+
+template<typename Derived, ExecutionPolicy execution = ExecutionPolicy::single_threaded, profiling::ProfilerLike TProfiler = profiling::null::Profiler, typename TSettings = SchedulerSettings>
 struct SchedulerBase : Block<Derived> {
+    static_assert(std::derived_from<TSettings, SchedulerSettings>, "a scheduler's Settings derive from gr::scheduler::SchedulerSettings");
+
     friend class lifecycle::StateMachine<Derived>;
     using TaskExecutor = gr::thread_pool::TaskExecutor;
     using enum block::Category;
 
 private:
     static consteval void _forbid_reserved_overrides() {
-        using Base = SchedulerBase<Derived, execution, TProfiler>;
+        using Base = SchedulerBase<Derived, execution, TProfiler, TSettings>;
         // Lifecycle callback functions init/start/stop/pause/resume/reset need to remain reserved to SchedulerBase<Derived, ...>.
         // Do NOT re-implement them in the Derived custom user-defined scheduler.
         static_assert(std::same_as<decltype(&Derived::init), decltype(&Base::init)>, "Derived defines 'init()' (reserved). Use 'customInit()' instead.");
@@ -209,6 +236,9 @@ private:
         static_assert(std::same_as<decltype(&Derived::pause), decltype(&Base::pause)>, "Derived defines 'pause()' (reserved). Use 'customPause()' instead.");
         static_assert(std::same_as<decltype(&Derived::resume), decltype(&Base::resume)>, "Derived defines 'resume()' (reserved). Use 'customResume()' instead.");
         static_assert(std::same_as<decltype(&Derived::reset), decltype(&Base::reset)>, "Derived defines 'reset()' (reserved). Use 'customReset()' instead.");
+        // core applies the keys of SchedulerSettings through these two names
+        static_assert(std::same_as<decltype(&Derived::applySchedulerSettings), decltype(&Base::applySchedulerSettings)>, "Derived defines 'applySchedulerSettings()' (reserved). Use 'applySettings()' instead.");
+        static_assert(std::same_as<typename Derived::Settings, TSettings>, "Derived declares its own 'Settings' (reserved). Name its settings struct as SchedulerBase's fourth template argument instead.");
     }
 
     gr::Graph* findTargetSubGraph(const gr::property_map& data) {
@@ -312,6 +342,41 @@ protected:
     std::mutex                                _runEndingBlockMutex;
     std::optional<std::string>                _runEndingBlock; // the first block that ended the run since the latest start (see failRun())
 
+    // what the settings of the blocks this scheduler runs read of it
+    struct SettingsLink final : settings::detail::SchedulerLink {
+        SchedulerBase* scheduler;
+
+        explicit SettingsLink(SchedulerBase& owner) : scheduler(&owner) {}
+        void                                                     wake() override { scheduler->wakeForSettings(); }
+        void                                                     push(settings::Notification notification) override { scheduler->_notifications.push(std::move(notification)); }
+        [[nodiscard]] bool                                       isWorkerThread() const override { return activeSchedulerWorker() != nullptr; }
+        [[nodiscard]] std::optional<settings::NotificationLevel> level() const override { return scheduler->levelForBlocks(); }
+        [[nodiscard]] std::chrono::milliseconds                  defaultTimeout() const override { return scheduler->timeoutForBlocks(); }
+        void                                                     retire(std::string_view block) override { scheduler->forgetPrinted(block); }
+        void                                                     join(std::string_view block) override { scheduler->erasePrintedAtJoin(block); }
+        void                                                     deliver() override { scheduler->deliverNotifications(); }
+    };
+    using NotificationReader = std::function<void(const settings::Notification&)>;
+    using PrintedSlot        = std::tuple<std::string, std::string, settings::NotificationLevel>;
+
+    SettingsLink                                              _settingsLink{*this};
+    settings::detail::NotificationQueue                       _notifications;
+    std::mutex                                                _readersLock;
+    std::vector<NotificationReader>                           _readers;
+    std::mutex                                                _deliverLock;
+    inline static thread_local const void*                    _deliveringScheduler = nullptr; // the scheduler whose delivery runs the readers on this thread
+    std::mutex                                                _printedLock;
+    std::map<PrintedSlot, std::size_t>                        _printed;                     // the default reader's count per block, key and level
+    std::set<std::string, std::less<>>                        _retiredPrinted;              // the blocks whose counts the next delivery erases
+    settings::detail::NotificationQueue                       _events;                      // the notifications that wait for room in the event stream, at the top
+    std::mutex                                                _subscriptionsLock;           // the message pass subscribes while another thread changes the state or delivers
+    std::map<std::string, std::set<std::string>, std::less<>> _subscriptions;               // the clients of each endpoint the scheduler notifies
+    bool                                                      _startValuesReturned = false; // the caller of runAndWait() returns the start's values itself
+    bool                                                      _notifiesStartValues = false; // the start runAndWait() makes reports its values as notifications
+    std::atomic<std::uint32_t>                                _settingsTimeoutMs{0U};       // settings_timeout_ms as the blocks' calls read it
+    bool                                                      _runsOnOwnThread = false;
+    std::function<void()>                                     _onSettingsRunning; // set before the first start, called on the starting thread
+
     std::atomic_flag             _processingScheduledMessages;
     std::atomic<std::thread::id> _messagePassThread{}; // the thread that holds _processingScheduledMessages, or none
     // A pass that moves samples, here or in a sub-scheduler's graph, sets _graphMoved. The holder's call to this
@@ -408,7 +473,7 @@ protected:
     // start() has returned, the swap proceeds. The thread that applies a swap requested on the scheduler's worker
     // swaps as the worker would: a start in the same message batch has published RUNNING without running a worker.
     [[nodiscard]] std::expected<void, Error> swapAllowedFromThisThread() {
-        if constexpr (executionPolicy() == ExecutionPolicy::singleThreaded || executionPolicy() == ExecutionPolicy::singleThreadedBlocking) {
+        if constexpr (executionPolicy() == ExecutionPolicy::single_threaded || executionPolicy() == ExecutionPolicy::single_threaded_blocking) {
             const auto state = this->state();
             if (!isOnOwnWorkerThread() && applyingScheduler() != static_cast<const void*>(this) && lifecycle::isActive(state)) {
                 std::lock_guard guard(_runMutex);
@@ -528,17 +593,38 @@ protected:
         _profilerHandler = _profiler.forThisThread();
     }
 
-    // throws for a key the scheduler does not declare and for a value it refuses. The key check runs after the apply
-    // and names the scheduler by the name the map gives
-    void applyInitialSettings(const property_map& initParameters) {
-        const property_map undeclared = this->settings().set(initParameters);
-        if (!this->settings().activateContext().has_value()) {
-            throw gr::exception("Settings for context could not be activated");
+    // throws for an undeclared key, naming the scheduler by the name the map gives
+    void checkInitialSettings(const property_map& initParameters) {
+        std::string_view givenName = this->name.value;
+        if (const auto it = initParameters.find(std::pmr::string("name")); it != initParameters.end()) {
+            if (const std::string_view text = it->second.value_or(std::string_view{}); text.data() != nullptr) {
+                givenName = text;
+            }
         }
-        if (const ApplyStagedParametersResult applied = this->settings().applyStagedParameters(); !applied.failedParameters.empty()) {
-            throw gr::exception(applied.refusal);
+        gr::detail::checkDeclared(this->writableMembers(), givenName, gr::meta::type_name<Derived>(), initParameters);
+    }
+
+    // the setup of a scheduler that declares no settings or settings hook of its own calls no derived code, and its
+    // constructor sets its settings up
+    [[nodiscard]] static consteval bool setsUpAtConstruction() { return std::same_as<TSettings, SchedulerSettings> && !settings::HasSettingsCheck<Derived> && !settings::HasSettingsApply<Derived>; }
+
+    // No graph holds a scheduler, so its settings are set up over the constructed values. A scheduler that has code of its
+    // own at the setup is set up once it is constructed, where its hooks can run: by SchedulerWrapper's
+    // constructor, at the first settings call, at its initialization or at its start, whichever comes first. A refusal
+    // names the scheduler by the name it was constructed with
+    [[nodiscard]] std::optional<settings::RefusedSettings> setUpSettings() {
+        const std::expected<void, settings::Rejected> initialized = settings::detail::FrameworkAccess::init(settings::detail::settingsOf(*this));
+        if (initialized) {
+            return std::nullopt;
         }
-        gr::detail::checkDeclared(this->settings().writableMembers(), this->name.value, gr::meta::type_name<Derived>(), undeclared);
+        std::string_view    refusedName = this->name.value;
+        const property_map& constructed = settings::detail::FrameworkAccess::constructedWith(settings::detail::settingsOf(*this));
+        if (const auto it = constructed.find(std::pmr::string("name")); it != constructed.end()) {
+            if (const std::string_view given = it->second.value_or(std::string_view{}); given.data() != nullptr) {
+                refusedName = given;
+            }
+        }
+        return settings::RefusedSettings(std::format("scheduler '{}': {}", refusedName, settings::describeRejected(initialized.error())), initialized.error(), refusedName);
     }
 
     void registerPropertyCallbacks() noexcept {
@@ -553,30 +639,25 @@ protected:
         callbacks[scheduler::property::kGraphGRC]         = static_cast<PropertyCallback>(&SchedulerBase::propertyCallbackGraphGRC);
         callbacks[scheduler::property::kSchedulerInspect] = static_cast<PropertyCallback>(&SchedulerBase::propertyCallbackSchedulerInspect);
         callbacks[graph::property::kInspectBlock]         = static_cast<PropertyCallback>(&SchedulerBase::propertyCallbackInspectBlock);
-        this->settings().updateActiveParameters();
+        callbacks[block::property::kSettingsNotification] = static_cast<PropertyCallback>(&SchedulerBase::propertyCallbackSettingsNotification);
+        callbacks[block::property::kLifeCycleState]       = static_cast<PropertyCallback>(&SchedulerBase::propertyCallbackLifecycleState);
     }
 
 public:
     using base_t = Block<Derived>;
 
-    Annotated<gr::Size_t, "timeout", Unit<"ms">, Doc<"longest wait of an idle or paused worker">>                                                           timeout_ms                      = 100U;
-    Annotated<gr::Size_t, "watchdog_timeout", Unit<"ms">, Doc<"sleep timeout for watchdog">>                                                                watchdog_timeout                = 1000U;
-    Annotated<gr::Size_t, "timeout_inactivity_count", Doc<"inactive traversals before single-threaded parking, or watchdog periods before a stall report">> timeout_inactivity_count        = 5U;
-    Annotated<gr::Size_t, "process_stream_to_message_ratio", Doc<"number of stream to msg processing">, Limits<1U, std::numeric_limits<gr::Size_t>::max()>> process_stream_to_message_ratio = 16U;
-    Annotated<gr::Size_t, "pool_park_count", Doc<"idle passes at the longest back-off sleep before a pool worker parks">>                                   pool_park_count                 = 5U;
-    Annotated<std::string, "pool name", Doc<"default pool name">>                                                                                           poolName                        = std::string(gr::thread_pool::kDefaultCpuPoolId);
-    Annotated<std::size_t, "max_work_items", Doc<"number of work items per work scheduling interval (controls latency)">>                                   max_work_items                  = std::numeric_limits<std::size_t>::max(); // TODO: check whether we can keep this std::size_t or more consistently to gr::Size_t
-    Annotated<property_map, "sched_settings", Doc<"scheduler implementation specific settings">>                                                            sched_settings{};
-    Annotated<bool, "flush_subnormals", Doc<"subnormals read and written as zero on this scheduler's own workers">>                                         flush_subnormals = true;
+    using Settings = TSettings;
 
-    GR_MAKE_REFLECTABLE(SchedulerBase, timeout_ms, watchdog_timeout, timeout_inactivity_count, process_stream_to_message_ratio, pool_park_count, max_work_items, poolName, sched_settings, flush_subnormals);
+    Settings settings;
+
+    GR_MAKE_REFLECTABLE(SchedulerBase, settings);
 
     constexpr static block::Category blockCategory = block::Category::ScheduledBlockGroup;
 
     [[nodiscard]] static constexpr auto executionPolicy() { return execution; }
 
     // whether an idle worker parks on the graph's progress sequence until work or a wake ends the park
-    [[nodiscard]] static constexpr bool parksIdleWorkers() { return executionPolicy() == ExecutionPolicy::singleThreadedBlocking || executionPolicy() == ExecutionPolicy::multiThreadedBlocking; }
+    [[nodiscard]] static constexpr bool parksIdleWorkers() { return executionPolicy() == ExecutionPolicy::single_threaded_blocking || executionPolicy() == ExecutionPolicy::multi_threaded_blocking; }
 
     // waits until no worker is inside work(), and keeps every worker out of work() until releaseWorkQuiescence(). The
     // requests of several callers add up, and each caller releases its own. A request made inside a work() call of this
@@ -626,17 +707,14 @@ public:
     // applies the settings staged since they were last applied. A setting that refuses its staged value keeps its
     // value, and the error names the scheduler and each refused key.
     [[nodiscard]] std::expected<void, Error> applyStagedSettings() {
-        if (!this->settings().changed()) {
-            return {};
-        }
-        const ApplyStagedParametersResult applied = this->settings().applyStagedParameters();
-        if (applied.failedParameters.empty()) {
+        const settings::Rejected failed = settings::detail::FrameworkAccess::applyStagedParameters(settings::detail::settingsOf(*this));
+        if (failed.empty()) {
             return {};
         }
         std::string refusedKeys;
-        for (const auto& [key, value] : applied.failedParameters) {
+        for (const settings::Rejection& entry : failed) {
             refusedKeys += refusedKeys.empty() ? "" : ", ";
-            refusedKeys += key;
+            refusedKeys += entry.key;
         }
         return std::unexpected(Error(std::format("scheduler '{}' refused the staged settings {}", this->unique_name, refusedKeys)));
     }
@@ -850,12 +928,22 @@ public:
 
     SchedulerBase(std::initializer_list<std::pair<const std::pmr::string, pmt::Value>> initParameter) noexcept(false) : base_t(initParameter) {
         registerPropertyCallbacks();
-        applyInitialSettings(initParameter);
+        checkInitialSettings(initParameter);
+        if constexpr (setsUpAtConstruction()) {
+            if (std::optional<settings::RefusedSettings> refused = setUpSettings(); refused) {
+                throw std::move(*refused);
+            }
+        }
     }
 
     explicit SchedulerBase(property_map initParameters) noexcept(false) : base_t(initParameters) {
         registerPropertyCallbacks();
-        applyInitialSettings(initParameters);
+        checkInitialSettings(initParameters);
+        if constexpr (setsUpAtConstruction()) {
+            if (std::optional<settings::RefusedSettings> refused = setUpSettings(); refused) {
+                throw std::move(*refused);
+            }
+        }
     }
 
     ~SchedulerBase() {
@@ -884,7 +972,20 @@ public:
             retireWatchdogs();
         } while (lifecycle::isActive(this->state()) || _nRunningJobs->value() != 0UZ || nDeferred() != 0UZ || nWatchdogs() != 0UZ);
 
+        // the base's destructor moves the state to STOPPED, and stateChanged() then notifies the subscribers, whose map
+        // ends before that destructor runs; the move happens here instead, where the map lives
+        if (lifecycle::isValidTransition(this->state(), lifecycle::State::STOPPED)) {
+            this->emitErrorMessageIfAny("~SchedulerBase()", this->changeStateTo(lifecycle::State::STOPPED));
+        }
+        for (const std::vector<std::shared_ptr<BlockModel>>& jobList : *_executionOrder) { // a block adopted into a job list need not be in the graph
+            std::ranges::for_each(jobList, [this](const std::shared_ptr<BlockModel>& block) { settings::detail::FrameworkAccess::detachScheduler(settings::detail::settingsOf(*block), &_settingsLink); });
+        }
         _executionOrder.reset(); // force earlier crashes if this is accessed after destruction (e.g. from thread that was kept running)
+        linkBlockSettings(*_graph, false);
+        std::lock_guard guard(_zombieBlocksMutex);
+        for (const std::shared_ptr<BlockModel>& zombie : _zombieBlocks) { // a job list may keep one past the scheduler
+            settings::detail::FrameworkAccess::detachScheduler(settings::detail::settingsOf(*zombie), &_settingsLink);
+        }
     }
 
     [[nodiscard]] bool isOnOwnWorkerThread() const noexcept { return activeSchedulerWorker() == static_cast<const void*>(this); }
@@ -1013,18 +1114,12 @@ public:
 
         retireWatchdogs(); // the watchdog reads _graph
         auto oldGraph = std::exchange(_graph, std::move(newGraph));
+        linkBlockSettings(*oldGraph, false);
+        graph::forEachBlock<TransparentBlockGroup>(*oldGraph, [this](const std::shared_ptr<BlockModel>& block) { forgetPrinted(block->uniqueName()); });
+        linkBlockSettings(*_graph, true);
 
         if ((option != profiling::Options{})) { // need to update profiler
             rebuildProfiler(option);
-        }
-
-        if (_pool->name() != std::string_view(poolName.value)) { // sync pool with (possibly updated) poolName setting
-            const std::string_view requested{poolName.value};
-            try {
-                _pool = gr::thread_pool::Manager::instance().get(requested);
-            } catch (const std::exception& e) {
-                this->emitErrorMessage("exchange(poolName)", std::format("unknown thread pool '{}': {}; keeping existing pool '{}'", requested, e.what(), _pool->name()));
-            }
         }
 
         // an initialized scheduler builds the new graph's job lists here. Its next start() builds none
@@ -1051,19 +1146,22 @@ public:
         return _nRunningJobs->value() > 0UZ;
     }
 
-    void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings) noexcept {
-        if (!newSettings.contains("poolName")) {
-            return;
+    // the core's apply of the keys of SchedulerSettings, which runs before a derived scheduler's own `applySettings`
+    void applySchedulerSettings(const Settings& s, const Settings& old) {
+        if (s.settings_timeout_ms != old.settings_timeout_ms) {
+            _settingsTimeoutMs.store(s.settings_timeout_ms.value, std::memory_order_relaxed);
         }
-        const std::string_view requested{poolName.value};
-        if (!_pool || _pool->name() == requested) {
-            return;
+        if (s.poolName != old.poolName) {
+            choosePool();
         }
-        try {
-            _pool = gr::thread_pool::Manager::instance().get(requested);
-        } catch (const std::exception& e) {
-            this->emitErrorMessage("settingsChanged(poolName)", std::format("unknown thread pool '{}': {}; keeping existing pool '{}'", requested, e.what(), _pool->name()));
-        }
+    }
+
+    // a reader the scheduler's delivery calls with each notification of its blocks and of the schedulers nested in it,
+    // one notification at a time and under no block's lock. With a reader installed the default reader prints nothing,
+    // and at the top the notifications also go to the event stream when msgOut has a reader
+    void installReader(NotificationReader reader) {
+        std::lock_guard lock(_readersLock);
+        _readers.push_back(std::move(reader));
     }
 
     void stateChanged(lifecycle::State newState) {
@@ -1191,6 +1289,7 @@ public:
         }
 
         forwardMessagesFromChildren();
+        deliverNotifications();
     }
 
     // drains _fromChildMessagePort on every path: the ring is shared by all blocks, so an unconsumed span
@@ -1281,7 +1380,11 @@ public:
         }
     }
 
-    std::expected<void, Error> runAndWait() { return runAndWaitImpl(true); }
+    std::expected<void, Error> runAndWait() {
+        _notifiesStartValues             = !_startValuesReturned;
+        on_scope_exit endsNotifyingStart = [this] { _notifiesStartValues = false; };
+        return runAndWaitImpl(true);
+    }
 
     // Request source completion, drain accepted input, then join. Ordinary blocks
     // finalize DONE on their workers; custom work() sources use their finish hook
@@ -1371,6 +1474,24 @@ public:
 private:
     template<BlockLike TScheduler>
     friend class ::gr::SchedulerWrapper;
+    friend struct settings::detail::FrameworkAccess;
+
+    // a scheduler started on a thread of its own holds its pool's threads for its whole run, so with no pool named it
+    // takes the IO pool, as a nested scheduler does
+    void runsOnOwnThread() {
+        _runsOnOwnThread = true;
+        if (settings.poolName.value.empty()) {
+            choosePool();
+        }
+    }
+
+    // `signal` runs each time the scheduler's settings move to running, at a start's release of the workers and at a
+    // resume, on the starting thread; a host that waits for a run to begin waits on it. Set it before the first start
+    void onSettingsRunning(std::function<void()> signal) { _onSettingsRunning = std::move(signal); }
+
+    // whether the caller of runAndWait() returns the start's values itself, as `Runtime::start()` does; otherwise
+    // runAndWait() reports each value that differs from the one given as a notification
+    void returnStartValues(bool returned) noexcept { _startValuesReturned = returned; }
 
     // The wrapper initializes its run before launching its thread. Its entry
     // must not restart a run whose stop won the race with thread startup.
@@ -1424,8 +1545,8 @@ private:
         }
 
         // N.B. the transition to lifecycle::State::RUNNING will for the ExecutionPolicy:
-        // * singleThreaded[Blocking] naturally block in the calling thread
-        // * multiThreaded[Blocking] spawn two worker and block on 'waitDone()'
+        // * single_threaded[Blocking] naturally block in the calling thread
+        // * multi_threaded[Blocking] spawn two worker and block on 'waitDone()'
         // A swap or a restart that a worker requested runs the next run of this call.
         waitForRunAndClaims();
 
@@ -1647,7 +1768,7 @@ protected:
 
     // a block whose work() returns ERROR ends the traversal, and the first such block since the start names the run's error
     work::Result traverseBlockListOnce(const std::vector<std::shared_ptr<BlockModel>>& blocks) {
-        const std::size_t requestedWorkAllBlocks = max_work_items;
+        const std::size_t requestedWorkAllBlocks = settings.max_work_items;
         std::size_t       performedWorkAllBlocks = 0UZ;
         bool              unfinishedBlocksExist  = false; // i.e. at least one block returned OK, INSUFFICIENT_INPUT_ITEMS, or INSUFFICIENT_OUTPU_ITEMS
         bool              exportedBlockMoved     = false;
@@ -1698,7 +1819,7 @@ protected:
         if ((performedWorkAllBlocks > 0UZ || nestedGraphMoved) && !gr::atomic_ref(_graphMoved).load_relaxed()) {
             gr::atomic_ref(_graphMoved).store_release(true);
         }
-        return {max_work_items, performedWorkAllBlocks, unfinishedBlocksExist ? work::Status::OK : work::Status::DONE};
+        return {settings.max_work_items, performedWorkAllBlocks, unfinishedBlocksExist ? work::Status::OK : work::Status::DONE};
     }
 
     // makes one traversal of the blocks through callAsWork(). A scheduler that supplies its own poolWorker() makes each
@@ -1731,6 +1852,9 @@ protected:
         const void*   previousLifecycle = std::exchange(_lifecycleScheduler, this);
         on_scope_exit restoreLifecycle  = [previousLifecycle] { _lifecycleScheduler = previousLifecycle; };
         awaitExchange();
+        if (std::optional<settings::RefusedSettings> refused = setUpSettings(); refused) { // the start fails for it as well
+            this->emitErrorMessage("init()", Error(refused->what()));
+        }
         [[maybe_unused]] const auto pe = _profilerHandler->startCompleteEvent("scheduler_base.init");
         {
             const bool    heldPass    = awaitMessagePass();
@@ -1776,7 +1900,8 @@ protected:
     // startError() and runAndWait(). The scheduler enters ERROR, which only a reset leaves, and its stop() retires the
     // workers of a resumed or partially started run, including starts with no worker to settle the state later.
     void failStart(Error reason) {
-        _startError = std::move(reason);
+        on_scope_exit deliver = [this] { deliverNotifications(); }; // no worker runs a message pass for a failed start
+        _startError           = std::move(reason);
         // Moving an active scheduler to ERROR invokes stop(), which releases
         // blocking children before quiescing workers. If ERROR was already
         // published by a lifecycle exception, that transition cannot run stop().
@@ -1784,6 +1909,24 @@ protected:
             stop();
         }
         this->emitErrorMessageIfAny("failStart() -> LifecycleState -> ERROR", this->changeStateTo(lifecycle::State::ERROR));
+    }
+
+    // every block's settings, those of a nested scheduler's blocks included, are checked before any block starts, so a
+    // refusal leaves no block started and no waiting change applied; the refusal names each refusing block's entries
+    [[nodiscard]] std::optional<Error> refusedBlockSettings() {
+        std::string refusals;
+        graph::forEachBlock<block::Category::All>(*_graph, [&refusals](const std::shared_ptr<BlockModel>& block) {
+            if (block->blockCategory() == block::Category::ScheduledBlockGroup) {
+                return;
+            }
+            for (const settings::Rejection& entry : settings::detail::FrameworkAccess::checkStart(settings::detail::settingsOf(*block))) {
+                refusals += std::format("{}{}{}{}: {}", refusals.empty() ? "" : "; ", block->uniqueName(), entry.key.empty() ? "" : ".", entry.key, entry.reason);
+            }
+        });
+        if (refusals.empty()) {
+            return std::nullopt;
+        }
+        return Error(std::format("start refused: {}", refusals));
     }
 
     void reportExecutionException(Error reason) {
@@ -1859,11 +2002,36 @@ protected:
         gr::atomic_ref(_nWorkersStarted).store_release(0UZ);
         _startError.reset();
 
+        if (std::optional<settings::RefusedSettings> refused = setUpSettings(); refused) {
+            Error reason(refused->what());
+            this->emitErrorMessage("start()", reason);
+            failStart(std::move(reason));
+            return;
+        }
         // the settings staged since the scheduler initialized take effect before the run's job lists are fixed. A pool
         // other than the one the lists were sized on sizes them again
         if (std::expected<void, Error> applied = applyStagedSettings(); !applied.has_value()) {
             this->emitErrorMessage("start()", applied.error());
             failStart(std::move(applied.error()));
+            return;
+        }
+        if (settings.poolName.value.empty()) { // a scheduler nested since its last start chooses again
+            choosePool();
+        }
+        linkBlockSettings(*_graph, true);
+        if (const std::vector<std::string> withoutInit = settings::detail::FrameworkAccess::blocksAddedWithoutInit(*_graph); !withoutInit.empty()) {
+            std::string names;
+            for (const std::string& name : withoutInit) {
+                names += std::format("{}'{}'", names.empty() ? "" : ", ", name);
+            }
+            Error reason(std::format("start refused: blocks added without init(): {}", names));
+            this->emitErrorMessage("start()", reason);
+            failStart(std::move(reason));
+            return;
+        }
+        if (std::optional<Error> refused = refusedBlockSettings(); refused) {
+            this->emitErrorMessage("start()", *refused);
+            failStart(std::move(*refused));
             return;
         }
         if constexpr (requires(Derived& d) { d.customInit(); }) {
@@ -1903,7 +2071,7 @@ protected:
         // the sweep runs whole under this lock, released before the workers are dispatched: a worker requesting a stop takes it
         {
             std::lock_guard childLock(_childLifecycleMutex);
-            if (lifecycle::isShuttingDown(this->state())) {
+            if (lifecycle::isShuttingDown(this->state())) { // a stop asked during the start is no failure of the run
                 return;
             }
             graph::forEachBlock<TransparentBlockGroup>(*_graph, [this, &firstChildError, &startedSubSchedulers](auto& block) { //
@@ -1925,16 +2093,9 @@ protected:
                         throw gr::exception(std::format("ScheduledBlockGroup is not a SchedulerModel {}", block->uniqueName()));
                     }
                 } else {
-                    // a child that never initialized or refuses to start — a throwing init or start() hook
-                    // leaves the block unable to run — must fail the run itself, not only the message
-                    // stream: the first such error is what runAndWait() returns
-                    std::optional<Error>       initFailure = block->initError();
-                    std::expected<void, Error> transitioned;
-                    if (initFailure.has_value()) {
-                        transitioned = std::unexpected(std::move(*initFailure));
-                    } else {
-                        transitioned = block->changeStateTo(lifecycle::RUNNING);
-                    }
+                    // a child that refuses to start, by a throwing start() hook, fails the run itself, not only the
+                    // message stream; runAndWait() returns the first such error
+                    std::expected<void, Error> transitioned = block->changeStateTo(lifecycle::RUNNING);
                     if (!transitioned && !firstChildError.has_value()) {
                         firstChildError = transitioned.error();
                     }
@@ -1959,6 +2120,11 @@ protected:
             failStart(std::move(*firstChildError));
             return;
         }
+        // a stop asked during the sweep stops the blocks once the sweep's lock is free; the run then has no worker and
+        // ends without an error
+        if (lifecycle::isShuttingDown(this->state())) {
+            return;
+        }
 
         { // every job list of this run takes adopted blocks until its worker leaves its loop, and no block is withdrawn
             std::lock_guard guard(_adoptionBlocksMutex);
@@ -1968,13 +2134,14 @@ protected:
         }
 
         assert(_executionOrder != nullptr && !_executionOrder->empty());
-        constexpr bool    singleThreaded = executionPolicy() == ExecutionPolicy::singleThreaded || executionPolicy() == ExecutionPolicy::singleThreadedBlocking;
+        constexpr bool    singleThreaded = executionPolicy() == ExecutionPolicy::single_threaded || executionPolicy() == ExecutionPolicy::single_threaded_blocking;
         auto              jobListsCopy   = _executionOrder;
         const std::size_t nWorkers       = singleThreaded ? 1UZ : jobListsCopy->size();
         auto              ioThreadPool   = gr::thread_pool::Manager::defaultIoPool();
 
         stopWatchdogs();
         const std::size_t generation = _watchdogGeneration.value();
+        markSettingsRunning(); // the workers start below
 
         // the whole generation is counted before the watchdog starts and before any worker is queued. waitDone() then
         // also covers the workers the pool has not started yet, and the watchdog finds the run's jobs counted
@@ -1985,7 +2152,7 @@ protected:
         gr::atomic_ref(_nWatchdogsRunning).fetch_add(1UZ);
 
         try {
-            ioThreadPool->execute([this, generation] { this->runWatchDog(watchdog_timeout.value, timeout_inactivity_count.value, generation); });
+            ioThreadPool->execute([this, generation] { this->runWatchDog(settings.watchdog_timeout.value, settings.timeout_inactivity_count.value, generation); });
         } catch (...) { // a rejected task would strand both counts and spin waitDone() and ~SchedulerBase() forever
             gr::atomic_ref(_nWatchdogsRunning).fetch_sub(1UZ);
             gr::atomic_ref(_nWatchdogsRunning).notify_all();
@@ -2055,7 +2222,7 @@ protected:
     // sets, on a pool thread or, under a single-threaded policy, on the thread that started the run. The thread gets its
     // earlier flush back when the worker returns.
     void dispatchWorker(std::size_t runnerID, std::shared_ptr<JobLists> jobList, std::size_t generation) {
-        const gr::thread_pool::thread::detail::SubnormalFlushScope subnormalFlush(flush_subnormals.value);
+        const gr::thread_pool::thread::detail::SubnormalFlushScope subnormalFlush(settings.flush_subnormals.value);
         runWorker(runnerID, std::move(jobList), generation);
     }
 
@@ -2195,12 +2362,11 @@ protected:
                 currentDraining = gr::detail::drainingCalls();
             }
 
-            // A message waiting at msgIn or from the run's blocks restarts the idle back-off. A multiThreadedBlocking
-            // worker restarts it only for a message at msgIn. A block with a heartbeat subscriber publishes a message
-            // in every message pass.
+            // A message waiting at msgIn or from the run's blocks restarts the idle back-off. A multi_threaded_blocking
+            // worker restarts it only for a message at msgIn.
             const bool msgInPending    = this->msgIn.available() > 0UZ;
             const bool childPending    = _fromChildMessagePort.available() > 0UZ;
-            const bool restartsBackoff = msgInPending || (executionPolicy() != ExecutionPolicy::multiThreadedBlocking && childPending);
+            const bool restartsBackoff = msgInPending || (executionPolicy() != ExecutionPolicy::multi_threaded_blocking && childPending);
 
             // Process messages either when the ratio gate opens, or immediately when any entry-point port has
             // pending traffic. This keeps the ratio's amortisation of empty-queue checks while giving arriving
@@ -2235,7 +2401,7 @@ protected:
                 if (restartsBackoff || activeState != previousState) {
                     idleIterations = 0UZ;
                 }
-                nPassesToMessages = std::max(static_cast<std::size_t>(process_stream_to_message_ratio.value), 1UZ) - 1UZ;
+                nPassesToMessages = std::max(static_cast<std::size_t>(settings.process_stream_to_message_ratio.value), 1UZ) - 1UZ;
             } else {
                 nPassesToMessages--;
             }
@@ -2287,7 +2453,7 @@ protected:
                 const std::size_t progressAfter = progress->value();
                 const std::size_t waitFrom      = isMultiThreaded(executionPolicy()) ? currentProgress : progressAfter;
                 inactiveCycleCount              = currentProgress == progressAfter ? inactiveCycleCount + 1UZ : 0UZ;
-                const bool parkDue              = isMultiThreaded(executionPolicy()) ? idleIterations >= kIdleBackoffPasses + pool_park_count : inactiveCycleCount > timeout_inactivity_count;
+                const bool parkDue              = isMultiThreaded(executionPolicy()) ? idleIterations >= kIdleBackoffPasses + settings.pool_park_count : inactiveCycleCount > settings.timeout_inactivity_count;
                 // A draining block that does not wait on its outputs, and an epilogue waiting for room in its outputs,
                 // end after a bound of calls in which nothing they wait on moved. A parked worker would make one such
                 // call per park. The worker therefore does not park after a pass in which it called such a block.
@@ -2300,8 +2466,9 @@ protected:
                 if (activeState == RUNNING && parkDue && !calledDrainingBlock && gr::atomic_ref(_run.generation).load_acquire() == generation && this->state() == RUNNING) {
                     // allow a scheduler process to wait on progress before retrying (N.B. intended to save CPU/battery power)
                     // work, or a wake since the top of this pass, ends the park. A wake does not count as progress
-                    waitUntilChanged(*progress, waitFrom, *_wake, currentWake, timeout_ms);
-                    nPassesToMessages = 0UZ;
+                    const auto parkEnds = std::chrono::steady_clock::now() + std::chrono::milliseconds(settings.timeout_ms.value);
+                    std::ignore         = progress->waitUntil(waitFrom, *_wake, currentWake, parkEnds);
+                    nPassesToMessages   = 0UZ;
                 }
             }
         } while (lifecycle::isActive(activeState) && gr::atomic_ref(_run.generation).load_acquire() == generation);
@@ -2368,7 +2535,7 @@ protected:
     // polls the state every millisecond until it changes or timeout_ms passes. Only a worker outside RUNNING calls it.
     void sleepUntilStateChanges(lifecycle::State observedState) {
         constexpr auto kChunk   = std::chrono::milliseconds(1);
-        const auto     deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms.value);
+        const auto     deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(settings.timeout_ms.value);
         while (std::chrono::steady_clock::now() < deadline) {
             std::this_thread::sleep_for(kChunk);
             if (this->state() != observedState) {
@@ -2454,6 +2621,255 @@ protected:
     void wakeWorkers() {
         _wake->incrementAndGet();
         _graph->_progress->notify_all();
+    }
+
+    // a block's pending change or notification wakes the idle workers of a run, unless this thread is one of them,
+    // whose pass goes on
+    void wakeForSettings() {
+        if (!lifecycle::isActive(this->state()) || isOnOwnWorkerThread()) {
+            return;
+        }
+        wakeParkedWorkers();
+    }
+
+    void markSettingsRunning() {
+        settings::detail::FrameworkAccess::moveState(settings::detail::settingsOf(*this), settings::detail::BlockState::running);
+        settings::detail::FrameworkAccess::markStarting(settings::detail::settingsOf(*this), false);
+        if (std::exchange(_notifiesStartValues, false)) {
+            notifyStartValues();
+        }
+        if (_onSettingsRunning) {
+            _onSettingsRunning();
+        }
+    }
+
+    // no caller holds the result of the start runAndWait() makes, so each key whose value in force differs from the
+    // value the start gave goes out at info
+    void notifyStartValues() {
+        using settings::detail::FrameworkAccess;
+        graph::forEachBlock<block::Category::All>(*_graph, [](const std::shared_ptr<BlockModel>& block) {
+            for (const auto& [key, entry] : FrameworkAccess::runOutcome(settings::detail::settingsOf(*block))) {
+                if (entry.isValue()) {
+                    FrameworkAccess::notify(settings::detail::settingsOf(*block), settings::NotificationLevel::info, settings::NotificationKind::changed, key, entry.reason.empty() ? std::string_view("the value in force differs") : std::string_view(entry.reason));
+                }
+            }
+        });
+    }
+
+    // the blocks of `graph`, its subgraphs' included, take or leave this scheduler's link
+    void linkBlockSettings(Graph& graph, bool attach) {
+        graph::forEachBlock<TransparentBlockGroup>(graph, [this, attach](auto& block) {
+            if (attach) {
+                joinBlockSettings(*block);
+            } else {
+                settings::detail::FrameworkAccess::detachScheduler(settings::detail::settingsOf(*block), &_settingsLink);
+            }
+        });
+    }
+
+    // a block that joins this scheduler takes its link. One that was not linked to it starts the default reader's
+    // counts of its name afresh: a notification of a block of that name that retired may have counted after the
+    // delivery that erased its counts
+    void joinBlockSettings(BlockModel& block) {
+        if (settings::detail::FrameworkAccess::schedulerLink(settings::detail::settingsOf(block)) != &_settingsLink) {
+            erasePrintedAtJoin(block.uniqueName());
+        }
+        settings::detail::FrameworkAccess::attachScheduler(settings::detail::settingsOf(block), &_settingsLink);
+    }
+
+    void erasePrintedAtJoin(std::string_view name) {
+        if (settings::detail::SchedulerLink* enclosing = settings::detail::FrameworkAccess::schedulerLink(settings::detail::settingsOf(*this)); enclosing != nullptr) {
+            enclosing->join(name);
+            return;
+        }
+        std::lock_guard printedLock(_printedLock);
+        std::erase_if(_printed, [name](const auto& entry) { return std::get<0>(entry.first) == name; });
+    }
+
+    // the default reader's counts of a block that left this scheduler or one nested in it, kept at the top. The next
+    // delivery erases them after it prints what the block's stop raised before the retire
+    void forgetPrinted(std::string_view name) {
+        if (settings::detail::SchedulerLink* enclosing = settings::detail::FrameworkAccess::schedulerLink(settings::detail::settingsOf(*this)); enclosing != nullptr) {
+            enclosing->retire(name);
+            return;
+        }
+        std::lock_guard printedLock(_printedLock); // its own lock: a reader runs under the delivery's and may retire a block
+        _retiredPrinted.emplace(name);
+    }
+
+    // the blocks retired before a delivery takes the queue; the stop of each pushed its notifications before its retire
+    [[nodiscard]] std::set<std::string, std::less<>> takeRetiredPrinted() {
+        std::lock_guard printedLock(_printedLock);
+        return std::exchange(_retiredPrinted, {});
+    }
+
+    void erasePrinted(const std::set<std::string, std::less<>>& retired) {
+        if (retired.empty()) {
+            return;
+        }
+        std::lock_guard printedLock(_printedLock);
+        std::erase_if(_printed, [&retired](const auto& entry) { return retired.contains(std::get<0>(entry.first)); });
+    }
+
+    // a block that leaves this scheduler once its stop has run, with the blocks of its subgraphs and of a scheduler
+    // nested in it. Its settings leave the link after each notification of the stop went to this scheduler's readers,
+    // and its counts leave the top. A nested scheduler's blocks keep the link to their own scheduler
+    void retireBlockSettings(BlockModel& block) {
+        settings::detail::FrameworkAccess::detachScheduler(settings::detail::settingsOf(block), &_settingsLink);
+        forgetPrinted(block.uniqueName());
+        if (block.blockCategory() == TransparentBlockGroup || block.blockCategory() == ScheduledBlockGroup) {
+            std::ranges::for_each(block.blocks(), [this](const std::shared_ptr<BlockModel>& inner) { retireBlockSettings(*inner); });
+        }
+    }
+
+    // the scheduler's own level when it names one, an "off" included, else the enclosing scheduler's
+    [[nodiscard]] std::optional<settings::NotificationLevel> levelForBlocks() const {
+        if (std::optional<settings::NotificationLevel> own = settings::detail::FrameworkAccess::ownLevel(settings::detail::settingsOf(*this)); own) {
+            return own;
+        }
+        const settings::detail::SchedulerLink* enclosing = settings::detail::FrameworkAccess::schedulerLink(settings::detail::settingsOf(*this));
+        return enclosing != nullptr ? enclosing->level() : std::nullopt;
+    }
+
+    [[nodiscard]] std::chrono::milliseconds timeoutForBlocks() const {
+        if (const std::uint32_t own = _settingsTimeoutMs.load(std::memory_order_relaxed); own > 0U) {
+            return std::chrono::milliseconds(own);
+        }
+        const settings::detail::SchedulerLink* enclosing = settings::detail::FrameworkAccess::schedulerLink(settings::detail::settingsOf(*this));
+        return enclosing != nullptr ? enclosing->defaultTimeout() : settings::kDefaultTimeout;
+    }
+
+    // the pool a name gives; the empty name, and a name no pool has, take the CPU pool at the top and the IO pool for a
+    // scheduler nested in another, since a nested scheduler on its parent's CPU pool could find no free thread
+    void choosePool() {
+        const bool nested    = _runsOnOwnThread || settings::detail::FrameworkAccess::schedulerLink(settings::detail::settingsOf(*this)) != nullptr;
+        auto       automatic = [nested] { return nested ? gr::thread_pool::Manager::defaultIoPool() : gr::thread_pool::Manager::instance().defaultCpuPool(); };
+        if (settings.poolName.value.empty()) {
+            _pool = automatic();
+            return;
+        }
+        try {
+            _pool = gr::thread_pool::Manager::instance().get(settings.poolName.value);
+        } catch (const std::exception& e) {
+            this->emitErrorMessage("applySettings(poolName)", std::format("unknown thread pool '{}': {}; the scheduler chooses its pool", settings.poolName.value, e.what()));
+            settings.poolName.value.clear();
+            _pool = automatic();
+        }
+    }
+
+    // one delivery: each held notification goes to every installed reader, then to the enclosing scheduler's queue, or
+    // at the top to the event stream once a host reads it, else to the default reader. A host reads the stream when it
+    // subscribes to kSettingsNotification or installs a reader, and msgOut has a reader; a host that only connects
+    // msgOut, as every Runtime does, may never read the notifications, and the default reader prints them. A reader's own
+    // notification joins the same delivery. A nested scheduler that does not run then delivers at its parent, since a
+    // parent that does not run makes no message pass to carry what it pushed. A reader that stops the run, or that
+    // calls anything else that delivers, on the delivering thread starts no second delivery: the outer one takes what
+    // the call queued once the reader returns
+    void deliverNotifications() {
+        if (_deliveringScheduler == static_cast<const void*>(this)) {
+            return;
+        }
+        settings::detail::SchedulerLink* enclosing = settings::detail::FrameworkAccess::schedulerLink(settings::detail::settingsOf(*this));
+        {
+            std::lock_guard                          deliverLock(_deliverLock);
+            const void*                              previousDelivering = std::exchange(_deliveringScheduler, static_cast<const void*>(this));
+            on_scope_exit                            restoreDelivering  = [previousDelivering] { _deliveringScheduler = previousDelivering; };
+            const std::set<std::string, std::less<>> retired            = enclosing == nullptr ? takeRetiredPrinted() : std::set<std::string, std::less<>>{};
+            std::vector<settings::Notification>      taken              = _notifications.take(); // most passes find the queue empty
+            if (!taken.empty()) {
+                std::vector<NotificationReader> readers;
+                {
+                    std::lock_guard lock(_readersLock);
+                    readers = _readers;
+                }
+                const bool silent        = settings::detail::FrameworkAccess::ownLevel(settings::detail::settingsOf(*this)) == settings::NotificationLevel::off;
+                const bool hostReads     = !readers.empty() || hostSubscribed();
+                const bool toEventStream = enclosing == nullptr && hostReads && this->msgOut.nReaders() != 0;
+                for (; !taken.empty(); taken = _notifications.take()) {
+                    for (const settings::Notification& notification : taken) {
+                        for (const NotificationReader& reader : readers) {
+                            try {
+                                reader(notification);
+                            } catch (const std::exception& thrown) {
+                                this->emitErrorMessage("installReader()", std::format("a notification reader threw: {}", thrown.what()));
+                            } catch (...) {
+                                this->emitErrorMessage("installReader()", "a notification reader threw");
+                            }
+                        }
+                        if (enclosing != nullptr) {
+                            enclosing->push(notification);
+                            enclosing->wake();
+                        } else if (toEventStream && !notification.quiet) { // a quiet notification reaches the installed readers alone
+                            _events.push(notification);
+                        } else if (!hostReads && !silent && !notification.quiet) {
+                            printCounted(notification);
+                        }
+                    }
+                }
+            }
+            if (enclosing == nullptr) {
+                sendEvents();
+                erasePrinted(retired);
+            }
+        }
+        if (enclosing != nullptr && !lifecycle::isActive(this->state())) {
+            enclosing->deliver();
+        }
+    }
+
+    // the event stream carries a few notifications at a time: a host that reads late reads the latest of each block,
+    // key and level, not a backlog in order. The rest wait in the event queue for a later delivery
+    static constexpr std::size_t kEventsInTransport = 16UZ;
+
+    // sends the oldest held events while msgOut holds fewer than kEventsInTransport messages, through a writer of its
+    // own, since a stop delivers on the stopping thread
+    void sendEvents() {
+        if (_events.empty() || this->msgOut.nReaders() == 0) {
+            return;
+        }
+        auto              writer      = this->msgOut.buffer().streamBuffer.new_writer();
+        const std::size_t inTransport = this->msgOut.bufferSize() - std::min(writer.available(), this->msgOut.bufferSize());
+        if (inTransport >= kEventsInTransport) {
+            return;
+        }
+        std::vector<settings::Notification> sending = _events.take(kEventsInTransport - inTransport);
+        if (sending.empty()) {
+            return;
+        }
+        WriterSpanLike auto span  = writer.template tryReserve<SpanReleasePolicy::ProcessAll>(sending.size());
+        const std::size_t   nSent = span.size();
+        for (std::size_t i = 0UZ; i < nSent; ++i) {
+            Message& message    = span[i];
+            message             = Message{};
+            message.cmd         = message::Command::Notify;
+            message.serviceName = sending[i].block;
+            message.endpoint    = block::property::kSettingsNotification;
+            message.data        = settings::detail::toMessageData(sending[i]);
+        }
+        span.publish(nSent);
+        for (std::size_t i = nSent; i < sending.size(); ++i) { // a notification that found no slot waits for the next delivery
+            _events.push(std::move(sending[i]));
+        }
+    }
+
+    // the default reader at the top: the first notification of a block, key and level, then the count each time it
+    // reaches a power of ten, with the latest reason
+    void printCounted(const settings::Notification& notification) {
+        std::lock_guard   printedLock(_printedLock);
+        std::size_t&      count  = _printed[PrintedSlot{notification.block, notification.key, notification.level}];
+        const std::size_t before = count;
+        count += notification.nReplaced + 1UZ;
+        std::size_t decade = 1UZ;
+        while (decade <= before && decade <= std::numeric_limits<std::size_t>::max() / 10UZ) {
+            decade *= 10UZ;
+        }
+        if (before == 0UZ || decade <= count) {
+            settings::Notification counted = notification;
+            if (before > 0UZ) {
+                counted.reason = std::format("{} ({} times)", notification.reason, count);
+            }
+            settings::detail::printNotification(counted);
+        }
     }
 
     // The scheduler's message service runs on any thread, and a parent's worker runs a nested scheduler's. The service
@@ -2608,6 +3024,7 @@ protected:
         if constexpr (requires(Derived& d) { d.customStop(); }) {
             static_cast<Derived*>(this)->customStop();
         }
+        deliverNotifications(); // a reader that reads after the stop misses nothing raised before it
     }
 
     // a block that blocks in work() ends its wait in its pause() hook, and that hook runs first. Such a block settles in
@@ -2667,8 +3084,11 @@ protected:
                 failStart(std::move(reason));
                 return;
             }
+            // the scheduler already reads RUNNING, so a worker past the quiescence would call a block whose settings
+            // hook the resume still runs
+            graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) { this->emitErrorMessageIfAny("resume() -> LifecycleState", block->changeStateTo(RUNNING)); });
+            markSettingsRunning();
         }
-        graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) { this->emitErrorMessageIfAny("resume() -> LifecycleState", block->changeStateTo(RUNNING)); });
         wakeWorkers(); // a worker that parked before the blocks reached RUNNING calls them now
         if constexpr (requires(Derived& d) { d.customResume(); }) {
             static_cast<Derived*>(this)->customResume();
@@ -2681,7 +3101,7 @@ protected:
     // in ERROR, so ERROR with no worker counted is a failed start. A stop that claims the start leaves no worker and no
     // ERROR
     [[nodiscard]] SubSchedulerStart awaitSubSchedulerStart(const BlockModel& block, SchedulerModel& schedulerModel) const {
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(watchdog_timeout.value);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(settings.watchdog_timeout.value);
         while (true) {
             const lifecycle::State state = block.state();
             if (schedulerModel.workerStarted()) {
@@ -2806,6 +3226,7 @@ protected:
             return std::nullopt;
         }
         auto noWorkerLeft = [&block] { return Error(std::format("every worker of the run has left. '{}' runs from the next start", block->uniqueName())); };
+        joinBlockSettings(*block);
 
         if (block->blockCategory() == ScheduledBlockGroup) {
             // the scheduler starts an added scheduler and then queues it. The worker that takes it calls into it, and its
@@ -3242,7 +3663,7 @@ protected:
             if (checkedBlock) {
                 const auto             nameIt    = blockProperties.find("name");
                 const std::string_view blockName = nameIt != blockProperties.end() ? nameIt->second.value_or(checkedBlock->name()) : checkedBlock->name();
-                gr::detail::checkDeclared(checkedBlock->settings().writableMembers(), blockName, checkedBlock->typeName(), blockProperties);
+                gr::detail::checkDeclared(checkedBlock->writableMembers(), blockName, checkedBlock->typeName(), blockProperties);
             }
         }
 
@@ -3436,6 +3857,7 @@ protected:
                 // zombie has no local-list owner to clean it. The shared lists cover every adopted
                 // block; makeZombie() already removed its pending adoption.
                 if (!lifecycle::isActive((*it)->state()) && !jobListHolds(*it)) {
+                    retireBlockSettings(**it);
                     it = _zombieBlocks.erase(it);
                 } else {
                     ++it;
@@ -3470,7 +3892,8 @@ protected:
                 localBlockList.erase(localBlockIt);
 
                 std::shared_ptr<BlockModel> zombieRaw = *it;
-                it                                    = _zombieBlocks.erase(it); // ~Block() runs here
+                retireBlockSettings(*zombieRaw);
+                it = _zombieBlocks.erase(it); // ~Block() runs here
 
                 // We need to remove zombieRaw from jobLists as well, in case Scheduler ever goes to INITIALIZED again.
                 std::lock_guard lock(_executionOrderMutex);
@@ -3587,6 +4010,9 @@ protected:
     void makeZombie(std::shared_ptr<BlockModel> block) {
         const bool active = lifecycle::isActive(block->state());
         stopChild(*block, "makeZombie");
+        if (block->state() != lifecycle::State::REQUESTED_STOP) { // a blocking block still stopping leaves at its drop
+            retireBlockSettings(*block);
+        }
 
         {
             // Handle edge case: If we receive two consecutive "Add Block X" "Remove Block X" messages
@@ -3605,6 +4031,60 @@ protected:
         }
         std::lock_guard guard(_zombieBlocksMutex);
         _zombieBlocks.push_back(std::move(block));
+    }
+
+    // a Subscribe adds the client to the endpoint's subscribers and an Unsubscribe removes it; a new client past
+    // kMaxSubscribersPerProperty is refused. Returns the number of the endpoint's subscribers
+    std::size_t subscribe(std::string_view endpoint, const Message& message) {
+        std::lock_guard        lock(_subscriptionsLock);
+        std::set<std::string>& subscribers = _subscriptions[std::string(endpoint)];
+        if (message.cmd == message::Command::Unsubscribe) {
+            subscribers.erase(message.clientRequestID);
+        } else if (message.cmd != message::Command::Subscribe) {
+            throw gr::exception(std::format("scheduler {} property {} does not implement command {}, msg: {}", this->unique_name, endpoint, message.cmd, message));
+        } else if (!subscribers.contains(message.clientRequestID) && subscribers.size() >= message::kMaxSubscribersPerProperty) {
+            throw gr::exception(std::format("refused client {}: property {} already notifies {} clients, the cap kMaxSubscribersPerProperty", message.clientRequestID, endpoint, message::kMaxSubscribersPerProperty));
+        } else {
+            subscribers.insert(message.clientRequestID);
+        }
+        return subscribers.size();
+    }
+
+    // whether a host subscribes to the notifications of the blocks' settings
+    [[nodiscard]] bool hostSubscribed() {
+        std::lock_guard lock(_subscriptionsLock);
+        const auto      it = _subscriptions.find(std::string_view(block::property::kSettingsNotification));
+        return it != _subscriptions.end() && !it->second.empty();
+    }
+
+    // notifies the subscribers of the endpoint as they were when the call began, with the map unlocked
+    void notifyListeners(std::string_view endpoint, property_map message) noexcept {
+        std::vector<std::string> clientIDs;
+        {
+            std::lock_guard lock(_subscriptionsLock);
+            if (const auto it = _subscriptions.find(endpoint); it != _subscriptions.end()) {
+                clientIDs.assign(it->second.begin(), it->second.end());
+            }
+        }
+        for (const std::string& clientID : clientIDs) {
+            this->emitMessage(endpoint, message, clientID);
+        }
+    }
+
+    // the scheduler's lifecycle notifies its subscribers; a Set and a Get act as on any block
+    std::optional<Message> propertyCallbackLifecycleState(std::string_view propertyName, Message message) {
+        if (message.cmd == message::Command::Set || message.cmd == message::Command::Get) {
+            return BlockBase::propertyCallbackLifecycleState(propertyName, std::move(message));
+        }
+        std::ignore = subscribe(propertyName, message);
+        return std::nullopt;
+    }
+
+    // a Subscribe sends the notifications at the top to the event stream from then on, in place of the default reader;
+    // an Unsubscribe of the last subscriber gives them back to the default reader
+    std::optional<Message> propertyCallbackSettingsNotification(std::string_view propertyName, Message message) {
+        std::ignore = subscribe(propertyName, message);
+        return std::nullopt;
     }
 
     std::optional<Message> propertyCallbackGraphGRC([[maybe_unused]] std::string_view propertyName, Message message) {
@@ -3820,7 +4300,7 @@ inline void printExecutionOrder(const std::vector<std::vector<std::shared_ptr<Bl
 
 } // namespace detail
 
-template<ExecutionPolicy execution = ExecutionPolicy::singleThreaded, profiling::ProfilerLike TProfiler = profiling::null::Profiler>
+template<ExecutionPolicy execution = ExecutionPolicy::single_threaded, profiling::ProfilerLike TProfiler = profiling::null::Profiler>
 struct Simple : SchedulerBase<Simple<execution, TProfiler>, execution, TProfiler> {
     using Description = Doc<R""(Simple loop based Scheduler, which iterates over all blocks in the order they have beein defined and emplaced definition in the graph.)"">;
 
@@ -3835,10 +4315,10 @@ struct Simple : SchedulerBase<Simple<execution, TProfiler>, execution, TProfiler
 
         std::size_t n_batches = 1UZ;
         switch (this->executionPolicy()) {
-        case ExecutionPolicy::singleThreaded:
-        case ExecutionPolicy::singleThreadedBlocking: break;
-        case ExecutionPolicy::multiThreaded:
-        case ExecutionPolicy::multiThreadedBlocking: n_batches = this->nJobLists(nBlocks); break;
+        case ExecutionPolicy::single_threaded:
+        case ExecutionPolicy::single_threaded_blocking: break;
+        case ExecutionPolicy::multi_threaded:
+        case ExecutionPolicy::multi_threaded_blocking: n_batches = this->nJobLists(nBlocks); break;
         default:;
         }
 
@@ -3850,14 +4330,14 @@ struct Simple : SchedulerBase<Simple<execution, TProfiler>, execution, TProfiler
     }
 };
 
-template<ExecutionPolicy execution = ExecutionPolicy::singleThreaded, profiling::ProfilerLike TProfiler = profiling::null::Profiler>
+template<ExecutionPolicy execution = ExecutionPolicy::single_threaded, profiling::ProfilerLike TProfiler = profiling::null::Profiler>
 struct BreadthFirst : SchedulerBase<BreadthFirst<execution, TProfiler>, execution, TProfiler> {
     using Description = Doc<R""(Breadth First Scheduler which traverses the graph starting from the source blocks in a breath first fashion
 detecting cycles and blocks which can be reached from several source blocks.)"">;
 
     using SchedulerBase<BreadthFirst<execution, TProfiler>, execution, TProfiler>::SchedulerBase;
 
-    static_assert(execution != ExecutionPolicy::singleThreadedBlocking, "Unsupported execution policy");
+    static_assert(execution != ExecutionPolicy::single_threaded_blocking, "Unsupported execution policy");
 
     void customInit() {
         /* implements Breadth-first search scheduling algorithm (https://en.wikipedia.org/wiki/Breadth-first_search)
@@ -3932,13 +4412,13 @@ detecting cycles and blocks which can be reached from several source blocks.)"">
     }
 };
 
-template<ExecutionPolicy execution = ExecutionPolicy::singleThreaded, profiling::ProfilerLike TProfiler = profiling::null::Profiler>
+template<ExecutionPolicy execution = ExecutionPolicy::single_threaded, profiling::ProfilerLike TProfiler = profiling::null::Profiler>
 struct DepthFirst : SchedulerBase<DepthFirst<execution, TProfiler>, execution, TProfiler> {
     using Description = Doc<R""(Depth First Scheduler which traverses the graph starting from the source blocks in a depth-first manner.)"">;
 
     using SchedulerBase<DepthFirst<execution, TProfiler>, execution, TProfiler>::SchedulerBase;
 
-    static_assert(execution != ExecutionPolicy::singleThreadedBlocking, "Unsupported execution policy");
+    static_assert(execution != ExecutionPolicy::single_threaded_blocking, "Unsupported execution policy");
 
     void customInit() {
         /**

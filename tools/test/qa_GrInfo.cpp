@@ -561,6 +561,23 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
 #endif
     };
 
+    "block prints each value as a setting or a status value, and each setting's update policy"_test = [] {
+        const Result block = run(overTestDirectories({"block", "LibraryDoubler"}));
+        expect(eq(block.exitCode, 0)) << block.output;
+        expect(block.output.contains("peak")) << "the status value is listed" << block.output;
+        expect(block.output.contains("status")) << "as a status value" << block.output;
+        expect(!block.output.contains("read_only") && !block.output.contains("writable")) << "no read-only marking" << block.output;
+        const Result json = run(overTestDirectories({"block", "LibraryDoubler", "--json"}), Streams::standardOutput);
+        expect(json.output.contains("\"kind\": \"status\"")) << json.output;
+        expect(json.output.contains("\"kind\": \"setting\"")) << json.output;
+        expect(json.output.contains("\"documentation\": \"largest output seen\"")) << "a status value with its documentation" << json.output;
+        expect(!json.output.contains("\"access\"") && !json.output.contains("\"writable\"")) << json.output;
+        const Result schedulers = run(overTestDirectories({"schedulers"}));
+        expect(schedulers.output.contains("stopped")) << "the update policy of a key that waits for a stop" << schedulers.output;
+        const Result schedulersJson = run(overTestDirectories({"schedulers", "--json"}), Streams::standardOutput);
+        expect(schedulersJson.output.contains("\"updatePolicy\": \"stopped\"")) << schedulersJson.output;
+    };
+
     "the settings the framework declares on every block are behind an option"_test = [] {
         const Result block = run(overTestDirectories({"block", "LibraryDoubler"}));
         expect(eq(block.exitCode, 0)) << block.output;
@@ -612,7 +629,7 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         expect(eq(schedulers.exitCode, 0)) << schedulers.output;
         expect(schedulers.output.contains("gr::scheduler")) << "the family of core's schedulers" << schedulers.output;
         expect(schedulers.output.contains("this-program")) << "the keys the program registers itself" << schedulers.output;
-        for (const std::string_view policy : {"<singleThreaded>", "<multiThreaded>", "<singleThreadedBlocking>", "<multiThreadedBlocking>"}) {
+        for (const std::string_view policy : {"<single_threaded>", "<multi_threaded>", "<single_threaded_blocking>", "<multi_threaded_blocking>"}) {
             expect(schedulers.output.contains(policy)) << "one key per execution policy" << policy << schedulers.output;
         }
         expect(schedulers.output.contains("GoodMathScheduler")) << "the scheduler a plugin registers" << schedulers.output;
@@ -633,11 +650,12 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         for (const std::string_view key : {"\"libraries\"", "\"schedulerKeys\"", "\"families\"", "\"schedulers\"", "\"instantiations\"", "\"totals\""}) {
             expect(schedulers.output.contains(key)) << key << schedulers.output;
         }
-        expect(schedulers.output.contains("\"key\": \"gr::scheduler::Simple<singleThreaded>\"")) << schedulers.output;
-        expect(schedulers.output.contains("\"key\": \"gr::scheduler::Simple<multiThreaded>\"")) << schedulers.output;
+        expect(schedulers.output.contains("\"key\": \"gr::scheduler::Simple<single_threaded>\"")) << schedulers.output;
+        expect(schedulers.output.contains("\"key\": \"gr::scheduler::Simple<multi_threaded>\"")) << schedulers.output;
         expect(schedulers.output.contains("\"key\": \"good::GoodMathScheduler\"")) << schedulers.output;
         expect(schedulers.output.contains("\"name\": \"timeout_ms\"")) << schedulers.output;
         expect(schedulers.output.contains("\"unit\": \"ms\"")) << "the unit the annotation carries" << schedulers.output;
+        expect(schedulers.output.contains("\"limits\": \">= 1\"")) << "the limits of process_stream_to_message_ratio, as a refusal states them" << schedulers.output;
         expect(!schedulers.output.contains(": null")) << schedulers.output;
         for (const std::string_view blockOnly : {"\"ports\"", "\"blockCategory\"", "\"uiCategory\""}) {
             expect(!schedulers.output.contains(blockOnly)) << "a scheduler entry carries nothing only a block has:" << blockOnly << schedulers.output;
@@ -647,7 +665,7 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
     "version names the registered schedulers and counts them"_test = [] {
         const Result version = run(overTestDirectories({"version"}));
         expect(eq(version.exitCode, 0)) << version.output;
-        expect(version.output.contains("gr::scheduler::Simple<singleThreaded>")) << version.output;
+        expect(version.output.contains("gr::scheduler::Simple<single_threaded>")) << version.output;
         expect(version.output.contains("good::GoodMathScheduler")) << version.output;
         expect(version.output.contains("scheduler keys")) << version.output;
     };
@@ -702,7 +720,7 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         expect(markdown.output.starts_with("# grinfo version\n")) << "the command is the title" << markdown.output;
         expect(hasRenderedRow(markdown.output, {fromEnvironment("GR_TOOLS_CORE_TEST_PLUGINS"), "option", "searched"})) << "a directory row, its path whole" << markdown.output;
         expect(markdown.output.contains("| Good Math Plugin | v1 | MIT | 4 | 1 |")) << "a plugin row" << markdown.output;
-        expect(markdown.output.contains("- gr::scheduler::Simple\\<singleThreaded\\>\n")) << "a scheduler key, its brackets escaped" << markdown.output;
+        expect(markdown.output.contains("- gr::scheduler::Simple\\<single_threaded\\>\n")) << "a scheduler key, its brackets escaped" << markdown.output;
 
         const Result html = run(overTestDirectories({"version", "--html"}), Streams::standardOutput);
         expect(eq(html.exitCode, 0)) << html.output;
@@ -726,13 +744,13 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         const Result markdown = run(overTestDirectories({"blocks", "--verbose", "--markdown"}), Streams::standardOutput);
         expect(eq(markdown.exitCode, 0)) << markdown.output;
         expect(markdown.output.contains("| in | input | float32 |")) << "a port with its type" << markdown.output;
-        expect(markdown.output.contains("| extra_gain | float32 | 1.000000 | dB | yes |")) << "a setting with its type and default" << markdown.output;
+        expect(markdown.output.contains("| extra_gain | float32 | 1.000000 | dB | \\> 0 and \\<= 100 | setting |")) << "a setting with its type and default" << markdown.output;
         expect(markdown.output.contains("| in | input | T |")) << "a port written in the block's type parameter" << markdown.output;
 
         const Result html = run(overTestDirectories({"blocks", "--verbose", "--html"}), Streams::standardOutput);
         expect(eq(html.exitCode, 0)) << html.output;
         expect(html.output.contains("<tr><td>in</td><td>input</td><td>float32</td></tr>")) << html.output;
-        expect(html.output.contains("<tr><td>extra_gain</td><td>float32</td><td>1.000000</td><td>dB</td><td>yes</td></tr>")) << html.output;
+        expect(html.output.contains("<tr><td>extra_gain</td><td>float32</td><td>1.000000</td><td>dB</td><td>&gt; 0 and &lt;= 100</td><td>setting</td><td></td></tr>")) << html.output;
     };
 
     "every link of blocks --verbose leads to an anchor of the same document"_test = [] {
@@ -760,7 +778,7 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         expect(markdown.output.starts_with("# grinfo block LibraryDoubler\n")) << markdown.output;
         expect(markdown.output.contains("## gr::testing::LibraryDoubler\n")) << "the block named in full" << markdown.output;
         expect(markdown.output.contains("| out | output | float32 |")) << markdown.output;
-        expect(markdown.output.contains("| extra_gain | float32 | 1.000000 | dB | yes |")) << markdown.output;
+        expect(markdown.output.contains("| extra_gain | float32 | 1.000000 | dB | \\> 0 and \\<= 100 | setting |")) << markdown.output;
 #ifndef _MSC_VER
         // the description is the placeholder under MSVC: gnuradio/gnuradio4-core#252
         expect(markdown.output.contains("doubles its input")) << "the description the block declares" << markdown.output;
@@ -769,14 +787,14 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
         const Result html = run(overTestDirectories({"block", "LibraryDoubler", "--html"}), Streams::standardOutput);
         expect(eq(html.exitCode, 0)) << html.output;
         expect(html.output.contains("<tr><td>out</td><td>output</td><td>float32</td></tr>")) << html.output;
-        expect(html.output.contains("<tr><td>extra_gain</td><td>float32</td><td>1.000000</td><td>dB</td><td>yes</td></tr>")) << html.output;
+        expect(html.output.contains("<tr><td>extra_gain</td><td>float32</td><td>1.000000</td><td>dB</td><td>&gt; 0 and &lt;= 100</td><td>setting</td><td></td></tr>")) << html.output;
     };
 
     "a templated key in a Markdown title and table cell keeps its angle brackets"_test = [] {
         const Result markdown = run(overTestDirectories({"block", "good::multiply<float32>", "--all-settings", "--markdown"}), Streams::standardOutput);
         expect(eq(markdown.exitCode, 0)) << markdown.output;
         expect(markdown.output.starts_with("# grinfo block good::multiply\\<float32\\>\n")) << "the title, escaped" << markdown.output;
-        expect(markdown.output.contains("| name | string | \"good::multiply\\<float32\\>\" |  | yes |")) << "the default of name, escaped" << markdown.output;
+        expect(markdown.output.contains("| name | string | \"good::multiply\\<float32\\>\" |  |  | setting |")) << "the default of name, escaped" << markdown.output;
         expect(!markdown.output.contains("\"good::multiply<float32>\"")) << "and nowhere raw" << markdown.output;
     };
 
@@ -812,7 +830,7 @@ const boost::ut::suite<"GrInfo"> grInfoTests = [] {
 
         const Result html = run(overTestDirectories({"schedulers", "--html"}), Streams::standardOutput);
         expect(eq(html.exitCode, 0)) << html.output;
-        expect(html.output.contains("<tr><td>timeout_ms</td><td>uint32</td><td>100</td><td>ms</td></tr>")) << html.output;
+        expect(html.output.contains("<tr><td>timeout_ms</td><td>uint32</td><td>100</td><td>ms</td><td></td><td>stopped</td></tr>")) << html.output;
     };
 
     "every HTML page is one self-contained page"_test = [] {

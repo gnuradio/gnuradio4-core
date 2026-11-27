@@ -18,9 +18,13 @@ struct Stage : gr::Block<Stage> {
     gr::PortIn<float>  in;
     gr::PortOut<float> out;
 
-    gr::Annotated<std::string, "label", gr::Visible, gr::Doc<"text shown as written">> label = "*literal* &lt;";
+    struct Settings {
+        gr::Annotated<std::string, gr::Visible, gr::Doc<"text shown as written">> label = "*literal* &lt;";
 
-    GR_MAKE_REFLECTABLE(Stage, in, out, label);
+        GR_MAKE_REFLECTABLE(Settings, label);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(Stage, in, out, settings);
 
     explicit Stage(gr::property_map init = {}) : gr::Block<Stage>(std::move(init)) {}
 

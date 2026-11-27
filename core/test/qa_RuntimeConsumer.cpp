@@ -10,7 +10,7 @@
  * GNU Radio header.
  *
  * check_runtime_cascade.sh compiles this file with clang -ftime-trace. It asserts that the file instantiates no
- * Block<T>, CtxSettings<T>, Port<T, ...> or SchedulerBase<...>. Nothing here includes another GNU Radio header, and
+ * Block<T>, settings::BlockSettingsOf<T>, Port<T, ...> or SchedulerBase<...>. Nothing here includes another GNU Radio header, and
  * nothing names a framework type.
  */
 
@@ -40,7 +40,7 @@ int main() {
         std::printf("runtime: %s\n", runtime.error().message.c_str());
         return EXIT_FAILURE;
     }
-    if (const auto sent = runtime->send(gr::RuntimeCommand::Get, gain->uniqueName(), gr::Runtime::kSettingsEndpoint, {}, "demo"); !sent) {
+    if (const auto sent = runtime->send(gr::RuntimeCommand::Get, "", gr::Runtime::kGraphGRCEndpoint, {}, "demo"); !sent) {
         std::printf("send: %s\n", sent.error().message.c_str());
         return EXIT_FAILURE;
     }
@@ -54,7 +54,7 @@ int main() {
         answered = answered || (event.clientRequestID == "demo" && !event.isError);
     }
     if (!answered) {
-        std::puts("the demo gain did not answer its settings request");
+        std::puts("the demo scheduler did not answer its graph request");
         return EXIT_FAILURE;
     }
 
